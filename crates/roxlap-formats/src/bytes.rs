@@ -34,6 +34,16 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
     }
 
+    pub(crate) fn read_i16(&mut self) -> Result<i16, OutOfBounds> {
+        let buf = self.read_bytes(2)?;
+        Ok(i16::from_le_bytes([buf[0], buf[1]]))
+    }
+
+    pub(crate) fn read_i32(&mut self) -> Result<i32, OutOfBounds> {
+        let buf = self.read_bytes(4)?;
+        Ok(i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+    }
+
     pub(crate) fn read_f32(&mut self) -> Result<f32, OutOfBounds> {
         Ok(f32::from_bits(self.read_u32()?))
     }

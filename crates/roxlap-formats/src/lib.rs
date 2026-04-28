@@ -11,6 +11,7 @@
 
 mod bytes;
 
+pub mod kfa;
 pub mod kv6;
 pub mod kvx;
 pub mod palette;
