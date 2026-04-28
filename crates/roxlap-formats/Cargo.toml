@@ -8,5 +8,11 @@ authors.workspace = true
 rust-version.workspace = true
 description = "Voxlap on-disk format parsers (.vxl, .kv6, .kvx, .kfa)."
 
+[dev-dependencies]
+# R2.3: oracle.vxl.gz fixture is the procedurally-built world voxlaptest
+# renders, gzipped for repo-friendly size (37 MB → 200 KB). Pure-Rust
+# backend so this crate has no native build deps.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 [lints]
 workspace = true

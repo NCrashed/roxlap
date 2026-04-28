@@ -14,5 +14,6 @@ mod bytes;
 pub mod kv6;
 pub mod kvx;
 pub mod palette;
+pub mod vxl;
 
 pub use palette::Rgb6;
