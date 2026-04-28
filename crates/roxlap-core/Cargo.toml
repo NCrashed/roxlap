@@ -1,0 +1,12 @@
+[package]
+name = "roxlap-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust port of Ken Silverman's Voxlap voxel engine — engine core."
+
+[lints]
+workspace = true

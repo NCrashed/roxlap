@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "crates/roxlap-core",
+    "crates/roxlap-formats",
+    "crates/roxlap-sdl",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/NCrashed/roxlap"
+authors = ["Anton Gushcha <ncrashed@gmail.com>"]
+rust-version = "1.74"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Module-name redundancy is fine for small crates that may grow.
+module_name_repetitions = "allow"
