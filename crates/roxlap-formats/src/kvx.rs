@@ -29,6 +29,9 @@
 
 use core::fmt;
 
+use crate::bytes::{Cursor, OutOfBounds};
+use crate::Rgb6;
+
 /// One run of consecutive voxels at a fixed (x, y) column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slab {
@@ -42,28 +45,6 @@ pub struct Slab {
     /// Per-voxel palette indices. `colors.len()` is the run length
     /// ("zleng" in the file format).
     pub colors: Vec<u8>,
-}
-
-/// A 6-bit-per-channel palette entry (each component is `0..=63`,
-/// preserving the on-disk encoding without lossy widening to 8-bit).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rgb6 {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-}
-
-impl Rgb6 {
-    /// Voxlap-style 32-bit packed colour: each component widened to 8
-    /// bits with low 2 bits zero, plus the `0x80000000` brightness bit
-    /// the engine treats as "full intensity".
-    #[must_use]
-    pub fn to_voxlap_argb(self) -> u32 {
-        0x8000_0000
-            | (u32::from(self.r) << 18)
-            | (u32::from(self.g) << 10)
-            | (u32::from(self.b) << 2)
-    }
 }
 
 /// Parsed `.kvx` model. Round-trips byte-equally via [`parse`] +
@@ -132,6 +113,15 @@ impl fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+impl From<OutOfBounds> for ParseError {
+    fn from(e: OutOfBounds) -> Self {
+        Self::Truncated {
+            at: e.at,
+            need: e.need,
+        }
+    }
+}
 
 const HEADER_LEN: usize = 28;
 const PALETTE_LEN: usize = 768;
@@ -308,57 +298,6 @@ pub fn serialize(kvx: &Kvx) -> Vec<u8> {
     }
 
     out
-}
-
-// --- internal helpers ---------------------------------------------------
-
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
-    }
-    fn read_u8(&mut self) -> Result<u8, ParseError> {
-        if self.pos + 1 > self.bytes.len() {
-            return Err(ParseError::Truncated {
-                at: self.pos,
-                need: 1,
-            });
-        }
-        let v = self.bytes[self.pos];
-        self.pos += 1;
-        Ok(v)
-    }
-    fn read_u16(&mut self) -> Result<u16, ParseError> {
-        if self.pos + 2 > self.bytes.len() {
-            return Err(ParseError::Truncated {
-                at: self.pos,
-                need: 2,
-            });
-        }
-        let v = u16::from_le_bytes([self.bytes[self.pos], self.bytes[self.pos + 1]]);
-        self.pos += 2;
-        Ok(v)
-    }
-    fn read_u32(&mut self) -> Result<u32, ParseError> {
-        if self.pos + 4 > self.bytes.len() {
-            return Err(ParseError::Truncated {
-                at: self.pos,
-                need: 4,
-            });
-        }
-        let v = u32::from_le_bytes([
-            self.bytes[self.pos],
-            self.bytes[self.pos + 1],
-            self.bytes[self.pos + 2],
-            self.bytes[self.pos + 3],
-        ]);
-        self.pos += 4;
-        Ok(v)
-    }
 }
 
 // --- tests --------------------------------------------------------------

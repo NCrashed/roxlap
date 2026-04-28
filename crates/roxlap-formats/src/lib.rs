@@ -9,4 +9,10 @@
 //! - R2.3: `.vxl`
 //! - R2.4: `.kfa`
 
+mod bytes;
+
+pub mod kv6;
 pub mod kvx;
+pub mod palette;
+
+pub use palette::Rgb6;
