@@ -131,12 +131,21 @@ pub(crate) struct GrouscanState<'a> {
     pub wall_lane: usize,
     /// Radar offset of the current pixel write — voxlap's `ebx`.
     pub ebx: isize,
+    /// Voxlap's `v - *ixy_sptr_col` byte offset within the current
+    /// column's slab list. `0` means we're at the top of the column.
+    /// Updated by R4.3e2's deletez when the algorithm walks past a
+    /// slab; for R4.3f4 it stays at the initial-dispatch value.
+    pub vptr_offset: usize,
 }
 
 impl<'a> GrouscanState<'a> {
     /// Build a fresh state from the cf[128] seed slot. Mirrors
     /// voxlap5.c:11601-11606.
-    fn from_seed(scratch: &'a mut ScanScratch, inputs: &GrouscanInputs<'a>) -> Self {
+    fn from_seed(
+        scratch: &'a mut ScanScratch,
+        inputs: &GrouscanInputs<'a>,
+        vptr_offset: usize,
+    ) -> Self {
         let c = scratch.cf[CF_SEED_INDEX];
         Self {
             scratch,
@@ -159,6 +168,7 @@ impl<'a> GrouscanState<'a> {
             mm5_tail: 0,
             wall_lane: 0,
             ebx: 0,
+            vptr_offset,
         }
     }
 }
@@ -328,7 +338,7 @@ pub fn grouscan_run(
     gxmip: i32,
     gmipnum: u32,
 ) -> GrouscanPrologue {
-    let mut state = GrouscanState::from_seed(scratch, inputs);
+    let mut state = GrouscanState::from_seed(scratch, inputs, vptr_offset);
 
     // --- ngxmax = min(gxmax, gxmip) when multiple mips exist. ---
     state.ngxmax = state.scratch.gxmax;
@@ -347,7 +357,7 @@ pub fn grouscan_run(
         state.scratch.gpz[state.lane].wrapping_add(state.scratch.gdz[state.lane]);
 
     // --- Initial dispatch. Voxlap5.c:11640-11641. ---
-    let dispatch = if vptr_offset == 0 {
+    let dispatch = if state.vptr_offset == 0 {
         InitialDispatch::DrawFlor
     } else {
         InitialDispatch::DrawCeil
@@ -518,10 +528,102 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
     }
 }
 
-#[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_draw_cwall(_state: &mut GrouscanState<'_>) -> Phase {
-    // R4.3f4: voxlap5.c:11681. Back-wall fill.
-    Phase::Done
+/// `drawcwall` — back-wall fill (voxlap5.c:11681). Mirror of
+/// drawfwall:
+/// - walks `z0` *upward* through the slab (z0++ per row, vs z1-- in
+///   drawfwall),
+/// - writes radar entries *rightward* (`ebx++`),
+/// - exits the inner loop when cross-sign goes `> 0` (drawfwall:
+///   `≤ 0`),
+/// - early-out branches: column-top → predrawflor, dv3 ≤ z0 →
+///   predrawceil with `z0 = dv3`.
+//
+// Mirror of phase_draw_fwall — same structural shape with sign
+// flips.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::similar_names
+)]
+fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
+    if state.column.len() < 4 {
+        return Phase::PreDrawCeil;
+    }
+
+    // Voxlap5.c:11694 — `z1 = v[1]` UNCONDITIONALLY at drawcwall
+    // entry (the comment in the C source warns that drawfwall's
+    // early-exit path leaves z1 stale otherwise).
+    state.z1 = i32::from(state.column[1]);
+
+    // Column-top: no back wall, jump to drawflor's prep.
+    if state.vptr_offset == 0 {
+        return Phase::PreDrawFlor;
+    }
+
+    // Voxlap5.c:11699-11703. v[3] = z0 of this slab (the air-ceiling
+    // above it). If it's ≤ the cached z0 there's no back wall above
+    // this slab to draw → set z0 = dv3, fall through to drawceil.
+    let dv3 = i32::from(state.column[3]);
+    if dv3 <= state.z0 {
+        state.z0 = dv3;
+        return Phase::PreDrawCeil;
+    }
+
+    state.ebx = state.scratch.cf[CF_SEED_INDEX].i0;
+
+    'outer: loop {
+        // -- loop2 (voxlap5.c:11706): per voxel-row setup. --
+        state.off = state.z0 - i32::from(state.column[3]);
+        state.z0 += 1;
+        let row_offset = (state.off as usize) * 4;
+        if row_offset + 4 > state.column.len() {
+            state.scratch.cf[CF_SEED_INDEX].i0 = state.ebx;
+            state.z0 = i32::from(state.column[3]);
+            return Phase::PreDrawCeil;
+        }
+        let vox = u32::from_le_bytes(
+            state.column[row_offset..row_offset + 4]
+                .try_into()
+                .expect("4-byte slice"),
+        );
+        state.color = grouscan_shade(vox, &mut state.mm5_tail, state.gcsub[state.wall_lane]);
+        let z0_idx = state.z0 as usize;
+        if z0_idx >= state.gylookup.len() {
+            state.scratch.cf[CF_SEED_INDEX].i0 = state.ebx;
+            state.z0 = i32::from(state.column[3]);
+            return Phase::PreDrawCeil;
+        }
+        state.gy_raw = state.gylookup[z0_idx];
+
+        // -- loop3 (voxlap5.c:11714): per-pixel inner. --
+        loop {
+            let test = grouscan_cross_sign(state.cx0, state.cy0, state.ogx, state.gy_raw);
+            if test > 0 {
+                // endloop3 (voxlap5.c:11728). Voxel row exhausted.
+                if i32::from(state.column[3]) != state.z0 {
+                    continue 'outer;
+                }
+                // c->i0 = ebx, z0 = v[3], fall through to drawceil.
+                state.scratch.cf[CF_SEED_INDEX].i0 = state.ebx;
+                state.z0 = i32::from(state.column[3]);
+                return Phase::PreDrawCeil;
+            }
+            // Advance left-edge ray right.
+            state.cx0 = state.cx0.wrapping_add(state.scratch.gi0);
+            state.cy0 = state.cy0.wrapping_add(state.scratch.gi1);
+
+            let radar_idx = state.ebx as usize;
+            if let Some(slot) = state.scratch.radar.get_mut(radar_idx) {
+                slot.col = state.color as i32;
+                slot.dist = state.ogx;
+            }
+            state.ebx += 1;
+            if state.ebx > state.scratch.cf[CF_SEED_INDEX].i1 {
+                return Phase::PreDeleteZ;
+            }
+        }
+    }
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
@@ -714,7 +816,7 @@ mod tests {
     }
 
     /// Build a `GrouscanState` with custom column / gylookup / gcsub
-    /// so drawfwall can be exercised directly.
+    /// so drawfwall / drawcwall can be exercised directly.
     fn state_for_drawfwall<'a>(
         scratch: &'a mut ScanScratch,
         column: &'a [u8],
@@ -726,7 +828,22 @@ mod tests {
             gylookup,
             gcsub,
         };
-        GrouscanState::from_seed(scratch, &inputs)
+        GrouscanState::from_seed(scratch, &inputs, 0)
+    }
+
+    fn state_for_drawcwall<'a>(
+        scratch: &'a mut ScanScratch,
+        column: &'a [u8],
+        gylookup: &'a [i32],
+        gcsub: &'a [i64; 9],
+        vptr_offset: usize,
+    ) -> GrouscanState<'a> {
+        let inputs = GrouscanInputs {
+            column,
+            gylookup,
+            gcsub,
+        };
+        GrouscanState::from_seed(scratch, &inputs, vptr_offset)
     }
 
     #[test]
@@ -798,6 +915,32 @@ mod tests {
         assert_ne!(state.scratch.radar[50].col, 0);
         // ebx decremented from 50 to 49 by the one pixel write.
         assert_eq!(state.ebx, 49);
+    }
+
+    #[test]
+    fn drawcwall_column_top_jumps_to_predrawflor() {
+        let mut s = fresh_scratch();
+        let column = [0u8, 10, 12, 0]; // any header; column-top so v == ixy_sptr_col
+        let gylookup = [0i32; 64];
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
+        assert_eq!(phase_draw_cwall(&mut state), Phase::PreDrawFlor);
+        // z1 was unconditionally updated to v[1] = 10.
+        assert_eq!(state.z1, 10);
+    }
+
+    #[test]
+    fn drawcwall_dv3_le_z0_jumps_to_predrawceil() {
+        // dv3 = v[3] = 5, z0 cached = 20. dv3 <= z0 → set z0 = 5,
+        // return PreDrawCeil.
+        let mut s = fresh_scratch();
+        s.cf[CF_SEED_INDEX].z0 = 20;
+        let column = [0u8, 10, 12, 5];
+        let gylookup = [0i32; 64];
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 32);
+        assert_eq!(phase_draw_cwall(&mut state), Phase::PreDrawCeil);
+        assert_eq!(state.z0, 5);
     }
 
     #[test]
