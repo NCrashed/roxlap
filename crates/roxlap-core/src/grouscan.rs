@@ -39,9 +39,12 @@ pub struct CfType {
     pub cy1: i32,
 }
 
-/// Length of the `cf` stack. Voxlap's asm allocates `cfasm dd 32*129`
-/// (32 bytes × 129 entries); we keep the same 129-slot footprint.
-pub const CF_LEN: usize = 129;
+/// Length of the `cf` stack. Voxlap declares `int8_t cfasm[256*32]`
+/// (`voxlap5.c:143`) — 8192 bytes used as `cftype[256]`. The seed
+/// slot lives at index 128 and the active stack pushes upward
+/// (capped at index 191 by an asm `cmp eax, _cfasm[4096]` check).
+/// We mirror the full 256-slot footprint.
+pub const CF_LEN: usize = 256;
 
 /// Index of the seed slot `gline` populates before invoking
 /// `grouscan_run`. Voxlap calls this `cf[128]`.
@@ -136,6 +139,24 @@ pub(crate) struct GrouscanState<'a> {
     /// Updated by R4.3e2's deletez when the algorithm walks past a
     /// slab; for R4.3f4 it stays at the initial-dispatch value.
     pub vptr_offset: usize,
+
+    // ---------------------------------------------------------------
+    // cf-stack cursors (R4.3e2a). Voxlap's `c` (current entry) and
+    // `ce` (top-of-stack) are pointers into the `cf[]` array; we
+    // mirror with usize indices into `scratch.cf`. Both initialise
+    // to `CF_SEED_INDEX = 128` so the seed slot acts as the bottom
+    // of the working stack the way voxlap's asm uses it.
+    // ---------------------------------------------------------------
+    /// Index of the current cf entry — voxlap's `c`.
+    pub c_idx: usize,
+    /// Index of the cf-stack top — voxlap's `ce`.
+    pub ce_idx: usize,
+    /// Index of the pre-pop sync slot — voxlap's `c_presync`. Used
+    /// by deletez → afterdelete to steer the skipixy2 sync test.
+    /// `usize::MAX` means "not set" (the `AfterDelete` path
+    /// initialises it; `AfterDeleteKeptPresync` sets it to the
+    /// freed slot's index inside deletez).
+    pub c_presync_idx: usize,
 }
 
 impl<'a> GrouscanState<'a> {
@@ -169,6 +190,9 @@ impl<'a> GrouscanState<'a> {
             wall_lane: 0,
             ebx: 0,
             vptr_offset,
+            c_idx: CF_SEED_INDEX,
+            ce_idx: CF_SEED_INDEX,
+            c_presync_idx: usize::MAX,
         }
     }
 }
@@ -363,15 +387,10 @@ pub fn grouscan_run(
         InitialDispatch::DrawCeil
     };
 
-    // --- Phase state machine. R4.3e ships the driver + stubs;
-    // R4.3f+ replaces each stub with the real fill body. ---
-    let entry = match dispatch {
-        InitialDispatch::DrawFlor => Phase::DrawFlor,
-        InitialDispatch::DrawCeil => Phase::DrawCeil,
-    };
-    run_phases(&mut state, entry);
-
-    GrouscanPrologue {
+    // Snapshot the prologue state BEFORE dispatching the state
+    // machine — the returned `GrouscanPrologue` is meant to expose
+    // the prologue setup, not the post-fill register state.
+    let prologue = GrouscanPrologue {
         z0: state.z0,
         z1: state.z1,
         cx0: state.cx0,
@@ -383,7 +402,17 @@ pub fn grouscan_run(
         gx: state.gx,
         ngxmax: state.ngxmax,
         dispatch,
-    }
+    };
+
+    // --- Phase state machine. R4.3e ships the driver + stubs;
+    // R4.3f+ replaces each stub with the real fill body. ---
+    let entry = match dispatch {
+        InitialDispatch::DrawFlor => Phase::DrawFlor,
+        InitialDispatch::DrawCeil => Phase::DrawCeil,
+    };
+    run_phases(&mut state, entry);
+
+    prologue
 }
 
 /// One label in voxlap's grouscan state machine. The C source uses
@@ -410,6 +439,16 @@ pub enum Phase {
     PreDeleteZ,
     /// Cf-stack pop / column advance (11967).
     DeleteZ,
+    /// Post-pop cleanup. Voxlap5.c:11788. Pops `c`, either jumps to
+    /// `skipixy_with_presync` (intra-column) or steps to the next
+    /// voxel column. R4.3e2c+ ships the body; R4.3e2a stubs to
+    /// [`Phase::Done`].
+    AfterDelete,
+    /// Variant of [`Phase::AfterDelete`] that bypasses the
+    /// `c_presync = c` re-assignment. Voxlap5.c:11793. Used by
+    /// `deletez` when it shifted entries down — stashing the freed
+    /// slot index so the post-column-step skip-sync test fires.
+    AfterDeleteKeptPresync,
     /// Driver-only: no more work. Returned by the last phase.
     Done,
 }
@@ -432,6 +471,8 @@ fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
             Phase::DrawFlor => phase_draw_flor(state),
             Phase::PreDeleteZ => phase_pre_delete_z(state),
             Phase::DeleteZ => phase_delete_z(state),
+            Phase::AfterDelete => phase_after_delete(state),
+            Phase::AfterDeleteKeptPresync => phase_after_delete_kept_presync(state),
             Phase::Done => break,
         };
     }
@@ -783,15 +824,57 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
     }
 }
 
-#[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_pre_delete_z(_state: &mut GrouscanState<'_>) -> Phase {
-    // R4.3e2: pre-pop cleanup before deletez.
+/// `predeletez` — voxlap5.c:11962-11965. Swaps `ogx ↔ gx` before
+/// falling into deletez. Mirrors the `pshufd 0x4e` on mm6 in
+/// the asm.
+fn phase_pre_delete_z(state: &mut GrouscanState<'_>) -> Phase {
+    std::mem::swap(&mut state.ogx, &mut state.gx);
     Phase::DeleteZ
 }
 
+/// `deletez` — voxlap5.c:11967-11997. Pops the cf-stack top (`ce--`).
+/// If we're processing an interior entry (`c < old_ce`), shifts
+/// entries `(c .. old_ce]` down by one slot to close the gap and
+/// stashes the freed slot's index in `c_presync` so the post-
+/// column-step skip-sync test fires (otherwise locals would never
+/// reload from the now-shifted `cf[c]` memory). Falls into
+/// `afterdelete` (or `afterdelete_kept_presync` when the shift
+/// fired).
+///
+/// `if (ce <= &cf[128]) goto retsub` — when the stack drops below
+/// the seed slot, the algorithm is done; we return [`Phase::Done`].
+fn phase_delete_z(state: &mut GrouscanState<'_>) -> Phase {
+    if state.ce_idx <= CF_SEED_INDEX {
+        return Phase::Done;
+    }
+    let old_ce = state.ce_idx;
+    state.ce_idx -= 1;
+    if state.c_idx < old_ce {
+        // Shift cf[c..old_ce] down by one (cf[c] = cf[c+1], …,
+        // cf[old_ce-1] = cf[old_ce]).
+        for p in state.c_idx..old_ce {
+            state.scratch.cf[p] = state.scratch.cf[p + 1];
+        }
+        state.c_presync_idx = old_ce;
+        return Phase::AfterDeleteKeptPresync;
+    }
+    Phase::AfterDelete
+}
+
+/// `afterdelete` — voxlap5.c:11788. R4.3e2c will implement the
+/// `c--` + intra-column / column-step branch. R4.3e2a stubs to
+/// [`Phase::Done`] so the state machine terminates after a
+/// deletez pop.
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_delete_z(_state: &mut GrouscanState<'_>) -> Phase {
-    // R4.3e2: voxlap5.c:11967. Cf-stack pop / column advance.
+fn phase_after_delete(_state: &mut GrouscanState<'_>) -> Phase {
+    Phase::Done
+}
+
+/// `afterdelete_kept_presync` — voxlap5.c:11793. As above but the
+/// caller (deletez post-shift) has already set `c_presync_idx`.
+/// R4.3e2c will implement the body.
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn phase_after_delete_kept_presync(_state: &mut GrouscanState<'_>) -> Phase {
     Phase::Done
 }
 
@@ -1239,6 +1322,82 @@ mod tests {
         let gcsub = [0i64; 9];
         let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 0);
         assert_eq!(phase_draw_flor(&mut state), Phase::PreDeleteZ);
+    }
+
+    #[test]
+    fn predeletez_swaps_ogx_and_gx() {
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        state.ogx = 0xAAAA;
+        state.gx = 0xBBBB;
+        assert_eq!(phase_pre_delete_z(&mut state), Phase::DeleteZ);
+        assert_eq!(state.ogx, 0xBBBB);
+        assert_eq!(state.gx, 0xAAAA);
+    }
+
+    #[test]
+    fn deletez_at_seed_slot_returns_done() {
+        // ce_idx == CF_SEED_INDEX (= 128) → `ce <= &cf[128]` →
+        // retsub → Done. Initial state from from_seed already has
+        // ce_idx == CF_SEED_INDEX.
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        assert_eq!(state.ce_idx, CF_SEED_INDEX);
+        assert_eq!(phase_delete_z(&mut state), Phase::Done);
+    }
+
+    #[test]
+    fn deletez_pops_top_when_c_equals_ce() {
+        // ce above seed and c == ce → just decrement ce, no shift,
+        // route to AfterDelete.
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        state.ce_idx = CF_SEED_INDEX + 2;
+        state.c_idx = CF_SEED_INDEX + 2;
+        assert_eq!(phase_delete_z(&mut state), Phase::AfterDelete);
+        assert_eq!(state.ce_idx, CF_SEED_INDEX + 1);
+        assert_eq!(state.c_idx, CF_SEED_INDEX + 2);
+        assert_eq!(state.c_presync_idx, usize::MAX);
+    }
+
+    #[test]
+    fn deletez_shifts_down_when_c_below_ce() {
+        // ce above c → shift cf[c..old_ce] down, stash old_ce as
+        // c_presync, route to AfterDeleteKeptPresync.
+        let mut s = fresh_scratch();
+        // Plant recognisable values in cf[129] and cf[130].
+        s.cf[CF_SEED_INDEX + 1] = CfType {
+            i0: 1,
+            i1: 1,
+            ..Default::default()
+        };
+        s.cf[CF_SEED_INDEX + 2] = CfType {
+            i0: 2,
+            i1: 2,
+            ..Default::default()
+        };
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        state.ce_idx = CF_SEED_INDEX + 2;
+        state.c_idx = CF_SEED_INDEX + 1;
+        assert_eq!(phase_delete_z(&mut state), Phase::AfterDeleteKeptPresync);
+        assert_eq!(state.ce_idx, CF_SEED_INDEX + 1);
+        assert_eq!(state.c_presync_idx, CF_SEED_INDEX + 2);
+        // cf[c=129] now holds what was at cf[130].
+        assert_eq!(state.scratch.cf[CF_SEED_INDEX + 1].i0, 2);
+    }
+
+    #[test]
+    fn from_seed_initialises_cf_indices_to_seed() {
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        assert_eq!(state.c_idx, CF_SEED_INDEX);
+        assert_eq!(state.ce_idx, CF_SEED_INDEX);
+        assert_eq!(state.c_presync_idx, usize::MAX);
     }
 
     #[test]
