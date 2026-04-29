@@ -44,6 +44,12 @@ use crate::scan_loops::ScanContext;
 /// Borrows the framebuffer + zbuffer for the duration of one
 /// `opticast` call; SDL hosts allocate these once and reuse across
 /// frames, see `roxlap-host`.
+//
+// `slab_buf` / `column_offsets` / `vsid` are R4.3a-rewire-2
+// scaffolding — the real `gline` (R4.3a-rewire-3) needs them to
+// call `grouscan_run` per ray. The current placeholder gline
+// doesn't read them yet, hence the dead_code allow.
+#[allow(dead_code)]
 pub struct ScalarRasterizer<'a> {
     framebuffer: &'a mut [u32],
     zbuffer: &'a mut [f32],
@@ -51,6 +57,18 @@ pub struct ScalarRasterizer<'a> {
     /// for tightly-packed buffers; SDL streaming textures may add
     /// trailing padding).
     pitch_pixels: usize,
+    /// World-level flat slab buffer (voxlap's malloc'd column
+    /// data). Re-borrowed from opticast's caller for the lifetime
+    /// of the rasterizer.
+    slab_buf: &'a [u8],
+    /// Per-column byte offsets into [`Self::slab_buf`].
+    /// `column_offsets[i]..column_offsets[i + 1]` is column `i`'s
+    /// slab list. Length is `vsid² + 1`.
+    column_offsets: &'a [u32],
+    /// World dimension. Combined with the prelude's `column_index`
+    /// and the column-step path in grouscan, this is what lets the
+    /// real gline walk the per-ray voxel-column traversal.
+    vsid: u32,
     /// Cached per-frame ray-step coefficients (`optistr*` /
     /// `optihei*` / `optiadd*` in voxlap globals). Stamped on each
     /// `frame_setup` call.
@@ -64,15 +82,29 @@ impl<'a> ScalarRasterizer<'a> {
     /// the engine renders into; the `frame_setup` hook does not
     /// validate sizes (it has no height to check against).
     ///
+    /// `slab_buf` / `column_offsets` / `vsid` describe the world
+    /// the renderer reads from. Same shape as opticast's world
+    /// arguments — pass the same values.
+    ///
     /// `ray_step` is initialised to a zero placeholder; the real
     /// values get stamped on the first [`Rasterizer::frame_setup`]
     /// call before any per-pixel work runs.
     #[must_use]
-    pub fn new(framebuffer: &'a mut [u32], zbuffer: &'a mut [f32], pitch_pixels: usize) -> Self {
+    pub fn new(
+        framebuffer: &'a mut [u32],
+        zbuffer: &'a mut [f32],
+        pitch_pixels: usize,
+        slab_buf: &'a [u8],
+        column_offsets: &'a [u32],
+        vsid: u32,
+    ) -> Self {
         Self {
             framebuffer,
             zbuffer,
             pitch_pixels,
+            slab_buf,
+            column_offsets,
+            vsid,
             ray_step: zero_ray_step(),
         }
     }
@@ -251,7 +283,7 @@ mod tests {
     fn frame_setup_caches_ray_step() {
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
         let (proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -276,7 +308,7 @@ mod tests {
         // and verify the framebuffer received the colours.
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
         let (proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -336,7 +368,22 @@ mod tests {
         let mut fb = vec![0u32; 640 * 480];
         let mut zb = vec![0.0f32; 640 * 480];
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
-        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, 640);
+
+        // Single solid slab at z = 200..254. cz = 128 < 200 →
+        // air-above-the-slab, opticast renders. Synthetic world:
+        // only the camera's column (1024 * 2048 + 1024) holds the
+        // slab; every other column is empty. Build world before
+        // the rasterizer so it can borrow `&column` / `&column_offsets`.
+        let column = vec![0u8, 200, 254, 0];
+        let cam_idx = 1024usize * 2048 + 1024;
+        let mut column_offsets = vec![0u32; 2048 * 2048 + 1];
+        let column_len_u32 = u32::try_from(column.len()).expect("column fits u32");
+        for offset in &mut column_offsets[(cam_idx + 1)..] {
+            *offset = column_len_u32;
+        }
+
+        let mut rasterizer =
+            ScalarRasterizer::new(&mut fb, &mut zb, 640, &column, &column_offsets, 2048);
 
         let cam = crate::Camera {
             pos: [1024.0, 1024.0, 128.0],
@@ -345,17 +392,6 @@ mod tests {
             forward: [0.0, 0.0, 1.0],
         };
         let settings = OpticastSettings::for_oracle_framebuffer(640, 480);
-        // Single solid slab at z = 200..254. cz = 128 < 200 →
-        // air-above-the-slab, opticast renders. Synthetic world:
-        // only the camera's column (1024 * 2048 + 1024) holds the
-        // slab; every other column is empty.
-        let column = vec![0u8, 200, 254, 0];
-        let cam_idx = 1024usize * 2048 + 1024;
-        let mut column_offsets = vec![0u32; 2048 * 2048 + 1];
-        let column_len_u32 = u32::try_from(column.len()).expect("column fits u32");
-        for offset in &mut column_offsets[(cam_idx + 1)..] {
-            *offset = column_len_u32;
-        }
 
         let outcome = opticast_fn(
             &mut rasterizer,
@@ -383,7 +419,7 @@ mod tests {
         // happens once per pixel.
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
         let (proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,

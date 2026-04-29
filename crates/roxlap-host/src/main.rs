@@ -132,8 +132,14 @@ impl ApplicationHandler for App {
                 // Scope the rasterizer so its &mut buffer borrow ends
                 // before we present the buffer.
                 {
-                    let mut rasterizer =
-                        ScalarRasterizer::new(&mut buffer, &mut self.zbuffer, pitch_pixels);
+                    let mut rasterizer = ScalarRasterizer::new(
+                        &mut buffer,
+                        &mut self.zbuffer,
+                        pitch_pixels,
+                        &self.slab_buf,
+                        &self.column_offsets,
+                        VSID,
+                    );
                     let _ = opticast(
                         &mut rasterizer,
                         &mut self.scratch,
