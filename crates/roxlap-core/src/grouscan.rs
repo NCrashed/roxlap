@@ -144,15 +144,23 @@ pub fn grouscan_run(
 
     // --- Initial dispatch. Voxlap5.c:11640-11641. ---
     let dispatch = if vptr_offset == 0 {
-        // v == *ixy_sptr_col → camera is at the top of the slab list.
-        // R4.3d stub: would jump to drawflor; R4.3e fills it in.
-        draw_flor_stub(scratch);
         InitialDispatch::DrawFlor
     } else {
-        // Camera in interior air gap. R4.3d stub.
-        draw_ceil_stub(scratch);
         InitialDispatch::DrawCeil
     };
+
+    // --- Phase state machine. Voxlap's C uses gotos between draw-
+    // phase labels (the asm's control graph isn't reducible, so each
+    // phase is both an entry label and a re-entry target). Rust has
+    // no goto; we encode each phase as a `Phase` variant and run a
+    // `loop { match state { ... } }` driver instead. R4.3f+ fills in
+    // the per-phase fill bodies; R4.3e (this commit) ships the
+    // driver + stubs.
+    let entry = match dispatch {
+        InitialDispatch::DrawFlor => Phase::DrawFlor,
+        InitialDispatch::DrawCeil => Phase::DrawCeil,
+    };
+    run_phases(scratch, entry);
 
     GrouscanPrologue {
         z0,
@@ -169,40 +177,111 @@ pub fn grouscan_run(
     }
 }
 
-// --- Draw-phase stubs (R4.3d). All return immediately; R4.3e+
-//     replaces each body with the real fill loop ported from
-//     voxlap5.c:11643..11800-area. They take `&mut ScanScratch` so
-//     the eventual real implementations can write into radar /
-//     advance gscanptr / mutate the cf stack. ---
+/// One label in voxlap's grouscan state machine. The C source uses
+/// `goto` between these labels; we drive them via [`run_phases`].
+///
+/// Voxlap line numbers reference the same label names in
+/// `voxlaptest`'s `grouscanasm_scalar` (`voxlap5.c:11643..11770`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Front-wall fill (voxlap5.c:11643).
+    DrawFwall,
+    /// Back-wall fill, falls through from `drawfwall` (11681).
+    DrawCwall,
+    /// Pre-ceiling — swaps mm6 halves before drawceil (11734).
+    PreDrawCeil,
+    /// Ceiling fill (11740).
+    DrawCeil,
+    /// Pre-floor (11761).
+    PreDrawFlor,
+    /// Floor fill (11765).
+    DrawFlor,
+    /// Pre-pop cleanup before deletez (no source label; `goto
+    /// predeletez` from inside the fill loops).
+    PreDeleteZ,
+    /// Cf-stack pop / column advance (11967).
+    DeleteZ,
+    /// Driver-only: no more work. Returned by the last phase.
+    Done,
+}
+
+/// Drive grouscan's state machine starting at `entry`.
+///
+/// Each phase function reads / mutates `scratch` and returns the
+/// next [`Phase`] — modelling voxlap's `goto X` jumps. R4.3e ships
+/// every phase as a stub that returns [`Phase::Done`]; R4.3f+
+/// replaces them with the actual fill loops.
+fn run_phases(scratch: &mut ScanScratch, entry: Phase) {
+    let mut current = entry;
+    loop {
+        current = match current {
+            Phase::DrawFwall => phase_draw_fwall(scratch),
+            Phase::DrawCwall => phase_draw_cwall(scratch),
+            Phase::PreDrawCeil => phase_pre_draw_ceil(scratch),
+            Phase::DrawCeil => phase_draw_ceil(scratch),
+            Phase::PreDrawFlor => phase_pre_draw_flor(scratch),
+            Phase::DrawFlor => phase_draw_flor(scratch),
+            Phase::PreDeleteZ => phase_pre_delete_z(scratch),
+            Phase::DeleteZ => phase_delete_z(scratch),
+            Phase::Done => break,
+        };
+    }
+}
+
+// --- Per-phase functions. R4.3e stubs return Phase::Done; R4.3f+
+//     replaces each body with the fill / pop / mip-transition
+//     logic ported from voxlap5.c:11643..11770-area. ---
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn draw_fwall_stub(_scratch: &mut ScanScratch) {
-    // R4.3e: front-wall fill (voxlap5.c:11643).
+fn phase_draw_fwall(_scratch: &mut ScanScratch) -> Phase {
+    // R4.3f: voxlap5.c:11643. Front-wall fill loop, then falls
+    // through to drawcwall.
+    Phase::Done
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn draw_cwall_stub(_scratch: &mut ScanScratch) {
-    // R4.3e: ceiling-wall fill (voxlap5.c:11681).
+fn phase_draw_cwall(_scratch: &mut ScanScratch) -> Phase {
+    // R4.3f: voxlap5.c:11681. Back-wall fill, branches to
+    // predrawflor / predrawceil based on z relations.
+    Phase::Done
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn draw_ceil_stub(_scratch: &mut ScanScratch) {
-    // R4.3e: ceiling fill (voxlap5.c:11740).
+fn phase_pre_draw_ceil(_scratch: &mut ScanScratch) -> Phase {
+    // R4.3f: voxlap5.c:11734. Swaps ogx ↔ gx before drawceil.
+    Phase::DrawCeil
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn draw_flor_stub(_scratch: &mut ScanScratch) {
-    // R4.3e: floor fill (voxlap5.c:11765).
+fn phase_draw_ceil(_scratch: &mut ScanScratch) -> Phase {
+    // R4.3f: voxlap5.c:11740. Ceiling fill; can re-enter from
+    // drawceilloop on failed sign test.
+    Phase::Done
 }
 
-// Silence dead_code lints on the not-yet-dispatched stubs. Each will
-// fire from R4.3e+ once the inter-phase gotos are wired.
-#[allow(dead_code)]
-fn _ensure_stubs_referenced(scratch: &mut ScanScratch) {
-    draw_fwall_stub(scratch);
-    draw_cwall_stub(scratch);
-    draw_ceil_stub(scratch);
-    draw_flor_stub(scratch);
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn phase_pre_draw_flor(_scratch: &mut ScanScratch) -> Phase {
+    // R4.3f: voxlap5.c:11761. Sets up drawflor.
+    Phase::DrawFlor
+}
+
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn phase_draw_flor(_scratch: &mut ScanScratch) -> Phase {
+    // R4.3f: voxlap5.c:11765. Floor fill; cross-phase target from
+    // drawceilloop (the irreducible-control-flow case).
+    Phase::Done
+}
+
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn phase_pre_delete_z(_scratch: &mut ScanScratch) -> Phase {
+    // R4.3f: pre-pop cleanup before deletez.
+    Phase::DeleteZ
+}
+
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn phase_delete_z(_scratch: &mut ScanScratch) -> Phase {
+    // R4.3e: voxlap5.c:11967. Cf-stack pop / column advance.
+    Phase::Done
 }
 
 #[cfg(test)]
