@@ -56,7 +56,10 @@ use crate::rasterizer::ScanScratch;
 /// to keep `grouscan_run`'s signature compact.
 pub struct GrouscanInputs<'a> {
     /// The slab-list bytes of the column the ray currently sits in.
-    /// Voxlap's `v` pointer indexes into this.
+    /// Voxlap's `v` pointer indexes into this. After R4.3e2d, this
+    /// is the INITIAL column (matching the seed `ixy_sptr_col_idx`);
+    /// the column-step path recomputes it from `slab_buf` and
+    /// `column_offsets` as the ray walks across columns.
     pub column: &'a [u8],
     /// Voxlap's `gylookoff` window into the per-frame `gylookup`
     /// table. For single-mip rendering this is just
@@ -66,6 +69,16 @@ pub struct GrouscanInputs<'a> {
     /// Voxlap's `gcsub[9]` per-side shading table (each entry is
     /// 8 bytes viewed as four `u16` lanes — see `grouscan_shade`).
     pub gcsub: &'a [i64; 9],
+    /// World-level flat slab buffer — voxlap's malloc'd column
+    /// data (`vbuf` / `vbit` area). The column-step path slices
+    /// this at `column_offsets[ixy_sptr_col_idx]` to refresh
+    /// `state.column`.
+    pub slab_buf: &'a [u8],
+    /// `vsid² × u32` table of byte offsets into `slab_buf`, one
+    /// per voxel column. Voxlap stores this as `unsigned char **`
+    /// (`sptr`); we use `u32` offsets to keep the port pointer-
+    /// free.
+    pub column_offsets: &'a [u32],
 }
 
 /// All of grouscan's per-ray local state in one struct.
@@ -89,12 +102,18 @@ pub(crate) struct GrouscanState<'a> {
     /// Per-frame scratch (radar, angstart, cf, gpz, gdz, gixy, gi0,
     /// gi1, gxmax, lastx, uurend).
     pub scratch: &'a mut ScanScratch,
-    /// Slab bytes of the column the ray currently sits in.
+    /// Slab bytes of the column the ray currently sits in. Mutated
+    /// by R4.3e2d's column-step path (re-sliced from
+    /// [`Self::slab_buf`] at the new column's offset).
     pub column: &'a [u8],
     /// `gylookoff` window into the per-frame gylookup table.
     pub gylookup: &'a [i32],
     /// Per-side shading table.
     pub gcsub: &'a [i64; 9],
+    /// World-level flat slab buffer (see [`GrouscanInputs`]).
+    pub slab_buf: &'a [u8],
+    /// Per-column byte offsets into [`Self::slab_buf`].
+    pub column_offsets: &'a [u32],
 
     // -------------------------------------------------------------
     // Cached prologue scalars (R4.3c). Mutated as the algorithm
@@ -180,6 +199,8 @@ impl<'a> GrouscanState<'a> {
             column: inputs.column,
             gylookup: inputs.gylookup,
             gcsub: inputs.gcsub,
+            slab_buf: inputs.slab_buf,
+            column_offsets: inputs.column_offsets,
             z0: c.z0,
             z1: c.z1,
             cx0: c.cx0,
@@ -469,9 +490,13 @@ pub enum Phase {
     SyncFromPresync,
     /// Voxlap5.c:11853. Findslab dispatch: walk slabs to find the
     /// one intersecting the ray frustum, then jump to drawfwall
-    /// (or push a split entry). R4.3e2d/e ships the body; R4.3e2c
+    /// (or push a split entry). R4.3e2e/f ships the body; R4.3e2d
     /// stubs to [`Phase::Done`].
     Skipixy3,
+    /// Voxlap5.c:11998. Mip-level transition. Triggered by the
+    /// column step when `gpz[lane]` (unsigned) exceeds `ngxmax`.
+    /// R4.3e3 ships the body; R4.3e2d stubs to [`Phase::Done`].
+    Remiporend,
     /// Driver-only: no more work. Returned by the last phase.
     Done,
 }
@@ -499,6 +524,7 @@ fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
             Phase::SkipixyWithPresync => phase_skipixy_with_presync(state),
             Phase::SyncFromPresync => phase_sync_from_presync(state),
             Phase::Skipixy3 => phase_skipixy3(state),
+            Phase::Remiporend => phase_remiporend(state),
             Phase::Done => break,
         };
     }
@@ -895,12 +921,26 @@ fn phase_after_delete(state: &mut GrouscanState<'_>) -> Phase {
     Phase::AfterDeleteKeptPresync
 }
 
-/// `afterdelete_kept_presync` — voxlap5.c:11793. Decrements `c`;
-/// if still in the active region (`c >= cf[128]` after the
+/// `afterdelete_kept_presync` — voxlap5.c:11793-11831. Decrements
+/// `c`; if still in the active region (`c >= cf[128]` after the
 /// decrement) routes to [`Phase::SkipixyWithPresync`]. Otherwise
-/// the algorithm needs to step to the next voxel column — that
-/// branch lives in R4.3e2c (it requires the column-pointer-array
-/// on `ScanScratch`); R4.3e2b stubs it to [`Phase::Done`].
+/// the algorithm steps to the next voxel column: advance
+/// `ixy_sptr_col_idx` by `gixy[lane]`, refresh `state.column`
+/// from `slab_buf` + `column_offsets`, recompute the leading
+/// raycast lane, update `gx`/`gpz`. If the new `gpz[lane]`
+/// (unsigned) exceeds `ngxmax`, divert to mip transition
+/// ([`Phase::Remiporend`], stubbed to [`Phase::Done`] until
+/// R4.3e3). Otherwise reset `c` to the stack top (`ce`) and
+/// route to [`Phase::Skipixy3`] when the post-pop slot equals
+/// `c_presync`, or [`Phase::SyncFromPresync`] otherwise.
+//
+// Heavy bit-narrowings + unsigned-compare port; the asm uses
+// `ja` (unsigned >) on the gpz overflow check.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::similar_names
+)]
 fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     if state.c_idx == 0 {
         // Defensive — voxlap's `c--` would underflow; treat as
@@ -909,10 +949,65 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     }
     state.c_idx -= 1;
     if state.c_idx >= CF_SEED_INDEX {
-        Phase::SkipixyWithPresync
+        return Phase::SkipixyWithPresync;
+    }
+
+    // --- Column step (voxlap5.c:11803-11831). ---
+
+    // Cache OLD lane as wall_lane — voxlap's asm captures `mm4 =
+    // gcsub[OLD ebp]` BEFORE recomputing the lane (v5.asm:388).
+    // Subsequent drawfwall / drawcwall fills use this cached value
+    // for their wall side-shade until the next column step.
+    state.wall_lane = state.lane;
+
+    // ixy_sptr_col_idx advances by gixy[lane] in element units.
+    // Voxlap does the byte arithmetic directly; we keep
+    // `column_offsets` in element units so a plain signed-add
+    // suffices. gixy can be negative — `wrapping_add_signed` on
+    // usize handles that without panicking on overflow.
+    let step = state.scratch.gixy[state.lane] as isize;
+    state.ixy_sptr_col_idx = state.ixy_sptr_col_idx.wrapping_add_signed(step);
+
+    // Refresh state.column from the world buffers. If the new
+    // index is out of range or the offset points past the buffer,
+    // leave column unchanged — a malformed world shouldn't crash
+    // us; the fill loops have bounds checks of their own.
+    if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
+        let off = col_off as usize;
+        if off <= state.slab_buf.len() {
+            state.column = &state.slab_buf[off..];
+        }
+    }
+
+    // Recompute the leading raycast lane (the one whose next grid
+    // crossing is closer).
+    state.lane = usize::from(state.scratch.gpz[1] < state.scratch.gpz[0]);
+
+    let new_gpz = state.scratch.gpz[state.lane];
+    // Asm: `punpckldq mm6, mm7 + pand mmask` — gx = high half of
+    // new_gpz (the integer part). Low half stays at the post-swap
+    // ogx the column-step path inherited.
+    state.gx = new_gpz & -0x1_0000_i32;
+
+    // Asm: `ja remiporend`. Unsigned compare catches negative-
+    // wrap of new_gpz (gpz can drift past INT32_MAX into negative
+    // territory under accumulated step-additions; the unsigned
+    // view rolls that into a "very large" gpz that triggers mip
+    // transition rather than fooling a signed compare).
+    if (new_gpz as u32) > (state.ngxmax as u32) {
+        return Phase::Remiporend;
+    }
+
+    state.scratch.gpz[state.lane] =
+        state.scratch.gpz[state.lane].wrapping_add(state.scratch.gdz[state.lane]);
+
+    // c = ce — re-set current to top-of-stack.
+    state.c_idx = state.ce_idx;
+
+    if state.c_presync_idx == state.c_idx {
+        Phase::Skipixy3
     } else {
-        // Column step path — R4.3e2c.
-        Phase::Done
+        Phase::SyncFromPresync
     }
 }
 
@@ -961,11 +1056,18 @@ fn phase_sync_from_presync(state: &mut GrouscanState<'_>) -> Phase {
     Phase::Skipixy3
 }
 
-/// `skipixy3` — voxlap5.c:11853. Findslab dispatch. R4.3e2d/e
-/// ships the body; R4.3e2b stubs to [`Phase::Done`] so the post-
+/// `skipixy3` — voxlap5.c:11853. Findslab dispatch. R4.3e2e/f
+/// ships the body; R4.3e2d stubs to [`Phase::Done`] so the post-
 /// pop chain terminates here.
 #[allow(clippy::needless_pass_by_ref_mut)]
 fn phase_skipixy3(_state: &mut GrouscanState<'_>) -> Phase {
+    Phase::Done
+}
+
+/// `remiporend` — voxlap5.c:11998. Mip-level transition. R4.3e3
+/// ships the body; R4.3e2d stubs to [`Phase::Done`].
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn phase_remiporend(_state: &mut GrouscanState<'_>) -> Phase {
     Phase::Done
 }
 
@@ -996,12 +1098,16 @@ mod tests {
     const DUMMY_GYLOOKUP: [i32; 64] = [0; 64];
     const DUMMY_GCSUB: [i64; 9] = [0; 9];
     const DUMMY_COLUMN: [u8; 4] = [0, 0, 0, 0];
+    const DUMMY_SLAB_BUF: [u8; 0] = [];
+    const DUMMY_COLUMN_OFFSETS: [u32; 0] = [];
 
     fn dummy_inputs<'a>() -> GrouscanInputs<'a> {
         GrouscanInputs {
             column: &DUMMY_COLUMN,
             gylookup: &DUMMY_GYLOOKUP,
             gcsub: &DUMMY_GCSUB,
+            slab_buf: &DUMMY_SLAB_BUF,
+            column_offsets: &DUMMY_COLUMN_OFFSETS,
         }
     }
 
@@ -1134,6 +1240,8 @@ mod tests {
             column,
             gylookup,
             gcsub,
+            slab_buf: &DUMMY_SLAB_BUF,
+            column_offsets: &DUMMY_COLUMN_OFFSETS,
         };
         GrouscanState::from_seed(scratch, &inputs, 0, 0)
     }
@@ -1149,6 +1257,8 @@ mod tests {
             column,
             gylookup,
             gcsub,
+            slab_buf: &DUMMY_SLAB_BUF,
+            column_offsets: &DUMMY_COLUMN_OFFSETS,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0)
     }
@@ -1264,6 +1374,8 @@ mod tests {
             column,
             gylookup,
             gcsub,
+            slab_buf: &DUMMY_SLAB_BUF,
+            column_offsets: &DUMMY_COLUMN_OFFSETS,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0)
     }
@@ -1521,15 +1633,121 @@ mod tests {
     }
 
     #[test]
-    fn afterdelete_kept_presync_routes_to_done_at_seed_pop() {
+    fn afterdelete_kept_presync_below_seed_runs_column_step() {
         // c at cf[128]; c-- = cf[127], below seed → column-step
-        // path (R4.3e2c stub returns Done).
+        // fires. With all-zero gpz/gdz/gixy and empty world, the
+        // step:
+        //   - wall_lane = 0 (cached from old lane)
+        //   - lane recompute: (0 < 0) → 0
+        //   - gpz[0] = 0, ngxmax = 0 → not > ngxmax → no Remiporend
+        //   - c_idx = ce_idx = CF_SEED_INDEX
+        //   - c_presync_idx (= usize::MAX) != c_idx → SyncFromPresync
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         state.c_idx = CF_SEED_INDEX;
-        assert_eq!(phase_after_delete_kept_presync(&mut state), Phase::Done);
-        assert_eq!(state.c_idx, CF_SEED_INDEX - 1);
+        assert_eq!(
+            phase_after_delete_kept_presync(&mut state),
+            Phase::SyncFromPresync
+        );
+        // c was reset to ce (still at seed).
+        assert_eq!(state.c_idx, CF_SEED_INDEX);
+    }
+
+    /// 4×4 voxel-column world, each column starts with a bare
+    /// 4-byte slab header. Used by the column-step tests to verify
+    /// `state.column` re-slices correctly.
+    fn build_4x4_world() -> (Vec<u8>, Vec<u32>) {
+        let mut buf = Vec::with_capacity(16 * 4);
+        for col in 0..16u8 {
+            // Per-column header — first byte holds the column
+            // index so tests can verify which column got loaded.
+            buf.extend_from_slice(&[col, 10, 12, 0]);
+        }
+        let offsets: Vec<u32> = (0..16u32).map(|c| c * 4).collect();
+        (buf, offsets)
+    }
+
+    #[test]
+    fn column_step_advances_ixy_and_reslices_column() {
+        let (slab_buf, column_offsets) = build_4x4_world();
+        let gylookup = DUMMY_GYLOOKUP;
+        let gcsub = DUMMY_GCSUB;
+        let inputs = GrouscanInputs {
+            column: &slab_buf[20..], // initial column = #5
+            gylookup: &gylookup,
+            gcsub: &gcsub,
+            slab_buf: &slab_buf,
+            column_offsets: &column_offsets,
+        };
+        let mut s = fresh_scratch();
+        s.gixy = [1, 4]; // x-step = 1, y-step = 4
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 5);
+        state.c_idx = CF_SEED_INDEX; // → c-- below seed → column step
+        state.lane = 0; // step by gixy[0] = 1
+
+        let next = phase_after_delete_kept_presync(&mut state);
+        assert!(matches!(
+            next,
+            Phase::SyncFromPresync | Phase::Skipixy3 | Phase::Remiporend
+        ));
+
+        // Cursor advanced from 5 to 6 (= column #6).
+        assert_eq!(state.ixy_sptr_col_idx, 6);
+        // state.column now points at column #6's bytes — first
+        // byte of the new slab header is `6`.
+        assert_eq!(state.column[0], 6);
+        // wall_lane captured the OLD lane (= 0) before recompute.
+        assert_eq!(state.wall_lane, 0);
+    }
+
+    #[test]
+    fn column_step_routes_to_remiporend_when_gpz_exceeds_ngxmax() {
+        let (slab_buf, column_offsets) = build_4x4_world();
+        let gylookup = DUMMY_GYLOOKUP;
+        let gcsub = DUMMY_GCSUB;
+        let inputs = GrouscanInputs {
+            column: &slab_buf[..],
+            gylookup: &gylookup,
+            gcsub: &gcsub,
+            slab_buf: &slab_buf,
+            column_offsets: &column_offsets,
+        };
+        let mut s = fresh_scratch();
+        // BOTH lanes must exceed ngxmax: lane recompute picks the
+        // smaller gpz, so the *winning* lane is the one whose gpz
+        // is also above ngxmax.
+        s.gpz = [0x100, 0x200];
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        state.ngxmax = 0xFF;
+        state.c_idx = CF_SEED_INDEX;
+
+        assert_eq!(
+            phase_after_delete_kept_presync(&mut state),
+            Phase::Remiporend
+        );
+    }
+
+    #[test]
+    fn column_step_routes_to_skipixy3_when_presync_equals_c() {
+        let (slab_buf, column_offsets) = build_4x4_world();
+        let gylookup = DUMMY_GYLOOKUP;
+        let gcsub = DUMMY_GCSUB;
+        let inputs = GrouscanInputs {
+            column: &slab_buf[..],
+            gylookup: &gylookup,
+            gcsub: &gcsub,
+            slab_buf: &slab_buf,
+            column_offsets: &column_offsets,
+        };
+        let mut s = fresh_scratch();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        state.c_idx = CF_SEED_INDEX;
+        // c is reset to ce inside column step. If presync == ce
+        // already, the post-reset c equals presync → Skipixy3.
+        state.ce_idx = CF_SEED_INDEX;
+        state.c_presync_idx = CF_SEED_INDEX;
+        assert_eq!(phase_after_delete_kept_presync(&mut state), Phase::Skipixy3);
     }
 
     #[test]
