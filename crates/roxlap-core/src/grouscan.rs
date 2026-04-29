@@ -705,16 +705,82 @@ fn phase_draw_ceil(state: &mut GrouscanState<'_>) -> Phase {
     }
 }
 
-#[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_pre_draw_flor(_state: &mut GrouscanState<'_>) -> Phase {
-    // R4.3f6: voxlap5.c:11761. Sets up drawflor.
+/// `predrawflor` — voxlap5.c:11761-11763. Mirror of predrawceil.
+/// The C code swaps `ogx ↔ gx` so the subsequent drawflor cross-
+/// product test reads what was `gx` as its `ogx` operand. Reached
+/// from drawcwall's column-top branch (where predrawceil's swap
+/// never fired, so this swap takes its place); drawceil → drawflor
+/// transitions skip predrawflor and use the post-predrawceil state.
+fn phase_pre_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
+    std::mem::swap(&mut state.ogx, &mut state.gx);
     Phase::DrawFlor
 }
 
-#[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_draw_flor(_state: &mut GrouscanState<'_>) -> Phase {
-    // R4.3f6: voxlap5.c:11765. Floor fill.
-    Phase::Done
+/// `drawflor` — floor fill (voxlap5.c:11765-11783). Mirror of
+/// drawceil with three sign flips:
+/// - cross-sign exits when `≤ 0` (vs `> 0` in drawceil),
+/// - `c->i1` walks LEFTWARD (`c->i1 -= 1`) vs drawceil's
+///   `i0 += 1`,
+/// - cx1/cy1 advance with `-= gi0/gi1` (vs `+=` in drawceil),
+///   and the voxel source is `v + 4` (= top of CURRENT slab)
+///   instead of `v - 4` (previous slab's last voxel). gcsub lane
+///   3 vs 2.
+///
+/// Two exits:
+/// - cross-sign goes `≤ 0` → `Done` (enddrawflor → afterdelete;
+///   the cf-stack pop lives in R4.3e2's deletez).
+/// - `c->i1 < c->i0` (radar exhausted) → `PreDeleteZ`.
+//
+// Heavy cast traffic ports the asm's bit-narrowings.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::similar_names
+)]
+fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
+    // gy_raw = gylookoff[z1].
+    let z1_idx = state.z1 as usize;
+    if z1_idx >= state.gylookup.len() {
+        return Phase::PreDeleteZ;
+    }
+    state.gy_raw = state.gylookup[z1_idx];
+
+    // Floor colour = `v + 4` = first voxel byte INSIDE the current
+    // slab. Always within column even at column-top (vptr_offset
+    // == 0 → slab starts at column[0..4], floor voxel at column[4]).
+    let vox_off = state.vptr_offset + 4;
+    if vox_off + 4 > state.column.len() {
+        return Phase::PreDeleteZ;
+    }
+    let vox = u32::from_le_bytes(
+        state.column[vox_off..vox_off + 4]
+            .try_into()
+            .expect("4-byte slice"),
+    );
+
+    loop {
+        let test = grouscan_cross_sign(state.cx1, state.cy1, state.ogx, state.gy_raw);
+        if test <= 0 {
+            // enddrawflor → afterdelete. Cf-stack pop lands in
+            // R4.3e2; for now just terminate the state machine.
+            return Phase::Done;
+        }
+        state.cx1 = state.cx1.wrapping_sub(state.scratch.gi0);
+        state.cy1 = state.cy1.wrapping_sub(state.scratch.gi1);
+
+        state.color = grouscan_shade(vox, &mut state.mm5_tail, state.gcsub[3]);
+
+        let i1 = state.scratch.cf[CF_SEED_INDEX].i1;
+        if let Some(slot) = state.scratch.radar.get_mut(i1 as usize) {
+            slot.col = state.color as i32;
+            slot.dist = state.ogx;
+        }
+        state.scratch.cf[CF_SEED_INDEX].i1 = i1 - 1;
+        if state.scratch.cf[CF_SEED_INDEX].i1 < state.scratch.cf[CF_SEED_INDEX].i0 {
+            return Phase::PreDeleteZ;
+        }
+    }
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
@@ -1100,6 +1166,79 @@ mod tests {
         let gcsub = [0i64; 9];
         let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 4);
         assert_eq!(phase_draw_ceil(&mut state), Phase::PreDeleteZ);
+    }
+
+    #[test]
+    fn predrawflor_swaps_ogx_and_gx() {
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        state.ogx = 0x3333;
+        state.gx = 0x4444;
+        assert_eq!(phase_pre_draw_flor(&mut state), Phase::DrawFlor);
+        assert_eq!(state.ogx, 0x4444);
+        assert_eq!(state.gx, 0x3333);
+    }
+
+    #[test]
+    fn drawflor_cross_sign_non_positive_returns_done() {
+        // cx1 = cy1 = 0, gylookup[z1] = 0 → cross_sign = 0 ≤ 0 on
+        // entry → enddrawflor → Done. No pixel written.
+        let mut s = fresh_scratch();
+        s.cf[CF_SEED_INDEX].z1 = 5;
+        s.cf[CF_SEED_INDEX].cx1 = 0;
+        s.cf[CF_SEED_INDEX].cy1 = 0;
+        s.cf[CF_SEED_INDEX].i0 = 10;
+        s.cf[CF_SEED_INDEX].i1 = 20;
+
+        // Slab header at column[0..4]; floor voxel at column[4..8].
+        let mut column = vec![0u8; 8];
+        column[4..8].copy_from_slice(&[0x77, 0x88, 0x99, 0x80]);
+        let gylookup = [0i32; 64];
+        let gcsub = [0i64; 9];
+
+        let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 0);
+        state.ogx = 0;
+        assert_eq!(phase_draw_flor(&mut state), Phase::Done);
+        assert_eq!(state.scratch.cf[CF_SEED_INDEX].i1, 20);
+    }
+
+    #[test]
+    fn drawflor_writes_pixel_then_exhausts_radar() {
+        // cx1 = 1<<16, cy1 = 0, gylookup[z1] = 1 → cross_sign = 1 > 0
+        // → write pixel at radar[i1=20], i1 → 19. i0 = 20 → 19 < 20
+        // trips PreDeleteZ.
+        let mut s = fresh_scratch();
+        s.cf[CF_SEED_INDEX].z1 = 5;
+        s.cf[CF_SEED_INDEX].cx1 = 1 << 16;
+        s.cf[CF_SEED_INDEX].cy1 = 0;
+        s.cf[CF_SEED_INDEX].i0 = 20;
+        s.cf[CF_SEED_INDEX].i1 = 20;
+        s.gi0 = 0;
+        s.gi1 = 0;
+
+        let mut column = vec![0u8; 8];
+        column[4..8].copy_from_slice(&[0x00, 0x00, 0xff, 0x80]);
+        let mut gylookup = [0i32; 64];
+        gylookup[5] = 1;
+        let gcsub = [0i64; 9];
+
+        let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 0);
+        state.ogx = 0;
+        assert_eq!(phase_draw_flor(&mut state), Phase::PreDeleteZ);
+        assert_ne!(state.scratch.radar[20].col, 0);
+        assert_eq!(state.scratch.cf[CF_SEED_INDEX].i1, 19);
+    }
+
+    #[test]
+    fn drawflor_bails_when_z1_out_of_gylookup() {
+        let mut s = fresh_scratch();
+        s.cf[CF_SEED_INDEX].z1 = 64;
+        let column = vec![0u8; 8];
+        let gylookup = [0i32; 64];
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 0);
+        assert_eq!(phase_draw_flor(&mut state), Phase::PreDeleteZ);
     }
 
     #[test]
