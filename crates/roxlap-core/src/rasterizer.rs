@@ -71,6 +71,33 @@ pub struct ScanScratch {
     /// our port sizes the buffer exactly to the framebuffer width
     /// rounded up.
     pub uurend_half_stride: usize,
+
+    // ---------------------------------------------------------------
+    // grouscan (R4.3c+) per-ray state. Voxlap keeps these as globals;
+    // we group them on ScanScratch so each render call owns them and
+    // there is no hidden mutable global state.
+    // ---------------------------------------------------------------
+    /// `cf[129]` — voxlap's cfasm scratch. The seed slot at
+    /// [`CF_SEED_INDEX`](crate::grouscan::CF_SEED_INDEX) is filled by
+    /// `gline` before each ray; grouscan pops / pushes from there.
+    pub cf: Vec<crate::grouscan::CfType>,
+    /// `gpz[2]` — distance to next voxel-grid line per axis,
+    /// `PREC`-scaled. Set by gline per ray; grouscan walks it.
+    pub gpz: [i32; 2],
+    /// `gdz[2]` — per-column-step delta added to `gpz` after a
+    /// column advance. Constant per ray. Set by gline.
+    pub gdz: [i32; 2],
+    /// `gixy[2]` — voxel-column step in the ray's direction
+    /// (`±1` along x, `±vsid` along y). Set by gline.
+    pub gixy: [i32; 2],
+    /// `gxmax` — scan-distance ceiling, `PREC`-scaled. Set by gline
+    /// per ray (clipped against viewport edges and `gmaxscandist`).
+    pub gxmax: i32,
+    /// `gi0` — voxlap's per-pixel x step coefficient written by
+    /// gline; consumed by grouscan's column advance.
+    pub gi0: i32,
+    /// `gi1` — voxlap's per-pixel y step coefficient.
+    pub gi1: i32,
 }
 
 impl ScanScratch {
@@ -96,6 +123,13 @@ impl ScanScratch {
             lastx: vec![0i32; lastx_cap],
             uurend: vec![0i32; half_stride * 2],
             uurend_half_stride: half_stride,
+            cf: vec![crate::grouscan::CfType::default(); crate::grouscan::CF_LEN],
+            gpz: [0; 2],
+            gdz: [0; 2],
+            gixy: [0; 2],
+            gxmax: 0,
+            gi0: 0,
+            gi1: 0,
         }
     }
 
