@@ -12,6 +12,7 @@
 //! - **R4.1f2..f4**: rasterizer trait + per-quadrant drivers (top,
 //!   right, bottom, left).
 
+use crate::camera_math::CameraState;
 use crate::fixed::{isshldiv16safe, lbound0, mulshr16, shldiv16};
 use crate::opticast_prelude::OpticastPrelude;
 use crate::projection::ProjectionRect;
@@ -31,6 +32,20 @@ pub struct ScanContext<'a> {
     pub xres: i32,
     pub yres: i32,
     pub anginc: i32,
+    /// Camera basis + frustum corners. Concrete rasterizers' real
+    /// `gline` (R4.3a-rewire-3b) projects per-ray endpoints through
+    /// `camera_state.right` / `down` / `corn[0]` to derive the
+    /// world-space ray.
+    pub camera_state: &'a CameraState,
+    /// Voxlap's `gstartz0` — top of the camera's air gap. `0` for
+    /// the column-top case (above the first slab).
+    pub camera_gstartz0: i32,
+    /// Voxlap's `gstartz1` — bottom of the camera's air gap (= top
+    /// of the slab below it).
+    pub camera_gstartz1: i32,
+    /// Byte offset within the camera's column to the slab whose top
+    /// bounds the air gap from below. `0` means column-top.
+    pub camera_vptr_offset: usize,
 }
 
 /// Clip a vertical-direction line `(x0, y0) → (x1, y1)` against the
@@ -804,6 +819,7 @@ mod tests {
     /// all four quadrant fans are non-trivial — the top fan in
     /// particular covers the half of the screen above y = cy = 240.
     fn looking_down_context() -> (
+        crate::camera_math::CameraState,
         crate::projection::ProjectionRect,
         crate::ray_step::RayStep,
         crate::opticast_prelude::OpticastPrelude,
@@ -818,7 +834,7 @@ mod tests {
         let proj = crate::projection::derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1);
         let rs = ray_step::derive_ray_step(&s, proj.cx, proj.cy, 320.0);
         let prelude = opticast_prelude::derive_prelude(&s, 2048, 1, 4, 1024);
-        (proj, rs, prelude)
+        (s, proj, rs, prelude)
     }
 
     #[test]
@@ -826,7 +842,7 @@ mod tests {
         // Construct a synthetic ProjectionRect with cy way above wy0
         // (centre is far above the viewport — fy = wy0 - cy is large
         // positive, NOT < 0). This is the early-out case.
-        let (proj_lookdown, rs, prelude) = looking_down_context();
+        let (cs, proj_lookdown, rs, prelude) = looking_down_context();
         let mut proj = proj_lookdown;
         // Force fy >= 0 by moving cy way up.
         proj.cy = -1000.0;
@@ -841,6 +857,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         top_quadrant(&mut rec, &mut scratch, &ctx);
         assert_eq!(rec.gline_calls, 0);
@@ -854,7 +874,7 @@ mod tests {
         // [x0, x1] horizontal range above cy. After the corner-cut
         // pass, x1 - x0 ≈ 2 * sqrt(320 * 240) ≈ 554, plus the ±0.01
         // bias. j_count = round((x1 - x0) / 1) = ~554.
-        let (proj, rs, prelude) = looking_down_context();
+        let (cs, proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
@@ -864,6 +884,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         top_quadrant(&mut rec, &mut scratch, &ctx);
         // We don't pin the exact value (anginc rounding + ±0.01 bias),
@@ -876,7 +900,7 @@ mod tests {
     fn top_quadrant_emits_at_least_one_hrend() {
         // For the looking-down camera, sy walks downward from cy ≈ 240
         // through all rows above, so hrend should fire at least once.
-        let (proj, rs, prelude) = looking_down_context();
+        let (cs, proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
@@ -886,6 +910,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         top_quadrant(&mut rec, &mut scratch, &ctx);
         assert!(rec.hrend_calls > 0, "expected ≥ 1 hrend, got 0");
@@ -898,7 +926,7 @@ mod tests {
     #[test]
     fn bottom_quadrant_skips_when_centre_below_bottom_edge() {
         // Force gy <= 0 by placing cy below the viewport bottom.
-        let (proj_lookdown, rs, prelude) = looking_down_context();
+        let (cs, proj_lookdown, rs, prelude) = looking_down_context();
         let mut proj = proj_lookdown;
         proj.cy = 1000.0;
         proj.gy = proj.wy1 - proj.cy; // negative now
@@ -911,6 +939,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         bottom_quadrant(&mut rec, &mut scratch, &ctx);
         assert_eq!(rec.gline_calls, 0);
@@ -923,7 +955,7 @@ mod tests {
         // Looking-down camera has both top and bottom fans engaged;
         // bottom uses x3..x2 width which equals top's x0..x1 width
         // by symmetry of the corner-cut quadrilateral.
-        let (proj, rs, prelude) = looking_down_context();
+        let (cs, proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
@@ -933,6 +965,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         bottom_quadrant(&mut rec, &mut scratch, &ctx);
         let expected = ((proj.x2 - proj.x3) / 1.0).round_ties_even() as u32;
@@ -941,7 +977,7 @@ mod tests {
 
     #[test]
     fn bottom_quadrant_emits_at_least_one_hrend() {
-        let (proj, rs, prelude) = looking_down_context();
+        let (cs, proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
@@ -951,6 +987,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         bottom_quadrant(&mut rec, &mut scratch, &ctx);
         assert!(rec.hrend_calls > 0, "expected ≥ 1 hrend, got 0");
@@ -962,7 +1002,7 @@ mod tests {
 
     #[test]
     fn right_quadrant_skips_when_centre_right_of_viewport() {
-        let (proj_lookdown, rs, prelude) = looking_down_context();
+        let (cs, proj_lookdown, rs, prelude) = looking_down_context();
         let mut proj = proj_lookdown;
         proj.cx = 1000.0;
         proj.gx = proj.wx1 - proj.cx; // negative
@@ -975,6 +1015,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         right_quadrant(&mut rec, &mut scratch, &ctx);
         assert_eq!(rec.gline_calls + rec.vrend_calls, 0);
@@ -982,7 +1026,7 @@ mod tests {
 
     #[test]
     fn left_quadrant_skips_when_centre_left_of_viewport() {
-        let (proj_lookdown, rs, prelude) = looking_down_context();
+        let (cs, proj_lookdown, rs, prelude) = looking_down_context();
         let mut proj = proj_lookdown;
         proj.cx = -1000.0;
         proj.fx = proj.wx0 - proj.cx; // positive (large)
@@ -995,6 +1039,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         left_quadrant(&mut rec, &mut scratch, &ctx);
         assert_eq!(rec.gline_calls + rec.vrend_calls, 0);
@@ -1003,7 +1051,7 @@ mod tests {
     #[test]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn right_quadrant_casts_one_ray_per_anginc_step() {
-        let (proj, rs, prelude) = looking_down_context();
+        let (cs, proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
@@ -1013,6 +1061,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         right_quadrant(&mut rec, &mut scratch, &ctx);
         let expected = ((proj.y2 - proj.y1) / 1.0).round_ties_even() as u32;
@@ -1022,7 +1074,7 @@ mod tests {
     #[test]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn left_quadrant_casts_one_ray_per_anginc_step() {
-        let (proj, rs, prelude) = looking_down_context();
+        let (cs, proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
@@ -1032,6 +1084,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         left_quadrant(&mut rec, &mut scratch, &ctx);
         let expected = ((proj.y3 - proj.y0) / 1.0).round_ties_even() as u32;
@@ -1040,7 +1096,7 @@ mod tests {
 
     #[test]
     fn right_and_left_quadrants_emit_vrend() {
-        let (proj, rs, prelude) = looking_down_context();
+        let (cs, proj, rs, prelude) = looking_down_context();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
             proj: &proj,
@@ -1049,6 +1105,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         let mut rec_right = Recorder::default();
         right_quadrant(&mut rec_right, &mut scratch, &ctx);
@@ -1070,7 +1130,7 @@ mod tests {
     fn top_quadrant_advances_gscanptr_by_ray_lengths() {
         // After all rays cast, scratch.gscanptr should equal sum of
         // (|iy1-iy0|+1) over all rays.
-        let (proj, rs, prelude) = looking_down_context();
+        let (cs, proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
@@ -1080,6 +1140,10 @@ mod tests {
             xres: 640,
             yres: 480,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         top_quadrant(&mut rec, &mut scratch, &ctx);
         // Lower bound: gscanptr advanced at least once per ray (every

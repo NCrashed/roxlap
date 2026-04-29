@@ -21,20 +21,28 @@
 /// Walk a column's slab list to find which air gap contains z = `cz`.
 ///
 /// Returns:
-/// - `Some((z0, z1))` — voxlap's `gstartz0` / `gstartz1`; camera sits
-///   in the air gap with top z = `z0` and bottom z = `z1`. For the
-///   air above the first slab `z0 = 0`.
+/// - `Some((z0, z1, vptr_offset))` — voxlap's `gstartz0` /
+///   `gstartz1` / `v - *ixy_sptr_col` triple. Camera sits in the
+///   air gap with top z = `z0` and bottom z = `z1`. `vptr_offset`
+///   is the byte offset within `column` to the slab whose top
+///   bounds the air gap from below. `0` means the air gap is
+///   above the first slab (z0 = 0); a non-zero value means the
+///   camera is in an interior air gap and `vptr_offset` points to
+///   the slab header below it. R4.3a-rewire-3 grouscan uses this
+///   to dispatch the initial drawflor (top-of-column) vs drawceil
+///   (interior) branch.
 /// - `None` — camera is inside a slab (hidden interior or below the
 ///   final slab); opticast returns early with no render.
 #[must_use]
-pub fn camera_column_air_gap(column: &[u8], cz: i32) -> Option<(i32, i32)> {
+pub fn camera_column_air_gap(column: &[u8], cz: i32) -> Option<(i32, i32, usize)> {
     if column.len() < 4 {
         return None;
     }
     let first_z1 = i32::from(column[1]);
     if cz < first_z1 {
-        // Air above the first slab — gstartz0 = 0 in voxlap's else branch.
-        return Some((0, first_z1));
+        // Air above the first slab — gstartz0 = 0 in voxlap's else
+        // branch. vptr_offset = 0 marks "column-top" for grouscan.
+        return Some((0, first_z1, 0));
     }
 
     let mut pos = 0usize;
@@ -58,7 +66,7 @@ pub fn camera_column_air_gap(column: &[u8], cz: i32) -> Option<(i32, i32)> {
                 // and floor colours — no render.
                 return None;
             }
-            return Some((z0, z1));
+            return Some((z0, z1, pos));
         }
     }
 }
@@ -103,8 +111,8 @@ mod tests {
     #[test]
     fn camera_above_first_slab_returns_zero_to_z1() {
         let col = single_slab_5_15();
-        assert_eq!(camera_column_air_gap(&col, 0), Some((0, 5)));
-        assert_eq!(camera_column_air_gap(&col, 4), Some((0, 5)));
+        assert_eq!(camera_column_air_gap(&col, 0), Some((0, 5, 0)));
+        assert_eq!(camera_column_air_gap(&col, 4), Some((0, 5, 0)));
     }
 
     #[test]
@@ -121,16 +129,20 @@ mod tests {
     fn camera_above_first_slab_in_two_slab_column() {
         let col = two_slabs_air_at_20_30();
         // cz = 5 is above slab 0's z1 = 10.
-        assert_eq!(camera_column_air_gap(&col, 5), Some((0, 10)));
+        // Column-top — vptr_offset = 0.
+        assert_eq!(camera_column_air_gap(&col, 5), Some((0, 10, 0)));
     }
 
     #[test]
     fn camera_in_air_gap_between_slabs() {
         let col = two_slabs_air_at_20_30();
         // cz = 25 is in the [20, 30) gap above slab 1.
-        assert_eq!(camera_column_air_gap(&col, 25), Some((20, 30)));
-        assert_eq!(camera_column_air_gap(&col, 20), Some((20, 30)));
-        assert_eq!(camera_column_air_gap(&col, 29), Some((20, 30)));
+        // Interior gap — vptr_offset points to slab 1's header.
+        // Slab 0's nextptr = 6 → 24-byte stride (6 × 4); slab 1
+        // starts at column[24].
+        assert_eq!(camera_column_air_gap(&col, 25), Some((20, 30, 24)));
+        assert_eq!(camera_column_air_gap(&col, 20), Some((20, 30, 24)));
+        assert_eq!(camera_column_air_gap(&col, 29), Some((20, 30, 24)));
     }
 
     #[test]

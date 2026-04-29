@@ -254,18 +254,17 @@ mod tests {
     use super::*;
     use crate::rasterizer::CastDat;
 
-    /// Build a `ScanContext` reference triple where rs uses a known
-    /// strx so that pixel-spaced direction math is predictable.
-    /// Returns owned `ProjectionRect`, `RayStep`, `OpticastPrelude`
-    /// the caller can then assemble into a `ScanContext`.
+    /// Build owned per-frame state so tests can assemble a
+    /// `ScanContext` with proper-lifetime borrows. Values aren't
+    /// load-bearing for the scalar-fill behaviour tests; the real
+    /// `gline` cares about them, hence `camera_state` joining the
+    /// tuple.
     fn dummy_per_frame() -> (
+        crate::camera_math::CameraState,
         crate::projection::ProjectionRect,
         crate::ray_step::RayStep,
         crate::opticast_prelude::OpticastPrelude,
     ) {
-        // Build a real CameraState + projection so the supporting
-        // borrows have proper lifetimes; values aren't load-bearing
-        // for these unit tests because we test scalar fill behaviour.
         let cam = crate::Camera {
             pos: [0.0, 0.0, 0.0],
             right: [1.0, 0.0, 0.0],
@@ -276,7 +275,7 @@ mod tests {
         let proj = crate::projection::derive_projection(&cs, 64, 64, 32.0, 32.0, 32.0, 1);
         let rs = crate::ray_step::derive_ray_step(&cs, proj.cx, proj.cy, 32.0);
         let prelude = crate::opticast_prelude::derive_prelude(&cs, 2048, 1, 4, 1024);
-        (proj, rs, prelude)
+        (cs, proj, rs, prelude)
     }
 
     #[test]
@@ -284,7 +283,7 @@ mod tests {
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
         let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
-        let (proj, rs, prelude) = dummy_per_frame();
+        let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
             rs: &rs,
@@ -292,6 +291,10 @@ mod tests {
             xres: 64,
             yres: 64,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         r.frame_setup(&ctx);
         assert_eq!(r.ray_step.strx.to_bits(), rs.strx.to_bits());
@@ -309,7 +312,7 @@ mod tests {
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
         let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
-        let (proj, rs, prelude) = dummy_per_frame();
+        let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
             rs: &rs,
@@ -317,6 +320,10 @@ mod tests {
             xres: 64,
             yres: 64,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         r.frame_setup(&ctx);
 
@@ -420,7 +427,7 @@ mod tests {
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
         let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
-        let (proj, rs, prelude) = dummy_per_frame();
+        let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
             rs: &rs,
@@ -428,6 +435,10 @@ mod tests {
             xres: 64,
             yres: 64,
             anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
         };
         r.frame_setup(&ctx);
 

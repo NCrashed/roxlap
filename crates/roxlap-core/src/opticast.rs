@@ -143,9 +143,11 @@ pub fn opticast<R: Rasterizer>(
     let Some(camera_column_data) = camera_column else {
         return OpticastOutcome::SkippedCameraInSolid;
     };
-    if column_walk::camera_column_air_gap(camera_column_data, prelude.li_pos[2]).is_none() {
+    let Some((gstartz0, gstartz1, camera_vptr_offset)) =
+        column_walk::camera_column_air_gap(camera_column_data, prelude.li_pos[2])
+    else {
         return OpticastOutcome::SkippedCameraInSolid;
-    }
+    };
 
     let proj = projection::derive_projection(
         &cs,
@@ -165,6 +167,10 @@ pub fn opticast<R: Rasterizer>(
         xres: settings.xres as i32,
         yres: settings.yres as i32,
         anginc: settings.anginc,
+        camera_state: &cs,
+        camera_gstartz0: gstartz0,
+        camera_gstartz1: gstartz1,
+        camera_vptr_offset,
     };
 
     // Per-frame setup hook — concrete rasterizers (R4.2) cache the
