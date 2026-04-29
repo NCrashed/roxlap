@@ -49,7 +49,7 @@ voxlaptest's image output:
 | **R4.1b** | Opticast prelude: `gylookup` mip table, `gposxfrac`/`gposyfrac`, `gpixy` (sptr-based column-base address), `gstartv` (top-of-column slab walk). Per-frame state cache. |
 | **R4.1c** | Column-scan dispatch: the four-quadrant `vline`/`hline` setup + `angstart` radar table + per-column `hrend` / `vrend` calls. Rasterizers stubbed until R4.3. |
 | **R4.2** | Scalar `hrend` / `vrend` scanline rasterizers — consume radar entries, write pixels + z-buffer. First stage that puts real pixels on screen behind a stub `gline`. (Originally scoped as "drawcwall/drawfwall/drawceil/drawflor"; those turned out to be labels *inside* grouscan, so they fold into R4.3.) |
-| **R4.3** | grouscan = `gline` ray-cast: full algorithmic port including the drawcwall / drawfwall / drawceil / drawflor / deletez / findslab / slab-split / mid-column-search state machine. The hard core. |
+| **R4.3** | grouscan = `gline` ray-cast: full algorithmic port. Sub-substaged the same way voxlaptest's grouscanasm scalar port was (`Stage 4.5b.2..6`): R4.3a magenta-placeholder gline, R4.3b gline frustum setup, R4.3c grouscan prologue + dispatch skeleton, R4.3d wall/ceil/flor fill loops, R4.3e findslab/slab-split/deletez, R4.3f remiporend + startsky. The hard core. |
 | **R4.4** | Sky-fill primitives: `startsky` integration, fog gating. |
 | **R4.5** | Mip-level transition (`remiporend`): the deeper-recursion cftype refresh. |
 

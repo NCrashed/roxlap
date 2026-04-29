@@ -100,17 +100,35 @@ impl Rasterizer for ScalarRasterizer<'_> {
 
     fn gline(
         &mut self,
-        _scratch: &mut ScanScratch,
-        _length: u32,
+        scratch: &mut ScanScratch,
+        length: u32,
         _x0: f32,
         _y0: f32,
         _x1: f32,
         _y1: f32,
     ) {
-        // TODO(R4.3): grouscan ray-cast. Until then this is a stub
-        // — the angstart entries the scan loops install point at
-        // zero-initialised radar slots, so hrend / vrend produce
-        // all-zero pixels until R4.3 lands.
+        // R4.3a placeholder: write `length + 1` magenta CastDat slots
+        // starting at scratch.gscanptr (= what voxlap's gline would
+        // populate). The four-quadrant scan loops advance gscanptr
+        // by length + 1 after this call, so the writes here line up
+        // with where angstart[ray] points. R4.3b onwards replaces
+        // this with the real grouscan voxel-column raycaster.
+        //
+        // Magenta = 0x80FF00FF (Voxlap brightness bit + RGB ff00ff)
+        // is intentionally a colour the scene's actual palette does
+        // not produce, so the placeholder is unmistakeable when it
+        // shows up on screen.
+        let placeholder = crate::rasterizer::CastDat {
+            col: 0x80ff_00ff_u32 as i32,
+            dist: 1024,
+        };
+        let start = scratch.gscanptr;
+        let end = start
+            .saturating_add(length as usize + 1)
+            .min(scratch.radar.len());
+        for slot in start..end {
+            scratch.radar[slot] = placeholder;
+        }
     }
 
     fn hrend(
@@ -305,6 +323,49 @@ mod tests {
         // Pixels outside the rendered span are untouched.
         assert_eq!(fb[row_off + 9], 0);
         assert_eq!(fb[row_off + 14], 0);
+    }
+
+    #[test]
+    fn end_to_end_opticast_paints_magenta_through_placeholder_gline() {
+        // Smoke test: with a valid above-the-slab camera and the
+        // ScalarRasterizer's R4.3a placeholder gline, full opticast
+        // should fill some framebuffer pixels with magenta.
+        use crate::opticast as opticast_fn;
+        use crate::OpticastSettings;
+
+        let mut fb = vec![0u32; 640 * 480];
+        let mut zb = vec![0.0f32; 640 * 480];
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, 640);
+
+        let cam = crate::Camera {
+            pos: [1024.0, 1024.0, 128.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let settings = OpticastSettings::for_oracle_framebuffer(640, 480);
+        // Single solid slab at z = 200..254. cz = 128 < 200 →
+        // air-above-the-slab, opticast renders.
+        let column = vec![0u8, 200, 254, 0];
+
+        let outcome = opticast_fn(
+            &mut rasterizer,
+            &mut scratch,
+            &cam,
+            &settings,
+            2048,
+            &column,
+        );
+        assert_eq!(outcome, crate::OpticastOutcome::Rendered);
+
+        let magenta = 0x80ff_00ff_u32;
+        let count = fb.iter().filter(|&&p| p == magenta).count();
+        assert!(
+            count > 0,
+            "expected ≥ 1 magenta pixel, got 0 (gline placeholder \
+             didn't make it through hrend/vrend)",
+        );
     }
 
     #[test]
