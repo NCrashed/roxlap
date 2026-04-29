@@ -488,11 +488,23 @@ pub enum Phase {
     /// (intra-column) and — once R4.3e2d lands — from the
     /// column-step path when `c_presync != c`.
     SyncFromPresync,
-    /// Voxlap5.c:11853. Findslab dispatch: walk slabs to find the
-    /// one intersecting the ray frustum, then jump to drawfwall
-    /// (or push a split entry). R4.3e2e/f ships the body; R4.3e2d
-    /// stubs to [`Phase::Done`].
+    /// Voxlap5.c:11853. Findslab dispatch entry. Reads the new
+    /// column's first slab header byte `v[0]` — `0` means the
+    /// column has only one slab so jump to drawfwall; otherwise
+    /// drop into [`Phase::Intoslabloop`] to walk slabs.
     Skipixy3,
+    /// Voxlap5.c:11863 (`intoslabloop`). Per-slab body of the
+    /// findslab walk: tests whether the current slab intersects
+    /// the ray. If `test_hi <= 0` (slab intersects) falls through
+    /// to drawfwall (R4.3e2e ships the single-slab case; R4.3e2f
+    /// will add the two-slab cfasm split). If `test_hi > 0` (slab
+    /// is still above the ray) routes to [`Phase::Findslabloop`].
+    Intoslabloop,
+    /// Voxlap5.c:11860 (`findslabloop`). Advances `v` by
+    /// `v[0] * 4` bytes to the next slab header and re-checks
+    /// `v[0]` for column-end. Routes back to
+    /// [`Phase::Intoslabloop`] or out to drawfwall.
+    Findslabloop,
     /// Voxlap5.c:11998. Mip-level transition. Triggered by the
     /// column step when `gpz[lane]` (unsigned) exceeds `ngxmax`.
     /// R4.3e3 ships the body; R4.3e2d stubs to [`Phase::Done`].
@@ -524,6 +536,8 @@ fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
             Phase::SkipixyWithPresync => phase_skipixy_with_presync(state),
             Phase::SyncFromPresync => phase_sync_from_presync(state),
             Phase::Skipixy3 => phase_skipixy3(state),
+            Phase::Intoslabloop => phase_intoslabloop(state),
+            Phase::Findslabloop => phase_findslabloop(state),
             Phase::Remiporend => phase_remiporend(state),
             Phase::Done => break,
         };
@@ -978,6 +992,10 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
             state.column = &state.slab_buf[off..];
         }
     }
+    // Voxlap's `v = *ixy_sptr_col` resets v to the new column's
+    // base — vptr_offset was relative to the OLD column's slab
+    // list and is meaningless for the new column.
+    state.vptr_offset = 0;
 
     // Recompute the leading raycast lane (the one whose next grid
     // crossing is closer).
@@ -1056,12 +1074,105 @@ fn phase_sync_from_presync(state: &mut GrouscanState<'_>) -> Phase {
     Phase::Skipixy3
 }
 
-/// `skipixy3` — voxlap5.c:11853. Findslab dispatch. R4.3e2e/f
-/// ships the body; R4.3e2d stubs to [`Phase::Done`] so the post-
-/// pop chain terminates here.
-#[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_skipixy3(_state: &mut GrouscanState<'_>) -> Phase {
-    Phase::Done
+/// `skipixy3` — voxlap5.c:11853-11858. Findslab dispatch entry.
+/// Reads `v[0]` of the new column. `0` means single-slab (jump
+/// straight to drawfwall); anything else falls through to
+/// [`Phase::Intoslabloop`] to walk slabs.
+fn phase_skipixy3(state: &mut GrouscanState<'_>) -> Phase {
+    let v0 = column_byte_at(state, 0);
+    if v0 == 0 {
+        Phase::DrawFwall
+    } else {
+        Phase::Intoslabloop
+    }
+}
+
+/// `intoslabloop` — voxlap5.c:11863-11876 (R4.3e2e ports the
+/// single-slab dispatch; the two-slab cfasm split lands in
+/// R4.3e2f).
+///
+/// 1. `v2 = v[2]` (slab's solid-bottom z).
+/// 2. `gy_raw = gylookoff[v2 + 1]`.
+/// 3. `test_hi = cross_sign(cx0, cy0, ogx, gy_raw)`. If `> 0`
+///    the slab is still above the ray's frustum top — route to
+///    [`Phase::Findslabloop`] to advance.
+/// 4. Else (slab intersects): test the NEXT slab's
+///    `next_v3 = v[v0*4 + 3]` against `cx1/cy1` to decide if
+///    the cfasm needs a split. R4.3e2e takes the single-slab
+///    fall-through (`DrawFwall`) regardless — the split case
+///    becomes R4.3e2f. This matches voxlap's `if (test_next <=
+///    0) goto drawfwall;` half exactly; the `else` branch we
+///    stub by also routing to drawfwall, which gives a visual
+///    artifact on multi-slab transitions but keeps the algorithm
+///    terminating until R4.3e2f lands.
+//
+// Heavy bit-narrowings + the test_hi sign bookkeeping; voxlap
+// names (cx0/cy0/cx1/cy1, v0/v2/v3) intentionally one-letter
+// different.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::similar_names
+)]
+fn phase_intoslabloop(state: &mut GrouscanState<'_>) -> Phase {
+    let v2 = i32::from(column_byte_at(state, 2));
+    let gy_idx = (v2 + 1) as usize;
+    if gy_idx >= state.gylookup.len() {
+        // Defensive — malformed v2 puts gylookup index out of
+        // range; voxlap C wouldn't bounds-check, but bailing to
+        // drawfwall keeps the algorithm terminating safely.
+        return Phase::DrawFwall;
+    }
+    state.gy_raw = state.gylookup[gy_idx];
+
+    let test_hi = grouscan_cross_sign(state.cx0, state.cy0, state.ogx, state.gy_raw);
+    if test_hi > 0 {
+        // Slab still above the ray — advance to next slab.
+        return Phase::Findslabloop;
+    }
+
+    // Slab intersects. Voxlap then tests the NEXT slab to decide
+    // single-vs-split. R4.3e2e collapses both branches into the
+    // single-slab fall-through; R4.3e2f will fork them.
+    Phase::DrawFwall
+}
+
+/// `findslabloop` — voxlap5.c:11860-11862. Advance `v` by
+/// `v[0] * 4` bytes to the next slab header. If the new slab's
+/// `v[0]` is `0` we've hit column-end → drawfwall. Otherwise
+/// fall back into [`Phase::Intoslabloop`] for the next slab
+/// test.
+fn phase_findslabloop(state: &mut GrouscanState<'_>) -> Phase {
+    let v0 = column_byte_at(state, 0);
+    if v0 == 0 {
+        // Defensive — would loop forever otherwise (advancing
+        // by 0). Voxlap relies on the slab walker reaching the
+        // sentinel; if a corrupt column has a non-zero v[0]
+        // here that's already been handled, but a 0 sneaking
+        // back in is just a column-end.
+        return Phase::DrawFwall;
+    }
+    state.vptr_offset = state.vptr_offset.saturating_add(usize::from(v0) * 4);
+
+    let next_v0 = column_byte_at(state, 0);
+    if next_v0 == 0 {
+        Phase::DrawFwall
+    } else {
+        Phase::Intoslabloop
+    }
+}
+
+/// Read `column[vptr_offset + offset]`, returning `0` (the asm's
+/// natural sentinel) when out of bounds. The slab walker reads
+/// individual header bytes (`v[0]`, `v[2]`, …); centralising the
+/// bounds-check keeps the per-phase code readable.
+fn column_byte_at(state: &GrouscanState<'_>, offset: usize) -> u8 {
+    state
+        .column
+        .get(state.vptr_offset.saturating_add(offset))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// `remiporend` — voxlap5.c:11998. Mip-level transition. R4.3e3
@@ -1748,6 +1859,105 @@ mod tests {
         state.ce_idx = CF_SEED_INDEX;
         state.c_presync_idx = CF_SEED_INDEX;
         assert_eq!(phase_after_delete_kept_presync(&mut state), Phase::Skipixy3);
+    }
+
+    #[test]
+    fn column_step_resets_vptr_offset_to_zero() {
+        let (slab_buf, column_offsets) = build_4x4_world();
+        let gylookup = DUMMY_GYLOOKUP;
+        let gcsub = DUMMY_GCSUB;
+        let inputs = GrouscanInputs {
+            column: &slab_buf[..],
+            gylookup: &gylookup,
+            gcsub: &gcsub,
+            slab_buf: &slab_buf,
+            column_offsets: &column_offsets,
+        };
+        let mut s = fresh_scratch();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 32, 0);
+        state.c_idx = CF_SEED_INDEX;
+        let _ = phase_after_delete_kept_presync(&mut state);
+        assert_eq!(state.vptr_offset, 0);
+    }
+
+    #[test]
+    fn skipixy3_routes_to_drawfwall_when_v0_zero() {
+        let mut s = fresh_scratch();
+        let column = [0u8, 10, 12, 0]; // v[0] = 0 → single-slab.
+        let gylookup = [0i32; 64];
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
+        assert_eq!(phase_skipixy3(&mut state), Phase::DrawFwall);
+    }
+
+    #[test]
+    fn skipixy3_routes_to_intoslabloop_when_v0_nonzero() {
+        let mut s = fresh_scratch();
+        // v[0] = 2 → next slab is 8 bytes ahead → multi-slab column.
+        let column = [2u8, 10, 12, 0, 0, 0, 0, 0, 0, 20, 22, 0];
+        let gylookup = [0i32; 64];
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
+        assert_eq!(phase_skipixy3(&mut state), Phase::Intoslabloop);
+    }
+
+    #[test]
+    fn intoslabloop_routes_to_findslabloop_when_test_hi_positive() {
+        // cx0 = 1<<16, gylookup[v[2]+1] = 1 → cross_sign = 1 > 0 →
+        // slab is still above the ray → Findslabloop.
+        let mut s = fresh_scratch();
+        s.cf[CF_SEED_INDEX].cx0 = 1 << 16;
+        let column = [2u8, 10, 12, 0, 0, 0, 0, 0, 0, 20, 22, 0];
+        let mut gylookup = [0i32; 64];
+        gylookup[13] = 1; // v[2]+1 = 12+1 = 13
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
+        state.ogx = 0;
+        assert_eq!(phase_intoslabloop(&mut state), Phase::Findslabloop);
+    }
+
+    #[test]
+    fn intoslabloop_routes_to_drawfwall_when_test_hi_nonpositive() {
+        // cx0 = cy0 = 0, gylookup all 0 → cross_sign = 0 ≤ 0 →
+        // slab intersects → DrawFwall (single-slab path; R4.3e2f
+        // will fork the split case).
+        let mut s = fresh_scratch();
+        let column = [2u8, 10, 12, 0, 0, 0, 0, 0, 0, 20, 22, 0];
+        let gylookup = [0i32; 64];
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
+        state.ogx = 0;
+        assert_eq!(phase_intoslabloop(&mut state), Phase::DrawFwall);
+    }
+
+    #[test]
+    fn findslabloop_advances_vptr_then_intoslabloop_when_next_nonzero() {
+        // v[0] = 2 at vptr_offset 0 → advance by 8 to slab #2 at
+        // offset 8. Slab #2's v[0] = 2 (also non-zero) → loop
+        // back to Intoslabloop.
+        let mut s = fresh_scratch();
+        let column = [
+            2u8, 10, 12, 0, 0, 0, 0, 0, // slab 0
+            2u8, 20, 22, 0, 0, 0, 0, 0, // slab 1 (advance lands here)
+            0u8, 30, 32, 0, // slab 2 (sentinel)
+        ];
+        let gylookup = [0i32; 64];
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
+        assert_eq!(phase_findslabloop(&mut state), Phase::Intoslabloop);
+        assert_eq!(state.vptr_offset, 8);
+    }
+
+    #[test]
+    fn findslabloop_routes_to_drawfwall_when_next_v0_zero() {
+        // v[0] = 1 → advance by 4 → next slab v[0] = 0 (column-end).
+        let mut s = fresh_scratch();
+        let column = [1u8, 10, 12, 0, 0u8, 20, 22, 0];
+        let gylookup = [0i32; 64];
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
+        assert_eq!(phase_findslabloop(&mut state), Phase::DrawFwall);
+        assert_eq!(state.vptr_offset, 4);
     }
 
     #[test]
