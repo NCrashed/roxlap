@@ -53,24 +53,49 @@ pub struct ScanScratch {
     /// each new quadrant entry. The scan loops will set this; for
     /// now [`ScanScratch::new_for_size`] just initialises to `0`.
     pub sky_cur_dir: i32,
+    /// Per-screen-row x-boundary, voxlap's
+    /// `int32_t lastx[max(MAXYDIM, VSID)]`. The right / left
+    /// quadrants populate this during their pass-2 column walk; the
+    /// `vrend` dispatch pass then reads `lastx[sy]` per row to know
+    /// where each vertical slice begins.
+    pub lastx: Vec<i32>,
+    /// Per-screen-column ray-index pair, voxlap's
+    /// `int32_t uurendmem[MAXXDIM*2 + 9]` viewed as
+    /// `[uurend[sx], uurend[sx + MAXXDIM]]`. The right / left
+    /// quadrants stamp `uurend[sx] = u` and
+    /// `uurend[sx + MAXXDIM] = ui` per column for the vertical
+    /// rasterizer to consume.
+    pub uurend: Vec<i32>,
+    /// Stride between the `uurend[sx]` half and the
+    /// `uurend[sx + half_stride]` half. Equals `MAXXDIM` in voxlap;
+    /// our port sizes the buffer exactly to the framebuffer width
+    /// rounded up.
+    pub uurend_half_stride: usize,
 }
 
 impl ScanScratch {
-    /// Allocate a scratch buffer sized for `xres` columns. Voxlap's
-    /// per-frame `radar` buffer is `MAXXDIM * 6 * 256` `castdat`
-    /// entries (`voxlap5.c:206`-area declaration); for now we
-    /// over-provision by `xres * something` until R4.1f3 nails down
-    /// the exact upper bound the scan loops require.
+    /// Allocate a scratch buffer sized for an `xres × yres`
+    /// framebuffer. Voxlap's per-frame `radar` buffer is
+    /// `MAXXDIM * 6 * 256` `castdat` entries (`voxlap5.c:206`-area
+    /// declaration); over-provisioned by `xres * 6 * 256` here until
+    /// R4.1f3 nails down the exact upper bound. `uurend` /
+    /// `lastx` are sized to fit `xres` / `max(yres, vsid)` entries
+    /// respectively (R4.1f4b consumers).
     #[must_use]
-    pub fn new_for_size(xres: u32) -> Self {
+    pub fn new_for_size(xres: u32, yres: u32, vsid: u32) -> Self {
         let radar_cap = (xres as usize) * 6 * 256;
         let angstart_cap = (xres as usize) * 4;
+        let half_stride = xres as usize;
+        let lastx_cap = std::cmp::max(yres, vsid) as usize;
         Self {
             radar: vec![CastDat::default(); radar_cap],
             angstart: vec![0isize; angstart_cap],
             gscanptr: 0,
             sky_cur_lng: -1,
             sky_cur_dir: 0,
+            lastx: vec![0i32; lastx_cap],
+            uurend: vec![0i32; half_stride * 2],
+            uurend_half_stride: half_stride,
         }
     }
 
@@ -144,7 +169,7 @@ mod tests {
 
     #[test]
     fn scratch_initial_state() {
-        let s = ScanScratch::new_for_size(640);
+        let s = ScanScratch::new_for_size(640, 480, 2048);
         assert_eq!(s.gscanptr, 0);
         assert_eq!(s.sky_cur_lng, -1);
         assert_eq!(s.sky_cur_dir, 0);
@@ -154,7 +179,7 @@ mod tests {
 
     #[test]
     fn scratch_reset_for_quadrant_keeps_buffers() {
-        let mut s = ScanScratch::new_for_size(640);
+        let mut s = ScanScratch::new_for_size(640, 480, 2048);
         let radar_cap = s.radar.len();
         let angstart_cap = s.angstart.len();
         // Pretend the previous quadrant filled in some scratch.
@@ -174,7 +199,7 @@ mod tests {
         // Confirms the trait object surface is callable — the scan
         // loops in R4.1f3+ will hold &mut dyn Rasterizer.
         let mut rec = RecordingRasterizer::default();
-        let mut scratch = ScanScratch::new_for_size(64);
+        let mut scratch = ScanScratch::new_for_size(64, 64, 64);
         let r: &mut dyn Rasterizer = &mut rec;
         r.gline(&mut scratch, 4, 0.0, 0.0, 1.0, 1.0);
         r.hrend(&scratch, 0, 0, 10, 0, 1, 0);

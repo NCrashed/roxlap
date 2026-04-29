@@ -256,6 +256,378 @@ pub fn top_quadrant<R: Rasterizer>(
     }
 }
 
+/// Drive the **bottom quadrant** scan — the mirror of [`top_quadrant`]
+/// fanning *downward* from `(cx, cy)` to `y = wy1`.
+///
+/// Port of `voxlap5.c:opticast` lines 2447..2480. Same vline + hrend
+/// shape as top, with these flips:
+/// - guard `gy > 0` (centre is above the viewport bottom)
+/// - rays iterate from `x3` to `x2` (the bottom-edge corner-cut Xs)
+/// - target y = `wy1`, not `wy0`
+/// - `skycurdir = +giforzsgn` (top uses `-giforzsgn`)
+/// - `angstart[i]` sign convention is flipped: `gscanptr - p0` /
+///   `gscanptr + p1` (top: `+ p0` / `- p1`)
+/// - scanline walks `sy` *upward* through `0..yres`
+/// - ray index `i` starts at `+sy` / `-sy` (top: opposite)
+//
+// See top_quadrant for the rationale on body length / arg count.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    clippy::too_many_lines
+)]
+pub fn bottom_quadrant<R: Rasterizer>(
+    rasterizer: &mut R,
+    scratch: &mut ScanScratch,
+    ctx: &ScanContext<'_>,
+) {
+    let p = ctx.proj;
+    let rs = ctx.rs;
+    let forward_z_sign = ctx.prelude.forward_z_sign;
+
+    let j_count = ((p.x2 - p.x3) / ctx.anginc as f32).round_ties_even() as i32;
+    if p.gy <= 0.0 || j_count <= 0 {
+        return;
+    }
+
+    let ff_x = (p.x2 - p.x3) / j_count as f32;
+    let grd = 1.0 / (p.wy1 - p.cy);
+
+    // Bottom quadrant uses +giforzsgn for skycurdir; top used -.
+    scratch.reset_for_quadrant(forward_z_sign);
+
+    // -- Pass 1: cast j_count rays from (cx, cy) toward y = wy1. --
+    let mut f_ray = p.x3 + ff_x * 0.5;
+    for i in 0..j_count as usize {
+        let (iy0, iy1) = vline_clip(p.cx, p.cy, f_ray, p.wy1, grd, p);
+
+        // Sign flip from top: gscanptr - p0 (giforzsgn < 0)
+        // / gscanptr + p1 (else).
+        let gscan = scratch.gscanptr as isize;
+        scratch.angstart[i] = if forward_z_sign < 0 {
+            gscan - iy0 as isize
+        } else {
+            gscan + iy1 as isize
+        };
+
+        let length = iy1.abs_diff(iy0);
+        let dxy = (f_ray - p.cx) * grd;
+        let cast_x0 = (iy0 as f32 - p.wy1) * dxy + f_ray;
+        let cast_x1 = (iy1 as f32 - p.wy1) * dxy + f_ray;
+        rasterizer.gline(scratch, length, cast_x0, iy0 as f32, cast_x1, iy1 as f32);
+
+        scratch.gscanptr += length as usize + 1;
+
+        f_ray += ff_x;
+    }
+
+    // -- Pass 2: scanline rasterization (sy walks upward). --
+    let j_fixed = j_count << 16;
+    let f_scale = j_fixed as f32 / ((p.x2 - p.x3) * grd);
+    let kadd = ((p.cx - p.x3) * grd * f_scale).round_ties_even() as i32;
+
+    let p1_init = (p.cx - 0.5).round_ties_even() as i32;
+    let mut p0 = lbound0(p1_init + 1, ctx.xres);
+    let mut p1 = lbound0(p1_init, ctx.xres);
+
+    let mut sy = (p.cy + 0.50005).round_ties_even() as i32;
+    if sy < 0 {
+        sy = 0;
+    }
+
+    let ff_check = ((p1 as f32 - p.cx).abs() + 1.0) * f_scale / 2_147_483_647.0 + p.cy;
+    while ff_check > sy as f32 && sy < ctx.yres {
+        sy += 1;
+    }
+    if sy >= ctx.yres {
+        return;
+    }
+
+    let kmul = f_scale.round_ties_even() as i32;
+    while sy < ctx.yres {
+        if isshldiv16safe(kmul, (sy << 16) - rs.cy16) != 0 {
+            break;
+        }
+        sy += 1;
+    }
+
+    let mut i = if forward_z_sign < 0 { sy } else { -sy };
+    while sy < ctx.yres {
+        let ui = shldiv16(kmul, (sy << 16) - rs.cy16);
+        let mut u = mulshr16((p0 << 16) - rs.cx16, ui) + kadd;
+
+        while p0 > 0 && u >= ui {
+            u -= ui;
+            p0 -= 1;
+        }
+        let mut u1 = (p1 - p0) * ui + u;
+        while p1 < ctx.xres && u1 < j_fixed {
+            u1 += ui;
+            p1 += 1;
+        }
+
+        if p0 < p1 {
+            rasterizer.hrend(scratch, p0, sy, p1, u, ui, i);
+        }
+
+        sy += 1;
+        i -= forward_z_sign;
+    }
+}
+
+/// Drive the **right quadrant** scan — the fan rooted at `(cx, cy)`
+/// opening rightward to the viewport's right edge (`x = wx1`).
+///
+/// Port of `voxlap5.c:opticast` lines 2408..2444. Hline-based ray
+/// cast, then a column walk that populates `scratch.uurend` /
+/// `scratch.lastx` per screen-x, finally a vrend dispatch loop over
+/// the resulting per-row x-boundary.
+//
+// See top_quadrant for the rationale on body length / arg count.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    clippy::too_many_lines
+)]
+pub fn right_quadrant<R: Rasterizer>(
+    rasterizer: &mut R,
+    scratch: &mut ScanScratch,
+    ctx: &ScanContext<'_>,
+) {
+    let p = ctx.proj;
+    let rs = ctx.rs;
+    let forward_z_sign = ctx.prelude.forward_z_sign;
+
+    let j_count = ((p.y2 - p.y1) / ctx.anginc as f32).round_ties_even() as i32;
+    if p.gx <= 0.0 || j_count <= 0 {
+        return;
+    }
+
+    let ff_y = (p.y2 - p.y1) / j_count as f32;
+    let grd = 1.0 / (p.wx1 - p.cx);
+
+    scratch.reset_for_quadrant(-forward_z_sign);
+
+    // -- Pass 1: cast j_count rays from (cx, cy) toward x = wx1. --
+    let mut f_ray = p.y1 + ff_y * 0.5;
+    for i in 0..j_count as usize {
+        let (ix0, ix1) = hline_clip(p.cx, p.cy, p.wx1, f_ray, grd, p);
+
+        // Right quadrant: gscanptr - p0 (giforzsgn < 0)
+        // / gscanptr + p1 (else).
+        let gscan = scratch.gscanptr as isize;
+        scratch.angstart[i] = if forward_z_sign < 0 {
+            gscan - ix0 as isize
+        } else {
+            gscan + ix1 as isize
+        };
+
+        // gline endpoints projected back to screen y at each ix.
+        let length = ix1.abs_diff(ix0);
+        let dyx = (f_ray - p.cy) * grd;
+        let cast_y0 = (ix0 as f32 - p.wx1) * dyx + f_ray;
+        let cast_y1 = (ix1 as f32 - p.wx1) * dyx + f_ray;
+        rasterizer.gline(scratch, length, ix0 as f32, cast_y0, ix1 as f32, cast_y1);
+
+        scratch.gscanptr += length as usize + 1;
+
+        f_ray += ff_y;
+    }
+
+    // -- Pass 2: column walk + vrend dispatch. --
+    let j_fixed = j_count << 16;
+    let f_scale = j_fixed as f32 / ((p.y2 - p.y1) * grd);
+    let kadd = ((p.cy - p.y1) * grd * f_scale).round_ties_even() as i32;
+
+    let p1_init = (p.cy - 0.5).round_ties_even() as i32;
+    let mut p0 = lbound0(p1_init + 1, ctx.yres);
+    let mut p1 = lbound0(p1_init, ctx.yres);
+
+    let mut sx = (p.cx + 0.50005).round_ties_even() as i32;
+    if sx < 0 {
+        sx = 0;
+    }
+
+    let ff_check = ((p1 as f32 - p.cy).abs() + 1.0) * f_scale / 2_147_483_647.0 + p.cx;
+    while ff_check > sx as f32 && sx < ctx.xres {
+        sx += 1;
+    }
+    if sx >= ctx.xres {
+        return;
+    }
+
+    let kmul = f_scale.round_ties_even() as i32;
+    while sx < ctx.xres {
+        if isshldiv16safe(kmul, (sx << 16) - rs.cx16) != 0 {
+            break;
+        }
+        sx += 1;
+    }
+
+    while sx < ctx.xres {
+        let ui = shldiv16(kmul, (sx << 16) - rs.cx16);
+        let mut u = mulshr16((p0 << 16) - rs.cy16, ui) + kadd;
+
+        // Walk p0 left, populating lastx along the way.
+        while p0 > 0 && u >= ui {
+            u -= ui;
+            p0 -= 1;
+            scratch.lastx[p0 as usize] = sx;
+        }
+        // Stamp this column's u/ui pair for the vrend dispatch.
+        scratch.uurend[sx as usize] = u;
+        scratch.uurend[sx as usize + scratch.uurend_half_stride] = ui;
+        u += (p1 - p0) * ui;
+        // Walk p1 right, populating lastx.
+        while p1 < ctx.yres && u < j_fixed {
+            u += ui;
+            scratch.lastx[p1 as usize] = sx;
+            p1 += 1;
+        }
+        sx += 1;
+    }
+
+    // vrend dispatch: for each y row in [p0, p1), call vrend with
+    // the row's x boundary. The plc / sign flips with giforzsgn.
+    if forward_z_sign < 0 {
+        for sy in p0..p1 {
+            let lx = scratch.lastx[sy as usize];
+            rasterizer.vrend(scratch, lx, sy, ctx.xres, lx, 1);
+        }
+    } else {
+        for sy in p0..p1 {
+            let lx = scratch.lastx[sy as usize];
+            rasterizer.vrend(scratch, lx, sy, ctx.xres, -lx, -1);
+        }
+    }
+}
+
+/// Drive the **left quadrant** scan — the fan rooted at `(cx, cy)`
+/// opening leftward to the viewport's left edge (`x = wx0`).
+///
+/// Port of `voxlap5.c:opticast` lines 2482..2517. Hline-based ray
+/// cast (mirror of right), then column walk going leftward, then a
+/// vrend dispatch over the resulting per-row x-boundary. Unlike the
+/// right quadrant the dispatch passes `xres + 1` style range with
+/// `0` as the start; voxlap calls `vrend(0, sy, lastx[sy]+1, 0,
+/// giforzsgn)` to render the left slice.
+//
+// See top_quadrant for the rationale on body length / arg count.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    clippy::too_many_lines
+)]
+pub fn left_quadrant<R: Rasterizer>(
+    rasterizer: &mut R,
+    scratch: &mut ScanScratch,
+    ctx: &ScanContext<'_>,
+) {
+    let p = ctx.proj;
+    let rs = ctx.rs;
+    let forward_z_sign = ctx.prelude.forward_z_sign;
+
+    let j_count = ((p.y3 - p.y0) / ctx.anginc as f32).round_ties_even() as i32;
+    if p.fx >= 0.0 || j_count <= 0 {
+        return;
+    }
+
+    let ff_y = (p.y3 - p.y0) / j_count as f32;
+    let grd = 1.0 / (p.wx0 - p.cx);
+
+    // Left quadrant: skycurdir = +giforzsgn (opposite of top).
+    scratch.reset_for_quadrant(forward_z_sign);
+
+    // -- Pass 1: cast j_count rays from (cx, cy) toward x = wx0. --
+    let mut f_ray = p.y0 + ff_y * 0.5;
+    for i in 0..j_count as usize {
+        let (ix0, ix1) = hline_clip(p.cx, p.cy, p.wx0, f_ray, grd, p);
+
+        // Left quadrant: gscanptr + p0 (giforzsgn < 0)
+        // / gscanptr - p1 (else).
+        let gscan = scratch.gscanptr as isize;
+        scratch.angstart[i] = if forward_z_sign < 0 {
+            gscan + ix0 as isize
+        } else {
+            gscan - ix1 as isize
+        };
+
+        let length = ix1.abs_diff(ix0);
+        let dyx = (f_ray - p.cy) * grd;
+        let cast_y0 = (ix0 as f32 - p.wx0) * dyx + f_ray;
+        let cast_y1 = (ix1 as f32 - p.wx0) * dyx + f_ray;
+        rasterizer.gline(scratch, length, ix0 as f32, cast_y0, ix1 as f32, cast_y1);
+
+        scratch.gscanptr += length as usize + 1;
+
+        f_ray += ff_y;
+    }
+
+    // -- Pass 2: column walk (sx walks leftward) + vrend dispatch. --
+    let j_fixed = j_count << 16;
+    let f_scale = j_fixed as f32 / ((p.y3 - p.y0) * grd);
+    let kadd = ((p.cy - p.y0) * grd * f_scale).round_ties_even() as i32;
+
+    let p1_init = (p.cy - 0.5).round_ties_even() as i32;
+    let mut p0 = lbound0(p1_init + 1, ctx.yres);
+    let mut p1 = lbound0(p1_init, ctx.yres);
+
+    let mut sx = (p.cx - 0.50005).round_ties_even() as i32;
+    if sx >= ctx.xres {
+        sx = ctx.xres - 1;
+    }
+
+    let ff_check = ((p1 as f32 - p.cy).abs() + 1.0) * f_scale / 2_147_483_647.0 + p.cx;
+    while ff_check < sx as f32 && sx >= 0 {
+        sx -= 1;
+    }
+    if sx < 0 {
+        return;
+    }
+
+    let kmul = f_scale.round_ties_even() as i32;
+    while sx >= 0 {
+        if isshldiv16safe(kmul, (sx << 16) - rs.cx16) != 0 {
+            break;
+        }
+        sx -= 1;
+    }
+
+    while sx >= 0 {
+        let ui = shldiv16(kmul, (sx << 16) - rs.cx16);
+        let mut u = mulshr16((p0 << 16) - rs.cy16, ui) + kadd;
+
+        while p0 > 0 && u >= ui {
+            u -= ui;
+            p0 -= 1;
+            scratch.lastx[p0 as usize] = sx;
+        }
+        scratch.uurend[sx as usize] = u;
+        scratch.uurend[sx as usize + scratch.uurend_half_stride] = ui;
+        u += (p1 - p0) * ui;
+        while p1 < ctx.yres && u < j_fixed {
+            u += ui;
+            scratch.lastx[p1 as usize] = sx;
+            p1 += 1;
+        }
+        sx -= 1;
+    }
+
+    for sy in p0..p1 {
+        let lx = scratch.lastx[sy as usize];
+        rasterizer.vrend(scratch, 0, sy, lx + 1, 0, forward_z_sign);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,7 +824,7 @@ mod tests {
         proj.fy = proj.wy0 - proj.cy; // positive now
 
         let mut rec = Recorder::default();
-        let mut scratch = ScanScratch::new_for_size(640);
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
             proj: &proj,
             rs: &rs,
@@ -475,7 +847,7 @@ mod tests {
         // bias. j_count = round((x1 - x0) / 1) = ~554.
         let (proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
-        let mut scratch = ScanScratch::new_for_size(640);
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
             proj: &proj,
             rs: &rs,
@@ -497,7 +869,7 @@ mod tests {
         // through all rows above, so hrend should fire at least once.
         let (proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
-        let mut scratch = ScanScratch::new_for_size(640);
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
             proj: &proj,
             rs: &rs,
@@ -515,12 +887,183 @@ mod tests {
     }
 
     #[test]
+    fn bottom_quadrant_skips_when_centre_below_bottom_edge() {
+        // Force gy <= 0 by placing cy below the viewport bottom.
+        let (proj_lookdown, rs, prelude) = looking_down_context();
+        let mut proj = proj_lookdown;
+        proj.cy = 1000.0;
+        proj.gy = proj.wy1 - proj.cy; // negative now
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        bottom_quadrant(&mut rec, &mut scratch, &ctx);
+        assert_eq!(rec.gline_calls, 0);
+        assert_eq!(rec.hrend_calls, 0);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn bottom_quadrant_casts_one_ray_per_anginc_step() {
+        // Looking-down camera has both top and bottom fans engaged;
+        // bottom uses x3..x2 width which equals top's x0..x1 width
+        // by symmetry of the corner-cut quadrilateral.
+        let (proj, rs, prelude) = looking_down_context();
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        bottom_quadrant(&mut rec, &mut scratch, &ctx);
+        let expected = ((proj.x2 - proj.x3) / 1.0).round_ties_even() as u32;
+        assert_eq!(rec.gline_calls, expected);
+    }
+
+    #[test]
+    fn bottom_quadrant_emits_at_least_one_hrend() {
+        let (proj, rs, prelude) = looking_down_context();
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        bottom_quadrant(&mut rec, &mut scratch, &ctx);
+        assert!(rec.hrend_calls > 0, "expected ≥ 1 hrend, got 0");
+        // First hrend's sy is the topmost scanned row of the bottom
+        // fan; with cy = 240 it should land at >= 240 (we walk down).
+        let (_, sy, _) = rec.first_hrend.expect("first hrend recorded");
+        assert!(sy >= 240, "first hrend sy = {sy}, expected ≥ 240");
+    }
+
+    #[test]
+    fn right_quadrant_skips_when_centre_right_of_viewport() {
+        let (proj_lookdown, rs, prelude) = looking_down_context();
+        let mut proj = proj_lookdown;
+        proj.cx = 1000.0;
+        proj.gx = proj.wx1 - proj.cx; // negative
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        right_quadrant(&mut rec, &mut scratch, &ctx);
+        assert_eq!(rec.gline_calls + rec.vrend_calls, 0);
+    }
+
+    #[test]
+    fn left_quadrant_skips_when_centre_left_of_viewport() {
+        let (proj_lookdown, rs, prelude) = looking_down_context();
+        let mut proj = proj_lookdown;
+        proj.cx = -1000.0;
+        proj.fx = proj.wx0 - proj.cx; // positive (large)
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        left_quadrant(&mut rec, &mut scratch, &ctx);
+        assert_eq!(rec.gline_calls + rec.vrend_calls, 0);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn right_quadrant_casts_one_ray_per_anginc_step() {
+        let (proj, rs, prelude) = looking_down_context();
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        right_quadrant(&mut rec, &mut scratch, &ctx);
+        let expected = ((proj.y2 - proj.y1) / 1.0).round_ties_even() as u32;
+        assert_eq!(rec.gline_calls, expected);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn left_quadrant_casts_one_ray_per_anginc_step() {
+        let (proj, rs, prelude) = looking_down_context();
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        left_quadrant(&mut rec, &mut scratch, &ctx);
+        let expected = ((proj.y3 - proj.y0) / 1.0).round_ties_even() as u32;
+        assert_eq!(rec.gline_calls, expected);
+    }
+
+    #[test]
+    fn right_and_left_quadrants_emit_vrend() {
+        let (proj, rs, prelude) = looking_down_context();
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        let mut rec_right = Recorder::default();
+        right_quadrant(&mut rec_right, &mut scratch, &ctx);
+        assert!(
+            rec_right.vrend_calls > 0,
+            "right quadrant: expected ≥ 1 vrend"
+        );
+
+        scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let mut rec_left = Recorder::default();
+        left_quadrant(&mut rec_left, &mut scratch, &ctx);
+        assert!(
+            rec_left.vrend_calls > 0,
+            "left quadrant: expected ≥ 1 vrend"
+        );
+    }
+
+    #[test]
     fn top_quadrant_advances_gscanptr_by_ray_lengths() {
         // After all rays cast, scratch.gscanptr should equal sum of
         // (|iy1-iy0|+1) over all rays.
         let (proj, rs, prelude) = looking_down_context();
         let mut rec = Recorder::default();
-        let mut scratch = ScanScratch::new_for_size(640);
+        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
         let ctx = ScanContext {
             proj: &proj,
             rs: &rs,
