@@ -49,6 +49,101 @@ pub const CF_SEED_INDEX: usize = 128;
 
 use crate::rasterizer::ScanScratch;
 
+/// Voxlap's per-voxel colour-shading helper, used by every fill loop
+/// in grouscan.
+///
+/// Originally MMX (`punpcklbw mm5, vox; psubusb; pshufw mm5, 0xff;
+/// pmulhuw; psrlw 7; packuswb`); voxlaptest's scalar port at
+/// `voxlap5.c:11438` is what we mirror here. Reads `*tail` (the
+/// previous voxel's packed result, used by `pmulhuw`'s broadcast
+/// stage), reads 8 byte-lanes of `csub_qword` for the saturated
+/// subtract, and writes the new packed colour back into `*tail`
+/// before returning it.
+///
+/// `csub_qword` is voxlap's `gcsub[lane]` — an `i64` viewed as
+/// 8 bytes. The high byte (`csub_qword[7]`) is the per-side shading
+/// intensity used for the broadcast; the low 4 bytes apply to the
+/// per-channel saturated subtract.
+//
+// The byte arithmetic is voxlap's verbatim — the constant 7-bit
+// right-shift, the high-half `pmulhuw` broadcast, and the saturated
+// pack are all asm-defined.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn grouscan_shade(vox: u32, tail: &mut u32, csub_qword: i64) -> u32 {
+    let cs = csub_qword.to_le_bytes();
+    let t = *tail;
+
+    // punpcklbw mm5, vox — interleave low 4 bytes of tail and vox.
+    let mut b = [
+        t as u8,
+        vox as u8,
+        (t >> 8) as u8,
+        (vox >> 8) as u8,
+        (t >> 16) as u8,
+        (vox >> 16) as u8,
+        (t >> 24) as u8,
+        (vox >> 24) as u8,
+    ];
+
+    // psubusb — saturated u8 subtract per byte against csub.
+    for i in 0..8 {
+        b[i] = b[i].saturating_sub(cs[i]);
+    }
+
+    // Repack to 4 u16 words.
+    let mut w = [
+        u16::from(b[0]) | (u16::from(b[1]) << 8),
+        u16::from(b[2]) | (u16::from(b[3]) << 8),
+        u16::from(b[4]) | (u16::from(b[5]) << 8),
+        u16::from(b[6]) | (u16::from(b[7]) << 8),
+    ];
+
+    // pshufw 0xff broadcast w[3], pmulhuw — high-half u16×u16.
+    let repl = u32::from(w[3]);
+    for slot in &mut w {
+        *slot = ((u32::from(*slot) * repl) >> 16) as u16;
+    }
+
+    // psrlw 7.
+    for slot in &mut w {
+        *slot >>= 7;
+    }
+
+    // packuswb mm5, mm5 — saturate-pack each word to u8.
+    let p = w.map(|x| if x > 255 { 255 } else { x as u8 });
+    let color = u32::from(p[0])
+        | (u32::from(p[1]) << 8)
+        | (u32::from(p[2]) << 16)
+        | (u32::from(p[3]) << 24);
+    *tail = color;
+    color
+}
+
+/// Voxlap's cross-product sign test, used by every grouscan fill
+/// loop's exit condition. Port of `voxlap5.c:11546`.
+///
+/// Returns `cx_hi16_signed * gy_low16_signed + cy_hi16_signed *
+/// depth_hi16_signed`. The bit-level signature matters: gylookup
+/// entries are populated in the asm's int16-signed format so this
+/// must use signed 16-bit operands rather than (say) the 32-bit
+/// `dmulrethigh` shape — the algebraic equivalence breaks under
+/// the int16 sign-extensions.
+//
+// The `as i16` casts are intentional bit-narrowings — we want the
+// low 16 bits viewed as a signed int16. clippy::cast_possible_
+// truncation flags exactly that. similar_names: cx_s16 / cy_s16 are
+// voxlap names; the one-letter difference is meaningful.
+#[allow(clippy::cast_possible_truncation, clippy::similar_names)]
+#[must_use]
+pub fn grouscan_cross_sign(cx: i32, cy: i32, depth: i32, gy_raw: i32) -> i32 {
+    let gy_s16 = i32::from(gy_raw as i16);
+    let depth_s16 = i32::from((depth >> 16) as i16);
+    let cx_s16 = i32::from((cx >> 16) as i16);
+    let cy_s16 = i32::from((cy >> 16) as i16);
+    cx_s16 * gy_s16 + cy_s16 * depth_s16
+}
+
 /// Snapshot of the prologue state — the local scalars voxlap caches
 /// from `cf[128]` before walking the ray. Returned by
 /// [`grouscan_run`] in R4.3c so the caller can verify the prologue
@@ -365,6 +460,60 @@ mod tests {
         s.gxmax = 1_000_000;
         let p = grouscan_run(&mut s, 0, 50_000, 1);
         assert_eq!(p.ngxmax, 1_000_000);
+    }
+
+    #[test]
+    fn shade_zero_csub_passes_voxel_through_unchanged_intensity() {
+        // csub = 0 → saturating sub leaves bytes alone.
+        // Run with a voxel = 0x80aabbcc, tail = 0x80112233.
+        // After interleave: [33,cc, 22,bb, 11,aa, 80,80].
+        // psubusb 0 → unchanged.
+        // word[3] = (80 << 8) | 80 = 0x8080.
+        // pmulhuw broadcast: each word * 0x8080 >> 16.
+        //   w[0] = ccu(0xcc33) * 0x8080 >> 16
+        // psrlw 7 + packuswb. Verify the whole pipeline runs without
+        // panicking and produces a valid u32 colour. (Bit-exact tests
+        // for non-trivial inputs come once we verify against the C.)
+        let mut tail: u32 = 0x8011_2233;
+        let _ = grouscan_shade(0x80aa_bbcc, &mut tail, 0);
+        // Tail is updated in place.
+        assert_ne!(tail, 0x8011_2233);
+    }
+
+    #[test]
+    fn shade_max_csub_produces_zero_intensity_blackout() {
+        // csub all-ones → saturating subtract drops every byte to 0;
+        // word[3] = 0; pmulhuw produces 0 across; final colour = 0.
+        let mut tail: u32 = 0xdead_beef;
+        let out = grouscan_shade(0xffff_ffff, &mut tail, !0_i64);
+        assert_eq!(out, 0);
+        assert_eq!(tail, 0);
+    }
+
+    #[test]
+    fn cross_sign_basic_signs() {
+        // depth = 1<<16 → depth_hi16 = 1.
+        // gy_raw = 0x0001 → gy_low16 = 1.
+        // cx = 1<<16 → cx_hi16 = 1.
+        // cy = 1<<16 → cy_hi16 = 1.
+        // result = 1 * 1 + 1 * 1 = 2.
+        assert_eq!(grouscan_cross_sign(1 << 16, 1 << 16, 1 << 16, 1), 2);
+    }
+
+    #[test]
+    fn cross_sign_negative_high_word_uses_signed_extension() {
+        // cx_hi16 = -1 (cx = -65536 = 0xFFFF_0000), gy_low16 = 1.
+        // depth = cy = 0. result = -1 * 1 + 0 * 0 = -1.
+        assert_eq!(grouscan_cross_sign(-(1 << 16), 0, 0, 1), -1);
+    }
+
+    #[test]
+    fn cross_sign_drops_low_16_of_cx_cy() {
+        // Two cx values that share the same hi16 should produce the
+        // same result regardless of the low bits.
+        let r1 = grouscan_cross_sign(0x0003_0000, 0, 1 << 16, 1);
+        let r2 = grouscan_cross_sign(0x0003_FFFF, 0, 1 << 16, 1);
+        assert_eq!(r1, r2);
     }
 
     #[test]
