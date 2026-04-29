@@ -1097,24 +1097,21 @@ fn phase_skipixy3(state: &mut GrouscanState<'_>) -> Phase {
     }
 }
 
-/// `intoslabloop` — voxlap5.c:11863-11876 (R4.3e2e ports the
-/// single-slab dispatch; the two-slab cfasm split lands in
-/// R4.3e2f).
+/// `intoslabloop` — voxlap5.c:11863-11957.
 ///
 /// 1. `v2 = v[2]` (slab's solid-bottom z).
 /// 2. `gy_raw = gylookoff[v2 + 1]`.
 /// 3. `test_hi = cross_sign(cx0, cy0, ogx, gy_raw)`. If `> 0`
 ///    the slab is still above the ray's frustum top — route to
 ///    [`Phase::Findslabloop`] to advance.
-/// 4. Else (slab intersects): test the NEXT slab's
-///    `next_v3 = v[v0*4 + 3]` against `cx1/cy1` to decide if
-///    the cfasm needs a split. R4.3e2e takes the single-slab
-///    fall-through (`DrawFwall`) regardless — the split case
-///    becomes R4.3e2f. This matches voxlap's `if (test_next <=
-///    0) goto drawfwall;` half exactly; the `else` branch we
-///    stub by also routing to drawfwall, which gives a visual
-///    artifact on multi-slab transitions but keeps the algorithm
-///    terminating until R4.3e2f lands.
+/// 4. Else (slab intersects): also test the NEXT slab's
+///    `next_v3 = v[v0*4 + 3]` against `cx1/cy1`.
+///    - `test_next <= 0` → single-slab dispatch
+///      ([`Phase::DrawFwall`]).
+///    - `test_next > 0` → two-slab cfasm split via
+///      [`do_slab_split`]; that helper pushes a new cf entry,
+///      narrows the current one, advances `c`, then returns
+///      [`Phase::DrawFwall`].
 //
 // Heavy bit-narrowings + the test_hi sign bookkeeping; voxlap
 // names (cx0/cy0/cx1/cy1, v0/v2/v3) intentionally one-letter
@@ -1142,9 +1139,144 @@ fn phase_intoslabloop(state: &mut GrouscanState<'_>) -> Phase {
         return Phase::Findslabloop;
     }
 
-    // Slab intersects. Voxlap then tests the NEXT slab to decide
-    // single-vs-split. R4.3e2e collapses both branches into the
-    // single-slab fall-through; R4.3e2f will fork them.
+    // Slab intersects. Test the NEXT slab to decide
+    // single-vs-split.
+    let v0 = i32::from(column_byte_at(state, 0));
+    let next_v3_offset = (v0 * 4 + 3) as usize;
+    let next_v3 = i32::from(column_byte_at(state, next_v3_offset));
+    let next_gy_idx = next_v3 as usize;
+    if next_gy_idx >= state.gylookup.len() {
+        return Phase::DrawFwall;
+    }
+    state.gy_raw = state.gylookup[next_gy_idx];
+    let test_next = grouscan_cross_sign(state.cx1, state.cy1, state.ogx, state.gy_raw);
+    if test_next <= 0 {
+        // Single-slab case — voxlap's `jle drawfwall`.
+        return Phase::DrawFwall;
+    }
+
+    // Two-slab split.
+    do_slab_split(state, v2, next_v3)
+}
+
+/// Two-slab cfasm split — voxlap5.c:11880-11957. Called from
+/// [`phase_intoslabloop`] when both the current and the next
+/// slab intersect the ray's frustum.
+///
+/// 1. Save current scalars to `cf[c]` (so the about-to-be-
+///    duplicated entry holds the pre-split state).
+/// 2. Reset `gy_raw = gylookoff[v2 + 1]` (the asm's mm3 for the
+///    column search; the next-slab test above clobbered it).
+/// 3. Search for the split column `col` walking from `c->i1`
+///    leftward, with `cx1`/`cy1` decrementing by `gi0`/`gi1`
+///    each step. Voxlap's `prebegsearchi16` uses 16-step
+///    batches for speed — the project memory tracks this as a
+///    perf follow-up; the per-step search here is functionally
+///    equivalent.
+/// 4. Stack-overflow check: voxlap caps `ce` at `cf[191]`
+///    (`cmp eax, _cfasm[4096]`). Past that we bail to
+///    [`Phase::Done`] (the asm's `retsub`).
+/// 5. Push new entry (`ce++`), then shift entries `(c, ce]` up
+///    by one slot — the C `for (p=ce; p>c; p--) *p = *(p-1)`
+///    duplicates `cf[c]` into `cf[c+1]` in the final pass.
+/// 6. Modify split fields:
+///    - `cf[c+1].i1 = col` (narrowed right edge for the
+///      BEFORE-split range).
+///    - `cf[c].i0 = col + 1`, `cf[c].z0 = next_v3`, and
+///      `cf[c].cx0/cy0 = cx1+gi0/cy1+gi1` (split-point ray).
+/// 7. Advance `c++` into the new top slot. `cf[c]` (new) holds
+///    the original via shift-copy; the locals' `cx1/cy1` carry
+///    the search-end values, which is what drawfwall wants for
+///    its right-edge walk.
+/// 8. Restore `z0 = c->z0` (= original z0, unchanged via
+///    shift-copy) and set `z1 = next_v3`. Voxlap's
+///    `mov edx, eax` here is functionally non-trivial — leaving
+///    `z1` stale at the pre-split value makes drawfwall iterate
+///    the wrong number of times and bleeds garbage past the
+///    slab's visible range (the project-memory note about the
+///    oracle's `sprite_iso` / `diag_down` ball artifacts traces
+///    back to this).
+//
+// Bit-narrowings + signed/unsigned isize math; voxlap names
+// retained.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::similar_names
+)]
+fn do_slab_split(state: &mut GrouscanState<'_>, v2: i32, next_v3: i32) -> Phase {
+    // 1. Save current scalars to cf[c] (voxlap5.c:11890-11892).
+    {
+        let z0 = state.z0;
+        let z1 = state.z1;
+        let cx0 = state.cx0;
+        let cy0 = state.cy0;
+        let cx1 = state.cx1;
+        let cy1 = state.cy1;
+        let c = &mut state.scratch.cf[state.c_idx];
+        c.z0 = z0;
+        c.z1 = z1;
+        c.cx0 = cx0;
+        c.cy0 = cy0;
+        c.cx1 = cx1;
+        c.cy1 = cy1;
+    }
+
+    // 2. Reset gy_raw — the next-slab test clobbered it.
+    let gy_idx = (v2 + 1) as usize;
+    if gy_idx >= state.gylookup.len() {
+        return Phase::DrawFwall;
+    }
+    state.gy_raw = state.gylookup[gy_idx];
+
+    // 3. Search for split column. Bound iterations by the
+    //    [i0, i1] range — geometry guarantees the search
+    //    terminates in fewer steps than this, but capping
+    //    avoids hangs on malformed test fixtures.
+    let mut col = state.scratch.cf[state.c_idx].i1;
+    let i0 = state.scratch.cf[state.c_idx].i0;
+    let max_iter = (col - i0).max(0) as usize + 1;
+    for _ in 0..=max_iter {
+        let t = grouscan_cross_sign(state.cx1, state.cy1, state.ogx, state.gy_raw);
+        if t <= 0 {
+            break;
+        }
+        state.cx1 = state.cx1.wrapping_sub(state.scratch.gi0);
+        state.cy1 = state.cy1.wrapping_sub(state.scratch.gi1);
+        col -= 1;
+    }
+
+    // 4. Stack-overflow check — voxlap's cf[191] cap.
+    if state.ce_idx >= 191 {
+        return Phase::Done;
+    }
+
+    // 5. Push + shift cf entries up.
+    state.ce_idx += 1;
+    for p in (state.c_idx + 1..=state.ce_idx).rev() {
+        state.scratch.cf[p] = state.scratch.cf[p - 1];
+    }
+
+    // 6. Modify split fields.
+    state.scratch.cf[state.c_idx + 1].i1 = col;
+    {
+        let new_cx0 = state.cx1.wrapping_add(state.scratch.gi0);
+        let new_cy0 = state.cy1.wrapping_add(state.scratch.gi1);
+        let c = &mut state.scratch.cf[state.c_idx];
+        c.i0 = col + 1;
+        c.z0 = next_v3;
+        c.cx0 = new_cx0;
+        c.cy0 = new_cy0;
+    }
+
+    // 7. Advance into the new top slot.
+    state.c_idx += 1;
+
+    // 8. z0 = c->z0 (= original z0 via shift-copy), z1 = next_v3.
+    state.z0 = state.scratch.cf[state.c_idx].z0;
+    state.z1 = next_v3;
+
     Phase::DrawFwall
 }
 
@@ -1968,10 +2100,10 @@ mod tests {
     }
 
     #[test]
-    fn intoslabloop_routes_to_drawfwall_when_test_hi_nonpositive() {
-        // cx0 = cy0 = 0, gylookup all 0 → cross_sign = 0 ≤ 0 →
-        // slab intersects → DrawFwall (single-slab path; R4.3e2f
-        // will fork the split case).
+    fn intoslabloop_routes_to_drawfwall_when_test_hi_and_test_next_nonpositive() {
+        // cx0 = cy0 = cx1 = cy1 = 0 → both cross_sign tests = 0 ≤ 0
+        // → slab intersects (test_hi) AND next slab does not extend
+        // past ray (test_next ≤ 0) → single-slab DrawFwall.
         let mut s = fresh_scratch();
         let column = [2u8, 10, 12, 0, 0, 0, 0, 0, 0, 20, 22, 0];
         let gylookup = [0i32; 64];
@@ -1979,6 +2111,85 @@ mod tests {
         let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
         state.ogx = 0;
         assert_eq!(phase_intoslabloop(&mut state), Phase::DrawFwall);
+    }
+
+    #[test]
+    fn intoslabloop_pushes_split_when_test_next_positive() {
+        // test_hi ≤ 0 (slab intersects) AND test_next > 0 (next slab
+        // straddles the right edge) → two-slab cfasm split.
+        //
+        // Setup:
+        //   v[0] = 2, v[2] = 12 → next_v3_offset = 2*4+3 = 11.
+        //   column[11] = next_v3 = 5. gylookup[5] = 1, cx1 = 1<<16
+        //   → test_next = 1 > 0.
+        //   gylookup[v[2]+1] = gylookup[13] = 0 → test_hi = 0 ≤ 0.
+        //
+        // Verify after split:
+        //   - ce_idx incremented 128 → 129
+        //   - c_idx incremented 128 → 129 (advanced into new slot)
+        //   - cf[128].i0 = col+1, cf[128].z0 = next_v3 = 5
+        //   - cf[129] holds the original via shift-copy + i1 = col
+        //   - state.z0 = original z0 (= 0, via shift-copy)
+        //   - state.z1 = next_v3 = 5
+        //
+        let mut s = fresh_scratch();
+        s.cf[CF_SEED_INDEX].i0 = 0;
+        s.cf[CF_SEED_INDEX].i1 = 5;
+        s.cf[CF_SEED_INDEX].cx1 = 1 << 16;
+        s.cf[CF_SEED_INDEX].cy1 = 0;
+        s.gi0 = 0;
+        s.gi1 = 0;
+        let column = [
+            2u8, 10, 12, 0, 0, 0, 0, 0, // slab 0 — v[0]=2, v[2]=12, v[3]=0
+            0u8, 20, 22, 5, // next slab header — v[3] = 5 (= next_v3)
+        ];
+        let mut gylookup = [0i32; 64];
+        gylookup[5] = 1; // gylookup[next_v3]
+                         // gylookup[v[2]+1] = gylookup[13] stays 0 → test_hi = 0.
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
+        state.cx1 = 1 << 16;
+        state.cy1 = 0;
+        state.ogx = 0;
+        state.z0 = 0;
+        state.z1 = 99; // pre-split sentinel — will be overwritten
+
+        assert_eq!(phase_intoslabloop(&mut state), Phase::DrawFwall);
+
+        assert_eq!(state.ce_idx, CF_SEED_INDEX + 1);
+        assert_eq!(state.c_idx, CF_SEED_INDEX + 1);
+        assert_eq!(state.z1, 5);
+        assert_eq!(state.z0, 0);
+        // cf[128] (= old c, post-modification) — z0 = next_v3, i0 = col+1.
+        // The search loop's gy_raw is reset to gylookup[v[2]+1] =
+        // gylookup[13] = 0, so cross_sign(1<<16, 0, 0, 0) = 0 ≤ 0
+        // → break on first iteration → col stays at i1 = 5.
+        assert_eq!(state.scratch.cf[CF_SEED_INDEX].z0, 5);
+        assert_eq!(state.scratch.cf[CF_SEED_INDEX].i0, 6);
+        // cf[129].i1 = col = 5 (shift-copied original i1 was also
+        // 5, then overwritten with col which is also 5 — same
+        // value either way; this pins the modification fired).
+        assert_eq!(state.scratch.cf[CF_SEED_INDEX + 1].i1, 5);
+    }
+
+    #[test]
+    fn slab_split_returns_done_when_stack_full() {
+        // ce_idx already at the cap → push fails → Done.
+        let mut s = fresh_scratch();
+        s.cf[CF_SEED_INDEX].i0 = 0;
+        s.cf[CF_SEED_INDEX].i1 = 5;
+        s.cf[CF_SEED_INDEX].cx1 = 1 << 16;
+        let column = [2u8, 10, 12, 0, 0, 0, 0, 0, 0u8, 20, 22, 5];
+        let mut gylookup = [0i32; 64];
+        gylookup[5] = 1;
+        let gcsub = [0i64; 9];
+        let mut state = state_for_drawcwall(&mut s, &column, &gylookup, &gcsub, 0);
+        state.cx1 = 1 << 16;
+        state.ce_idx = 191; // at cap
+        state.ogx = 0;
+        assert_eq!(phase_intoslabloop(&mut state), Phase::Done);
+        // ce_idx unchanged (push didn't fire).
+        assert_eq!(state.ce_idx, 191);
     }
 
     #[test]
