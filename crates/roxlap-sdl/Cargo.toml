@@ -13,8 +13,12 @@ name = "roxlap-sdl"
 path = "src/main.rs"
 
 [dependencies]
-# Real SDL2 dep added in stage R3.
-# sdl2 = "0.36"
+roxlap-core = { path = "../roxlap-core" }
+# SDL2 binding. Default features cover the basic video / event surface
+# we need; `bundled` (would compile SDL2 from source) is intentionally
+# off because the workspace's flake.nix already supplies SDL2 + pkg-
+# config in the dev shell.
+sdl2 = "0.36"
 
 [lints]
 workspace = true
