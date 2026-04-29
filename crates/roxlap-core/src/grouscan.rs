@@ -74,10 +74,35 @@ pub struct GrouscanPrologue {
     /// `ngxmax` = `min(gxmax, gxmip)` when multiple mips exist; for
     /// `gmipnum == 1` this just equals `gxmax`.
     pub ngxmax: i32,
+    /// Which draw phase the prologue's initial-dispatch picked. R4.3e+
+    /// will branch into the corresponding fill loop; R4.3d ships
+    /// only the stubs.
+    pub dispatch: InitialDispatch,
 }
 
-/// Run grouscan for one ray. R4.3c stops after the prologue and
-/// returns the snapshot; R4.3d+ adds the dispatch loop.
+/// Voxlap's `v == *ixy_sptr_col ? drawflor : drawceil` initial
+/// dispatch (`voxlap5.c:11640-11641`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialDispatch {
+    /// Camera sits *above* the first slab in this column — render
+    /// the floor of the first slab as seen from below.
+    DrawFlor,
+    /// Camera is in an air gap *between* slabs — render the ceiling
+    /// of the slab immediately below it.
+    DrawCeil,
+}
+
+/// Run grouscan for one ray.
+///
+/// `vptr_offset` is the byte offset within the camera-column's slab
+/// list where voxlap's `gstartv` lands (`0` when the camera is in
+/// the air *above* the first slab; `> 0` when in an interior air
+/// gap). The C source compares `v == *ixy_sptr_col`; here we just
+/// check the offset directly.
+///
+/// R4.3c shipped the prologue. R4.3d (this commit) adds the
+/// initial dispatch and stubs the four draw phases. R4.3e+ fleshes
+/// out the fill loops.
 ///
 /// Side effects on `scratch`:
 /// - `gpz[lane] += gdz[lane]` (voxlap's first column advance, baked
@@ -87,7 +112,12 @@ pub struct GrouscanPrologue {
 // returns the prologue snapshot so the prologue's behaviour is
 // unit-testable in isolation.
 #[must_use]
-pub fn grouscan_run(scratch: &mut ScanScratch, gxmip: i32, gmipnum: u32) -> GrouscanPrologue {
+pub fn grouscan_run(
+    scratch: &mut ScanScratch,
+    vptr_offset: usize,
+    gxmip: i32,
+    gmipnum: u32,
+) -> GrouscanPrologue {
     // --- Cache cf[128] state. Voxlap5.c:11601-11606. ---
     let c = scratch.cf[CF_SEED_INDEX];
     let z0 = c.z0;
@@ -112,6 +142,18 @@ pub fn grouscan_run(scratch: &mut ScanScratch, gxmip: i32, gmipnum: u32) -> Grou
     // First column advance — voxlap's `gpz[lane] += gdz[lane]`.
     scratch.gpz[lane] = scratch.gpz[lane].wrapping_add(scratch.gdz[lane]);
 
+    // --- Initial dispatch. Voxlap5.c:11640-11641. ---
+    let dispatch = if vptr_offset == 0 {
+        // v == *ixy_sptr_col → camera is at the top of the slab list.
+        // R4.3d stub: would jump to drawflor; R4.3e fills it in.
+        draw_flor_stub(scratch);
+        InitialDispatch::DrawFlor
+    } else {
+        // Camera in interior air gap. R4.3d stub.
+        draw_ceil_stub(scratch);
+        InitialDispatch::DrawCeil
+    };
+
     GrouscanPrologue {
         z0,
         z1,
@@ -123,7 +165,44 @@ pub fn grouscan_run(scratch: &mut ScanScratch, gxmip: i32, gmipnum: u32) -> Grou
         ogx,
         gx,
         ngxmax,
+        dispatch,
     }
+}
+
+// --- Draw-phase stubs (R4.3d). All return immediately; R4.3e+
+//     replaces each body with the real fill loop ported from
+//     voxlap5.c:11643..11800-area. They take `&mut ScanScratch` so
+//     the eventual real implementations can write into radar /
+//     advance gscanptr / mutate the cf stack. ---
+
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn draw_fwall_stub(_scratch: &mut ScanScratch) {
+    // R4.3e: front-wall fill (voxlap5.c:11643).
+}
+
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn draw_cwall_stub(_scratch: &mut ScanScratch) {
+    // R4.3e: ceiling-wall fill (voxlap5.c:11681).
+}
+
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn draw_ceil_stub(_scratch: &mut ScanScratch) {
+    // R4.3e: ceiling fill (voxlap5.c:11740).
+}
+
+#[allow(clippy::needless_pass_by_ref_mut)]
+fn draw_flor_stub(_scratch: &mut ScanScratch) {
+    // R4.3e: floor fill (voxlap5.c:11765).
+}
+
+// Silence dead_code lints on the not-yet-dispatched stubs. Each will
+// fire from R4.3e+ once the inter-phase gotos are wired.
+#[allow(dead_code)]
+fn _ensure_stubs_referenced(scratch: &mut ScanScratch) {
+    draw_fwall_stub(scratch);
+    draw_cwall_stub(scratch);
+    draw_ceil_stub(scratch);
+    draw_flor_stub(scratch);
 }
 
 #[cfg(test)]
@@ -152,7 +231,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         s.gxmax = 999_999;
-        let p = grouscan_run(&mut s, 50_000, 1);
+        let p = grouscan_run(&mut s, 0, 50_000, 1);
         assert_eq!(p.z0, 5);
         assert_eq!(p.z1, 50);
         assert_eq!(p.cx0, 100);
@@ -167,14 +246,14 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
-        let p = grouscan_run(&mut s, 1, 1);
+        let p = grouscan_run(&mut s, 0, 1, 1);
         assert_eq!(p.lane, 0);
 
         // Reverse: gpz[1] = 500 < gpz[0] = 800 → lane 1 wins.
         let mut s = fresh_scratch();
         s.gpz = [800, 500];
         s.gdz = [10, 20];
-        let p = grouscan_run(&mut s, 1, 1);
+        let p = grouscan_run(&mut s, 0, 1, 1);
         assert_eq!(p.lane, 1);
     }
 
@@ -184,7 +263,7 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [1_000, 2_000];
         s.gdz = [256, 999];
-        let _ = grouscan_run(&mut s, 1, 1);
+        let _ = grouscan_run(&mut s, 0, 1, 1);
         assert_eq!(s.gpz[0], 1_256);
         // Lane 1 is untouched.
         assert_eq!(s.gpz[1], 2_000);
@@ -197,7 +276,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         s.gxmax = 1_000_000;
-        let p = grouscan_run(&mut s, 50_000, 2);
+        let p = grouscan_run(&mut s, 0, 50_000, 2);
         assert_eq!(p.ngxmax, 50_000);
 
         // Single-mip case: ngxmax = gxmax regardless of gxmip.
@@ -205,8 +284,27 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         s.gxmax = 1_000_000;
-        let p = grouscan_run(&mut s, 50_000, 1);
+        let p = grouscan_run(&mut s, 0, 50_000, 1);
         assert_eq!(p.ngxmax, 1_000_000);
+    }
+
+    #[test]
+    fn dispatch_drawflor_when_camera_at_top_of_column() {
+        let mut s = fresh_scratch();
+        s.gpz = [1_000, 2_000];
+        s.gdz = [10, 20];
+        let p = grouscan_run(&mut s, 0, 1, 1);
+        assert_eq!(p.dispatch, InitialDispatch::DrawFlor);
+    }
+
+    #[test]
+    fn dispatch_drawceil_when_camera_in_interior_air_gap() {
+        let mut s = fresh_scratch();
+        s.gpz = [1_000, 2_000];
+        s.gdz = [10, 20];
+        // vptr_offset > 0 → camera in interior.
+        let p = grouscan_run(&mut s, 16, 1, 1);
+        assert_eq!(p.dispatch, InitialDispatch::DrawCeil);
     }
 
     #[test]
@@ -215,7 +313,7 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [0x1234_5678, 0x7FFF_FFFF];
         s.gdz = [0, 0];
-        let p = grouscan_run(&mut s, 1, 1);
+        let p = grouscan_run(&mut s, 0, 1, 1);
         assert_eq!(p.lane, 0);
         // 0x1234_0000 fits i32 positively (high bit clear).
         assert_eq!(p.ogx, 0x1234_0000_i32);
