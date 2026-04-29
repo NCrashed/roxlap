@@ -1367,11 +1367,49 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     Phase::Done
 }
 
-/// `startsky` — voxlap5.c:12120. R4.3e4 ships the body; R4.3e3
-/// stubs to [`Phase::Done`] so a remiporend → startsky route
-/// terminates the state machine cleanly.
-#[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_startsky(_state: &mut GrouscanState<'_>) -> Phase {
+/// `startsky` — voxlap5.c:12120-12190. Drains every remaining
+/// cfasm entry's pixel range with sky values.
+///
+/// Voxlap's body forks on `skyoff`:
+/// - `skyoff == 0` (no sky texture loaded): solid fill —
+///   write `skycast` into each radar slot in the entry's
+///   `[i0, i1]` range.
+/// - `skyoff != 0` (textured sky): per-pixel latitude search
+///   into the `skylat` table, write `sky_tex[edi]`.
+///
+/// R4.3e4 ports only the solid-fill branch (the engine's
+/// startup default) — that's all the oracle scenes exercise.
+/// Textured sky support is R4.4 work in PORTING-RUST.md.
+//
+// `p as usize` cast is intentional: `p` walks an `isize` range
+// `[i0, i1]` where both ends were checked non-negative inside
+// the loop above (i0 > i1 short-circuits, and CfType.i0/i1 are
+// always set to non-negative values by the rest of grouscan).
+#[allow(clippy::cast_sign_loss)]
+fn phase_startsky(state: &mut GrouscanState<'_>) -> Phase {
+    // Voxlap5.c:12125-12126. c starts at the seed slot; if the
+    // stack already drained below it, retsub.
+    if CF_SEED_INDEX > state.ce_idx {
+        return Phase::Done;
+    }
+
+    // Solid-fill branch (skyoff == 0). Write skycast into every
+    // radar slot from c->i0 to c->i1 inclusive, for each cf
+    // entry in [cf[128], ce].
+    let skycast = state.scratch.skycast;
+    for c_idx in CF_SEED_INDEX..=state.ce_idx {
+        let i0 = state.scratch.cf[c_idx].i0;
+        let i1 = state.scratch.cf[c_idx].i1;
+        // Empty range if i0 > i1 — RangeInclusive correctly skips.
+        if i0 > i1 {
+            continue;
+        }
+        for p in i0..=i1 {
+            if let Some(slot) = state.scratch.radar.get_mut(p as usize) {
+                *slot = skycast;
+            }
+        }
+    }
     Phase::Done
 }
 
@@ -2094,6 +2132,63 @@ mod tests {
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 4);
         state.gmipcnt = 0;
         assert_eq!(phase_remiporend(&mut state), Phase::Done);
+    }
+
+    #[test]
+    fn startsky_returns_done_when_stack_below_seed() {
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        // ce_idx below seed (defensive — unreachable in normal flow,
+        // but voxlap explicitly guards `if (c > ce) goto retsub`).
+        state.ce_idx = CF_SEED_INDEX - 1;
+        assert_eq!(phase_startsky(&mut state), Phase::Done);
+    }
+
+    #[test]
+    fn startsky_solid_fills_radar_with_skycast() {
+        let mut s = fresh_scratch();
+        let sky_col_bits: u32 = 0x80AB_CDEF;
+        s.set_skycast(sky_col_bits.cast_signed(), 0x7FFF_FFFF);
+        // Seed cf[128] with a 4-slot pixel range [10..=13].
+        s.cf[CF_SEED_INDEX].i0 = 10;
+        s.cf[CF_SEED_INDEX].i1 = 13;
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        // Single entry at the seed slot.
+        state.ce_idx = CF_SEED_INDEX;
+
+        assert_eq!(phase_startsky(&mut state), Phase::Done);
+
+        for p in 10usize..=13 {
+            assert_eq!(state.scratch.radar[p].col, sky_col_bits.cast_signed());
+            assert_eq!(state.scratch.radar[p].dist, 0x7FFF_FFFF);
+        }
+        // Outside the range untouched (default 0).
+        assert_eq!(state.scratch.radar[9].col, 0);
+        assert_eq!(state.scratch.radar[14].col, 0);
+    }
+
+    #[test]
+    fn startsky_walks_multiple_cf_entries() {
+        let mut s = fresh_scratch();
+        s.set_skycast(0x1234_5678, 0);
+        s.cf[CF_SEED_INDEX].i0 = 0;
+        s.cf[CF_SEED_INDEX].i1 = 1;
+        s.cf[CF_SEED_INDEX + 1].i0 = 5;
+        s.cf[CF_SEED_INDEX + 1].i1 = 6;
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        state.ce_idx = CF_SEED_INDEX + 1;
+
+        assert_eq!(phase_startsky(&mut state), Phase::Done);
+
+        assert_eq!(state.scratch.radar[0].col, 0x1234_5678);
+        assert_eq!(state.scratch.radar[1].col, 0x1234_5678);
+        // Gap [2, 4] untouched.
+        assert_eq!(state.scratch.radar[2].col, 0);
+        assert_eq!(state.scratch.radar[5].col, 0x1234_5678);
+        assert_eq!(state.scratch.radar[6].col, 0x1234_5678);
     }
 
     #[test]

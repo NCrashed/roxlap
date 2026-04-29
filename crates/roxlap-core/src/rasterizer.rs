@@ -98,6 +98,13 @@ pub struct ScanScratch {
     pub gi0: i32,
     /// `gi1` — voxlap's per-pixel y step coefficient.
     pub gi1: i32,
+
+    /// Voxlap's `skycast` — the `(col, dist)` pair grouscan's
+    /// startsky writes into every remaining radar slot when the
+    /// solid-sky branch fires (textured sky is R4.4 work). The
+    /// engine sets it via [`Self::set_skycast`] before invoking
+    /// the rasterizer; default is opaque black at far depth.
+    pub skycast: CastDat,
 }
 
 impl ScanScratch {
@@ -130,7 +137,15 @@ impl ScanScratch {
             gxmax: 0,
             gi0: 0,
             gi1: 0,
+            skycast: CastDat::default(),
         }
+    }
+
+    /// Engine-side setter for the sky `(col, dist)` pair. Engine
+    /// owns `Engine::sky_color`; this is the wire it writes to so
+    /// `grouscan`'s startsky has the right value at fill time.
+    pub fn set_skycast(&mut self, col: i32, dist: i32) {
+        self.skycast = CastDat { col, dist };
     }
 
     /// Reset cursors at the start of a new quadrant scan.
