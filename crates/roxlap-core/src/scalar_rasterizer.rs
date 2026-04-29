@@ -346,8 +346,16 @@ mod tests {
         };
         let settings = OpticastSettings::for_oracle_framebuffer(640, 480);
         // Single solid slab at z = 200..254. cz = 128 < 200 →
-        // air-above-the-slab, opticast renders.
+        // air-above-the-slab, opticast renders. Synthetic world:
+        // only the camera's column (1024 * 2048 + 1024) holds the
+        // slab; every other column is empty.
         let column = vec![0u8, 200, 254, 0];
+        let cam_idx = 1024usize * 2048 + 1024;
+        let mut column_offsets = vec![0u32; 2048 * 2048 + 1];
+        let column_len_u32 = u32::try_from(column.len()).expect("column fits u32");
+        for offset in &mut column_offsets[(cam_idx + 1)..] {
+            *offset = column_len_u32;
+        }
 
         let outcome = opticast_fn(
             &mut rasterizer,
@@ -356,6 +364,7 @@ mod tests {
             &settings,
             2048,
             &column,
+            &column_offsets,
         );
         assert_eq!(outcome, crate::OpticastOutcome::Rendered);
 

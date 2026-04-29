@@ -44,10 +44,15 @@ struct App {
     /// frames. Sized at app construction for the initial window
     /// resolution; resized on window-resize.
     scratch: ScanScratch,
-    /// Synthetic single-slab column the placeholder gline ignores
-    /// but `opticast` checks via `camera_column_air_gap`. Moves up
-    /// the priority list once R4.3b loads a real `.vxl` world.
-    column_data: Vec<u8>,
+    /// Synthetic world data — `slab_buf` holds the camera column's
+    /// single solid slab at z = 200..254; `column_offsets` maps the
+    /// camera's column to that slab and every other column to
+    /// empty. The placeholder gline ignores both; `opticast` reads
+    /// `slab_buf[column_offsets[camera_column_index]..]` for the
+    /// camera-column air-gap check. Replaced by an actual `.vxl`
+    /// world once R4.3a-rewire-4 lands.
+    slab_buf: Vec<u8>,
+    column_offsets: Vec<u32>,
 }
 
 impl ApplicationHandler for App {
@@ -135,7 +140,8 @@ impl ApplicationHandler for App {
                         &cam,
                         &settings,
                         VSID,
-                        &self.column_data,
+                        &self.slab_buf,
+                        &self.column_offsets,
                     );
                 }
                 buffer.present().expect("softbuffer: present");
@@ -149,18 +155,31 @@ impl ApplicationHandler for App {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
+
+    // Synthetic single-slab world: only the camera's column at
+    // (1024, 1024) holds the solid slab z = 200..254; every other
+    // column is empty. `column_offsets[i]` is the byte offset
+    // into `slab_buf` where column `i`'s slabs start; the slice
+    // length `column_offsets[i + 1] - column_offsets[i]` is 0 for
+    // all empty columns and `slab_buf.len()` for the camera's
+    // column.
+    let slab_buf: Vec<u8> = vec![0u8, 200, 254, 0];
+    let cam_col_idx: usize = 1024 * (VSID as usize) + 1024;
+    let vsid_sq: usize = (VSID as usize) * (VSID as usize);
+    let mut column_offsets = vec![0u32; vsid_sq + 1];
+    let slab_len_u32 = u32::try_from(slab_buf.len()).expect("slab_buf fits u32");
+    for offset in &mut column_offsets[(cam_col_idx + 1)..] {
+        *offset = slab_len_u32;
+    }
+
     let mut app = App {
         window: None,
         surface: None,
         engine: Engine::new(),
         zbuffer: Vec::new(),
         scratch: ScanScratch::new_for_size(WIDTH, HEIGHT, VSID),
-        // Single-slab synthetic column at z = 200..254. The placeholder
-        // gline doesn't read this, but opticast's camera_column_air_gap
-        // walks it to confirm the camera (z = 128) is in air above
-        // the slab; otherwise opticast would early-out and skip
-        // rendering.
-        column_data: vec![0u8, 200, 254, 0],
+        slab_buf,
+        column_offsets,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

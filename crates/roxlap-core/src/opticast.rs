@@ -88,9 +88,13 @@ pub enum OpticastOutcome {
 /// - `camera`: pose to render from.
 /// - `settings`: framebuffer + projection + scan-dist constants.
 /// - `vsid`: world dimension (square map).
-/// - `camera_column_data`: raw slab bytes for the column the camera
-///   sits in. The orchestrator only reads this column; per-screen-
-///   pixel column data is the rasterizer trait's concern (R4.3+).
+/// - `slab_buf` + `column_offsets`: world-level voxel data —
+///   `slab_buf` is the flat byte buffer holding all columns'
+///   slab lists concatenated; `column_offsets[i]` is the byte
+///   offset where column `i`'s slabs start.
+///   `column_offsets.len()` must equal `vsid * vsid + 1` (the
+///   final entry is `slab_buf.len()`, so column slices are
+///   `slab_buf[column_offsets[i]..column_offsets[i + 1]]`).
 ///
 /// Whatever real or stub [`Rasterizer`] is plugged in receives the
 /// `gline` / `hrend` / `vrend` calls the four-quadrant scan loops
@@ -110,7 +114,8 @@ pub fn opticast<R: Rasterizer>(
     camera: &Camera,
     settings: &OpticastSettings,
     vsid: u32,
-    camera_column_data: &[u8],
+    slab_buf: &[u8],
+    column_offsets: &[u32],
 ) -> OpticastOutcome {
     let cs = camera_math::derive(
         camera,
@@ -130,9 +135,14 @@ pub fn opticast<R: Rasterizer>(
     );
 
     // gstartv walk — early-out if the camera is inside solid voxel
-    // material. The returned air-gap range is also what the
-    // rasterizer's gline implementation will consume in R4.3 to
-    // bound the slab walk; for R4.1g we just check presence.
+    // material. Slice `slab_buf` at the camera column's range
+    // (computed by the prelude as `column_index = li_pos.y * vsid +
+    // li_pos.x`); a malformed or out-of-bounds offset table is
+    // treated as "camera in solid" so we early-out cleanly.
+    let camera_column = camera_column_slice(slab_buf, column_offsets, prelude.column_index);
+    let Some(camera_column_data) = camera_column else {
+        return OpticastOutcome::SkippedCameraInSolid;
+    };
     if column_walk::camera_column_air_gap(camera_column_data, prelude.li_pos[2]).is_none() {
         return OpticastOutcome::SkippedCameraInSolid;
     }
@@ -169,6 +179,27 @@ pub fn opticast<R: Rasterizer>(
     left_quadrant(rasterizer, scratch, &ctx);
 
     OpticastOutcome::Rendered
+}
+
+/// Slice `slab_buf` at column `idx`'s byte range (per the
+/// `column_offsets` table). Returns `None` if the index is out of
+/// range or the offsets are malformed (non-monotonic, past the
+/// buffer end). Treated as camera-in-solid by the caller.
+fn camera_column_slice<'a>(
+    slab_buf: &'a [u8],
+    column_offsets: &[u32],
+    idx: u32,
+) -> Option<&'a [u8]> {
+    let i = idx as usize;
+    if i + 1 >= column_offsets.len() {
+        return None;
+    }
+    let start = column_offsets[i] as usize;
+    let end = column_offsets[i + 1] as usize;
+    if start > end || end > slab_buf.len() {
+        return None;
+    }
+    Some(&slab_buf[start..end])
 }
 
 #[cfg(test)]
@@ -212,15 +243,52 @@ mod tests {
         }
     }
 
+    /// Build a `(slab_buf, column_offsets)` pair where one column —
+    /// `camera_column_index` — holds `column_data`'s bytes and
+    /// every other column is empty. Lets opticast tests target the
+    /// camera column without allocating per-column slab data for
+    /// the full `vsid²` grid.
+    #[allow(clippy::cast_possible_truncation)]
+    fn synthetic_world_with_camera_column(
+        column_data: &[u8],
+        camera_column_index: u32,
+        vsid: u32,
+    ) -> (Vec<u8>, Vec<u32>) {
+        let vsid_sq = (vsid as usize) * (vsid as usize);
+        let len_u32 = column_data.len() as u32;
+        let cam_idx = camera_column_index as usize;
+        let mut column_offsets = vec![0u32; vsid_sq + 1];
+        for offset in &mut column_offsets[(cam_idx + 1)..] {
+            *offset = len_u32;
+        }
+        (column_data.to_vec(), column_offsets)
+    }
+
+    /// `looking_down_camera` at pos = (1024, 1024) with vsid = 2048
+    /// → `column_index` = 1024 * 2048 + 1024 = `2_099_200`.
+    const LOOKING_DOWN_COL_INDEX: u32 = 1024 * 2048 + 1024;
+
     #[test]
     fn opticast_dispatches_all_four_quadrants() {
         let cam = looking_down_camera();
         let settings = OpticastSettings::for_oracle_framebuffer(640, 480);
         let mut counts = Counts::default();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
-        let column = solid_slab_z200_to_254();
+        let (slab_buf, column_offsets) = synthetic_world_with_camera_column(
+            &solid_slab_z200_to_254(),
+            LOOKING_DOWN_COL_INDEX,
+            2048,
+        );
 
-        let outcome = opticast(&mut counts, &mut scratch, &cam, &settings, 2048, &column);
+        let outcome = opticast(
+            &mut counts,
+            &mut scratch,
+            &cam,
+            &settings,
+            2048,
+            &slab_buf,
+            &column_offsets,
+        );
 
         assert_eq!(outcome, OpticastOutcome::Rendered);
         // Looking-down camera: each quadrant fires. gline counts ≈
@@ -241,9 +309,21 @@ mod tests {
         let settings = OpticastSettings::for_oracle_framebuffer(640, 480);
         let mut counts = Counts::default();
         let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
-        let column = solid_slab_z200_to_254();
+        let (slab_buf, column_offsets) = synthetic_world_with_camera_column(
+            &solid_slab_z200_to_254(),
+            LOOKING_DOWN_COL_INDEX,
+            2048,
+        );
 
-        let outcome = opticast(&mut counts, &mut scratch, &cam, &settings, 2048, &column);
+        let outcome = opticast(
+            &mut counts,
+            &mut scratch,
+            &cam,
+            &settings,
+            2048,
+            &slab_buf,
+            &column_offsets,
+        );
 
         assert_eq!(outcome, OpticastOutcome::SkippedCameraInSolid);
         assert_eq!(counts.gline, 0);
