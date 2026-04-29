@@ -12,7 +12,26 @@
 //! - **R4.1f2..f4**: rasterizer trait + per-quadrant drivers (top,
 //!   right, bottom, left).
 
+use crate::fixed::{isshldiv16safe, lbound0, mulshr16, shldiv16};
+use crate::opticast_prelude::OpticastPrelude;
 use crate::projection::ProjectionRect;
+use crate::rasterizer::{Rasterizer, ScanScratch};
+use crate::ray_step::RayStep;
+
+/// Per-frame state the four-quadrant scan loops read. Bundling it
+/// keeps the per-quadrant driver signatures from sprouting eight
+/// arguments each. None of the borrows are mutable — the loops only
+/// produce calls through the [`Rasterizer`] trait + side effects on
+/// [`ScanScratch`].
+#[derive(Debug, Clone, Copy)]
+pub struct ScanContext<'a> {
+    pub proj: &'a ProjectionRect,
+    pub rs: &'a RayStep,
+    pub prelude: &'a OpticastPrelude,
+    pub xres: i32,
+    pub yres: i32,
+    pub anginc: i32,
+}
 
 /// Clip a vertical-direction line `(x0, y0) → (x1, y1)` against the
 /// viewport's x-bounds, then clamp the start endpoint to the
@@ -91,6 +110,150 @@ pub fn hline_clip(x0: f32, y0: f32, x1: f32, y1: f32, grd: f32, p: &ProjectionRe
 
     let ix0 = ix0_raw.clamp(p.iwx0, p.iwx1);
     (ix0, ix1)
+}
+
+/// Drive the **top quadrant** scan — the fan rooted at the projection
+/// centre `(cx, cy)` opening upward to the viewport's top edge.
+///
+/// Port of `voxlap5.c:opticast` lines 2373..2406. Two passes:
+///
+/// 1. **Ray cast pass.** Issue `j` rays via `vline_clip` + the
+///    rasterizer's `gline`. Each ray's hit-record range is recorded in
+///    `scratch.angstart[i]` so the scanline pass can dereference it.
+/// 2. **Scanline pass.** For each screen row `sy` from `cy` upward,
+///    compute the column range `(p0, p1)` that maps into this fan and
+///    dispatch `rasterizer.hrend(p0, sy, p1, u, ui, i)`. The `u` /
+///    `ui` are voxlap's `shldiv16`-based fixed-point per-pixel
+///    counters that the SSE rasterizers (R5) consume.
+///
+/// Early-out when `proj.fy >= 0` (no fan above `cy`) or `j == 0` (no
+/// pixels wide enough to scan), matching voxlap's outer guard
+/// (`(fy < 0) && (j > 0)`).
+//
+// Length / arg count: the math is dense and one-shot. Splitting into
+// helper functions hides the relationship between voxlap's source and
+// this port; readers cross-checking against voxlap5.c benefit from a
+// single contiguous body. See PORTING-RUST.md / R4.1f3 for context.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    clippy::too_many_lines
+)]
+pub fn top_quadrant<R: Rasterizer>(
+    rasterizer: &mut R,
+    scratch: &mut ScanScratch,
+    ctx: &ScanContext<'_>,
+) {
+    let p = ctx.proj;
+    let rs = ctx.rs;
+    let forward_z_sign = ctx.prelude.forward_z_sign;
+
+    let j_count = ((p.x1 - p.x0) / ctx.anginc as f32).round_ties_even() as i32;
+    if p.fy >= 0.0 || j_count <= 0 {
+        return;
+    }
+
+    let ff_x = (p.x1 - p.x0) / j_count as f32;
+    let grd = 1.0 / (p.wy0 - p.cy);
+
+    // Voxlap stamps -giforzsgn into skycurdir at the start of every
+    // quadrant; reset_for_quadrant takes care of the cursor + sign.
+    scratch.reset_for_quadrant(-forward_z_sign);
+
+    // -- Pass 1: cast j_count rays from (cx, cy) toward y = wy0. --
+    let mut f_ray = p.x0 + ff_x * 0.5;
+    for i in 0..j_count as usize {
+        let (iy0, iy1) = vline_clip(p.cx, p.cy, f_ray, p.wy0, grd, p);
+
+        // angstart[i] = gscanptr ± (p0 / p1) per giforzsgn — voxlap's
+        // pointer-arithmetic stores a `castdat*` that may land before
+        // radar[0]. Mirror with isize.
+        let gscan = scratch.gscanptr as isize;
+        scratch.angstart[i] = if forward_z_sign < 0 {
+            gscan + iy0 as isize
+        } else {
+            gscan - iy1 as isize
+        };
+
+        // Issue gline. Endpoints are projected back to the screen
+        // x = (iy - wy0) * dxy + f_ray (voxlap's vline formula).
+        let length = iy1.abs_diff(iy0);
+        let dxy = (f_ray - p.cx) * grd;
+        let cast_x0 = (iy0 as f32 - p.wy0) * dxy + f_ray;
+        let cast_x1 = (iy1 as f32 - p.wy0) * dxy + f_ray;
+        rasterizer.gline(scratch, length, cast_x0, iy0 as f32, cast_x1, iy1 as f32);
+
+        // Advance gscanptr by |iy1 - iy0| + 1 castdat slots.
+        scratch.gscanptr += length as usize + 1;
+
+        f_ray += ff_x;
+    }
+
+    // -- Pass 2: scanline rasterization. --
+    // Voxlap shifts j into Q16 fixed-point; range stays in i32 for
+    // realistic xres.
+    let j_fixed = j_count << 16;
+    let f_scale = j_fixed as f32 / ((p.x1 - p.x0) * grd);
+    let kadd = ((p.cx - p.x0) * grd * f_scale).round_ties_even() as i32;
+
+    let p1_init = (p.cx - 0.5).round_ties_even() as i32;
+    let mut p0 = lbound0(p1_init + 1, ctx.xres);
+    let mut p1 = lbound0(p1_init, ctx.xres);
+
+    let mut sy = (p.cy - 0.50005).round_ties_even() as i32;
+    if sy >= ctx.yres {
+        sy = ctx.yres - 1;
+    }
+
+    // Anti-crash: voxlap's float-overflow guard. Step sy down until
+    // ftol(f_scale) won't push (sy<<16)-cy16 into a value the
+    // shldiv16 below would overflow on.
+    let ff_check = ((p1 as f32 - p.cx).abs() + 1.0) * f_scale / 2_147_483_647.0 + p.cy;
+    while ff_check < sy as f32 && sy >= 0 {
+        sy -= 1;
+    }
+    if sy < 0 {
+        return;
+    }
+
+    let kmul = f_scale.round_ties_even() as i32;
+    while sy >= 0 {
+        if isshldiv16safe(kmul, (sy << 16) - rs.cy16) != 0 {
+            break;
+        }
+        sy -= 1;
+    }
+
+    // Ray index `i` walks paired with `sy`. Sign of step matches
+    // -giforzsgn (i.e. when looking up sy decreases, i increases for
+    // -1 sign or decreases for +1 sign).
+    let mut i = if forward_z_sign < 0 { -sy } else { sy };
+    while sy >= 0 {
+        let ui = shldiv16(kmul, (sy << 16) - rs.cy16);
+        let mut u = mulshr16((p0 << 16) - rs.cx16, ui) + kadd;
+
+        // Walk p0 left while the ray index is past the previous one.
+        while p0 > 0 && u >= ui {
+            u -= ui;
+            p0 -= 1;
+        }
+        // Walk p1 right until the ray index passes the j_fixed cap.
+        let mut u1 = (p1 - p0) * ui + u;
+        while p1 < ctx.xres && u1 < j_fixed {
+            u1 += ui;
+            p1 += 1;
+        }
+
+        if p0 < p1 {
+            rasterizer.hrend(scratch, p0, sy, p1, u, ui, i);
+        }
+
+        sy -= 1;
+        i -= forward_z_sign;
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +385,153 @@ mod tests {
         let (ix0, ix1) = hline_clip(-1000.0, 10.0, -500.0, 20.0, grd, &p);
         assert_eq!(ix0, p.iwx0);
         assert_eq!(ix1, -500);
+    }
+
+    // --- top quadrant tests ---
+
+    use crate::opticast_prelude;
+    use crate::rasterizer::{Rasterizer, ScanScratch};
+    use crate::ray_step;
+
+    /// Recording rasterizer that counts gline / hrend / vrend calls
+    /// and stores them as flat events for assertions.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        gline_calls: u32,
+        hrend_calls: u32,
+        vrend_calls: u32,
+        first_hrend: Option<(i32, i32, i32)>, // (sx, sy, p1) snapshot
+    }
+
+    impl Rasterizer for Recorder {
+        fn gline(&mut self, _: &mut ScanScratch, _: u32, _: f32, _: f32, _: f32, _: f32) {
+            self.gline_calls += 1;
+        }
+        fn hrend(&mut self, _: &ScanScratch, sx: i32, sy: i32, p1: i32, _: i32, _: i32, _: i32) {
+            if self.first_hrend.is_none() {
+                self.first_hrend = Some((sx, sy, p1));
+            }
+            self.hrend_calls += 1;
+        }
+        fn vrend(&mut self, _: &ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32) {
+            self.vrend_calls += 1;
+        }
+    }
+
+    /// Build a `ScanContext` for a "looking down" camera at the
+    /// origin of a 2048-wide world. cx/cy land at viewport centre, so
+    /// all four quadrant fans are non-trivial — the top fan in
+    /// particular covers the half of the screen above y = cy = 240.
+    fn looking_down_context() -> (
+        crate::projection::ProjectionRect,
+        crate::ray_step::RayStep,
+        crate::opticast_prelude::OpticastPrelude,
+    ) {
+        let cam = crate::Camera {
+            pos: [1024.0, 1024.0, 128.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
+        let proj = crate::projection::derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1);
+        let rs = ray_step::derive_ray_step(&s, proj.cx, proj.cy, 320.0);
+        let prelude = opticast_prelude::derive_prelude(&s, 2048, 1, 4, 1024);
+        (proj, rs, prelude)
+    }
+
+    #[test]
+    fn top_quadrant_skips_when_centre_below_top_edge() {
+        // Construct a synthetic ProjectionRect with cy way above wy0
+        // (centre is far above the viewport — fy = wy0 - cy is large
+        // positive, NOT < 0). This is the early-out case.
+        let (proj_lookdown, rs, prelude) = looking_down_context();
+        let mut proj = proj_lookdown;
+        // Force fy >= 0 by moving cy way up.
+        proj.cy = -1000.0;
+        proj.fy = proj.wy0 - proj.cy; // positive now
+
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        top_quadrant(&mut rec, &mut scratch, &ctx);
+        assert_eq!(rec.gline_calls, 0);
+        assert_eq!(rec.hrend_calls, 0);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn top_quadrant_casts_one_ray_per_anginc_step() {
+        // Looking-down camera: cx = 320, cy = 240. Top fan covers the
+        // [x0, x1] horizontal range above cy. After the corner-cut
+        // pass, x1 - x0 ≈ 2 * sqrt(320 * 240) ≈ 554, plus the ±0.01
+        // bias. j_count = round((x1 - x0) / 1) = ~554.
+        let (proj, rs, prelude) = looking_down_context();
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        top_quadrant(&mut rec, &mut scratch, &ctx);
+        // We don't pin the exact value (anginc rounding + ±0.01 bias),
+        // but the count must be in the expected ballpark of ~ |x1-x0|.
+        let expected = ((proj.x1 - proj.x0) / 1.0).round_ties_even() as u32;
+        assert_eq!(rec.gline_calls, expected);
+    }
+
+    #[test]
+    fn top_quadrant_emits_at_least_one_hrend() {
+        // For the looking-down camera, sy walks downward from cy ≈ 240
+        // through all rows above, so hrend should fire at least once.
+        let (proj, rs, prelude) = looking_down_context();
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        top_quadrant(&mut rec, &mut scratch, &ctx);
+        assert!(rec.hrend_calls > 0, "expected ≥ 1 hrend, got 0");
+        // The first hrend's sy is the topmost row scanned; it should
+        // be ≤ initial sy (= round(cy - 0.50005) = 239).
+        let (_, sy, _) = rec.first_hrend.expect("first hrend recorded");
+        assert!(sy <= 239, "first hrend sy = {sy}, expected ≤ 239");
+    }
+
+    #[test]
+    fn top_quadrant_advances_gscanptr_by_ray_lengths() {
+        // After all rays cast, scratch.gscanptr should equal sum of
+        // (|iy1-iy0|+1) over all rays.
+        let (proj, rs, prelude) = looking_down_context();
+        let mut rec = Recorder::default();
+        let mut scratch = ScanScratch::new_for_size(640);
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 640,
+            yres: 480,
+            anginc: 1,
+        };
+        top_quadrant(&mut rec, &mut scratch, &ctx);
+        // Lower bound: gscanptr advanced at least once per ray (every
+        // ray contributes length+1 ≥ 1).
+        assert!(scratch.gscanptr >= rec.gline_calls as usize);
     }
 }

@@ -35,11 +35,14 @@ pub struct ScanScratch {
     /// All ray-cast hit records, written by `gline` calls and read
     /// indirectly by `hrend` / `vrend` via [`Self::angstart`].
     pub radar: Vec<CastDat>,
-    /// Per-ray index into [`Self::radar`] — what ray `i` should
-    /// dereference for its starting `castdat`. Voxlap stores this as
-    /// a `castdat*` table; integer indices are the natural Rust
-    /// translation given Rust's lack of pointer arithmetic.
-    pub angstart: Vec<usize>,
+    /// Per-ray offset into [`Self::radar`] — voxlap stores this as a
+    /// `castdat*` array and computes entries via `gscanptr ± p0/p1`,
+    /// which can land *before* `radar[0]` (negative offset). The
+    /// scanline rasterizers add a per-pixel `plc` value on top before
+    /// the actual deref, and that combination is always in-range. We
+    /// keep the raw signed offset here to mirror voxlap's pointer
+    /// arithmetic exactly.
+    pub angstart: Vec<isize>,
     /// Cursor into [`Self::radar`] for the next-to-be-written hit
     /// record. Reset to 0 at the start of each quadrant scan.
     pub gscanptr: usize,
@@ -64,7 +67,7 @@ impl ScanScratch {
         let angstart_cap = (xres as usize) * 4;
         Self {
             radar: vec![CastDat::default(); radar_cap],
-            angstart: vec![0usize; angstart_cap],
+            angstart: vec![0isize; angstart_cap],
             gscanptr: 0,
             sky_cur_lng: -1,
             sky_cur_dir: 0,
