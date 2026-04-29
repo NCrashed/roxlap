@@ -11,7 +11,7 @@ project intent and the relationship to
 | 1 | **Pure Rust, no C FFI.** | Eliminates voxlaptest's MASM / inline-asm / MSVC-only baggage. One toolchain (`cargo`). |
 | 2 | **Targets: x86_64, aarch64, wasm32.** | SIMD via `core::arch::*` per architecture; portable scalar fallback as the correctness reference. |
 | 3 | **SDL2 host as the canonical demo.** | Replaces both Voxlaptest's C# frontend and Ken's original `game.c` host. Cross-platform for free. |
-| 4 | **Cargo workspace from day 1.** | `roxlap-core` (engine), `roxlap-formats` (I/O), `roxlap-sdl` (demo). Splittable later (e.g. `roxlap-wasm` web host in R10). |
+| 4 | **Cargo workspace from day 1.** | `roxlap-core` (engine), `roxlap-formats` (I/O), `roxlap-host` (winit + softbuffer demo). Splittable later (e.g. `roxlap-wasm` web host in R10). |
 | 5 | **Bit-exact data format compat with voxlaptest.** | `.vxl`/`.kv6`/`.kfa` produced by voxlaptest's tooling load identically in roxlap and vice versa. |
 | 6 | **Algorithmic correctness validated against voxlaptest's C oracle.** | Image-similarity initially (FP non-associativity tolerable); bit-exact convergence after R5 SSE batches land. |
 | 7 | **License: `MIT OR Apache-2.0`.** | Standard Rust ecosystem dual. README documents Voxlap's separate non-commercial-only license — commercial users contact Ken. |
@@ -23,7 +23,7 @@ project intent and the relationship to
 |---|---|---|
 | **R1** | Repo skeleton: workspace, README, `PORTING-RUST.md`, license files, asset copy. | `cargo build` green, `cargo test` green (zero tests). |
 | **R2** | `.vxl` / `.kv6` / `.kvx` / `.kfa` parsers in `roxlap-formats`. | Byte-equal round-trip parse + re-serialise on `assets/coco.kvx` and procedurally-built `.vxl` fixtures. Header dumps match voxlaptest's loader output. |
-| **R3** | `Engine` public API (framebuffer, camera, render entry point); SDL2 host opens a window and shows sky-blue fill. | `cargo run -p roxlap-sdl` opens a window. End-to-end toolchain works before any rasterizer code lands. |
+| **R3** | `Engine` public API (framebuffer, camera, render entry point); winit + softbuffer host opens a window and shows sky-blue fill. | `cargo run -p roxlap-host` opens a window. End-to-end toolchain works before any rasterizer code lands. |
 | **R4** | Full `opticast` + `grouscan` algorithm port from `grouscanasm_scalar` (scalar Rust). | Renders the same scene voxlaptest does; image-similarity ≥ 99% per terrain pose (RMS pixel diff bounded by FP rounding). |
 | **R5** | x86_64 SSE2 4-pixel rsqrtps batches in the four hot rasterizers (mirror of voxlaptest Stage 4.9). | Re-converges on voxlaptest's CI golden hashes where the rsqrtps approach is bit-equivalent. |
 | **R6** | KV6 sprite renderer (scalar `drawsprite` / `drawboundcube`). | Sprite poses image-similarity ≥ 99%. |

@@ -1,4 +1,4 @@
-//! roxlap-sdl — winit + softbuffer demo host.
+//! roxlap-host — winit + softbuffer demo host.
 //!
 //! Stage R3: opens a window, allocates a softbuffer surface, and on
 //! every `RedrawRequested` event asks the [`Engine`] to render into

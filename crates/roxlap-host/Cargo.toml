@@ -1,5 +1,5 @@
 [package]
-name = "roxlap-sdl"
+name = "roxlap-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,15 +9,14 @@ rust-version.workspace = true
 description = "winit + softbuffer demo host for the roxlap engine."
 
 [[bin]]
-name = "roxlap-sdl"
+name = "roxlap-host"
 path = "src/main.rs"
 
 [dependencies]
 roxlap-core = { path = "../roxlap-core" }
 # winit + softbuffer is a pure-Rust windowing + framebuffer-blit pair
 # that compiles on Linux / Windows / macOS today and on wasm32 once
-# R10 lands. The crate name still says "sdl" — a follow-up renames it
-# to roxlap-host since SDL is no longer involved.
+# R10 lands.
 winit = "0.30"
 softbuffer = "0.4"
 

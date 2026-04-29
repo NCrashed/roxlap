@@ -2,7 +2,7 @@
 members = [
     "crates/roxlap-core",
     "crates/roxlap-formats",
-    "crates/roxlap-sdl",
+    "crates/roxlap-host",
 ]
 resolver = "2"
 

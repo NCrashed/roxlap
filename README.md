@@ -29,7 +29,7 @@ Voxlap. See `PORTING-RUST.md` for the substage roadmap and current status.
 crates/
 ├── roxlap-core/      engine: framebuffer, camera, opticast, grouscan, rasterizers
 ├── roxlap-formats/   .vxl / .kv6 / .kvx / .kfa parsers
-└── roxlap-sdl/       SDL2-hosted demo binary
+└── roxlap-host/      winit + softbuffer demo binary
 ```
 
 ## Relationship to voxlaptest
