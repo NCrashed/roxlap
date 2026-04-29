@@ -157,6 +157,12 @@ pub(crate) struct GrouscanState<'a> {
     /// initialises it; `AfterDeleteKeptPresync` sets it to the
     /// freed slot's index inside deletez).
     pub c_presync_idx: usize,
+
+    /// Voxlap's `ixy_sptr_col` cursor — index into the world's
+    /// per-column slab-pointer array. Mutated by R4.3e2d's column-
+    /// step path via `gixy[lane]`. `gline` seeds it before invoking
+    /// `grouscan_run`; the fill-loop phases never touch it.
+    pub ixy_sptr_col_idx: usize,
 }
 
 impl<'a> GrouscanState<'a> {
@@ -166,6 +172,7 @@ impl<'a> GrouscanState<'a> {
         scratch: &'a mut ScanScratch,
         inputs: &GrouscanInputs<'a>,
         vptr_offset: usize,
+        ixy_sptr_col_idx: usize,
     ) -> Self {
         let c = scratch.cf[CF_SEED_INDEX];
         Self {
@@ -193,6 +200,7 @@ impl<'a> GrouscanState<'a> {
             c_idx: CF_SEED_INDEX,
             ce_idx: CF_SEED_INDEX,
             c_presync_idx: usize::MAX,
+            ixy_sptr_col_idx,
         }
     }
 }
@@ -359,10 +367,11 @@ pub fn grouscan_run(
     scratch: &mut ScanScratch,
     inputs: &GrouscanInputs<'_>,
     vptr_offset: usize,
+    ixy_sptr_col_idx: usize,
     gxmip: i32,
     gmipnum: u32,
 ) -> GrouscanPrologue {
-    let mut state = GrouscanState::from_seed(scratch, inputs, vptr_offset);
+    let mut state = GrouscanState::from_seed(scratch, inputs, vptr_offset, ixy_sptr_col_idx);
 
     // --- ngxmax = min(gxmax, gxmip) when multiple mips exist. ---
     state.ngxmax = state.scratch.gxmax;
@@ -449,12 +458,18 @@ pub enum Phase {
     /// assignment).
     AfterDeleteKeptPresync,
     /// Voxlap5.c:11833. Same-column skip path: swap `ogx ↔ gx`
-    /// (undoing predeletez's swap), sync state between
-    /// `c_presync` and `c` slots, fall to [`Phase::Skipixy3`].
+    /// (undoing predeletez's swap), then fall to
+    /// [`Phase::SyncFromPresync`].
     SkipixyWithPresync,
+    /// Voxlap5.c:11840 (`skipixy2_sync_from_presync`). Saves
+    /// scalars to the `c_presync` slot and loads them from the
+    /// new `c` slot. Reached from [`Phase::SkipixyWithPresync`]
+    /// (intra-column) and — once R4.3e2d lands — from the
+    /// column-step path when `c_presync != c`.
+    SyncFromPresync,
     /// Voxlap5.c:11853. Findslab dispatch: walk slabs to find the
     /// one intersecting the ray frustum, then jump to drawfwall
-    /// (or push a split entry). R4.3e2d/e ships the body; R4.3e2b
+    /// (or push a split entry). R4.3e2d/e ships the body; R4.3e2c
     /// stubs to [`Phase::Done`].
     Skipixy3,
     /// Driver-only: no more work. Returned by the last phase.
@@ -482,6 +497,7 @@ fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
             Phase::AfterDelete => phase_after_delete(state),
             Phase::AfterDeleteKeptPresync => phase_after_delete_kept_presync(state),
             Phase::SkipixyWithPresync => phase_skipixy_with_presync(state),
+            Phase::SyncFromPresync => phase_sync_from_presync(state),
             Phase::Skipixy3 => phase_skipixy3(state),
             Phase::Done => break,
         };
@@ -900,24 +916,29 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     }
 }
 
-/// `skipixy_with_presync` — voxlap5.c:11833-11850. Same-column
-/// skip path:
-/// 1. Swap `ogx ↔ gx` (undoes predeletez's swap; we never
-///    column-stepped so the swap was just bookkeeping for the
-///    column-step path).
-/// 2. `skipixy2_sync_from_presync` (voxlap5.c:11840-11849): save
-///    current scalars to the `c_presync` slot, load scalars from
-///    the new `c` slot. The `i0`/`i1` radar offsets are NOT part
-///    of this swap — they stay at whatever the cf entry already
-///    holds.
-/// 3. Fall through to [`Phase::Skipixy3`] (findslab).
+/// `skipixy_with_presync` — voxlap5.c:11833-11838. Same-column
+/// skip path: undoes predeletez's swap (`ogx ↔ gx`), then falls
+/// through to [`Phase::SyncFromPresync`]. The swap-undo only
+/// fires here because the column-step path overwrites `gx` with
+/// `new_gpz_masked`, making the swap meaningful for that path —
+/// here we stayed in the same column so the swap was just
+/// predeletez bookkeeping.
 fn phase_skipixy_with_presync(state: &mut GrouscanState<'_>) -> Phase {
     std::mem::swap(&mut state.ogx, &mut state.gx);
+    Phase::SyncFromPresync
+}
 
-    // Save current scalars into c_presync. Voxlap's "c_presync is
-    // c+1 here" comment notes presync is always a different slot
-    // than c on this path — so the save/load below is meaningful
-    // (no read-after-write hazard).
+/// `skipixy2_sync_from_presync` — voxlap5.c:11840-11849. Saves
+/// current scalars to the `c_presync` slot and loads them from
+/// the new `c` slot. The `i0`/`i1` radar offsets are NOT part of
+/// this swap — they stay at whatever the cf entry already holds.
+/// Falls through to [`Phase::Skipixy3`] (findslab).
+fn phase_sync_from_presync(state: &mut GrouscanState<'_>) -> Phase {
+    // Save current scalars into c_presync. Voxlap notes "c_presync
+    // is c+1 here" on the same-column path; the column-step path
+    // also enters this phase only when `c_presync != c` (the
+    // equal case skips directly to skipixy3). Either way, the
+    // save/load is on distinct slots → no read-after-write hazard.
     if state.c_presync_idx < state.scratch.cf.len() {
         let presync = &mut state.scratch.cf[state.c_presync_idx];
         presync.z0 = state.z0;
@@ -990,7 +1011,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         s.gxmax = 999_999;
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 50_000, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 50_000, 1);
         assert_eq!(p.z0, 5);
         assert_eq!(p.z1, 50);
         assert_eq!(p.cx0, 100);
@@ -1005,14 +1026,14 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
         assert_eq!(p.lane, 0);
 
         // Reverse: gpz[1] = 500 < gpz[0] = 800 → lane 1 wins.
         let mut s = fresh_scratch();
         s.gpz = [800, 500];
         s.gdz = [10, 20];
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
         assert_eq!(p.lane, 1);
     }
 
@@ -1022,7 +1043,7 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [1_000, 2_000];
         s.gdz = [256, 999];
-        let _ = grouscan_run(&mut s, &dummy_inputs(), 0, 1, 1);
+        let _ = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
         assert_eq!(s.gpz[0], 1_256);
         // Lane 1 is untouched.
         assert_eq!(s.gpz[1], 2_000);
@@ -1035,7 +1056,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         s.gxmax = 1_000_000;
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 50_000, 2);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 50_000, 2);
         assert_eq!(p.ngxmax, 50_000);
 
         // Single-mip case: ngxmax = gxmax regardless of gxmip.
@@ -1043,7 +1064,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         s.gxmax = 1_000_000;
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 50_000, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 50_000, 1);
         assert_eq!(p.ngxmax, 1_000_000);
     }
 
@@ -1114,7 +1135,7 @@ mod tests {
             gylookup,
             gcsub,
         };
-        GrouscanState::from_seed(scratch, &inputs, 0)
+        GrouscanState::from_seed(scratch, &inputs, 0, 0)
     }
 
     fn state_for_drawcwall<'a>(
@@ -1129,7 +1150,7 @@ mod tests {
             gylookup,
             gcsub,
         };
-        GrouscanState::from_seed(scratch, &inputs, vptr_offset)
+        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0)
     }
 
     #[test]
@@ -1244,14 +1265,14 @@ mod tests {
             gylookup,
             gcsub,
         };
-        GrouscanState::from_seed(scratch, &inputs, vptr_offset)
+        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0)
     }
 
     #[test]
     fn predrawceil_swaps_ogx_and_gx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         state.ogx = 0x1111;
         state.gx = 0x2222;
         assert_eq!(phase_pre_draw_ceil(&mut state), Phase::DrawCeil);
@@ -1325,7 +1346,7 @@ mod tests {
     fn predrawflor_swaps_ogx_and_gx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         state.ogx = 0x3333;
         state.gx = 0x4444;
         assert_eq!(phase_pre_draw_flor(&mut state), Phase::DrawFlor);
@@ -1398,7 +1419,7 @@ mod tests {
     fn predeletez_swaps_ogx_and_gx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         state.ogx = 0xAAAA;
         state.gx = 0xBBBB;
         assert_eq!(phase_pre_delete_z(&mut state), Phase::DeleteZ);
@@ -1413,7 +1434,7 @@ mod tests {
         // ce_idx == CF_SEED_INDEX.
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         assert_eq!(state.ce_idx, CF_SEED_INDEX);
         assert_eq!(phase_delete_z(&mut state), Phase::Done);
     }
@@ -1424,7 +1445,7 @@ mod tests {
         // route to AfterDelete.
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         state.ce_idx = CF_SEED_INDEX + 2;
         state.c_idx = CF_SEED_INDEX + 2;
         assert_eq!(phase_delete_z(&mut state), Phase::AfterDelete);
@@ -1450,7 +1471,7 @@ mod tests {
             ..Default::default()
         };
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         state.ce_idx = CF_SEED_INDEX + 2;
         state.c_idx = CF_SEED_INDEX + 1;
         assert_eq!(phase_delete_z(&mut state), Phase::AfterDeleteKeptPresync);
@@ -1464,7 +1485,7 @@ mod tests {
     fn from_seed_initialises_cf_indices_to_seed() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         assert_eq!(state.c_idx, CF_SEED_INDEX);
         assert_eq!(state.ce_idx, CF_SEED_INDEX);
         assert_eq!(state.c_presync_idx, usize::MAX);
@@ -1474,7 +1495,7 @@ mod tests {
     fn afterdelete_sets_presync_and_routes_to_kept() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         state.c_idx = CF_SEED_INDEX + 1;
         state.c_presync_idx = usize::MAX;
         assert_eq!(
@@ -1490,7 +1511,7 @@ mod tests {
         // SkipixyWithPresync (intra-column case).
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         state.c_idx = CF_SEED_INDEX + 1;
         assert_eq!(
             phase_after_delete_kept_presync(&mut state),
@@ -1505,20 +1526,38 @@ mod tests {
         // path (R4.3e2c stub returns Done).
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         state.c_idx = CF_SEED_INDEX;
         assert_eq!(phase_after_delete_kept_presync(&mut state), Phase::Done);
         assert_eq!(state.c_idx, CF_SEED_INDEX - 1);
     }
 
     #[test]
-    fn skipixy_with_presync_swaps_ogx_and_syncs_state() {
+    fn skipixy_with_presync_swaps_ogx_and_routes_to_sync() {
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        state.ogx = 0xAAAA;
+        state.gx = 0xBBBB;
+
+        assert_eq!(
+            phase_skipixy_with_presync(&mut state),
+            Phase::SyncFromPresync
+        );
+        // Swap fired.
+        assert_eq!(state.ogx, 0xBBBB);
+        assert_eq!(state.gx, 0xAAAA);
+    }
+
+    #[test]
+    fn sync_from_presync_saves_to_presync_and_loads_from_c() {
         // Two slots: c_presync at 130, c at 129. State scalars hold
         // "current" values (call them A); cf[129] holds different
-        // values (B). After skipixy_with_presync:
-        //   - ogx and gx swapped.
-        //   - cf[130] now holds A (= what state had).
-        //   - state now holds B (= what cf[129] had).
+        // values (B). After sync_from_presync:
+        //   - cf[130] holds A (saved from state).
+        //   - state holds B (loaded from cf[129]).
+        // ogx / gx are NOT touched (that's skipixy_with_presync's
+        // job; column-step path overwrites gx separately).
         let mut s = fresh_scratch();
         s.cf[CF_SEED_INDEX + 1] = CfType {
             i0: 0,
@@ -1531,7 +1570,7 @@ mod tests {
             cy1: 600,
         };
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
         // Working state = "A".
         state.z0 = 1;
         state.z1 = 2;
@@ -1544,11 +1583,11 @@ mod tests {
         state.c_idx = CF_SEED_INDEX + 1;
         state.c_presync_idx = CF_SEED_INDEX + 2;
 
-        assert_eq!(phase_skipixy_with_presync(&mut state), Phase::Skipixy3);
+        assert_eq!(phase_sync_from_presync(&mut state), Phase::Skipixy3);
 
-        // Swap fired.
-        assert_eq!(state.ogx, 0xBBBB);
-        assert_eq!(state.gx, 0xAAAA);
+        // ogx / gx untouched.
+        assert_eq!(state.ogx, 0xAAAA);
+        assert_eq!(state.gx, 0xBBBB);
 
         // c_presync got A.
         let presync = state.scratch.cf[CF_SEED_INDEX + 2];
@@ -1569,11 +1608,19 @@ mod tests {
     }
 
     #[test]
+    fn from_seed_carries_ixy_sptr_col_idx() {
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 42);
+        assert_eq!(state.ixy_sptr_col_idx, 42);
+    }
+
+    #[test]
     fn dispatch_drawflor_when_camera_at_top_of_column() {
         let mut s = fresh_scratch();
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
         assert_eq!(p.dispatch, InitialDispatch::DrawFlor);
     }
 
@@ -1583,7 +1630,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         // vptr_offset > 0 → camera in interior.
-        let p = grouscan_run(&mut s, &dummy_inputs(), 16, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 16, 0, 1, 1);
         assert_eq!(p.dispatch, InitialDispatch::DrawCeil);
     }
 
@@ -1593,7 +1640,7 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [0x1234_5678, 0x7FFF_FFFF];
         s.gdz = [0, 0];
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
         assert_eq!(p.lane, 0);
         // 0x1234_0000 fits i32 positively (high bit clear).
         assert_eq!(p.ogx, 0x1234_0000_i32);
