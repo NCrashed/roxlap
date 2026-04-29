@@ -12,6 +12,7 @@ pub mod camera_math;
 pub mod column_walk;
 mod engine;
 pub mod fixed;
+pub mod opticast;
 pub mod opticast_prelude;
 pub mod projection;
 pub mod rasterizer;
@@ -20,3 +21,4 @@ pub mod scan_loops;
 
 pub use camera::Camera;
 pub use engine::Engine;
+pub use opticast::{opticast, OpticastOutcome, OpticastSettings};
