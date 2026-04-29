@@ -182,6 +182,15 @@ pub(crate) struct GrouscanState<'a> {
     /// step path via `gixy[lane]`. `gline` seeds it before invoking
     /// `grouscan_run`; the fill-loop phases never touch it.
     pub ixy_sptr_col_idx: usize,
+
+    /// Voxlap's `gmipcnt` — current mip level walked. Starts at 0;
+    /// incremented inside `remiporend` each time the column step's
+    /// `gpz > ngxmax` overflow fires. Single-mip rendering
+    /// (`gmipnum == 1`) never increments it.
+    pub gmipcnt: i32,
+    /// Voxlap's `gmipnum` — total mip levels available. Constant
+    /// per ray; copied from `grouscan_run`'s parameter.
+    pub gmipnum: u32,
 }
 
 impl<'a> GrouscanState<'a> {
@@ -192,6 +201,7 @@ impl<'a> GrouscanState<'a> {
         inputs: &GrouscanInputs<'a>,
         vptr_offset: usize,
         ixy_sptr_col_idx: usize,
+        gmipnum: u32,
     ) -> Self {
         let c = scratch.cf[CF_SEED_INDEX];
         Self {
@@ -222,6 +232,8 @@ impl<'a> GrouscanState<'a> {
             ce_idx: CF_SEED_INDEX,
             c_presync_idx: usize::MAX,
             ixy_sptr_col_idx,
+            gmipcnt: 0,
+            gmipnum,
         }
     }
 }
@@ -392,7 +404,8 @@ pub fn grouscan_run(
     gxmip: i32,
     gmipnum: u32,
 ) -> GrouscanPrologue {
-    let mut state = GrouscanState::from_seed(scratch, inputs, vptr_offset, ixy_sptr_col_idx);
+    let mut state =
+        GrouscanState::from_seed(scratch, inputs, vptr_offset, ixy_sptr_col_idx, gmipnum);
 
     // --- ngxmax = min(gxmax, gxmip) when multiple mips exist. ---
     state.ngxmax = state.scratch.gxmax;
@@ -507,8 +520,14 @@ pub enum Phase {
     Findslabloop,
     /// Voxlap5.c:11998. Mip-level transition. Triggered by the
     /// column step when `gpz[lane]` (unsigned) exceeds `ngxmax`.
-    /// R4.3e3 ships the body; R4.3e2d stubs to [`Phase::Done`].
+    /// R4.3e3 ports only the early-out fast-path
+    /// (`gmipcnt + 1 >= gmipnum`) → [`Phase::Startsky`]; the
+    /// full mip-transition body is R4.5 work.
     Remiporend,
+    /// Voxlap5.c:12120. Sky-fill primitive that drains remaining
+    /// cfasm entries with sky pixels. R4.3e4 ships the body;
+    /// R4.3e3 stubs to [`Phase::Done`].
+    Startsky,
     /// Driver-only: no more work. Returned by the last phase.
     Done,
 }
@@ -539,6 +558,7 @@ fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
             Phase::Intoslabloop => phase_intoslabloop(state),
             Phase::Findslabloop => phase_findslabloop(state),
             Phase::Remiporend => phase_remiporend(state),
+            Phase::Startsky => phase_startsky(state),
             Phase::Done => break,
         };
     }
@@ -1317,10 +1337,41 @@ fn column_byte_at(state: &GrouscanState<'_>, offset: usize) -> u8 {
         .unwrap_or(0)
 }
 
-/// `remiporend` — voxlap5.c:11998. Mip-level transition. R4.3e3
-/// ships the body; R4.3e2d stubs to [`Phase::Done`].
+/// `remiporend` — voxlap5.c:11998-12118. Mip-level transition.
+///
+/// R4.3e3 ports only the FIRST check —
+/// `(gmipcnt + 1) >= gmipnum` → goto startsky — which is the
+/// hot path for the oracle scenes (single-mip rendering, where
+/// `gmipnum == 1` and `gmipcnt` starts at 0). The full mip
+/// transition body (`gdz`/`gixy`/`gpz` adjust, `ixy_sptr_col`
+/// re-mask, `gylookoff` shift, cfasm z0/z1 halve, `ngxmax`
+/// double) is
+/// substantial and was originally scoped at R4.5 in the
+/// porting plan; it stays a Done stub here until then.
+//
+// Voxlap's check is `(uint8_t)(gmipcnt + 1) >= (uint8_t)gmipnum`
+// — bytewise compare. For our port the natural i32/u32 widths
+// give the same answer for any realistic mip count (0..32-ish);
+// the byte-cast was an asm artifact.
+#[allow(clippy::cast_sign_loss)]
+fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
+    if (state.gmipcnt + 1) as u32 >= state.gmipnum {
+        return Phase::Startsky;
+    }
+    // R4.5 — full mip transition body. Reaching this branch means
+    // gmipnum > 1 (vxlmipuse > 1 in voxlap terms), which the
+    // oracle scenes don't exercise. Audit the asm `<<29` / `+17`
+    // pointer-stride arithmetic for LP64 (the C port has a
+    // documented bug here, voxlap5.c:12017-12023 area) before
+    // implementing.
+    Phase::Done
+}
+
+/// `startsky` — voxlap5.c:12120. R4.3e4 ships the body; R4.3e3
+/// stubs to [`Phase::Done`] so a remiporend → startsky route
+/// terminates the state machine cleanly.
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_remiporend(_state: &mut GrouscanState<'_>) -> Phase {
+fn phase_startsky(_state: &mut GrouscanState<'_>) -> Phase {
     Phase::Done
 }
 
@@ -1496,7 +1547,7 @@ mod tests {
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
         };
-        GrouscanState::from_seed(scratch, &inputs, 0, 0)
+        GrouscanState::from_seed(scratch, &inputs, 0, 0, 1)
     }
 
     fn state_for_drawcwall<'a>(
@@ -1513,7 +1564,7 @@ mod tests {
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
         };
-        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0)
+        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
     }
 
     #[test]
@@ -1671,14 +1722,14 @@ mod tests {
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
         };
-        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0)
+        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
     }
 
     #[test]
     fn predrawceil_swaps_ogx_and_gx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.ogx = 0x1111;
         state.gx = 0x2222;
         assert_eq!(phase_pre_draw_ceil(&mut state), Phase::DrawCeil);
@@ -1752,7 +1803,7 @@ mod tests {
     fn predrawflor_swaps_ogx_and_gx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.ogx = 0x3333;
         state.gx = 0x4444;
         assert_eq!(phase_pre_draw_flor(&mut state), Phase::DrawFlor);
@@ -1825,7 +1876,7 @@ mod tests {
     fn predeletez_swaps_ogx_and_gx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.ogx = 0xAAAA;
         state.gx = 0xBBBB;
         assert_eq!(phase_pre_delete_z(&mut state), Phase::DeleteZ);
@@ -1840,7 +1891,7 @@ mod tests {
         // ce_idx == CF_SEED_INDEX.
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         assert_eq!(state.ce_idx, CF_SEED_INDEX);
         assert_eq!(phase_delete_z(&mut state), Phase::Done);
     }
@@ -1851,7 +1902,7 @@ mod tests {
         // route to AfterDelete.
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.ce_idx = CF_SEED_INDEX + 2;
         state.c_idx = CF_SEED_INDEX + 2;
         assert_eq!(phase_delete_z(&mut state), Phase::AfterDelete);
@@ -1877,7 +1928,7 @@ mod tests {
             ..Default::default()
         };
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.ce_idx = CF_SEED_INDEX + 2;
         state.c_idx = CF_SEED_INDEX + 1;
         assert_eq!(phase_delete_z(&mut state), Phase::AfterDeleteKeptPresync);
@@ -1891,7 +1942,7 @@ mod tests {
     fn from_seed_initialises_cf_indices_to_seed() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         assert_eq!(state.c_idx, CF_SEED_INDEX);
         assert_eq!(state.ce_idx, CF_SEED_INDEX);
         assert_eq!(state.c_presync_idx, usize::MAX);
@@ -1901,7 +1952,7 @@ mod tests {
     fn afterdelete_sets_presync_and_routes_to_kept() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX + 1;
         state.c_presync_idx = usize::MAX;
         assert_eq!(
@@ -1917,7 +1968,7 @@ mod tests {
         // SkipixyWithPresync (intra-column case).
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX + 1;
         assert_eq!(
             phase_after_delete_kept_presync(&mut state),
@@ -1938,7 +1989,7 @@ mod tests {
         //   - c_presync_idx (= usize::MAX) != c_idx → SyncFromPresync
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX;
         assert_eq!(
             phase_after_delete_kept_presync(&mut state),
@@ -1976,7 +2027,7 @@ mod tests {
         };
         let mut s = fresh_scratch();
         s.gixy = [1, 4]; // x-step = 1, y-step = 4
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 5);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 5, 1);
         state.c_idx = CF_SEED_INDEX; // → c-- below seed → column step
         state.lane = 0; // step by gixy[0] = 1
 
@@ -2012,7 +2063,7 @@ mod tests {
         // smaller gpz, so the *winning* lane is the one whose gpz
         // is also above ngxmax.
         s.gpz = [0x100, 0x200];
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.ngxmax = 0xFF;
         state.c_idx = CF_SEED_INDEX;
 
@@ -2020,6 +2071,29 @@ mod tests {
             phase_after_delete_kept_presync(&mut state),
             Phase::Remiporend
         );
+    }
+
+    #[test]
+    fn remiporend_routes_to_startsky_when_no_more_mips() {
+        // Single-mip rendering: gmipnum == 1, gmipcnt starts at 0
+        // → (0 + 1) >= 1 → Startsky. This is the path the oracle
+        // scenes always take.
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        state.gmipcnt = 0;
+        assert_eq!(phase_remiporend(&mut state), Phase::Startsky);
+    }
+
+    #[test]
+    fn remiporend_full_body_remains_stubbed_at_done() {
+        // gmipnum > 1 + gmipcnt+1 < gmipnum hits the path
+        // R4.5 will replace. R4.3e3 stubs it as Done.
+        let mut s = fresh_scratch();
+        let inputs = dummy_inputs();
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 4);
+        state.gmipcnt = 0;
+        assert_eq!(phase_remiporend(&mut state), Phase::Done);
     }
 
     #[test]
@@ -2035,7 +2109,7 @@ mod tests {
             column_offsets: &column_offsets,
         };
         let mut s = fresh_scratch();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX;
         // c is reset to ce inside column step. If presync == ce
         // already, the post-reset c equals presync → Skipixy3.
@@ -2057,7 +2131,7 @@ mod tests {
             column_offsets: &column_offsets,
         };
         let mut s = fresh_scratch();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 32, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 32, 0, 1);
         state.c_idx = CF_SEED_INDEX;
         let _ = phase_after_delete_kept_presync(&mut state);
         assert_eq!(state.vptr_offset, 0);
@@ -2226,7 +2300,7 @@ mod tests {
     fn skipixy_with_presync_swaps_ogx_and_routes_to_sync() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         state.ogx = 0xAAAA;
         state.gx = 0xBBBB;
 
@@ -2260,7 +2334,7 @@ mod tests {
             cy1: 600,
         };
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
         // Working state = "A".
         state.z0 = 1;
         state.z1 = 2;
@@ -2301,7 +2375,7 @@ mod tests {
     fn from_seed_carries_ixy_sptr_col_idx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 42);
+        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 42, 1);
         assert_eq!(state.ixy_sptr_col_idx, 42);
     }
 
