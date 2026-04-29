@@ -12,6 +12,7 @@ pub mod camera_math;
 pub mod column_walk;
 mod engine;
 pub mod opticast_prelude;
+pub mod projection;
 
 pub use camera::Camera;
 pub use engine::Engine;
