@@ -12,7 +12,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NCrashed/roxlap"
 authors = ["Anton Gushcha <ncrashed@gmail.com>"]
-rust-version = "1.74"
+rust-version = "1.77"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

@@ -10,6 +10,7 @@
 mod camera;
 pub mod camera_math;
 mod engine;
+pub mod opticast_prelude;
 
 pub use camera::Camera;
 pub use engine::Engine;
