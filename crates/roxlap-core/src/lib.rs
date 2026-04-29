@@ -11,8 +11,10 @@ mod camera;
 pub mod camera_math;
 pub mod column_walk;
 mod engine;
+pub mod fixed;
 pub mod opticast_prelude;
 pub mod projection;
+pub mod rasterizer;
 pub mod ray_step;
 pub mod scan_loops;
 
