@@ -48,8 +48,8 @@ voxlaptest's image output:
 | **R4.1a** | `setcamera` math: derive the per-frame camera-relative basis, translation `giadd`, frustum corners `gcorn[4]`, and frustum edge normals `ginor[4]` from `Camera` + screen-projection parameters. Pure value-in / value-out, bit-exact testable. |
 | **R4.1b** | Opticast prelude: `gylookup` mip table, `gposxfrac`/`gposyfrac`, `gpixy` (sptr-based column-base address), `gstartv` (top-of-column slab walk). Per-frame state cache. |
 | **R4.1c** | Column-scan dispatch: the four-quadrant `vline`/`hline` setup + `angstart` radar table + per-column `hrend` / `vrend` calls. Rasterizers stubbed until R4.3. |
-| **R4.2** | Wall / floor / ceiling fill primitives: `drawcwall`, `drawfwall`, `drawceil`, `drawflor`. First stage that puts pixels on screen. |
-| **R4.3** | grouscan column advance: `deletez` (cftype-stack pop), `findslab`, slab-split, mid-column-search. The hard core. |
+| **R4.2** | Scalar `hrend` / `vrend` scanline rasterizers — consume radar entries, write pixels + z-buffer. First stage that puts real pixels on screen behind a stub `gline`. (Originally scoped as "drawcwall/drawfwall/drawceil/drawflor"; those turned out to be labels *inside* grouscan, so they fold into R4.3.) |
+| **R4.3** | grouscan = `gline` ray-cast: full algorithmic port including the drawcwall / drawfwall / drawceil / drawflor / deletez / findslab / slab-split / mid-column-search state machine. The hard core. |
 | **R4.4** | Sky-fill primitives: `startsky` integration, fog gating. |
 | **R4.5** | Mip-level transition (`remiporend`): the deeper-recursion cftype refresh. |
 

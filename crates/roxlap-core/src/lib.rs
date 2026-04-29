@@ -17,6 +17,7 @@ pub mod opticast_prelude;
 pub mod projection;
 pub mod rasterizer;
 pub mod ray_step;
+pub mod scalar_rasterizer;
 pub mod scan_loops;
 
 pub use camera::Camera;

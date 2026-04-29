@@ -128,11 +128,18 @@ impl ScanScratch {
 // the C source it's tracking.
 #[allow(clippy::too_many_arguments)]
 pub trait Rasterizer {
+    /// Called once per frame, before the four-quadrant scan loops
+    /// run, with the per-frame derived state. Concrete rasterizers
+    /// override this to cache whatever they need from the
+    /// projection / ray-step / prelude triple (a default-noop stub
+    /// is fine for recording / counting test rasterizers).
+    fn frame_setup(&mut self, _ctx: &crate::scan_loops::ScanContext<'_>) {}
+
     fn gline(&mut self, scratch: &mut ScanScratch, length: u32, x0: f32, y0: f32, x1: f32, y1: f32);
 
     fn hrend(
         &mut self,
-        scratch: &ScanScratch,
+        scratch: &mut ScanScratch,
         sx: i32,
         sy: i32,
         p1: i32,
@@ -141,7 +148,7 @@ pub trait Rasterizer {
         j: i32,
     );
 
-    fn vrend(&mut self, scratch: &ScanScratch, sx: i32, sy: i32, p1: i32, iplc: i32, iinc: i32);
+    fn vrend(&mut self, scratch: &mut ScanScratch, sx: i32, sy: i32, p1: i32, iplc: i32, iinc: i32);
 }
 
 #[cfg(test)]
@@ -159,10 +166,10 @@ mod tests {
         fn gline(&mut self, _: &mut ScanScratch, _: u32, _: f32, _: f32, _: f32, _: f32) {
             self.events.push("gline");
         }
-        fn hrend(&mut self, _: &ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32) {
+        fn hrend(&mut self, _: &mut ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32) {
             self.events.push("hrend");
         }
-        fn vrend(&mut self, _: &ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32) {
+        fn vrend(&mut self, _: &mut ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32) {
             self.events.push("vrend");
         }
     }
@@ -202,8 +209,8 @@ mod tests {
         let mut scratch = ScanScratch::new_for_size(64, 64, 64);
         let r: &mut dyn Rasterizer = &mut rec;
         r.gline(&mut scratch, 4, 0.0, 0.0, 1.0, 1.0);
-        r.hrend(&scratch, 0, 0, 10, 0, 1, 0);
-        r.vrend(&scratch, 0, 0, 10, 0, 1);
+        r.hrend(&mut scratch, 0, 0, 10, 0, 1, 0);
+        r.vrend(&mut scratch, 0, 0, 10, 0, 1);
         assert_eq!(rec.events, ["gline", "hrend", "vrend"]);
     }
 }

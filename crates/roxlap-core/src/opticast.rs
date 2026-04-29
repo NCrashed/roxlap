@@ -157,6 +157,12 @@ pub fn opticast<R: Rasterizer>(
         anginc: settings.anginc,
     };
 
+    // Per-frame setup hook — concrete rasterizers (R4.2) cache the
+    // bits of CameraState / RayStep / OpticastPrelude they need for
+    // the per-pixel math. Stub rasterizers ignore via the trait's
+    // default no-op.
+    rasterizer.frame_setup(&ctx);
+
     top_quadrant(rasterizer, scratch, &ctx);
     right_quadrant(rasterizer, scratch, &ctx);
     bottom_quadrant(rasterizer, scratch, &ctx);
@@ -181,10 +187,10 @@ mod tests {
         fn gline(&mut self, _: &mut ScanScratch, _: u32, _: f32, _: f32, _: f32, _: f32) {
             self.gline += 1;
         }
-        fn hrend(&mut self, _: &ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32) {
+        fn hrend(&mut self, _: &mut ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32) {
             self.hrend += 1;
         }
-        fn vrend(&mut self, _: &ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32) {
+        fn vrend(&mut self, _: &mut ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32) {
             self.vrend += 1;
         }
     }

@@ -779,13 +779,22 @@ mod tests {
         fn gline(&mut self, _: &mut ScanScratch, _: u32, _: f32, _: f32, _: f32, _: f32) {
             self.gline_calls += 1;
         }
-        fn hrend(&mut self, _: &ScanScratch, sx: i32, sy: i32, p1: i32, _: i32, _: i32, _: i32) {
+        fn hrend(
+            &mut self,
+            _: &mut ScanScratch,
+            sx: i32,
+            sy: i32,
+            p1: i32,
+            _: i32,
+            _: i32,
+            _: i32,
+        ) {
             if self.first_hrend.is_none() {
                 self.first_hrend = Some((sx, sy, p1));
             }
             self.hrend_calls += 1;
         }
-        fn vrend(&mut self, _: &ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32) {
+        fn vrend(&mut self, _: &mut ScanScratch, _: i32, _: i32, _: i32, _: i32, _: i32) {
             self.vrend_calls += 1;
         }
     }
