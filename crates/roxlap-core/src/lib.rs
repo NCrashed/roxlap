@@ -9,6 +9,7 @@
 
 mod camera;
 pub mod camera_math;
+pub mod column_walk;
 mod engine;
 pub mod opticast_prelude;
 
