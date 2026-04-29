@@ -49,6 +49,95 @@ pub const CF_SEED_INDEX: usize = 128;
 
 use crate::rasterizer::ScanScratch;
 
+/// All of grouscan's per-ray local state in one struct.
+///
+/// Voxlap's `grouscanasm_scalar` keeps these as scalars in the
+/// function's stack frame, threaded through goto labels via
+/// "everything is in scope" implicit dataflow. Rust's per-phase
+/// functions can't share locals that way, so we put them on a
+/// struct the state machine driver passes by `&mut`.
+///
+/// The borrows here mean a `GrouscanState` can't outlive the
+/// `ScanScratch` it's reading from — that matches voxlap's design
+/// where this state lives strictly within one `grouscan_run` call.
+//
+// dead_code allow: the per-voxel scratch fields (color, gy_raw,
+// off, mm5_tail, wall_lane, ebx) are populated and consumed by the
+// R4.3f3+ fill loops; in R4.3f2 they're scaffolding the next
+// commits will start using.
+#[allow(dead_code)]
+pub(crate) struct GrouscanState<'a> {
+    /// Per-frame scratch (radar, angstart, cf, gpz, gdz, gixy, gi0,
+    /// gi1, gxmax, lastx, uurend).
+    pub scratch: &'a mut ScanScratch,
+
+    // -------------------------------------------------------------
+    // Cached prologue scalars (R4.3c). Mutated as the algorithm
+    // walks; voxlap's `cf[128]` is the seed they're initialised from.
+    // -------------------------------------------------------------
+    pub z0: i32,
+    pub z1: i32,
+    pub cx0: i32,
+    pub cy0: i32,
+    pub cx1: i32,
+    pub cy1: i32,
+    /// Voxlap's "previous gx", seeded with `gpz[lane] & 0xFFFF0000`.
+    pub ogx: i32,
+    /// Voxlap's "current gx" — accumulates depth as columns advance.
+    pub gx: i32,
+    /// `min(gxmax, gxmip)` when multiple mips exist.
+    pub ngxmax: i32,
+    /// Leading raycast lane: `0` (x) or `1` (y).
+    pub lane: usize,
+
+    // -------------------------------------------------------------
+    // Per-voxel scratch (R4.3f+ fill loops use these). All start at
+    // zero on entry to `grouscan_run`.
+    // -------------------------------------------------------------
+    /// The per-voxel packed colour shaded by `grouscan_shade`.
+    pub color: u32,
+    /// Voxlap's `gy_raw` — the gylookup entry for the current voxel
+    /// z, used by `grouscan_cross_sign`.
+    pub gy_raw: i32,
+    /// Byte offset within the current slab for the colour fetch.
+    pub off: i32,
+    /// `mm5_tail` — alpha-blend tail carried across `grouscan_shade`
+    /// invocations within one ray.
+    pub mm5_tail: u32,
+    /// Which side-shading lane (`gcsub` index) the current wall fill
+    /// is using. `0` or `1` for the two raycast lanes.
+    pub wall_lane: usize,
+    /// Radar offset of the current pixel write — voxlap's `ebx`.
+    pub ebx: isize,
+}
+
+impl<'a> GrouscanState<'a> {
+    /// Build a fresh state from the cf[128] seed slot. Mirrors
+    /// voxlap5.c:11601-11606.
+    fn from_seed(scratch: &'a mut ScanScratch) -> Self {
+        let c = scratch.cf[CF_SEED_INDEX];
+        Self {
+            scratch,
+            z0: c.z0,
+            z1: c.z1,
+            cx0: c.cx0,
+            cy0: c.cy0,
+            cx1: c.cx1,
+            cy1: c.cy1,
+            ogx: 0,
+            gx: 0,
+            ngxmax: 0,
+            lane: 0,
+            color: 0,
+            gy_raw: 0,
+            off: 0,
+            mm5_tail: 0,
+            wall_lane: 0,
+            ebx: 0,
+        }
+    }
+}
+
 /// Voxlap's per-voxel colour-shading helper, used by every fill loop
 /// in grouscan.
 ///
@@ -213,29 +302,23 @@ pub fn grouscan_run(
     gxmip: i32,
     gmipnum: u32,
 ) -> GrouscanPrologue {
-    // --- Cache cf[128] state. Voxlap5.c:11601-11606. ---
-    let c = scratch.cf[CF_SEED_INDEX];
-    let z0 = c.z0;
-    let z1 = c.z1;
-    let cx0 = c.cx0;
-    let cy0 = c.cy0;
-    let cx1 = c.cx1;
-    let cy1 = c.cy1;
+    let mut state = GrouscanState::from_seed(scratch);
 
     // --- ngxmax = min(gxmax, gxmip) when multiple mips exist. ---
-    let mut ngxmax = scratch.gxmax;
-    if gmipnum > 1 && gxmip < ngxmax {
-        ngxmax = gxmip;
+    state.ngxmax = state.scratch.gxmax;
+    if gmipnum > 1 && gxmip < state.ngxmax {
+        state.ngxmax = gxmip;
     }
 
     // --- Pick the leading raycast lane. Voxlap5.c:11621-11624. ---
-    let lane: usize = usize::from(scratch.gpz[1] < scratch.gpz[0]);
+    state.lane = usize::from(state.scratch.gpz[1] < state.scratch.gpz[0]);
     // ogx = gpz[lane] & 0xFFFF0000 — keep only the integer part of
     // the fixed-point depth.
-    let ogx = scratch.gpz[lane] & -0x1_0000_i32;
-    let gx = 0;
+    state.ogx = state.scratch.gpz[state.lane] & -0x1_0000_i32;
+    state.gx = 0;
     // First column advance — voxlap's `gpz[lane] += gdz[lane]`.
-    scratch.gpz[lane] = scratch.gpz[lane].wrapping_add(scratch.gdz[lane]);
+    state.scratch.gpz[state.lane] =
+        state.scratch.gpz[state.lane].wrapping_add(state.scratch.gdz[state.lane]);
 
     // --- Initial dispatch. Voxlap5.c:11640-11641. ---
     let dispatch = if vptr_offset == 0 {
@@ -244,30 +327,25 @@ pub fn grouscan_run(
         InitialDispatch::DrawCeil
     };
 
-    // --- Phase state machine. Voxlap's C uses gotos between draw-
-    // phase labels (the asm's control graph isn't reducible, so each
-    // phase is both an entry label and a re-entry target). Rust has
-    // no goto; we encode each phase as a `Phase` variant and run a
-    // `loop { match state { ... } }` driver instead. R4.3f+ fills in
-    // the per-phase fill bodies; R4.3e (this commit) ships the
-    // driver + stubs.
+    // --- Phase state machine. R4.3e ships the driver + stubs;
+    // R4.3f+ replaces each stub with the real fill body. ---
     let entry = match dispatch {
         InitialDispatch::DrawFlor => Phase::DrawFlor,
         InitialDispatch::DrawCeil => Phase::DrawCeil,
     };
-    run_phases(scratch, entry);
+    run_phases(&mut state, entry);
 
     GrouscanPrologue {
-        z0,
-        z1,
-        cx0,
-        cy0,
-        cx1,
-        cy1,
-        lane,
-        ogx,
-        gx,
-        ngxmax,
+        z0: state.z0,
+        z1: state.z1,
+        cx0: state.cx0,
+        cy0: state.cy0,
+        cx1: state.cx1,
+        cy1: state.cy1,
+        lane: state.lane,
+        ogx: state.ogx,
+        gx: state.gx,
+        ngxmax: state.ngxmax,
         dispatch,
     }
 }
@@ -306,76 +384,73 @@ pub enum Phase {
 /// next [`Phase`] — modelling voxlap's `goto X` jumps. R4.3e ships
 /// every phase as a stub that returns [`Phase::Done`]; R4.3f+
 /// replaces them with the actual fill loops.
-fn run_phases(scratch: &mut ScanScratch, entry: Phase) {
+fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
     let mut current = entry;
     loop {
         current = match current {
-            Phase::DrawFwall => phase_draw_fwall(scratch),
-            Phase::DrawCwall => phase_draw_cwall(scratch),
-            Phase::PreDrawCeil => phase_pre_draw_ceil(scratch),
-            Phase::DrawCeil => phase_draw_ceil(scratch),
-            Phase::PreDrawFlor => phase_pre_draw_flor(scratch),
-            Phase::DrawFlor => phase_draw_flor(scratch),
-            Phase::PreDeleteZ => phase_pre_delete_z(scratch),
-            Phase::DeleteZ => phase_delete_z(scratch),
+            Phase::DrawFwall => phase_draw_fwall(state),
+            Phase::DrawCwall => phase_draw_cwall(state),
+            Phase::PreDrawCeil => phase_pre_draw_ceil(state),
+            Phase::DrawCeil => phase_draw_ceil(state),
+            Phase::PreDrawFlor => phase_pre_draw_flor(state),
+            Phase::DrawFlor => phase_draw_flor(state),
+            Phase::PreDeleteZ => phase_pre_delete_z(state),
+            Phase::DeleteZ => phase_delete_z(state),
             Phase::Done => break,
         };
     }
 }
 
-// --- Per-phase functions. R4.3e stubs return Phase::Done; R4.3f+
-//     replaces each body with the fill / pop / mip-transition
-//     logic ported from voxlap5.c:11643..11770-area. ---
+// --- Per-phase functions. R4.3f+ stubs return Phase::Done; later
+//     iterations replace each body with the fill / pop / mip-
+//     transition logic ported from voxlap5.c:11643..11770-area. ---
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_draw_fwall(_scratch: &mut ScanScratch) -> Phase {
-    // R4.3f: voxlap5.c:11643. Front-wall fill loop, then falls
+fn phase_draw_fwall(_state: &mut GrouscanState<'_>) -> Phase {
+    // R4.3f3: voxlap5.c:11643. Front-wall fill loop, then falls
     // through to drawcwall.
     Phase::Done
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_draw_cwall(_scratch: &mut ScanScratch) -> Phase {
-    // R4.3f: voxlap5.c:11681. Back-wall fill, branches to
-    // predrawflor / predrawceil based on z relations.
+fn phase_draw_cwall(_state: &mut GrouscanState<'_>) -> Phase {
+    // R4.3f4: voxlap5.c:11681. Back-wall fill.
     Phase::Done
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_pre_draw_ceil(_scratch: &mut ScanScratch) -> Phase {
-    // R4.3f: voxlap5.c:11734. Swaps ogx ↔ gx before drawceil.
+fn phase_pre_draw_ceil(_state: &mut GrouscanState<'_>) -> Phase {
+    // R4.3f5: voxlap5.c:11734. Swaps ogx ↔ gx before drawceil.
     Phase::DrawCeil
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_draw_ceil(_scratch: &mut ScanScratch) -> Phase {
-    // R4.3f: voxlap5.c:11740. Ceiling fill; can re-enter from
-    // drawceilloop on failed sign test.
+fn phase_draw_ceil(_state: &mut GrouscanState<'_>) -> Phase {
+    // R4.3f5: voxlap5.c:11740. Ceiling fill.
     Phase::Done
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_pre_draw_flor(_scratch: &mut ScanScratch) -> Phase {
-    // R4.3f: voxlap5.c:11761. Sets up drawflor.
+fn phase_pre_draw_flor(_state: &mut GrouscanState<'_>) -> Phase {
+    // R4.3f6: voxlap5.c:11761. Sets up drawflor.
     Phase::DrawFlor
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_draw_flor(_scratch: &mut ScanScratch) -> Phase {
-    // R4.3f: voxlap5.c:11765. Floor fill; cross-phase target from
-    // drawceilloop (the irreducible-control-flow case).
+fn phase_draw_flor(_state: &mut GrouscanState<'_>) -> Phase {
+    // R4.3f6: voxlap5.c:11765. Floor fill.
     Phase::Done
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_pre_delete_z(_scratch: &mut ScanScratch) -> Phase {
-    // R4.3f: pre-pop cleanup before deletez.
+fn phase_pre_delete_z(_state: &mut GrouscanState<'_>) -> Phase {
+    // R4.3e2: pre-pop cleanup before deletez.
     Phase::DeleteZ
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn phase_delete_z(_scratch: &mut ScanScratch) -> Phase {
-    // R4.3e: voxlap5.c:11967. Cf-stack pop / column advance.
+fn phase_delete_z(_state: &mut GrouscanState<'_>) -> Phase {
+    // R4.3e2: voxlap5.c:11967. Cf-stack pop / column advance.
     Phase::Done
 }
 
