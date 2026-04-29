@@ -8,6 +8,7 @@
 //! opticast + grouscan algorithm.
 
 mod camera;
+pub mod camera_math;
 mod engine;
 
 pub use camera::Camera;

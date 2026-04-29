@@ -45,8 +45,10 @@ voxlaptest's image output:
 
 | # | Scope |
 |---|---|
-| **R4.1** | `opticast` dispatch loop: per-column setup, camera-matrix derivation, `gylookup` table, `gposxfrac`/`gposyfrac`, sx0/sx1 column range. |
-| **R4.2** | Wall / floor / ceiling fill primitives: `drawcwall`, `drawfwall`, `drawceil`, `drawflor`. Lower complexity; first stage that puts pixels on screen. |
+| **R4.1a** | `setcamera` math: derive the per-frame camera-relative basis, translation `giadd`, frustum corners `gcorn[4]`, and frustum edge normals `ginor[4]` from `Camera` + screen-projection parameters. Pure value-in / value-out, bit-exact testable. |
+| **R4.1b** | Opticast prelude: `gylookup` mip table, `gposxfrac`/`gposyfrac`, `gpixy` (sptr-based column-base address), `gstartv` (top-of-column slab walk). Per-frame state cache. |
+| **R4.1c** | Column-scan dispatch: the four-quadrant `vline`/`hline` setup + `angstart` radar table + per-column `hrend` / `vrend` calls. Rasterizers stubbed until R4.3. |
+| **R4.2** | Wall / floor / ceiling fill primitives: `drawcwall`, `drawfwall`, `drawceil`, `drawflor`. First stage that puts pixels on screen. |
 | **R4.3** | grouscan column advance: `deletez` (cftype-stack pop), `findslab`, slab-split, mid-column-search. The hard core. |
 | **R4.4** | Sky-fill primitives: `startsky` integration, fog gating. |
 | **R4.5** | Mip-level transition (`remiporend`): the deeper-recursion cftype refresh. |
