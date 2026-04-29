@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforce rustfmt across the workspace before a commit
+# lands. Reflects what is staged, not what is in the working tree —
+# unstaged changes are stashed for the check and restored afterwards
+# so this hook never fails on something the user did not stage.
+#
+# Bypass: `git commit --no-verify`. Same check gates CI (R8 onward),
+# so skipping locally only defers the failure.
+#
+# Clippy is intentionally NOT in this hook — clippy on a Rust workspace
+# routinely takes 5+ seconds and pedantic-level lints are opinionated
+# enough that they belong in CI rather than every-commit gating. Run
+#   cargo clippy --all-targets -- -D warnings
+# manually before pushing if you want the same gate locally.
+
+set -euo pipefail
+
+# Ensure cargo is reachable. The roxlap nix devshell ships rustc +
+# cargo + rustfmt; if the user is committing from a host shell where
+# cargo is on PATH (rustup), that works too.
+if ! command -v cargo >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+pre-commit: cargo not on PATH.
+  Either enter `nix develop` or install Rust system-wide via rustup.
+  This hook will not run otherwise (commit aborted).
+EOF
+    exit 1
+fi
+
+# Stash unstaged changes so `cargo fmt --check` only sees the staged
+# tree. Restore on exit (success OR failure).
+need_unstash=
+cleanup() {
+    if [ "${need_unstash:-}" = "1" ]; then
+        git stash pop --quiet || true
+    fi
+}
+trap cleanup EXIT
+
+if ! git diff --quiet; then
+    git stash push --keep-index --quiet --message "pre-commit hook: stash unstaged"
+    need_unstash=1
+fi
+
+if ! cargo fmt --check 2>&1; then
+    cat >&2 <<'EOF'
+
+pre-commit: rustfmt found unformatted files. Run `cargo fmt`, re-stage,
+and commit again. (Or `git commit --no-verify` to bypass.)
+
+EOF
+    exit 1
+fi

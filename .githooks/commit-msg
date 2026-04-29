@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# commit-msg hook: strip trailing whitespace from every line of the
+# commit message. Trailing whitespace shows up when copy-pasting from
+# editors / chat tools and clutters `git log`'s rendered output.
+#
+# Receives the path to the message file as $1; rewrites it in place.
+
+set -euo pipefail
+
+msgfile="$1"
+tmp="$(mktemp)"
+sed 's/[[:space:]][[:space:]]*$//' "$msgfile" > "$tmp"
+mv "$tmp" "$msgfile"

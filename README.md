@@ -48,6 +48,30 @@ The two repositories move in sync: when voxlaptest gains a new oracle pose
 or freezes a hash change, roxlap's matching code path lands the equivalent
 update.
 
+## Development
+
+After cloning, point git at the tracked hooks directory:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+That installs:
+
+- **`pre-commit`** — `cargo fmt --check` across the workspace, with
+  unstaged changes stashed for the check so it never fails on
+  something you did not stage. Run `cargo fmt` and re-stage if it
+  flags anything. Bypass with `git commit --no-verify`.
+- **`commit-msg`** — strips trailing whitespace from every line of
+  the commit message.
+
+Clippy is **not** in the pre-commit hook — pedantic-level lints are
+opinionated enough that they belong in CI rather than every-commit
+gating, and a >2-second pre-commit hook just gets `--no-verify`'d.
+Run `cargo clippy --all-targets -- -D warnings` manually before
+pushing if you want the same gate locally; CI (from R8 onward) will
+enforce it on every push regardless.
+
 ## License
 
 Dual-licensed under either of:
