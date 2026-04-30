@@ -50,6 +50,36 @@ use crate::scan_loops::ScanContext;
 /// to thread into `GrouscanInputs.gcsub`.
 const DEFAULT_GCSUB: [i64; 9] = [0; 9];
 
+/// Per-channel fog blend — voxlap5.c:2052-2056 (and the matching
+/// hrend / vrend scalar tail). `col` is the source ARGB voxel
+/// colour; `dist` is the radar slot's depth (PREC-scaled, so
+/// `>> 20` gives the integer cell distance index into `foglut`).
+/// `foglut` empty short-circuits to "no fog" (returns `col`
+/// unchanged); OOB indices saturate to 32767 (full fog) since
+/// `set_fog` pads the table that way.
+//
+// The C form is one branchless expression per channel; we keep
+// it as-is for legibility against the source. `as i32` casts
+// match the C int32 arithmetic.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::many_single_char_names
+)]
+fn fog_blend(col: i32, dist: i32, foglut: &[i32], fog_col: i32) -> i32 {
+    if foglut.is_empty() {
+        return col;
+    }
+    let idx = (dist >> 20) as usize;
+    let l = foglut.get(idx).copied().unwrap_or(32767) & 32767;
+    let k = col;
+    let fc = fog_col;
+    let r = (((fc & 255) - (k & 255)) * l) >> 15;
+    let g = (((((fc >> 8) & 255) - ((k >> 8) & 255)) * l) >> 15) << 8;
+    let b = (((((fc >> 16) & 255) - ((k >> 16) & 255)) * l) >> 15) << 16;
+    r + g + b + k
+}
+
 /// Per-frame state cached on first `frame_setup` call. Owned here
 /// (vs. borrowed from `ScanContext`) because gline needs to read
 /// it across many calls without re-borrowing each time. The
@@ -363,6 +393,17 @@ impl Rasterizer for ScalarRasterizer<'_> {
                     dst[k] = cd.dist;
                     plc_local = plc_local.wrapping_add(incr);
                 }
+                // R5.2: per-pixel fog blend (voxlap's `hrendzfogsse`).
+                // No-op when foglut is empty. Voxlap's MMX path used
+                // pmulhw with foglut as 4 packed int16 lanes; we
+                // mirror the scalar fallback the goldens use, which
+                // applies a single `l = foglut[..] & 32767` factor
+                // per pixel (one `l` per ray, all 3 channels).
+                if !scratch.foglut.is_empty() {
+                    for k in 0..4 {
+                        col[k] = fog_blend(col[k], dst[k], &scratch.foglut, scratch.fog_col);
+                    }
+                }
                 let vcol = _mm_setr_epi32(col[0], col[1], col[2], col[3]);
                 let vdsi = _mm_setr_epi32(dst[0], dst[1], dst[2], dst[3]);
                 let vdst = _mm_cvtepi32_ps(vdsi);
@@ -397,9 +438,10 @@ impl Rasterizer for ScalarRasterizer<'_> {
             let ray_idx = (plc_local >> 16) as usize;
             let cd_offset = scratch.angstart[ray_idx] + j as isize;
             let cd = scratch.radar[cd_offset as usize];
+            let col = fog_blend(cd.col, cd.dist, &scratch.foglut, scratch.fog_col);
 
             let pixel_idx = row_start + x as usize;
-            self.framebuffer[pixel_idx] = cd.col as u32;
+            self.framebuffer[pixel_idx] = col as u32;
             #[allow(clippy::cast_precision_loss)]
             let z = cd.dist as f32 / (dirx * dirx + diry * diry).sqrt();
             self.zbuffer[pixel_idx] = z;
@@ -573,6 +615,53 @@ mod tests {
             // to confirm the slot was written, not its precise value.
             assert_ne!(zb[row_off + 10 + k].to_bits(), 0u32);
         }
+    }
+
+    #[test]
+    fn fog_blend_disabled_returns_col_unchanged() {
+        let foglut: Vec<i32> = Vec::new();
+        let col = 0x0080_C040;
+        assert_eq!(fog_blend(col, 0x1234_5678, &foglut, 0xFF_FFFF), col);
+    }
+
+    #[test]
+    fn fog_blend_full_fog_returns_fog_col_per_channel() {
+        // l = 32767 → ((fog - col) * 32767) >> 15 = fog - col → final
+        // is col + (fog - col) = fog (per channel; alpha untouched).
+        let foglut = vec![32767; 2048];
+        let col = 0x80_AA_BB_CC_u32 as i32;
+        let fog = 0x00_11_22_33_i32;
+        let blended = fog_blend(col, 0, &foglut, fog) as u32;
+        // Low 24 bits = fog colour; alpha (high byte) survives from col.
+        assert_eq!(blended & 0x00FF_FFFF, fog as u32 & 0x00FF_FFFF);
+        assert_eq!(blended & 0xFF00_0000, col as u32 & 0xFF00_0000);
+    }
+
+    #[test]
+    fn set_fog_zero_distance_clears_table() {
+        let mut s = ScanScratch::new_for_size(64, 64, 64);
+        s.set_fog(0x1234_5678, 100);
+        assert!(!s.foglut.is_empty());
+        s.set_fog(0, 0);
+        assert!(s.foglut.is_empty());
+    }
+
+    #[test]
+    fn set_fog_table_starts_at_zero_and_climbs() {
+        let mut s = ScanScratch::new_for_size(64, 64, 64);
+        s.set_fog(0xFF, 1024);
+        // First entry: acc = 0 → hi16 = 0.
+        assert_eq!(s.foglut[0], 0);
+        // Last entry near the overflow boundary should be near 32767
+        // (the saturate-fill value); voxlap's exact step makes
+        // foglut[2047] either ~32766 (last walked entry) or 32767
+        // (post-overflow padding) depending on max_scan_dist
+        // divisibility.
+        assert!(
+            s.foglut[2047] > 30_000,
+            "tail entry too low: {}",
+            s.foglut[2047]
+        );
     }
 
     #[test]

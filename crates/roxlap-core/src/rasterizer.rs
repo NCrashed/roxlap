@@ -105,6 +105,14 @@ pub struct ScanScratch {
     /// engine sets it via [`Self::set_skycast`] before invoking
     /// the rasterizer; default is opaque black at far depth.
     pub skycast: CastDat,
+    /// Fog colour (packed ARGB; the alpha byte isn't used by the
+    /// per-channel blend). Set by [`Self::set_fog`].
+    pub fog_col: i32,
+    /// Fog distance falloff table. Empty = fog disabled (voxlap's
+    /// `ofogdist < 0`). Otherwise `foglut[dist >> 20] & 32767`
+    /// gives the per-pixel blend factor (0 = no fog applied,
+    /// 32767 = full fog colour). Built by [`Self::set_fog`].
+    pub foglut: Vec<i32>,
 }
 
 impl ScanScratch {
@@ -138,6 +146,8 @@ impl ScanScratch {
             gi0: 0,
             gi1: 0,
             skycast: CastDat::default(),
+            fog_col: 0,
+            foglut: Vec::new(),
         }
     }
 
@@ -146,6 +156,43 @@ impl ScanScratch {
     /// `grouscan`'s startsky has the right value at fill time.
     pub fn set_skycast(&mut self, col: i32, dist: i32) {
         self.skycast = CastDat { col, dist };
+    }
+
+    /// Engine-side setter for fog. Voxlap5.c:11151-11185.
+    /// `max_scan_dist <= 0` disables fog (clears the table).
+    /// Otherwise builds the 2048-entry fog falloff table:
+    /// `foglut[k] = (acc >> 16) & 32767` where `acc` accumulates
+    /// `step = i32::MAX / max_scan_dist` per entry. After the
+    /// accumulation overflows, remaining entries pad with `32767`
+    /// (full fog).
+    //
+    // The C version stores per-entry as a 4-lane packed `int64`
+    // (`hi16` repeated four times) for the asm's MMX path. The
+    // scalar fallback only reads the low 15 bits; we mirror the
+    // scalar form, storing `i32` per entry.
+    pub fn set_fog(&mut self, col: i32, max_scan_dist: i32) {
+        if max_scan_dist <= 0 {
+            self.fog_col = 0;
+            self.foglut.clear();
+            return;
+        }
+        self.fog_col = col;
+        // Pad with full-fog (32767) so OOB / past-overflow entries
+        // saturate at maximum fog.
+        self.foglut = vec![32767; 2048];
+        let step = i32::MAX / max_scan_dist;
+        let mut acc: i32 = 0;
+        for entry in self.foglut.iter_mut().take(2048) {
+            let Some(next) = acc.checked_add(step) else {
+                break;
+            };
+            // hi16 = (acc >> 16) treated as u16 then widened — for
+            // acc in [0, i32::MAX), hi16 is in [0, 32767].
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+            let hi16 = ((acc as u32) >> 16) as i32;
+            *entry = hi16;
+            acc = next;
+        }
     }
 
     /// Reset cursors at the start of a new quadrant scan.
