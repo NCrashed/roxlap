@@ -845,7 +845,12 @@ fn phase_draw_ceil(state: &mut GrouscanState<'_>) -> Phase {
         }
         state.scratch.cf[state.c_idx].i0 = i0 + 1;
         if state.scratch.cf[state.c_idx].i0 > state.scratch.cf[state.c_idx].i1 {
-            return Phase::PreDeleteZ;
+            // drawceil exits to deletez direct (voxlap5.c:11766) —
+            // NO `ogx ↔ gx` swap. Only drawfwall / drawcwall route
+            // through predeletez. Routing through PreDeleteZ here
+            // adds a stray swap that perturbs subsequent ogx for
+            // 1-bit shading drift on sphere-edge pixels.
+            return Phase::DeleteZ;
         }
     }
 }
@@ -928,7 +933,9 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
         }
         state.scratch.cf[state.c_idx].i1 = i1 - 1;
         if state.scratch.cf[state.c_idx].i1 < state.scratch.cf[state.c_idx].i0 {
-            return Phase::PreDeleteZ;
+            // drawflor exits to deletez direct (voxlap5.c:11790) —
+            // NO `ogx ↔ gx` swap. See drawceil's matching note.
+            return Phase::DeleteZ;
         }
     }
 }
@@ -1815,7 +1822,9 @@ mod tests {
     #[test]
     fn drawceil_writes_pixel_then_exhausts_radar() {
         // First iteration: cross_sign = 0 (cx0 = cy0 = 0) ≤ 0 → write
-        // pixel at radar[i0=20], i0 → 21. i0 > i1 = 20 → PreDeleteZ.
+        // pixel at radar[i0=20], i0 → 21. i0 > i1 = 20 → DeleteZ
+        // (voxlap5.c:11766 → `goto deletez` direct, NO ogx ↔ gx
+        // swap; only drawfwall / drawcwall route through predeletez).
         let mut s = fresh_scratch();
         s.cf[CF_SEED_INDEX].z0 = 5;
         s.cf[CF_SEED_INDEX].cx0 = 0;
@@ -1833,7 +1842,7 @@ mod tests {
 
         let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 4);
         state.ogx = 0;
-        assert_eq!(phase_draw_ceil(&mut state), Phase::PreDeleteZ);
+        assert_eq!(phase_draw_ceil(&mut state), Phase::DeleteZ);
         assert_ne!(state.scratch.radar[20].col, 0);
         assert_eq!(state.scratch.cf[CF_SEED_INDEX].i0, 21);
     }
@@ -1889,7 +1898,7 @@ mod tests {
     fn drawflor_writes_pixel_then_exhausts_radar() {
         // cx1 = 1<<16, cy1 = 0, gylookup[z1] = 1 → cross_sign = 1 > 0
         // → write pixel at radar[i1=20], i1 → 19. i0 = 20 → 19 < 20
-        // trips PreDeleteZ.
+        // trips DeleteZ direct (voxlap5.c:11790; NO ogx ↔ gx swap).
         let mut s = fresh_scratch();
         s.cf[CF_SEED_INDEX].z1 = 5;
         s.cf[CF_SEED_INDEX].cx1 = 1 << 16;
@@ -1907,7 +1916,7 @@ mod tests {
 
         let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 0);
         state.ogx = 0;
-        assert_eq!(phase_draw_flor(&mut state), Phase::PreDeleteZ);
+        assert_eq!(phase_draw_flor(&mut state), Phase::DeleteZ);
         assert_ne!(state.scratch.radar[20].col, 0);
         assert_eq!(state.scratch.cf[CF_SEED_INDEX].i1, 19);
     }
