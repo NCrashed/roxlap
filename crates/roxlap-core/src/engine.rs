@@ -13,6 +13,11 @@ pub struct Engine {
     /// Maximum distance the fog blend interpolates over (PREC-
     /// scaled cells; voxlap's `vx5.maxscandist`). `0` disables fog.
     fog_max_scan_dist: i32,
+    /// Per-side darkening intensities — voxlap's
+    /// `setsideshades(top, bot, left, right, up, down)`. Default is
+    /// `[0; 6]` (no shading), matching the oracle. `ScanScratch`
+    /// rebuilds its `gcsub` table from these per frame.
+    side_shades: [i8; 6],
 }
 
 impl Default for Engine {
@@ -23,6 +28,7 @@ impl Default for Engine {
             sky_color: 0x8087_ceeb,
             fog_color: 0,
             fog_max_scan_dist: 0,
+            side_shades: [0; 6],
         }
     }
 }
@@ -73,6 +79,21 @@ impl Engine {
     #[must_use]
     pub fn fog_max_scan_dist(&self) -> i32 {
         self.fog_max_scan_dist
+    }
+
+    /// Voxlap's `setsideshades(top, bot, left, right, up, down)`
+    /// — per-side voxel darkening intensities. Each `i8` is stamped
+    /// onto the high byte of `gcsub[2..7]` (downstream by
+    /// `ScanScratch::set_side_shades`). Pass `(0,…,0)` to disable
+    /// (the oracle baseline); positive values like 15 / 31 give the
+    /// directional darkening typical of voxlap's classic games.
+    pub fn set_side_shades(&mut self, top: i8, bot: i8, left: i8, right: i8, up: i8, down: i8) {
+        self.side_shades = [top, bot, left, right, up, down];
+    }
+
+    #[must_use]
+    pub fn side_shades(&self) -> [i8; 6] {
+        self.side_shades
     }
 
     /// Render one frame into the caller-owned ARGB framebuffer.

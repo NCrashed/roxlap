@@ -233,6 +233,14 @@ impl App {
         self.scratch
             .set_fog(fog_col_i, self.engine.fog_max_scan_dist());
 
+        // Engine side-shades → ScanScratch gcsub. Default is
+        // `[0; 6]` (no shading); the host bumps it to a moderate
+        // value at startup so faces facing each direction read
+        // visibly different.
+        let s = self.engine.side_shades();
+        self.scratch
+            .set_side_shades(s[0], s[1], s[2], s[3], s[4], s[5]);
+
         let cam = self.camera();
         let sky = self.engine.sky_color();
         let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
@@ -512,10 +520,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_scratch = ScanScratch::new_for_size(WIDTH, HEIGHT, vxl_world.vsid);
     let cam_pos = vxl_world.ipo;
 
+    // Voxlap's classic per-side darkening (top, bot, left, right,
+    // up, down) — moderate values that read as visible directional
+    // shading without going so dark the floor crushes to black.
+    // The oracle uses (0,…,0) so this only affects the interactive
+    // host; goldens stay bit-exact.
+    let mut engine = Engine::new();
+    engine.set_side_shades(15, 15, 15, 15, 15, 15);
+
     let mut app = App {
         window: None,
         surface: None,
-        engine: Engine::new(),
+        engine,
         zbuffer: Vec::new(),
         scratch: initial_scratch,
         vxl: vxl_world,

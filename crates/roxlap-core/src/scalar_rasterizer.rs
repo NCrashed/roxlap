@@ -44,18 +44,12 @@ use crate::rasterizer::{Rasterizer, ScanScratch};
 use crate::ray_step::RayStep;
 use crate::scan_loops::ScanContext;
 
-/// Voxlap's `gcsub[9]` per-side shading table. Voxlap5.c:235
-/// initialises all 9 entries to `0x00ff00ff00ff00ff`. The 0xff
-/// bytes sit in the tail-lane positions of `grouscan_shade`'s
-/// interleaved `b[]` and saturate-zero the previous call's tail
-/// via the psubusb step — that's how voxlap keeps per-voxel
-/// shade calls independent (no cross-call tail bleed). The 0x00
-/// bytes in the vox-lane positions leave voxel colour untouched.
-/// `setsideshades(...)` only writes the HIGH byte of entries
-/// 2..7 (per-side darkening intensity); the low 7 bytes keep the
-/// initialiser pattern. For R4.3a-rewire-3b we mirror voxlap's
-/// `setsideshades(0,0,0,0,0,0)` baseline (high byte = 0).
-const DEFAULT_GCSUB: [i64; 9] = [0x00ff_00ff_00ff_00ff; 9];
+// gcsub now lives on `ScanScratch::gcsub`; the host pokes it via
+// `ScanScratch::set_side_shades` per frame (mirrors voxlap's
+// `setsideshades` global). The default-state pattern
+// (`0x00ff00ff00ff00ff` per entry, == `setsideshades(0,…,0)`) is
+// what `ScanScratch::new_for_size` initialises to, so the oracle
+// stays bit-exact when no shading is configured.
 
 /// Per-channel fog blend — voxlap5.c:2052-2056 (and the matching
 /// hrend / vrend scalar tail). `col` is the source ARGB voxel
@@ -334,10 +328,14 @@ impl Rasterizer for ScalarRasterizer<'_> {
             cache.prelude.column_index,
         )
         .unwrap_or(&[]);
+        // Copy gcsub out of scratch so the GrouscanInputs immutable
+        // borrow doesn't collide with the `&mut scratch` grouscan_run
+        // takes below. `[i64; 9]` is 72 bytes — cheap.
+        let gcsub_local: [i64; 9] = scratch.gcsub;
         let inputs = GrouscanInputs {
             column,
             gylookup: &cache.prelude.y_lookup,
-            gcsub: &DEFAULT_GCSUB,
+            gcsub: &gcsub_local,
             slab_buf: self.slab_buf,
             column_offsets: self.column_offsets,
         };

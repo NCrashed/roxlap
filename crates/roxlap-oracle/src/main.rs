@@ -564,6 +564,13 @@ fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
     if std::env::var("ROXLAP_FOG").is_ok() {
         engine.set_fog(0x00_87_ce_eb, 1024);
     }
+    // Mirror roxlap-host's shading so find-hairlines's rendered
+    // output matches what the user sees in the interactive view.
+    // Override with `ROXLAP_NO_SHADES=1` to revert to the oracle's
+    // (0,…,0) baseline.
+    if std::env::var("ROXLAP_NO_SHADES").is_err() {
+        engine.set_side_shades(15, 15, 15, 15, 15, 15);
+    }
     let vxl_world = load_oracle_vxl();
 
     let pixel_count = (hx as usize) * (hy as usize);
@@ -593,6 +600,8 @@ fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
     scratch.set_skycast(sky_col_i, 0);
     let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
     scratch.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    let s = engine.side_shades();
+    scratch.set_side_shades(s[0], s[1], s[2], s[3], s[4], s[5]);
 
     let settings = OpticastSettings::for_oracle_framebuffer(hx, hy);
     {

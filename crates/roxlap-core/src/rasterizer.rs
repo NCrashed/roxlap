@@ -113,6 +113,14 @@ pub struct ScanScratch {
     /// gives the per-pixel blend factor (0 = no fog applied,
     /// 32767 = full fog colour). Built by [`Self::set_fog`].
     pub foglut: Vec<i32>,
+    /// Voxlap's `gcsub[9]` per-side shading table. Default pattern
+    /// is `0x00ff00ff00ff00ff` per entry — that's voxlap's
+    /// `setsideshades(0,0,0,0,0,0)` baseline (no per-side
+    /// darkening). The high byte of entries 2..7 is the per-side
+    /// intensity (top, bottom, left, right, up, down). Set via
+    /// [`Self::set_side_shades`]; rasterizers read it on every gline
+    /// call.
+    pub gcsub: [i64; 9],
 }
 
 impl ScanScratch {
@@ -148,7 +156,41 @@ impl ScanScratch {
             skycast: CastDat::default(),
             fog_col: 0,
             foglut: Vec::new(),
+            gcsub: [0x00ff_00ff_00ff_00ff; 9],
         }
+    }
+
+    /// Engine-side setter for per-side shading intensities, mirror
+    /// of voxlap's `setsideshades(top, bot, left, right, up, down)`
+    /// (`voxlap5.c`). Each `i8` parameter is the high byte stamped
+    /// onto `gcsub[2..7]`; the low 7 bytes keep the
+    /// `0x00ff00ff00ff00ff` saturate-zero pattern. Pass `(0,…,0)` to
+    /// disable shading (the default), or moderate positive values
+    /// (15..31) for visible side darkening like voxlap's classic
+    /// games use.
+    pub fn set_side_shades(&mut self, top: i8, bot: i8, left: i8, right: i8, up: i8, down: i8) {
+        // High byte of an i64 (LE) is byte 7. Voxlap writes
+        // `((char *)&gcsub[k])[7] = sxx;` directly — bit-equivalent
+        // to reinterpreting the i8 as u8 and stamping it into the
+        // top byte. The sign-loss `as u8` is intentional (mirrors
+        // the C cast).
+        let pack = |intensity: i8| -> i64 {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+            let high = u64::from(intensity as u8) << 56;
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                (high | 0x00ff_00ff_00ff_00ff_u64) as i64
+            }
+        };
+        self.gcsub[0] = 0x00ff_00ff_00ff_00ff;
+        self.gcsub[1] = 0x00ff_00ff_00ff_00ff;
+        self.gcsub[2] = pack(top);
+        self.gcsub[3] = pack(bot);
+        self.gcsub[4] = pack(left);
+        self.gcsub[5] = pack(right);
+        self.gcsub[6] = pack(up);
+        self.gcsub[7] = pack(down);
+        self.gcsub[8] = 0x00ff_00ff_00ff_00ff;
     }
 
     /// Engine-side setter for the sky `(col, dist)` pair. Engine
