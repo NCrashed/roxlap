@@ -1359,32 +1359,110 @@ fn column_byte_at(state: &GrouscanState<'_>, offset: usize) -> u8 {
 
 /// `remiporend` — voxlap5.c:11998-12118. Mip-level transition.
 ///
-/// R4.3e3 ports only the FIRST check —
-/// `(gmipcnt + 1) >= gmipnum` → goto startsky — which is the
-/// hot path for the oracle scenes (single-mip rendering, where
-/// `gmipnum == 1` and `gmipcnt` starts at 0). The full mip
-/// transition body (`gdz`/`gixy`/`gpz` adjust, `ixy_sptr_col`
-/// re-mask, `gylookoff` shift, cfasm z0/z1 halve, `ngxmax`
-/// double) is
-/// substantial and was originally scoped at R4.5 in the
-/// porting plan; it stays a Done stub here until then.
+/// **R4.5 status**: audit complete; full body deferred behind a
+/// world-model dependency. Detailed reasoning below.
+///
+/// # Why this is a stub, not a body
+///
+/// The C body coarsens the active raycast onto the next mip
+/// level: doubles `gdz`/`ngxmax`, halves `gixy[1]` and every
+/// active `cf` entry's `z0`/`z1`, slides `gylookoff` to the
+/// mip-(N+1) sub-range of `gylookup`, and **rebases
+/// `ixy_sptr_col`** to point into the mip-(N+1) sub-table of
+/// the global `sptr` array.
+///
+/// That last step is the blocker. Voxlap's `sptr` is laid out
+/// as concatenated per-mip column-pointer sub-arrays:
+///
+/// ```text
+/// [ mip-0: VSID²    pointers ]
+/// [ mip-1: (VSID/2)² pointers ]
+/// [ mip-2: (VSID/4)² pointers ]
+/// ...
+/// ```
+///
+/// The mip-N+ entries are populated at world-load time by
+/// `genmipvxl` (voxlap5.c:4710+). roxlap-formats currently
+/// reads only the mip-0 columns from `.vxl` (the on-disk format
+/// stores only mip-0); roxlap has no equivalent of `genmipvxl`,
+/// so `Vxl::column_offset` is exactly `vsid² + 1` entries —
+/// mip-0 only. There's nowhere for the rebase to point.
+///
+/// Reaching this branch requires `gmipnum > 1`, which is gated
+/// on `vx5.vxlmipuse > 1` in voxlap C. The oracle uses
+/// `vxlmipuse == 1`, so all 12 oracle poses (and the 4 currently
+/// bit-exact) take the `Phase::Startsky` early-out and never
+/// reach the body. This stub preserves that behaviour.
+///
+/// # LP32 / LP64 sptr-stride bug audit (voxlap5.c:12017-12023)
+///
+/// The C body's `xor0 = (esi_rel << 29) ^ gixy[0]` and
+/// `xor1 = (esi_rel << (gmipcnt + 17)) ^ gixy[1]` parity tests
+/// were calibrated for `sizeof(char *) == 4`. After
+/// voxlaptest's LP64 widen (`SPTR_LOG2_STRIDE = 3`,
+/// `voxlap5.c:99-104`), `esi_rel = ixy_sptr_col - sptr` carries
+/// an extra factor of 2 in its low bits, so:
+///
+/// | shift              | LP32 tests                    | LP64 tests                       |
+/// |--------------------|-------------------------------|----------------------------------|
+/// | `<<29`             | bit 0 of `column_index` (x parity) | bit −1 (always 0 → always "add") |
+/// | `<<(gmipcnt + 17)` | depends on VSID + N (off-by-one even on LP32 for VSID > 1024) | even more wrong |
+///
+/// The C source carries an explicit `NOTE` flagging this and
+/// documents the gating on `vxlmipuse == 1` as the reason
+/// nothing has burned. **roxlap sidesteps the whole issue**:
+/// its `ixy_sptr_col_idx` is an *element* index into
+/// `column_offsets` (no pointer-stride at all), so the natural
+/// expression of the parity test in roxlap is
+/// `(column_index >> bit_pos) & 1`, with `bit_pos` derived
+/// from VSID and `gmipcnt`:
+///
+/// - lane 0 (x parity at mip-N): `bit_pos = gmipcnt`
+/// - lane 1 (y parity at mip-N): `bit_pos = log2(vsid) + gmipcnt`
+///
+/// This is LP-independent and VSID-independent by construction.
+/// When the multi-mip world model lands, the body should use
+/// these bit positions directly rather than porting the C
+/// shift arithmetic.
+///
+/// # Safer fall-through: Startsky, not Done
+///
+/// Pre-R4.5 this stub returned `Phase::Done` once the gmipnum
+/// check failed, leaving every still-open `cf` entry's pixel
+/// range unwritten in `radar`. For multi-mip worlds (which
+/// roxlap doesn't load yet, but a host crate could in theory
+/// build by hand) that surfaces as garbage in the radar tail.
+/// `Phase::Startsky` instead fills the tail with sky — the same
+/// behaviour `gmipcnt + 1 >= gmipnum` triggers naturally, and
+/// the visually-correct fallback for "ran out of voxel data
+/// along this ray".
+///
+/// # Open follow-ups before R4.5 can land for real
+///
+/// 1. Port `genmipvxl` (voxlap5.c:4710+) to roxlap-formats so
+///    `Vxl` carries mip-1+ column data.
+/// 2. Extend `column_offset` to concatenate per-mip sub-tables,
+///    or split into a `Vec<Box<[u32]>>` indexed by mip level.
+///    Plumb a `mip_base_offsets: &[u32]` view through
+///    `GrouscanInputs` so `phase_remiporend` can do the rebase.
+/// 3. Then: implement the body using column-index parity tests
+///    (above) and the per-mip `mip_base_offsets` for the rebase.
 //
-// Voxlap's check is `(uint8_t)(gmipcnt + 1) >= (uint8_t)gmipnum`
-// — bytewise compare. For our port the natural i32/u32 widths
-// give the same answer for any realistic mip count (0..32-ish);
-// the byte-cast was an asm artifact.
+// Voxlap's outer check is `(uint8_t)(gmipcnt + 1) >=
+// (uint8_t)gmipnum` — bytewise compare. For our port the
+// natural i32/u32 widths give the same answer for any
+// realistic mip count (0..32-ish); the byte-cast was an asm
+// artifact.
 #[allow(clippy::cast_sign_loss)]
 fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     if (state.gmipcnt + 1) as u32 >= state.gmipnum {
         return Phase::Startsky;
     }
-    // R4.5 — full mip transition body. Reaching this branch means
-    // gmipnum > 1 (vxlmipuse > 1 in voxlap terms), which the
-    // oracle scenes don't exercise. Audit the asm `<<29` / `+17`
-    // pointer-stride arithmetic for LP64 (the C port has a
-    // documented bug here, voxlap5.c:12017-12023 area) before
-    // implementing.
-    Phase::Done
+    // Multi-mip transition reached but no mip-N+ column data
+    // available in roxlap's world model yet (see doc comment).
+    // Safer than `Phase::Done`: fill the rest of the ray with
+    // sky instead of leaving the radar tail uninitialized.
+    Phase::Startsky
 }
 
 /// `startsky` — voxlap5.c:12120-12190. Drains every remaining
@@ -2146,14 +2224,20 @@ mod tests {
     }
 
     #[test]
-    fn remiporend_full_body_remains_stubbed_at_done() {
-        // gmipnum > 1 + gmipcnt+1 < gmipnum hits the path
-        // R4.5 will replace. R4.3e3 stubs it as Done.
+    fn remiporend_multimip_falls_through_to_startsky() {
+        // gmipnum > 1 + gmipcnt+1 < gmipnum hits the multi-mip
+        // body. Until the world model carries mip-N+ column data
+        // (port of voxlap's genmipvxl), the stub falls through to
+        // Phase::Startsky — the visually-correct fallback that
+        // fills the unrendered tail with sky rather than leaving
+        // the radar uninitialized (which Phase::Done would do).
+        // The audit at `phase_remiporend`'s doc comment covers
+        // why the full body is gated on multi-mip column_offsets.
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 4);
         state.gmipcnt = 0;
-        assert_eq!(phase_remiporend(&mut state), Phase::Done);
+        assert_eq!(phase_remiporend(&mut state), Phase::Startsky);
     }
 
     #[test]
