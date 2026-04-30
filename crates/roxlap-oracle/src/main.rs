@@ -450,6 +450,241 @@ fn print_help() {
     );
 }
 
+/// Captured runtime state from the host's F-key capture. Exactly
+/// the fields `crates/roxlap-host/src/main.rs::write_capture` writes.
+struct Capture {
+    width: u32,
+    height: u32,
+    pos: [f64; 3],
+    yaw: f64,
+    pitch: f64,
+}
+
+/// Parse a `key = value` capture file. Tolerates `# comment` lines.
+fn parse_capture(text: &str) -> Capture {
+    let mut width = 800u32;
+    let mut height = 600u32;
+    let mut pos = [1024.0_f64, 1024.0, 100.0];
+    let mut yaw = 0.0_f64;
+    let mut pitch = 0.0_f64;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        let v = v.trim();
+        match k {
+            "width" => {
+                if let Ok(n) = v.parse() {
+                    width = n;
+                }
+            }
+            "height" => {
+                if let Ok(n) = v.parse() {
+                    height = n;
+                }
+            }
+            "pos.x" => {
+                if let Ok(n) = v.parse() {
+                    pos[0] = n;
+                }
+            }
+            "pos.y" => {
+                if let Ok(n) = v.parse() {
+                    pos[1] = n;
+                }
+            }
+            "pos.z" => {
+                if let Ok(n) = v.parse() {
+                    pos[2] = n;
+                }
+            }
+            "yaw" => {
+                if let Ok(n) = v.parse() {
+                    yaw = n;
+                }
+            }
+            "pitch" => {
+                if let Ok(n) = v.parse() {
+                    pitch = n;
+                }
+            }
+            _ => {}
+        }
+    }
+    Capture {
+        width,
+        height,
+        pos,
+        yaw,
+        pitch,
+    }
+}
+
+/// `find-hairlines [path-to-capture.txt]` — debug aid for the
+/// "vertical sky-coloured hairline on the floor" artifact. Loads
+/// the camera state captured by the host's `F` hotkey (default:
+/// `./roxlap-capture.txt`), re-renders into a sentinel-initialised
+/// framebuffer at the captured resolution, and scans for sandwich
+/// patterns where sky / unwritten pixels sit between floor pixels.
+//
+// Suppress dead-code lints — this is diagnostic-only, called via
+// the CLI dispatch, not by the test suite.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines
+)]
+fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
+    let txt = fs::read_to_string(capture_path)?;
+    let cap = parse_capture(&txt);
+    let Capture {
+        width: hx,
+        height: hy,
+        pos,
+        yaw,
+        pitch,
+    } = cap;
+
+    let mut engine = Engine::new();
+    // ROXLAP_TAG_SKY: paint sky bright green so pixels that hrend
+    // writes from a startsky-drained radar slot are unambiguously
+    // distinguishable from sky-colour reads via fog. Off by default;
+    // set the env var when isolating a hairline source.
+    if std::env::var("ROXLAP_TAG_SKY").is_ok() {
+        engine.set_sky_color(0x80_00_FF_00);
+    }
+    if std::env::var("ROXLAP_FOG").is_ok() {
+        engine.set_fog(0x00_87_ce_eb, 1024);
+    }
+    let vxl_world = load_oracle_vxl();
+
+    let pixel_count = (hx as usize) * (hy as usize);
+    let mut framebuffer = vec![0u32; pixel_count];
+    let mut zbuffer = vec![0.0f32; pixel_count];
+    let mut scratch = ScanScratch::new_for_size(hx, hy, vxl_world.vsid);
+    // Host yaw/pitch convention (main.rs::App::camera): yaw=0 looks
+    // +y; right = [cos, -sin, 0]; forward = [sin*cos, cos*cos, sin].
+    let cyaw = yaw.cos();
+    let syaw = yaw.sin();
+    let cp = pitch.cos();
+    let sp = pitch.sin();
+    let host_cam = Camera {
+        pos,
+        right: [cyaw, -syaw, 0.0],
+        down: [-syaw * sp, -cyaw * sp, cp],
+        forward: [syaw * cp, cyaw * cp, sp],
+    };
+
+    // Pre-fill with a SENTINEL value (≠ sky and ≠ any voxel colour)
+    // so we can distinguish (a) "pixel never written by opticast"
+    // [stays sentinel] from (b) "pixel written but with sky colour"
+    // [becomes sky], which is the actual hairline symptom.
+    let sentinel: u32 = 0x0000_0001;
+    framebuffer.fill(sentinel);
+    let sky_col_i = i32::from_ne_bytes(engine.sky_color().to_ne_bytes());
+    scratch.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    scratch.set_fog(fog_col_i, engine.fog_max_scan_dist());
+
+    let settings = OpticastSettings::for_oracle_framebuffer(hx, hy);
+    {
+        let mut rasterizer = ScalarRasterizer::new(
+            &mut framebuffer,
+            &mut zbuffer,
+            hx as usize,
+            &vxl_world.data,
+            &vxl_world.column_offset,
+            vxl_world.vsid,
+        );
+        let _ = opticast(
+            &mut rasterizer,
+            &mut scratch,
+            &host_cam,
+            &settings,
+            vxl_world.vsid,
+            &vxl_world.data,
+            &vxl_world.column_offset,
+        );
+    }
+
+    // sky here = the sentinel green we set above; it's what
+    // startsky drains into radar slots.
+    let sky = engine.sky_color();
+    // True hairline = a run of sky/sentinel pixels that has a
+    // FLOOR-coloured pixel both ABOVE and BELOW it in the same
+    // column. That excludes the actual horizon-meets-sky region
+    // and edge artifacts (where sky reaches the screen border).
+    let is_floor = |p: u32| p != sky && p != sentinel;
+    let mut hairline_columns = Vec::<(u32, u32, u32, u32)>::new(); // (sx, sy_top, run_len, is_sky)
+    for sx in 0..hx {
+        // Walk top-down looking for [floor, sky-run, floor] sandwiches.
+        let col_idx = |sy: u32| (sy as usize) * (hx as usize) + (sx as usize);
+        let mut sy = 0u32;
+        while sy < hy {
+            // Skip until we find a floor pixel — required for the
+            // top side of the sandwich.
+            while sy < hy && !is_floor(framebuffer[col_idx(sy)]) {
+                sy += 1;
+            }
+            if sy >= hy {
+                break;
+            }
+            // Skip floor pixels.
+            while sy < hy && is_floor(framebuffer[col_idx(sy)]) {
+                sy += 1;
+            }
+            if sy >= hy {
+                break;
+            }
+            // Sky/sentinel run; record its top + length.
+            let top = sy;
+            let mut run_is_sky = 0u32;
+            while sy < hy && !is_floor(framebuffer[col_idx(sy)]) {
+                if framebuffer[col_idx(sy)] == sky {
+                    run_is_sky = 1;
+                }
+                sy += 1;
+            }
+            let run = sy - top;
+            // Sandwich check: must be followed by another floor pixel
+            // (sy < hy here means a floor pixel exists below).
+            if sy < hy && run >= 2 {
+                hairline_columns.push((sx, top, run, run_is_sky));
+            }
+        }
+    }
+
+    println!(
+        "pose: pos=({}, {}, {}) yaw={yaw:.4} pitch={pitch:.4} size={hx}x{hy}\n\
+         {} sandwich-shaped hairlines (sky/sentinel between floor pixels, run ≥ 2)",
+        pos[0],
+        pos[1],
+        pos[2],
+        hairline_columns.len(),
+    );
+    for (sx, sy_top, run, is_sky) in hairline_columns.iter().take(40) {
+        let kind = if *is_sky == 1 { "sky" } else { "unwritten" };
+        println!("  sx={sx} sy_top={sy_top} run={run} ({kind})");
+    }
+
+    // Highlight the offending pixels in the PPM dump.
+    let mut viz = framebuffer.clone();
+    for px in &mut viz {
+        if *px == sentinel {
+            *px = 0xFFFF_00FF; // magenta = unwritten
+        }
+    }
+    write_ppm("find-hairlines.ppm", &viz, hx, hy)?;
+    println!("\nwrote find-hairlines.ppm (unwritten → magenta; sky stays sky)");
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map_or("render", String::as_str);
@@ -492,6 +727,16 @@ fn main() -> std::io::Result<()> {
         "debug-gline" => {
             let pose_name = args.get(1).cloned().unwrap_or_else(|| "north".to_string());
             cmd_debug_gline(&pose_name)
+        }
+        "find-hairlines" => {
+            // Default: ./roxlap-capture.txt — what the host writes
+            // when the user presses F. CLI override lets you point
+            // at a different captured pose.
+            let path = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "roxlap-capture.txt".to_string());
+            cmd_find_hairlines(&path)
         }
         "--help" | "-h" => {
             print_help();

@@ -539,8 +539,21 @@ pub enum Phase {
 /// every phase as a stub that returns [`Phase::Done`]; R4.3f+
 /// replaces them with the actual fill loops.
 fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
+    let trace = std::env::var("ROXLAP_TRACE_PHASES").is_ok();
     let mut current = entry;
+    let mut step_count = 0u32;
     loop {
+        if trace {
+            eprintln!(
+                "  phase {step_count:4}: {current:?} c={} ce={} z0={} z1={} cx1={} cy1={} ogx={} gx={}",
+                state.c_idx, state.ce_idx, state.z0, state.z1, state.cx1, state.cy1, state.ogx, state.gx,
+            );
+            step_count += 1;
+            if step_count > 200 {
+                eprintln!("  (truncated)");
+                break;
+            }
+        }
         current = match current {
             Phase::DrawFwall => phase_draw_fwall(state),
             Phase::DrawCwall => phase_draw_cwall(state),
@@ -1455,6 +1468,19 @@ fn column_byte_at(state: &GrouscanState<'_>, offset: usize) -> u8 {
 // artifact.
 #[allow(clippy::cast_sign_loss)]
 fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
+    if std::env::var("ROXLAP_TRACE_STARTSKY").is_ok() {
+        eprintln!(
+            "remiporend: gmipcnt={} gmipnum={} ce={} c={} gpz=[{}, {}] gxmax={} ngxmax={}",
+            state.gmipcnt,
+            state.gmipnum,
+            state.ce_idx,
+            state.c_idx,
+            state.scratch.gpz[0],
+            state.scratch.gpz[1],
+            state.scratch.gxmax,
+            state.ngxmax,
+        );
+    }
     if (state.gmipcnt + 1) as u32 >= state.gmipnum {
         return Phase::Startsky;
     }
@@ -1491,6 +1517,11 @@ fn phase_startsky(state: &mut GrouscanState<'_>) -> Phase {
         return Phase::Done;
     }
 
+    // Diagnostic: ROXLAP_TRACE_STARTSKY=1 dumps each cf entry's
+    // drained range to stderr so we can pin which rays leak sky
+    // into the floor.
+    let trace = std::env::var("ROXLAP_TRACE_STARTSKY").is_ok();
+
     // Solid-fill branch (skyoff == 0). Write skycast into every
     // radar slot from c->i0 to c->i1 inclusive, for each cf
     // entry in [cf[128], ce].
@@ -1500,7 +1531,20 @@ fn phase_startsky(state: &mut GrouscanState<'_>) -> Phase {
         let i1 = state.scratch.cf[c_idx].i1;
         // Empty range if i0 > i1 — RangeInclusive correctly skips.
         if i0 > i1 {
+            if trace {
+                eprintln!(
+                    "startsky cf[{c_idx}] i0={i0} i1={i1} (empty, skip; ce={})",
+                    state.ce_idx
+                );
+            }
             continue;
+        }
+        if trace {
+            eprintln!(
+                "startsky cf[{c_idx}] drains slots [{i0}..={i1}] ({} slots; ce={})",
+                i1 - i0 + 1,
+                state.ce_idx
+            );
         }
         for p in i0..=i1 {
             if let Some(slot) = state.scratch.radar.get_mut(p as usize) {
