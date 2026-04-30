@@ -1146,7 +1146,9 @@ dependencies = [
 name = "roxlap-host"
 version = "0.0.0"
 dependencies = [
+ "flate2",
  "roxlap-core",
+ "roxlap-formats",
  "softbuffer",
  "winit",
 ]

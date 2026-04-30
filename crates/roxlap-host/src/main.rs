@@ -1,24 +1,26 @@
 //! roxlap-host — winit + softbuffer demo host.
 //!
-//! Stage R4.3a: opens a window, allocates a softbuffer surface, and on
-//! every `RedrawRequested` event runs `opticast` with the
-//! `ScalarRasterizer` and the placeholder gline. The visible scene
-//! pixels show as magenta on a sky-blue background; once R4.3b+
-//! lands the real grouscan ray-cast, the magenta is replaced with
-//! actual voxel colours.
+//! Stage R4.3a-rewire-4: opens a window, loads a real `.vxl` world
+//! (oracle.vxl.gz from the workspace assets), and on every
+//! `RedrawRequested` event runs `opticast` with the
+//! `ScalarRasterizer`. The real R4.3a-rewire-3b gline + grouscan
+//! chain produces voxel colours from the loaded world.
 //!
 //! Controls:
 //! - `Esc` or window close → exit.
 
+use std::io::Read;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
+use flate2::read::GzDecoder;
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
+use roxlap_formats::vxl;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -28,7 +30,10 @@ use winit::window::{Window, WindowId};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
-const VSID: u32 = 2048;
+
+/// Embedded gzipped oracle world. Same fixture roxlap-formats uses
+/// in its parser tests — no extra disk I/O at startup.
+const ORACLE_VXL_GZ: &[u8] = include_bytes!("../../../assets/oracle.vxl.gz");
 
 struct App {
     /// Window handle. Wrapped in `Rc` because softbuffer's `Context`
@@ -44,21 +49,17 @@ struct App {
     /// frames. Sized at app construction for the initial window
     /// resolution; resized on window-resize.
     scratch: ScanScratch,
-    /// Synthetic world data — `slab_buf` holds the camera column's
-    /// single solid slab at z = 200..254; `column_offsets` maps the
-    /// camera's column to that slab and every other column to
-    /// empty. The placeholder gline ignores both; `opticast` reads
-    /// `slab_buf[column_offsets[camera_column_index]..]` for the
-    /// camera-column air-gap check. Replaced by an actual `.vxl`
-    /// world once R4.3a-rewire-4 lands.
-    slab_buf: Vec<u8>,
-    column_offsets: Vec<u32>,
+    /// World loaded from `oracle.vxl.gz`. `vxl.data` is the flat
+    /// slab buffer, `vxl.column_offset` the per-column byte offsets;
+    /// `vxl.vsid` the world dimension; `vxl.ipo`/`ist`/`ihe`/`ifo`
+    /// the saved camera.
+    vxl: vxl::Vxl,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
-            .with_title("roxlap (R4.3a — magenta placeholder)")
+            .with_title("roxlap (R4.3a-rewire-4 — oracle.vxl)")
             .with_inner_size(LogicalSize::new(f64::from(WIDTH), f64::from(HEIGHT)));
         let window = Rc::new(
             event_loop
@@ -105,8 +106,21 @@ impl ApplicationHandler for App {
                     self.zbuffer.resize(pixel_count, 0.0);
                 }
                 if self.scratch.uurend_half_stride < size.width as usize {
-                    self.scratch = ScanScratch::new_for_size(size.width, size.height, VSID);
+                    self.scratch =
+                        ScanScratch::new_for_size(size.width, size.height, self.vxl.vsid);
                 }
+
+                // Wire engine sky colour onto scratch so grouscan's
+                // startsky has the right (col, dist) for any radar
+                // slot it drains. Voxlap stamps `skycast.dist =
+                // gxmax` per ray (with USEZBUFFER); the R4.3a-rewire
+                // path stays at a static far-depth sentinel until
+                // R4.4 lands the per-ray skycast update.
+                // u32 → i32 reinterpret (preserves bits — `set_skycast`
+                // treats it as a packed ARGB and `cast_signed` is
+                // 1.87+, beyond the workspace MSRV).
+                let sky_col_i = i32::from_ne_bytes(self.engine.sky_color().to_ne_bytes());
+                self.scratch.set_skycast(sky_col_i, 0x7FFF_FFFF);
 
                 let mut buffer = surface.buffer_mut().expect("softbuffer: buffer_mut");
                 // Pre-fill with sky-blue so any pixel opticast leaves
@@ -116,15 +130,17 @@ impl ApplicationHandler for App {
                     *px = sky;
                 }
 
-                // Looking-down camera so all four scan-quadrants engage
-                // and the magenta placeholder fills a noticeable
-                // region of the screen. Replaced with engine-managed
-                // camera state once R4.3b+ has a real world to look at.
+                // Camera from the .vxl save. Voxlap's saved basis is
+                // (ist, ihe, ifo) = (right, screen-down, forward);
+                // roxlap's Camera names them `right`, `down`,
+                // `forward` — same semantics, same f64 width, so a
+                // direct field-by-field copy lifts each vector
+                // across.
                 let cam = Camera {
-                    pos: [1024.0, 1024.0, 128.0],
-                    right: [1.0, 0.0, 0.0],
-                    down: [0.0, 1.0, 0.0],
-                    forward: [0.0, 0.0, 1.0],
+                    pos: self.vxl.ipo,
+                    right: self.vxl.ist,
+                    down: self.vxl.ihe,
+                    forward: self.vxl.ifo,
                 };
 
                 let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
@@ -136,18 +152,18 @@ impl ApplicationHandler for App {
                         &mut buffer,
                         &mut self.zbuffer,
                         pitch_pixels,
-                        &self.slab_buf,
-                        &self.column_offsets,
-                        VSID,
+                        &self.vxl.data,
+                        &self.vxl.column_offset,
+                        self.vxl.vsid,
                     );
                     let _ = opticast(
                         &mut rasterizer,
                         &mut self.scratch,
                         &cam,
                         &settings,
-                        VSID,
-                        &self.slab_buf,
-                        &self.column_offsets,
+                        self.vxl.vsid,
+                        &self.vxl.data,
+                        &self.vxl.column_offset,
                     );
                 }
                 buffer.present().expect("softbuffer: present");
@@ -158,34 +174,32 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Decompress + parse the embedded oracle world. Errors are fatal:
+/// a malformed asset means the binary is broken, not a runtime
+/// recoverable state.
+fn load_oracle_vxl() -> vxl::Vxl {
+    let mut decoder = GzDecoder::new(ORACLE_VXL_GZ);
+    let mut bytes = Vec::with_capacity(40 * 1024 * 1024);
+    decoder
+        .read_to_end(&mut bytes)
+        .expect("gunzip oracle.vxl.gz");
+    vxl::parse(&bytes).expect("parse oracle.vxl")
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    // Synthetic single-slab world: only the camera's column at
-    // (1024, 1024) holds the solid slab z = 200..254; every other
-    // column is empty. `column_offsets[i]` is the byte offset
-    // into `slab_buf` where column `i`'s slabs start; the slice
-    // length `column_offsets[i + 1] - column_offsets[i]` is 0 for
-    // all empty columns and `slab_buf.len()` for the camera's
-    // column.
-    let slab_buf: Vec<u8> = vec![0u8, 200, 254, 0];
-    let cam_col_idx: usize = 1024 * (VSID as usize) + 1024;
-    let vsid_sq: usize = (VSID as usize) * (VSID as usize);
-    let mut column_offsets = vec![0u32; vsid_sq + 1];
-    let slab_len_u32 = u32::try_from(slab_buf.len()).expect("slab_buf fits u32");
-    for offset in &mut column_offsets[(cam_col_idx + 1)..] {
-        *offset = slab_len_u32;
-    }
+    let vxl_world = load_oracle_vxl();
+    let initial_scratch = ScanScratch::new_for_size(WIDTH, HEIGHT, vxl_world.vsid);
 
     let mut app = App {
         window: None,
         surface: None,
         engine: Engine::new(),
         zbuffer: Vec::new(),
-        scratch: ScanScratch::new_for_size(WIDTH, HEIGHT, VSID),
-        slab_buf,
-        column_offsets,
+        scratch: initial_scratch,
+        vxl: vxl_world,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

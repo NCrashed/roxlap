@@ -14,11 +14,15 @@ path = "src/main.rs"
 
 [dependencies]
 roxlap-core = { path = "../roxlap-core" }
+roxlap-formats = { path = "../roxlap-formats" }
 # winit + softbuffer is a pure-Rust windowing + framebuffer-blit pair
 # that compiles on Linux / Windows / macOS today and on wasm32 once
 # R10 lands.
 winit = "0.30"
 softbuffer = "0.4"
+# flate2 with the rust_backend feature stays pure-Rust (no native
+# zlib link), matching roxlap-formats's `oracle.vxl.gz` decode.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [lints]
 workspace = true
