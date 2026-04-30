@@ -5,9 +5,27 @@ voxel engine.
 
 ## Status
 
-Very early — Stage R1 (repo skeleton). The port is being staged out of
-[voxlaptest](https://github.com/NCrashed/voxlaptest), the modernised C fork of
-Voxlap. See `PORTING-RUST.md` for the substage roadmap and current status.
+R4 (the opticast + grouscan port) is **bit-exact against voxlap C** on
+the 4 oracle poses that exercise opticast alone (`north`, `east`,
+`diag_down`, `high_down`). The remaining 8 oracle poses each need a
+feature that doesn't live inside opticast — KV6 sprites (R6), per-voxel
+lighting, or `drawtile` 2D blits — so they're tracked as later stages
+rather than R4 gaps.
+
+```
+$ cargo run -p roxlap-oracle -- diff
+MATCH    north  326a7c41c3cc659d
+MATCH    east  3e00f1d0d62d5be0
+MATCH    diag_down  118de3c1132d0f6b
+MATCH    high_down  cd1ceac6e21c55f4
+4 match, 0 mismatch, 0 missing-from-golden (4 total roxlap rows)
+```
+
+The port is being staged out of
+[voxlaptest](https://github.com/NCrashed/voxlaptest), the modernised C
+fork of Voxlap. See [PORTING-RUST.md](PORTING-RUST.md) for the substage
+roadmap, deferred R4 items (textured sky, multi-mip, sideshademode), and
+the planned R6 sprite renderer.
 
 ## Goals
 
@@ -29,7 +47,8 @@ Voxlap. See `PORTING-RUST.md` for the substage roadmap and current status.
 crates/
 ├── roxlap-core/      engine: framebuffer, camera, opticast, grouscan, rasterizers
 ├── roxlap-formats/   .vxl / .kv6 / .kvx / .kfa parsers
-└── roxlap-host/      winit + softbuffer demo binary
+├── roxlap-host/      winit + softbuffer demo binary
+└── roxlap-oracle/    cross-engine render-hash oracle (writes roxlap-hashes.txt; `diff` mode compares against voxlap C goldens)
 ```
 
 ## Relationship to voxlaptest
