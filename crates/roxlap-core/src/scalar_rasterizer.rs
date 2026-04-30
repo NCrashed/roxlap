@@ -476,6 +476,87 @@ impl Rasterizer for ScalarRasterizer<'_> {
 
         let mut iplc_local = iplc;
         let mut x = sx;
+
+        // R5.3: SSE2 4-pixel batch — port of voxlaptest's
+        // `vrendzsse` (voxlap5.c:2083). The per-column
+        // `uurend[sx] += uurend[sx + half_stride]` update is
+        // parallel-safe: uurend[sx + half_stride..] is read-only
+        // here, and uurend[sx..+3] are four distinct lanes.
+        // Read OLD u/d values, do the SSE z math, then write
+        // back four NEW u values. Plus fog blend (R5.2-style)
+        // when foglut is non-empty.
+        #[cfg(target_arch = "x86_64")]
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            use core::arch::x86_64::{
+                __m128i, _mm_add_ps, _mm_cvtepi32_ps, _mm_cvtss_f32, _mm_mul_ps, _mm_rsqrt_ps,
+                _mm_set1_ps, _mm_setr_epi32, _mm_setr_ps, _mm_storeu_ps, _mm_storeu_si128,
+            };
+            let strx = rs.strx;
+            let stry = rs.stry;
+            let vstrx4 = _mm_set1_ps(strx * 4.0);
+            let vstry4 = _mm_set1_ps(stry * 4.0);
+            let mut vdx = _mm_setr_ps(dirx, dirx + strx, dirx + 2.0 * strx, dirx + 3.0 * strx);
+            let mut vdy = _mm_setr_ps(diry, diry + stry, diry + 2.0 * stry, diry + 3.0 * stry);
+            while p1 - x >= 4 {
+                let xu = x as usize;
+                // Read 4 OLD uurend pairs (u, d). u = current ray
+                // index for column; d = per-pixel delta.
+                let mut u = [0i32; 4];
+                let mut d = [0i32; 4];
+                for k in 0..4 {
+                    u[k] = scratch.uurend[xu + k];
+                    d[k] = scratch.uurend[xu + k + half_stride];
+                }
+                // Gather 4 castdat hits.
+                let mut col = [0i32; 4];
+                let mut dst = [0i32; 4];
+                for k in 0..4 {
+                    let ray_idx = (u[k] >> 16) as usize;
+                    let iplc_k = iplc_local.wrapping_add(iinc.wrapping_mul(k as i32));
+                    let cd_offset = scratch.angstart[ray_idx] + iplc_k as isize;
+                    let cd = scratch.radar[cd_offset as usize];
+                    col[k] = cd.col;
+                    dst[k] = cd.dist;
+                }
+                if !scratch.foglut.is_empty() {
+                    for k in 0..4 {
+                        col[k] = fog_blend(col[k], dst[k], &scratch.foglut, scratch.fog_col);
+                    }
+                }
+                let vcol = _mm_setr_epi32(col[0], col[1], col[2], col[3]);
+                let vdsi = _mm_setr_epi32(dst[0], dst[1], dst[2], dst[3]);
+                let vdst = _mm_cvtepi32_ps(vdsi);
+                let vsqr = _mm_add_ps(_mm_mul_ps(vdx, vdx), _mm_mul_ps(vdy, vdy));
+                let vinv = _mm_rsqrt_ps(vsqr);
+                let vz = _mm_mul_ps(vdst, vinv);
+
+                let pixel_idx = row_start + xu;
+                _mm_storeu_si128(
+                    self.framebuffer
+                        .as_mut_ptr()
+                        .add(pixel_idx)
+                        .cast::<__m128i>(),
+                    vcol,
+                );
+                _mm_storeu_ps(self.zbuffer.as_mut_ptr().add(pixel_idx), vz);
+
+                // Write back NEW uurend values — u + d per lane.
+                for k in 0..4 {
+                    scratch.uurend[xu + k] = u[k].wrapping_add(d[k]);
+                }
+
+                vdx = _mm_add_ps(vdx, vstrx4);
+                vdy = _mm_add_ps(vdy, vstry4);
+                iplc_local = iplc_local.wrapping_add(iinc.wrapping_mul(4));
+                x += 4;
+            }
+            dirx = _mm_cvtss_f32(vdx);
+            diry = _mm_cvtss_f32(vdy);
+        }
+
+        // Scalar tail — handles 0..3 leftover pixels on x86_64
+        // and the full body on other targets.
         while x < p1 {
             // Vertical scan reads the per-column ray index from
             // uurend[sx] (>>16 to drop the fractional bits).
@@ -483,9 +564,10 @@ impl Rasterizer for ScalarRasterizer<'_> {
             let ray_idx = (scratch.uurend[xu] >> 16) as usize;
             let cd_offset = scratch.angstart[ray_idx] + iplc_local as isize;
             let cd = scratch.radar[cd_offset as usize];
+            let col = fog_blend(cd.col, cd.dist, &scratch.foglut, scratch.fog_col);
 
             let pixel_idx = row_start + xu;
-            self.framebuffer[pixel_idx] = cd.col as u32;
+            self.framebuffer[pixel_idx] = col as u32;
             #[allow(clippy::cast_precision_loss)]
             let z = cd.dist as f32 / (dirx * dirx + diry * diry).sqrt();
             self.zbuffer[pixel_idx] = z;
@@ -797,6 +879,66 @@ mod tests {
         // colour-presence assertion replaces this comment.
         let _ = sky_col; // suppress unused-let warning — kept as
                          // scaffolding for the future assertion.
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vrend_sse_batch_writes_4_pixel_block() {
+        // R5.3 smoke test: vrend's SSE batch fires for span len ≥
+        // 4. Pre-fill 4 distinct radar entries, set angstart so
+        // each lane's uurend[sx]>>16 indexes a different ray, run
+        // vrend over [10..14], assert each column got the right
+        // colour and uurend advanced.
+        let mut fb = vec![0u32; 64 * 64];
+        let mut zb = vec![0.0f32; 64 * 64];
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
+        let (cs, proj, rs, prelude) = dummy_per_frame();
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 64,
+            yres: 64,
+            anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
+        };
+        r.frame_setup(&ctx);
+
+        let mut scratch = ScanScratch::new_for_size(64, 64, 64);
+        for k in 0..4 {
+            scratch.radar[k] = CastDat {
+                col: 0x8000_0000_u32 as i32 | k as i32,
+                dist: 1024,
+            };
+            scratch.angstart[k] = k as isize;
+        }
+        // uurend[sx + k] >> 16 = k → ray_idx k → angstart[k] = k
+        // → radar[k]. delta = 5 (so post-batch uurend[sx + k] =
+        // (k << 16) + 5).
+        let half = scratch.uurend_half_stride;
+        for k in 0..4 {
+            scratch.uurend[10 + k] = (k as i32) << 16;
+            scratch.uurend[10 + k + half] = 5;
+        }
+
+        r.vrend(&mut scratch, 10, 5, 14, 0, 0);
+
+        let row_off = 5 * 64;
+        for k in 0..4 {
+            let want = 0x8000_0000_u32 | k as u32;
+            assert_eq!(fb[row_off + 10 + k], want, "fb col[{}]", 10 + k);
+            assert!(zb[row_off + 10 + k].to_bits() != 0, "z[{}]", 10 + k);
+            // Post-batch uurend = old_u + delta.
+            assert_eq!(
+                scratch.uurend[10 + k],
+                ((k as i32) << 16) + 5,
+                "uurend[{}]",
+                10 + k
+            );
+        }
     }
 
     #[test]
