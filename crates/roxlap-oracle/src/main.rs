@@ -203,6 +203,29 @@ fn render_pose(
     fnv1a64(&bytes)
 }
 
+/// Dump framebuffer as a P6 PPM (binary RGB). Standalone format
+/// — no external image library — that GIMP / feh / `xdg-open`
+/// open natively. Voxlap's framebuffer is `int32_t` packed as
+/// `(brightness << 24) | (R << 16) | (G << 8) | B`; we extract
+/// the RGB bytes and discard the brightness/alpha.
+///
+/// Useful for side-by-side visual diff against
+/// `voxlaptest/build-clang/oracle-run/<pose>.png`. Gated behind
+/// the `ROXLAP_ORACLE_PPM` env var so the default render run
+/// stays disk-quiet.
+fn write_ppm(path: &str, framebuffer: &[u32], width: u32, height: u32) -> std::io::Result<()> {
+    let header = format!("P6\n{width} {height}\n255\n");
+    let mut bytes = Vec::with_capacity(header.len() + framebuffer.len() * 3);
+    bytes.extend_from_slice(header.as_bytes());
+    for &px in framebuffer {
+        bytes.push(((px >> 16) & 0xff) as u8); // R
+        bytes.push(((px >> 8) & 0xff) as u8); // G
+        bytes.push((px & 0xff) as u8); // B
+    }
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
 /// Format hashes lines as `name  hex_hash\n` — same shape as
 /// voxlap's `fprintf(hf, "%s  %016llx\n", ...)`.
 fn format_hashes(rows: &[(&str, u64)]) -> String {
@@ -226,6 +249,7 @@ fn cmd_render() -> std::io::Result<()> {
     let mut scratch = ScanScratch::new_for_size(XRES, YRES, vxl_world.vsid);
 
     let mut rows: Vec<(&str, u64)> = Vec::with_capacity(POSES.len());
+    let dump_ppm = std::env::var("ROXLAP_ORACLE_PPM").is_ok();
     for pose in POSES {
         let hash = render_pose(
             &engine,
@@ -236,6 +260,9 @@ fn cmd_render() -> std::io::Result<()> {
             &mut scratch,
         );
         println!("{:<14}  {:016x}", pose.name, hash);
+        if dump_ppm {
+            write_ppm(&format!("{}.ppm", pose.name), &framebuffer, XRES, YRES)?;
+        }
         rows.push((pose.name, hash));
     }
 
