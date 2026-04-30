@@ -240,7 +240,14 @@ fn format_hashes(rows: &[(&str, u64)]) -> String {
 /// Render every pose and write `roxlap-hashes.txt` next to the
 /// invocation cwd.
 fn cmd_render() -> std::io::Result<()> {
-    let engine = Engine::new();
+    let mut engine = Engine::new();
+    // Mirror voxlap C oracle.c:117 + :110 — `set_fogcol(0x87ceeb)` +
+    // `setMaxScanDist(1024)`. Without this the fog falloff table
+    // (`scratch.foglut`) stays empty and `fog_blend` short-circuits
+    // to a no-op, leaving the floor flat instead of gradient-shaded
+    // toward sky as distance grows.
+    engine.set_fog(0x0087_ceeb, 1024);
+    let engine = engine; // re-freeze after one-shot setup
     let vxl_world = load_oracle_vxl();
 
     let pixel_count = (XRES as usize) * (YRES as usize);
