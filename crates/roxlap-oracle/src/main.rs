@@ -28,9 +28,12 @@
 //!   places; voxlap's C path is mostly f32 throughout.
 //!
 //! Use `cargo run -p roxlap-oracle -- diff` to compare the
-//! freshly-produced `roxlap-hashes.txt` against
-//! `voxlaptest/tests/oracle/golden-hashes.txt` (path passed via
-//! `--golden`). The diff tool lists per-pose match / mismatch
+//! freshly-produced `roxlap-hashes.txt` against the in-tree
+//! `tests/golden-hashes.txt` (currently the 4 opticast-only
+//! poses roxlap renders bit-exact). Override `--golden` to
+//! compare against voxlaptest's full 12-pose
+//! `tests/oracle/golden-hashes.txt` when both repos sit side by
+//! side locally. The diff tool lists per-pose match / mismatch
 //! so progress on closing the divergences shows up as more
 //! matches.
 
@@ -433,10 +436,10 @@ fn print_help() {
              roxlap-oracle              render every pose, write roxlap-hashes.txt\n\
              roxlap-oracle render       same as above\n\
              roxlap-oracle diff [--golden PATH] [--ours PATH]\n\
-                                         diff roxlap-hashes.txt against voxlaptest's\n\
+                                         diff roxlap-hashes.txt against the in-tree\n\
                                          golden-hashes.txt; exits non-zero on any mismatch.\n\
                                          Defaults: --ours=roxlap-hashes.txt,\n\
-                                         --golden=../voxlaptest/tests/oracle/golden-hashes.txt\n\
+                                         --golden=tests/golden-hashes.txt\n\
              roxlap-oracle debug-gline POSE\n\
                                          dump camera basis + prelude + gline frustum\n\
                                          values for one named pose's center bottom-\n\
@@ -692,7 +695,11 @@ fn main() -> std::io::Result<()> {
         "render" => cmd_render(),
         "diff" => {
             let mut ours = "roxlap-hashes.txt".to_string();
-            let mut golden = "../voxlaptest/tests/oracle/golden-hashes.txt".to_string();
+            // Default golden lives in roxlap (`tests/golden-hashes.txt`) so
+            // CI is self-contained. Override with `--golden` to compare
+            // against voxlaptest's full 12-pose `golden-hashes.txt` when
+            // those repos sit side by side locally.
+            let mut golden = "tests/golden-hashes.txt".to_string();
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {

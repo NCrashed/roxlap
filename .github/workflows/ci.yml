@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch / PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rustfmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release
+
+  oracle:
+    name: roxlap-oracle hash-diff vs goldens
+    # x86_64-linux pinned: SSE2 rsqrtps approximation matches voxlap C
+    # bit-for-bit on this toolchain. ARM / wasm runners are deferred to
+    # R9 / R10 — they'll need their own per-arch goldens because NEON /
+    # v128 rsqrtss approximations differ from x86 SSE2.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Render every pose (writes roxlap-hashes.txt)
+        run: cargo run -p roxlap-oracle --release
+      - name: Diff against tests/golden-hashes.txt
+        # cmd_diff returns nonzero on any mismatch — failing the job
+        # locks in the bit-exact milestone and any regression that
+        # breaks one of the 4 currently-matching poses.
+        run: cargo run -p roxlap-oracle --release -- diff
+      - name: Show roxlap-hashes.txt
+        if: always()
+        run: cat roxlap-hashes.txt
+      - name: Upload oracle artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roxlap-oracle-hashes
+          path: roxlap-hashes.txt

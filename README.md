@@ -21,6 +21,10 @@ MATCH    high_down  cd1ceac6e21c55f4
 4 match, 0 mismatch, 0 missing-from-golden (4 total roxlap rows)
 ```
 
+GitHub CI runs fmt / clippy / tests / oracle-diff on every push and
+fails the build if any of the 4 frozen hashes drift. The expected
+hashes live in [`tests/golden-hashes.txt`](tests/golden-hashes.txt).
+
 The port is being staged out of
 [voxlaptest](https://github.com/NCrashed/voxlaptest), the modernised C
 fork of Voxlap. See [PORTING-RUST.md](PORTING-RUST.md) for the substage
@@ -88,8 +92,8 @@ Clippy is **not** in the pre-commit hook — pedantic-level lints are
 opinionated enough that they belong in CI rather than every-commit
 gating, and a >2-second pre-commit hook just gets `--no-verify`'d.
 Run `cargo clippy --all-targets -- -D warnings` manually before
-pushing if you want the same gate locally; CI (from R8 onward) will
-enforce it on every push regardless.
+pushing if you want the same gate locally; CI enforces it on every
+push regardless (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ## License
 

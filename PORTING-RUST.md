@@ -28,7 +28,7 @@ project intent and the relationship to
 | **R5** | x86_64 SSE2 4-pixel rsqrtps batches in the four hot rasterizers (mirror of voxlaptest Stage 4.9). | scalar reference is bit-exact; SSE batches not yet ported | Re-converges on voxlaptest's CI golden hashes where the rsqrtps approach is bit-equivalent. |
 | **R6** | KV6 sprite renderer (scalar `drawsprite` / `drawboundcube`). | not started | Sprite poses image-similarity ≥ 99%. |
 | **R7** | KV6 sprite renderer SSE (mirror of voxlaptest's `drawboundcube_sse`). | not started | Re-converges on voxlaptest's sprite hashes. |
-| **R8** | Cross-engine oracle: roxlap-side oracle binary writing `roxlap-hashes.txt`; CI matrix that diffs against `golden-hashes.txt`. | oracle binary done; CI matrix pending | `cargo run -p roxlap-oracle -- diff` reports `4 match, 0 mismatch`. GitHub workflow that mirrors voxlaptest's `--strip-trailing-cr` hash diff is the next deliverable. |
+| **R8** | Cross-engine oracle: roxlap-side oracle binary writing `roxlap-hashes.txt`; CI matrix that diffs against `golden-hashes.txt`. | done | `cargo run -p roxlap-oracle -- diff` reports `4 match, 0 mismatch` against the in-tree `tests/golden-hashes.txt` (4 opticast-only poses, frozen against voxlap C). `.github/workflows/ci.yml` runs fmt / clippy / test / oracle-diff on every push + PR; oracle job fails on any hash mismatch so the bit-exact milestone can't regress silently. |
 | **R9** | ARM NEON via `core::arch::aarch64`; macOS arm64 + Linux aarch64 in CI. | not started | Own goldens (NEON ≠ x86 SSE bits); aarch64 CI green. |
 | **R10** | wasm SIMD via `core::arch::wasm32`; web host (canvas + js glue) as a separate crate. | not started | Browser perf benchmark; own wasm goldens. |
 | **R11** | Polish: docs, examples, version 0.1 publish to crates.io. | not started | Crates published; docs.rs renders. |
@@ -86,7 +86,9 @@ per call site as in C, not portable_simd. Sub-substages:
 - Loading non-Voxlap asset formats. Stick to `.vxl` / `.kv6` / `.kvx` / `.kfa`.
 - DirectX or Vulkan backends. Engine remains a software rasterizer; the host
   blits one texture per frame.
-- Pre-R8 CI: until the oracle binary lands, validation is local-only.
+- macOS / aarch64 / wasm CI — deferred to R9 / R10. Each architecture
+  needs its own per-arch goldens (NEON ≠ x86 SSE bits, wasm v128 ≠
+  either). The R8 CI is x86_64-linux only.
 
 ## Sync with voxlaptest
 
