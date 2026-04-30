@@ -597,7 +597,12 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
         return Phase::DrawCwall;
     }
     // Cache c->i1 as ebx — the radar offset we walk down from.
-    state.ebx = state.scratch.cf[CF_SEED_INDEX].i1;
+    // Voxlap's `c` is the current cf-stack pointer (advances after
+    // slab-split via `c++`), so reads/writes target `cf[c_idx]`,
+    // NOT the seed slot. Using CF_SEED_INDEX here previously meant
+    // post-split rays drew the wrong [i0,i1] range — visible as
+    // missing yellow voxels when sphere columns triggered slab-split.
+    state.ebx = state.scratch.cf[state.c_idx].i1;
 
     'outer: loop {
         // -- loop0 (voxlap5.c:11650): per voxel-row setup. --
@@ -609,7 +614,7 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
         let row_offset = state.vptr_offset + (state.off as usize) * 4;
         if row_offset + 4 > state.column.len() {
             // Malformed slab — bail out gracefully.
-            state.scratch.cf[CF_SEED_INDEX].i1 = state.ebx;
+            state.scratch.cf[state.c_idx].i1 = state.ebx;
             return Phase::DrawCwall;
         }
         let vox = u32::from_le_bytes(
@@ -621,7 +626,7 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
         // gylookup index by current (post-decrement) z1.
         let z1_idx = state.z1 as usize;
         if z1_idx >= state.gylookup.len() {
-            state.scratch.cf[CF_SEED_INDEX].i1 = state.ebx;
+            state.scratch.cf[state.c_idx].i1 = state.ebx;
             return Phase::DrawCwall;
         }
         state.gy_raw = state.gylookup[z1_idx];
@@ -635,7 +640,7 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
                     continue 'outer;
                 }
                 // c->i1 = ebx, then fall through to drawcwall.
-                state.scratch.cf[CF_SEED_INDEX].i1 = state.ebx;
+                state.scratch.cf[state.c_idx].i1 = state.ebx;
                 return Phase::DrawCwall;
             }
             // Advance right-edge ray left.
@@ -649,7 +654,7 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
                 slot.dist = state.ogx;
             }
             state.ebx -= 1;
-            if state.ebx < state.scratch.cf[CF_SEED_INDEX].i0 {
+            if state.ebx < state.scratch.cf[state.c_idx].i0 {
                 // Radar exhausted — jump to pre-pop cleanup.
                 return Phase::PreDeleteZ;
             }
@@ -701,7 +706,10 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
         return Phase::PreDrawCeil;
     }
 
-    state.ebx = state.scratch.cf[CF_SEED_INDEX].i0;
+    // c->i0 — current cf-stack pointer's i0, NOT the seed. After
+    // slab-split this is cf[c_idx], which carries the post-split
+    // [i0, i1] range distinct from cf[CF_SEED_INDEX].
+    state.ebx = state.scratch.cf[state.c_idx].i0;
 
     'outer: loop {
         // -- loop2 (voxlap5.c:11706): per voxel-row setup. --
@@ -714,7 +722,7 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
         state.z0 += 1;
         let row_offset_signed = state.vptr_offset as isize + (state.off as isize) * 4;
         if row_offset_signed < 0 || (row_offset_signed as usize) + 4 > state.column.len() {
-            state.scratch.cf[CF_SEED_INDEX].i0 = state.ebx;
+            state.scratch.cf[state.c_idx].i0 = state.ebx;
             state.z0 = i32::from(state.column[state.vptr_offset + 3]);
             return Phase::PreDrawCeil;
         }
@@ -727,7 +735,7 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
         state.color = grouscan_shade(vox, &mut state.mm5_tail, state.gcsub[state.wall_lane]);
         let z0_idx = state.z0 as usize;
         if z0_idx >= state.gylookup.len() {
-            state.scratch.cf[CF_SEED_INDEX].i0 = state.ebx;
+            state.scratch.cf[state.c_idx].i0 = state.ebx;
             state.z0 = i32::from(state.column[state.vptr_offset + 3]);
             return Phase::PreDrawCeil;
         }
@@ -742,7 +750,7 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
                     continue 'outer;
                 }
                 // c->i0 = ebx, z0 = v[3], fall through to drawceil.
-                state.scratch.cf[CF_SEED_INDEX].i0 = state.ebx;
+                state.scratch.cf[state.c_idx].i0 = state.ebx;
                 state.z0 = i32::from(state.column[state.vptr_offset + 3]);
                 return Phase::PreDrawCeil;
             }
@@ -756,7 +764,7 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
                 slot.dist = state.ogx;
             }
             state.ebx += 1;
-            if state.ebx > state.scratch.cf[CF_SEED_INDEX].i1 {
+            if state.ebx > state.scratch.cf[state.c_idx].i1 {
                 return Phase::PreDeleteZ;
             }
         }
@@ -830,13 +838,13 @@ fn phase_draw_ceil(state: &mut GrouscanState<'_>) -> Phase {
         // identical `vox`.
         state.color = grouscan_shade(vox, &mut state.mm5_tail, state.gcsub[2]);
 
-        let i0 = state.scratch.cf[CF_SEED_INDEX].i0;
+        let i0 = state.scratch.cf[state.c_idx].i0;
         if let Some(slot) = state.scratch.radar.get_mut(i0 as usize) {
             slot.col = state.color as i32;
             slot.dist = state.ogx;
         }
-        state.scratch.cf[CF_SEED_INDEX].i0 = i0 + 1;
-        if state.scratch.cf[CF_SEED_INDEX].i0 > state.scratch.cf[CF_SEED_INDEX].i1 {
+        state.scratch.cf[state.c_idx].i0 = i0 + 1;
+        if state.scratch.cf[state.c_idx].i0 > state.scratch.cf[state.c_idx].i1 {
             return Phase::PreDeleteZ;
         }
     }
@@ -913,13 +921,13 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
 
         state.color = grouscan_shade(vox, &mut state.mm5_tail, state.gcsub[3]);
 
-        let i1 = state.scratch.cf[CF_SEED_INDEX].i1;
+        let i1 = state.scratch.cf[state.c_idx].i1;
         if let Some(slot) = state.scratch.radar.get_mut(i1 as usize) {
             slot.col = state.color as i32;
             slot.dist = state.ogx;
         }
-        state.scratch.cf[CF_SEED_INDEX].i1 = i1 - 1;
-        if state.scratch.cf[CF_SEED_INDEX].i1 < state.scratch.cf[CF_SEED_INDEX].i0 {
+        state.scratch.cf[state.c_idx].i1 = i1 - 1;
+        if state.scratch.cf[state.c_idx].i1 < state.scratch.cf[state.c_idx].i0 {
             return Phase::PreDeleteZ;
         }
     }
