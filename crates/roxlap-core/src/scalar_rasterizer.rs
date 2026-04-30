@@ -221,18 +221,22 @@ impl Rasterizer for ScalarRasterizer<'_> {
         scratch.gpz = f.gpz;
         scratch.gdz = f.gdz;
 
-        // 3. cmprecip[leng] = 1/leng (voxlap precomputed table).
-        //    gi0 / gi1 are per-pixel ray-step coefficients in
-        //    Q12.20 (= PREC); cx0/cy0/cx1/cy1 are the cf[128] seed
-        //    endpoints. voxlap5.c:1179-1190.
-        // Voxlap precomputes a `cmprecip[leng]` table; we just
-        // compute on the fly. The `as f32` casts here lose
-        // precision for very large leng (> 2²³), but realistic
-        // scanline lengths (a few thousand) are well below that.
-        #[allow(clippy::cast_precision_loss)]
-        let cmprecip = if leng > 0 { 1.0 / (leng as f32) } else { 0.0 };
+        // 3. cmprecip[leng] = CMPPREC / leng (voxlap precomputed
+        //    table; voxlap5.c:12315 builds it as `CMPPREC/(float)i`).
+        //    CMPPREC = 256*4096 = PREC. gi0 / gi1 are per-pixel ray-
+        //    step coefficients in Q12.20 (= PREC); cx0/cy0/cx1/cy1
+        //    are the cf[128] seed endpoints. voxlap5.c:1179-1190.
+        // The `as f32` casts here lose precision for very large leng
+        // (> 2²³), but realistic scanline lengths (a few thousand)
+        // are well below that.
         #[allow(clippy::cast_precision_loss)]
         let cmpprec = PREC as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let cmprecip = if leng > 0 {
+            cmpprec / (leng as f32)
+        } else {
+            0.0
+        };
         let (gi0, gi1, cx0, cy0) = if cache.prelude.forward_z_sign < 0 {
             (
                 ((f.vd1 - f.vd0) * cmprecip).round_ties_even() as i32,
