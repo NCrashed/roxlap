@@ -21,15 +21,34 @@ MATCH    high_down  cd1ceac6e21c55f4
 4 match, 0 mismatch, 0 missing-from-golden (4 total roxlap rows)
 ```
 
-GitHub CI runs fmt / clippy / tests / oracle-diff on every push and
-fails the build if any of the 4 frozen hashes drift. The expected
-hashes live in [`tests/golden-hashes.txt`](tests/golden-hashes.txt).
+R8 GitHub CI runs fmt / clippy / tests / oracle-diff on every push
+and fails the build if any of the 4 frozen hashes drift. Expected
+hashes live in [`tests/golden-hashes.txt`](tests/golden-hashes.txt);
+the workflow is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+[`roxlap-host`](crates/roxlap-host) is interactive: opens a winit
+window, loads `oracle.vxl.gz`, and renders with WASD + mouse-look.
+Press `F` to capture the current camera pose + framebuffer to
+`roxlap-capture.{txt,ppm}` for off-line repro of any rendering
+artifact. Side-shading is on by default in the host so directional
+lighting reads correctly; the oracle stays at voxlap's
+`setsideshades(0,…,0)` baseline so its hashes don't shift.
+
+### Next stage: R6 — KV6 sprite renderer
+
+The natural next big port. Unlocks 4 of 8 remaining oracle goldens
+(`sprite_front`, `sprite_above`, `sprite_iso`, `sprite_coco`) by
+porting voxlap's `drawsprite` → `kv6draw` → `drawboundcubesse`
+chain. The KV6 parser already lives in `roxlap-formats`; what's
+missing is the rasterizer. Multi-day work; sub-substages and risks
+mapped out in `memory/project_r6_kv6_sprite_plan.md`.
 
 The port is being staged out of
 [voxlaptest](https://github.com/NCrashed/voxlaptest), the modernised C
-fork of Voxlap. See [PORTING-RUST.md](PORTING-RUST.md) for the substage
-roadmap, deferred R4 items (textured sky, multi-mip, sideshademode), and
-the planned R6 sprite renderer.
+fork of Voxlap. See [PORTING-RUST.md](PORTING-RUST.md) for the full
+substage roadmap, deferred R4 items (textured sky, multi-mip,
+sideshademode), one known voxlap-inherited rendering quirk, and
+where R6+ slot in.
 
 ## Goals
 
