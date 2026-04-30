@@ -115,21 +115,36 @@ pub fn derive_gline_frustum(
     }
     let vd1 = f;
 
-    // gdz lanes — fixed-point per-step deltas. Voxlap's `gdz <= 0`
-    // overflow check below depends on the cast wrapping to a non-
-    // positive value when the input is huge; Rust's `as i32`
-    // saturates at i32::MAX instead, so we detect the overflow
-    // explicitly via `is_finite()` and stamp a -1 sentinel that the
-    // clamp below treats the same way voxlap treats a wrapped value.
+    // gdz lanes — fixed-point per-step deltas. Voxlap C's
+    // `ftol(fabs(f1)*PREC, &gdz[0])` is `lrintf` + `(int32_t)`
+    // truncation: for floats that exceed i32::MAX (near-axis-
+    // aligned rays where one lane's f-recip explodes), C wraps
+    // modulo 2³² via the cast, leaving `gdz` at a moderate
+    // positive value. Rust's `as i32` SATURATES at i32::MAX
+    // instead, which makes `gpz[lane] += gdz[lane]` overflow on
+    // the FIRST column step instead of the ~6th — and the
+    // unsigned compare in the column-step path catches that as a
+    // scan-distance overflow, routes to `Phase::Remiporend` →
+    // `Phase::Startsky`, and drains the seed cf entry's full
+    // radar range to sky. Visible as sky-blue dashes on the
+    // floor along the world-axis-aligned ray's projection (see
+    // `project_roxlap_floor_hairline.md`).
+    //
+    // Fix: go via `i64` first, which wraps the same way C's int
+    // cast does for floats in [i64::MIN, i64::MAX]. For floats
+    // OUTSIDE that range the f32→i64 step still saturates, but
+    // the resulting i32 truncation lands on a value the
+    // `<= 0` clamp below catches the same way voxlap treats
+    // FE_INVALID-then-cast.
     let f1_abs = f1.abs();
     let gdz_0 = if f1_abs.is_finite() {
-        (f1_abs * PREC as f32).round_ties_even() as i32
+        (f1_abs * PREC as f32).round_ties_even() as i64 as i32
     } else {
         -1
     };
     let f2_abs = f2.abs();
     let gdz_1 = if f2_abs.is_finite() {
-        (f2_abs * PREC as f32).round_ties_even() as i32
+        (f2_abs * PREC as f32).round_ties_even() as i64 as i32
     } else {
         -1
     };
