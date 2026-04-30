@@ -66,6 +66,36 @@ deferred R4 items above (R4.4 textured sky, R4.5 multi-mip,
 sideshademode high-byte). None of them break the 4 matching poses; they
 matter for worlds outside the oracle's deliberately-narrow fixture.
 
+### Known voxlap-inherent quirk: floor-hairline at certain camera poses
+
+At unusual interactive camera positions (e.g. yaw + pitch that sends one
+ray's `gdz[0]` to ~2 G — just under `i32::MAX`), grouscan's column-step
+overflow check fires after a single lane-0 increment instead of the
+expected ~6th, routing the ray to `Phase::Startsky` and draining the
+seed cf entry's unwritten remainder to sky. Visible as a single 6–30
+pixel sky-blue vertical run on the floor.
+
+**This bug also exists in voxlap C** at the same camera + 800×600
+resolution. Voxlap's standard 640×480 oracle doesn't show it because at
+that resolution the buggy ray lands on a different (non-floor) screen
+position. The `gline` frustum + cf-seed values match field-for-field
+between the two engines; the artifact is a property of the underlying
+grouscan algorithm's overflow handling, not the roxlap port.
+
+A separate, similar-looking artifact rooted in Rust's saturating
+`as i32` cast (vs voxlap's wrapping `lrintf + (int32_t)cast`) was an
+*actual* roxlap regression — that one is fixed; see commit `6d4bcf4`
+and the `fixed::ftol` helper. The voxlap-inherent quirk above is not
+fixable without diverging from voxlap's bit-exact behaviour and
+regressing the 4 oracle-pose hashes; documented as a known limitation
+until a downstream fixture demands a workaround.
+
+Diagnostics for chasing future hairline-style artifacts live in
+`crates/roxlap-host/src/main.rs` (the `F` capture hotkey) and
+`crates/roxlap-oracle/src/main.rs::cmd_find_hairlines` (env vars
+`ROXLAP_TAG_SKY`, `ROXLAP_FOG`, `ROXLAP_TRACE_STARTSKY`,
+`ROXLAP_TRACE_PHASES`).
+
 ## Substage R5 — x86 SSE batches
 
 Mirror of voxlaptest's Stage 4.9. Same four rasterizers, same rsqrtps
