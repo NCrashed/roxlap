@@ -13,7 +13,7 @@
 //!   right, bottom, left).
 
 use crate::camera_math::CameraState;
-use crate::fixed::{isshldiv16safe, lbound0, mulshr16, shldiv16};
+use crate::fixed::{ftol, isshldiv16safe, lbound0, mulshr16, shldiv16};
 use crate::opticast_prelude::OpticastPrelude;
 use crate::projection::ProjectionRect;
 use crate::rasterizer::{Rasterizer, ScanScratch};
@@ -212,7 +212,10 @@ pub fn top_quadrant<R: Rasterizer>(
     // realistic xres.
     let j_fixed = j_count << 16;
     let f_scale = j_fixed as f32 / ((p.x1 - p.x0) * grd);
-    let kadd = ((p.cx - p.x0) * grd * f_scale).round_ties_even() as i32;
+    // f_scale = j_fixed / ((x_range)*grd) blows up for level cameras
+    // where grd ≈ 1/cy is tiny; the `kadd` and `kmul` products land
+    // past i32::MAX. Voxlap C's ftol wraps; route through the helper.
+    let kadd = ftol((p.cx - p.x0) * grd * f_scale);
 
     let p1_init = (p.cx - 0.5).round_ties_even() as i32;
     let mut p0 = lbound0(p1_init + 1, ctx.xres);
@@ -234,7 +237,7 @@ pub fn top_quadrant<R: Rasterizer>(
         return;
     }
 
-    let kmul = f_scale.round_ties_even() as i32;
+    let kmul = ftol(f_scale);
     while sy >= 0 {
         if isshldiv16safe(kmul, (sy << 16) - rs.cy16) != 0 {
             break;
@@ -342,7 +345,7 @@ pub fn bottom_quadrant<R: Rasterizer>(
     // -- Pass 2: scanline rasterization (sy walks upward). --
     let j_fixed = j_count << 16;
     let f_scale = j_fixed as f32 / ((p.x2 - p.x3) * grd);
-    let kadd = ((p.cx - p.x3) * grd * f_scale).round_ties_even() as i32;
+    let kadd = ftol((p.cx - p.x3) * grd * f_scale);
 
     let p1_init = (p.cx - 0.5).round_ties_even() as i32;
     let mut p0 = lbound0(p1_init + 1, ctx.xres);
@@ -361,7 +364,7 @@ pub fn bottom_quadrant<R: Rasterizer>(
         return;
     }
 
-    let kmul = f_scale.round_ties_even() as i32;
+    let kmul = ftol(f_scale);
     while sy < ctx.yres {
         if isshldiv16safe(kmul, (sy << 16) - rs.cy16) != 0 {
             break;
@@ -458,7 +461,7 @@ pub fn right_quadrant<R: Rasterizer>(
     // -- Pass 2: column walk + vrend dispatch. --
     let j_fixed = j_count << 16;
     let f_scale = j_fixed as f32 / ((p.y2 - p.y1) * grd);
-    let kadd = ((p.cy - p.y1) * grd * f_scale).round_ties_even() as i32;
+    let kadd = ftol((p.cy - p.y1) * grd * f_scale);
 
     let p1_init = (p.cy - 0.5).round_ties_even() as i32;
     let mut p0 = lbound0(p1_init + 1, ctx.yres);
@@ -477,7 +480,7 @@ pub fn right_quadrant<R: Rasterizer>(
         return;
     }
 
-    let kmul = f_scale.round_ties_even() as i32;
+    let kmul = ftol(f_scale);
     while sx < ctx.xres {
         if isshldiv16safe(kmul, (sx << 16) - rs.cx16) != 0 {
             break;
@@ -590,7 +593,7 @@ pub fn left_quadrant<R: Rasterizer>(
     // -- Pass 2: column walk (sx walks leftward) + vrend dispatch. --
     let j_fixed = j_count << 16;
     let f_scale = j_fixed as f32 / ((p.y3 - p.y0) * grd);
-    let kadd = ((p.cy - p.y0) * grd * f_scale).round_ties_even() as i32;
+    let kadd = ftol((p.cy - p.y0) * grd * f_scale);
 
     let p1_init = (p.cy - 0.5).round_ties_even() as i32;
     let mut p0 = lbound0(p1_init + 1, ctx.yres);
@@ -609,7 +612,7 @@ pub fn left_quadrant<R: Rasterizer>(
         return;
     }
 
-    let kmul = f_scale.round_ties_even() as i32;
+    let kmul = ftol(f_scale);
     while sx >= 0 {
         if isshldiv16safe(kmul, (sx << 16) - rs.cx16) != 0 {
             break;

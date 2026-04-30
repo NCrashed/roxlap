@@ -35,6 +35,7 @@
 )]
 
 use crate::camera_math::CameraState;
+use crate::fixed::ftol;
 use crate::gline::derive_gline_frustum;
 use crate::grouscan::{grouscan_run, CfType, GrouscanInputs, CF_SEED_INDEX};
 use crate::opticast::camera_column_slice;
@@ -243,19 +244,25 @@ impl Rasterizer for ScalarRasterizer<'_> {
         } else {
             0.0
         };
+        // ftol() routes float→i32 through i64 to mirror voxlap C's
+        // wrap-on-overflow `lrintf+(int32_t)cast`. The cf-seed
+        // products (vd ± vd) * cmprecip and vd * cmpprec land at
+        // the i32 boundary for world-coord magnitudes near VSID
+        // (= 2048) × PREC (= 2²⁰); Rust's `as i32` saturates and
+        // diverges for those edge cases.
         let (gi0, gi1, cx0, cy0) = if cache.prelude.forward_z_sign < 0 {
             (
-                ((f.vd1 - f.vd0) * cmprecip).round_ties_even() as i32,
-                ((f.vz1 - f.vz0) * cmprecip).round_ties_even() as i32,
-                (f.vd0 * cmpprec).round_ties_even() as i32,
-                (f.vz0 * cmpprec).round_ties_even() as i32,
+                ftol((f.vd1 - f.vd0) * cmprecip),
+                ftol((f.vz1 - f.vz0) * cmprecip),
+                ftol(f.vd0 * cmpprec),
+                ftol(f.vz0 * cmpprec),
             )
         } else {
             (
-                ((f.vd0 - f.vd1) * cmprecip).round_ties_even() as i32,
-                ((f.vz0 - f.vz1) * cmprecip).round_ties_even() as i32,
-                (f.vd1 * cmpprec).round_ties_even() as i32,
-                (f.vz1 * cmpprec).round_ties_even() as i32,
+                ftol((f.vd0 - f.vd1) * cmprecip),
+                ftol((f.vz0 - f.vz1) * cmprecip),
+                ftol(f.vd1 * cmpprec),
+                ftol(f.vz1 * cmpprec),
             )
         };
         let cx1 = leng.wrapping_mul(gi0).wrapping_add(cx0);

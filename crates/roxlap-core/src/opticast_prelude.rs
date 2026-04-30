@@ -32,6 +32,7 @@
 //!   PREC-scaled.
 
 use crate::camera_math::CameraState;
+use crate::fixed::ftol;
 
 /// Voxlap's fixed-point Q12.20-style scale factor (`PREC` in
 /// `voxlap5.c:13`). `gposz` is `pos.z * PREC` rounded; `gylookup`
@@ -95,9 +96,11 @@ pub fn derive_prelude(
     let pos_xfrac = [1.0 - xfrac1, xfrac1];
     let pos_yfrac = [1.0 - yfrac1, yfrac1];
 
-    // gposz = ftol(gipos.z * PREC - 0.5) — round-ties-to-even (lrintf
-    // default in voxlaptest's portable ftol shim).
-    let pos_z = (camera_state.pos[2] * PREC as f32 - 0.5).round_ties_even() as i32;
+    // gposz = ftol(gipos.z * PREC - 0.5). Voxlap's ftol wraps on
+    // overflow; for camera positions with pos.z above ~2048 (PREC
+    // = 2²⁰) the product exceeds i32::MAX, so we go through the
+    // wrap-not-saturate `ftol` helper rather than a bare `as i32`.
+    let pos_z = ftol(camera_state.pos[2] * PREC as f32 - 0.5);
 
     // gylookup: per mip level j, fill (512 >> j) + 4 entries computed
     // from ((pos_z >> j) - i * PREC) >> (16 - j), masked to 16 bits.

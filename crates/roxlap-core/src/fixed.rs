@@ -23,6 +23,31 @@
 //! delta, screen-space column ranges); the four quadrant drivers
 //! that R4.1f3+ lays down call them on every iteration.
 
+/// Voxlap C's `ftol(f, &out)` — `lrintf` rounds to the nearest
+/// integer (ties to even), then the result is cast to `int32_t`.
+/// On Linux `x86_64` `lrintf` returns `long` (64-bit), so the
+/// `(int32_t)` cast **wraps modulo 2³²** for floats whose rounded
+/// value exceeds `i32::MAX`. Rust's `as i32` instead **saturates**,
+/// which silently diverges from voxlap C for any float wider than
+/// `i32::MAX` — visible as the floor-hairline artifact when
+/// `gline`'s `gdz` lane saturated for near-axis-aligned rays
+/// (see `project_roxlap_floor_hairline.md`).
+///
+/// Going via `i64` first matches voxlap's wrap behaviour exactly
+/// for floats in `[i64::MIN, i64::MAX]`. Floats outside that
+/// range still saturate at the i64 step — but voxlap's `lrintf`
+/// raises `FE_INVALID` and returns an implementation-defined
+/// value at that magnitude too, so callers always need an
+/// upstream sanity-check at boundaries that extreme.
+///
+/// Use this anywhere a roxlap port mirrors a voxlap5.c
+/// `ftol(float, &int32)` call.
+#[must_use]
+#[inline]
+pub fn ftol(f: f32) -> i32 {
+    f.round_ties_even() as i64 as i32
+}
+
 /// `(a * d) >> 16`, computed in `i64` to avoid intermediate overflow.
 #[must_use]
 pub fn mulshr16(a: i32, d: i32) -> i32 {
@@ -158,5 +183,43 @@ mod tests {
     fn lbound0_above_b_clamps_to_b() {
         assert_eq!(lbound0(101, 100), 100);
         assert_eq!(lbound0(i32::MAX, 100), 100);
+    }
+
+    #[test]
+    fn ftol_rounds_ties_to_even_in_range() {
+        // round-half-to-even: 0.5 → 0, 1.5 → 2, 2.5 → 2.
+        assert_eq!(ftol(0.5), 0);
+        assert_eq!(ftol(1.5), 2);
+        assert_eq!(ftol(2.5), 2);
+        assert_eq!(ftol(-0.5), 0);
+        assert_eq!(ftol(-1.5), -2);
+        // Plain rounding for non-tie inputs.
+        assert_eq!(ftol(1.4), 1);
+        assert_eq!(ftol(1.6), 2);
+    }
+
+    #[test]
+    fn ftol_wraps_modulo_2_to_32_on_overflow() {
+        // The defining property: floats whose rounded value exceeds
+        // i32::MAX must WRAP modulo 2^32 (matching voxlap C's
+        // `lrintf + (int32_t)cast`), not saturate at i32::MAX. This
+        // is the regression test for the floor-hairline bug.
+
+        // Exactly-representable boundary cases: 2^31 wraps to
+        // i32::MIN; 2^32 wraps to 0.
+        assert_eq!(ftol(2_147_483_648.0_f32), i32::MIN);
+        assert_eq!(ftol(4_294_967_296.0_f32), 0);
+
+        // For arbitrary huge finite f32, the result must equal
+        // `(rounded as i64 as i32)` — i.e., the low 32 bits, not
+        // i32::MAX. f32 can't represent 3.9e10 exactly (rounds to a
+        // multiple of ~4096), but whatever it rounds to, the wrap
+        // identity holds.
+        let f = 3.9e10_f32;
+        let want = f.round_ties_even() as i64 as i32;
+        assert_eq!(ftol(f), want);
+        // Roxlap's pre-fix `as i32` saturated to i32::MAX here.
+        // ftol must not.
+        assert_ne!(ftol(f), i32::MAX);
     }
 }

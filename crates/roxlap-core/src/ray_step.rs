@@ -23,6 +23,7 @@
 //! voxlaptest's stage 4.9 which scoped it the same way.
 
 use crate::camera_math::CameraState;
+use crate::fixed::ftol;
 use crate::opticast_prelude::PREC;
 
 /// Coefficients the four-quadrant scan loops use to step a ray
@@ -69,8 +70,11 @@ pub fn derive_ray_step(camera_state: &CameraState, cx: f32, cy: f32, hz: f32) ->
     let heiy = camera_state.down[1] * f;
     let addx = camera_state.corn[0][0] * f;
     let addy = camera_state.corn[0][1] * f;
-    let cx16 = (cx * 65536.0).round_ties_even() as i32;
-    let cy16 = (cy * 65536.0).round_ties_even() as i32;
+    // cx / cy can sit just past F_CLAMP = 32000 + screen-half
+    // (≈33k) for level-camera projections, so cx*65536 overflows
+    // i32::MAX. Voxlap C's ftol wraps; route through the helper.
+    let cx16 = ftol(cx * 65536.0);
+    let cy16 = ftol(cy * 65536.0);
     RayStep {
         strx,
         stry,

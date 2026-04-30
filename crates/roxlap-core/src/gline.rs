@@ -24,6 +24,7 @@
 //! math because it's hand-verifiable in isolation.
 
 use crate::camera_math::CameraState;
+use crate::fixed::ftol;
 use crate::opticast_prelude::OpticastPrelude;
 use crate::opticast_prelude::PREC;
 
@@ -116,35 +117,20 @@ pub fn derive_gline_frustum(
     let vd1 = f;
 
     // gdz lanes — fixed-point per-step deltas. Voxlap C's
-    // `ftol(fabs(f1)*PREC, &gdz[0])` is `lrintf` + `(int32_t)`
-    // truncation: for floats that exceed i32::MAX (near-axis-
-    // aligned rays where one lane's f-recip explodes), C wraps
-    // modulo 2³² via the cast, leaving `gdz` at a moderate
-    // positive value. Rust's `as i32` SATURATES at i32::MAX
-    // instead, which makes `gpz[lane] += gdz[lane]` overflow on
-    // the FIRST column step instead of the ~6th — and the
-    // unsigned compare in the column-step path catches that as a
-    // scan-distance overflow, routes to `Phase::Remiporend` →
-    // `Phase::Startsky`, and drains the seed cf entry's full
-    // radar range to sky. Visible as sky-blue dashes on the
-    // floor along the world-axis-aligned ray's projection (see
-    // `project_roxlap_floor_hairline.md`).
-    //
-    // Fix: go via `i64` first, which wraps the same way C's int
-    // cast does for floats in [i64::MIN, i64::MAX]. For floats
-    // OUTSIDE that range the f32→i64 step still saturates, but
-    // the resulting i32 truncation lands on a value the
-    // `<= 0` clamp below catches the same way voxlap treats
-    // FE_INVALID-then-cast.
+    // `ftol(fabs(f1)*PREC, &gdz[0])` wraps modulo 2³² for floats
+    // exceeding i32::MAX; Rust's `as i32` saturates instead. The
+    // mismatch caused the floor-hairline artifact for near-axis-
+    // aligned rays (see `project_roxlap_floor_hairline.md`); the
+    // `ftol` helper in `fixed.rs` mirrors voxlap's wrap-on-overflow.
     let f1_abs = f1.abs();
     let gdz_0 = if f1_abs.is_finite() {
-        (f1_abs * PREC as f32).round_ties_even() as i64 as i32
+        ftol(f1_abs * PREC as f32)
     } else {
         -1
     };
     let f2_abs = f2.abs();
     let gdz_1 = if f2_abs.is_finite() {
-        (f2_abs * PREC as f32).round_ties_even() as i64 as i32
+        ftol(f2_abs * PREC as f32)
     } else {
         -1
     };
@@ -171,16 +157,19 @@ pub fn derive_gline_frustum(
     let yfrac_idx = (vy1.to_bits() >> 31) as usize;
 
     // Asm clamp on overflow — gdz <= 0 means f1/f2 was huge or NaN.
+    // Same wrap-not-saturate constraint applies to the gpz cast:
+    // for `pos_xfrac ≈ 1` and `gdz` near i32::MAX, the product is
+    // at the i32 boundary.
     let (gdz_clamped_0, gpz_0) = if gdz_0 <= 0 {
         (0, i32::MAX)
     } else {
-        let gp = (prelude.pos_xfrac[xfrac_idx] * gdz_0 as f32).round_ties_even() as i32;
+        let gp = ftol(prelude.pos_xfrac[xfrac_idx] * gdz_0 as f32);
         (gdz_0, gp)
     };
     let (gdz_clamped_1, gpz_1) = if gdz_1 <= 0 {
         (0, i32::MAX)
     } else {
-        let gp = (prelude.pos_yfrac[yfrac_idx] * gdz_1 as f32).round_ties_even() as i32;
+        let gp = ftol(prelude.pos_yfrac[yfrac_idx] * gdz_1 as f32);
         (gdz_1, gp)
     };
 
