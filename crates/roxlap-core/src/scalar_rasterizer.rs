@@ -318,45 +318,6 @@ impl Rasterizer for ScalarRasterizer<'_> {
         }
         scratch.gxmax = gxmax;
 
-        // ROXLAP_GLINE_AT=N : if set, dump the full gline frustum
-        // + cf seed + gxmax for the ray whose gscanptr-at-entry is
-        // exactly N. Used to diff per-ray state vs voxlap C when
-        // chasing the floor-hairline artifact: roxlap-oracle
-        // find-hairlines reports drained slot ranges, and the i0
-        // of the drained range tells you which gline call to
-        // probe.
-        if let Ok(target) = std::env::var("ROXLAP_GLINE_AT") {
-            if let Ok(target) = target.parse::<usize>() {
-                if scratch.gscanptr == target {
-                    eprintln!(
-                        "ROXLAP_GLINE_AT={target} gline(leng={leng}, x0={x0}, y0={y0}, x1={x1}, y1={y1})"
-                    );
-                    eprintln!("  forward_z_sign = {}", cache.prelude.forward_z_sign);
-                    eprintln!("  vd0={} vd1={}", f.vd0, f.vd1);
-                    eprintln!("  vx1={} vy1={}", f.vx1, f.vy1);
-                    eprintln!("  vz0={} vz1={}", f.vz0, f.vz1);
-                    eprintln!("  gixy=[{}, {}]", f.gixy[0], f.gixy[1]);
-                    eprintln!("  gpz =[{}, {}]", f.gpz[0], f.gpz[1]);
-                    eprintln!("  gdz =[{}, {}]", f.gdz[0], f.gdz[1]);
-                    eprintln!("  cmprecip={cmprecip}");
-                    eprintln!("  gi0={gi0} gi1={gi1}");
-                    eprintln!("  cx0={cx0} cy0={cy0} cx1={cx1} cy1={cy1}");
-                    eprintln!("  gxmax={gxmax}");
-                    eprintln!(
-                        "  cf[128] i0={} i1={} z0={} z1={}",
-                        scratch.cf[CF_SEED_INDEX].i0,
-                        scratch.cf[CF_SEED_INDEX].i1,
-                        scratch.cf[CF_SEED_INDEX].z0,
-                        scratch.cf[CF_SEED_INDEX].z1,
-                    );
-                    eprintln!(
-                        "  vptr_offset={} column_index={} li_pos=[{},{}]",
-                        cache.vptr_offset, cache.prelude.column_index, li_pos[0], li_pos[1],
-                    );
-                }
-            }
-        }
-
         // 6. Build inputs and call grouscan_run. The starting
         //    column is the camera's column (column_index from the
         //    prelude); the slab walker handles the rest.
