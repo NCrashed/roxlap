@@ -37,6 +37,10 @@
               clippy
               rust-analyzer
               pkg-config
+              # Image inspection — imagemagick reads roxlap-oracle's
+              # PPM dumps and voxlap C oracle's PNG outputs for byte-
+              # level pixel diffing across the two engines.
+              imagemagick
             ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxRuntimeLibs;
 
             # winit + softbuffer link these via dlopen at runtime;

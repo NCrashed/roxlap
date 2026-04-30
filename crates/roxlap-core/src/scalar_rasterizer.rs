@@ -43,12 +43,18 @@ use crate::rasterizer::{Rasterizer, ScanScratch};
 use crate::ray_step::RayStep;
 use crate::scan_loops::ScanContext;
 
-/// Voxlap's `gcsub[9]` per-side shading table, default zeroed
-/// (no shading subtraction → raw voxel colour passes through).
-/// The real engine populates this from `vx5.sideshademode` and
-/// camera state; for R4.3a-rewire-3b we just need a valid borrow
-/// to thread into `GrouscanInputs.gcsub`.
-const DEFAULT_GCSUB: [i64; 9] = [0; 9];
+/// Voxlap's `gcsub[9]` per-side shading table. Voxlap5.c:235
+/// initialises all 9 entries to `0x00ff00ff00ff00ff`. The 0xff
+/// bytes sit in the tail-lane positions of `grouscan_shade`'s
+/// interleaved `b[]` and saturate-zero the previous call's tail
+/// via the psubusb step — that's how voxlap keeps per-voxel
+/// shade calls independent (no cross-call tail bleed). The 0x00
+/// bytes in the vox-lane positions leave voxel colour untouched.
+/// `setsideshades(...)` only writes the HIGH byte of entries
+/// 2..7 (per-side darkening intensity); the low 7 bytes keep the
+/// initialiser pattern. For R4.3a-rewire-3b we mirror voxlap's
+/// `setsideshades(0,0,0,0,0,0)` baseline (high byte = 0).
+const DEFAULT_GCSUB: [i64; 9] = [0x00ff_00ff_00ff_00ff; 9];
 
 /// Per-channel fog blend — voxlap5.c:2052-2056 (and the matching
 /// hrend / vrend scalar tail). `col` is the source ARGB voxel
