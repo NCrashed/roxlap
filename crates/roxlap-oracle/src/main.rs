@@ -318,19 +318,128 @@ fn cmd_diff(roxlap_path: &str, golden_path: &str) -> std::io::Result<i32> {
     Ok(i32::from(mismatches != 0))
 }
 
+/// `debug-gline <pose>` — print the gline frustum values for a
+/// canonical center bottom-quadrant scanline. Lets the next debug
+/// session diff these against voxlap C's `gline` debug prints
+/// for the same input. Pin the divergence cause for the
+/// `north`/`east` identical-hash bug without trial-and-erroring
+/// blind.
+#[allow(clippy::unnecessary_wraps)]
+fn cmd_debug_gline(pose_name: &str) -> std::io::Result<()> {
+    use roxlap_core::camera_math;
+    use roxlap_core::gline::derive_gline_frustum;
+    use roxlap_core::opticast_prelude;
+
+    let Some(pose) = POSES.iter().find(|p| p.name == pose_name) else {
+        let _ = writeln!(std::io::stderr(), "unknown pose: {pose_name}");
+        let names: Vec<&str> = POSES.iter().map(|p| p.name).collect();
+        let _ = writeln!(std::io::stderr(), "known: {}", names.join(", "));
+        std::process::exit(2);
+    };
+    let cam = camera_for_pose(pose);
+    println!("=== pose: {} ===", pose.name);
+    println!(
+        "camera.pos     = [{}, {}, {}]",
+        cam.pos[0], cam.pos[1], cam.pos[2]
+    );
+    println!(
+        "camera.right   = [{}, {}, {}]",
+        cam.right[0], cam.right[1], cam.right[2]
+    );
+    println!(
+        "camera.down    = [{}, {}, {}]",
+        cam.down[0], cam.down[1], cam.down[2]
+    );
+    println!(
+        "camera.forward = [{}, {}, {}]",
+        cam.forward[0], cam.forward[1], cam.forward[2]
+    );
+
+    let cs = camera_math::derive(&cam, XRES, YRES, 320.0, 240.0, 320.0);
+    println!("\nCameraState:");
+    println!("  right  = {:?}", cs.right);
+    println!("  down   = {:?}", cs.down);
+    println!("  fwd    = {:?}", cs.forward);
+    println!("  add    = {:?}", cs.add);
+    println!("  corn[0]= {:?}", cs.corn[0]);
+    println!("  corn[1]= {:?}", cs.corn[1]);
+    println!("  corn[2]= {:?}", cs.corn[2]);
+    println!("  corn[3]= {:?}", cs.corn[3]);
+
+    let prelude = opticast_prelude::derive_prelude(&cs, 2048, 1, 4, 1024);
+    println!("\nOpticastPrelude:");
+    println!("  forward_z_sign = {}", prelude.forward_z_sign);
+    println!("  li_pos         = {:?}", prelude.li_pos);
+    println!("  column_index   = {}", prelude.column_index);
+    println!("  pos_xfrac      = {:?}", prelude.pos_xfrac);
+    println!("  pos_yfrac      = {:?}", prelude.pos_yfrac);
+    println!(
+        "  pos_z          = {} (= 0x{:08x})",
+        prelude.pos_z, prelude.pos_z
+    );
+    println!(
+        "  x_mip          = {} (= 0x{:08x})",
+        prelude.x_mip, prelude.x_mip
+    );
+    println!(
+        "  max_scan_dist  = {} (= 0x{:08x})",
+        prelude.max_scan_dist, prelude.max_scan_dist
+    );
+
+    // Canonical center bottom-quadrant ray from voxlap's scan
+    // loop: x0 = cx (= 320), y0 = cy (= 240), x1 = cx, y1 = wy1
+    // (= 480). For voxlap C debug-print parity, instrument
+    // voxlap5.c:gline at line ~1146 with the same inputs and dump
+    // the same fields.
+    let leng = 240; // |y1 - y0| = 480 - 240
+    let f = derive_gline_frustum(&cs, &prelude, 2048, leng, 320.0, 240.0, 320.0, 480.0);
+    println!("\ngline frustum (x0=320, y0=240, x1=320, y1=480, leng={leng}):");
+    println!("  vd0 = {} (post-rescale)", f.vd0);
+    println!("  vd1 = {} (= f = sqrt(vx1²+vy1²))", f.vd1);
+    println!("  vz0 = {}", f.vz0);
+    println!("  vx1 = {}", f.vx1);
+    println!("  vy1 = {}", f.vy1);
+    println!("  vz1 = {}", f.vz1);
+    println!("  gixy = {:?}", f.gixy);
+    println!("  gpz  = {:?}", f.gpz);
+    println!("  gdz  = {:?}", f.gdz);
+    println!(
+        "\nKey check: vd0 == vd1? {} (vd0-vd1 = {})",
+        f.vd0.to_bits() == f.vd1.to_bits(),
+        f.vd0 - f.vd1
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let leng_f = leng as f32;
+    println!(
+        "  → gi0 = (vd0 - vd1) / leng = {} (zero ⇒ drawflor exits on first cross-sign test)",
+        (f.vd0 - f.vd1) / leng_f
+    );
+    Ok(())
+}
+
 fn print_help() {
     let _ = writeln!(
         std::io::stderr(),
         "roxlap-oracle — render-hash oracle for the roxlap engine.\n\
          \n\
          Usage:\n\
-             roxlap-oracle           render every pose, write roxlap-hashes.txt\n\
-             roxlap-oracle render    same as above\n\
+             roxlap-oracle              render every pose, write roxlap-hashes.txt\n\
+             roxlap-oracle render       same as above\n\
              roxlap-oracle diff [--golden PATH] [--ours PATH]\n\
-                                      diff roxlap-hashes.txt against voxlaptest's\n\
-                                      golden-hashes.txt; exits non-zero on any mismatch.\n\
-                                      Defaults: --ours=roxlap-hashes.txt,\n\
-                                      --golden=../voxlaptest/tests/oracle/golden-hashes.txt"
+                                         diff roxlap-hashes.txt against voxlaptest's\n\
+                                         golden-hashes.txt; exits non-zero on any mismatch.\n\
+                                         Defaults: --ours=roxlap-hashes.txt,\n\
+                                         --golden=../voxlaptest/tests/oracle/golden-hashes.txt\n\
+             roxlap-oracle debug-gline POSE\n\
+                                         dump camera basis + prelude + gline frustum\n\
+                                         values for one named pose's center bottom-\n\
+                                         quadrant scanline. For diff against voxlap C\n\
+                                         debug prints. Known poses: north, east,\n\
+                                         diag_down, high_down.\n\
+         \n\
+         Env:\n\
+             ROXLAP_ORACLE_PPM=1        also dump <pose>.ppm framebuffers (P6 RGB)\n\
+                                         alongside roxlap-hashes.txt"
     );
 }
 
@@ -372,6 +481,10 @@ fn main() -> std::io::Result<()> {
             }
             let exit = cmd_diff(&ours, &golden)?;
             std::process::exit(exit);
+        }
+        "debug-gline" => {
+            let pose_name = args.get(1).cloned().unwrap_or_else(|| "north".to_string());
+            cmd_debug_gline(&pose_name)
         }
         "--help" | "-h" => {
             print_help();
