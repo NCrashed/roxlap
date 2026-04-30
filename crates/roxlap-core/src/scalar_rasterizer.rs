@@ -324,6 +324,74 @@ impl Rasterizer for ScalarRasterizer<'_> {
 
         let mut plc_local = plc;
         let mut x = sx;
+
+        // R5.1: SSE2 4-pixel batch via `_mm_rsqrt_ps` — port of
+        // voxlaptest's `hrendzsse` (voxlap5.c:1947). 12-bit
+        // approximation, no Newton refine, matching the
+        // historical asm. The tail (0..3 leftover pixels)
+        // continues with the bit-exact scalar form below; the
+        // batch's z lanes will not match scalar 1/sqrt exactly,
+        // mirroring voxlap. SSE2 is x86_64 baseline so no
+        // runtime CPU-feature check is needed.
+        //
+        // `cast_ptr_alignment` is suppressed because we use
+        // `_mm_storeu_si128` / `_mm_storeu_ps` — the `u`-suffix
+        // variants explicitly support unaligned addresses, so a
+        // u32 pointer cast to `*mut __m128i` is sound.
+        #[cfg(target_arch = "x86_64")]
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            use core::arch::x86_64::{
+                __m128i, _mm_add_ps, _mm_cvtepi32_ps, _mm_cvtss_f32, _mm_mul_ps, _mm_rsqrt_ps,
+                _mm_set1_ps, _mm_setr_epi32, _mm_setr_ps, _mm_storeu_ps, _mm_storeu_si128,
+            };
+            let strx = rs.strx;
+            let stry = rs.stry;
+            let vstrx4 = _mm_set1_ps(strx * 4.0);
+            let vstry4 = _mm_set1_ps(stry * 4.0);
+            let mut vdx = _mm_setr_ps(dirx, dirx + strx, dirx + 2.0 * strx, dirx + 3.0 * strx);
+            let mut vdy = _mm_setr_ps(diry, diry + stry, diry + 2.0 * stry, diry + 3.0 * stry);
+            while p1 - x >= 4 {
+                // Gather 4 castdat hits — one per ray index.
+                let mut col = [0i32; 4];
+                let mut dst = [0i32; 4];
+                for k in 0..4 {
+                    let ray_idx = (plc_local >> 16) as usize;
+                    let cd_offset = scratch.angstart[ray_idx] + j as isize;
+                    let cd = scratch.radar[cd_offset as usize];
+                    col[k] = cd.col;
+                    dst[k] = cd.dist;
+                    plc_local = plc_local.wrapping_add(incr);
+                }
+                let vcol = _mm_setr_epi32(col[0], col[1], col[2], col[3]);
+                let vdsi = _mm_setr_epi32(dst[0], dst[1], dst[2], dst[3]);
+                let vdst = _mm_cvtepi32_ps(vdsi);
+                let vsqr = _mm_add_ps(_mm_mul_ps(vdx, vdx), _mm_mul_ps(vdy, vdy));
+                let vinv = _mm_rsqrt_ps(vsqr);
+                let vz = _mm_mul_ps(vdst, vinv);
+
+                let pixel_idx = row_start + x as usize;
+                _mm_storeu_si128(
+                    self.framebuffer
+                        .as_mut_ptr()
+                        .add(pixel_idx)
+                        .cast::<__m128i>(),
+                    vcol,
+                );
+                _mm_storeu_ps(self.zbuffer.as_mut_ptr().add(pixel_idx), vz);
+
+                vdx = _mm_add_ps(vdx, vstrx4);
+                vdy = _mm_add_ps(vdy, vstry4);
+                x += 4;
+            }
+            // Bring scalar dirx/diry up to where the batch left
+            // off — first lane of the post-step vdx/vdy.
+            dirx = _mm_cvtss_f32(vdx);
+            diry = _mm_cvtss_f32(vdy);
+        }
+
+        // Scalar tail — handles 0..3 leftover pixels on x86_64
+        // and the full body on other targets.
         while x < p1 {
             // ray index = signed shift right (voxlap's `plc >> 16`).
             let ray_idx = (plc_local >> 16) as usize;
@@ -445,6 +513,66 @@ mod tests {
         assert_eq!(cached_rs.stry.to_bits(), rs.stry.to_bits());
         assert_eq!(cached_rs.cx16, rs.cx16);
         assert_eq!(cached_rs.cy16, rs.cy16);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn hrend_sse_batch_writes_4_pixel_block() {
+        // R5.1 smoke test: hrend's SSE batch fires for span len ≥
+        // 4. Pre-fill radar with 4 distinct ARGB values, run hrend
+        // over [10..14], assert the framebuffer carries the colour
+        // bits (z lanes use rsqrtps approximation so are intent-
+        // ionally not bit-checked).
+        let mut fb = vec![0u32; 64 * 64];
+        let mut zb = vec![0.0f32; 64 * 64];
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
+        let (cs, proj, rs, prelude) = dummy_per_frame();
+        let ctx = ScanContext {
+            proj: &proj,
+            rs: &rs,
+            prelude: &prelude,
+            xres: 64,
+            yres: 64,
+            anginc: 1,
+            camera_state: &cs,
+            camera_gstartz0: 0,
+            camera_gstartz1: 0,
+            camera_vptr_offset: 0,
+        };
+        r.frame_setup(&ctx);
+
+        let mut scratch = ScanScratch::new_for_size(64, 64, 64);
+        // 4 colour records so the batch reads each lane.
+        for (i, slot) in scratch.radar.iter_mut().enumerate().take(4) {
+            slot.col = 0x8000_0000_u32 as i32 | i as i32;
+            slot.dist = 1024;
+        }
+        // angstart[i] = i so ray_idx i (= plc>>16) resolves to
+        // radar[i + j] = radar[i] with j=0.
+        for k in 0..4 {
+            scratch.angstart[k] = k as isize;
+        }
+
+        // sx=10, p1=14, j=0, plc=0, incr=1<<16 → plc>>16 steps
+        // 0,1,2,3 over the four pixels → angstart[0..4].
+        r.hrend(&mut scratch, 10, 5, 14, 0, 1 << 16, 0);
+
+        let row_off = 5 * 64;
+        for k in 0..4 {
+            let want = 0x8000_0000_u32 | k as u32;
+            assert_eq!(
+                fb[row_off + 10 + k],
+                want,
+                "fb[5][{}] = {:#010x}, expected {:#010x}",
+                10 + k,
+                fb[row_off + 10 + k],
+                want,
+            );
+            // z lane non-zero (rsqrtps produced something).
+            // Bit-compare to dodge clippy::float_cmp; we just want
+            // to confirm the slot was written, not its precise value.
+            assert_ne!(zb[row_off + 10 + k].to_bits(), 0u32);
+        }
     }
 
     #[test]

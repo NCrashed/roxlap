@@ -130,17 +130,28 @@ impl ApplicationHandler for App {
                     *px = sky;
                 }
 
-                // Camera from the .vxl save. Voxlap's saved basis is
-                // (ist, ihe, ifo) = (right, screen-down, forward);
-                // roxlap's Camera names them `right`, `down`,
-                // `forward` — same semantics, same f64 width, so a
-                // direct field-by-field copy lifts each vector
-                // across.
+                // Looking-down camera at the .vxl's saved position.
+                // Oracle's saved basis is `ist=[1,0,0]`,
+                // `ihe=[0,0,1]`, `ifo=[0,1,0]` — a level
+                // look-along-y. That basis makes
+                // `derive_gline_frustum` collapse per-scanline (vd0
+                // == vd1 because right[1] = down[0] = forward[2] =
+                // 0), which makes `gi0 = (vd0 - vd1)/leng = 0`,
+                // which freezes drawflor's cross-sign test on the
+                // first iteration → no floor pixels written, only
+                // sky. The oracle binary's actual rendered poses
+                // (oracle.c:261-271) use a yawed/pitched basis
+                // computed per-frame; the saved camera is a
+                // placeholder for `loadvxl`. Until R4.4 ships a
+                // proper engine-level camera-pose API, the demo
+                // host uses an unambiguously non-degenerate
+                // looking-down basis and keeps the saved position
+                // (which is in air above the playable carve).
                 let cam = Camera {
                     pos: self.vxl.ipo,
-                    right: self.vxl.ist,
-                    down: self.vxl.ihe,
-                    forward: self.vxl.ifo,
+                    right: [1.0, 0.0, 0.0],
+                    down: [0.0, 1.0, 0.0],
+                    forward: [0.0, 0.0, 1.0],
                 };
 
                 let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);

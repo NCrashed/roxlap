@@ -899,9 +899,14 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
     loop {
         let test = grouscan_cross_sign(state.cx1, state.cy1, state.ogx, state.gy_raw);
         if test <= 0 {
-            // enddrawflor → afterdelete. Cf-stack pop lands in
-            // R4.3e2; for now just terminate the state machine.
-            return Phase::Done;
+            // enddrawflor (voxlap5.c:11785) → afterdelete. Pops
+            // the current cf entry; if the column gets exhausted
+            // the chain reaches startsky which fills any
+            // remaining radar slots with skycast (= sky colour).
+            // Without this route, sky-pointing rays exit drawflor
+            // on the first cross-sign test and leave radar at
+            // default zeros — those screen rows render as black.
+            return Phase::AfterDelete;
         }
         state.cx1 = state.cx1.wrapping_sub(state.scratch.gi0);
         state.cy1 = state.cy1.wrapping_sub(state.scratch.gi1);
@@ -1850,9 +1855,9 @@ mod tests {
     }
 
     #[test]
-    fn drawflor_cross_sign_non_positive_returns_done() {
+    fn drawflor_cross_sign_non_positive_returns_after_delete() {
         // cx1 = cy1 = 0, gylookup[z1] = 0 → cross_sign = 0 ≤ 0 on
-        // entry → enddrawflor → Done. No pixel written.
+        // entry → enddrawflor → AfterDelete. No pixel written.
         let mut s = fresh_scratch();
         s.cf[CF_SEED_INDEX].z1 = 5;
         s.cf[CF_SEED_INDEX].cx1 = 0;
@@ -1868,7 +1873,7 @@ mod tests {
 
         let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 0);
         state.ogx = 0;
-        assert_eq!(phase_draw_flor(&mut state), Phase::Done);
+        assert_eq!(phase_draw_flor(&mut state), Phase::AfterDelete);
         assert_eq!(state.scratch.cf[CF_SEED_INDEX].i1, 20);
     }
 
