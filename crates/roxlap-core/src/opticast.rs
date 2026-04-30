@@ -191,7 +191,7 @@ pub fn opticast<R: Rasterizer>(
 /// `column_offsets` table). Returns `None` if the index is out of
 /// range or the offsets are malformed (non-monotonic, past the
 /// buffer end). Treated as camera-in-solid by the caller.
-fn camera_column_slice<'a>(
+pub(crate) fn camera_column_slice<'a>(
     slab_buf: &'a [u8],
     column_offsets: &[u32],
     idx: u32,
