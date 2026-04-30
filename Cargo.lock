@@ -1154,6 +1154,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxlap-oracle"
+version = "0.0.0"
+dependencies = [
+ "flate2",
+ "roxlap-core",
+ "roxlap-formats",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,21 @@
+[package]
+name = "roxlap-oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Cross-engine render-hash oracle for roxlap (R8)."
+
+[[bin]]
+name = "roxlap-oracle"
+path = "src/main.rs"
+
+[dependencies]
+roxlap-core = { path = "../roxlap-core" }
+roxlap-formats = { path = "../roxlap-formats" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[lints]
+workspace = true
