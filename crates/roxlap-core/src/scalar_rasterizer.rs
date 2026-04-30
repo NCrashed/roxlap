@@ -183,6 +183,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn gline(
         &mut self,
         scratch: &mut ScanScratch,
@@ -271,7 +272,16 @@ impl Rasterizer for ScalarRasterizer<'_> {
         //    voxlap5.c:1192-1228. Unsigned compare — voxlap's `q`
         //    is a uint64_t product that may exceed gmaxscandist or
         //    wrap negative.
+        //
+        //    Also stamps `skycast.dist` per voxlap5.c:1209-1227:
+        //    initialised to `gxmax` (the scan-distance ceiling),
+        //    overwritten with `0x7FFFFFFF` if either frustum-edge
+        //    clip fires (= ray hits world edge before scan-dist
+        //    cap → "infinitely far" sky depth). startsky's solid-
+        //    fill writes this into every drained radar slot's
+        //    `dist`, which the z-buffer ends up carrying.
         let mut gxmax = cache.prelude.max_scan_dist;
+        scratch.skycast.dist = gxmax;
         let li_pos = cache.prelude.li_pos;
         let vsid_signed = self.vsid as i32;
         let j0 = if f.gixy[0] < 0 {
@@ -283,6 +293,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
             .wrapping_add(i64::from(f.gpz[0] as u32));
         if (q0 as u64) < u64::from(gxmax as u32) {
             gxmax = q0 as i32;
+            scratch.skycast.dist = i32::MAX;
         }
         let j1 = if f.gixy[1] < 0 {
             li_pos[1]
@@ -293,6 +304,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
             .wrapping_add(i64::from(f.gpz[1] as u32));
         if (q1 as u64) < u64::from(gxmax as u32) {
             gxmax = q1 as i32;
+            scratch.skycast.dist = i32::MAX;
         }
         scratch.gxmax = gxmax;
 

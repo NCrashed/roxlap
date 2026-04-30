@@ -9,6 +9,10 @@ use crate::Camera;
 pub struct Engine {
     camera: Camera,
     sky_color: u32,
+    fog_color: u32,
+    /// Maximum distance the fog blend interpolates over (PREC-
+    /// scaled cells; voxlap's `vx5.maxscandist`). `0` disables fog.
+    fog_max_scan_dist: i32,
 }
 
 impl Default for Engine {
@@ -17,6 +21,8 @@ impl Default for Engine {
             camera: Camera::default(),
             // Voxlap-style packed sky blue: brightness bit | 0x87ceeb.
             sky_color: 0x8087_ceeb,
+            fog_color: 0,
+            fog_max_scan_dist: 0,
         }
     }
 }
@@ -47,6 +53,26 @@ impl Engine {
     #[must_use]
     pub fn sky_color(&self) -> u32 {
         self.sky_color
+    }
+
+    /// Configure fog. `max_scan_dist <= 0` disables fog. Otherwise
+    /// pixels at the maximum scan distance blend fully to
+    /// `fog_color` (low 24 bits — alpha byte ignored). Voxlap's
+    /// `vx5.maxscandist`-based foglut is rebuilt downstream by
+    /// `ScanScratch::set_fog`.
+    pub fn set_fog(&mut self, color: u32, max_scan_dist: i32) {
+        self.fog_color = color;
+        self.fog_max_scan_dist = max_scan_dist.max(0);
+    }
+
+    #[must_use]
+    pub fn fog_color(&self) -> u32 {
+        self.fog_color
+    }
+
+    #[must_use]
+    pub fn fog_max_scan_dist(&self) -> i32 {
+        self.fog_max_scan_dist
     }
 
     /// Render one frame into the caller-owned ARGB framebuffer.
@@ -116,6 +142,28 @@ mod tests {
             assert!(row[..width as usize].iter().all(|&p| p == 0x1234_5678));
             assert!(row[width as usize..].iter().all(|&p| p == 0));
         }
+    }
+
+    #[test]
+    fn fog_defaults_disabled() {
+        let e = Engine::new();
+        assert_eq!(e.fog_color(), 0);
+        assert_eq!(e.fog_max_scan_dist(), 0);
+    }
+
+    #[test]
+    fn set_fog_stores_color_and_distance() {
+        let mut e = Engine::new();
+        e.set_fog(0xFF_AA_BB_CC, 1024);
+        assert_eq!(e.fog_color(), 0xFF_AA_BB_CC);
+        assert_eq!(e.fog_max_scan_dist(), 1024);
+    }
+
+    #[test]
+    fn set_fog_clamps_negative_distance_to_zero() {
+        let mut e = Engine::new();
+        e.set_fog(0xFF, -100);
+        assert_eq!(e.fog_max_scan_dist(), 0);
     }
 
     #[test]

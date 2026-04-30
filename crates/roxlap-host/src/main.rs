@@ -112,15 +112,25 @@ impl ApplicationHandler for App {
 
                 // Wire engine sky colour onto scratch so grouscan's
                 // startsky has the right (col, dist) for any radar
-                // slot it drains. Voxlap stamps `skycast.dist =
-                // gxmax` per ray (with USEZBUFFER); the R4.3a-rewire
-                // path stays at a static far-depth sentinel until
-                // R4.4 lands the per-ray skycast update.
-                // u32 → i32 reinterpret (preserves bits — `set_skycast`
-                // treats it as a packed ARGB and `cast_signed` is
-                // 1.87+, beyond the workspace MSRV).
+                // slot it drains. The `dist` argument here seeds an
+                // initial value; gline (R4.4) overwrites
+                // `scratch.skycast.dist` per ray based on the
+                // frustum-edge clip outcome — `gxmax` when the ray
+                // is bounded by scan-distance, `i32::MAX` when by
+                // world edge.
+                // u32 → i32 reinterpret (preserves bits; `cast_signed`
+                // is 1.87+, beyond the workspace MSRV).
                 let sky_col_i = i32::from_ne_bytes(self.engine.sky_color().to_ne_bytes());
-                self.scratch.set_skycast(sky_col_i, 0x7FFF_FFFF);
+                self.scratch.set_skycast(sky_col_i, 0);
+
+                // Engine fog → ScanScratch foglut. Rebuilds the
+                // 2048-entry table only when fog params change in
+                // practice (set_fog itself is the only producer);
+                // the foglut alloc lives across frames so this is
+                // cheap on steady-state.
+                let fog_col_i = i32::from_ne_bytes(self.engine.fog_color().to_ne_bytes());
+                self.scratch
+                    .set_fog(fog_col_i, self.engine.fog_max_scan_dist());
 
                 let mut buffer = surface.buffer_mut().expect("softbuffer: buffer_mut");
                 // Pre-fill with sky-blue so any pixel opticast leaves
