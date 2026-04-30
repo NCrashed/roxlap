@@ -1,4 +1,4 @@
 north  326a7c41c3cc659d
 east  3e00f1d0d62d5be0
-diag_down  8ca9e042a12a411b
-high_down  60493de94b77fbdf
+diag_down  c90680e8afaf976a
+high_down  a18438fec3a33547

@@ -344,10 +344,13 @@ impl Rasterizer for ScalarRasterizer<'_> {
                // remiporend body and a real multi-mip world.
         );
 
-        // 7. Advance gscanptr for the next gline call. Voxlap
-        //    increments by leng + 1 (the radar slot just past the
-        //    end of this ray's range).
-        scratch.gscanptr = scratch.gscanptr.saturating_add(leng as usize + 1);
+        // gscanptr is advanced by the opticast quadrant scan
+        // (`scan_loops.rs::top_quadrant` etc., voxlap5.c:2382 area)
+        // AFTER each gline call. Voxlap's `gline` itself does NOT
+        // touch gscanptr — advancing it here too created gaps of
+        // `leng+1` unwritten radar slots between consecutive glines,
+        // which read back as 0 in hrend → black pixels at the
+        // sphere position in diag_down / high_down.
     }
 
     fn hrend(
