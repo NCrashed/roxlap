@@ -240,7 +240,7 @@ pub(crate) fn kv6_draw_prepare<'a>(
 /// `c_s = a_s * b_s.x + a_h * b_s.y + a_f * b_s.z`, similarly for
 /// `c_h` / `c_f`. `c_o = same form on b_o + a_o`.
 #[allow(clippy::too_many_arguments)]
-fn mat2(
+pub(crate) fn mat2(
     a_s: [f32; 3],
     a_h: [f32; 3],
     a_f: [f32; 3],

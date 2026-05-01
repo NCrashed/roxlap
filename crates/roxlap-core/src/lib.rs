@@ -16,6 +16,7 @@ pub mod equivec;
 pub mod fixed;
 pub mod gline;
 pub mod grouscan;
+pub mod kfa_draw;
 pub mod meltsphere;
 pub mod opticast;
 pub mod opticast_prelude;

@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use flate2::read::GzDecoder;
 use roxlap_core::camera_math;
+use roxlap_core::kfa_draw::{draw_kfa_sprite, KfaSprite};
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
@@ -34,6 +35,7 @@ use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::LightSrc;
 use roxlap_core::OpticastSettings;
+use roxlap_formats::kfa::{Hinge, Point3};
 use roxlap_formats::{kv6, vxl};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -211,6 +213,12 @@ struct App {
     /// at app construction; the redraw loop reads `elapsed()` every
     /// frame to derive the coco's spin angle.
     spawn_time: Instant,
+    /// Procedurally-built 2-bone KFA demo. Bone 0 (root) is a
+    /// meltsphere body; bone 1 is a coco arm hinged 15 voxels to
+    /// the body's right via a z-axis rotation joint. The redraw
+    /// loop drives `kfaval[1]` from `spawn_time.elapsed()` so the
+    /// arm spins continuously around the body.
+    kfa_demo: KfaSprite,
     /// Demo light parameters — kept around so the `L` hotkey can
     /// re-add the same light after a previous toggle cleared it.
     /// The toggle flips the engine between `lightmode=2` + this
@@ -543,6 +551,31 @@ impl App {
                     );
                 }
             }
+
+            // Animate the KFA demo: spin bone 1 around its hinge
+            // axis once per ~4 seconds. kfaval is a Q15 angle —
+            // full circle = 65536 ticks, so 16384 ticks/sec gives
+            // 4-second period.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let spin = (self.spawn_time.elapsed().as_secs_f32() * 16384.0) as i32;
+            self.kfa_demo.kfaval[1] = (spin & 0xffff) as i16;
+            let kfa_written = draw_kfa_sprite(
+                &mut target,
+                &cam_state,
+                &settings,
+                &lighting,
+                &mut self.kfa_demo,
+            );
+            if debug {
+                eprintln!(
+                    "kfa_demo: pos=({:.1}, {:.1}, {:.1}) kfaval[1]={} → wrote {} pixels",
+                    self.kfa_demo.p[0],
+                    self.kfa_demo.p[1],
+                    self.kfa_demo.p[2],
+                    self.kfa_demo.kfaval[1],
+                    kfa_written
+                );
+            }
         }
 
         if self.capture_pending {
@@ -775,6 +808,7 @@ fn load_oracle_vxl() -> vxl::Vxl {
     vxl::parse(&bytes).expect("parse oracle.vxl")
 }
 
+#[allow(clippy::too_many_lines)] // straight-line setup; splitting hurts readability
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -850,6 +884,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Engine starts in the unlit state (light_on=false). The L
     // hotkey applies lightmode + light + world bake on demand.
 
+    // Procedural 2-bone KFA: meltsphere body + coco arm hinged
+    // 15 voxels to the body's right via a z-axis rotation joint.
+    // Placed at cam + [+30, 0, -20] — above the camera spawn line
+    // (voxlap's +z = down, so -20 is 20 voxels up). The redraw
+    // loop spins kfaval[1] over time.
+    let kfa_root_pos = [cam_f32[0] + 30.0, cam_f32[1], cam_f32[2] - 20.0];
+    let kfa_body = Sprite::axis_aligned(
+        kv6::parse(SPRITE_MELTSPHERE_KV6).expect("parse meltsphere for kfa body"),
+        kfa_root_pos,
+    );
+    let kfa_arm = Sprite::axis_aligned(
+        kv6::parse(COCO_KV6).expect("parse coco for kfa arm"),
+        kfa_root_pos, // overwritten by setlimb on first frame
+    );
+    let zero = Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    let z_axis = Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+    let body_hinge = Hinge {
+        parent: -1,
+        p: [zero, zero],
+        v: [z_axis, z_axis],
+        vmin: 0,
+        vmax: 0,
+        htype: 0,
+        filler: [0; 7],
+    };
+    let arm_hinge = Hinge {
+        parent: 0,
+        // Child anchor (arm-side velcro) at arm origin.
+        // Parent anchor (body-side velcro) 15 voxels right of body
+        // centre — the arm "attaches" at body.x+15.
+        p: [
+            zero,
+            Point3 {
+                x: 15.0,
+                y: 0.0,
+                z: 0.0,
+            },
+        ],
+        v: [z_axis, z_axis],
+        vmin: i16::MIN,
+        vmax: i16::MAX,
+        htype: 0,
+        filler: [0; 7],
+    };
+    let kfa_demo = KfaSprite::new(
+        vec![kfa_body, kfa_arm],
+        vec![body_hinge, arm_hinge],
+        kfa_root_pos,
+    );
+
     // Bake region: a 1024×1024 area centred on the spawn camera,
     // covering the full voxlap z range. Big enough that distant
     // scene features (e.g. the red pillar) fall inside; the demo
@@ -894,6 +986,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         capture_pending: false,
         sprites: vec![meltsphere_sprite, coco_sprite],
         spawn_time: Instant::now(),
+        kfa_demo,
         demo_light,
         pristine_world,
         baked_world: None,
