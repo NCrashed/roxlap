@@ -26,7 +26,7 @@ use roxlap_core::camera_math;
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
-use roxlap_core::sprite::{draw_sprite, Sprite};
+use roxlap_core::sprite::{draw_sprite, DrawTarget, Sprite};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
@@ -292,10 +292,9 @@ impl App {
             );
         }
 
-        // R6.4a sprite-plumbing call: dispatcher runs cull + setup
-        // math + per-voxel iteration through scissor. No pixels
-        // written yet — R6.4b/c/d add vertex projection, screen-
-        // AABB, and the fill loop.
+        // R6.4 sprite render: cull + setup + per-voxel rasterizer
+        // writes pixels + zbuffer. Scoped after opticast so the
+        // sprite layers on top of the world.
         let cam_state = camera_math::derive(
             &cam,
             size.width,
@@ -304,7 +303,16 @@ impl App {
             settings.hy,
             settings.hz,
         );
-        let _ = draw_sprite(&cam_state, &settings, &self.sprite);
+        {
+            let mut target = DrawTarget {
+                framebuffer: &mut buffer,
+                zbuffer: &mut self.zbuffer,
+                pitch_pixels,
+                width: size.width,
+                height: size.height,
+            };
+            let _ = draw_sprite(&mut target, &cam_state, &settings, &self.sprite);
+        }
 
         if self.capture_pending {
             self.capture_pending = false;

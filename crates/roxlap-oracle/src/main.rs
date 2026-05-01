@@ -41,20 +41,45 @@ use std::fs;
 use std::io::{Read, Write};
 
 use flate2::read::GzDecoder;
+use roxlap_core::camera_math;
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::sprite::{draw_sprite, DrawTarget, Sprite};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
-use roxlap_formats::vxl;
+use roxlap_formats::{kv6, vxl};
 
 const XRES: u32 = 640;
 const YRES: u32 = 480;
 const ORACLE_VXL_GZ: &[u8] = include_bytes!("../../../assets/oracle.vxl.gz");
 
+/// Voxlap-C oracle's `meltsphere`-extracted sprite at radius 8.
+/// Bit-exact with `voxlaptest/build-clang/oracle-run/sprite_meltsphere.kv6`
+/// (see `roxlap-core/tests/fixtures`).
+const SPRITE_MELTSPHERE_KV6: &[u8] =
+    include_bytes!("../../roxlap-core/tests/fixtures/sprite_meltsphere.kv6");
+/// Voxlap-C oracle's coco-melt sprite (radius 12 around a stamped
+/// coco kvx in the world).
+const SPRITE_COCO_MELT_KV6: &[u8] =
+    include_bytes!("../../roxlap-core/tests/fixtures/sprite_coco_melt.kv6");
+
+/// Which sprite an oracle pose draws after opticast (or `None` for
+/// the opticast-only poses).
+#[derive(Debug, Clone, Copy)]
+enum SpriteKind {
+    /// Axis-aligned `g_sprite` at world `(1050, 1050, 175)` —
+    /// meltsphere'd from the world voxel grid (radius 8).
+    MeltsphereAxis,
+    /// Rotated `g_coco_sprite` at world `(1110, 1080, 175)` with
+    /// basis = 120° rotation about z.
+    CocoRot120,
+}
+
 /// One render pose. Mirror of voxlaptest's `struct pose`, minus
-/// the sprite / lit / tile fields (skipped here).
+/// the lit / tile fields. Sprite poses get a `sprite` reference;
+/// opticast-only poses leave it `None`.
 #[derive(Debug, Clone, Copy)]
 struct Pose {
     name: &'static str,
@@ -63,11 +88,12 @@ struct Pose {
     pz: f64,
     yaw: f64,
     pitch: f64,
+    sprite: Option<SpriteKind>,
 }
 
-/// The 4 opticast-only poses. Same names + positions as
-/// voxlaptest's oracle so the diff line-by-line comparison
-/// works.
+/// The 8 oracle poses we currently render — the 4 opticast-only
+/// poses plus the 4 sprite poses (R6.4). Same names + positions as
+/// voxlaptest's oracle so a line-by-line diff works.
 const POSES: &[Pose] = &[
     Pose {
         name: "north",
@@ -76,6 +102,7 @@ const POSES: &[Pose] = &[
         pz: 128.0,
         yaw: std::f64::consts::FRAC_PI_2,
         pitch: 0.0,
+        sprite: None,
     },
     Pose {
         name: "east",
@@ -84,6 +111,7 @@ const POSES: &[Pose] = &[
         pz: 128.0,
         yaw: 0.0,
         pitch: 0.0,
+        sprite: None,
     },
     Pose {
         name: "diag_down",
@@ -92,6 +120,7 @@ const POSES: &[Pose] = &[
         pz: 110.0,
         yaw: std::f64::consts::FRAC_PI_4,
         pitch: 0.4,
+        sprite: None,
     },
     Pose {
         name: "high_down",
@@ -100,8 +129,75 @@ const POSES: &[Pose] = &[
         pz: 90.0,
         yaw: std::f64::consts::FRAC_PI_2,
         pitch: 0.7,
+        sprite: None,
+    },
+    // Sprite poses: cameras aimed at g_sprite at (1050, 1050, 175).
+    // sprite_iso uses yaw = π/4 (= 0.7853981633974483), matching
+    // oracle.c:303-310.
+    Pose {
+        name: "sprite_front",
+        px: 1020.0,
+        py: 1050.0,
+        pz: 175.0,
+        yaw: 0.0,
+        pitch: 0.0,
+        sprite: Some(SpriteKind::MeltsphereAxis),
+    },
+    Pose {
+        name: "sprite_above",
+        px: 1050.0,
+        py: 1050.0,
+        pz: 150.0,
+        yaw: 0.0,
+        pitch: 1.3,
+        sprite: Some(SpriteKind::MeltsphereAxis),
+    },
+    Pose {
+        name: "sprite_iso",
+        px: 1020.0,
+        py: 1020.0,
+        pz: 160.0,
+        yaw: std::f64::consts::FRAC_PI_4,
+        pitch: 0.4,
+        sprite: Some(SpriteKind::MeltsphereAxis),
+    },
+    Pose {
+        name: "sprite_coco",
+        px: 1080.0,
+        py: 1050.0,
+        pz: 160.0,
+        yaw: std::f64::consts::FRAC_PI_4,
+        pitch: 0.4,
+        sprite: Some(SpriteKind::CocoRot120),
     },
 ];
+
+/// Build a [`Sprite`] for a given pose. Returns `None` for
+/// opticast-only poses. Loaded fresh per pose so `kv6_compute_full_state`
+/// sees the same byte-equal sprite voxlap C does.
+fn sprite_for_pose(kind: SpriteKind) -> Sprite {
+    match kind {
+        SpriteKind::MeltsphereAxis => {
+            let kv = kv6::parse(SPRITE_MELTSPHERE_KV6).expect("parse meltsphere fixture");
+            Sprite::axis_aligned(kv, [1050.0, 1050.0, 175.0])
+        }
+        SpriteKind::CocoRot120 => {
+            // 120° rotation about z (oracle.c:248-251).
+            let theta = 2.0_f32 * std::f32::consts::PI / 3.0_f32;
+            let ca = theta.cos();
+            let sa = theta.sin();
+            let kv = kv6::parse(SPRITE_COCO_MELT_KV6).expect("parse coco fixture");
+            Sprite {
+                kv6: kv,
+                p: [1110.0, 1080.0, 175.0],
+                s: [ca, sa, 0.0],
+                h: [-sa, ca, 0.0],
+                f: [0.0, 0.0, 1.0],
+                flags: 0,
+            }
+        }
+    }
+}
 
 /// FNV-1a 64-bit, byte-for-byte the same as voxlaptest's
 /// `tests/oracle/oracle.c` `fnv1a64`. Comparisons against
@@ -192,6 +288,23 @@ fn render_pose(
             &vxl.data,
             &vxl.column_offset,
         );
+    }
+
+    // R6.4 sprite render: layer one of the meltsphere'd kv6 sprites
+    // on top of the world for the four `sprite_*` poses. The
+    // opticast-only poses leave `pose.sprite` as `None`.
+    if let Some(kind) = pose.sprite {
+        let sprite = sprite_for_pose(kind);
+        let cam_state =
+            camera_math::derive(&cam, XRES, YRES, settings.hx, settings.hy, settings.hz);
+        let mut target = DrawTarget {
+            framebuffer,
+            zbuffer,
+            pitch_pixels,
+            width: XRES,
+            height: YRES,
+        };
+        let _ = draw_sprite(&mut target, &cam_state, &settings, &sprite);
     }
 
     // FNV-1a over the framebuffer's raw bytes — same shape as

@@ -11,6 +11,7 @@ mod camera;
 pub mod camera_math;
 pub mod column_walk;
 mod engine;
+pub mod equivec;
 pub mod fixed;
 pub mod gline;
 pub mod grouscan;

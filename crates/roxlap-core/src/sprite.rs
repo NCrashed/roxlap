@@ -35,14 +35,25 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_ptr_alignment, // _mm_loadl_epi64 / _mm_storeu_si128 are intentionally unaligned
+    clippy::doc_markdown,
+    clippy::no_effect_underscore_binding, // SSE intrinsic side-effect-only stores
+    clippy::no_effect, // the discarded pmaddwd intermediate
+    clippy::ref_as_ptr,
+    clippy::float_cmp_const,
+    clippy::float_cmp,
 )]
 
 use roxlap_formats::kv6::{Kv6, Voxel};
 
 use crate::camera_math::CameraState;
+use crate::equivec::iunivec;
 use crate::fixed::ftol;
 use crate::opticast::OpticastSettings;
+use crate::ptfaces16::PTFACES16;
 
 /// Voxlap's `vx5.kv6mipfactor` default (`voxlap5.c:12335`). Threshold
 /// distance (in voxlap's "ftol-of-forward-projected" estimate units)
@@ -293,9 +304,10 @@ pub(crate) struct Kv6IterState<'a> {
 ///
 /// Built by [`kv6_compute_full_state`] from the post-cull
 /// `Kv6DrawSetup` + the camera's projection params. Mirror of the
-/// voxlap5.c:8915-8973 setup block.
+/// voxlap5.c:8915-8973 setup block + the qsum1/qbplbpp framebuffer
+/// state from `voxsetframebuffer` (voxlap5.c:11119-11122) +
+/// kv6colmul/kv6coladd from `updatereflects` (voxlap5.c:8466).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // R6.4b/c/d will read these.
 pub(crate) struct Kv6FullState<'a> {
     pub iter: Kv6IterState<'a>,
     /// 8 cube-vertex offsets, gihz-scaled. `cadd4[k]` for `k = 0..7`
@@ -324,6 +336,40 @@ pub(crate) struct Kv6FullState<'a> {
     /// `qsum0[2] = qsum0[0] = 0x7fff - (xres - hx as i32)`,
     /// `qsum0[3] = qsum0[1] = 0x7fff - (yres - hy as i32)`.
     pub qsum0: [i16; 4],
+    /// Viewport-clip floor (voxlap5.c:11120). After the saturated
+    /// add of `qsum0`, the screen-AABB is clamped from below by
+    /// `qsum1[0/2] = 0x7fff - xres`, `qsum1[1/3] = 0x7fff - yres`.
+    pub qsum1: [i16; 4],
+    /// Framebuffer pixel-stride packed for `pmaddwd` (voxlap5.c:11121).
+    /// `qbplbpp[0/2] = 4` (bytes per pixel), `qbplbpp[1/3] = pitch_bytes`.
+    pub qbplbpp: [i16; 4],
+    /// Per-direction colour modulation table built by
+    /// [`update_reflects`]. Indexed by `v.dir` (256 entries). Each
+    /// entry packs four `u16` modulation factors (one per byte
+    /// channel) used by `_mm_mulhi_epu16` against the unpacked
+    /// voxel colour.
+    pub kv6colmul: Box<[u64; 256]>,
+    /// Fog bias added after the colour modulate. Zero when fog is
+    /// disabled (the oracle case).
+    pub kv6coladd: u64,
+}
+
+/// Borrowed framebuffer + zbuffer the per-voxel rasterizer fills.
+///
+/// Mirrors voxlap's `kv6frameplace` + `zbuffermem` but in
+/// row-major-pixel form rather than byte-pointer form. `width` /
+/// `height` must match the `OpticastSettings.xres` / `yres` used
+/// when [`Kv6FullState`] was built — the bounds derived from
+/// `qsum0` / `qsum1` assume that geometry.
+pub struct DrawTarget<'a> {
+    /// Packed BGRA pixels, row-major, length `pitch_pixels * height`.
+    pub framebuffer: &'a mut [u32],
+    /// Per-pixel z values, same layout as `framebuffer`.
+    pub zbuffer: &'a mut [f32],
+    /// Row stride in pixels (= `framebuffer.len() / height`).
+    pub pitch_pixels: usize,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[inline]
@@ -341,14 +387,125 @@ fn vec4_scale(a: [f32; 4], s: f32) -> [f32; 4] {
     [a[0] * s, a[1] * s, a[2] * s, a[3] * s]
 }
 
+/// Builds `kv6colmul[256]` + `kv6coladd[0]` for the oracle's
+/// no-fog + `flags=0` + `lightmode<2` + grey `vx5.kv6col` (R==G==B)
+/// branch of voxlap's `updatereflects` (`voxlap5.c:8466-8629`).
+///
+/// Other branches (fog, `flags & 1`, lightmode>=2, non-grey
+/// `kv6col`) are deferred — the four sprite oracle poses all sit in
+/// the simpler R==G==B nolighta sub-branch, so this is enough to
+/// validate bit-equality. The ports for the other branches mirror
+/// voxlap's logic line-for-line and can be added when a downstream
+/// caller demands them.
+fn update_reflects(sprite: &Sprite) -> (Box<[u64; 256]>, u64) {
+    // Oracle config: vx5.kv6col = 0x808080 (R==G==B, grey), no fog
+    // (vx5.fogcol < 0 → ofogdist stays -1 → fogmul = 0,
+    //  kv6coladd[0] = 0). vx5.lightmode = 0 default.
+    let kv6col: u32 = 0x0080_8080;
+    let fogmul_lo: u32 = 0; // (int32_t)fogmul == 0 since fog off
+
+    // (voxlap5.c:8538-8543) fx=fy=fz=1.0; tp = sum of basis vectors.
+    let tp_x = sprite.s[0] + sprite.h[0] + sprite.f[0];
+    let tp_y = sprite.s[1] + sprite.h[1] + sprite.f[1];
+    let tp_z = sprite.s[2] + sprite.h[2] + sprite.f[2];
+
+    let f0 = 64.0_f32 / (tp_x * tp_x + tp_y * tp_y + tp_z * tp_z).sqrt();
+
+    // g = ((fogmul & 32767) ^ 32767) * (16*8/65536). With fogmul=0:
+    //   g = 32767 * (128/65536) ≈ 63.998.
+    let g_pre = ((((fogmul_lo & 0x7fff) ^ 0x7fff) as i32) as f32) * (16.0 * 8.0 / 65536.0);
+
+    // R==G==B test: ((kv6col & 0xffff) << 8) ^ (kv6col & 0xffff00)
+    //   == 0  iff  R == G and G == B.
+    let lo16 = kv6col & 0xffff;
+    let mid24 = kv6col & 0x00ff_ff00;
+    let is_grey = ((lo16 << 8) ^ mid24) == 0;
+
+    let mut kv6colmul = Box::new([0u64; 256]);
+
+    if is_grey {
+        // Nolighta path (voxlap5.c:8553-8584): grey kv6col absorbs
+        // into a single multiplier per direction.
+        let g = g_pre * (((kv6col & 0xff) as f32) / 256.0);
+        let f = f0 * g;
+
+        let l0 = (tp_x * f) as i16; // (short)(...) is C truncating cast
+        let l1 = (tp_y * f) as i16;
+        let l2 = (tp_z * f) as i16;
+        let l3 = (g * 128.0) as i16;
+
+        let iu = iunivec();
+        for k in 0..256 {
+            // Per-direction dot product across 4 i16 lanes (3 spatial
+            // + 1 bias). The asm sums the two pmaddwd dword lanes
+            // modulo 2^32 then takes the high 16 — equivalent to:
+            //   word = ((u0*l0+u1*l1) + (u2*l2+u3*l3)) >> 16
+            // computed in u32 wrapping arithmetic.
+            let u0 = i32::from(iu[k][0]);
+            let u1 = i32::from(iu[k][1]);
+            let u2 = i32::from(iu[k][2]);
+            let u3 = i32::from(iu[k][3]);
+            let lo = (u0.wrapping_mul(l0.into())) as u32;
+            let lo = lo.wrapping_add((u1.wrapping_mul(l1.into())) as u32);
+            let hi = (u2.wrapping_mul(l2.into())) as u32;
+            let hi = hi.wrapping_add((u3.wrapping_mul(l3.into())) as u32);
+            let w = ((lo.wrapping_add(hi)) >> 16) as u16;
+            let w64 = u64::from(w);
+            kv6colmul[k] = w64 | (w64 << 16) | (w64 << 32) | (w64 << 48);
+        }
+    } else {
+        // Nolightb path (voxlap5.c:8587-8629). Per-channel
+        // modulation factor M_k = (kv6col_byte_k << 8) → mulhi_pu16
+        // by the per-direction dot. Same dot derivation as nolighta.
+        let f = f0 * g_pre;
+
+        let l0 = (tp_x * f) as i16;
+        let l1 = (tp_y * f) as i16;
+        let l2 = (tp_z * f) as i16;
+        let l3 = (g_pre * 128.0) as i16;
+
+        let m0 = ((kv6col & 0xff) << 8) as u16;
+        let m1 = (((kv6col >> 8) & 0xff) << 8) as u16;
+        let m2 = (((kv6col >> 16) & 0xff) << 8) as u16;
+        let m3 = (((kv6col >> 24) & 0xff) << 8) as u16;
+
+        let iu = iunivec();
+        for k in 0..256 {
+            let u0 = i32::from(iu[k][0]);
+            let u1 = i32::from(iu[k][1]);
+            let u2 = i32::from(iu[k][2]);
+            let u3 = i32::from(iu[k][3]);
+            let lo = (u0.wrapping_mul(l0.into())) as u32;
+            let lo = lo.wrapping_add((u1.wrapping_mul(l1.into())) as u32);
+            let hi = (u2.wrapping_mul(l2.into())) as u32;
+            let hi = hi.wrapping_add((u3.wrapping_mul(l3.into())) as u32);
+            let w = ((lo.wrapping_add(hi)) >> 16) as u32;
+            let w0 = ((w * u32::from(m0)) >> 16) as u16;
+            let w1 = ((w * u32::from(m1)) >> 16) as u16;
+            let w2 = ((w * u32::from(m2)) >> 16) as u16;
+            let w3 = ((w * u32::from(m3)) >> 16) as u16;
+            kv6colmul[k] = u64::from(w0)
+                | (u64::from(w1) << 16)
+                | (u64::from(w2) << 32)
+                | (u64::from(w3) << 48);
+        }
+    }
+
+    (kv6colmul, 0)
+}
+
 /// Full setup: mat2 + Cramer's + nfor↔nhei swap + cadd4/ztab4/r1/r2/
 /// scisdist/qsum0 init. Mirror of voxlap5.c:8915-8973.
-fn kv6_compute_full_state<'a>(
+pub(crate) fn kv6_compute_full_state<'a>(
     setup: &Kv6DrawSetup<'a>,
-    sprite_pos: [f32; 3],
+    sprite: &Sprite,
     cam: &CameraState,
     settings: &OpticastSettings,
+    fb_width: u32,
+    fb_height: u32,
+    fb_pitch_pixels: usize,
 ) -> Kv6FullState<'a> {
+    let sprite_pos = sprite.p;
     let kv = setup.kv;
 
     // Transform sprite basis from world to camera-relative
@@ -487,6 +644,22 @@ fn kv6_compute_full_state<'a>(
     // r2 = -ysiz * cadd4[4] (voxlap5.c:8974). intss + mulps in voxlap.
     let r2 = vec4_scale(cadd4[4], -(ysiz_i as f32));
 
+    // qsum1 + qbplbpp from voxsetframebuffer (voxlap5.c:11119-11122).
+    // The framebuffer geometry is independent of the camera projection
+    // — these are derived from `(width, height, pitch_bytes)`.
+    let pitch_bytes = (fb_pitch_pixels as i32).saturating_mul(4);
+    let qsum1_x = 0x7fff_i32 - fb_width as i32;
+    let qsum1_y = 0x7fff_i32 - fb_height as i32;
+    let qsum1 = [
+        qsum1_x as i16,
+        qsum1_y as i16,
+        qsum1_x as i16,
+        qsum1_y as i16,
+    ];
+    let qbplbpp = [4i16, pitch_bytes as i16, 4, pitch_bytes as i16];
+
+    let (kv6colmul, kv6coladd) = update_reflects(sprite);
+
     Kv6FullState {
         iter,
         cadd4,
@@ -495,42 +668,231 @@ fn kv6_compute_full_state<'a>(
         r2,
         scisdist,
         qsum0,
+        qsum1,
+        qbplbpp,
+        kv6colmul,
+        kv6coladd,
     }
 }
 
-/// Per-voxel rasterizer entry.
+/// Per-voxel rasterizer (R6.4 complete).
 ///
-/// R6.4a stops after origin compute + scissor; later substages
-/// add vertex projection (R6.4b), screen-AABB + clip (R6.4c),
-/// fill loop (R6.4d), and colour modulation + `mm5` cross-call
-/// tail (R6.4e).
+/// Mirror of `voxlap5.c:8179-8320` (`drawboundcubesse`). For each
+/// voxel:
+/// 1. `effmask = mask & v.vis` early-out.
+/// 2. `origin = r0 + ztab4_per_z[v.z]`; scissor on `origin.z`.
+/// 3. Look up `ptfaces16[effmask]` — `face[0]` = 4 or 6 vertex
+///    count, `face[1..7]` = byte offsets into `caddasm` (the
+///    `cadd4[8]` array, each entry 16 bytes).
+/// 4. For each vertex pair (a, b), compute the projected screen
+///    coords as `(cadd4[a] + origin).xy / (cadd4[a] + origin).z`
+///    via `_mm_rcp_ps`.
+/// 5. Pack the 4 (or 6) projected vertices to int16, min/max-reduce
+///    to a single screen-AABB, viewport-clip via `qsum0` /
+///    `qsum1`, and early-out on degenerate rect.
+/// 6. Compute the per-voxel colour via the `mm5` cross-call tail +
+///    `kv6colmul[v.dir]` + `kv6coladd[0]` modulation.
+/// 7. Fill the screen rectangle with z-test + framebuffer write.
 ///
-/// Mirror of voxlap5.c:8179-8192 (the early-out + origin + scissor
-/// portion of `drawboundcubesse`).
+/// Returns the number of pixels actually written (z-test passing).
+/// Tests use this as a sanity gate; production callers ignore it.
 ///
-/// Returns `true` if the voxel passed the early-out + scissor —
-/// i.e. R6.4b would proceed to project vertices. For R6.4a the
-/// return value is the scissor-pass signal that tests assert on.
+/// `mm5_tail` is voxlap's static cross-call register tail
+/// (voxlap5.c:8170-8177). It carries one byte of contribution from
+/// the previous voxel's colour into the current; bit-equality with
+/// the asm requires preserving it across calls within one sprite.
+///
+/// Currently x86_64-only — relies on `_mm_rcp_ps` for bit-equality
+/// with voxlap C. NEON / wasm ports will need their own goldens
+/// (see `PORTING-RUST.md` R9 / R10).
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::trivially_copy_pass_by_ref)] // hot loop; matches voxlap's pointer-passed v.
 pub(crate) fn drawboundcubesse(
     v: &Voxel,
     mask: u32,
     state: &Kv6FullState<'_>,
     r0: [f32; 4],
-) -> bool {
-    let effmask = mask & u32::from(v.vis);
-    if effmask == 0 {
-        return false;
+    mm5_tail: &mut u32,
+    target: &mut DrawTarget<'_>,
+) -> u32 {
+    use core::arch::x86_64::{
+        __m128, __m128i, _mm_add_epi16, _mm_add_ps, _mm_adds_epi16, _mm_cvtsi128_si32,
+        _mm_cvtsi32_si128, _mm_cvttps_epi32, _mm_loadl_epi64, _mm_loadu_ps, _mm_madd_epi16,
+        _mm_max_epi16, _mm_min_epi16, _mm_movehl_ps, _mm_movelh_ps, _mm_mul_ps, _mm_mulhi_epu16,
+        _mm_packs_epi32, _mm_packus_epi16, _mm_rcp_ps, _mm_setzero_si128, _mm_shufflelo_epi16,
+        _mm_storeu_ps, _mm_storeu_si128, _mm_subs_epu16, _mm_unpackhi_epi64, _mm_unpacklo_epi32,
+        _mm_unpacklo_epi8,
+    };
+
+    let effmask = (mask & u32::from(v.vis)) as usize;
+    if effmask == 0 || effmask >= PTFACES16.len() {
+        return 0;
     }
-    let z = v.z as usize;
-    let zstep = state.ztab4_per_z[z];
-    let origin = vec4_add(r0, zstep);
-    if origin[2] < state.scisdist {
-        return false;
+    let face = PTFACES16[effmask];
+    if face[0] == 0 {
+        return 0;
     }
-    // R6.4b will continue from here.
-    let _ = effmask;
-    true
+
+    // origin = r0 + ztab4_per_z[v.z] (4 f32 lanes, [x*hz, y*hz, z, z]).
+    let z_idx = v.z as usize;
+    if z_idx >= state.ztab4_per_z.len() {
+        return 0;
+    }
+    let ztep = state.ztab4_per_z[z_idx];
+    // SAFETY: `_mm_loadu_ps` reads 16 unaligned bytes from a 4-f32
+    // array (which is 16 bytes); subsequent intrinsics are SSE2
+    // baseline on x86_64.
+    unsafe {
+        let r0_v = _mm_loadu_ps(r0.as_ptr());
+        let ztep_v = _mm_loadu_ps(ztep.as_ptr());
+        let origin_v: __m128 = _mm_add_ps(r0_v, ztep_v);
+        let mut origin_arr = [0.0f32; 4];
+        _mm_storeu_ps(origin_arr.as_mut_ptr(), origin_v);
+        if origin_arr[2] < state.scisdist {
+            return 0;
+        }
+
+        // Project vertex pair (a, b). Returns __m128 with lanes:
+        //   [b.x_proj, b.y_proj, a.x_proj, a.y_proj]
+        // The byte offsets in face[k] index `caddasm` (= bytes into a
+        // [point4d; 8] = [[f32; 4]; 8]); divide by 16 (= sizeof point4d)
+        // to land back at the cadd4 index.
+        let project = |off_a: u8, off_b: u8| -> __m128 {
+            let a = state.cadd4[(off_a >> 4) as usize];
+            let b = state.cadd4[(off_b >> 4) as usize];
+            let wva = _mm_add_ps(_mm_loadu_ps(a.as_ptr()), origin_v);
+            let wvb = _mm_add_ps(_mm_loadu_ps(b.as_ptr()), origin_v);
+            let wv0 = _mm_movehl_ps(wva, wvb); // [b.z, b.z, a.z, a.z]
+            let wv1 = _mm_movelh_ps(wvb, wva); // [b.x, b.y, a.x, a.y]
+            let wv0_inv = _mm_rcp_ps(wv0);
+            _mm_mul_ps(wv0_inv, wv1)
+        };
+
+        let pair01 = project(face[1], face[2]);
+        let pair23 = project(face[3], face[4]);
+
+        // Convert to int32 (truncate-toward-zero), pack to int16.
+        // pack01_int16 lanes 0..3 = [v1x, v1y, v0x, v0y]
+        // pack01_int16 lanes 4..7 = [v3x, v3y, v2x, v2y]
+        let p01_i32 = _mm_cvttps_epi32(pair01);
+        let p23_i32 = _mm_cvttps_epi32(pair23);
+        let pack_lo = _mm_packs_epi32(p01_i32, p23_i32);
+        let pack01 = pack_lo;
+        let pack23 = _mm_unpackhi_epi64(pack_lo, _mm_setzero_si128());
+        let mut mm_min = _mm_min_epi16(pack01, pack23);
+        let mut mm_max = _mm_max_epi16(pack01, pack23);
+
+        if face[0] != 4 {
+            let pair45 = project(face[5], face[6]);
+            let p45_i32 = _mm_cvttps_epi32(pair45);
+            let pack45 = _mm_packs_epi32(p45_i32, _mm_setzero_si128());
+            mm_min = _mm_min_epi16(mm_min, pack45);
+            mm_max = _mm_max_epi16(mm_max, pack45);
+        }
+
+        // shufflelo(_, 0x0e) brings high half (lanes 2..3) into low
+        // half so min/max collapses across all 4 (or 6) vertices.
+        let mm_min_hi = _mm_shufflelo_epi16(mm_min, 0x0e);
+        let mm_max_hi = _mm_shufflelo_epi16(mm_max, 0x0e);
+        let mm_min_red = _mm_min_epi16(mm_min, mm_min_hi);
+        let mm_max_red = _mm_max_epi16(mm_max, mm_max_hi);
+
+        // bounds = unpacklo(mm_min, mm_max) lanes 0..3 (i16)
+        //        = [min_x, max_x, min_y, max_y]  ?
+        // Actually: _mm_unpacklo_epi32 interleaves 32-bit lanes.
+        // Low 32 of mm_min = (mm_min[0], mm_min[1]) i.e. (min_x, min_y).
+        // Low 32 of mm_max similarly. After unpacklo_epi32:
+        //   lanes_32[0] = mm_min low32, lanes_32[1] = mm_max low32
+        //   → 4 i16: [min_x, min_y, max_x, max_y]
+        let bounds = _mm_unpacklo_epi32(mm_min_red, mm_max_red);
+
+        // Apply qsum0 (saturated add) + qsum1 (max-floor). Both are
+        // 8-byte values loaded into the low 64 bits of __m128i.
+        let qsum0_v = _mm_loadl_epi64(state.qsum0.as_ptr().cast::<__m128i>());
+        let qsum1_v = _mm_loadl_epi64(state.qsum1.as_ptr().cast::<__m128i>());
+        let bounds = _mm_adds_epi16(bounds, qsum0_v);
+        let bounds = _mm_max_epi16(bounds, qsum1_v);
+
+        // dxdy = subs_epu16(bounds_hi, bounds) — saturating unsigned
+        // subtract, with bounds_hi being lanes [2,3,2,3] of bounds.
+        let bounds_hi = _mm_shufflelo_epi16(bounds, 0xee);
+        let dxdy = _mm_subs_epu16(bounds_hi, bounds);
+        let dxdy_low = _mm_cvtsi128_si32(dxdy) as u32;
+        let dx = (dxdy_low & 0xffff) as i32;
+        if dx == 0 {
+            return 0;
+        }
+        let dy = ((dxdy_low >> 16) as i32) - 1;
+        if dy < 0 {
+            return 0;
+        }
+
+        // Recover pixel coords from bounds + qsum1. Bounds[0/1] are
+        // currently in the saturated [0x7fff - res, 0x7fff] range;
+        // pixel = bounds - qsum1.
+        let mut bounds_arr = [0i16; 8];
+        _mm_storeu_si128(bounds_arr.as_mut_ptr().cast::<__m128i>(), bounds);
+        let pixel_min_x = i32::from(bounds_arr[0]) - i32::from(state.qsum1[0]);
+        let pixel_min_y = i32::from(bounds_arr[1]) - i32::from(state.qsum1[1]);
+
+        // pmaddwd is consumed for completeness so the asm-equivalent
+        // pixel-byte-offset is computable; not strictly needed since
+        // we index directly via (pixel_min_x, pixel_min_y).
+        let qbplbpp_v = _mm_loadl_epi64(state.qbplbpp.as_ptr().cast::<__m128i>());
+        let _ = _mm_madd_epi16(bounds, qbplbpp_v);
+
+        // Colour modulation with mm5 cross-call tail.
+        let tail_in = *mm5_tail;
+        let mm5 = _mm_cvtsi32_si128(tail_in as i32);
+        let col_v = _mm_cvtsi32_si128(v.col as i32);
+        let mm5 = _mm_unpacklo_epi8(mm5, col_v);
+        let kvm = state.kv6colmul[v.dir as usize];
+        let kvm_v = _mm_loadl_epi64(std::ptr::addr_of!(kvm).cast::<__m128i>());
+        let mm5 = _mm_mulhi_epu16(mm5, kvm_v);
+        let kva_v = _mm_loadl_epi64(std::ptr::addr_of!(state.kv6coladd).cast::<__m128i>());
+        let mm5 = _mm_add_epi16(mm5, kva_v);
+        let mm5 = _mm_packus_epi16(mm5, mm5);
+        let color = _mm_cvtsi128_si32(mm5) as u32;
+        *mm5_tail = color;
+
+        // Fill rectangle [pixel_min_x .. +dx) × [pixel_min_y .. +dy+1).
+        // The qsum0/qsum1 clip + saturating sub guarantee the rect
+        // sits inside the framebuffer, so no per-pixel bounds check
+        // needed beyond Rust's slice indexing.
+        let z_val = origin_arr[2];
+        let pitch = target.pitch_pixels;
+        let x0 = pixel_min_x as usize;
+        let x_end = x0 + dx as usize;
+        let mut written: u32 = 0;
+        for row in 0..=(dy as usize) {
+            let y = pixel_min_y as usize + row;
+            let row_start = y * pitch;
+            for x in x0..x_end {
+                let idx = row_start + x;
+                if z_val < target.zbuffer[idx] {
+                    target.zbuffer[idx] = z_val;
+                    target.framebuffer[idx] = color;
+                    written += 1;
+                }
+            }
+        }
+        written
+    }
+}
+
+/// Non-x86_64 fallback. Same signature, no rendering. R9 / R10 will
+/// add NEON / wasm ports with their own goldens.
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn drawboundcubesse(
+    _v: &Voxel,
+    _mask: u32,
+    _state: &Kv6FullState<'_>,
+    _r0: [f32; 4],
+    _mm5_tail: &mut u32,
+    _target: &mut DrawTarget<'_>,
+) -> u32 {
+    0
 }
 
 /// One iteration of voxlap's `DRAWBOUNDCUBELINE` macro
@@ -785,39 +1147,56 @@ pub(crate) fn kv6_iterate<F: FnMut(&Voxel, u32, [f32; 4])>(
     }
 }
 
-/// Draw a sprite into the engine's framebuffer + z-buffer.
+/// Draw a sprite into a framebuffer + z-buffer.
 ///
 /// Top-level dispatcher mirroring voxlap5.c:9818-9828:
 /// - Skips on `flags & INVISIBLE`.
-/// - Picks `kv6draw` vs `kv6draw_noz` based on `flags & NO_Z`.
-/// - Picks the kv6 vs kfa path based on `flags & KFA`.
+/// - Skips on `flags & KFA` (animation path; out of scope for R6).
+/// - Skips on `flags & NO_Z` (handled by `drawboundcubenozsse`,
+///   not yet ported — the four oracle sprite poses all use z-tested
+///   rendering).
 ///
-/// **R6.4a status**: dispatcher runs cull → setup math (mat2 +
-/// Cramer's + nfor↔nhei swap + cadd4/ztab4/scisdist/qsum0) → 9-arm
-/// per-voxel iteration with the per-voxel callback running
-/// [`drawboundcubesse`] through scissor. No pixels written yet —
-/// R6.4b adds vertex projection, R6.4c the screen-AABB, R6.4d the
-/// fill loop. Returns `false` for "culled" and "would render"
-/// alike until R6.4d ships.
-#[must_use]
-pub fn draw_sprite(cam: &CameraState, settings: &OpticastSettings, sprite: &Sprite) -> bool {
+/// Otherwise: cull → setup math → 9-arm per-voxel iteration →
+/// per-voxel rasterize via [`drawboundcubesse`].
+///
+/// Returns the total number of pixels written across all voxels of
+/// the sprite (== sum of z-test passes). Zero means the sprite
+/// produced no visible pixels (culled, fully behind near plane, or
+/// totally occluded).
+pub fn draw_sprite(
+    target: &mut DrawTarget<'_>,
+    cam: &CameraState,
+    settings: &OpticastSettings,
+    sprite: &Sprite,
+) -> u32 {
     if sprite.flags & SPRITE_FLAG_INVISIBLE != 0 {
-        return false;
+        return 0;
     }
     if sprite.flags & SPRITE_FLAG_KFA != 0 {
-        // KFA animation path is out of scope for R6 (no oracle
-        // pose exercises it). Mirror voxlap's silent dispatch but
-        // without rendering anything.
-        return false;
+        return 0;
+    }
+    if sprite.flags & SPRITE_FLAG_NO_Z != 0 {
+        // drawboundcubenozsse port deferred; oracle doesn't exercise it.
+        return 0;
     }
     let Some(setup) = kv6_draw_prepare(sprite, cam) else {
-        return false;
+        return 0;
     };
-    let state = kv6_compute_full_state(&setup, sprite.p, cam, settings);
+    let state = kv6_compute_full_state(
+        &setup,
+        sprite,
+        cam,
+        settings,
+        target.width,
+        target.height,
+        target.pitch_pixels,
+    );
+    let mut mm5_tail: u32 = 0;
+    let mut total_written: u32 = 0;
     kv6_iterate(&state, |voxel, mask, r0| {
-        let _ = drawboundcubesse(voxel, mask, &state, r0);
+        total_written += drawboundcubesse(voxel, mask, &state, r0, &mut mm5_tail, target);
     });
-    false
+    total_written
 }
 
 #[cfg(test)]
@@ -878,6 +1257,36 @@ mod tests {
         OpticastSettings::for_oracle_framebuffer(640, 480)
     }
 
+    /// Test-only ergonomic shim: build a Kv6FullState with the
+    /// oracle 640×480 framebuffer geometry. Mirrors the
+    /// pre-R6.4 signature so tests don't have to spell out
+    /// width/height/pitch every time.
+    fn compute_state_for_test<'a>(
+        setup: &Kv6DrawSetup<'a>,
+        sprite: &Sprite,
+        cam: &camera_math::CameraState,
+    ) -> Kv6FullState<'a> {
+        kv6_compute_full_state(setup, sprite, cam, &oracle_settings(), 640, 480, 640)
+    }
+
+    /// Allocate a 640×480 framebuffer + zbuffer (zbuffer pre-filled
+    /// with f32::INFINITY so any voxel passes the z-test on first
+    /// write).
+    fn alloc_target() -> (Vec<u32>, Vec<f32>) {
+        let pixels = 640usize * 480usize;
+        (vec![0u32; pixels], vec![f32::INFINITY; pixels])
+    }
+
+    fn make_target<'a>(fb: &'a mut [u32], zb: &'a mut [f32]) -> DrawTarget<'a> {
+        DrawTarget {
+            framebuffer: fb,
+            zbuffer: zb,
+            pitch_pixels: 640,
+            width: 640,
+            height: 480,
+        }
+    }
+
     /// Bit-pattern compare for two `[f32; 4]` vectors. The setup
     /// math produces these via deterministic IEEE-754 ops, so
     /// bit-equality is well-defined and dodges `clippy::float_cmp`.
@@ -908,7 +1317,9 @@ mod tests {
         let cam = oracle_sprite_front_camera();
         let mut s = Sprite::axis_aligned(cube_kv6(), [1050.0, 1050.0, 175.0]);
         s.flags = SPRITE_FLAG_INVISIBLE;
-        assert!(!draw_sprite(&cam, &oracle_settings(), &s));
+        let (mut fb, mut zb) = alloc_target();
+        let mut target = make_target(&mut fb, &mut zb);
+        assert_eq!(draw_sprite(&mut target, &cam, &oracle_settings(), &s), 0);
     }
 
     #[test]
@@ -916,7 +1327,9 @@ mod tests {
         let cam = oracle_sprite_front_camera();
         let mut s = Sprite::axis_aligned(cube_kv6(), [1050.0, 1050.0, 175.0]);
         s.flags = SPRITE_FLAG_KFA;
-        assert!(!draw_sprite(&cam, &oracle_settings(), &s));
+        let (mut fb, mut zb) = alloc_target();
+        let mut target = make_target(&mut fb, &mut zb);
+        assert_eq!(draw_sprite(&mut target, &cam, &oracle_settings(), &s), 0);
     }
 
     #[test]
@@ -1017,8 +1430,8 @@ mod tests {
             mip: 0,
         };
         let cam = oracle_sprite_front_camera();
-        let state =
-            kv6_compute_full_state(&setup, [1050.0, 1050.0, 175.0], &cam, &oracle_settings());
+        let synth_sprite = Sprite::axis_aligned(empty_kv6(), [1050.0, 1050.0, 175.0]);
+        let state = compute_state_for_test(&setup, &synth_sprite, &cam);
 
         // Every voxel index must fire exactly once. We use a
         // by-pointer identity check via .as_ptr() offsets.
@@ -1050,7 +1463,7 @@ mod tests {
         let sprite = Sprite::axis_aligned(kv, [1050.0, 1050.0, 175.0]);
         let cam = oracle_sprite_front_camera();
         let setup = kv6_draw_prepare(&sprite, &cam).expect("oracle sprite must pass cull");
-        let state = kv6_compute_full_state(&setup, sprite.p, &cam, &oracle_settings());
+        let state = compute_state_for_test(&setup, &sprite, &cam);
 
         let voxels_ptr = sprite.kv6.voxels.as_ptr();
         let mut visited = vec![0u32; sprite.kv6.voxels.len()];
@@ -1078,7 +1491,7 @@ mod tests {
         let sprite = Sprite::axis_aligned(kv, [1050.0, 1050.0, 175.0]);
         let cam = oracle_sprite_front_camera();
         let setup = kv6_draw_prepare(&sprite, &cam).expect("cull pass");
-        let state = kv6_compute_full_state(&setup, sprite.p, &cam, &oracle_settings());
+        let state = compute_state_for_test(&setup, &sprite, &cam);
 
         // ztab4_per_z[0] = [0; 4].
         assert_eq!(bits4(state.ztab4_per_z[0]), bits4([0.0; 4]));
@@ -1128,13 +1541,21 @@ mod tests {
         let sprite = Sprite::axis_aligned(kv, [1050.0, 1050.0, 175.0]);
         let cam = oracle_sprite_front_camera();
         let setup = kv6_draw_prepare(&sprite, &cam).expect("cull pass");
-        let state = kv6_compute_full_state(&setup, sprite.p, &cam, &oracle_settings());
-        assert!(!drawboundcubesse(
-            &v,
-            0xff,
-            &state,
-            [0.0, 0.0, 100.0, 100.0]
-        ));
+        let state = compute_state_for_test(&setup, &sprite, &cam);
+        let (mut fb, mut zb) = alloc_target();
+        let mut target = make_target(&mut fb, &mut zb);
+        let mut tail = 0u32;
+        assert_eq!(
+            drawboundcubesse(
+                &v,
+                0xff,
+                &state,
+                [0.0, 0.0, 100.0, 100.0],
+                &mut tail,
+                &mut target,
+            ),
+            0
+        );
     }
 
     #[test]
@@ -1154,33 +1575,17 @@ mod tests {
         let sprite = Sprite::axis_aligned(kv, [1050.0, 1050.0, 175.0]);
         let cam = oracle_sprite_front_camera();
         let setup = kv6_draw_prepare(&sprite, &cam).expect("cull pass");
-        let state = kv6_compute_full_state(&setup, sprite.p, &cam, &oracle_settings());
+        let state = compute_state_for_test(&setup, &sprite, &cam);
         // r0.z = -1000 makes origin.z = -1000 + ztab4_per_z[0].z = -1000.
         // scisdist >= 0; -1000 < scisdist → cull.
         let r0 = [0.0, 0.0, -1000.0, -1000.0];
-        assert!(!drawboundcubesse(&v, 0xff, &state, r0));
-    }
-
-    #[test]
-    fn drawboundcubesse_passes_scissor_for_in_frustum_voxel() {
-        // Use the iteration's actual r0 — drawboundcubesse should
-        // pass scissor for at least one voxel of the meltsphere
-        // sprite. Counts how many voxels pass.
-        let kv = roxlap_formats::kv6::parse(SPRITE_MELTSPHERE_KV6).expect("parse fixture");
-        let sprite = Sprite::axis_aligned(kv, [1050.0, 1050.0, 175.0]);
-        let cam = oracle_sprite_front_camera();
-        let setup = kv6_draw_prepare(&sprite, &cam).expect("cull pass");
-        let state = kv6_compute_full_state(&setup, sprite.p, &cam, &oracle_settings());
-
-        let mut pass = 0u32;
-        kv6_iterate(&state, |v, mask, r0| {
-            if drawboundcubesse(v, mask, &state, r0) {
-                pass += 1;
-            }
-        });
-        // At least one voxel must pass; full-rasterizer (R6.4d)
-        // bit-exact validation is the next gate.
-        assert!(pass > 0, "expected at least one voxel to pass scissor");
+        let (mut fb, mut zb) = alloc_target();
+        let mut target = make_target(&mut fb, &mut zb);
+        let mut tail = 0u32;
+        assert_eq!(
+            drawboundcubesse(&v, 0xff, &state, r0, &mut tail, &mut target),
+            0
+        );
     }
 
     #[test]
@@ -1194,11 +1599,55 @@ mod tests {
     }
 
     #[test]
-    fn r63_dispatcher_returns_false_for_in_frustum_sprite() {
-        // R6.3 stub: cull + iteration run, but no pixels are
-        // written by the no-op callback. R6.4 will flip this.
+    fn draw_sprite_writes_pixels_for_oracle_meltsphere() {
+        // R6.4 end-to-end: load the meltsphere fixture, run
+        // draw_sprite at the sprite_front pose. Expect a non-zero
+        // pixel count and at least one non-zero framebuffer entry.
+        let kv = roxlap_formats::kv6::parse(SPRITE_MELTSPHERE_KV6).expect("parse fixture");
+        let sprite = Sprite::axis_aligned(kv, [1050.0, 1050.0, 175.0]);
         let cam = oracle_sprite_front_camera();
-        let s = Sprite::axis_aligned(cube_kv6(), [1050.0, 1050.0, 175.0]);
-        assert!(!draw_sprite(&cam, &oracle_settings(), &s));
+        let (mut fb, mut zb) = alloc_target();
+        let mut target = make_target(&mut fb, &mut zb);
+        let written = draw_sprite(&mut target, &cam, &oracle_settings(), &sprite);
+        assert!(written > 0, "expected some pixels to be written");
+        assert!(
+            fb.iter().any(|&p| p != 0),
+            "expected at least one non-zero framebuffer entry"
+        );
+        // Z-buffer must have shrunk somewhere from f32::INFINITY.
+        assert!(
+            zb.iter().any(|&z| z.is_finite()),
+            "expected at least one finite zbuffer entry"
+        );
+    }
+
+    #[test]
+    fn draw_sprite_returns_zero_for_culled_sprite() {
+        let cam = oracle_sprite_front_camera();
+        let s = Sprite::axis_aligned(cube_kv6(), [1020.0 - 500.0, 1050.0, 175.0]);
+        let (mut fb, mut zb) = alloc_target();
+        let mut target = make_target(&mut fb, &mut zb);
+        assert_eq!(draw_sprite(&mut target, &cam, &oracle_settings(), &s), 0);
+        assert!(fb.iter().all(|&p| p == 0));
+    }
+
+    /// `update_reflects` for the oracle sprite_front pose hits the
+    /// nolighta path (R==G==B kv6col, no fog, lightmode<2). All
+    /// kv6colmul[k] entries must repeat one u16 modulation factor
+    /// across all 4 lanes.
+    #[test]
+    fn update_reflects_nolighta_lanes_match() {
+        let s = Sprite::axis_aligned(empty_kv6(), [1050.0, 1050.0, 175.0]);
+        let (cm, ca) = update_reflects(&s);
+        assert_eq!(ca, 0, "kv6coladd must be zero (no fog)");
+        for (k, e) in cm.iter().enumerate() {
+            let l0 = (e & 0xffff) as u16;
+            let l1 = ((e >> 16) & 0xffff) as u16;
+            let l2 = ((e >> 32) & 0xffff) as u16;
+            let l3 = ((e >> 48) & 0xffff) as u16;
+            assert_eq!(l0, l1, "kv6colmul[{k}] lane0 != lane1");
+            assert_eq!(l0, l2, "kv6colmul[{k}] lane0 != lane2");
+            assert_eq!(l0, l3, "kv6colmul[{k}] lane0 != lane3");
+        }
     }
 }
