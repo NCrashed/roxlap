@@ -5,12 +5,15 @@ voxel engine.
 
 ## Status
 
-R4 (the opticast + grouscan port) is **bit-exact against voxlap C** on
-the 4 oracle poses that exercise opticast alone (`north`, `east`,
-`diag_down`, `high_down`). The remaining 8 oracle poses each need a
-feature that doesn't live inside opticast — KV6 sprites (R6), per-voxel
-lighting, or `drawtile` 2D blits — so they're tracked as later stages
-rather than R4 gaps.
+R4 (opticast + grouscan), R5 (x86_64 SSE batches), R6 (KV6 sprites,
+sprite + world voxel lighting, textured sky), R6.6 (animated KFA
+sprites), and R8 (oracle + CI) are all done. R7 was cancelled; R9
+(NEON), R10 (wasm), R11 (polish + crates.io publish) are open.
+
+The cross-engine oracle tracks 9 of 12 voxlap C poses — 5 byte-for-byte
+bit-exact against voxlap C, and 4 frozen as roxlap's own goldens
+(visually verified against voxlap C, sub-pixel rounding noise
+documented).
 
 ```
 $ cargo run -p roxlap-oracle -- diff
@@ -18,37 +21,47 @@ MATCH    north  326a7c41c3cc659d
 MATCH    east  3e00f1d0d62d5be0
 MATCH    diag_down  118de3c1132d0f6b
 MATCH    high_down  cd1ceac6e21c55f4
-4 match, 0 mismatch, 0 missing-from-golden (4 total roxlap rows)
+MATCH    sprite_above  79b87c92dd96a59b
+MATCH    sprite_front  87c7de0ddeb0f7ce        (roxlap-frozen)
+MATCH    sprite_iso  9caf71069594fde6          (roxlap-frozen)
+MATCH    sprite_coco  0c8f30141c9e7a4e         (roxlap-frozen)
+MATCH    diag_down_lit  b536ce3fdf771b9e       (roxlap-frozen)
+9 match, 0 mismatch, 0 missing-from-golden (9 total roxlap rows)
 ```
 
 R8 GitHub CI runs fmt / clippy / tests / oracle-diff on every push
-and fails the build if any of the 4 frozen hashes drift. Expected
-hashes live in [`tests/golden-hashes.txt`](tests/golden-hashes.txt);
-the workflow is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+and fails the build if any frozen hash drifts. Expected hashes live in
+[`tests/golden-hashes.txt`](tests/golden-hashes.txt); the workflow is
+in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+A separate roxlap-only integration test
+(`crates/roxlap-core/tests/multi_mip.rs`) regression-tests the
+multi-mip rendering path — voxlap C never exercises `vxlmipuse > 1`
+so no shared golden exists, and the test pins roxlap's own FNV-1a
+hashes for the single-mip baseline and the post-`generate_mips(4)`
+render.
 
 [`roxlap-host`](crates/roxlap-host) is interactive: opens a winit
-window, loads `oracle.vxl.gz`, and renders with WASD + mouse-look.
-Press `F` to capture the current camera pose + framebuffer to
-`roxlap-capture.{txt,ppm}` for off-line repro of any rendering
-artifact. Side-shading is on by default in the host so directional
-lighting reads correctly; the oracle stays at voxlap's
-`setsideshades(0,…,0)` baseline so its hashes don't shift.
+window, loads `oracle.vxl.gz`, and renders with WASD + mouse-look,
+animated KFA sprites, and a textured panoramic sky. Press `L` to
+toggle the world-voxel lighting bake; press `F` to capture the
+current camera pose + framebuffer to `roxlap-capture.{txt,ppm}` for
+off-line repro of any rendering artifact. Side-shading is on by
+default in the host so directional lighting reads correctly; the
+oracle stays at voxlap's `setsideshades(0,…,0)` baseline so its
+hashes don't shift.
 
-### Next stage: R6 — KV6 sprite renderer
+### What's left
 
-The natural next big port. Unlocks 4 of 8 remaining oracle goldens
-(`sprite_front`, `sprite_above`, `sprite_iso`, `sprite_coco`) by
-porting voxlap's `drawsprite` → `kv6draw` → `drawboundcubesse`
-chain. The KV6 parser already lives in `roxlap-formats`; what's
-missing is the rasterizer. Multi-day work; sub-substages and risks
-mapped out in `memory/project_r6_kv6_sprite_plan.md`.
+R9 (ARM NEON), R10 (wasm SIMD + browser host), and R11 (docs +
+crates.io publish) are the remaining big stages. Smaller open
+items — a `do_slab_split` perf restoration (1-15% scanline win),
+a deferred `drawsprite` no-z path — are tracked in
+[PORTING-RUST.md](PORTING-RUST.md).
 
-The port is being staged out of
+The port is staged out of
 [voxlaptest](https://github.com/NCrashed/voxlaptest), the modernised C
-fork of Voxlap. See [PORTING-RUST.md](PORTING-RUST.md) for the full
-substage roadmap, deferred R4 items (textured sky, multi-mip,
-sideshademode), one known voxlap-inherited rendering quirk, and
-where R6+ slot in.
+fork of Voxlap.
 
 ## Goals
 
@@ -81,10 +94,11 @@ engine this project ports *from*:
 
 - voxlaptest is the **bit-exact reference** for terrain and sprite rasterizer
   correctness during development.
-- roxlap matches its image output using the same oracle harness — eventually
-  re-converging on the same `golden-hashes.txt` rows once the SIMD batches in
-  R5 / R7 land.
-- Once roxlap reaches feature + perf parity, voxlaptest can be retired.
+- roxlap matches its image output using the same oracle harness — 5 of 9
+  tracked poses already byte-for-byte; the remaining 4 are frozen as
+  roxlap's own hashes after visual verification (sub-pixel rounding
+  noise from voxlap C's `_mm_rcp_ps`-based vertex projection).
+- Once roxlap reaches full feature + perf parity, voxlaptest can be retired.
 
 The two repositories move in sync: when voxlaptest gains a new oracle pose
 or freezes a hash change, roxlap's matching code path lands the equivalent

@@ -24,8 +24,8 @@ project intent and the relationship to
 | **R1** | Repo skeleton: workspace, README, `PORTING-RUST.md`, license files, asset copy. | done | `cargo build` green, `cargo test` green (zero tests). |
 | **R2** | `.vxl` / `.kv6` / `.kvx` / `.kfa` parsers in `roxlap-formats`. | done | Byte-equal round-trip parse + re-serialise on `assets/coco.kvx` and procedurally-built `.vxl` fixtures. Header dumps match voxlaptest's loader output. |
 | **R3** | `Engine` public API (framebuffer, camera, render entry point); winit + softbuffer host opens a window and shows sky-blue fill. | done | `cargo run -p roxlap-host` opens a window. End-to-end toolchain works before any rasterizer code lands. |
-| **R4** | Full `opticast` + `grouscan` algorithm port from `grouscanasm_scalar` (scalar Rust). | **opticast-only poses bit-exact**; deferred remainders: R4.5 multi-mip `remiporend`, sideshademode high-byte. R4.4 textured sky landed. | 4 of 12 oracle poses match voxlap C goldens byte-for-byte (`north`, `east`, `diag_down`, `high_down`). The other 8 poses each require a feature roxlap covers in R6+ (sprites, lighting, drawtile). |
-| **R5** | x86_64 SSE2 4-pixel rsqrtps batches in the four hot rasterizers (mirror of voxlaptest Stage 4.9). | scalar reference is bit-exact; SSE batches not yet ported | Re-converges on voxlaptest's CI golden hashes where the rsqrtps approach is bit-equivalent. |
+| **R4** | Full `opticast` + `grouscan` algorithm port from `grouscanasm_scalar` (scalar Rust). | **fully landed**: opticast bit-exact on the 4 opticast-only oracle poses; R4.4 textured sky landed alongside R6; R4.5 multi-mip `remiporend` + sideshademode landed. | 4 of 12 oracle poses match voxlap C goldens byte-for-byte (`north`, `east`, `diag_down`, `high_down`). The other 8 poses each require a feature roxlap covers in R6+ (sprites, lighting, drawtile). |
+| **R5** | x86_64 SSE2 4-pixel rsqrtps batches in the four hot rasterizers (mirror of voxlaptest Stage 4.9). | **fully landed**: hrend's SSE block inlines R5.1 (no-fog) + R5.2 (fog); vrend's SSE block inlines R5.3 (no-fog, parallel `uurend` update) + R5.4 (fog). | Same FNV-1a hashes as the scalar reference where SSE2 `rsqrtps` is bit-equivalent. |
 | **R6** | KV6 sprite renderer + sprite/world lighting (`drawsprite` / `drawboundcubesse` / `updatereflects` / `updatelighting`) + textured sky (`startsky` non-solid branch). | **fully landed**: R6.0..R6.4 sprite renderer; R6.4f sprite point lighting (`updatereflects` lightmode≥2); R6.5 world voxel lighting bake; R4.4-final textured sky. 1 of 4 sprite oracle poses bit-exact, 3 drift on sub-pixel rounding; `diag_down_lit` drifts similarly (frozen as roxlap golden). | **9 of 12 oracle poses tracked** by `tests/golden-hashes.txt`: 4 opticast bit-exact, 4 sprite + 1 lit pose frozen as roxlap goldens (visually verified vs voxlap C, sub-pixel rounding noise documented). `roxlap-host` demos the full pipeline: textured `assets/sky.png` panorama, two animated kv6 sprites with point-light shading, world voxel lighting bake toggleable via `L`. |
 | **R7** | _Cancelled_. Was scoped as "close sprite-pose drift". The three drifted poses (`sprite_front`, `sprite_iso`, `sprite_coco`) and `diag_down_lit` are visually indistinguishable from voxlap C output; the in-tree goldens track roxlap's own hashes for regression detection. Reopen if a downstream consumer demands bit-exactness against voxlap C. | cancelled | n/a |
 | **R8** | Cross-engine oracle: roxlap-side oracle binary writing `roxlap-hashes.txt`; CI matrix that diffs against `golden-hashes.txt`. | done | `cargo run -p roxlap-oracle -- diff` reports `9 match, 0 mismatch` against the in-tree `tests/golden-hashes.txt`. `.github/workflows/ci.yml` runs fmt / clippy / test / oracle-diff on every push + PR; oracle job fails on any hash mismatch so the bit-exact milestone can't regress silently. |
@@ -51,9 +51,9 @@ voxlaptest's image output:
 | **R4.2** | Scalar `hrend` / `vrend` scanline rasterizers — consume radar entries, write pixels + z-buffer. First stage that puts real pixels on screen behind a stub `gline`. (Originally scoped as "drawcwall/drawfwall/drawceil/drawflor"; those turned out to be labels *inside* grouscan, so they fold into R4.3.) |
 | **R4.3** | grouscan = `gline` ray-cast: full algorithmic port. Sub-substaged the same way voxlaptest's grouscanasm scalar port was (`Stage 4.5b.2..6`): R4.3a magenta-placeholder gline, R4.3b gline frustum setup, R4.3c grouscan prologue + dispatch skeleton, R4.3d wall/ceil/flor fill loops, R4.3e findslab/slab-split/deletez, R4.3f remiporend + startsky. The hard core. |
 | **R4.4** | Sky-fill primitives: `startsky` integration, fog gating. **Done**: solid-fill branch + fog blend (R4.3f), textured-sky `skyoff != 0` path landed alongside R6's lighting work. The textured branch is wrapped behind an [`crate::sky::Sky`] resource on `Engine`; gline updates `scratch.sky_off` per ray via the rotating-cursor walk; `phase_startsky` dispatches between solid (oracle default, byte-stable) and textured (host's `assets/sky.png`). Includes a fix for voxlap C's latent stale-cx1 bug — `phase_startsky_textured` re-derives the per-cf-entry far-end position from `cx0 + (i1 - i0) * gi0` instead of reading the cf's stored `cx1`, which goes stale when drains shrink `i1` without touching cx1 (visible in voxlap C as horizontal sky distortion at low pitch). |
-| **R4.5** | Mip-level transition (`remiporend`): the deeper-recursion cftype refresh. **Audit complete; full body deferred behind a world-model dependency.** Oracle uses `gmipnum=1` so the gmipnum check short-circuits to `Phase::Startsky`. The body is gated on multi-mip column data (port of `genmipvxl`, voxlap5.c:4710+) which roxlap-formats doesn't load yet. See the audit at `crates/roxlap-core/src/grouscan.rs::phase_remiporend` — it covers (a) the LP32/LP64 sptr-stride bug in voxlap C's `<<29` / `<<(gmipcnt+17)` parity shifts, (b) why roxlap's column-index design sidesteps it, and (c) the genmipvxl + multi-mip-`column_offset` work needed before the body can land for real. |
+| **R4.5** | Mip-level transition (`remiporend`): the deeper-recursion cftype refresh. **Landed.** `Vxl::generate_mips` ports voxlap's `genmipvxl` (voxlap5.c:4710+) onto a flat per-mip `column_offset` extension; `phase_remiporend`'s body uses column-index parity (`(col_within_mip >> bit_pos) & 1`) for the gpz/gdz alignment instead of voxlap C's broken LP32/LP64 sptr-stride shift arithmetic. Oracle stays at `gmipnum=1`, so its 12 hashes are byte-stable; multi-mip rendering is exercised by the new roxlap-only golden in `crates/roxlap-core/tests/multi_mip.rs`. The audit + LP32/LP64 bug table is preserved in the doc comment on `phase_remiporend`. |
 
-### What "R4 effectively done" means
+### What "R4 fully done" means
 
 The 4 opticast-only oracle poses are bit-exact against voxlap C goldens
 as of 2026-04-30 (commit `74172a2`). The other 8 oracle poses are not a
@@ -61,13 +61,13 @@ grouscan / opticast issue — each needs a feature that lives outside the
 opticast pipeline: KV6 sprites (R6), per-voxel lighting, or `drawtile`
 2D blits.
 
-The remaining engine-correctness gaps in opticast itself shrunk to two
-deferred R4 items: R4.5 multi-mip (gated on a multi-mip world model)
-and sideshademode high-byte. Both are documented above; neither breaks
-the 4 matching poses, and they matter only for worlds outside the
-oracle's deliberately-narrow fixture. R4.4 textured sky, originally a
-deferred R4 item, landed alongside R6 — see its row in the substage
-table.
+R4.4 textured sky, R4.5 multi-mip `remiporend`, and the sideshademode
+high-byte all landed (textured sky alongside R6; multi-mip + sideshademode
+in the 2026-05-02 work). The 12 voxlap-C oracle hashes stay byte-stable
+because they all run with `gmipnum=1` and zero side shading, and the
+new code paths early-out for those configurations. Multi-mip rendering
+is regression-tested by `crates/roxlap-core/tests/multi_mip.rs`'s own
+pinned hashes (no voxlap C reference exists for `vxlmipuse > 1`).
 
 ### Known voxlap-inherent quirk: floor-hairline at certain camera poses
 
