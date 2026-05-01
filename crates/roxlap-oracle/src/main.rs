@@ -78,8 +78,12 @@ enum SpriteKind {
 }
 
 /// One render pose. Mirror of voxlaptest's `struct pose`, minus
-/// the lit / tile fields. Sprite poses get a `sprite` reference;
-/// opticast-only poses leave it `None`.
+/// the tile field (drawtile primitive not yet ported). Sprite
+/// poses get a `sprite` reference; the `lit` flag triggers a
+/// one-shot lightmode-2 bake of the world's voxel intensities
+/// before the first lit-flagged pose renders (mirrors voxlap C
+/// oracle's `lighting_baked` flag — bake persists across
+/// subsequent renders).
 #[derive(Debug, Clone, Copy)]
 struct Pose {
     name: &'static str,
@@ -89,6 +93,7 @@ struct Pose {
     yaw: f64,
     pitch: f64,
     sprite: Option<SpriteKind>,
+    lit: bool,
 }
 
 /// The 8 oracle poses we currently render — the 4 opticast-only
@@ -103,6 +108,7 @@ const POSES: &[Pose] = &[
         yaw: std::f64::consts::FRAC_PI_2,
         pitch: 0.0,
         sprite: None,
+        lit: false,
     },
     Pose {
         name: "east",
@@ -112,6 +118,7 @@ const POSES: &[Pose] = &[
         yaw: 0.0,
         pitch: 0.0,
         sprite: None,
+        lit: false,
     },
     Pose {
         name: "diag_down",
@@ -121,6 +128,7 @@ const POSES: &[Pose] = &[
         yaw: std::f64::consts::FRAC_PI_4,
         pitch: 0.4,
         sprite: None,
+        lit: false,
     },
     Pose {
         name: "high_down",
@@ -130,6 +138,7 @@ const POSES: &[Pose] = &[
         yaw: std::f64::consts::FRAC_PI_2,
         pitch: 0.7,
         sprite: None,
+        lit: false,
     },
     // Sprite poses: cameras aimed at g_sprite at (1050, 1050, 175).
     // sprite_iso uses yaw = π/4 (= 0.7853981633974483), matching
@@ -142,6 +151,7 @@ const POSES: &[Pose] = &[
         yaw: 0.0,
         pitch: 0.0,
         sprite: Some(SpriteKind::MeltsphereAxis),
+        lit: false,
     },
     Pose {
         name: "sprite_above",
@@ -151,6 +161,7 @@ const POSES: &[Pose] = &[
         yaw: 0.0,
         pitch: 1.3,
         sprite: Some(SpriteKind::MeltsphereAxis),
+        lit: false,
     },
     Pose {
         name: "sprite_iso",
@@ -160,6 +171,7 @@ const POSES: &[Pose] = &[
         yaw: std::f64::consts::FRAC_PI_4,
         pitch: 0.4,
         sprite: Some(SpriteKind::MeltsphereAxis),
+        lit: false,
     },
     Pose {
         name: "sprite_coco",
@@ -169,6 +181,24 @@ const POSES: &[Pose] = &[
         yaw: std::f64::consts::FRAC_PI_4,
         pitch: 0.4,
         sprite: Some(SpriteKind::CocoRot120),
+        lit: false,
+    },
+    // diag_down camera pose, but with a one-shot lightmode-2 bake
+    // applied first (one point light at (1100, 1100, 70), radius
+    // 600, intensity 1.0, baked over 800..1248 × 800..1248 × 0..200).
+    // The bake mutates voxel intensities — every later pose sees
+    // the lit world (matches voxlap C oracle's `lighting_baked`
+    // sticky flag). Must come after every unlit pose to keep the
+    // unlit hashes byte-stable.
+    Pose {
+        name: "diag_down_lit",
+        px: 1000.0,
+        py: 1000.0,
+        pz: 110.0,
+        yaw: std::f64::consts::FRAC_PI_4,
+        pitch: 0.4,
+        sprite: None,
+        lit: true,
     },
 ];
 
@@ -382,8 +412,7 @@ fn cmd_render(opts: &RenderOpts) -> std::io::Result<()> {
     // to a no-op, leaving the floor flat instead of gradient-shaded
     // toward sky as distance grows.
     engine.set_fog(0x0087_ceeb, 1024);
-    let engine = engine; // re-freeze after one-shot setup
-    let vxl_world = load_oracle_vxl();
+    let mut vxl_world = load_oracle_vxl();
 
     let pixel_count = (XRES as usize) * (YRES as usize);
     let mut framebuffer = vec![0u32; pixel_count];
@@ -394,8 +423,36 @@ fn cmd_render(opts: &RenderOpts) -> std::io::Result<()> {
         fs::create_dir_all(dir)?;
     }
 
+    // Mirror voxlap C oracle's `lighting_baked` flag: the bake is
+    // sticky — once applied, every later pose sees the lit world.
+    let mut lighting_baked = false;
     let mut rows: Vec<(&str, u64)> = Vec::with_capacity(POSES.len());
     for pose in POSES {
+        if pose.lit && !lighting_baked {
+            // Match oracle.c:438-443: setLightingMode(2) +
+            // add_light(1100, 1100, 70, 600, 1.0) +
+            // updatelighting(800, 800, 0, 1248, 1248, 200).
+            engine.set_lightmode(2);
+            engine.add_light(roxlap_core::LightSrc {
+                pos: [1100.0, 1100.0, 70.0],
+                r2: 600.0 * 600.0,
+                sc: 1.0,
+            });
+            roxlap_core::update_lighting(
+                &mut vxl_world.data,
+                &vxl_world.column_offset,
+                vxl_world.vsid,
+                800,
+                800,
+                0,
+                1248,
+                1248,
+                200,
+                engine.lightmode(),
+                engine.lights(),
+            );
+            lighting_baked = true;
+        }
         let hash = render_pose(
             &engine,
             &vxl_world,

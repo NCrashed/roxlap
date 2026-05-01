@@ -13,6 +13,9 @@
 //! - `F` → capture current camera state + frame to
 //!   `roxlap-capture.{txt,ppm}` for off-line repro (e.g. via
 //!   `roxlap-oracle find-hairlines`).
+//! - `L` → toggle the demo point light on/off (lightmode 2 ↔ 0)
+//!   for an A/B comparison of sprite shading. Off → uniform
+//!   ambient; on → directional shadowing from the demo torch.
 //! - `Esc` → release cursor (or exit if already released).
 //! - Window close → exit.
 
@@ -144,6 +147,37 @@ struct App {
     /// at app construction; the redraw loop reads `elapsed()` every
     /// frame to derive the coco's spin angle.
     spawn_time: Instant,
+    /// Demo light parameters — kept around so the `L` hotkey can
+    /// re-add the same light after a previous toggle cleared it.
+    /// The toggle flips the engine between `lightmode=2` + this
+    /// light (visible directional shading) and `lightmode=0` (no
+    /// lighting at all → sprites render at full ambient via the
+    /// nolighta path), giving a clear A/B visual comparison.
+    demo_light: LightSrc,
+    /// Snapshot of the pristine (unbaked) `vxl.data` taken at
+    /// startup. The `L` toggle restores from this when switching
+    /// the light off so the world voxel intensities revert to
+    /// their pre-bake state. ~30 MB on the oracle world — fine
+    /// for an interactive demo.
+    pristine_world: Box<[u8]>,
+    /// Cached snapshot of the post-bake world. Built lazily on the
+    /// first `L` ON press; subsequent toggles just memcpy between
+    /// `pristine_world` and `baked_world` (instant) instead of
+    /// re-running `update_lighting` (~3 seconds for the bake region
+    /// below). Doubles the world memory footprint (~60 MB total)
+    /// but makes the toggle responsive after the first press.
+    baked_world: Option<Box<[u8]>>,
+    /// World-space bounding box the bake covers. Voxlap C's
+    /// `diag_down_lit` oracle pose bakes a 448×448 playable area;
+    /// here we go larger (1024×1024 around the spawn) so all the
+    /// scene the user is likely to fly through gets shaded —
+    /// otherwise distant features like the red pillar render
+    /// against unbaked default brightness while nearby ones look
+    /// lit. Stored as `[x0, y0, z0, x1, y1, z1]`.
+    bake_bbox: [i32; 6],
+    /// Tracks the toggle so press handling stays idempotent across
+    /// rapid presses.
+    light_on: bool,
 }
 
 impl App {
@@ -168,6 +202,75 @@ impl App {
             down,
             forward,
         }
+    }
+
+    fn toggle_light(&mut self) {
+        self.light_on = !self.light_on;
+        if self.light_on {
+            self.engine.set_lightmode(2);
+            self.engine.clear_lights();
+            self.engine.add_light(self.demo_light);
+            self.swap_in_baked_world();
+            eprintln!("light: ON  (lightmode=2, 1 light, world baked)");
+        } else {
+            self.engine.set_lightmode(0);
+            self.engine.clear_lights();
+            self.swap_in_pristine_world();
+            eprintln!("light: OFF (lightmode=0, world unbaked)");
+        }
+    }
+
+    /// Make `vxl.data` show the lit world. First call runs the
+    /// `update_lighting` bake (slow — typically a few seconds for
+    /// the 1024×1024 demo region) and caches the result so future
+    /// toggles are an instant memcpy.
+    fn swap_in_baked_world(&mut self) {
+        if self.baked_world.is_none() {
+            eprintln!(
+                "  baking world (lightmode={}, {} light(s), bbox=[{}..{}, {}..{}, {}..{}]) — first toggle, ~few seconds…",
+                self.engine.lightmode(),
+                self.engine.lights().len(),
+                self.bake_bbox[0],
+                self.bake_bbox[3],
+                self.bake_bbox[1],
+                self.bake_bbox[4],
+                self.bake_bbox[2],
+                self.bake_bbox[5],
+            );
+            // Always start the bake from pristine so multiple bakes
+            // stay deterministic regardless of toggle history.
+            self.vxl.data.copy_from_slice(&self.pristine_world);
+            let bbox = self.bake_bbox;
+            let started = Instant::now();
+            roxlap_core::update_lighting(
+                &mut self.vxl.data,
+                &self.vxl.column_offset,
+                self.vxl.vsid,
+                bbox[0],
+                bbox[1],
+                bbox[2],
+                bbox[3],
+                bbox[4],
+                bbox[5],
+                self.engine.lightmode(),
+                self.engine.lights(),
+            );
+            eprintln!("  bake done in {:?}", started.elapsed());
+            // Snapshot the post-bake state so subsequent ON
+            // toggles are an O(memcpy) restore.
+            self.baked_world = Some(self.vxl.data.clone());
+        } else if let Some(baked) = &self.baked_world {
+            self.vxl.data.copy_from_slice(baked);
+        }
+    }
+
+    /// Restore the original (pre-bake) brightness bytes by copying
+    /// back the snapshot `pristine_world` taken at startup. Always
+    /// wholesale — a `[u8]` `copy_from_slice` on the oracle world
+    /// is well below interactive-feeling latency.
+    fn swap_in_pristine_world(&mut self) {
+        debug_assert_eq!(self.vxl.data.len(), self.pristine_world.len());
+        self.vxl.data.copy_from_slice(&self.pristine_world);
     }
 
     fn integrate(&mut self, dt: f64) {
@@ -471,6 +574,9 @@ impl ApplicationHandler for App {
                     KeyCode::KeyF if pressed => {
                         self.capture_pending = true;
                     }
+                    KeyCode::KeyL if pressed => {
+                        self.toggle_light();
+                    }
                     _ => {}
                 }
             }
@@ -644,12 +750,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 16` is a steep inverse-cube curve, so generous `sc` is
     // needed to push shadow contrast up; `r2 = 60²` cuts the light
     // off cleanly past 60 voxels.
-    engine.set_lightmode(2);
-    engine.add_light(LightSrc {
+    let demo_light = LightSrc {
         pos: [cam_f32[0] + 24.0, cam_f32[1], cam_f32[2]],
         r2: 60.0 * 60.0,
         sc: 8192.0,
-    });
+    };
+    // Engine starts in the unlit state (light_on=false). The L
+    // hotkey applies lightmode + light + world bake on demand.
+
+    // Bake region: a 1024×1024 area centred on the spawn camera,
+    // covering the full voxlap z range. Big enough that distant
+    // scene features (e.g. the red pillar) fall inside; the demo
+    // light only affects voxels within `sqrt(r2)` (= 60 voxels) of
+    // its position, so the rest of the bake region just gets the
+    // base directional shading (`(tp.y*0.5 + tp.z)*16 + 47.5`),
+    // matching voxlap C `diag_down_lit`'s look.
+    #[allow(clippy::cast_possible_wrap)]
+    let vsid_i = vxl_world.vsid as i32;
+    #[allow(clippy::cast_possible_truncation)]
+    let cx = cam_pos[0] as i32;
+    #[allow(clippy::cast_possible_truncation)]
+    let cy = cam_pos[1] as i32;
+    let bake_half: i32 = 512;
+    let bake_bbox: [i32; 6] = [
+        (cx - bake_half).max(0),
+        (cy - bake_half).max(0),
+        0,
+        (cx + bake_half).min(vsid_i),
+        (cy + bake_half).min(vsid_i),
+        256,
+    ];
+
+    // Snapshot the pristine world so the `L` toggle can restore
+    // the un-lit state on demand. The post-bake snapshot is built
+    // lazily on first toggle (see `App::swap_in_baked_world`).
+    let pristine_world = vxl_world.data.clone();
 
     let mut app = App {
         window: None,
@@ -667,6 +802,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         capture_pending: false,
         sprites: vec![meltsphere_sprite, coco_sprite],
         spawn_time: Instant::now(),
+        demo_light,
+        pristine_world,
+        baked_world: None,
+        bake_bbox,
+        light_on: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

@@ -6,3 +6,4 @@ sprite_front  87c7de0ddeb0f7ce
 sprite_above  79b87c92dd96a59b
 sprite_iso  9caf71069594fde6
 sprite_coco  0c8f30141c9e7a4e
+diag_down_lit  b536ce3fdf771b9e

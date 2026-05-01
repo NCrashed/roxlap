@@ -1,8 +1,0 @@
-north  326a7c41c3cc659d
-east  3e00f1d0d62d5be0
-diag_down  118de3c1132d0f6b
-high_down  cd1ceac6e21c55f4
-sprite_front  87c7de0ddeb0f7ce
-sprite_above  79b87c92dd96a59b
-sprite_iso  9caf71069594fde6
-sprite_coco  0c8f30141c9e7a4e
