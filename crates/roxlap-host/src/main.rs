@@ -22,6 +22,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use flate2::read::GzDecoder;
+use roxlap_core::camera_math;
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
@@ -291,10 +292,19 @@ impl App {
             );
         }
 
-        // R6.1 sprite-plumbing call. The dispatcher is a no-op
-        // stub today (returns false); R6.2-R6.4 will replace it
-        // with the real frustum-cull + per-voxel rasterizer.
-        let _ = draw_sprite(&self.sprite);
+        // R6.2 sprite-plumbing call: dispatcher runs the mip-LOD
+        // pick + 4-plane frustum cull but writes no pixels yet
+        // (returns false either way). R6.3+ will plug in the real
+        // per-voxel iteration + rasterizer behind this same call.
+        let cam_state = camera_math::derive(
+            &cam,
+            size.width,
+            size.height,
+            settings.hx,
+            settings.hy,
+            settings.hz,
+        );
+        let _ = draw_sprite(&cam_state, &self.sprite);
 
         if self.capture_pending {
             self.capture_pending = false;
