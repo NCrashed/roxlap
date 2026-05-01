@@ -14,6 +14,7 @@ mod engine;
 pub mod fixed;
 pub mod gline;
 pub mod grouscan;
+pub mod meltsphere;
 pub mod opticast;
 pub mod opticast_prelude;
 pub mod projection;
