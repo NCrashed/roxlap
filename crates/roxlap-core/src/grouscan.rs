@@ -1657,6 +1657,9 @@ fn phase_startsky_textured(state: &mut GrouscanState<'_>) -> Phase {
         // upward (most rays hit sky directly with no drain) but
         // becomes visible at low pitch where wall-fills shrink
         // `i1` substantially.
+        // Realistic radar widths fit i32 by orders of magnitude
+        // (xres ≤ a few thousand); the isize→i32 narrowing is safe.
+        #[allow(clippy::cast_possible_truncation)]
         let leng_remaining = (i1 - i0) as i32;
         let cx0 = state.scratch.cf[c_idx].cx0;
         let cy0 = state.scratch.cf[c_idx].cy0;

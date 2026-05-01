@@ -77,13 +77,32 @@ enum SpriteKind {
     CocoRot120,
 }
 
-/// One render pose. Mirror of voxlaptest's `struct pose`, minus
-/// the tile field (drawtile primitive not yet ported). Sprite
+/// `tile` field of a `Pose`. Mirror of voxlaptest's
+/// `oracle.c:283-290` switch:
+/// - `None`: no tile overlay.
+/// - `OneX`: 1× zoom, alpha-disabled (texture-stretch path with
+///   `black==white==BR(0)` triggering the ignore-alpha branch).
+/// - `Half`: 0.5× zoom, alpha-disabled (the fast 2×2-average
+///   downsample path).
+/// - `Blend`: 1.5× zoom + alpha-modulate-and-blend (alpha bytes
+///   differ → alpha branch; per-channel modulate between the
+///   `0x40103060` / `0xc0e0a0c0` endpoints, then blend onto the
+///   destination).
+#[derive(Debug, Clone, Copy)]
+enum TileKind {
+    OneX,
+    Half,
+    Blend,
+}
+
+/// One render pose. Mirror of voxlaptest's `struct pose`. Sprite
 /// poses get a `sprite` reference; the `lit` flag triggers a
 /// one-shot lightmode-2 bake of the world's voxel intensities
 /// before the first lit-flagged pose renders (mirrors voxlap C
 /// oracle's `lighting_baked` flag — bake persists across
-/// subsequent renders).
+/// subsequent renders). The `tile` flag dispatches a post-
+/// opticast `drawtile` overlay across the three voxlap C
+/// `drawtile` paths.
 #[derive(Debug, Clone, Copy)]
 struct Pose {
     name: &'static str,
@@ -94,6 +113,7 @@ struct Pose {
     pitch: f64,
     sprite: Option<SpriteKind>,
     lit: bool,
+    tile: Option<TileKind>,
 }
 
 /// The 8 oracle poses we currently render — the 4 opticast-only
@@ -109,6 +129,7 @@ const POSES: &[Pose] = &[
         pitch: 0.0,
         sprite: None,
         lit: false,
+        tile: None,
     },
     Pose {
         name: "east",
@@ -119,6 +140,7 @@ const POSES: &[Pose] = &[
         pitch: 0.0,
         sprite: None,
         lit: false,
+        tile: None,
     },
     Pose {
         name: "diag_down",
@@ -129,6 +151,7 @@ const POSES: &[Pose] = &[
         pitch: 0.4,
         sprite: None,
         lit: false,
+        tile: None,
     },
     Pose {
         name: "high_down",
@@ -139,6 +162,7 @@ const POSES: &[Pose] = &[
         pitch: 0.7,
         sprite: None,
         lit: false,
+        tile: None,
     },
     // Sprite poses: cameras aimed at g_sprite at (1050, 1050, 175).
     // sprite_iso uses yaw = π/4 (= 0.7853981633974483), matching
@@ -152,6 +176,7 @@ const POSES: &[Pose] = &[
         pitch: 0.0,
         sprite: Some(SpriteKind::MeltsphereAxis),
         lit: false,
+        tile: None,
     },
     Pose {
         name: "sprite_above",
@@ -162,6 +187,7 @@ const POSES: &[Pose] = &[
         pitch: 1.3,
         sprite: Some(SpriteKind::MeltsphereAxis),
         lit: false,
+        tile: None,
     },
     Pose {
         name: "sprite_iso",
@@ -172,6 +198,7 @@ const POSES: &[Pose] = &[
         pitch: 0.4,
         sprite: Some(SpriteKind::MeltsphereAxis),
         lit: false,
+        tile: None,
     },
     Pose {
         name: "sprite_coco",
@@ -182,6 +209,7 @@ const POSES: &[Pose] = &[
         pitch: 0.4,
         sprite: Some(SpriteKind::CocoRot120),
         lit: false,
+        tile: None,
     },
     // diag_down camera pose, but with a one-shot lightmode-2 bake
     // applied first (one point light at (1100, 1100, 70), radius
@@ -199,8 +227,84 @@ const POSES: &[Pose] = &[
         pitch: 0.4,
         sprite: None,
         lit: true,
+        tile: None,
+    },
+    // drawtile coverage. All 3 use diag_down's camera so the
+    // underlying scene render is identical across them — the hash
+    // difference comes purely from the post-opticast drawtile
+    // call. Tile is anchored at its centre via `tcx=tcy=8<<16`,
+    // placed at screen (320, 240) (= centre of the 640×480 fb).
+    // Order matters: must come AFTER the lit pose so the lit
+    // world is the underlying state for all three (matches voxlap
+    // C oracle's pose ordering).
+    Pose {
+        name: "tile_1x",
+        px: 1000.0,
+        py: 1000.0,
+        pz: 110.0,
+        yaw: std::f64::consts::FRAC_PI_4,
+        pitch: 0.4,
+        sprite: None,
+        lit: false,
+        tile: Some(TileKind::OneX),
+    },
+    Pose {
+        name: "tile_half",
+        px: 1000.0,
+        py: 1000.0,
+        pz: 110.0,
+        yaw: std::f64::consts::FRAC_PI_4,
+        pitch: 0.4,
+        sprite: None,
+        lit: false,
+        tile: Some(TileKind::Half),
+    },
+    Pose {
+        name: "tile_blend",
+        px: 1000.0,
+        py: 1000.0,
+        pz: 110.0,
+        yaw: std::f64::consts::FRAC_PI_4,
+        pitch: 0.4,
+        sprite: None,
+        lit: false,
+        tile: Some(TileKind::Blend),
     },
 ];
+
+/// Voxlap's `BR(rgb) = 0x80000000 | rgb`: stamps the brightness
+/// bit (= "neutral modulator" alpha = 0x80) onto a packed RGB.
+#[allow(clippy::cast_possible_wrap)]
+const fn br(rgb: u32) -> i32 {
+    (0x8000_0000_u32 | rgb) as i32
+}
+
+/// Voxlap C oracle's procedural test tile (oracle.c:83-95).
+/// 16×16 ARGB checkerboard with a yellow cross at the centre row
+/// + column. Used by all three `tile_*` poses.
+const TILE_SIZE: i32 = 16;
+fn build_test_tile() -> Vec<i32> {
+    let n = (TILE_SIZE * TILE_SIZE) as usize;
+    let mut out = vec![0i32; n];
+    let half = TILE_SIZE / 2;
+    for y in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            let cx = x - half;
+            let cy = y - half;
+            let argb = if cx == 0 || cy == 0 {
+                br(0x00ff_d050) // yellow cross
+            } else if (((x >> 1) ^ (y >> 1)) & 1) == 0 {
+                br(0x00c0_3030) // red
+            } else {
+                br(0x0030_c030) // green
+            };
+            #[allow(clippy::cast_sign_loss)]
+            let idx = (y * TILE_SIZE + x) as usize;
+            out[idx] = argb;
+        }
+    }
+    out
+}
 
 /// Build a [`Sprite`] for a given pose. Returns `None` for
 /// opticast-only poses. Loaded fresh per pose so `kv6_compute_full_state`
@@ -340,6 +444,54 @@ fn render_pose(
         // config — anything else changes them.
         let lighting = SpriteLighting::default_oracle();
         let _ = draw_sprite(&mut target, &cam_state, &settings, &lighting, &sprite);
+    }
+
+    // drawtile overlay: post-opticast 2D textured-quad blit. The
+    // tile is anchored at its centre (8<<16, 8<<16 in tile-pixel
+    // q16) on screen position (320, 240) — the centre of the
+    // 640×480 framebuffer. Each `TileKind` selects one of the
+    // three voxlap C `drawtile` paths.
+    if let Some(kind) = pose.tile {
+        let tile_pixels = build_test_tile();
+        let mut target = DrawTarget {
+            framebuffer,
+            zbuffer,
+            pitch_pixels,
+            width: XRES,
+            height: YRES,
+        };
+        // Endpoint i32 cast wraps the high bit deliberately —
+        // the alpha-blend branch reads sign-extended bytes from
+        // the i32. clippy's wrap warning is the desired behaviour.
+        #[allow(clippy::cast_possible_wrap)]
+        let (xz, yz, black, white) = match kind {
+            TileKind::OneX => (1 << 16, 1 << 16, br(0), br(0)),
+            TileKind::Half => (32768, 32768, br(0), br(0)),
+            // tile_blend: 1.5× zoom = (3<<16)/2 = 98304. Endpoints
+            // differ in alpha (0x40 vs 0xc0) so the blend path
+            // fires; the channel spread tints the tile cyan-ward.
+            TileKind::Blend => (
+                (3 << 16) / 2,
+                (3 << 16) / 2,
+                0x4010_3060_u32 as i32,
+                0xc0e0_a0c0_u32 as i32,
+            ),
+        };
+        roxlap_core::drawtile::drawtile(
+            &mut target,
+            &tile_pixels,
+            TILE_SIZE * 4,
+            TILE_SIZE,
+            TILE_SIZE,
+            8 << 16,
+            8 << 16,
+            320 << 16,
+            240 << 16,
+            xz,
+            yz,
+            black,
+            white,
+        );
     }
 
     // FNV-1a over the framebuffer's raw bytes — same shape as

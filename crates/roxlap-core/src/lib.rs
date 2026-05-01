@@ -10,6 +10,7 @@
 mod camera;
 pub mod camera_math;
 pub mod column_walk;
+pub mod drawtile;
 mod engine;
 pub mod equivec;
 pub mod fixed;

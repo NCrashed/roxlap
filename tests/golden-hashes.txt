@@ -7,3 +7,6 @@ sprite_above  79b87c92dd96a59b
 sprite_iso  9caf71069594fde6
 sprite_coco  0c8f30141c9e7a4e
 diag_down_lit  b536ce3fdf771b9e
+tile_1x  e3f8567c8f405669
+tile_half  903729b33ab615af
+tile_blend  126269811726684b
