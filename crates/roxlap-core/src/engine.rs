@@ -4,6 +4,26 @@
 
 use crate::Camera;
 
+/// Voxlap's `vx5.kv6col` default — mid-grey, equal R/G/B so the
+/// sprite `update_reflects` nolighta optimisation kicks in.
+pub const DEFAULT_KV6COL: u32 = 0x0080_8080;
+
+/// One point light source for sprite (and, eventually, world) lighting.
+/// Mirror of voxlap's `lightsrc_t` (`voxlap5.h`): position, squared
+/// reach radius, and intensity scale. The lighting math reads `r2`
+/// not `r`, matching voxlap's `vx5.lightsrc[i].r2`-keyed range
+/// check.
+#[derive(Debug, Clone, Copy)]
+pub struct LightSrc {
+    /// World-space position.
+    pub pos: [f32; 3],
+    /// Squared influence radius. Voxels / sprites further than
+    /// `sqrt(r2)` from `pos` get no contribution.
+    pub r2: f32,
+    /// Intensity scale — voxlap's `lightsrc_t::sc`. Larger = brighter.
+    pub sc: f32,
+}
+
 /// Voxel engine state.
 #[derive(Debug, Clone)]
 pub struct Engine {
@@ -18,6 +38,19 @@ pub struct Engine {
     /// `[0; 6]` (no shading), matching the oracle. `ScanScratch`
     /// rebuilds its `gcsub` table from these per frame.
     side_shades: [i8; 6],
+    /// Sprite material colour — voxlap's `vx5.kv6col`. Default
+    /// `0x80_8080` (mid grey, R==G==B → triggers `update_reflects`'s
+    /// nolighta fast path).
+    kv6col: u32,
+    /// Sprite lighting mode — voxlap's `vx5.lightmode`. 0 / 1 →
+    /// directional surface tint (the cheap nolighta / nolightb
+    /// path); 2 → per-light point-source modulation against
+    /// [`Engine::lights`].
+    lightmode: u32,
+    /// Active point lights. Voxlap's `vx5.lightsrc[]`/`vx5.numlights`.
+    /// Read by sprite `update_reflects` (and, when world voxel
+    /// lighting lands, by `updatelighting`).
+    lights: Vec<LightSrc>,
 }
 
 impl Default for Engine {
@@ -29,6 +62,9 @@ impl Default for Engine {
             fog_color: 0,
             fog_max_scan_dist: 0,
             side_shades: [0; 6],
+            kv6col: DEFAULT_KV6COL,
+            lightmode: 0,
+            lights: Vec::new(),
         }
     }
 }
@@ -94,6 +130,46 @@ impl Engine {
     #[must_use]
     pub fn side_shades(&self) -> [i8; 6] {
         self.side_shades
+    }
+
+    /// Sprite material colour — packed BGRA bytes, voxlap's
+    /// `vx5.kv6col`. R/G/B equal triggers `update_reflects`'s
+    /// nolighta fast path.
+    pub fn set_kv6col(&mut self, color: u32) {
+        self.kv6col = color;
+    }
+
+    #[must_use]
+    pub fn kv6col(&self) -> u32 {
+        self.kv6col
+    }
+
+    /// Sprite lighting mode — voxlap's `vx5.lightmode`. 0 / 1 →
+    /// directional tint; 2 → point-light shading from
+    /// [`Engine::lights`]. Other values clamp to 2 in voxlap.
+    pub fn set_lightmode(&mut self, mode: u32) {
+        self.lightmode = mode;
+    }
+
+    #[must_use]
+    pub fn lightmode(&self) -> u32 {
+        self.lightmode
+    }
+
+    /// Append a light source. No upper bound enforced here —
+    /// voxlap's `MAXLIGHTS` (16) is the practical limit, but the
+    /// rendering math just iterates whatever's in the slice.
+    pub fn add_light(&mut self, light: LightSrc) {
+        self.lights.push(light);
+    }
+
+    pub fn clear_lights(&mut self) {
+        self.lights.clear();
+    }
+
+    #[must_use]
+    pub fn lights(&self) -> &[LightSrc] {
+        &self.lights
     }
 
     /// Render one frame into the caller-owned ARGB framebuffer.

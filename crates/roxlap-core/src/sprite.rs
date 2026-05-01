@@ -50,10 +50,16 @@
 use roxlap_formats::kv6::{Kv6, Voxel};
 
 use crate::camera_math::CameraState;
+use crate::engine::{Engine, LightSrc, DEFAULT_KV6COL};
 use crate::equivec::iunivec;
 use crate::fixed::ftol;
 use crate::opticast::OpticastSettings;
 use crate::ptfaces16::PTFACES16;
+
+/// Voxlap's `MAXLIGHTS` cap (`voxlap5.c`). Used to size the
+/// ambient-plus-N-lights `lightlist` scratch in `update_reflects`'s
+/// lightmode≥2 branch.
+const MAX_LIGHTS: usize = 16;
 
 /// Voxlap's `vx5.kv6mipfactor` default (`voxlap5.c:12335`). Threshold
 /// distance (in voxlap's "ftol-of-forward-projected" estimate units)
@@ -387,111 +393,343 @@ fn vec4_scale(a: [f32; 4], s: f32) -> [f32; 4] {
     [a[0] * s, a[1] * s, a[2] * s, a[3] * s]
 }
 
-/// Builds `kv6colmul[256]` + `kv6coladd[0]` for the oracle's
-/// no-fog + `flags=0` + `lightmode<2` + grey `vx5.kv6col` (R==G==B)
-/// branch of voxlap's `updatereflects` (`voxlap5.c:8466-8629`).
+/// Sprite lighting + colour state — the subset of voxlap's
+/// `vx5` global that `updatereflects` reads. Built once per
+/// frame from [`Engine`] state and passed to [`draw_sprite`].
 ///
-/// Other branches (fog, `flags & 1`, lightmode>=2, non-grey
-/// `kv6col`) are deferred — the four sprite oracle poses all sit in
-/// the simpler R==G==B nolighta sub-branch, so this is enough to
-/// validate bit-equality. The ports for the other branches mirror
-/// voxlap's logic line-for-line and can be added when a downstream
-/// caller demands them.
-fn update_reflects(sprite: &Sprite) -> (Box<[u64; 256]>, u64) {
-    // Oracle config: vx5.kv6col = 0x808080 (R==G==B, grey), no fog
-    // (vx5.fogcol < 0 → ofogdist stays -1 → fogmul = 0,
-    //  kv6coladd[0] = 0). vx5.lightmode = 0 default.
-    let kv6col: u32 = 0x0080_8080;
-    let fogmul_lo: u32 = 0; // (int32_t)fogmul == 0 since fog off
+/// All fields mirror voxlap names:
+/// - `kv6col` ↔ `vx5.kv6col`
+/// - `lightmode` ↔ `vx5.lightmode`
+/// - `lights` ↔ `vx5.lightsrc[0..vx5.numlights]`
+///
+/// The `vx5.fogcol`/`ofogdist` fog plumbing is deferred — sprite
+/// fog stays off for now, matching the oracle path
+/// (`vx5.fogcol < 0` ⇒ `ofogdist == -1` in voxlap C, no fog).
+#[derive(Debug, Clone, Copy)]
+pub struct SpriteLighting<'a> {
+    /// Material colour. R==G==B triggers the cheaper nolighta path
+    /// in `update_reflects`; arbitrary RGB takes the per-channel
+    /// nolightb path; lightmode≥2 ignores the R==G==B fast path
+    /// and always does per-channel modulation.
+    pub kv6col: u32,
+    /// `0` / `1` → directional surface tint (lightmode<2 paths).
+    /// `2` → per-light shadow-side modulation against `lights`.
+    pub lightmode: u32,
+    /// Active point lights — voxlap's `vx5.lightsrc[..vx5.numlights]`.
+    /// Empty for lightmode<2; populated for lightmode≥2.
+    pub lights: &'a [LightSrc],
+}
 
-    // (voxlap5.c:8538-8543) fx=fy=fz=1.0; tp = sum of basis vectors.
-    let tp_x = sprite.s[0] + sprite.h[0] + sprite.f[0];
-    let tp_y = sprite.s[1] + sprite.h[1] + sprite.f[1];
-    let tp_z = sprite.s[2] + sprite.h[2] + sprite.f[2];
+impl<'a> SpriteLighting<'a> {
+    /// Snapshot the lighting + colour subset of an [`Engine`].
+    /// Use this once per frame in the host so the sprite render
+    /// reflects engine setters made between frames.
+    #[must_use]
+    pub fn from_engine(engine: &'a Engine) -> Self {
+        Self {
+            kv6col: engine.kv6col(),
+            lightmode: engine.lightmode(),
+            lights: engine.lights(),
+        }
+    }
+}
 
-    let f0 = 64.0_f32 / (tp_x * tp_x + tp_y * tp_y + tp_z * tp_z).sqrt();
+impl SpriteLighting<'static> {
+    /// Default oracle config — grey `kv6col`, lightmode 0, no
+    /// lights. Used by `roxlap-oracle` so the four sprite golden
+    /// hashes stay byte-stable: this is the exact state voxlap C's
+    /// oracle has when it calls `drawsprite`.
+    #[must_use]
+    pub fn default_oracle() -> Self {
+        Self {
+            kv6col: DEFAULT_KV6COL,
+            lightmode: 0,
+            lights: &[],
+        }
+    }
+}
+
+/// Builds `kv6colmul[256]` + `kv6coladd[0]` from the engine's
+/// sprite lighting state. Mirror of voxlap's `updatereflects`
+/// (`voxlap5.c:8466-8750`).
+///
+/// Branches:
+/// - `lightmode < 2` + R==G==B `kv6col` → nolighta (cheap
+///   single-multiplier path, voxlap5.c:8553-8584).
+/// - `lightmode < 2` + arbitrary `kv6col` → nolightb (per-channel
+///   path, voxlap5.c:8587-8629).
+/// - `lightmode >= 2` → per-light shadow-side modulation
+///   (voxlap5.c:8631-8750), iterating the active `lights`.
+///
+/// `flags & 1` (disable shading) and the active-fog path remain
+/// deferred — neither is exercised by the oracle's four sprite
+/// poses, and adding them is a follow-up that doesn't change the
+/// already-frozen hashes.
+///
+fn update_reflects(sprite: &Sprite, lighting: &SpriteLighting<'_>) -> (Box<[u64; 256]>, u64) {
+    // Sprite fog plumbing is a follow-up — `vx5.fogcol < 0` (voxlap
+    // C oracle's set_fogcol(BR(...)) state) means ofogdist stays -1,
+    // fogmul = 0, kv6coladd[0] = 0. We pin to that here.
+    let fogmul_lo: u32 = 0;
+    let kv6coladd: u64 = 0;
+
+    let kv6col = lighting.kv6col;
 
     // g = ((fogmul & 32767) ^ 32767) * (16*8/65536). With fogmul=0:
     //   g = 32767 * (128/65536) ≈ 63.998.
     let g_pre = ((((fogmul_lo & 0x7fff) ^ 0x7fff) as i32) as f32) * (16.0 * 8.0 / 65536.0);
 
-    // R==G==B test: ((kv6col & 0xffff) << 8) ^ (kv6col & 0xffff00)
-    //   == 0  iff  R == G and G == B.
-    let lo16 = kv6col & 0xffff;
-    let mid24 = kv6col & 0x00ff_ff00;
-    let is_grey = ((lo16 << 8) ^ mid24) == 0;
-
     let mut kv6colmul = Box::new([0u64; 256]);
 
-    if is_grey {
-        // Nolighta path (voxlap5.c:8553-8584): grey kv6col absorbs
-        // into a single multiplier per direction.
-        let g = g_pre * (((kv6col & 0xff) as f32) / 256.0);
-        let f = f0 * g;
+    if lighting.lightmode < 2 {
+        // (voxlap5.c:8538-8543) fx=fy=fz=1.0; tp = sum of basis vectors.
+        let tp_x = sprite.s[0] + sprite.h[0] + sprite.f[0];
+        let tp_y = sprite.s[1] + sprite.h[1] + sprite.f[1];
+        let tp_z = sprite.s[2] + sprite.h[2] + sprite.f[2];
 
-        let l0 = (tp_x * f) as i16; // (short)(...) is C truncating cast
-        let l1 = (tp_y * f) as i16;
-        let l2 = (tp_z * f) as i16;
-        let l3 = (g * 128.0) as i16;
+        let f0 = 64.0_f32 / (tp_x * tp_x + tp_y * tp_y + tp_z * tp_z).sqrt();
 
-        let iu = iunivec();
-        for k in 0..256 {
-            // Per-direction dot product across 4 i16 lanes (3 spatial
-            // + 1 bias). The asm sums the two pmaddwd dword lanes
-            // modulo 2^32 then takes the high 16 — equivalent to:
-            //   word = ((u0*l0+u1*l1) + (u2*l2+u3*l3)) >> 16
-            // computed in u32 wrapping arithmetic.
-            let u0 = i32::from(iu[k][0]);
-            let u1 = i32::from(iu[k][1]);
-            let u2 = i32::from(iu[k][2]);
-            let u3 = i32::from(iu[k][3]);
-            let lo = (u0.wrapping_mul(l0.into())) as u32;
-            let lo = lo.wrapping_add((u1.wrapping_mul(l1.into())) as u32);
-            let hi = (u2.wrapping_mul(l2.into())) as u32;
-            let hi = hi.wrapping_add((u3.wrapping_mul(l3.into())) as u32);
-            let w = ((lo.wrapping_add(hi)) >> 16) as u16;
-            let w64 = u64::from(w);
-            kv6colmul[k] = w64 | (w64 << 16) | (w64 << 32) | (w64 << 48);
+        // R==G==B test: ((kv6col & 0xffff) << 8) ^ (kv6col & 0xffff00)
+        //   == 0  iff  R == G and G == B.
+        let lo16 = kv6col & 0xffff;
+        let mid24 = kv6col & 0x00ff_ff00;
+        let is_grey = ((lo16 << 8) ^ mid24) == 0;
+
+        if is_grey {
+            // Nolighta path (voxlap5.c:8553-8584): grey kv6col absorbs
+            // into a single multiplier per direction.
+            let g = g_pre * (((kv6col & 0xff) as f32) / 256.0);
+            let f = f0 * g;
+
+            let l0 = (tp_x * f) as i16; // (short)(...) is C truncating cast
+            let l1 = (tp_y * f) as i16;
+            let l2 = (tp_z * f) as i16;
+            let l3 = (g * 128.0) as i16;
+
+            let iu = iunivec();
+            for k in 0..256 {
+                let w = dot_iunivec_i16x4(iu[k], [l0, l1, l2, l3]);
+                let w64 = u64::from(w);
+                kv6colmul[k] = w64 | (w64 << 16) | (w64 << 32) | (w64 << 48);
+            }
+        } else {
+            // Nolightb path (voxlap5.c:8587-8629). Per-channel
+            // modulation factor M_k = (kv6col_byte_k << 8) → mulhi_pu16
+            // by the per-direction dot. Same dot derivation as nolighta.
+            let f = f0 * g_pre;
+
+            let l0 = (tp_x * f) as i16;
+            let l1 = (tp_y * f) as i16;
+            let l2 = (tp_z * f) as i16;
+            let l3 = (g_pre * 128.0) as i16;
+
+            let m = kv6col_channel_mods(kv6col);
+
+            let iu = iunivec();
+            for k in 0..256 {
+                let w = dot_iunivec_i16x4(iu[k], [l0, l1, l2, l3]);
+                kv6colmul[k] = pack_modulated_word(w, m);
+            }
         }
     } else {
-        // Nolightb path (voxlap5.c:8587-8629). Per-channel
-        // modulation factor M_k = (kv6col_byte_k << 8) → mulhi_pu16
-        // by the per-direction dot. Same dot derivation as nolighta.
-        let f = f0 * g_pre;
-
-        let l0 = (tp_x * f) as i16;
-        let l1 = (tp_y * f) as i16;
-        let l2 = (tp_z * f) as i16;
-        let l3 = (g_pre * 128.0) as i16;
-
-        let m0 = ((kv6col & 0xff) << 8) as u16;
-        let m1 = (((kv6col >> 8) & 0xff) << 8) as u16;
-        let m2 = (((kv6col >> 16) & 0xff) << 8) as u16;
-        let m3 = (((kv6col >> 24) & 0xff) << 8) as u16;
-
-        let iu = iunivec();
-        for k in 0..256 {
-            let u0 = i32::from(iu[k][0]);
-            let u1 = i32::from(iu[k][1]);
-            let u2 = i32::from(iu[k][2]);
-            let u3 = i32::from(iu[k][3]);
-            let lo = (u0.wrapping_mul(l0.into())) as u32;
-            let lo = lo.wrapping_add((u1.wrapping_mul(l1.into())) as u32);
-            let hi = (u2.wrapping_mul(l2.into())) as u32;
-            let hi = hi.wrapping_add((u3.wrapping_mul(l3.into())) as u32);
-            let w = ((lo.wrapping_add(hi)) >> 16) as u32;
-            let w0 = ((w * u32::from(m0)) >> 16) as u16;
-            let w1 = ((w * u32::from(m1)) >> 16) as u16;
-            let w2 = ((w * u32::from(m2)) >> 16) as u16;
-            let w3 = ((w * u32::from(m3)) >> 16) as u16;
-            kv6colmul[k] = u64::from(w0)
-                | (u64::from(w1) << 16)
-                | (u64::from(w2) << 32)
-                | (u64::from(w3) << 48);
-        }
+        // Lightmode≥2 path (voxlap5.c:8631-8750): per-sprite point
+        // lighting from `lighting.lights`. Each light projects onto
+        // the sprite's normalised basis; per-direction kv6colmul[i]
+        // starts from a synthetic ambient slot and subtracts shadow
+        // contributions from each light's "negative" lanes.
+        let m = kv6col_channel_mods(kv6col);
+        build_kv6colmul_lightmode2(sprite, lighting.lights, &mut kv6colmul, fogmul_lo, m);
     }
 
-    (kv6colmul, 0)
+    (kv6colmul, kv6coladd)
+}
+
+/// Voxlap's `pmaddwd(iunivec[k], lightlist) summed across two
+/// dword lanes mod 2^32, take high 16` reduction. Returns the
+/// `u16` modulation factor before any per-channel packing.
+#[inline]
+fn dot_iunivec_i16x4(u: [i16; 4], l: [i16; 4]) -> u16 {
+    let u0 = i32::from(u[0]);
+    let u1 = i32::from(u[1]);
+    let u2 = i32::from(u[2]);
+    let u3 = i32::from(u[3]);
+    let lo = (u0.wrapping_mul(l[0].into())) as u32;
+    let lo = lo.wrapping_add((u1.wrapping_mul(l[1].into())) as u32);
+    let hi = (u2.wrapping_mul(l[2].into())) as u32;
+    let hi = hi.wrapping_add((u3.wrapping_mul(l[3].into())) as u32);
+    ((lo.wrapping_add(hi)) >> 16) as u16
+}
+
+/// `(kv6col_byte_k << 8)` per channel — the four `M_k` factors the
+/// nolightb / lightmode≥2 paths multiply against the per-direction
+/// dot via `pmulhuw`.
+#[inline]
+fn kv6col_channel_mods(kv6col: u32) -> [u16; 4] {
+    [
+        ((kv6col & 0xff) << 8) as u16,
+        (((kv6col >> 8) & 0xff) << 8) as u16,
+        (((kv6col >> 16) & 0xff) << 8) as u16,
+        (((kv6col >> 24) & 0xff) << 8) as u16,
+    ]
+}
+
+/// Pack one direction's `kv6colmul[k]` u64: per-channel
+/// `(W * M_c) >> 16` words concatenated.
+#[inline]
+fn pack_modulated_word(w_dot: u16, m: [u16; 4]) -> u64 {
+    let w = u32::from(w_dot);
+    let w0 = ((w * u32::from(m[0])) >> 16) as u16;
+    let w1 = ((w * u32::from(m[1])) >> 16) as u16;
+    let w2 = ((w * u32::from(m[2])) >> 16) as u16;
+    let w3 = ((w * u32::from(m[3])) >> 16) as u16;
+    u64::from(w0) | (u64::from(w1) << 16) | (u64::from(w2) << 32) | (u64::from(w3) << 48)
+}
+
+/// Lightmode≥2 path body — voxlap5.c:8631-8750. Builds the full
+/// `kv6colmul[256]` from the active light list.
+///
+/// Steps:
+/// 1. Normalise each sprite-basis axis (`sprs`/`sprh`/`sprf`).
+/// 2. For each light within `r2` of the sprite, compute its
+///    intensity falloff `h` and project the world-space delta onto
+///    the normalised sprite basis → store in `lightlist[k]`.
+/// 3. Append a synthetic ambient slot (voxlap's hardcoded
+///    `(fx, fy, fz) = (0, 0.5, 1.0)` direction) at
+///    `lightlist[lightcnt]`.
+/// 4. For each direction `idx ∈ 0..256`:
+///    - `base = ambient_slot · iunivec[idx]` (treated as one u32).
+///    - For each real light `k`: compute `dot = light_k ·
+///      iunivec[idx]`, split into low/high i16 lanes (asm-faithful
+///      "16-bits-is-ugly-but-ok-here" quirk); subtract the negative
+///      lanes from `base` (= shadow side of the surface).
+///    - `W = base >> 16`, then per-channel modulate against `M_c`
+///      and pack into `kv6colmul[idx]`.
+fn build_kv6colmul_lightmode2(
+    sprite: &Sprite,
+    lights: &[LightSrc],
+    kv6colmul: &mut [u64; 256],
+    fogmul_lo: u32,
+    m: [u16; 4],
+) {
+    // (voxlap5.c:8638-8643) Normalise sprite basis. WARNING from
+    // voxlap: only correct for orthonormal sprite-bases; non-
+    // orthogonal bases (e.g. shears) drift. The four oracle sprite
+    // poses are all orthonormal so this matches voxlap's behaviour.
+    let sprs = normalise(sprite.s);
+    let sprh = normalise(sprite.h);
+    let sprf = normalise(sprite.f);
+
+    // hh = ((fogmul & 32767) ^ 32767) / 65536 * 2 (voxlap5.c:8645).
+    // With fogmul=0 → hh = 32767 / 65536 * 2 ≈ 1.0. This is a
+    // distinct scaling from `g_pre` (= same numerator * 128/65536
+    // for the lightmode<2 path) — they differ by a factor of 64.
+    // An earlier port mistakenly derived hh from g_pre / 128 = 0.5,
+    // giving sprites half the intended ambient brightness.
+    let hh_initial = ((((fogmul_lo & 0x7fff) ^ 0x7fff) as i32) as f32) * (2.0 / 65536.0);
+
+    // Project each in-range light onto the sprite basis.
+    let mut lightlist: [[i16; 4]; MAX_LIGHTS + 1] = [[0; 4]; MAX_LIGHTS + 1];
+    let mut lightcnt: usize = 0;
+    for light in lights.iter().rev() {
+        if lightcnt >= MAX_LIGHTS {
+            break;
+        }
+        let fx = light.pos[0] - sprite.p[0];
+        let fy = light.pos[1] - sprite.p[1];
+        let fz = light.pos[2] - sprite.p[2];
+        let gg = fx * fx + fy * fy + fz * fz;
+        let ff = light.r2;
+        // Voxlap's `*(int32_t *)&gg < *(int32_t *)&ff` is a bit-
+        // pattern compare. For non-negative finite floats the bit
+        // order matches the magnitude order, so `gg < ff` is
+        // equivalent (and safer in the presence of NaN: NaN !< x
+        // for any x, matching voxlap's float-bit-cast trick).
+        if gg >= ff || gg <= 0.0 {
+            continue;
+        }
+        let f = ff.sqrt();
+        let g = gg.sqrt();
+        // h = (f*ff - g*gg) / (f*ff*g*gg) * sc * 16
+        let mut h = (f * ff - g * gg) / (f * ff * g * gg) * light.sc * 16.0;
+        if g * h > 4096.0 {
+            h = 4096.0 / g; // saturation clip
+        }
+        h *= hh_initial;
+        let l0 = (fx * sprs[0] + fy * sprs[1] + fz * sprs[2]) * h;
+        let l1 = (fx * sprh[0] + fy * sprh[1] + fz * sprh[2]) * h;
+        let l2 = (fx * sprf[0] + fy * sprf[1] + fz * sprf[2]) * h;
+        lightlist[lightcnt] = [l0 as i16, l1 as i16, l2 as i16, 0];
+        lightcnt += 1;
+    }
+
+    // Synthetic ambient slot: voxlap's hardcoded direction
+    // (fx, fy, fz) = (0, 0.5, 1.0) projected onto the sprite basis,
+    // scaled by `hh * 16*16*8/2 = hh * 1024`. The lane-3 bias is
+    // `hh * 48 / 16 = hh * 3`.
+    let amb_fx = 0.0_f32;
+    let amb_fy = 0.5_f32;
+    let amb_fz = 1.0_f32;
+    let hh = hh_initial * (16.0 * 16.0 * 8.0 / 2.0);
+    let al0 = (sprs[0] * amb_fx + sprs[1] * amb_fy + sprs[2] * amb_fz) * hh;
+    let al1 = (sprh[0] * amb_fx + sprh[1] * amb_fy + sprh[2] * amb_fz) * hh;
+    let al2 = (sprf[0] * amb_fx + sprf[1] * amb_fy + sprf[2] * amb_fz) * hh;
+    let al3 = hh * (48.0 / 16.0);
+    lightlist[lightcnt] = [al0 as i16, al1 as i16, al2 as i16, al3 as i16];
+
+    let iu = iunivec();
+    for idx in 0..256 {
+        let u = iu[idx];
+        // Ambient base = lightlist[lightcnt] · iunivec[idx], in u32
+        // wrapping arithmetic (asm summed the pmaddwd dword lanes
+        // mod 2^32).
+        let u0 = i32::from(u[0]);
+        let u1 = i32::from(u[1]);
+        let u2 = i32::from(u[2]);
+        let u3 = i32::from(u[3]);
+        let amb = lightlist[lightcnt];
+        let base_lo = (u0.wrapping_mul(i32::from(amb[0]))) as u32;
+        let base_lo = base_lo.wrapping_add((u1.wrapping_mul(i32::from(amb[1]))) as u32);
+        let base_hi = (u2.wrapping_mul(i32::from(amb[2]))) as u32;
+        let base_hi = base_hi.wrapping_add((u3.wrapping_mul(i32::from(amb[3]))) as u32);
+        let mut base = base_lo.wrapping_add(base_hi);
+
+        // For each real light, compute dot, then subtract its
+        // "negative" half-lanes from `base` (= shadow side).
+        for k in (0..lightcnt).rev() {
+            let l = lightlist[k];
+            let klo = (u0.wrapping_mul(i32::from(l[0]))) as u32;
+            let klo = klo.wrapping_add((u1.wrapping_mul(i32::from(l[1]))) as u32);
+            let khi = (u2.wrapping_mul(i32::from(l[2]))) as u32;
+            let khi = khi.wrapping_add((u3.wrapping_mul(i32::from(l[3]))) as u32);
+            let dot = klo.wrapping_add(khi);
+            // Voxlap quirk: 32-bit dot but pminsw is per-i16 lane.
+            // Light magnitudes stay clamped enough that the
+            // mixed-lane behaviour is benign — port faithfully.
+            let lo16 = (dot & 0xffff) as i16;
+            let hi16 = ((dot >> 16) & 0xffff) as i16;
+            let lo16c: u16 = if lo16 < 0 { lo16 as u16 } else { 0 };
+            let hi16c: u16 = if hi16 < 0 { hi16 as u16 } else { 0 };
+            let sub = (u32::from(hi16c) << 16) | u32::from(lo16c);
+            base = base.wrapping_sub(sub);
+        }
+
+        let w_dot = (base >> 16) as u16;
+        kv6colmul[idx] = pack_modulated_word(w_dot, m);
+    }
+}
+
+/// Normalise a 3-vector. Returns the unit-length version; if
+/// the input is zero-length, returns the input unchanged (avoids
+/// NaN propagation — voxlap's `1.0 / sqrt(...)` would NaN out for
+/// a zero basis axis but the C code never gets passed one).
+#[inline]
+fn normalise(v: [f32; 3]) -> [f32; 3] {
+    let len_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    if len_sq <= 0.0 {
+        return v;
+    }
+    let inv = 1.0 / len_sq.sqrt();
+    [v[0] * inv, v[1] * inv, v[2] * inv]
 }
 
 /// Full setup: mat2 + Cramer's + nfor↔nhei swap + cadd4/ztab4/r1/r2/
@@ -499,6 +737,7 @@ fn update_reflects(sprite: &Sprite) -> (Box<[u64; 256]>, u64) {
 pub(crate) fn kv6_compute_full_state<'a>(
     setup: &Kv6DrawSetup<'a>,
     sprite: &Sprite,
+    lighting: &SpriteLighting<'_>,
     cam: &CameraState,
     settings: &OpticastSettings,
     fb_width: u32,
@@ -658,7 +897,7 @@ pub(crate) fn kv6_compute_full_state<'a>(
     ];
     let qbplbpp = [4i16, pitch_bytes as i16, 4, pitch_bytes as i16];
 
-    let (kv6colmul, kv6coladd) = update_reflects(sprite);
+    let (kv6colmul, kv6coladd) = update_reflects(sprite, lighting);
 
     Kv6FullState {
         iter,
@@ -1167,6 +1406,7 @@ pub fn draw_sprite(
     target: &mut DrawTarget<'_>,
     cam: &CameraState,
     settings: &OpticastSettings,
+    lighting: &SpriteLighting<'_>,
     sprite: &Sprite,
 ) -> u32 {
     if sprite.flags & SPRITE_FLAG_INVISIBLE != 0 {
@@ -1185,6 +1425,7 @@ pub fn draw_sprite(
     let state = kv6_compute_full_state(
         &setup,
         sprite,
+        lighting,
         cam,
         settings,
         target.width,
@@ -1266,7 +1507,17 @@ mod tests {
         sprite: &Sprite,
         cam: &camera_math::CameraState,
     ) -> Kv6FullState<'a> {
-        kv6_compute_full_state(setup, sprite, cam, &oracle_settings(), 640, 480, 640)
+        let lighting = SpriteLighting::default_oracle();
+        kv6_compute_full_state(
+            setup,
+            sprite,
+            &lighting,
+            cam,
+            &oracle_settings(),
+            640,
+            480,
+            640,
+        )
     }
 
     /// Allocate a 640×480 framebuffer + zbuffer (zbuffer pre-filled
@@ -1319,7 +1570,11 @@ mod tests {
         s.flags = SPRITE_FLAG_INVISIBLE;
         let (mut fb, mut zb) = alloc_target();
         let mut target = make_target(&mut fb, &mut zb);
-        assert_eq!(draw_sprite(&mut target, &cam, &oracle_settings(), &s), 0);
+        let lighting = SpriteLighting::default_oracle();
+        assert_eq!(
+            draw_sprite(&mut target, &cam, &oracle_settings(), &lighting, &s),
+            0
+        );
     }
 
     #[test]
@@ -1329,7 +1584,11 @@ mod tests {
         s.flags = SPRITE_FLAG_KFA;
         let (mut fb, mut zb) = alloc_target();
         let mut target = make_target(&mut fb, &mut zb);
-        assert_eq!(draw_sprite(&mut target, &cam, &oracle_settings(), &s), 0);
+        let lighting = SpriteLighting::default_oracle();
+        assert_eq!(
+            draw_sprite(&mut target, &cam, &oracle_settings(), &lighting, &s),
+            0
+        );
     }
 
     #[test]
@@ -1608,7 +1867,8 @@ mod tests {
         let cam = oracle_sprite_front_camera();
         let (mut fb, mut zb) = alloc_target();
         let mut target = make_target(&mut fb, &mut zb);
-        let written = draw_sprite(&mut target, &cam, &oracle_settings(), &sprite);
+        let lighting = SpriteLighting::default_oracle();
+        let written = draw_sprite(&mut target, &cam, &oracle_settings(), &lighting, &sprite);
         assert!(written > 0, "expected some pixels to be written");
         assert!(
             fb.iter().any(|&p| p != 0),
@@ -1627,7 +1887,11 @@ mod tests {
         let s = Sprite::axis_aligned(cube_kv6(), [1020.0 - 500.0, 1050.0, 175.0]);
         let (mut fb, mut zb) = alloc_target();
         let mut target = make_target(&mut fb, &mut zb);
-        assert_eq!(draw_sprite(&mut target, &cam, &oracle_settings(), &s), 0);
+        let lighting = SpriteLighting::default_oracle();
+        assert_eq!(
+            draw_sprite(&mut target, &cam, &oracle_settings(), &lighting, &s),
+            0
+        );
         assert!(fb.iter().all(|&p| p == 0));
     }
 
@@ -1638,7 +1902,8 @@ mod tests {
     #[test]
     fn update_reflects_nolighta_lanes_match() {
         let s = Sprite::axis_aligned(empty_kv6(), [1050.0, 1050.0, 175.0]);
-        let (cm, ca) = update_reflects(&s);
+        let lighting = SpriteLighting::default_oracle();
+        let (cm, ca) = update_reflects(&s, &lighting);
         assert_eq!(ca, 0, "kv6coladd must be zero (no fog)");
         for (k, e) in cm.iter().enumerate() {
             let l0 = (e & 0xffff) as u16;
@@ -1649,5 +1914,91 @@ mod tests {
             assert_eq!(l0, l2, "kv6colmul[{k}] lane0 != lane2");
             assert_eq!(l0, l3, "kv6colmul[{k}] lane0 != lane3");
         }
+    }
+
+    /// Non-grey kv6col forces the nolightb path. Lanes 0..3 of each
+    /// `kv6colmul[k]` come from per-channel modulators built from
+    /// the kv6col bytes — they should NOT all match unless the
+    /// channels themselves match.
+    #[test]
+    fn update_reflects_nolightb_lanes_diverge_for_tinted_kv6col() {
+        let s = Sprite::axis_aligned(empty_kv6(), [1050.0, 1050.0, 175.0]);
+        let lighting = SpriteLighting {
+            kv6col: 0x0040_8040, // R != G != B
+            lightmode: 0,
+            lights: &[],
+        };
+        let (cm, _) = update_reflects(&s, &lighting);
+        // Find any direction where the dot is non-zero (most are
+        // non-zero); that direction's lanes must vary by channel.
+        let mut saw_divergence = false;
+        for e in cm.iter() {
+            let l0 = (e & 0xffff) as u16;
+            let l1 = ((e >> 16) & 0xffff) as u16;
+            let l2 = ((e >> 32) & 0xffff) as u16;
+            if l0 != l1 || l0 != l2 {
+                saw_divergence = true;
+                break;
+            }
+        }
+        assert!(
+            saw_divergence,
+            "non-grey kv6col must produce per-channel divergence in some kv6colmul slot"
+        );
+    }
+
+    /// Lightmode-2 with one point light + grey kv6col still
+    /// produces R==G==B lanes (because the per-channel modulators
+    /// are all 0x80<<8 = 0x8000). It must produce a non-uniform
+    /// kv6colmul (some directions face the light, others away),
+    /// which differs from lightmode<2 where every direction has the
+    /// same dot magnitude regardless of position.
+    #[test]
+    fn update_reflects_lightmode2_produces_directional_shading() {
+        let s = Sprite::axis_aligned(empty_kv6(), [100.0, 100.0, 100.0]);
+        let lights = [LightSrc {
+            pos: [110.0, 100.0, 100.0],
+            r2: 100.0,
+            sc: 16.0,
+        }];
+        let lighting = SpriteLighting {
+            kv6col: DEFAULT_KV6COL,
+            lightmode: 2,
+            lights: &lights,
+        };
+        let (cm, _) = update_reflects(&s, &lighting);
+        // Some directions must darken (shadow side) while others
+        // brighten (light side) — the spread between min and max
+        // tells us shading is happening.
+        let mut min_w = u16::MAX;
+        let mut max_w = 0u16;
+        for e in cm.iter() {
+            let l0 = (e & 0xffff) as u16;
+            min_w = min_w.min(l0);
+            max_w = max_w.max(l0);
+        }
+        assert!(
+            max_w > min_w + 16,
+            "lightmode-2 should produce directional shading: min={min_w} max={max_w}"
+        );
+    }
+
+    /// Lightmode-2 with no lights → ambient-only. Should still
+    /// produce some non-zero kv6colmul (the synthetic ambient slot
+    /// is non-trivial).
+    #[test]
+    fn update_reflects_lightmode2_no_lights_falls_back_to_ambient() {
+        let s = Sprite::axis_aligned(empty_kv6(), [100.0, 100.0, 100.0]);
+        let lighting = SpriteLighting {
+            kv6col: DEFAULT_KV6COL,
+            lightmode: 2,
+            lights: &[],
+        };
+        let (cm, _) = update_reflects(&s, &lighting);
+        let any_nonzero = cm.iter().any(|&e| e != 0);
+        assert!(
+            any_nonzero,
+            "lightmode-2 with no lights should still emit ambient shading"
+        );
     }
 }

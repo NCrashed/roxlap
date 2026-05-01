@@ -28,5 +28,5 @@ pub mod sprite;
 pub mod world_query;
 
 pub use camera::Camera;
-pub use engine::Engine;
+pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
 pub use opticast::{opticast, OpticastOutcome, OpticastSettings};

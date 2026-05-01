@@ -26,9 +26,10 @@ use roxlap_core::camera_math;
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
-use roxlap_core::sprite::{draw_sprite, DrawTarget, Sprite};
+use roxlap_core::sprite::{draw_sprite, DrawTarget, Sprite, SpriteLighting};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
+use roxlap_core::LightSrc;
 use roxlap_core::OpticastSettings;
 use roxlap_formats::{kv6, vxl};
 use winit::application::ApplicationHandler;
@@ -347,12 +348,18 @@ impl App {
                 width: size.width,
                 height: size.height,
             };
+            // Snapshot the engine's lighting state once per frame.
+            // Cheap to build (it's just three field reads + a slice
+            // borrow) and lets sprite shading respond to runtime
+            // setter calls (e.g. moving the demo torch).
+            let lighting = SpriteLighting::from_engine(&self.engine);
+
             // Debug: count pixels written per sprite. Gated on an
             // env var so the noise stays out of normal interactive
             // runs. Set ROXLAP_HOST_SPRITE_DEBUG=1 to see counts.
             let debug = std::env::var("ROXLAP_HOST_SPRITE_DEBUG").is_ok();
             for (i, sprite) in self.sprites.iter().enumerate() {
-                let written = draw_sprite(&mut target, &cam_state, &settings, sprite);
+                let written = draw_sprite(&mut target, &cam_state, &settings, &lighting, sprite);
                 if debug {
                     eprintln!(
                         "sprite[{i}]: pos=({:.1}, {:.1}, {:.1}) basis_s=({:.2},{:.2},{:.2}) → wrote {} pixels",
@@ -627,6 +634,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let coco_sprite =
         Sprite::axis_aligned(coco_kv6, [cam_f32[0] + 24.0, cam_f32[1] + 12.0, cam_f32[2]]);
+
+    // Demo lighting: lightmode=2 + one bright point light parked
+    // exactly between the two sprites (each 12 voxels lateral
+    // from this point), at sprite-z. Both sprites get strong
+    // directional shading — the face turned toward the light at
+    // 0x80 (full ambient) brightness, the back face deeply
+    // shadowed. The voxlap lighting falloff `(1/d³ - 1/r³) * sc *
+    // 16` is a steep inverse-cube curve, so generous `sc` is
+    // needed to push shadow contrast up; `r2 = 60²` cuts the light
+    // off cleanly past 60 voxels.
+    engine.set_lightmode(2);
+    engine.add_light(LightSrc {
+        pos: [cam_f32[0] + 24.0, cam_f32[1], cam_f32[2]],
+        r2: 60.0 * 60.0,
+        sc: 8192.0,
+    });
 
     let mut app = App {
         window: None,

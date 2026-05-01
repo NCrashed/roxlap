@@ -45,7 +45,7 @@ use roxlap_core::camera_math;
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
-use roxlap_core::sprite::{draw_sprite, DrawTarget, Sprite};
+use roxlap_core::sprite::{draw_sprite, DrawTarget, Sprite, SpriteLighting};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
@@ -304,7 +304,12 @@ fn render_pose(
             width: XRES,
             height: YRES,
         };
-        let _ = draw_sprite(&mut target, &cam_state, &settings, &sprite);
+        // Match voxlap C oracle's lighting state at the time of
+        // drawsprite: kv6col=0x808080, lightmode=0, no point lights.
+        // The four sprite_* hashes were frozen against this exact
+        // config — anything else changes them.
+        let lighting = SpriteLighting::default_oracle();
+        let _ = draw_sprite(&mut target, &cam_state, &settings, &lighting, &sprite);
     }
 
     // FNV-1a over the framebuffer's raw bytes — same shape as
