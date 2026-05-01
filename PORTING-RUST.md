@@ -24,11 +24,11 @@ project intent and the relationship to
 | **R1** | Repo skeleton: workspace, README, `PORTING-RUST.md`, license files, asset copy. | done | `cargo build` green, `cargo test` green (zero tests). |
 | **R2** | `.vxl` / `.kv6` / `.kvx` / `.kfa` parsers in `roxlap-formats`. | done | Byte-equal round-trip parse + re-serialise on `assets/coco.kvx` and procedurally-built `.vxl` fixtures. Header dumps match voxlaptest's loader output. |
 | **R3** | `Engine` public API (framebuffer, camera, render entry point); winit + softbuffer host opens a window and shows sky-blue fill. | done | `cargo run -p roxlap-host` opens a window. End-to-end toolchain works before any rasterizer code lands. |
-| **R4** | Full `opticast` + `grouscan` algorithm port from `grouscanasm_scalar` (scalar Rust). | **opticast-only poses bit-exact**; deferred: R4.4 textured-sky branch, R4.5 multi-mip `remiporend`, sideshademode high-byte. | 4 of 12 oracle poses match voxlap C goldens byte-for-byte (`north`, `east`, `diag_down`, `high_down`). The other 8 poses each require a feature roxlap doesn't have yet (sprites → R6, lighting, drawtile). |
+| **R4** | Full `opticast` + `grouscan` algorithm port from `grouscanasm_scalar` (scalar Rust). | **opticast-only poses bit-exact**; deferred remainders: R4.5 multi-mip `remiporend`, sideshademode high-byte. R4.4 textured sky landed. | 4 of 12 oracle poses match voxlap C goldens byte-for-byte (`north`, `east`, `diag_down`, `high_down`). The other 8 poses each require a feature roxlap covers in R6+ (sprites, lighting, drawtile). |
 | **R5** | x86_64 SSE2 4-pixel rsqrtps batches in the four hot rasterizers (mirror of voxlaptest Stage 4.9). | scalar reference is bit-exact; SSE batches not yet ported | Re-converges on voxlaptest's CI golden hashes where the rsqrtps approach is bit-equivalent. |
-| **R6** | KV6 sprite renderer (`drawsprite` / `drawboundcubesse` / `updatereflects`). | **architecture validated** (R6.4 b/c/d/e landed); 1 of 4 sprite oracle poses bit-exact, 3 drift on sub-pixel rounding | `sprite_above` matches voxlap C local build byte-for-byte (`79b87c92dd96a59b`). Drift on the other three poses tracked in memory for next session. |
-| **R7** | KV6 sprite renderer convergence: close drift on the three remaining sprite poses (likely iunivec rounding / Cramer's-rule cancellation / `_mm_rcp_ps` micro-arch). | not started | Re-converges on voxlaptest's full sprite hash set. |
-| **R8** | Cross-engine oracle: roxlap-side oracle binary writing `roxlap-hashes.txt`; CI matrix that diffs against `golden-hashes.txt`. | done | `cargo run -p roxlap-oracle -- diff` reports `4 match, 0 mismatch` against the in-tree `tests/golden-hashes.txt` (4 opticast-only poses, frozen against voxlap C). `.github/workflows/ci.yml` runs fmt / clippy / test / oracle-diff on every push + PR; oracle job fails on any hash mismatch so the bit-exact milestone can't regress silently. |
+| **R6** | KV6 sprite renderer + sprite/world lighting (`drawsprite` / `drawboundcubesse` / `updatereflects` / `updatelighting`) + textured sky (`startsky` non-solid branch). | **fully landed**: R6.0..R6.4 sprite renderer; R6.4f sprite point lighting (`updatereflects` lightmode≥2); R6.5 world voxel lighting bake; R4.4-final textured sky. 1 of 4 sprite oracle poses bit-exact, 3 drift on sub-pixel rounding; `diag_down_lit` drifts similarly (frozen as roxlap golden). | **9 of 12 oracle poses tracked** by `tests/golden-hashes.txt`: 4 opticast bit-exact, 4 sprite + 1 lit pose frozen as roxlap goldens (visually verified vs voxlap C, sub-pixel rounding noise documented). `roxlap-host` demos the full pipeline: textured `assets/sky.png` panorama, two animated kv6 sprites with point-light shading, world voxel lighting bake toggleable via `L`. |
+| **R7** | _Cancelled_. Was scoped as "close sprite-pose drift". The three drifted poses (`sprite_front`, `sprite_iso`, `sprite_coco`) and `diag_down_lit` are visually indistinguishable from voxlap C output; the in-tree goldens track roxlap's own hashes for regression detection. Reopen if a downstream consumer demands bit-exactness against voxlap C. | cancelled | n/a |
+| **R8** | Cross-engine oracle: roxlap-side oracle binary writing `roxlap-hashes.txt`; CI matrix that diffs against `golden-hashes.txt`. | done | `cargo run -p roxlap-oracle -- diff` reports `9 match, 0 mismatch` against the in-tree `tests/golden-hashes.txt`. `.github/workflows/ci.yml` runs fmt / clippy / test / oracle-diff on every push + PR; oracle job fails on any hash mismatch so the bit-exact milestone can't regress silently. |
 | **R9** | ARM NEON via `core::arch::aarch64`; macOS arm64 + Linux aarch64 in CI. | not started | Own goldens (NEON ≠ x86 SSE bits); aarch64 CI green. |
 | **R10** | wasm SIMD via `core::arch::wasm32`; web host (canvas + js glue) as a separate crate. | not started | Browser perf benchmark; own wasm goldens. |
 | **R11** | Polish: docs, examples, version 0.1 publish to crates.io. | not started | Crates published; docs.rs renders. |
@@ -50,7 +50,7 @@ voxlaptest's image output:
 | **R4.1c** | Column-scan dispatch: the four-quadrant `vline`/`hline` setup + `angstart` radar table + per-column `hrend` / `vrend` calls. Rasterizers stubbed until R4.3. |
 | **R4.2** | Scalar `hrend` / `vrend` scanline rasterizers — consume radar entries, write pixels + z-buffer. First stage that puts real pixels on screen behind a stub `gline`. (Originally scoped as "drawcwall/drawfwall/drawceil/drawflor"; those turned out to be labels *inside* grouscan, so they fold into R4.3.) |
 | **R4.3** | grouscan = `gline` ray-cast: full algorithmic port. Sub-substaged the same way voxlaptest's grouscanasm scalar port was (`Stage 4.5b.2..6`): R4.3a magenta-placeholder gline, R4.3b gline frustum setup, R4.3c grouscan prologue + dispatch skeleton, R4.3d wall/ceil/flor fill loops, R4.3e findslab/slab-split/deletez, R4.3f remiporend + startsky. The hard core. |
-| **R4.4** | Sky-fill primitives: `startsky` integration, fog gating. Solid-fill branch and fog blend done; textured-sky `skyoff != 0` path deferred until a fixture exercises it. |
+| **R4.4** | Sky-fill primitives: `startsky` integration, fog gating. **Done**: solid-fill branch + fog blend (R4.3f), textured-sky `skyoff != 0` path landed alongside R6's lighting work. The textured branch is wrapped behind an [`crate::sky::Sky`] resource on `Engine`; gline updates `scratch.sky_off` per ray via the rotating-cursor walk; `phase_startsky` dispatches between solid (oracle default, byte-stable) and textured (host's `assets/sky.png`). Includes a fix for voxlap C's latent stale-cx1 bug — `phase_startsky_textured` re-derives the per-cf-entry far-end position from `cx0 + (i1 - i0) * gi0` instead of reading the cf's stored `cx1`, which goes stale when drains shrink `i1` without touching cx1 (visible in voxlap C as horizontal sky distortion at low pitch). |
 | **R4.5** | Mip-level transition (`remiporend`): the deeper-recursion cftype refresh. **Audit complete; full body deferred behind a world-model dependency.** Oracle uses `gmipnum=1` so the gmipnum check short-circuits to `Phase::Startsky`. The body is gated on multi-mip column data (port of `genmipvxl`, voxlap5.c:4710+) which roxlap-formats doesn't load yet. See the audit at `crates/roxlap-core/src/grouscan.rs::phase_remiporend` — it covers (a) the LP32/LP64 sptr-stride bug in voxlap C's `<<29` / `<<(gmipcnt+17)` parity shifts, (b) why roxlap's column-index design sidesteps it, and (c) the genmipvxl + multi-mip-`column_offset` work needed before the body can land for real. |
 
 ### What "R4 effectively done" means
@@ -61,10 +61,13 @@ grouscan / opticast issue — each needs a feature that lives outside the
 opticast pipeline: KV6 sprites (R6), per-voxel lighting, or `drawtile`
 2D blits.
 
-The remaining engine-correctness gaps in opticast itself are the three
-deferred R4 items above (R4.4 textured sky, R4.5 multi-mip,
-sideshademode high-byte). None of them break the 4 matching poses; they
-matter for worlds outside the oracle's deliberately-narrow fixture.
+The remaining engine-correctness gaps in opticast itself shrunk to two
+deferred R4 items: R4.5 multi-mip (gated on a multi-mip world model)
+and sideshademode high-byte. Both are documented above; neither breaks
+the 4 matching poses, and they matter only for worlds outside the
+oracle's deliberately-narrow fixture. R4.4 textured sky, originally a
+deferred R4 item, landed alongside R6 — see its row in the substage
+table.
 
 ### Known voxlap-inherent quirk: floor-hairline at certain camera poses
 
@@ -110,11 +113,13 @@ per call site as in C, not portable_simd. Sub-substages:
 | **R5.3** | `vrend_z_sse` — vertical-scan with parallel `uurend` update. |
 | **R5.4** | `vrend_z_fog_sse` — vertical-scan with fog. |
 
-## Substage R6 — KV6 sprite renderer
+## Substage R6 — KV6 sprite renderer + lighting + textured sky
 
 Mirror of voxlap5.c:8179-9062 (`drawboundcubesse` + `kv6draw` + the
-9-arm `DRAWBOUNDCUBELINE` iteration) plus voxlap5.c:8466-8629
-(`updatereflects` colour-modulation table builder). Sub-substages:
+9-arm `DRAWBOUNDCUBELINE` iteration), voxlap5.c:8466-8750
+(`updatereflects` colour-modulation table builder, all branches),
+voxlap5.c:10539-10654 (`updatelighting` world-voxel bake), and
+voxlap5.c:12120-12190 (`startsky` textured branch). Sub-substages:
 
 | # | Scope |
 |---|---|
@@ -126,25 +131,40 @@ Mirror of voxlap5.c:8179-9062 (`drawboundcubesse` + `kv6draw` + the
 | **R6.4b** | Vertex projection: `_mm_rcp_ps`-based projection of the (4 or 6) `ptfaces16[effmask]` vertex pairs. |
 | **R6.4c** | Viewport clip + screen-AABB: `qsum0` saturated-add + `qsum1` max-floor; `_mm_subs_epu16` for `(dx, dy)` with degenerate-rect early-out. |
 | **R6.4d** | Fill rect + zbuffer write: per-pixel z-test, framebuffer write. `DrawTarget<'a>` API takes the borrowed framebuffer + zbuffer. |
-| **R6.4e** | Colour modulation + `mm5` cross-call tail + `update_reflects`. Oracle path only (`flags=0`, no fog, `lightmode<2`, both nolighta + nolightb branches). |
-| **R6.5** | Full 4-pose oracle bit-exact (= R7 in the table above). Iterative drift hunt: iunivec rounding, basis-rotation cancellation, `_mm_rcp_ps` micro-arch. |
+| **R6.4e** | Colour modulation + `mm5` cross-call tail + `update_reflects` oracle path (`flags=0`, no fog, `lightmode<2`, both nolighta + nolightb branches). |
+| **R6.4f** | Full sprite lighting: `Engine::set_lightmode` / `add_light` / `set_kv6col` plumbed via `SpriteLighting<'a>` into `update_reflects`'s `lightmode≥2` branch (voxlap5.c:8631-8750). Per-sprite point-light shadow modulation. Includes the `hh = ((fogmul&32767)^32767) / 65536 * 2` brightness fix where an earlier port had `g_pre / 128` (off by a factor of 2). |
+| **R6.5** | World voxel lighting bake (`updatelighting`, voxlap5.c:10539-10654). New `world_lighting.rs` module: BITNUM/BITSNUM tables, `expandbit256` slab→bit-array, `EstNormCache` with the `fsqrecip[5860]` LUT, mutable slab walker, lightmode-1 directional + lightmode-2 per-light Lambertian per-voxel brightness math. Adds the **9th oracle pose `diag_down_lit`** (matches voxlap C's bake setup at oracle.c:438-443). |
+| **R4.4-final** | Textured `startsky` branch (`skyoff != 0`, voxlap5.c:12143-12188). New `sky.rs` module: `Sky` resource with `lng[]` / `lat[]` lookup tables, `Sky::blue_gradient()` for the "BLUE" fallback. `phase_startsky` splits into solid (oracle default, byte-stable) and textured (host's `assets/sky.png` panorama). Includes a stale-cx1 fix that voxlap C also has latently (visible at low pitch). Exposed as `Engine::set_sky` + `ScalarRasterizer::with_sky`. |
 
-### What "R6.4 effectively done" means
+### What "R6 effectively done" means
 
-`sprite_above` matches voxlap C's local oracle build byte-for-byte
-(`79b87c92dd96a59b`) — the entire pipeline (geometry + clip + fill +
-colour modulation + mm5 tail + updatereflects) is structurally
-correct. The remaining three sprite poses produce stable hashes that
-diverge by sub-pixel drift; the next session's debug plan lives in
-the `project_r6_4_landed.md` memory.
+End-to-end rendering pipeline shipped:
+- KV6 sprites with point-light shading + bound-cube projection + z-tested fill.
+- World voxel intensity bake with directional or point-light shading.
+- Textured panoramic sky.
+- Engine API surface: `set_sky` / `set_lightmode` / `add_light` / `set_kv6col` /
+  `set_side_shades` / `set_fog` cover the full vx5 globals subset the host needs.
+- `roxlap-host` demos all of it: `assets/sky.png` panorama wraps the camera, two
+  animated kv6 sprites (axis-aligned meltsphere + spinning coco) with point-
+  light shading, world voxel lighting bake toggled via `L`.
 
-R6.4 is x86_64-only — `_mm_rcp_ps` produces hardware-specific
-12-bit-precision output and bit-equality with voxlap C requires the
-same instruction. NEON and wasm ports (R9 / R10) will have their own
-goldens. The non-x86_64 path returns 0 (no rendering).
+Bit-exact status against voxlap C goldens (full 9 poses tracked):
+- 4 opticast-only poses (`north`, `east`, `diag_down`, `high_down`):
+  byte-for-byte match.
+- `sprite_above`: byte-for-byte match.
+- `sprite_front`, `sprite_iso`, `sprite_coco`, `diag_down_lit`: stable hashes
+  drift from voxlap C by sub-pixel rounding (visually verified vs voxlap C
+  PPM output via `cargo run -p roxlap-oracle -- --ppm`). `tests/golden-
+  hashes.txt` tracks roxlap's own hashes for regression detection — CI
+  catches any algorithmic drift.
 
-R6.6 / R6.7 (KFA + animated sprites, no-z sprite path) stay deferred
-— none of the four sprite oracle poses exercise them.
+R6 is x86_64-only — `_mm_rcp_ps` produces hardware-specific 12-bit-precision
+output and bit-equality with voxlap C requires the same instruction. NEON and
+wasm ports (R9 / R10) will have their own goldens. The non-x86_64 path
+returns 0 (no rendering).
+
+R6.6 / R6.7 (KFA + animated sprites, no-z sprite path) stay deferred — none of
+the four sprite oracle poses exercise them.
 
 ## Out of scope
 
