@@ -1134,6 +1134,9 @@ dependencies = [
 [[package]]
 name = "roxlap-core"
 version = "0.0.0"
+dependencies = [
+ "roxlap-formats",
+]
 
 [[package]]
 name = "roxlap-formats"

@@ -8,5 +8,10 @@ authors.workspace = true
 rust-version.workspace = true
 description = "Pure-Rust port of Ken Silverman's Voxlap voxel engine — engine core."
 
+[dependencies]
+# R6: meltsphere builds Kv6 sprites from world voxel data; the Kv6
+# type lives in the formats crate alongside the parser/serialiser.
+roxlap-formats = { path = "../roxlap-formats" }
+
 [lints]
 workspace = true
