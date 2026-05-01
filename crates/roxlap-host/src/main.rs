@@ -358,13 +358,11 @@ impl ApplicationHandler for App {
                     return;
                 };
                 match code {
-                    KeyCode::Escape => {
-                        if pressed {
-                            if self.grabbed {
-                                self.set_grabbed(false);
-                            } else {
-                                event_loop.exit();
-                            }
+                    KeyCode::Escape if pressed => {
+                        if self.grabbed {
+                            self.set_grabbed(false);
+                        } else {
+                            event_loop.exit();
                         }
                     }
                     KeyCode::KeyW => self.keys.set(KeyState::FORWARD, pressed),
@@ -378,10 +376,8 @@ impl ApplicationHandler for App {
                     KeyCode::ControlLeft | KeyCode::ControlRight => {
                         self.keys.set(KeyState::FAST, pressed);
                     }
-                    KeyCode::KeyF => {
-                        if pressed {
-                            self.capture_pending = true;
-                        }
+                    KeyCode::KeyF if pressed => {
+                        self.capture_pending = true;
                     }
                     _ => {}
                 }
@@ -391,10 +387,8 @@ impl ApplicationHandler for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => {
-                if !self.grabbed {
-                    self.set_grabbed(true);
-                }
+            } if !self.grabbed => {
+                self.set_grabbed(true);
             }
 
             WindowEvent::Focused(false) => {
