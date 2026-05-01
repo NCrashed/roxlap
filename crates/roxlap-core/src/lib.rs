@@ -18,6 +18,7 @@ pub mod meltsphere;
 pub mod opticast;
 pub mod opticast_prelude;
 pub mod projection;
+pub mod ptfaces16;
 pub mod rasterizer;
 pub mod ray_step;
 pub mod scalar_rasterizer;

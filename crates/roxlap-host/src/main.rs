@@ -292,10 +292,10 @@ impl App {
             );
         }
 
-        // R6.2 sprite-plumbing call: dispatcher runs the mip-LOD
-        // pick + 4-plane frustum cull but writes no pixels yet
-        // (returns false either way). R6.3+ will plug in the real
-        // per-voxel iteration + rasterizer behind this same call.
+        // R6.4a sprite-plumbing call: dispatcher runs cull + setup
+        // math + per-voxel iteration through scissor. No pixels
+        // written yet — R6.4b/c/d add vertex projection, screen-
+        // AABB, and the fill loop.
         let cam_state = camera_math::derive(
             &cam,
             size.width,
@@ -304,7 +304,7 @@ impl App {
             settings.hy,
             settings.hz,
         );
-        let _ = draw_sprite(&cam_state, &self.sprite);
+        let _ = draw_sprite(&cam_state, &settings, &self.sprite);
 
         if self.capture_pending {
             self.capture_pending = false;
