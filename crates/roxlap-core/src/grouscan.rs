@@ -110,11 +110,19 @@ pub struct GrouscanInputs<'a> {
     /// this at `column_offsets[ixy_sptr_col_idx]` to refresh
     /// `state.column`.
     pub slab_buf: &'a [u8],
-    /// `vsid² × u32` table of byte offsets into `slab_buf`, one
-    /// per voxel column. Voxlap stores this as `unsigned char **`
-    /// (`sptr`); we use `u32` offsets to keep the port pointer-
-    /// free.
+    /// Per-column byte offsets into `slab_buf`, concatenated across
+    /// every built mip level. Mip-0's sub-table is the prefix
+    /// (`vsid² + 1` entries) — pre-multi-mip callers passing
+    /// `&vxl.column_offset` keep working. R4.5d's `phase_remiporend`
+    /// will switch to indexing via `mip_base_offsets[gmipcnt + 1]`
+    /// to land in mip-N+1's sub-table.
     pub column_offsets: &'a [u32],
+    /// `mip_base_offsets[mip]` is the start index of mip-N's
+    /// sub-table in [`Self::column_offsets`]. Length
+    /// `mip_count + 1`; the trailing sentinel equals
+    /// `column_offsets.len()`. Single-mip callers pass
+    /// `&[0, vsid² + 1]`.
+    pub mip_base_offsets: &'a [usize],
     /// Optional sky texture borrow. `None` ⇒ `phase_startsky`
     /// always solid-fills with `scratch.skycast` (the existing
     /// behaviour). `Some(_)` ⇒ `phase_startsky` runs the textured
@@ -153,8 +161,12 @@ pub(crate) struct GrouscanState<'a> {
     pub gcsub: &'a [i64; 9],
     /// World-level flat slab buffer (see [`GrouscanInputs`]).
     pub slab_buf: &'a [u8],
-    /// Per-column byte offsets into [`Self::slab_buf`].
+    /// Per-column byte offsets into [`Self::slab_buf`], concatenated
+    /// across all built mip levels (see [`GrouscanInputs`]).
     pub column_offsets: &'a [u32],
+    /// Per-mip column-offset sub-table base indices (see
+    /// [`GrouscanInputs`]).
+    pub mip_base_offsets: &'a [usize],
     /// Sky texture borrow (see [`GrouscanInputs::sky`]).
     pub sky: Option<SkyRef<'a>>,
 
@@ -254,6 +266,7 @@ impl<'a> GrouscanState<'a> {
             gcsub: inputs.gcsub,
             slab_buf: inputs.slab_buf,
             column_offsets: inputs.column_offsets,
+            mip_base_offsets: inputs.mip_base_offsets,
             sky: inputs.sky,
             z0: c.z0,
             z1: c.z1,
@@ -1738,6 +1751,10 @@ mod tests {
     const DUMMY_COLUMN: [u8; 4] = [0, 0, 0, 0];
     const DUMMY_SLAB_BUF: [u8; 0] = [];
     const DUMMY_COLUMN_OFFSETS: [u32; 0] = [];
+    /// Single-mip placeholder: `[0, column_offsets.len()]` is the
+    /// shape post-`Vxl::parse` callers send. With an empty
+    /// `DUMMY_COLUMN_OFFSETS`, this collapses to `[0, 0]`.
+    const DUMMY_MIP_OFFSETS: [usize; 2] = [0, 0];
 
     fn dummy_inputs<'a>() -> GrouscanInputs<'a> {
         GrouscanInputs {
@@ -1746,6 +1763,7 @@ mod tests {
             gcsub: &DUMMY_GCSUB,
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
+            mip_base_offsets: &DUMMY_MIP_OFFSETS,
             sky: None,
         }
     }
@@ -1881,6 +1899,7 @@ mod tests {
             gcsub,
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
+            mip_base_offsets: &DUMMY_MIP_OFFSETS,
             sky: None,
         };
         GrouscanState::from_seed(scratch, &inputs, 0, 0, 1)
@@ -1899,6 +1918,7 @@ mod tests {
             gcsub,
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
+            mip_base_offsets: &DUMMY_MIP_OFFSETS,
             sky: None,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
@@ -2058,6 +2078,7 @@ mod tests {
             gcsub,
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
+            mip_base_offsets: &DUMMY_MIP_OFFSETS,
             sky: None,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
@@ -2364,6 +2385,7 @@ mod tests {
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
+            mip_base_offsets: &[0, column_offsets.len()],
             sky: None,
         };
         let mut s = fresh_scratch();
@@ -2398,6 +2420,7 @@ mod tests {
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
+            mip_base_offsets: &[0, column_offsets.len()],
             sky: None,
         };
         let mut s = fresh_scratch();
@@ -2512,6 +2535,7 @@ mod tests {
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
+            mip_base_offsets: &[0, column_offsets.len()],
             sky: None,
         };
         let mut s = fresh_scratch();
@@ -2535,6 +2559,7 @@ mod tests {
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
+            mip_base_offsets: &[0, column_offsets.len()],
             sky: None,
         };
         let mut s = fresh_scratch();

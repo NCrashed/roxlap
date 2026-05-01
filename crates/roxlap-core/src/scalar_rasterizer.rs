@@ -189,10 +189,18 @@ pub struct ScalarRasterizer<'a> {
     /// data). Re-borrowed from opticast's caller for the lifetime
     /// of the rasterizer.
     slab_buf: &'a [u8],
-    /// Per-column byte offsets into [`Self::slab_buf`].
-    /// `column_offsets[i]..column_offsets[i + 1]` is column `i`'s
-    /// slab list. Length is `vsid² + 1`.
+    /// Per-column byte offsets into [`Self::slab_buf`], concatenated
+    /// across all built mip levels. The mip-0 sub-table prefix
+    /// (`vsid² + 1` entries) is what existing single-mip callers
+    /// pass; multi-mip callers pass the full concatenation and
+    /// declare boundaries via [`Self::mip_base_offsets`].
     column_offsets: &'a [u32],
+    /// Per-mip column-offset sub-table base indices. Length
+    /// `mip_count + 1`; trailing sentinel equals
+    /// `column_offsets.len()`. Single-mip callers pass
+    /// `&[0, vsid² + 1]`. R4.5d's `phase_remiporend` indexes
+    /// this to land in mip-N+1's sub-table.
+    mip_base_offsets: &'a [usize],
     /// World dimension. Combined with the prelude's `column_index`
     /// and the column-step path in grouscan, this is what lets the
     /// real gline walk the per-ray voxel-column traversal.
@@ -217,9 +225,10 @@ impl<'a> ScalarRasterizer<'a> {
     /// the engine renders into; the `frame_setup` hook does not
     /// validate sizes (it has no height to check against).
     ///
-    /// `slab_buf` / `column_offsets` / `vsid` describe the world
-    /// the renderer reads from. Same shape as opticast's world
-    /// arguments — pass the same values.
+    /// `slab_buf` / `column_offsets` / `mip_base_offsets` / `vsid`
+    /// describe the world the renderer reads from. Pass the matching
+    /// fields from a [`roxlap_formats::vxl::Vxl`] (or, for tests,
+    /// `&[0, vsid² + 1]` as the single-mip placeholder).
     ///
     /// `ray_step` is initialised to a zero placeholder; the real
     /// values get stamped on the first [`Rasterizer::frame_setup`]
@@ -231,6 +240,7 @@ impl<'a> ScalarRasterizer<'a> {
         pitch_pixels: usize,
         slab_buf: &'a [u8],
         column_offsets: &'a [u32],
+        mip_base_offsets: &'a [usize],
         vsid: u32,
     ) -> Self {
         Self {
@@ -239,6 +249,7 @@ impl<'a> ScalarRasterizer<'a> {
             pitch_pixels,
             slab_buf,
             column_offsets,
+            mip_base_offsets,
             vsid,
             sky: None,
             frame: None,
@@ -446,16 +457,24 @@ impl Rasterizer for ScalarRasterizer<'_> {
             gcsub: &gcsub_local,
             slab_buf: self.slab_buf,
             column_offsets: self.column_offsets,
+            mip_base_offsets: self.mip_base_offsets,
             sky: self.sky.map(crate::grouscan::SkyRef::from_sky),
         };
+        // gmipnum = number of built mip levels. R4.5d's
+        // `phase_remiporend` body will start incrementing
+        // `state.gmipcnt` once gmipnum > 1 and the column step's
+        // `gpz > ngxmax` overflow fires; until then a multi-mip
+        // world simply renders mip-0 only, byte-stable with the
+        // single-mip path.
+        let gmipnum = u32::try_from(self.mip_base_offsets.len().saturating_sub(1))
+            .expect("mip count fits in u32");
         let _ = grouscan_run(
             scratch,
             &inputs,
             cache.vptr_offset,
             cache.prelude.column_index as usize,
             cache.prelude.x_mip,
-            1, // gmipnum — single-mip until R4.5 lands the full
-               // remiporend body and a real multi-mip world.
+            gmipnum.max(1),
         );
 
         // gscanptr is advanced by the opticast quadrant scan
@@ -756,7 +775,7 @@ mod tests {
     fn frame_setup_caches_ray_step() {
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -788,7 +807,7 @@ mod tests {
         // ionally not bit-checked).
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -893,7 +912,7 @@ mod tests {
         // and verify the framebuffer received the colours.
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -980,8 +999,16 @@ mod tests {
             *offset = column_len_u32;
         }
 
-        let mut rasterizer =
-            ScalarRasterizer::new(&mut fb, &mut zb, 640, &column, &column_offsets, 2048);
+        let mip_base_offsets = [0usize, column_offsets.len()];
+        let mut rasterizer = ScalarRasterizer::new(
+            &mut fb,
+            &mut zb,
+            640,
+            &column,
+            &column_offsets,
+            &mip_base_offsets,
+            2048,
+        );
 
         let cam = crate::Camera {
             pos: [1024.0, 1024.0, 128.0],
@@ -1030,7 +1057,7 @@ mod tests {
         // colour and uurend advanced.
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -1086,7 +1113,7 @@ mod tests {
         // happens once per pixel.
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], 64);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,

@@ -467,6 +467,7 @@ impl App {
                 pitch_pixels,
                 &self.vxl.data,
                 &self.vxl.column_offset,
+                &self.vxl.mip_base_offsets,
                 self.vxl.vsid,
             );
             // Bind the sky if the engine has one — opts the

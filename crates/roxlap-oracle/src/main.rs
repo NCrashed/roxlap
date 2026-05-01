@@ -411,6 +411,7 @@ fn render_pose(
             pitch_pixels,
             &vxl.data,
             &vxl.column_offset,
+            &vxl.mip_base_offsets,
             vxl.vsid,
         );
         let _ = opticast(
@@ -967,6 +968,7 @@ fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
             hx as usize,
             &vxl_world.data,
             &vxl_world.column_offset,
+            &vxl_world.mip_base_offsets,
             vxl_world.vsid,
         );
         let _ = opticast(
