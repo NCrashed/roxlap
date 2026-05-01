@@ -123,6 +123,12 @@ pub struct GrouscanInputs<'a> {
     /// `column_offsets.len()`. Single-mip callers pass
     /// `&[0, vsid² + 1]`.
     pub mip_base_offsets: &'a [usize],
+    /// World dimension at mip-0. Power of two (voxlap-canonical
+    /// values are 1024 / 2048). `phase_remiporend` consumes this
+    /// to derive the y-parity bit position
+    /// (`log2(vsid >> gmipcnt)`) when rebasing the column index
+    /// across a mip transition.
+    pub vsid: u32,
     /// Optional sky texture borrow. `None` ⇒ `phase_startsky`
     /// always solid-fills with `scratch.skycast` (the existing
     /// behaviour). `Some(_)` ⇒ `phase_startsky` runs the textured
@@ -167,6 +173,8 @@ pub(crate) struct GrouscanState<'a> {
     /// Per-mip column-offset sub-table base indices (see
     /// [`GrouscanInputs`]).
     pub mip_base_offsets: &'a [usize],
+    /// World dimension at mip-0 (see [`GrouscanInputs::vsid`]).
+    pub vsid: u32,
     /// Sky texture borrow (see [`GrouscanInputs::sky`]).
     pub sky: Option<SkyRef<'a>>,
 
@@ -267,6 +275,7 @@ impl<'a> GrouscanState<'a> {
             slab_buf: inputs.slab_buf,
             column_offsets: inputs.column_offsets,
             mip_base_offsets: inputs.mip_base_offsets,
+            vsid: inputs.vsid,
             sky: inputs.sky,
             z0: c.z0,
             z1: c.z1,
@@ -1429,101 +1438,45 @@ fn column_byte_at(state: &GrouscanState<'_>, offset: usize) -> u8 {
 
 /// `remiporend` — voxlap5.c:11998-12118. Mip-level transition.
 ///
-/// **R4.5 status**: audit complete; full body deferred behind a
-/// world-model dependency. Detailed reasoning below.
+/// Coarsens the active raycast onto mip-(N+1): doubles `gdz`/`ngxmax`,
+/// halves `gixy[1]` and every active `cf` entry's `z0`/`z1`, slides
+/// `gylookup` to the mip-(N+1) sub-range, and rebases
+/// `ixy_sptr_col_idx` into mip-(N+1)'s `column_offsets` sub-table.
 ///
-/// # Why this is a stub, not a body
-///
-/// The C body coarsens the active raycast onto the next mip
-/// level: doubles `gdz`/`ngxmax`, halves `gixy[1]` and every
-/// active `cf` entry's `z0`/`z1`, slides `gylookoff` to the
-/// mip-(N+1) sub-range of `gylookup`, and **rebases
-/// `ixy_sptr_col`** to point into the mip-(N+1) sub-table of
-/// the global `sptr` array.
-///
-/// That last step is the blocker. Voxlap's `sptr` is laid out
-/// as concatenated per-mip column-pointer sub-arrays:
-///
-/// ```text
-/// [ mip-0: VSID²    pointers ]
-/// [ mip-1: (VSID/2)² pointers ]
-/// [ mip-2: (VSID/4)² pointers ]
-/// ...
-/// ```
-///
-/// The mip-N+ entries are populated at world-load time by
-/// `genmipvxl` (voxlap5.c:4710+). roxlap-formats currently
-/// reads only the mip-0 columns from `.vxl` (the on-disk format
-/// stores only mip-0); roxlap has no equivalent of `genmipvxl`,
-/// so `Vxl::column_offset` is exactly `vsid² + 1` entries —
-/// mip-0 only. There's nowhere for the rebase to point.
-///
-/// Reaching this branch requires `gmipnum > 1`, which is gated
-/// on `vx5.vxlmipuse > 1` in voxlap C. The oracle uses
-/// `vxlmipuse == 1`, so all 12 oracle poses (and the 4 currently
-/// bit-exact) take the `Phase::Startsky` early-out and never
-/// reach the body. This stub preserves that behaviour.
+/// Reaching this branch requires `gmipnum > 1`. The oracle uses
+/// `gmipnum == 1` (no host calls [`roxlap_formats::vxl::Vxl::generate_mips`]
+/// yet), so all 12 poses take the `(gmipcnt + 1) >= gmipnum`
+/// early-out — the body below is byte-stable dead code at oracle
+/// time.
 ///
 /// # LP32 / LP64 sptr-stride bug audit (voxlap5.c:12017-12023)
 ///
 /// The C body's `xor0 = (esi_rel << 29) ^ gixy[0]` and
 /// `xor1 = (esi_rel << (gmipcnt + 17)) ^ gixy[1]` parity tests
-/// were calibrated for `sizeof(char *) == 4`. After
-/// voxlaptest's LP64 widen (`SPTR_LOG2_STRIDE = 3`,
-/// `voxlap5.c:99-104`), `esi_rel = ixy_sptr_col - sptr` carries
-/// an extra factor of 2 in its low bits, so:
+/// were calibrated for `sizeof(char *) == 4`. After voxlaptest's
+/// LP64 widen (`SPTR_LOG2_STRIDE = 3`, `voxlap5.c:99-104`),
+/// `esi_rel = ixy_sptr_col - sptr` carries an extra factor of 2,
+/// so:
 ///
 /// | shift              | LP32 tests                    | LP64 tests                       |
 /// |--------------------|-------------------------------|----------------------------------|
 /// | `<<29`             | bit 0 of `column_index` (x parity) | bit −1 (always 0 → always "add") |
 /// | `<<(gmipcnt + 17)` | depends on VSID + N (off-by-one even on LP32 for VSID > 1024) | even more wrong |
 ///
-/// The C source carries an explicit `NOTE` flagging this and
-/// documents the gating on `vxlmipuse == 1` as the reason
-/// nothing has burned. **roxlap sidesteps the whole issue**:
-/// its `ixy_sptr_col_idx` is an *element* index into
-/// `column_offsets` (no pointer-stride at all), so the natural
-/// expression of the parity test in roxlap is
-/// `(column_index >> bit_pos) & 1`, with `bit_pos` derived
-/// from VSID and `gmipcnt`:
-///
-/// - lane 0 (x parity at mip-N): `bit_pos = gmipcnt`
-/// - lane 1 (y parity at mip-N): `bit_pos = log2(vsid) + gmipcnt`
-///
-/// This is LP-independent and VSID-independent by construction.
-/// When the multi-mip world model lands, the body should use
-/// these bit positions directly rather than porting the C
-/// shift arithmetic.
-///
-/// # Safer fall-through: Startsky, not Done
-///
-/// Pre-R4.5 this stub returned `Phase::Done` once the gmipnum
-/// check failed, leaving every still-open `cf` entry's pixel
-/// range unwritten in `radar`. For multi-mip worlds (which
-/// roxlap doesn't load yet, but a host crate could in theory
-/// build by hand) that surfaces as garbage in the radar tail.
-/// `Phase::Startsky` instead fills the tail with sky — the same
-/// behaviour `gmipcnt + 1 >= gmipnum` triggers naturally, and
-/// the visually-correct fallback for "ran out of voxel data
-/// along this ray".
-///
-/// # Open follow-ups before R4.5 can land for real
-///
-/// 1. Port `genmipvxl` (voxlap5.c:4710+) to roxlap-formats so
-///    `Vxl` carries mip-1+ column data.
-/// 2. Extend `column_offset` to concatenate per-mip sub-tables,
-///    or split into a `Vec<Box<[u32]>>` indexed by mip level.
-///    Plumb a `mip_base_offsets: &[u32]` view through
-///    `GrouscanInputs` so `phase_remiporend` can do the rebase.
-/// 3. Then: implement the body using column-index parity tests
-///    (above) and the per-mip `mip_base_offsets` for the rebase.
+/// The C source flags this with an explicit `NOTE` and gates the
+/// path on `vxlmipuse == 1` so it never burns. **Roxlap sidesteps
+/// the whole issue**: `ixy_sptr_col_idx` is an *element* index
+/// (no pointer-stride at all), and the body below derives parity
+/// directly from `(column_index - mip_base) & (vsid_OLD - 1)` /
+/// `>> log2(vsid_OLD)`. LP-independent and VSID-independent by
+/// construction.
 //
 // Voxlap's outer check is `(uint8_t)(gmipcnt + 1) >=
 // (uint8_t)gmipnum` — bytewise compare. For our port the
 // natural i32/u32 widths give the same answer for any
 // realistic mip count (0..32-ish); the byte-cast was an asm
 // artifact.
-#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     if std::env::var("ROXLAP_TRACE_STARTSKY").is_ok() {
         eprintln!(
@@ -1541,11 +1494,149 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     if (state.gmipcnt + 1) as u32 >= state.gmipnum {
         return Phase::Startsky;
     }
-    // Multi-mip transition reached but no mip-N+ column data
-    // available in roxlap's world model yet (see doc comment).
-    // Safer than `Phase::Done`: fill the rest of the ray with
-    // sky instead of leaving the radar tail uninitialized.
-    Phase::Startsky
+
+    // Voxlap5.c:12007 — increment gmipcnt to NEW (= OLD + 1).
+    let old_mip = state.gmipcnt as usize;
+    state.gmipcnt += 1;
+    let new_mip = state.gmipcnt as usize;
+
+    // Column-index parity at mip-OLD. Audit at the doc comment
+    // above: `ixy_sptr_col_idx` is currently in mip-OLD's
+    // sub-table; subtracting `mip_base_offsets[old_mip]` gives
+    // col-within-mip whose low bit is x parity and bit
+    // `log2(vsid_OLD)` is y parity. This sidesteps voxlap C's
+    // LP32-baked `<<29` / `<<(gmipcnt+17)` shift trick.
+    let mip_old_base = state.mip_base_offsets[old_mip];
+    let mip_new_base = state.mip_base_offsets[new_mip];
+    let col_within_old = state.ixy_sptr_col_idx - mip_old_base;
+    let vsid_old = (state.vsid >> old_mip) as usize;
+    debug_assert!(vsid_old.is_power_of_two() && vsid_old > 0);
+    let log2_vsid_old = vsid_old.trailing_zeros() as usize;
+    let x_parity = col_within_old & 1;
+    let y_parity = (col_within_old >> log2_vsid_old) & 1;
+
+    // Voxlap5.c:12012-12037 — lane 0 (x) gpz/gdz adjust.
+    // C: `xor0 = (esi_rel<<29) ^ gixy[0]`; if bit-31 zero, add gdz.
+    // Bit 31 of xor0 == (col-x-parity) XOR (sign-bit of gixy[0]).
+    // Trailing column ⇒ next column-step lands inside the same
+    // mip-NEW super-cell, so advance gpz to the next coarser
+    // grid line.
+    {
+        let dz = state.scratch.gdz[0];
+        let trailing = (x_parity == 0) == (state.scratch.gixy[0] >= 0);
+        if trailing {
+            state.scratch.gpz[0] = state.scratch.gpz[0].wrapping_add(dz);
+        }
+        let doubled = dz.wrapping_add(dz);
+        if (dz ^ doubled) < 0 {
+            // Signed overflow → saturate gpz to i32::MAX, gdz to 0
+            // (voxlap5.c:12030-12036).
+            state.scratch.gpz[0] = i32::MAX;
+            state.scratch.gdz[0] = 0;
+        } else {
+            state.scratch.gdz[0] = doubled;
+        }
+    }
+
+    // Voxlap5.c:12043 — save z0 to the c_presync slot before the
+    // halve loop runs. Voxlap relies on `c_presync` lying inside
+    // `[cf[128], ce]` so the loop halves it as a side effect; the
+    // explicit reload below halves it AGAIN (yes, twice — voxlap's
+    // literal asm fix-up). Defensive guard handles the unset
+    // (`usize::MAX`) case even though voxlap C dereferences
+    // unconditionally.
+    if state.c_presync_idx < state.scratch.cf.len() {
+        state.scratch.cf[state.c_presync_idx].z0 = state.z0;
+    }
+
+    // Voxlap5.c:12047-12060 — lane 1 (y) gpz/gdz adjust.
+    {
+        let dz = state.scratch.gdz[1];
+        let trailing = (y_parity == 0) == (state.scratch.gixy[1] >= 0);
+        if trailing {
+            state.scratch.gpz[1] = state.scratch.gpz[1].wrapping_add(dz);
+        }
+        let doubled = dz.wrapping_add(dz);
+        if (dz ^ doubled) < 0 {
+            state.scratch.gpz[1] = i32::MAX;
+            state.scratch.gdz[1] = 0;
+        } else {
+            state.scratch.gdz[1] = doubled;
+        }
+    }
+
+    // Voxlap5.c:12062-12073 — re-mask `ixy_sptr_col_idx` into
+    // mip-NEW's sub-table. The audit's natural form: halve the
+    // OLD-mip x/y coords, then index the NEW sub-table.
+    {
+        let x_old = col_within_old & (vsid_old - 1);
+        let y_old = col_within_old >> log2_vsid_old;
+        let x_new = x_old >> 1;
+        let y_new = y_old >> 1;
+        let vsid_new = vsid_old >> 1;
+        state.ixy_sptr_col_idx = mip_new_base + y_new * vsid_new + x_new;
+    }
+
+    // Voxlap5.c:12076 — slide `gylookup` to mip-NEW's sub-range.
+    // Each mip-N table is `(512 >> N) + 4` int32 entries; advance
+    // by mip-OLD's length to skip past it.
+    {
+        let advance = ((512u32 >> old_mip) as usize) + 4;
+        let advance = advance.min(state.gylookup.len());
+        state.gylookup = &state.gylookup[advance..];
+    }
+
+    // Voxlap5.c:12079 — halve gixy[1] (signed arithmetic shift).
+    state.scratch.gixy[1] >>= 1;
+
+    // Voxlap5.c:12084-12087 — halve every active cf entry's z bounds.
+    // z0 uses unsigned shift (rounds down, preserves voxlap's `shr`
+    // semantics on negative z arising from underflow on air-gap
+    // entries); z1 uses `(z1 + 1) >> 1` (round up).
+    for idx in CF_SEED_INDEX..=state.ce_idx {
+        let entry = &mut state.scratch.cf[idx];
+        entry.z0 = (entry.z0 as u32 >> 1) as i32;
+        entry.z1 = ((entry.z1 + 1) as u32 >> 1) as i32;
+    }
+
+    // Voxlap5.c:12089-12095 — saturating-double ngxmax (capped at
+    // gxmax). Pre-doubled comparison uses unsigned semantics to
+    // catch the wrapping-overflow case.
+    let gxmax = state.scratch.gxmax;
+    if (state.ngxmax as u32) >= (gxmax as u32) {
+        return Phase::Startsky;
+    }
+    let dn = state.ngxmax.wrapping_add(state.ngxmax);
+    state.ngxmax = if dn < 0 || dn >= gxmax { gxmax } else { dn };
+
+    // Voxlap5.c:12101-12102 — z0/z1 reload. cf-halve already halved
+    // c_presync's z0; the shift here halves it AGAIN. Voxlap's
+    // literal asm fix-up.
+    if state.c_presync_idx < state.scratch.cf.len() {
+        state.z0 = state.scratch.cf[state.c_presync_idx].z0 >> 1;
+    }
+    state.z1 = ((state.z1 + 1) as u32 >> 1) as i32;
+
+    // Voxlap5.c:12105-12110 — recompute leading lane and advance gpz.
+    state.lane = usize::from(state.scratch.gpz[1] < state.scratch.gpz[0]);
+    let new_gpz = state.scratch.gpz[state.lane];
+    state.gx = new_gpz & -0x1_0000_i32;
+    state.scratch.gpz[state.lane] =
+        state.scratch.gpz[state.lane].wrapping_add(state.scratch.gdz[state.lane]);
+
+    // Voxlap5.c:12112-12113 — reload `state.column` from the new
+    // column. Malformed offsets fall back to an empty slice
+    // (matches `camera_column_slice`'s defensive posture).
+    if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
+        let col_off = col_off as usize;
+        state.column = state.slab_buf.get(col_off..).unwrap_or(&[]);
+    }
+
+    // Voxlap5.c:12116 — reset c to top-of-stack.
+    state.c_idx = state.ce_idx;
+
+    // Voxlap5.c:12118 — `goto skipixy2_sync_from_presync`.
+    Phase::SyncFromPresync
 }
 
 /// `startsky` — voxlap5.c:12120-12190. Drains every remaining
@@ -1764,6 +1855,7 @@ mod tests {
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
             mip_base_offsets: &DUMMY_MIP_OFFSETS,
+            vsid: 64,
             sky: None,
         }
     }
@@ -1900,6 +1992,7 @@ mod tests {
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
             mip_base_offsets: &DUMMY_MIP_OFFSETS,
+            vsid: 64,
             sky: None,
         };
         GrouscanState::from_seed(scratch, &inputs, 0, 0, 1)
@@ -1919,6 +2012,7 @@ mod tests {
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
             mip_base_offsets: &DUMMY_MIP_OFFSETS,
+            vsid: 64,
             sky: None,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
@@ -2079,6 +2173,7 @@ mod tests {
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
             mip_base_offsets: &DUMMY_MIP_OFFSETS,
+            vsid: 64,
             sky: None,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
@@ -2386,6 +2481,7 @@ mod tests {
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
             mip_base_offsets: &[0, column_offsets.len()],
+            vsid: 4,
             sky: None,
         };
         let mut s = fresh_scratch();
@@ -2421,6 +2517,7 @@ mod tests {
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
             mip_base_offsets: &[0, column_offsets.len()],
+            vsid: 4,
             sky: None,
         };
         let mut s = fresh_scratch();
@@ -2536,6 +2633,7 @@ mod tests {
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
             mip_base_offsets: &[0, column_offsets.len()],
+            vsid: 4,
             sky: None,
         };
         let mut s = fresh_scratch();
@@ -2560,6 +2658,7 @@ mod tests {
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
             mip_base_offsets: &[0, column_offsets.len()],
+            vsid: 4,
             sky: None,
         };
         let mut s = fresh_scratch();

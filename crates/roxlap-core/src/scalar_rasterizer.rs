@@ -458,6 +458,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
             slab_buf: self.slab_buf,
             column_offsets: self.column_offsets,
             mip_base_offsets: self.mip_base_offsets,
+            vsid: self.vsid,
             sky: self.sky.map(crate::grouscan::SkyRef::from_sky),
         };
         // gmipnum = number of built mip levels. R4.5d's
