@@ -26,8 +26,8 @@ project intent and the relationship to
 | **R3** | `Engine` public API (framebuffer, camera, render entry point); winit + softbuffer host opens a window and shows sky-blue fill. | done | `cargo run -p roxlap-host` opens a window. End-to-end toolchain works before any rasterizer code lands. |
 | **R4** | Full `opticast` + `grouscan` algorithm port from `grouscanasm_scalar` (scalar Rust). | **opticast-only poses bit-exact**; deferred: R4.4 textured-sky branch, R4.5 multi-mip `remiporend`, sideshademode high-byte. | 4 of 12 oracle poses match voxlap C goldens byte-for-byte (`north`, `east`, `diag_down`, `high_down`). The other 8 poses each require a feature roxlap doesn't have yet (sprites → R6, lighting, drawtile). |
 | **R5** | x86_64 SSE2 4-pixel rsqrtps batches in the four hot rasterizers (mirror of voxlaptest Stage 4.9). | scalar reference is bit-exact; SSE batches not yet ported | Re-converges on voxlaptest's CI golden hashes where the rsqrtps approach is bit-equivalent. |
-| **R6** | KV6 sprite renderer (scalar `drawsprite` / `drawboundcube`). | not started | Sprite poses image-similarity ≥ 99%. |
-| **R7** | KV6 sprite renderer SSE (mirror of voxlaptest's `drawboundcube_sse`). | not started | Re-converges on voxlaptest's sprite hashes. |
+| **R6** | KV6 sprite renderer (`drawsprite` / `drawboundcubesse` / `updatereflects`). | **architecture validated** (R6.4 b/c/d/e landed); 1 of 4 sprite oracle poses bit-exact, 3 drift on sub-pixel rounding | `sprite_above` matches voxlap C local build byte-for-byte (`79b87c92dd96a59b`). Drift on the other three poses tracked in memory for next session. |
+| **R7** | KV6 sprite renderer convergence: close drift on the three remaining sprite poses (likely iunivec rounding / Cramer's-rule cancellation / `_mm_rcp_ps` micro-arch). | not started | Re-converges on voxlaptest's full sprite hash set. |
 | **R8** | Cross-engine oracle: roxlap-side oracle binary writing `roxlap-hashes.txt`; CI matrix that diffs against `golden-hashes.txt`. | done | `cargo run -p roxlap-oracle -- diff` reports `4 match, 0 mismatch` against the in-tree `tests/golden-hashes.txt` (4 opticast-only poses, frozen against voxlap C). `.github/workflows/ci.yml` runs fmt / clippy / test / oracle-diff on every push + PR; oracle job fails on any hash mismatch so the bit-exact milestone can't regress silently. |
 | **R9** | ARM NEON via `core::arch::aarch64`; macOS arm64 + Linux aarch64 in CI. | not started | Own goldens (NEON ≠ x86 SSE bits); aarch64 CI green. |
 | **R10** | wasm SIMD via `core::arch::wasm32`; web host (canvas + js glue) as a separate crate. | not started | Browser perf benchmark; own wasm goldens. |
@@ -109,6 +109,42 @@ per call site as in C, not portable_simd. Sub-substages:
 | **R5.2** | `hrend_z_fog_sse` — horizontal-scan, fog blend (per-pixel scalar inside batch, matching voxlaptest's bit-exact path). |
 | **R5.3** | `vrend_z_sse` — vertical-scan with parallel `uurend` update. |
 | **R5.4** | `vrend_z_fog_sse` — vertical-scan with fog. |
+
+## Substage R6 — KV6 sprite renderer
+
+Mirror of voxlap5.c:8179-9062 (`drawboundcubesse` + `kv6draw` + the
+9-arm `DRAWBOUNDCUBELINE` iteration) plus voxlap5.c:8466-8629
+(`updatereflects` colour-modulation table builder). Sub-substages:
+
+| # | Scope |
+|---|---|
+| **R6.0** | Foundations: `getcube` (R6.0a), `lightvox` + `factr` / `logint` / `tempfloatbuf` power tables (R6.0b/c), `meltsphere` (R6.0d), byte-equality validation against voxlap C oracle dumps for both meltsphere fixtures (R6.0e). All bit-exact. |
+| **R6.1** | `Sprite` type + `draw_sprite` skeleton dispatcher (voxlap5.c:9818). |
+| **R6.2** | Frustum cull + mip-LOD distance estimate (voxlap5.c:8832-8875). |
+| **R6.3** | 9-arm per-(x, y) iteration with `r0` / `r1` tracking (voxlap5.c:8982-9062). Validated: 401-voxel meltsphere visits each voxel exactly once. |
+| **R6.4a** | Setup math: `mat2` + Cramer's + `nfor↔nhei` swap + `cadd4` / `ztab4` / `r1` ANNOYING-HACK pre-decrement / `scisdist` / `qsum0` (voxlap5.c:8915-8973). Per-voxel scissor on `origin.z`. |
+| **R6.4b** | Vertex projection: `_mm_rcp_ps`-based projection of the (4 or 6) `ptfaces16[effmask]` vertex pairs. |
+| **R6.4c** | Viewport clip + screen-AABB: `qsum0` saturated-add + `qsum1` max-floor; `_mm_subs_epu16` for `(dx, dy)` with degenerate-rect early-out. |
+| **R6.4d** | Fill rect + zbuffer write: per-pixel z-test, framebuffer write. `DrawTarget<'a>` API takes the borrowed framebuffer + zbuffer. |
+| **R6.4e** | Colour modulation + `mm5` cross-call tail + `update_reflects`. Oracle path only (`flags=0`, no fog, `lightmode<2`, both nolighta + nolightb branches). |
+| **R6.5** | Full 4-pose oracle bit-exact (= R7 in the table above). Iterative drift hunt: iunivec rounding, basis-rotation cancellation, `_mm_rcp_ps` micro-arch. |
+
+### What "R6.4 effectively done" means
+
+`sprite_above` matches voxlap C's local oracle build byte-for-byte
+(`79b87c92dd96a59b`) — the entire pipeline (geometry + clip + fill +
+colour modulation + mm5 tail + updatereflects) is structurally
+correct. The remaining three sprite poses produce stable hashes that
+diverge by sub-pixel drift; the next session's debug plan lives in
+the `project_r6_4_landed.md` memory.
+
+R6.4 is x86_64-only — `_mm_rcp_ps` produces hardware-specific
+12-bit-precision output and bit-equality with voxlap C requires the
+same instruction. NEON and wasm ports (R9 / R10) will have their own
+goldens. The non-x86_64 path returns 0 (no rendering).
+
+R6.6 / R6.7 (KFA + animated sprites, no-z sprite path) stay deferred
+— none of the four sprite oracle poses exercise them.
 
 ## Out of scope
 

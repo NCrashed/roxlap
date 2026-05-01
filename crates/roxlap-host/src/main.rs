@@ -56,10 +56,17 @@ const PITCH_LIMIT: f64 = 88.0_f64 * std::f64::consts::PI / 180.0;
 /// in its parser tests — no extra disk I/O at startup.
 const ORACLE_VXL_GZ: &[u8] = include_bytes!("../../../assets/oracle.vxl.gz");
 
-/// Embedded coco kv6 sprite, used by R6.1+ to plumb a `Sprite`
-/// through the engine's `draw_sprite` API. Currently a no-op stub
-/// (R6.1) — R6.4 will turn it into a visible voxel sprite.
+/// Embedded coco kv6 sprite (Voxlap's iconic logo). Demoes the
+/// rotated `drawboundcubesse` path: the host spins the basis about
+/// the world z-axis once per ~12 seconds.
 const COCO_KV6: &[u8] = include_bytes!("../../../assets/coco.kv6");
+
+/// Embedded meltsphere kv6 sprite (401 voxels carved from the
+/// oracle world via R6.0d's `meltsphere`; same fixture the
+/// `sprite_*` oracle poses use). Demoes the axis-aligned
+/// `drawboundcubesse` path.
+const SPRITE_MELTSPHERE_KV6: &[u8] =
+    include_bytes!("../../roxlap-core/tests/fixtures/sprite_meltsphere.kv6");
 
 /// Tracks which movement keys are currently pressed. Polled each
 /// frame to integrate position; we don't act on the press/release
@@ -110,7 +117,8 @@ struct App {
     vxl: vxl::Vxl,
     /// Camera position in voxel-world units.
     cam_pos: [f64; 3],
-    /// Yaw — rotation around the world +z (down) axis. 0 looks +y.
+    /// Yaw — rotation around the world +z (down) axis. 0 looks +x
+    /// (voxlap's canonical heading).
     yaw: f64,
     /// Pitch — rotation around the camera's right axis. 0 = level;
     /// +π/2 = straight down. Clamped to `±PITCH_LIMIT`.
@@ -126,30 +134,33 @@ struct App {
     /// then clears the flag. Lets the user freeze a repro for
     /// rendering bugs that surface at runtime.
     capture_pending: bool,
-    /// Demo sprite plumbed through the R6.1 `draw_sprite` API.
-    /// Loaded from `assets/coco.kv6`; placed near the camera spawn
-    /// so the eventual real renderer (R6.4) can put it on screen.
-    /// Currently the dispatcher is a no-op; this field exists to
-    /// validate the API surface compiles end-to-end.
-    sprite: Sprite,
+    /// Demo sprites plumbed through the R6.4 `draw_sprite` path.
+    /// Slot 0 is the meltsphere fixture (axis-aligned); slot 1 is
+    /// the coco logo, whose basis the redraw loop spins about z so
+    /// the rotated `drawboundcubesse` path is exercised.
+    sprites: Vec<Sprite>,
+    /// Wall-clock baseline for sprite-rotation animation. Set once
+    /// at app construction; the redraw loop reads `elapsed()` every
+    /// frame to derive the coco's spin angle.
+    spawn_time: Instant,
 }
 
 impl App {
     fn camera(&self) -> Camera {
-        // Voxlap's basis: +z is "down" into the map. Yaw rotates
-        // around +z; pitch is rotation about the camera-relative
-        // right axis. The forward / right / down vectors below are
-        // the standard yaw-then-pitch composition.
+        // Voxlap's standard yaw/pitch composition (mirror of
+        // tests/oracle/oracle.c::set_camera_yaw_pitch). +z is
+        // "down" into the map; yaw=0 looks +x; positive pitch
+        // tilts the view downward. The basis is RIGHT-HANDED
+        // (right × down = forward), which the engine's frustum-
+        // normal cross product (`ginor[i] = gcorn[i] × gcorn[i+1]`)
+        // assumes — get the chirality wrong and `kv6_draw_prepare`'s
+        // bound-cube cull rejects every sprite as "outside the
+        // frustum".
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
-        let forward = [sy * cp, cy * cp, sp];
-        let right = [cy, -sy, 0.0];
-        // down = right × forward (right-handed).
-        let down = [
-            right[1] * forward[2] - right[2] * forward[1],
-            right[2] * forward[0] - right[0] * forward[2],
-            right[0] * forward[1] - right[1] * forward[0],
-        ];
+        let right = [-sy, cy, 0.0];
+        let down = [-cy * sp, -sy * sp, cp];
+        let forward = [cy * cp, sy * cp, sp];
         Camera {
             pos: self.cam_pos,
             right,
@@ -201,6 +212,7 @@ impl App {
         self.cam_pos[2] += dz * speed;
     }
 
+    #[allow(clippy::too_many_lines)] // straight-line per-frame work; splitting hurts readability
     fn redraw(&mut self) {
         let Some(window) = self.window.as_ref() else {
             return;
@@ -293,8 +305,9 @@ impl App {
         }
 
         // R6.4 sprite render: cull + setup + per-voxel rasterizer
-        // writes pixels + zbuffer. Scoped after opticast so the
-        // sprite layers on top of the world.
+        // writes pixels + zbuffer. Scoped after opticast so each
+        // sprite layers on top of the world (and on top of any
+        // earlier sprites in the `sprites` list).
         let cam_state = camera_math::derive(
             &cam,
             size.width,
@@ -303,7 +316,30 @@ impl App {
             settings.hy,
             settings.hz,
         );
+
+        // Spin slot 1 (coco) about world z. ~12-second period (≈30°/s)
+        // — slow enough to read individual voxel faces, fast enough
+        // to confirm the renderer is alive.
+        if self.sprites.len() > 1 {
+            let theta = self.spawn_time.elapsed().as_secs_f32() * 0.5;
+            let (s, c) = theta.sin_cos();
+            self.sprites[1].s = [c, s, 0.0];
+            self.sprites[1].h = [-s, c, 0.0];
+            self.sprites[1].f = [0.0, 0.0, 1.0];
+        }
+
         {
+            // Debug: ROXLAP_HOST_SPRITE_NO_Z=1 wipes the zbuffer
+            // back to +∞ before sprite render. Sprites then draw
+            // unconditionally on top of opticast output. Lets us
+            // distinguish "sprite z-test is rejecting" from
+            // "sprite geometry is broken".
+            if std::env::var("ROXLAP_HOST_SPRITE_NO_Z").is_ok() {
+                for z in &mut self.zbuffer {
+                    *z = f32::INFINITY;
+                }
+            }
+
             let mut target = DrawTarget {
                 framebuffer: &mut buffer,
                 zbuffer: &mut self.zbuffer,
@@ -311,7 +347,21 @@ impl App {
                 width: size.width,
                 height: size.height,
             };
-            let _ = draw_sprite(&mut target, &cam_state, &settings, &self.sprite);
+            // Debug: count pixels written per sprite. Gated on an
+            // env var so the noise stays out of normal interactive
+            // runs. Set ROXLAP_HOST_SPRITE_DEBUG=1 to see counts.
+            let debug = std::env::var("ROXLAP_HOST_SPRITE_DEBUG").is_ok();
+            for (i, sprite) in self.sprites.iter().enumerate() {
+                let written = draw_sprite(&mut target, &cam_state, &settings, sprite);
+                if debug {
+                    eprintln!(
+                        "sprite[{i}]: pos=({:.1}, {:.1}, {:.1}) basis_s=({:.2},{:.2},{:.2}) → wrote {} pixels",
+                        sprite.p[0], sprite.p[1], sprite.p[2],
+                        sprite.s[0], sprite.s[1], sprite.s[2],
+                        written
+                    );
+                }
+            }
         }
 
         if self.capture_pending {
@@ -557,19 +607,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::new();
     engine.set_side_shades(15, 15, 15, 15, 15, 15);
 
-    // Plumb a demo sprite through the R6.1 stub `draw_sprite` API.
-    // Position is just-in-front of the spawn camera (`cam_pos +
-    // [0, 16, 0]`) so when R6.4 turns the dispatcher into a real
-    // renderer the sprite lands in view.
+    // Demo sprites positioned in front of the spawn camera (which
+    // looks +x at yaw=0 with voxlap's RH basis). Slot 0 = meltsphere
+    // (axis-aligned), 12 voxels left of forward. Slot 1 = coco
+    // (rotated about world z by the redraw loop), 12 voxels right.
+    // Together they exercise both the axis-aligned and rotated
+    // `drawboundcubesse` paths.
+    let meltsphere_kv6 =
+        kv6::parse(SPRITE_MELTSPHERE_KV6).expect("parse sprite_meltsphere.kv6 fixture");
     let coco_kv6 = kv6::parse(COCO_KV6).expect("parse coco.kv6");
     // World coords are in [0, VSID = 2048]; safely fit f32 exactly.
     #[allow(clippy::cast_possible_truncation)]
-    let sprite_pos = [
-        cam_pos[0] as f32,
-        cam_pos[1] as f32 + 16.0,
-        cam_pos[2] as f32,
-    ];
-    let sprite = Sprite::axis_aligned(coco_kv6, sprite_pos);
+    let cam_f32 = [cam_pos[0] as f32, cam_pos[1] as f32, cam_pos[2] as f32];
+    // Forward (yaw=0) = +x; right = +y. So +24 forward = +x, ±12
+    // right/left = ±y.
+    let meltsphere_sprite = Sprite::axis_aligned(
+        meltsphere_kv6,
+        [cam_f32[0] + 24.0, cam_f32[1] - 12.0, cam_f32[2]],
+    );
+    let coco_sprite =
+        Sprite::axis_aligned(coco_kv6, [cam_f32[0] + 24.0, cam_f32[1] + 12.0, cam_f32[2]]);
 
     let mut app = App {
         window: None,
@@ -585,7 +642,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         grabbed: false,
         last_tick: None,
         capture_pending: false,
-        sprite,
+        sprites: vec![meltsphere_sprite, coco_sprite],
+        spawn_time: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())

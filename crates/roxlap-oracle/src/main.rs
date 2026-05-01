@@ -353,9 +353,23 @@ fn format_hashes(rows: &[(&str, u64)]) -> String {
     out
 }
 
+/// `cmd_render` options parsed off the CLI. `ppm_dir = Some(dir)`
+/// means "dump <pose>.ppm into `dir`" (creating it if missing).
+struct RenderOpts {
+    ppm_dir: Option<std::path::PathBuf>,
+}
+
+/// Default output directory for `--ppm` without an explicit path.
+/// Lives next to `roxlap-hashes.txt`; one PPM per pose dropped in.
+const DEFAULT_PPM_DIR: &str = "roxlap-oracle-out";
+
 /// Render every pose and write `roxlap-hashes.txt` next to the
-/// invocation cwd.
-fn cmd_render() -> std::io::Result<()> {
+/// invocation cwd. With `--ppm[=DIR]` (or `ROXLAP_ORACLE_PPM=1`),
+/// also dumps a P6 PPM per pose into `DIR` (default
+/// `roxlap-oracle-out/`) for visual inspection of the rendered
+/// framebuffer — useful for eyeballing whether a hash mismatch is
+/// a real visual difference or sub-pixel drift.
+fn cmd_render(opts: &RenderOpts) -> std::io::Result<()> {
     let mut engine = Engine::new();
     // Mirror voxlap C oracle.c:117 + :110 — `set_fogcol(0x87ceeb)` +
     // `setMaxScanDist(1024)`. Without this the fog falloff table
@@ -371,8 +385,11 @@ fn cmd_render() -> std::io::Result<()> {
     let mut zbuffer = vec![0.0f32; pixel_count];
     let mut scratch = ScanScratch::new_for_size(XRES, YRES, vxl_world.vsid);
 
+    if let Some(dir) = &opts.ppm_dir {
+        fs::create_dir_all(dir)?;
+    }
+
     let mut rows: Vec<(&str, u64)> = Vec::with_capacity(POSES.len());
-    let dump_ppm = std::env::var("ROXLAP_ORACLE_PPM").is_ok();
     for pose in POSES {
         let hash = render_pose(
             &engine,
@@ -383,8 +400,15 @@ fn cmd_render() -> std::io::Result<()> {
             &mut scratch,
         );
         println!("{:<14}  {:016x}", pose.name, hash);
-        if dump_ppm {
-            write_ppm(&format!("{}.ppm", pose.name), &framebuffer, XRES, YRES)?;
+        if let Some(dir) = &opts.ppm_dir {
+            let path = dir.join(format!("{}.ppm", pose.name));
+            write_ppm(
+                path.to_str().unwrap_or("<bad utf-8>"),
+                &framebuffer,
+                XRES,
+                YRES,
+            )?;
+            println!("  wrote {}", path.display());
         }
         rows.push((pose.name, hash));
     }
@@ -546,8 +570,13 @@ fn print_help() {
         "roxlap-oracle — render-hash oracle for the roxlap engine.\n\
          \n\
          Usage:\n\
-             roxlap-oracle              render every pose, write roxlap-hashes.txt\n\
-             roxlap-oracle render       same as above\n\
+             roxlap-oracle [--ppm[=DIR]]\n\
+                                         render every pose, write roxlap-hashes.txt;\n\
+                                         with --ppm also drop a P6 PPM per pose into\n\
+                                         DIR (default: roxlap-oracle-out/) for visual\n\
+                                         inspection of hash-mismatched poses.\n\
+             roxlap-oracle render [--ppm[=DIR]]\n\
+                                         same as above\n\
              roxlap-oracle diff [--golden PATH] [--ours PATH]\n\
                                          diff roxlap-hashes.txt against the in-tree\n\
                                          golden-hashes.txt; exits non-zero on any mismatch.\n\
@@ -561,8 +590,8 @@ fn print_help() {
                                          diag_down, high_down.\n\
          \n\
          Env:\n\
-             ROXLAP_ORACLE_PPM=1        also dump <pose>.ppm framebuffers (P6 RGB)\n\
-                                         alongside roxlap-hashes.txt"
+             ROXLAP_ORACLE_PPM=1        legacy alias for --ppm (dumps to cwd)\n\
+             ROXLAP_ORACLE_PPM=DIR      legacy alias for --ppm=DIR"
     );
 }
 
@@ -810,11 +839,65 @@ fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
+/// Parse a `render` subcommand's flags. Recognises
+/// `--ppm[=DIR]` / `--ppm DIR` and the `ROXLAP_ORACLE_PPM` env var
+/// (legacy path: `=1` → cwd, `=DIR` → that dir).
+fn parse_render_opts(args: &[String]) -> std::io::Result<RenderOpts> {
+    let mut ppm_dir: Option<std::path::PathBuf> = None;
+
+    // Env-var fallback (back-compat with the original gating).
+    if let Ok(v) = std::env::var("ROXLAP_ORACLE_PPM") {
+        ppm_dir = Some(if v == "1" || v.is_empty() {
+            std::path::PathBuf::from(".")
+        } else {
+            std::path::PathBuf::from(v)
+        });
+    }
+
+    // CLI flags override env var.
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--ppm" {
+            // Look at the next arg: if it's another flag or end, default-dir.
+            let next_is_path = args.get(i + 1).is_some_and(|n| !n.starts_with("--"));
+            if next_is_path {
+                ppm_dir = Some(std::path::PathBuf::from(&args[i + 1]));
+                i += 2;
+            } else {
+                ppm_dir = Some(std::path::PathBuf::from(DEFAULT_PPM_DIR));
+                i += 1;
+            }
+        } else if let Some(rest) = a.strip_prefix("--ppm=") {
+            ppm_dir = Some(std::path::PathBuf::from(rest));
+            i += 1;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unknown render arg: {a}"),
+            ));
+        }
+    }
+    Ok(RenderOpts { ppm_dir })
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map_or("render", String::as_str);
+    // Default subcommand is `render`. Treating a leading `--`-flag
+    // as "this is render with flags" lets `roxlap-oracle --ppm`
+    // work without spelling out `render`.
+    let cmd = args
+        .first()
+        .filter(|s| !s.starts_with("--"))
+        .map_or("render", String::as_str);
     match cmd {
-        "render" => cmd_render(),
+        "render" => {
+            // Skip the subcommand if present (`render --ppm`); the no-arg
+            // form (`roxlap-oracle --ppm`) treats the first arg as a flag.
+            let flag_start = usize::from(args.first().map(String::as_str) == Some("render"));
+            let opts = parse_render_opts(&args[flag_start..])?;
+            cmd_render(&opts)
+        }
         "diff" => {
             let mut ours = "roxlap-hashes.txt".to_string();
             // Default golden lives in roxlap (`tests/golden-hashes.txt`) so
