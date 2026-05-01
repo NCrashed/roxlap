@@ -1288,10 +1288,13 @@ fn phase_intoslabloop(state: &mut GrouscanState<'_>) -> Phase {
 ///    column search; the next-slab test above clobbered it).
 /// 3. Search for the split column `col` walking from `c->i1`
 ///    leftward, with `cx1`/`cy1` decrementing by `gi0`/`gi1`
-///    each step. Voxlap's `prebegsearchi16` uses 16-step
-///    batches for speed — the project memory tracks this as a
-///    perf follow-up; the per-step search here is functionally
-///    equivalent.
+///    per column. Two-rate, mirroring voxlap asm's
+///    `prebegsearchi16` + `begsearchi`: big-step backward by 16
+///    cols until the next big step would overshoot the sign
+///    transition, then single-step the 0..15 residual. Hash-
+///    neutral vs the per-step form (same transition, same col),
+///    purely a perf win — voxlap profiling estimated 1-15% on
+///    the scanline render path of a CPU renderer.
 /// 4. Stack-overflow check: voxlap caps `ce` at `cf[191]`
 ///    (`cmp eax, _cfasm[4096]`). Past that we bail to
 ///    [`Phase::Done`] (the asm's `retsub`).
@@ -1349,16 +1352,40 @@ fn do_slab_split(state: &mut GrouscanState<'_>, v2: i32, next_v3: i32) -> Phase 
     }
     state.gy_raw = state.gylookup[gy_idx];
 
-    // 3. Search for split column. Bound iterations by the
-    //    [i0, i1] range — geometry guarantees the search
-    //    terminates in fewer steps than this, but capping
-    //    avoids hangs on malformed test fixtures.
+    // 3. Two-rate search for the split column. Big-step phase
+    //    walks backward by 16 cols at a time (voxlap asm's
+    //    `prebegsearchi16`); single-step phase finishes the 0..15
+    //    residual (voxlap asm's `begsearchi`). Both phases bounded
+    //    defensively against malformed fixtures — geometry
+    //    guarantees the cross-sign transition exists in
+    //    `[i0, i1]`, but a degenerate (cf-i1 < cf-i0) input would
+    //    otherwise spin.
     let mut col = state.scratch.cf[state.c_idx].i1;
     let i0 = state.scratch.cf[state.c_idx].i0;
-    let max_iter = (col - i0).max(0) as usize + 1;
-    for _ in 0..=max_iter {
-        let t = grouscan_cross_sign(state.cx1, state.cy1, state.ogx, state.gy_raw);
-        if t <= 0 {
+    let span = (col - i0).max(0) as usize;
+    // Big-step (16-col) phase. Pre-compute `gi0 << 4` / `gi1 << 4`
+    // once; voxlap C uses `(gi0 << 4)` per iteration. Rust's `<<`
+    // on i32 with shift amount 4 is well-defined truncating-shift
+    // (no overflow panic), matching voxlap's MMX `pslld mm7, 4`
+    // behaviour on 32-bit lanes.
+    let gi0_16 = state.scratch.gi0 << 4;
+    let gi1_16 = state.scratch.gi1 << 4;
+    let big_step_max = span / 16 + 1;
+    for _ in 0..big_step_max {
+        let cx_try = state.cx1.wrapping_sub(gi0_16);
+        let cy_try = state.cy1.wrapping_sub(gi1_16);
+        if grouscan_cross_sign(cx_try, cy_try, state.ogx, state.gy_raw) <= 0 {
+            break;
+        }
+        state.cx1 = cx_try;
+        state.cy1 = cy_try;
+        col -= 16;
+    }
+    // Single-step finish — at most 16 cols residual after the
+    // big-step bail-out (transition lies inside the next 16 cols).
+    // Capped at 17 to absorb an off-by-one on degenerate fixtures.
+    for _ in 0..=16 {
+        if grouscan_cross_sign(state.cx1, state.cy1, state.ogx, state.gy_raw) <= 0 {
             break;
         }
         state.cx1 = state.cx1.wrapping_sub(state.scratch.gi0);
