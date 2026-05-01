@@ -25,10 +25,11 @@ use flate2::read::GzDecoder;
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::sprite::{draw_sprite, Sprite};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
-use roxlap_formats::vxl;
+use roxlap_formats::{kv6, vxl};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -53,6 +54,11 @@ const PITCH_LIMIT: f64 = 88.0_f64 * std::f64::consts::PI / 180.0;
 /// Embedded gzipped oracle world. Same fixture roxlap-formats uses
 /// in its parser tests — no extra disk I/O at startup.
 const ORACLE_VXL_GZ: &[u8] = include_bytes!("../../../assets/oracle.vxl.gz");
+
+/// Embedded coco kv6 sprite, used by R6.1+ to plumb a `Sprite`
+/// through the engine's `draw_sprite` API. Currently a no-op stub
+/// (R6.1) — R6.4 will turn it into a visible voxel sprite.
+const COCO_KV6: &[u8] = include_bytes!("../../../assets/coco.kv6");
 
 /// Tracks which movement keys are currently pressed. Polled each
 /// frame to integrate position; we don't act on the press/release
@@ -119,6 +125,12 @@ struct App {
     /// then clears the flag. Lets the user freeze a repro for
     /// rendering bugs that surface at runtime.
     capture_pending: bool,
+    /// Demo sprite plumbed through the R6.1 `draw_sprite` API.
+    /// Loaded from `assets/coco.kv6`; placed near the camera spawn
+    /// so the eventual real renderer (R6.4) can put it on screen.
+    /// Currently the dispatcher is a no-op; this field exists to
+    /// validate the API surface compiles end-to-end.
+    sprite: Sprite,
 }
 
 impl App {
@@ -278,6 +290,11 @@ impl App {
                 &self.vxl.column_offset,
             );
         }
+
+        // R6.1 sprite-plumbing call. The dispatcher is a no-op
+        // stub today (returns false); R6.2-R6.4 will replace it
+        // with the real frustum-cull + per-voxel rasterizer.
+        let _ = draw_sprite(&self.sprite);
 
         if self.capture_pending {
             self.capture_pending = false;
@@ -522,6 +539,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::new();
     engine.set_side_shades(15, 15, 15, 15, 15, 15);
 
+    // Plumb a demo sprite through the R6.1 stub `draw_sprite` API.
+    // Position is just-in-front of the spawn camera (`cam_pos +
+    // [0, 16, 0]`) so when R6.4 turns the dispatcher into a real
+    // renderer the sprite lands in view.
+    let coco_kv6 = kv6::parse(COCO_KV6).expect("parse coco.kv6");
+    // World coords are in [0, VSID = 2048]; safely fit f32 exactly.
+    #[allow(clippy::cast_possible_truncation)]
+    let sprite_pos = [
+        cam_pos[0] as f32,
+        cam_pos[1] as f32 + 16.0,
+        cam_pos[2] as f32,
+    ];
+    let sprite = Sprite::axis_aligned(coco_kv6, sprite_pos);
+
     let mut app = App {
         window: None,
         surface: None,
@@ -536,6 +567,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         grabbed: false,
         last_tick: None,
         capture_pending: false,
+        sprite,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

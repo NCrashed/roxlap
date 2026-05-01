@@ -22,6 +22,7 @@ pub mod rasterizer;
 pub mod ray_step;
 pub mod scalar_rasterizer;
 pub mod scan_loops;
+pub mod sprite;
 pub mod world_query;
 
 pub use camera::Camera;
