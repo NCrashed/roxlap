@@ -283,8 +283,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
     ) {
         // Voxlap's per-scanline ray-cast: derive the frustum, seed
         // cf[128], stamp scratch globals, call grouscan. Mirror of
-        // voxlap5.c:gline (1146..1235) sans the unported pieces
-        // (sideshademode, sky-radar bookkeeping — both R4.4 work).
+        // voxlap5.c:gline (1146..1235).
         let cache = self
             .frame
             .as_ref()
@@ -428,7 +427,19 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // Copy gcsub out of scratch so the GrouscanInputs immutable
         // borrow doesn't collide with the `&mut scratch` grouscan_run
         // takes below. `[i64; 9]` is 72 bytes — cheap.
-        let gcsub_local: [i64; 9] = scratch.gcsub;
+        let mut gcsub_local: [i64; 9] = scratch.gcsub;
+        // Voxlap5.c:1230-1234. Per-ray, populate the wall-side lanes
+        // (0/1) from the directional lanes (4/5 = left/right,
+        // 6/7 = up/down) according to the sign of `gixy`. Without
+        // this, `wall_lane` reads from the stale `0x00ff_00ff_00ff_00ff`
+        // baseline and wall faces get no directional darkening, even
+        // after the host calls `set_side_shades`.
+        if scratch.sideshademode {
+            let lane0_idx = if f.gixy[0] < 0 { 4 } else { 5 };
+            let lane1_idx = if f.gixy[1] < 0 { 6 } else { 7 };
+            gcsub_local[0] = gcsub_local[lane0_idx];
+            gcsub_local[1] = gcsub_local[lane1_idx];
+        }
         let inputs = GrouscanInputs {
             column,
             gylookup: &cache.prelude.y_lookup,

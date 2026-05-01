@@ -128,6 +128,13 @@ pub struct ScanScratch {
     /// [`Self::set_side_shades`]; rasterizers read it on every gline
     /// call.
     pub gcsub: [i64; 9],
+    /// Voxlap's `vx5.sideshademode` flag — derived by
+    /// [`Self::set_side_shades`]: false when all six args are zero
+    /// (oracle baseline, swap is dead), true otherwise. When true,
+    /// the per-ray gline body picks `gcsub[0]`/`gcsub[1]` from
+    /// `gcsub[4..7]` based on the sign of `gixy[0]`/`gixy[1]` so
+    /// wall faces get directional darkening (voxlap5.c:1230-1234).
+    pub sideshademode: bool,
 }
 
 impl ScanScratch {
@@ -165,6 +172,7 @@ impl ScanScratch {
             fog_col: 0,
             foglut: Vec::new(),
             gcsub: [0x00ff_00ff_00ff_00ff; 9],
+            sideshademode: false,
         }
     }
 
@@ -199,6 +207,11 @@ impl ScanScratch {
         self.gcsub[6] = pack(up);
         self.gcsub[7] = pack(down);
         self.gcsub[8] = 0x00ff_00ff_00ff_00ff;
+        // Voxlap5.c:2535-2540: `if (!(sto|sbo|sle|sri|sup|sdo))` →
+        // sideshademode = 0; else sideshademode = 1. Any non-zero
+        // arg flips on the per-ray gcsub[0]/[1] swap in gline.
+        self.sideshademode =
+            top != 0 || bot != 0 || left != 0 || right != 0 || up != 0 || down != 0;
     }
 
     /// Engine-side setter for the sky `(col, dist)` pair. Engine
@@ -350,6 +363,43 @@ mod tests {
         // Buffers are not reallocated.
         assert_eq!(s.radar.len(), radar_cap);
         assert_eq!(s.angstart.len(), angstart_cap);
+    }
+
+    #[test]
+    fn set_side_shades_zero_keeps_mode_off() {
+        // Voxlap5.c:2535-2540: all-zero args ⇒ sideshademode = 0 and
+        // gcsub[0]/[1] high byte zeroed. Roxlap re-stamps the whole
+        // i64 with the `0x00ff_00ff_00ff_00ff` baseline so cs[7] = 0.
+        let mut s = ScanScratch::new_for_size(64, 64, 64);
+        s.set_side_shades(0, 0, 0, 0, 0, 0);
+        assert!(!s.sideshademode);
+        assert_eq!(s.gcsub[0], 0x00ff_00ff_00ff_00ff);
+        assert_eq!(s.gcsub[1], 0x00ff_00ff_00ff_00ff);
+    }
+
+    #[test]
+    fn set_side_shades_nonzero_flips_mode_on() {
+        // Any non-zero arg ⇒ sideshademode = 1 (voxlap5.c:2540). The
+        // gline body's per-ray swap reads this flag.
+        let mut s = ScanScratch::new_for_size(64, 64, 64);
+        s.set_side_shades(15, 15, 15, 15, 15, 15);
+        assert!(s.sideshademode);
+        // Lanes 4..7 carry the per-side intensity in their high byte.
+        assert_eq!((s.gcsub[4] >> 56) & 0xff, 15);
+        assert_eq!((s.gcsub[7] >> 56) & 0xff, 15);
+        // Lanes 0/1 stay at the baseline; the per-ray swap in gline
+        // populates them from 4..7 based on gixy sign.
+        assert_eq!(s.gcsub[0], 0x00ff_00ff_00ff_00ff);
+        assert_eq!(s.gcsub[1], 0x00ff_00ff_00ff_00ff);
+    }
+
+    #[test]
+    fn set_side_shades_one_arg_nonzero_flips_mode_on() {
+        // Voxlap derives the flag from `sto|sbo|sle|sri|sup|sdo`;
+        // a single non-zero arg is enough.
+        let mut s = ScanScratch::new_for_size(64, 64, 64);
+        s.set_side_shades(0, 0, 0, 0, 0, 1);
+        assert!(s.sideshademode);
     }
 
     #[test]
