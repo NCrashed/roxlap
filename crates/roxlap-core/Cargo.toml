@@ -13,5 +13,11 @@ description = "Pure-Rust port of Ken Silverman's Voxlap voxel engine — engine 
 # type lives in the formats crate alongside the parser/serialiser.
 roxlap-formats = { path = "../roxlap-formats" }
 
+[dev-dependencies]
+# R6.0e: integration test loads the gzipped oracle.vxl fixture and
+# compares roxlap's meltsphere output against the byte-dumped C
+# oracle sprites in tests/fixtures/.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 [lints]
 workspace = true

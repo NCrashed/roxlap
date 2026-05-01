@@ -1135,6 +1135,7 @@ dependencies = [
 name = "roxlap-core"
 version = "0.0.0"
 dependencies = [
+ "flate2",
  "roxlap-formats",
 ]
 
