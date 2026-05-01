@@ -51,6 +51,42 @@ pub const CF_LEN: usize = 256;
 pub const CF_SEED_INDEX: usize = 128;
 
 use crate::rasterizer::ScanScratch;
+use crate::sky::Sky;
+
+/// Borrowed read-only view of an [`crate::sky::Sky`] resource —
+/// the subset `phase_startsky`'s textured-fill branch reads. Built
+/// from a `&Sky` once per ray (the per-ray sky-row state lives on
+/// [`ScanScratch::sky_off`] / [`ScanScratch::sky_cur_lng`]).
+#[derive(Clone, Copy)]
+pub struct SkyRef<'a> {
+    /// Pixel grid; voxlap-style packed BGRA i32. Row `y` starts at
+    /// `pixels[y * row_stride]`.
+    pub pixels: &'a [i32],
+    /// Latitude lookup table — packed `(xoff << 16) | (-yoff &
+    /// 0xffff)`. Length = `xsiz_post + 1`. `lat[0] = 0` is the
+    /// asm-search lower-bound sentinel.
+    pub lat: &'a [i32],
+    /// Post-decrement column count (matches voxlap's `skyxsiz`
+    /// after `loadsky`'s "skyxsiz--; //Hack" stamp). The latitude
+    /// search starts from this index as voxlap's initial `edi`.
+    pub xsiz_post: i32,
+    /// Row stride in `i32` elements (= `xsiz_post + 1` = pre-
+    /// decrement column count = `bpl / 4`).
+    pub row_stride: i32,
+}
+
+impl<'a> SkyRef<'a> {
+    /// Borrow a [`Sky`] for one rasterizer call.
+    #[must_use]
+    pub fn from_sky(sky: &'a Sky) -> Self {
+        Self {
+            pixels: &sky.pixels,
+            lat: &sky.lat,
+            xsiz_post: sky.xsiz,
+            row_stride: sky.bpl / 4,
+        }
+    }
+}
 
 /// Per-ray inputs grouscan reads from but does not mutate. Bundled
 /// to keep `grouscan_run`'s signature compact.
@@ -79,6 +115,11 @@ pub struct GrouscanInputs<'a> {
     /// (`sptr`); we use `u32` offsets to keep the port pointer-
     /// free.
     pub column_offsets: &'a [u32],
+    /// Optional sky texture borrow. `None` ⇒ `phase_startsky`
+    /// always solid-fills with `scratch.skycast` (the existing
+    /// behaviour). `Some(_)` ⇒ `phase_startsky` runs the textured
+    /// path when `scratch.sky_off != 0`.
+    pub sky: Option<SkyRef<'a>>,
 }
 
 /// All of grouscan's per-ray local state in one struct.
@@ -114,6 +155,8 @@ pub(crate) struct GrouscanState<'a> {
     pub slab_buf: &'a [u8],
     /// Per-column byte offsets into [`Self::slab_buf`].
     pub column_offsets: &'a [u32],
+    /// Sky texture borrow (see [`GrouscanInputs::sky`]).
+    pub sky: Option<SkyRef<'a>>,
 
     // -------------------------------------------------------------
     // Cached prologue scalars (R4.3c). Mutated as the algorithm
@@ -211,6 +254,7 @@ impl<'a> GrouscanState<'a> {
             gcsub: inputs.gcsub,
             slab_buf: inputs.slab_buf,
             column_offsets: inputs.column_offsets,
+            sky: inputs.sky,
             z0: c.z0,
             z1: c.z1,
             cx0: c.cx0,
@@ -1495,15 +1539,13 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
 /// cfasm entry's pixel range with sky values.
 ///
 /// Voxlap's body forks on `skyoff`:
-/// - `skyoff == 0` (no sky texture loaded): solid fill —
-///   write `skycast` into each radar slot in the entry's
-///   `[i0, i1]` range.
-/// - `skyoff != 0` (textured sky): per-pixel latitude search
-///   into the `skylat` table, write `sky_tex[edi]`.
-///
-/// R4.3e4 ports only the solid-fill branch (the engine's
-/// startup default) — that's all the oracle scenes exercise.
-/// Textured sky support is R4.4 work in PORTING-RUST.md.
+/// - `sky_off == 0` or no [`SkyRef`] loaded: solid fill — write
+///   `skycast` into each radar slot in the entry's `[i0, i1]`
+///   range. This is the cheap default path used by every oracle
+///   pose.
+/// - `sky_off != 0` and a [`SkyRef`] is bound: per-pixel latitude
+///   search into the `skylat` table, write `sky_tex[edi]` into
+///   each radar slot's `col` and `skydist` into its `dist`.
 //
 // `p as usize` cast is intentional: `p` walks an `isize` range
 // `[i0, i1]` where both ends were checked non-negative inside
@@ -1517,19 +1559,28 @@ fn phase_startsky(state: &mut GrouscanState<'_>) -> Phase {
         return Phase::Done;
     }
 
-    // Diagnostic: ROXLAP_TRACE_STARTSKY=1 dumps each cf entry's
-    // drained range to stderr so we can pin which rays leak sky
-    // into the floor.
+    // Branch on whether a sky texture is bound AND gline picked a
+    // non-zero per-ray sky_off. Either condition false ⇒ solid
+    // fill. The oracle never loads a sky; its hashes are byte-
+    // stable through this dispatch.
+    let textured = state.sky.is_some() && state.scratch.sky_off != 0;
+    if textured {
+        phase_startsky_textured(state)
+    } else {
+        phase_startsky_solid(state)
+    }
+}
+
+/// Solid-fill branch (voxlap5.c:12128-12141). Writes
+/// `state.scratch.skycast` into every remaining radar slot.
+#[allow(clippy::cast_sign_loss)]
+fn phase_startsky_solid(state: &mut GrouscanState<'_>) -> Phase {
     let trace = std::env::var("ROXLAP_TRACE_STARTSKY").is_ok();
 
-    // Solid-fill branch (skyoff == 0). Write skycast into every
-    // radar slot from c->i0 to c->i1 inclusive, for each cf
-    // entry in [cf[128], ce].
     let skycast = state.scratch.skycast;
     for c_idx in CF_SEED_INDEX..=state.ce_idx {
         let i0 = state.scratch.cf[c_idx].i0;
         let i1 = state.scratch.cf[c_idx].i1;
-        // Empty range if i0 > i1 — RangeInclusive correctly skips.
         if i0 > i1 {
             if trace {
                 eprintln!(
@@ -1550,6 +1601,106 @@ fn phase_startsky(state: &mut GrouscanState<'_>) -> Phase {
             if let Some(slot) = state.scratch.radar.get_mut(p as usize) {
                 *slot = skycast;
             }
+        }
+    }
+    Phase::Done
+}
+
+/// Textured-sky fill (voxlap5.c:12143-12188).
+///
+/// For each cf entry, walk pixels right-to-left. Per pixel:
+/// 1. Step ray endpoint backward by `(gi0, gi1)` (the per-pixel
+///    coefficient gline stamped on `scratch`).
+/// 2. Latitude search: from a starting `edi = sky.xsiz_post`
+///    (preserved across cf entries within one ray), walk `edi--`
+///    while `(cx1 >> 16) * neg_yvi + (cy1 >> 16) * xvi < 0`. Stop
+///    when the cross product flips sign — that's the texel
+///    column for this pixel ray.
+/// 3. Sample `sky_pixels[sky_off / 4 + edi]` into the radar
+///    slot's `col`; stamp `skydist` into its `dist`.
+///
+/// `sky_off` is a byte offset in voxlap C (`skyoff = curlng *
+/// skybpl + nskypic`); we keep it as a byte offset too and divide
+/// by 4 to land at the i32 pixel index.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+fn phase_startsky_textured(state: &mut GrouscanState<'_>) -> Phase {
+    let sky = state.sky.expect("phase_startsky_textured requires SkyRef");
+    let sky_off = state.scratch.sky_off;
+    let skydist = state.scratch.skycast.dist;
+    let gi0 = state.scratch.gi0;
+    let gi1 = state.scratch.gi1;
+
+    // sky_off is a byte offset relative to the texture's pixel
+    // base; voxlap C uses `int32_t *sky_tex = (int32_t *)skyoff`
+    // which means sky_off must be a multiple of 4. Convert to
+    // i32-pixel index.
+    let row_pixel_base = (sky_off as usize) / 4;
+
+    // edi cursor — voxlap calls this `sky_edi`, preserved across
+    // cf entries within one ray (mirrors the asm's `static`-like
+    // edi register).
+    let mut sky_edi: i32 = sky.xsiz_post;
+
+    for c_idx in CF_SEED_INDEX..=state.ce_idx {
+        let i0 = state.scratch.cf[c_idx].i0;
+        let i1 = state.scratch.cf[c_idx].i1;
+        if i0 > i1 {
+            continue;
+        }
+        // The cf entry's stored `cx1`/`cy1` are gline's original
+        // far-end values; drain operations during grouscan shrink
+        // `i1` without updating them. Re-derive the position at
+        // the *current* `i1` from `cx0 + (i1 - i0) * gi0`. Voxlap
+        // C has this same stale-cx1 quirk (voxlap5.c:11678 writes
+        // `c->i1 = ebx` without touching `c->cx1`); the textured-
+        // sky distortion is hidden in voxlap when looking
+        // upward (most rays hit sky directly with no drain) but
+        // becomes visible at low pitch where wall-fills shrink
+        // `i1` substantially.
+        let leng_remaining = (i1 - i0) as i32;
+        let cx0 = state.scratch.cf[c_idx].cx0;
+        let cy0 = state.scratch.cf[c_idx].cy0;
+        let mut sx = cx0.wrapping_add(leng_remaining.wrapping_mul(gi0));
+        let mut sy = cy0.wrapping_add(leng_remaining.wrapping_mul(gi1));
+        let mut p = i1;
+        loop {
+            // preskysearch: step ray backward.
+            sx = sx.wrapping_sub(gi0);
+            sy = sy.wrapping_sub(gi1);
+
+            // skysearch: find matching sky column.
+            loop {
+                if sky_edi < 0 || (sky_edi as usize) >= sky.lat.len() {
+                    // Out-of-range edi shouldn't happen with a
+                    // well-formed lat[], but guard so a malformed
+                    // sky doesn't OOB-panic the whole render.
+                    sky_edi = 0;
+                    break;
+                }
+                let sl = sky.lat[sky_edi as usize];
+                let neg_yvi = i32::from((sl & 0xffff) as i16);
+                let xvi_lane = i32::from(((sl >> 16) & 0xffff) as i16);
+                let test = (sx >> 16).wrapping_mul(neg_yvi) + (sy >> 16).wrapping_mul(xvi_lane);
+                if test >= 0 {
+                    break;
+                }
+                sky_edi -= 1;
+            }
+
+            let pixel_idx = row_pixel_base + sky_edi as usize;
+            let col = if pixel_idx < sky.pixels.len() {
+                sky.pixels[pixel_idx]
+            } else {
+                0
+            };
+            if let Some(slot) = state.scratch.radar.get_mut(p as usize) {
+                slot.col = col;
+                slot.dist = skydist;
+            }
+            if p <= i0 {
+                break;
+            }
+            p -= 1;
         }
     }
     Phase::Done
@@ -1592,6 +1743,7 @@ mod tests {
             gcsub: &DUMMY_GCSUB,
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
+            sky: None,
         }
     }
 
@@ -1726,6 +1878,7 @@ mod tests {
             gcsub,
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
+            sky: None,
         };
         GrouscanState::from_seed(scratch, &inputs, 0, 0, 1)
     }
@@ -1743,6 +1896,7 @@ mod tests {
             gcsub,
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
+            sky: None,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
     }
@@ -1901,6 +2055,7 @@ mod tests {
             gcsub,
             slab_buf: &DUMMY_SLAB_BUF,
             column_offsets: &DUMMY_COLUMN_OFFSETS,
+            sky: None,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
     }
@@ -2206,6 +2361,7 @@ mod tests {
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
+            sky: None,
         };
         let mut s = fresh_scratch();
         s.gixy = [1, 4]; // x-step = 1, y-step = 4
@@ -2239,6 +2395,7 @@ mod tests {
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
+            sky: None,
         };
         let mut s = fresh_scratch();
         // BOTH lanes must exceed ngxmax: lane recompute picks the
@@ -2352,6 +2509,7 @@ mod tests {
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
+            sky: None,
         };
         let mut s = fresh_scratch();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
@@ -2374,6 +2532,7 @@ mod tests {
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
+            sky: None,
         };
         let mut s = fresh_scratch();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 32, 0, 1);

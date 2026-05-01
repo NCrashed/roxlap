@@ -72,6 +72,70 @@ const COCO_KV6: &[u8] = include_bytes!("../../../assets/coco.kv6");
 const SPRITE_MELTSPHERE_KV6: &[u8] =
     include_bytes!("../../roxlap-core/tests/fixtures/sprite_meltsphere.kv6");
 
+/// Embedded panoramic sky texture for the textured-`startsky`
+/// path. Whatever PNG the user has dropped in `assets/sky.png` is
+/// baked into the binary at build time. Width maps to elevation
+/// (horizon → zenith), height to azimuth (wrap-around).
+const SKY_PNG: &[u8] = include_bytes!("../../../assets/sky.png");
+
+/// Decode a PNG byte slice into a `roxlap_core::sky::Sky`.
+///
+/// Voxlap's sky-mapping convention: **texture width = elevation
+/// gradient (horizon → zenith)**, **texture height = azimuth wrap
+/// (360° around the camera)**. Standard equirectangular
+/// panoramas are usually laid out the other way (width=azimuth,
+/// height=elevation), so this function **transposes** the
+/// decoded pixels: `transposed.width = png.height`,
+/// `transposed.height = png.width`. The result is a tall, thin
+/// texture matching voxlap's expectation.
+///
+/// On any decode failure the host falls back to
+/// [`roxlap_core::sky::Sky::blue_gradient`] so the demo always
+/// renders something — the error message lands on stderr.
+fn load_png_sky(png_bytes: &[u8]) -> Result<roxlap_core::sky::Sky, String> {
+    let decoder = png::Decoder::new(png_bytes);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("png header: {e}"))?;
+    let info = reader.info();
+    let png_w = info.width;
+    let png_h = info.height;
+    let bytes_per_pixel = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        ct => return Err(format!("unsupported colour type {ct:?}; want RGB or RGBA")),
+    };
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "unsupported bit depth {:?}; want 8-bit",
+            info.bit_depth
+        ));
+    }
+
+    let mut pixel_bytes = vec![0u8; reader.output_buffer_size()];
+    reader
+        .next_frame(&mut pixel_bytes)
+        .map_err(|e| format!("png frame: {e}"))?;
+    if pixel_bytes.len() != (png_w as usize) * (png_h as usize) * bytes_per_pixel {
+        return Err(format!(
+            "decoded byte count {} != {}*{}*{}",
+            pixel_bytes.len(),
+            png_w,
+            png_h,
+            bytes_per_pixel
+        ));
+    }
+
+    let mut pixels = Vec::with_capacity((png_w as usize) * (png_h as usize));
+    for chunk in pixel_bytes.chunks_exact(bytes_per_pixel) {
+        let r = i32::from(chunk[0]);
+        let g = i32::from(chunk[1]);
+        let b = i32::from(chunk[2]);
+        pixels.push((0x80 << 24) | (r << 16) | (g << 8) | b);
+    }
+    Ok(roxlap_core::sky::Sky::from_pixels(pixels, png_w, png_h))
+}
+
 /// Tracks which movement keys are currently pressed. Polled each
 /// frame to integrate position; we don't act on the press/release
 /// edge directly because that would tie movement rate to key-repeat.
@@ -389,7 +453,7 @@ impl App {
         // Scope the rasterizer so its &mut buffer borrow ends before
         // we present the buffer.
         {
-            let mut rasterizer = ScalarRasterizer::new(
+            let rasterizer = ScalarRasterizer::new(
                 &mut buffer,
                 &mut self.zbuffer,
                 pitch_pixels,
@@ -397,6 +461,13 @@ impl App {
                 &self.vxl.column_offset,
                 self.vxl.vsid,
             );
+            // Bind the sky if the engine has one — opts the
+            // rasterizer into the textured-startsky path.
+            let mut rasterizer = if let Some(sky) = self.engine.sky() {
+                rasterizer.with_sky(sky)
+            } else {
+                rasterizer
+            };
             let _ = opticast(
                 &mut rasterizer,
                 &mut self.scratch,
@@ -719,6 +790,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // host; goldens stay bit-exact.
     let mut engine = Engine::new();
     engine.set_side_shades(15, 15, 15, 15, 15, 15);
+
+    // Load `assets/sky.png` as the panoramic sky texture. PNG
+    // width maps to elevation (horizon → zenith); height wraps
+    // around the camera as azimuth. On decode failure, fall back
+    // to voxlap's "BLUE" gradient so the demo still has something
+    // to render.
+    let sky = match load_png_sky(SKY_PNG) {
+        Ok(sky) => {
+            eprintln!(
+                "loaded sky.png: {}×{}",
+                sky.xsiz + 1, // sky.xsiz is the post-decrement value
+                sky.ysiz,
+            );
+            sky
+        }
+        Err(e) => {
+            eprintln!("sky.png decode failed: {e} — falling back to blue gradient");
+            roxlap_core::sky::Sky::blue_gradient()
+        }
+    };
+    engine.set_sky(Some(sky));
 
     // Demo sprites positioned in front of the spawn camera (which
     // looks +x at yaw=0 with voxlap's RH basis). Slot 0 = meltsphere

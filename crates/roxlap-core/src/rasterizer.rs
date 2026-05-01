@@ -53,6 +53,13 @@ pub struct ScanScratch {
     /// each new quadrant entry. The scan loops will set this; for
     /// now [`ScanScratch::new_for_size`] just initialises to `0`.
     pub sky_cur_dir: i32,
+    /// Voxlap's `skyoff` — current row's pixel-index offset into the
+    /// sky texture (= `sky_cur_lng * (sky.xsiz + 1)`, computed in
+    /// gline's per-ray frustum prep). `0` means the textured-sky
+    /// path is inactive — `phase_startsky` falls back to solid-fill
+    /// `skycast`. Set by gline when an [`crate::sky::Sky`] is
+    /// loaded; reset to 0 each quadrant.
+    pub sky_off: i32,
     /// Per-screen-row x-boundary, voxlap's
     /// `int32_t lastx[max(MAXYDIM, VSID)]`. The right / left
     /// quadrants populate this during their pass-2 column walk; the
@@ -143,6 +150,7 @@ impl ScanScratch {
             gscanptr: 0,
             sky_cur_lng: -1,
             sky_cur_dir: 0,
+            sky_off: 0,
             lastx: vec![0i32; lastx_cap],
             uurend: vec![0i32; half_stride * 2],
             uurend_half_stride: half_stride,
@@ -242,6 +250,11 @@ impl ScanScratch {
         self.gscanptr = 0;
         self.sky_cur_lng = -1;
         self.sky_cur_dir = sky_cur_dir;
+        // sky_off stays 0 until gline updates it; the textured-sky
+        // path checks `sky_off != 0` to decide whether to texture-
+        // fill, so resetting here keeps the first-ray-of-quadrant
+        // path honest.
+        self.sky_off = 0;
     }
 }
 

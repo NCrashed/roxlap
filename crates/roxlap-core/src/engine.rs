@@ -2,6 +2,7 @@
 //! the API surface with a sky-fill stub; R4 wires in the real
 //! opticast + grouscan rasterizer behind the same call signatures.
 
+use crate::sky::Sky;
 use crate::Camera;
 
 /// Voxlap's `vx5.kv6col` default — mid-grey, equal R/G/B so the
@@ -51,6 +52,13 @@ pub struct Engine {
     /// Read by sprite `update_reflects` (and, when world voxel
     /// lighting lands, by `updatelighting`).
     lights: Vec<LightSrc>,
+    /// Sky texture for the textured-`startsky` path. `None` ⇒
+    /// `phase_startsky` solid-fills with `skycast` (cheap default;
+    /// every oracle pose stays here so its hashes are byte-stable
+    /// independent of any sky a host loads). `Some(sky)` ⇒ the
+    /// rasterizer walks `sky.lng` per ray + samples
+    /// `sky.pixels` per pixel, à la voxlap's `loadsky` path.
+    sky: Option<Sky>,
 }
 
 impl Default for Engine {
@@ -65,6 +73,7 @@ impl Default for Engine {
             kv6col: DEFAULT_KV6COL,
             lightmode: 0,
             lights: Vec::new(),
+            sky: None,
         }
     }
 }
@@ -170,6 +179,17 @@ impl Engine {
     #[must_use]
     pub fn lights(&self) -> &[LightSrc] {
         &self.lights
+    }
+
+    /// Set the sky texture used by the textured-`startsky` path.
+    /// `None` reverts to the cheap solid-fill default.
+    pub fn set_sky(&mut self, sky: Option<Sky>) {
+        self.sky = sky;
+    }
+
+    #[must_use]
+    pub fn sky(&self) -> Option<&Sky> {
+        self.sky.as_ref()
     }
 
     /// Render one frame into the caller-owned ARGB framebuffer.

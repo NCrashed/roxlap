@@ -81,6 +81,74 @@ fn fog_blend(col: i32, dist: i32, foglut: &[i32], fog_col: i32) -> i32 {
     r + g + b + k
 }
 
+/// Per-ray sky-row update. Mirror of voxlap5.c:1236-1255.
+///
+/// On the first ray of a quadrant (`scratch.sky_cur_lng < 0`),
+/// initialise from the ray's `atan2(vy1, vx1)` mapped through
+/// `sky.lng_mul`. On subsequent rays, walk `sky.lng[]` forward
+/// (when `sky_cur_dir < 0`) or backward (`sky_cur_dir >= 0`)
+/// until the cross-product flips sign — voxlap's rotating-cursor
+/// trick that avoids re-running atan2 per ray. After the search,
+/// stamp `scratch.sky_off = sky_cur_lng * sky.bpl`, which
+/// `phase_startsky_textured` divides by 4 to land at the row's
+/// pixel-base index.
+fn sky_per_ray_update(
+    scratch: &mut crate::rasterizer::ScanScratch,
+    sky: &crate::sky::Sky,
+    vx1: f32,
+    vy1: f32,
+) {
+    let ysiz = sky.ysiz;
+    if scratch.sky_cur_lng < 0 {
+        // First-ray init — atan2 mapped to row index.
+        let ang = vy1.atan2(vx1) + std::f32::consts::PI;
+        let raw = ang * sky.lng_mul - 0.5;
+        let mut lng = ftol(raw);
+        // Voxlap's `(uint32_t)skycurlng >= skyysiz` clamp uses an
+        // uninitialised `j` for the corrective shift; we substitute
+        // `rem_euclid` for a deterministic in-range value. The
+        // rotating-cursor walk in subsequent rays will quickly
+        // converge whichever way we land.
+        if (lng as u32) >= (ysiz as u32) {
+            lng = lng.rem_euclid(ysiz);
+        }
+        scratch.sky_cur_lng = lng;
+    } else if scratch.sky_cur_dir < 0 {
+        // Walk forward (rotating).
+        let mut j = scratch.sky_cur_lng + 1;
+        if j >= ysiz {
+            j = 0;
+        }
+        loop {
+            let l = sky.lng[j as usize];
+            if l[0] * vy1 <= l[1] * vx1 {
+                break;
+            }
+            scratch.sky_cur_lng = j;
+            j += 1;
+            if j >= ysiz {
+                j = 0;
+            }
+        }
+    } else {
+        // Walk backward (rotating).
+        loop {
+            let l = sky.lng[scratch.sky_cur_lng as usize];
+            if l[0] * vy1 >= l[1] * vx1 {
+                break;
+            }
+            scratch.sky_cur_lng -= 1;
+            if scratch.sky_cur_lng < 0 {
+                scratch.sky_cur_lng = ysiz - 1;
+            }
+        }
+    }
+    // Voxlap: `skyoff = skycurlng * skybpl + nskypic`. We strip
+    // the `+ nskypic` (texture base address) — `phase_startsky`
+    // adds it implicitly by indexing `sky.pixels` directly.
+    scratch.sky_off = scratch.sky_cur_lng * sky.bpl;
+}
+
 /// Per-frame state cached on first `frame_setup` call. Owned here
 /// (vs. borrowed from `ScanContext`) because gline needs to read
 /// it across many calls without re-borrowing each time. The
@@ -129,6 +197,14 @@ pub struct ScalarRasterizer<'a> {
     /// and the column-step path in grouscan, this is what lets the
     /// real gline walk the per-ray voxel-column traversal.
     vsid: u32,
+    /// Optional sky texture borrow. `None` ⇒ `phase_startsky`
+    /// solid-fills with `scratch.skycast`. `Some(_)` ⇒ gline's
+    /// per-ray frustum prep updates `scratch.sky_off`, and
+    /// `phase_startsky` runs the textured search-and-sample loop.
+    /// Set via [`Self::with_sky`] after construction; unset ⇒
+    /// engine's existing solid-sky behaviour, byte-stable for the
+    /// oracle.
+    sky: Option<&'a crate::sky::Sky>,
     /// Per-frame state cache. `None` until the first `frame_setup`
     /// call; gline panics if invoked before that.
     frame: Option<FrameCache>,
@@ -164,8 +240,19 @@ impl<'a> ScalarRasterizer<'a> {
             slab_buf,
             column_offsets,
             vsid,
+            sky: None,
             frame: None,
         }
+    }
+
+    /// Bind a sky texture for the lifetime of this rasterizer
+    /// instance. Hosts call this when [`crate::Engine::sky`] is
+    /// `Some(_)`. Without it, the rasterizer keeps the legacy
+    /// solid-fill `skycast` behaviour.
+    #[must_use]
+    pub fn with_sky(mut self, sky: &'a crate::sky::Sky) -> Self {
+        self.sky = Some(sky);
+        self
     }
 }
 
@@ -319,6 +406,16 @@ impl Rasterizer for ScalarRasterizer<'_> {
         }
         scratch.gxmax = gxmax;
 
+        // 5b. Per-ray sky-row search. Mirror of voxlap5.c:1236-
+        //     1255. Walks `sky.lng[]` to find the texel-row whose
+        //     longitude vector matches the ray's `(vx1, vy1)`
+        //     direction; stamps `scratch.sky_off` so
+        //     `phase_startsky` knows which row to sample. No-op
+        //     when no sky texture is bound.
+        if let Some(sky) = self.sky {
+            sky_per_ray_update(scratch, sky, f.vx1, f.vy1);
+        }
+
         // 6. Build inputs and call grouscan_run. The starting
         //    column is the camera's column (column_index from the
         //    prelude); the slab walker handles the rest.
@@ -338,6 +435,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
             gcsub: &gcsub_local,
             slab_buf: self.slab_buf,
             column_offsets: self.column_offsets,
+            sky: self.sky.map(crate::grouscan::SkyRef::from_sky),
         };
         let _ = grouscan_run(
             scratch,

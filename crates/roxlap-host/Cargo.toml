@@ -23,6 +23,10 @@ softbuffer = "0.4"
 # flate2 with the rust_backend feature stays pure-Rust (no native
 # zlib link), matching roxlap-formats's `oracle.vxl.gz` decode.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Pure-Rust PNG decoder for the embedded `assets/sky.png` panorama.
+# Default features include the deflate codec (also pure-Rust); no
+# native deps.
+png = "0.17"
 
 [lints]
 workspace = true
