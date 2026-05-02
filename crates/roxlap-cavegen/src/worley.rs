@@ -20,7 +20,22 @@
 //! grid (within toolchain — cross-CPU FP might diverge slightly,
 //! same caveat as the rendering tests).
 
+use crate::perlin::PerlinNoise3D;
+use crate::rng::SplitMix64;
 use crate::{CaveParams, MAXZDIM};
+
+/// Wavelength of the Perlin overlay's lowest octave, in voxels.
+/// Tuned so a `seed_count = 128` cave at `vsid = 256` shows
+/// recognisable surface roughness without dissolving the Worley
+/// cell structure.
+const PERLIN_LOWEST_FREQUENCY: f32 = 1.0 / 16.0;
+
+/// Perlin overlay's effect in voxel-distance units when
+/// `perlin_amplitude = 1.0` and the noise sample is at its peak.
+/// The full overlay is `perlin_amplitude * fbm * VOXEL_SCALE` —
+/// `VOXEL_SCALE = 8` means an `amplitude = 0.15` overlay shifts
+/// the air/solid boundary by up to ±1.2 voxels.
+const PERLIN_VOXEL_SCALE: f32 = 8.0;
 
 /// One Worley seed point.
 #[derive(Debug, Clone, Copy)]
@@ -87,6 +102,54 @@ pub fn classify_voxel(seeds: &[Seed], x: u32, y: u32, z: i32, anisotropy: f32) -
     d_air_sq >= d_solid_sq
 }
 
+/// Like [`classify_voxel`] but adds a Perlin-noise overlay to the
+/// distance-to-air-seed term. Voxel is air iff
+/// `d_air + overlay < d_solid`, where
+/// `overlay = perlin_amplitude × fbm(x, y, z, octaves) × PERLIN_VOXEL_SCALE`.
+///
+/// `perlin_octaves = 0` or `perlin_amplitude = 0.0` is equivalent to
+/// [`classify_voxel`] (overlay short-circuits to 0).
+///
+/// Costs 2 extra `sqrt`s per voxel + 1 `fbm` call vs the plain
+/// Worley path. At `vsid = 256, seed_count = 128`, the overlay's
+/// per-voxel work is dwarfed by the seed-distance loop (128 squared
+/// dists), so this is essentially free.
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+pub fn classify_voxel_with_perlin(
+    seeds: &[Seed],
+    perlin: &PerlinNoise3D,
+    x: u32,
+    y: u32,
+    z: i32,
+    anisotropy: f32,
+    perlin_octaves: u32,
+    perlin_amplitude: f32,
+) -> bool {
+    let p = [x as f32, y as f32, z as f32];
+    let mut d_air_sq = f32::INFINITY;
+    let mut d_solid_sq = f32::INFINITY;
+    for seed in seeds {
+        let d_sq = anisotropic_dist_sq(p, seed.pos, anisotropy);
+        if seed.is_air {
+            if d_sq < d_air_sq {
+                d_air_sq = d_sq;
+            }
+        } else if d_sq < d_solid_sq {
+            d_solid_sq = d_sq;
+        }
+    }
+    if perlin_octaves == 0 || perlin_amplitude == 0.0 {
+        return d_air_sq >= d_solid_sq;
+    }
+    let d_air = d_air_sq.sqrt();
+    let d_solid = d_solid_sq.sqrt();
+    let overlay = perlin.fbm(p[0], p[1], p[2], perlin_octaves, PERLIN_LOWEST_FREQUENCY)
+        * perlin_amplitude
+        * PERLIN_VOXEL_SCALE;
+    (d_air + overlay) >= d_solid
+}
+
 /// Build the dense `(VSID × VSID × MAXZDIM)` solidness grid by
 /// classifying every voxel against the seed set. Output: 1 byte
 /// per voxel; non-zero = solid.
@@ -98,6 +161,16 @@ pub fn classify_voxel(seeds: &[Seed], x: u32, y: u32, z: i32, anisotropy: f32) -
 #[allow(clippy::cast_sign_loss)]
 pub fn worley_classify_grid(params: &CaveParams, vsid: u32) -> Vec<u8> {
     let seeds = place_seeds(params, vsid);
+    // Different sub-seed for Perlin so its permutation table is
+    // decorrelated from the seed-placement RNG stream.
+    let perlin_active = params.perlin_octaves > 0 && params.perlin_amplitude > 0.0;
+    let perlin = if perlin_active {
+        Some(PerlinNoise3D::new(
+            params.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        ))
+    } else {
+        None
+    };
     let vsid_u = vsid as usize;
     let maxzdim_u = MAXZDIM as usize;
     let n_voxels = vsid_u * vsid_u * maxzdim_u;
@@ -106,7 +179,21 @@ pub fn worley_classify_grid(params: &CaveParams, vsid: u32) -> Vec<u8> {
         for x in 0..vsid {
             for z in 0..MAXZDIM {
                 let idx = (y as usize * vsid_u + x as usize) * maxzdim_u + z as usize;
-                if classify_voxel(&seeds, x, y, z, params.anisotropy) {
+                let solid = if let Some(ref p) = perlin {
+                    classify_voxel_with_perlin(
+                        &seeds,
+                        p,
+                        x,
+                        y,
+                        z,
+                        params.anisotropy,
+                        params.perlin_octaves,
+                        params.perlin_amplitude,
+                    )
+                } else {
+                    classify_voxel(&seeds, x, y, z, params.anisotropy)
+                };
+                if solid {
                     grid[idx] = 1;
                 }
             }
@@ -121,40 +208,6 @@ fn anisotropic_dist_sq(a: [f32; 3], b: [f32; 3], anisotropy: f32) -> f32 {
     let dy = a[1] - b[1];
     let dz = (a[2] - b[2]) * anisotropy;
     dx * dx + dy * dy + dz * dz
-}
-
-// ---- splitmix64 PRNG ------------------------------------------------
-//
-// Tiny deterministic PRNG, no external dep. Reference:
-// http://prng.di.unimi.it/splitmix64.c. Produces u64 streams indexed
-// by an internal counter; `next_f32_unit` maps to `[0.0, 1.0)`.
-
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: seed.wrapping_add(0x9E37_79B9_7F4A_7C15),
-        }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform `f32` in `[0.0, 1.0)`. 24 random bits → exact
-    /// representation as f32 mantissa.
-    #[allow(clippy::cast_precision_loss)]
-    fn next_f32_unit(&mut self) -> f32 {
-        let bits = self.next_u64() >> (64 - 24);
-        (bits as f32) / ((1u32 << 24) as f32)
-    }
 }
 
 #[cfg(test)]
@@ -309,5 +362,61 @@ mod tests {
         let g1 = worley_classify_grid(&p, 16);
         let g2 = worley_classify_grid(&p, 16);
         assert_eq!(g1, g2, "same seed → byte-stable grid");
+    }
+
+    #[test]
+    fn perlin_overlay_perturbs_classification() {
+        // Same Worley seeds; with vs without Perlin overlay should
+        // disagree on at least *some* voxels (boundary shifts).
+        let no_perlin = test_params(99, 32, 0.5);
+        let with_perlin = CaveParams {
+            perlin_octaves: 3,
+            perlin_amplitude: 0.4, // amplified to guarantee divergence
+            ..no_perlin
+        };
+        let g1 = worley_classify_grid(&no_perlin, 16);
+        let g2 = worley_classify_grid(&with_perlin, 16);
+        let diffs = g1.iter().zip(g2.iter()).filter(|(a, b)| a != b).count();
+        assert!(
+            diffs > 0,
+            "Perlin overlay should perturb the air/solid boundary"
+        );
+        // But not so many — Perlin should shift the boundary, not
+        // randomise it. Expect <30% of voxels to flip.
+        let total = g1.len();
+        assert!(
+            diffs * 100 / total < 30,
+            "Perlin shifts boundary, doesn't randomise: {diffs} of {total} flipped"
+        );
+    }
+
+    #[test]
+    fn perlin_overlay_byte_stable() {
+        // Same seed + perlin params → byte-stable grid.
+        let p = CaveParams {
+            seed: 7,
+            seed_count: 32,
+            air_ratio: 0.5,
+            anisotropy: 1.0,
+            perlin_octaves: 3,
+            perlin_amplitude: 0.15,
+        };
+        let g1 = worley_classify_grid(&p, 16);
+        let g2 = worley_classify_grid(&p, 16);
+        assert_eq!(g1, g2);
+    }
+
+    #[test]
+    fn perlin_disabled_when_amplitude_zero() {
+        // amplitude = 0 should match the no-Perlin path exactly.
+        let no_perlin = test_params(11, 32, 0.5);
+        let zero_amplitude = CaveParams {
+            perlin_octaves: 3,
+            perlin_amplitude: 0.0,
+            ..no_perlin
+        };
+        let g1 = worley_classify_grid(&no_perlin, 16);
+        let g2 = worley_classify_grid(&zero_amplitude, 16);
+        assert_eq!(g1, g2, "amplitude=0 should disable overlay");
     }
 }

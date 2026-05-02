@@ -23,10 +23,15 @@
 pub use roxlap_formats::vxl::Vxl;
 
 mod pack;
+mod perlin;
+mod rng;
 mod worley;
 
 pub use pack::{pack_dense_grid_to_vxl, MAXZDIM};
-pub use worley::{classify_voxel, place_seeds, worley_classify_grid, Seed};
+pub use perlin::PerlinNoise3D;
+pub use worley::{
+    classify_voxel, classify_voxel_with_perlin, place_seeds, worley_classify_grid, Seed,
+};
 
 /// Parameters for the procedural cave generators.
 ///
