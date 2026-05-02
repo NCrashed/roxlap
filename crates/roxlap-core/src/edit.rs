@@ -28,7 +28,7 @@
 
 /// Voxlap's `MAXZDIM` (voxlap5.h:10). World z is one byte → at most
 /// 256 voxels tall.
-pub(crate) const MAXZDIM: i32 = 256;
+pub const MAXZDIM: i32 = 256;
 
 /// Carve voxels in `[y0, y1)` to air on the column `b2`.
 ///
@@ -42,7 +42,7 @@ pub(crate) const MAXZDIM: i32 = 256;
 /// In the worst case the carve splits a single solid slab in two,
 /// growing the list by one pair. The caller is responsible for
 /// sizing `b2` to absorb this. The helper does not allocate.
-pub(crate) fn delslab(b2: &mut [i32], y0: i32, mut y1: i32) {
+pub fn delslab(b2: &mut [i32], y0: i32, mut y1: i32) {
     if y1 >= MAXZDIM {
         y1 = MAXZDIM - 1;
     }
@@ -114,7 +114,7 @@ pub(crate) fn delslab(b2: &mut [i32], y0: i32, mut y1: i32) {
 ///   `MAXZDIM`; voxlap relies on the caller for that. A `y1` value
 ///   `>= MAXZDIM` collapses the column into a single solid slab
 ///   that acts as the sentinel.
-pub(crate) fn insslab(b2: &mut [i32], y0: i32, y1: i32) {
+pub fn insslab(b2: &mut [i32], y0: i32, y1: i32) {
     if y0 >= y1 || b2.is_empty() {
         return;
     }
