@@ -24,11 +24,13 @@ pub use roxlap_formats::vxl::Vxl;
 
 mod pack;
 mod perlin;
+mod presets;
 mod rng;
 mod worley;
 
 pub use pack::{pack_dense_grid_to_vxl, MAXZDIM};
 pub use perlin::PerlinNoise3D;
+pub use presets::BlueCaveGenerator;
 pub use worley::{
     classify_voxel, classify_voxel_with_perlin, place_seeds, worley_classify_grid, Seed,
 };
@@ -97,13 +99,10 @@ pub trait Generator {
     fn generate(&self, params: &Self::Params, vsid: u32) -> Vxl;
 }
 
-// ---- Preset stubs (CD.6/CD.7 will fill these in) -------------------
-
-/// Blue-cave preset matching Ken's `caveblue2m.jpg`. Stone-grey
-/// base, green moss tops, dim orange floor. CD.6 lands the
-/// implementation; this stub holds the type for downstream wiring.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct BlueCaveGenerator;
+// ---- Preset stubs --------------------------------------------------
+//
+// `BlueCaveGenerator` lands at CD.6 in `presets.rs`. CD.7 will add
+// `MagCaveGenerator` there too.
 
 /// Magenta-cave preset matching Ken's `cavemag3m.jpg`. Magenta base,
 /// yellow-green edge highlight. CD.7 lands the implementation; this
