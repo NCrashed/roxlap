@@ -8,21 +8,16 @@ authors.workspace = true
 rust-version.workspace = true
 readme.workspace = true
 description = "winit + softbuffer demo host for the roxlap engine."
-documentation = "https://docs.rs/roxlap-host"
-keywords = ["voxlap", "voxel", "demo", "winit", "viewer"]
-categories = ["game-development", "graphics", "rendering"]
-# Assets the host's `include_bytes!` calls reference (oracle world,
-# kv6 sprites, sky panorama). Paths are relative to this crate's
-# directory; cargo preserves the workspace-relative layout in the
-# published tarball so `include_bytes!("../../../assets/...")`
-# still resolves at downstream-build time.
-include = [
-    "src/**/*",
-    "../../assets/coco.kv6",
-    "../../assets/oracle.vxl.gz",
-    "../../assets/sky.png",
-    "../../crates/roxlap-core/tests/fixtures/sprite_meltsphere.kv6",
-]
+# Not published to crates.io for v0.1 — the host's `include_bytes!`
+# calls reference workspace-shared assets at `../../../assets/`,
+# which sit outside the package directory and are silently dropped
+# by cargo's tarball builder. Reaching `cargo install roxlap-host`
+# parity would mean either relocating the shared assets under this
+# crate's tree or splitting them into a `roxlap-assets` crate; both
+# are scoped for a follow-up release. For v0.1 the host ships as a
+# binary in GitHub releases, and `git clone + cargo run` continues
+# to work zero-setup for development users.
+publish = false
 
 [[bin]]
 name = "roxlap-host"
