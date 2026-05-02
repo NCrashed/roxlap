@@ -5,7 +5,7 @@
 //! port (Stage 4.5b.2..6):
 //!
 //! - **R4.3c (this commit)**: cftype data model + `grouscan_run`
-//!   prologue. Caches the cf[128] seed slot's state into local
+//!   prologue. Caches the `cf[128]` seed slot's state into local
 //!   scalars, picks the leading raycast lane. The dispatch skeleton
 //!   + draw-phase stubs land in R4.3d.
 //! - **R4.3d**: drawcwall / drawfwall / drawceil / drawflor stubs +
@@ -525,7 +525,7 @@ pub fn grouscan_run(
 }
 
 /// One label in voxlap's grouscan state machine. The C source uses
-/// `goto` between these labels; we drive them via [`run_phases`].
+/// `goto` between these labels; we drive them via the phase driver.
 ///
 /// Voxlap line numbers reference the same label names in
 /// `voxlaptest`'s `grouscanasm_scalar` (`voxlap5.c:11643..11770`).

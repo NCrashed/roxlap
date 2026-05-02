@@ -18,7 +18,7 @@
 //! - **`gdz[2]`**: per-column-step delta added to `gpz` after a
 //!   column advance. Constant per scanline.
 //!
-//! The trailing pieces of voxlap's `gline` (cf[128] seeding, gxmax
+//! The trailing pieces of voxlap's `gline` (`cf[128]` seeding, gxmax
 //! edge clipping, sky-radar bookkeeping, the `grouscanasm_scalar`
 //! call) land in R4.3c+; this module only ships the projection
 //! math because it's hand-verifiable in isolation.
@@ -61,7 +61,7 @@ pub struct GlineFrustum {
 /// `leng` is voxlap's `leng` parameter (the pixel run length the
 /// caller will write into `radar`). It is *not* used by the
 /// projection math here — it's part of the broader gline signature
-/// and consumed in R4.3c when the cf[128] seed and `gi0` / `gi1`
+/// and consumed in R4.3c when the `cf[128]` seed and `gi0` / `gi1`
 /// step coefficients land. Kept in the signature now to flag the
 /// dependency for the next sub-substage.
 //

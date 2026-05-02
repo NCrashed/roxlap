@@ -99,8 +99,8 @@ pub const fn xbsceil(k: usize) -> u32 {
 /// is solid (= part of any slab body, including hidden interiors
 /// between slabs).
 ///
-/// Walks the slab linked list, alternating between v[1]
-/// (air→solid transition at top of slab) and v[3] (solid→air
+/// Walks the slab linked list, alternating between `v[1]`
+/// (air→solid transition at top of slab) and `v[3]` (solid→air
 /// transition at bottom of next slab). Each transition flushes
 /// pending whole-words (full air `0` or full solid `-1`) until
 /// it lands inside the partial word containing the transition,

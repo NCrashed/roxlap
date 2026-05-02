@@ -331,7 +331,7 @@ impl KfaSprite {
 /// Render an animated KFA sprite — voxlap's `kfadraw`
 /// (voxlap5.c:9759). Walks the bone tree in topological order
 /// (parents first), computes each limb's world transform from
-/// the parent's via [`setlimb`], then dispatches
+/// the parent's via the per-limb `setlimb` walk, then dispatches
 /// [`crate::sprite::draw_sprite`] per limb to rasterise its kv6.
 ///
 /// Returns the total number of pixels written across all limbs.

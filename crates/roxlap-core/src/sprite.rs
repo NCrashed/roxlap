@@ -65,7 +65,7 @@ const MAX_LIGHTS: usize = 16;
 /// distance (in voxlap's "ftol-of-forward-projected" estimate units)
 /// above which kv6draw walks the lowermip chain. Roxlap doesn't yet
 /// model the lowermip chain in `roxlap-formats::Kv6`, so the mip
-/// descent loop in [`kv6_draw_prepare`] is structurally faithful but
+/// descent loop in `kv6_draw_prepare` is structurally faithful but
 /// effectively a no-op until that lands.
 pub const KV6_MIPFACTOR_DEFAULT: i32 = 128;
 
@@ -365,7 +365,7 @@ pub(crate) struct Kv6FullState<'a> {
 /// Mirrors voxlap's `kv6frameplace` + `zbuffermem` but in
 /// row-major-pixel form rather than byte-pointer form. `width` /
 /// `height` must match the `OpticastSettings.xres` / `yres` used
-/// when [`Kv6FullState`] was built — the bounds derived from
+/// when the per-frame `Kv6FullState` was built — the bounds derived from
 /// `qsum0` / `qsum1` assume that geometry.
 pub struct DrawTarget<'a> {
     /// Packed BGRA pixels, row-major, length `pitch_pixels * height`.
@@ -1396,7 +1396,7 @@ pub(crate) fn kv6_iterate<F: FnMut(&Voxel, u32, [f32; 4])>(
 ///   rendering).
 ///
 /// Otherwise: cull → setup math → 9-arm per-voxel iteration →
-/// per-voxel rasterize via [`drawboundcubesse`].
+/// per-voxel rasterize via the R6.4 `drawboundcubesse` port.
 ///
 /// Returns the total number of pixels written across all voxels of
 /// the sprite (== sum of z-test passes). Zero means the sprite

@@ -542,7 +542,7 @@ fn format_hashes(rows: &[(&str, u64)]) -> String {
 }
 
 /// `cmd_render` options parsed off the CLI. `ppm_dir = Some(dir)`
-/// means "dump <pose>.ppm into `dir`" (creating it if missing).
+/// means "dump `<pose>.ppm` into `dir`" (creating it if missing).
 struct RenderOpts {
     ppm_dir: Option<std::path::PathBuf>,
 }
