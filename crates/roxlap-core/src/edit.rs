@@ -996,6 +996,216 @@ pub fn set_spans(world: &mut Vxl, spans: &[Vspan], color: Option<u32>) {
     set_spans_with_colfunc(world, spans, op, move |_, _, _| c_i32);
 }
 
+// ====================================================================
+// set_cube / set_rect / set_sphere (CD.4) — region wrappers.
+// ====================================================================
+
+/// Edit a single voxel at `(x, y, z)`. Voxlap5.c:4669 `setcube`.
+///
+/// `color = None` carves to air; `Some(c)` inserts solid coloured
+/// `c`. Out-of-bounds coordinates are silently skipped.
+///
+/// **Note**: This port skips voxlap C's "exposed-solid in-place
+/// colour overwrite" optimization — every call goes through the
+/// scum2 + delslab/insslab + compilerle pipeline. Per-voxel edits
+/// are rare in the cave-demo workload; the optimization can land
+/// later if needed.
+///
+/// # Panics
+///
+/// Panics if `world.vbit` is empty — call
+/// [`Vxl::reserve_edit_capacity`] first.
+pub fn set_cube(world: &mut Vxl, x: i32, y: i32, z: i32, color: Option<u32>) {
+    let op = if color.is_some() {
+        SpanOp::Insert
+    } else {
+        SpanOp::Carve
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    let c_i32 = color.unwrap_or(0) as i32;
+    set_cube_with_colfunc(world, x, y, z, op, move |_, _, _| c_i32);
+}
+
+/// [`set_cube`] with a custom colour callback.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub fn set_cube_with_colfunc<F>(world: &mut Vxl, x: i32, y: i32, z: i32, op: SpanOp, colfunc: F)
+where
+    F: FnMut(i32, i32, i32) -> i32,
+{
+    let vsid = world.vsid as i32;
+    if x < 0 || x >= vsid || y < 0 || y >= vsid || !(0..MAXZDIM).contains(&z) {
+        return;
+    }
+    let span = Vspan {
+        x: x as u32,
+        y: y as u32,
+        z0: z as u8,
+        z1: z as u8,
+    };
+    set_spans_with_colfunc(world, &[span], op, colfunc);
+}
+
+/// Edit an axis-aligned box `[lo, hi]` (inclusive on both ends in
+/// every axis). Voxlap5.c:5214 `setrect`.
+///
+/// `color = None` carves to air; `Some(c)` inserts solid coloured
+/// `c`. The box is sorted and clamped to world bounds before
+/// iteration; an empty box (any axis where lo > hi after clamp) is
+/// a no-op.
+///
+/// # Panics
+///
+/// Panics if `world.vbit` is empty — call
+/// [`Vxl::reserve_edit_capacity`] first.
+pub fn set_rect(world: &mut Vxl, lo: [i32; 3], hi: [i32; 3], color: Option<u32>) {
+    let op = if color.is_some() {
+        SpanOp::Insert
+    } else {
+        SpanOp::Carve
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    let c_i32 = color.unwrap_or(0) as i32;
+    set_rect_with_colfunc(world, lo, hi, op, move |_, _, _| c_i32);
+}
+
+/// [`set_rect`] with a custom colour callback.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub fn set_rect_with_colfunc<F>(world: &mut Vxl, lo: [i32; 3], hi: [i32; 3], op: SpanOp, colfunc: F)
+where
+    F: FnMut(i32, i32, i32) -> i32,
+{
+    let vsid = world.vsid as i32;
+    let xs = lo[0].min(hi[0]).max(0);
+    let xe = lo[0].max(hi[0]).min(vsid - 1);
+    let ys = lo[1].min(hi[1]).max(0);
+    let ye = lo[1].max(hi[1]).min(vsid - 1);
+    let zs = lo[2].min(hi[2]).max(0);
+    let ze = lo[2].max(hi[2]).min(MAXZDIM - 1);
+    if xs > xe || ys > ye || zs > ze {
+        return;
+    }
+    let inserting = op == SpanOp::Insert;
+    let mut ctx = ScumCtx::new(world);
+    ctx.set_colfunc(colfunc);
+    for y in ys..=ye {
+        for x in xs..=xe {
+            ctx.with_column(x, y, |b2| {
+                if inserting {
+                    insslab(b2, zs, ze + 1);
+                } else {
+                    delslab(b2, zs, ze + 1);
+                }
+            });
+        }
+    }
+    ctx.finish();
+}
+
+/// Edit a sphere of voxels centred at `center` with the given
+/// `radius`. Voxlap5.c:4970 `setsphere`.
+///
+/// Uses Euclidean distance (voxlap's default `vx5.curpow = 2.0`
+/// case). For voxlap-style non-Euclidean shapes (octahedron at
+/// `curpow = 1.0`, etc.) the user can drop down to [`ScumCtx`] and
+/// roll their own iteration; the cave-demo's spherical bullet
+/// impacts only need the Euclidean case.
+///
+/// `color = None` carves to air; `Some(c)` inserts solid coloured
+/// `c`. The bounding box is clamped to world bounds; a sphere fully
+/// outside the world is a no-op.
+///
+/// # Panics
+///
+/// Panics if `world.vbit` is empty — call
+/// [`Vxl::reserve_edit_capacity`] first.
+pub fn set_sphere(world: &mut Vxl, center: [i32; 3], radius: u32, color: Option<u32>) {
+    let op = if color.is_some() {
+        SpanOp::Insert
+    } else {
+        SpanOp::Carve
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    let c_i32 = color.unwrap_or(0) as i32;
+    set_sphere_with_colfunc(world, center, radius, op, move |_, _, _| c_i32);
+}
+
+/// [`set_sphere`] with a custom colour callback.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::similar_names
+)]
+pub fn set_sphere_with_colfunc<F>(
+    world: &mut Vxl,
+    center: [i32; 3],
+    radius: u32,
+    op: SpanOp,
+    colfunc: F,
+) where
+    F: FnMut(i32, i32, i32) -> i32,
+{
+    let vsid = world.vsid as i32;
+    let cx = center[0];
+    let cy = center[1];
+    let cz = center[2];
+    let r = radius as i32;
+    let xs = (cx - r).max(0);
+    let xe = (cx + r).min(vsid - 1);
+    let ys = (cy - r).max(0);
+    let ye = (cy + r).min(vsid - 1);
+    let zs = (cz - r).max(0);
+    let ze = (cz + r).min(MAXZDIM - 1);
+    if xs > xe || ys > ye || zs > ze {
+        return;
+    }
+    let r_sq = r * r;
+    let inserting = op == SpanOp::Insert;
+    let mut ctx = ScumCtx::new(world);
+    ctx.set_colfunc(colfunc);
+    for y in ys..=ye {
+        let dy = y - cy;
+        let dy_sq = dy * dy;
+        if dy_sq > r_sq {
+            continue;
+        }
+        for x in xs..=xe {
+            let dx = x - cx;
+            let dx_sq = dx * dx;
+            let xy_sq = dx_sq + dy_sq;
+            if xy_sq > r_sq {
+                continue;
+            }
+            // dz_max satisfies dx² + dy² + dz² <= r²; voxel range is
+            // z = cz - dz_max ..= cz + dz_max.
+            let dz_max_sq = r_sq - xy_sq;
+            let dz_max = (dz_max_sq as f32).sqrt() as i32;
+            let z_lo = (cz - dz_max).max(zs);
+            let z_hi = (cz + dz_max).min(ze);
+            if z_lo > z_hi {
+                continue;
+            }
+            ctx.with_column(x, y, |b2| {
+                if inserting {
+                    insslab(b2, z_lo, z_hi + 1);
+                } else {
+                    delslab(b2, z_lo, z_hi + 1);
+                }
+            });
+        }
+    }
+    ctx.finish();
+}
+
 #[cfg(test)]
 #[allow(
     clippy::cast_possible_truncation,
@@ -2012,6 +2222,185 @@ mod tests {
             v += usize::from(nextptr) * 4;
         }
         assert!(found, "did not find a slab with z1=60");
+    }
+
+    // ---- set_cube / set_rect / set_sphere (CD.4) ---------------------
+
+    #[test]
+    fn set_cube_carves_single_voxel() {
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+        set_cube(&mut vxl, 1, 1, 100, None);
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(4 + 1), &mut b2);
+        // Solid runs: [0, 100), [101, MAXZDIM).
+        assert_eq!(b2[0], 0);
+        assert_eq!(b2[1], 100);
+        assert_eq!(b2[2], 101);
+        assert_eq!(b2[3], MAXZDIM);
+    }
+
+    #[test]
+    fn set_cube_skips_oob() {
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+        // Negative x, oversized y, z >= MAXZDIM, all silently no-op.
+        set_cube(&mut vxl, -1, 1, 100, None);
+        set_cube(&mut vxl, 5, 1, 100, None);
+        set_cube(&mut vxl, 1, 1, 256, None);
+        // Column (1, 1) untouched.
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(4 + 1), &mut b2);
+        assert_eq!(b2[0], 0);
+        assert_eq!(b2[1], MAXZDIM);
+    }
+
+    #[test]
+    fn set_rect_carves_aabb() {
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(8192);
+        // Carve a 2x2x50 box at (1..=2, 1..=2, 50..=99).
+        set_rect(&mut vxl, [1, 1, 50], [2, 2, 99], None);
+        for y in 1..=2 {
+            for x in 1..=2 {
+                let idx = (y * 4 + x) as usize;
+                let mut b2 = vec![0i32; SCPITCH];
+                expandrle(vxl.column_data(idx), &mut b2);
+                assert_eq!(b2[0], 0, "col ({x},{y})");
+                assert_eq!(b2[1], 50, "col ({x},{y})");
+                assert_eq!(b2[2], 100, "col ({x},{y})");
+                assert_eq!(b2[3], MAXZDIM, "col ({x},{y})");
+            }
+        }
+        // Untouched corners still solid through the full column.
+        for &(x, y) in &[(0, 0), (3, 3)] {
+            let idx = (y * 4 + x) as usize;
+            let mut b2 = vec![0i32; SCPITCH];
+            expandrle(vxl.column_data(idx), &mut b2);
+            assert_eq!(b2[0], 0);
+            assert_eq!(b2[1], MAXZDIM);
+        }
+    }
+
+    #[test]
+    fn set_rect_clamps_to_world() {
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(8192);
+        // Box extends well past world bounds — clamps to [0, 3] in
+        // each axis.
+        set_rect(&mut vxl, [-10, -10, -10], [100, 100, 1000], None);
+        // Every column carved over [0, MAXZDIM) → all-air.
+        for idx in 0..16 {
+            let mut b2 = vec![0i32; SCPITCH];
+            expandrle(vxl.column_data(idx), &mut b2);
+            // delslab clamps z1 to MAXZDIM-1, leaving voxel at
+            // z=MAXZDIM-1 solid. The b2 reflects this: solid run
+            // [255, MAXZDIM) only.
+            assert_eq!(b2[0], 255, "col {idx}");
+            assert_eq!(b2[1], MAXZDIM, "col {idx}");
+        }
+    }
+
+    #[test]
+    fn set_sphere_carves_centred_sphere() {
+        // 4x4 world; sphere radius 1 carves a "+" pattern at z=128
+        // (center voxel + 4 axis-adjacent + 2 z-axis voxels).
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(8192);
+        set_sphere(&mut vxl, [1, 1, 128], 1, None);
+        // Voxels carved at: (1,1,127), (1,1,128), (1,1,129) [z axis],
+        // (0,1,128), (2,1,128) [x axis], (1,0,128), (1,2,128) [y axis].
+        // Center column (1,1) has z range [127, 130) carved.
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(4 + 1), &mut b2);
+        assert_eq!(b2[0], 0);
+        assert_eq!(b2[1], 127);
+        assert_eq!(b2[2], 130);
+        assert_eq!(b2[3], MAXZDIM);
+        // Adjacent column (0, 1) has only z=128 carved.
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(4), &mut b2);
+        assert_eq!(b2[0], 0);
+        assert_eq!(b2[1], 128);
+        assert_eq!(b2[2], 129);
+        assert_eq!(b2[3], MAXZDIM);
+    }
+
+    #[test]
+    fn set_sphere_radius_zero_is_single_voxel() {
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+        set_sphere(&mut vxl, [1, 1, 100], 0, None);
+        // Same as set_cube — only (1, 1, 100) carved.
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(4 + 1), &mut b2);
+        assert_eq!(b2[0], 0);
+        assert_eq!(b2[1], 100);
+        assert_eq!(b2[2], 101);
+        assert_eq!(b2[3], MAXZDIM);
+    }
+
+    #[test]
+    fn set_sphere_with_colfunc_position_dependent_color() {
+        // Carve a cave first (so the inserted sphere has air on every
+        // side, exposing its surface voxels), then insert a sphere
+        // with a colfunc that returns z in the low byte. Verify
+        // (a) b2 reflects the sphere shape and (b) the top exposed
+        // voxel's colour is the colfunc output.
+        //
+        // Note: voxlap's compilerle stores colours only for EXPOSED
+        // voxels (top of run + skip-forward landings); buried voxels
+        // in the middle of a slab don't get colfunc-derived colours
+        // recorded. So we can only verify colours for voxels at the
+        // run boundary or near them.
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(8192);
+        // Carve [50, 200) on every column.
+        set_rect(&mut vxl, [0, 0, 50], [3, 3, 199], None);
+        // Insert a sphere of radius 2 at (1, 1, 128). Center column
+        // gets z=126..130 inclusive (5 voxels) inserted.
+        set_sphere_with_colfunc(&mut vxl, [1, 1, 128], 2, SpanOp::Insert, |_, _, z| {
+            (0x80ff_ff00u32 as i32) | z
+        });
+        // (a) b2 has the expected three solid runs.
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(4 + 1), &mut b2);
+        assert_eq!(b2[0], 0, "b2 first run top");
+        assert_eq!(b2[1], 50, "b2 first run bot");
+        assert_eq!(b2[2], 126, "b2 sphere run top");
+        assert_eq!(b2[3], 131, "b2 sphere run bot");
+        assert_eq!(b2[4], 200, "b2 third run top");
+        assert_eq!(b2[5], MAXZDIM, "b2 third run bot");
+
+        // (b) top of the sphere (z=126) is exposed (air above from
+        // the carve). Its colour is the FIRST byte of the slab's
+        // floor list.
+        let column = vxl.column_data(4 + 1).to_vec();
+        let mut v = 0usize;
+        let mut top_color = None;
+        loop {
+            let nextptr = column[v];
+            let z1 = column[v + 1];
+            if z1 == 126 {
+                let off = v + 4;
+                top_color = Some(u32::from_le_bytes([
+                    column[off],
+                    column[off + 1],
+                    column[off + 2],
+                    column[off + 3],
+                ]));
+                break;
+            }
+            if nextptr == 0 {
+                break;
+            }
+            v += usize::from(nextptr) * 4;
+        }
+        assert_eq!(
+            top_color,
+            Some(0x80ff_ff7e),
+            "exposed voxel at z=126 should have colfunc-derived colour"
+        );
     }
 
     #[test]
