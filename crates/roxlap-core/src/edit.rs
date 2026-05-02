@@ -168,6 +168,34 @@ pub(crate) fn insslab(b2: &mut [i32], y0: i32, y1: i32) {
     }
 }
 
+/// Decode a column's slab bytes into the `b2` z-range buffer.
+///
+/// Port of `expandrle` (voxlap5.c:4131). Walks the slab chain, writes
+/// `[top0, bot0, top1, bot1, ..., MAXZDIM_sentinel]` into `uind`.
+/// `uind` MUST be sized to hold every solid run plus the sentinel pair
+/// — voxlap allocates `MAXZDIM` slots, which is the worst-case bound
+/// (one slab per z value).
+///
+/// The `if (v[3] >= v[1]) continue` branch handles a degenerate slab
+/// where ceiling-z is at or below floor-z (no air gap above this
+/// slab); voxlap merges it implicitly into the previous solid run by
+/// skipping the slab in `uind`.
+pub(crate) fn expandrle(slab: &[u8], uind: &mut [i32]) {
+    uind[0] = i32::from(slab[1]);
+    let mut i = 2usize;
+    let mut v = 0usize;
+    while slab[v] != 0 {
+        v += usize::from(slab[v]) * 4;
+        if slab[v + 3] >= slab[v + 1] {
+            continue;
+        }
+        uind[i - 1] = i32::from(slab[v + 3]);
+        uind[i] = i32::from(slab[v + 1]);
+        i += 2;
+    }
+    uind[i - 1] = MAXZDIM;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +448,122 @@ mod tests {
         let mut b2 = build_b2(&[(10, 20)]);
         insslab(&mut b2, 100, 150);
         assert_eq!(read_slabs(&b2), [(10, 20), (100, 150)]);
+    }
+
+    // ---- expandrle (CD.2.3) ------------------------------------------
+
+    /// Strip the `[top, bot, top, bot, ..., MAXZDIM]` decoded shape
+    /// off a `b2` produced by [`expandrle`]. Last bot is the sentinel
+    /// (== MAXZDIM); preceding pairs are the solid runs.
+    fn read_uind(uind: &[i32]) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while uind[i + 1] < MAXZDIM {
+            out.push((uind[i], uind[i + 1]));
+            i += 2;
+        }
+        // Last solid run terminated by sentinel.
+        out.push((uind[i], uind[i + 1]));
+        out
+    }
+
+    #[test]
+    fn expandrle_single_slab_fully_solid_column() {
+        // Voxlap encoding for solid [0, MAXZDIM) — the on-disk fixture
+        // we see for "ground all the way down" columns.
+        // [nextptr=0, z1=0, z1c=MAXZDIM-1, z0=0] + MAXZDIM × 4 colours.
+        let z1c = u8::try_from(MAXZDIM - 1).expect("MAXZDIM-1 fits in u8");
+        let mut slab = vec![0u8, 0, z1c, 0];
+        slab.extend(std::iter::repeat_n(0u8, (MAXZDIM as usize) * 4));
+        let mut uind = vec![0i32; 16];
+        expandrle(&slab, &mut uind);
+        // One solid run from z=0 to MAXZDIM, followed by sentinel.
+        assert_eq!(uind[0], 0);
+        assert_eq!(uind[1], MAXZDIM);
+    }
+
+    #[test]
+    fn expandrle_single_slab_partial_floor() {
+        // [nextptr=0, z1=64, z1c=66, z0=0] + 3 colours (don't matter).
+        // Solid run = [64, MAXZDIM) — voxlap treats below-floor as
+        // implicit solid.
+        let slab = [0u8, 64, 66, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+        let mut uind = vec![0i32; 16];
+        expandrle(&slab, &mut uind);
+        assert_eq!(uind[0], 64);
+        assert_eq!(uind[1], MAXZDIM);
+    }
+
+    #[test]
+    fn expandrle_two_slabs_with_cave() {
+        // Slab 0: nextptr=2 (advance 8 bytes), z1=10, z1c=12, z0=0.
+        // Floor list: 3 colours = 12 bytes; total slab 0 = 4 + 12 - 4 = 12?
+        // Actually slab 0 size = nextptr * 4 = 8 bytes. So with floor
+        // list shorter than (z1c - z1 + 1) = 3 colours = 12 bytes, size
+        // would be 16. To fit nextptr=2 (= 8 bytes), z1c-z1+1 must be 1
+        // colour = 4 bytes (8 = 4 header + 4 colour).
+        //
+        // Layout: [2, 10, 10, 0, c0, c0, c0, c0, 0, 50, 52, 30, ...].
+        // Slab 0: 1-voxel floor, then implicit solid [11, 30) (between
+        // slab 0 floor end and slab 1 ceiling top).
+        // Slab 1: ceiling [30, 50), floor [50, 53), implicit below.
+        //
+        // expandrle output:
+        //   uind[0] = v[1]_s0 = 10
+        //   advance to slab 1; v[3]=30 < v[1]=50 → write
+        //   uind[1] = 30, uind[2] = 50, i = 4
+        //   slab 1 nextptr=0 → exit loop
+        //   uind[3] = MAXZDIM
+        let slab = [
+            2u8, 10, 10, 0, // slab 0 header
+            0xaa, 0, 0, 0, // slab 0 1-voxel floor colour
+            0, 50, 52, 30, // slab 1 (last) header
+            0xbb, 0, 0, 0, // slab 1 floor 0
+            0xcc, 0, 0, 0, // slab 1 floor 1
+            0xdd, 0, 0, 0, // slab 1 floor 2
+        ];
+        let mut uind = vec![0i32; 16];
+        expandrle(&slab, &mut uind);
+        assert_eq!(uind[0], 10);
+        assert_eq!(uind[1], 30);
+        assert_eq!(uind[2], 50);
+        assert_eq!(uind[3], MAXZDIM);
+    }
+
+    #[test]
+    fn expandrle_skips_degenerate_slab_with_no_ceiling_gap() {
+        // Slab 1 has v[3] >= v[1]: ceiling collapses with floor → no
+        // air gap above. Voxlap's `continue` skips emitting a new
+        // solid run for this slab, merging it with the previous run.
+        //
+        // Layout:
+        //   slab 0: nextptr=2, z1=10, z1c=10, z0=0, 1 floor colour
+        //   slab 1: nextptr=0, z1=20, z1c=22, z0=20 (z0 == z1 → skip)
+        let slab = [
+            2u8, 10, 10, 0, // slab 0 header
+            0xaa, 0, 0, 0, // 1 floor colour
+            0, 20, 22, 20, // slab 1 (degenerate: z0=z1=20)
+            0xbb, 0, 0, 0, 0xcc, 0, 0, 0, 0xdd, 0, 0, 0, // floor colours
+        ];
+        let mut uind = vec![0i32; 16];
+        expandrle(&slab, &mut uind);
+        // Only one solid run (slab 0's), since slab 1 was skipped.
+        assert_eq!(uind[0], 10);
+        assert_eq!(uind[1], MAXZDIM);
+    }
+
+    #[test]
+    fn expandrle_round_trips_through_b2_helpers() {
+        // Decode a 2-slab column, then verify delslab can carve a
+        // hole into the air gap (the `read_uind` shape matches the b2
+        // shape that delslab/insslab consume).
+        let slab = [
+            2u8, 10, 10, 0, 0xaa, 0, 0, 0, 0, 50, 52, 30, 0xbb, 0, 0, 0, 0xcc, 0, 0, 0, 0xdd, 0, 0,
+            0,
+        ];
+        let mut uind = vec![0i32; 16];
+        expandrle(&slab, &mut uind);
+        let runs = read_uind(&uind[..4]);
+        assert_eq!(runs, [(10, 30), (50, MAXZDIM)]);
     }
 }
