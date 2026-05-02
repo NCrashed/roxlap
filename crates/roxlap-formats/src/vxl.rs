@@ -101,10 +101,16 @@ impl Vxl {
     /// Raw slab bytes for mip-0 column `idx` (`idx < vsid * vsid`).
     /// Equivalent to `column_data_for_mip(0, idx)` — kept for the
     /// pre-multi-mip call sites.
+    ///
+    /// Length is recovered by walking the slab chain via [`slng`].
+    /// This works both pre-edit (when columns are contiguous and
+    /// `column_offset[idx + 1]` would also bound the column) and
+    /// post-edit (when [`Vxl::voxalloc`] has scattered columns
+    /// across the vbuf pool).
     #[must_use]
     pub fn column_data(&self, idx: usize) -> &[u8] {
         let start = self.column_offset[idx] as usize;
-        let end = self.column_offset[idx + 1] as usize;
+        let end = start + slng(&self.data[start..]);
         &self.data[start..end]
     }
 
@@ -138,7 +144,8 @@ impl Vxl {
     }
 
     /// Raw slab bytes for column `idx` at mip `mip`. `idx` must be
-    /// `< (vsid >> mip)²`.
+    /// `< (vsid >> mip)²`. Length recovered via [`slng`] (works
+    /// both pre-edit and after [`Vxl::voxalloc`]-driven scatter).
     ///
     /// # Panics
     ///
@@ -148,7 +155,7 @@ impl Vxl {
     pub fn column_data_for_mip(&self, mip: u32, idx: usize) -> &[u8] {
         let table = self.column_offset_for_mip(mip);
         let start = table[idx] as usize;
-        let end = table[idx + 1] as usize;
+        let end = start + slng(&self.data[start..]);
         &self.data[start..end]
     }
 

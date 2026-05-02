@@ -448,8 +448,410 @@ pub(crate) fn compilerle(
     n
 }
 
+// ====================================================================
+// ScumCtx: scum2_line + scum2_finish + scum2 dispatcher (CD.2.5)
+// ====================================================================
+//
+// Voxlap5.c:4431/4544/4507. The column-edit batch context.
+//
+// Acquires a `&mut Vxl` for the duration of an edit batch, manages
+// the rolling 3-row b2 buffer cache (`radar`), and re-encodes each
+// finished y-row through `compilerle` + `voxalloc`/`voxdealloc` /
+// `column_offset` updates.
+//
+// User flow (matching voxlap's setspans / setsphere / setcube):
+//
+// ```ignore
+// vxl.reserve_edit_capacity(headroom);
+// let mut ctx = vxl.scum2_begin();
+// ctx.set_colfunc(|x, y, z| 0xff_8080_80);
+// for span in spans {
+//     let b2 = ctx.scum2(span.x, span.y).unwrap();
+//     insslab(b2, span.z0, span.z1);
+// }
+// ctx.finish();
+// ```
+//
+// Edits are accumulated per-column, then flushed when the y row
+// advances (so the 3-row neighborhood is stable). `finish` drains
+// the last 2 rows.
+
+use roxlap_formats::vxl::Vxl;
+
+/// Voxlap's `SCPITCH` (`voxlap5.c:202`) — per-column-per-row stride
+/// (in i32 units) inside the radar buffer. b2 buffer for column X
+/// in a row whose base offset in radar is R lives at
+/// `radar[R + X * SCPITCH * 3 .. R + X * SCPITCH * 3 + SCPITCH]`.
+pub(crate) const SCPITCH: usize = 256;
+
+/// Voxlap's `MAXCSIZ` (`voxlap5.c:93`). Maximum bytes a single
+/// column can occupy after re-encoding through [`compilerle`].
+pub(crate) const MAXCSIZ: usize = 1028;
+
+/// Sentinel "no row started yet". Voxlap encodes this as
+/// `0x80000000` = `i32::MIN`.
+const SCOY_NONE: i32 = i32::MIN;
+
+/// Initial radar offset for `scoym3`. Voxlap's `&radar[SCPITCH*6]`.
+const SCOYM3_INITIAL: usize = SCPITCH * 6;
+
+/// When `scoym3` reaches this offset, wrap back to
+/// `SCOYM3_INITIAL`. Voxlap's `&radar[SCPITCH*9]` test.
+const SCOYM3_WRAP: usize = SCPITCH * 9;
+
+/// Column-edit batch context. Acquired via [`Vxl::scum2_begin`].
+///
+/// Holds a `&mut Vxl` borrow plus the rolling 3-row b2 buffer cache.
+/// Mutate columns via [`ScumCtx::scum2`] — it returns the b2 buffer
+/// for the requested column; mutate via [`delslab`] / [`insslab`].
+/// Edits are committed when the y row advances (or when
+/// [`ScumCtx::finish`] drains the last 2 rows).
+///
+/// Caller MUST invoke [`ScumCtx::finish`] explicitly. Drop without
+/// finish leaks the trailing 2 rows of edits — voxlap's contract.
+pub struct ScumCtx<'v> {
+    vxl: &'v mut Vxl,
+    /// Rolling b2 buffer cache. Sized `(vsid + 4) * 3 * SCPITCH` ints.
+    radar: Vec<i32>,
+    /// `compilerle` output scratch (= voxlap's `tbuf`).
+    cbuf: Vec<u8>,
+    /// Color callback (= voxlap's `vx5.colfunc`). Called by
+    /// `compilerle` for each newly-exposed voxel.
+    colfunc: Box<dyn FnMut(i32, i32, i32) -> i32 + 'v>,
+
+    // ---- rolling state (matches voxlap5.c globals) ------------------
+    scoy: i32,
+    scoym3: usize,
+    scx0: i32,
+    scx1: i32,
+    scox0: i32,
+    scox1: i32,
+    scoox0: i32,
+    scoox1: i32,
+    scex0: i32,
+    scex1: i32,
+    sceox0: i32,
+    sceox1: i32,
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::if_not_else,
+    clippy::similar_names
+)]
+impl<'v> ScumCtx<'v> {
+    /// Open a new column-edit batch on a Vxl. The Vxl MUST have been
+    /// upgraded with [`Vxl::reserve_edit_capacity`] beforehand (the
+    /// slab allocator must be initialised).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vxl.vbit` is empty (no edit capacity reserved).
+    pub fn new(vxl: &'v mut Vxl) -> Self {
+        assert!(
+            !vxl.vbit.is_empty(),
+            "ScumCtx::new requires Vxl::reserve_edit_capacity to be called first"
+        );
+        let radar_size = (vxl.vsid as usize + 4) * 3 * SCPITCH;
+        Self {
+            vxl,
+            radar: vec![0i32; radar_size],
+            cbuf: vec![0u8; MAXCSIZ],
+            colfunc: Box::new(|_, _, _| 0),
+            scoy: SCOY_NONE,
+            scoym3: SCOYM3_INITIAL,
+            scx0: 0,
+            scx1: 0,
+            scox0: 0,
+            scox1: 0,
+            scoox0: 0,
+            scoox1: 0,
+            scex0: 0,
+            scex1: 0,
+            sceox0: 0,
+            sceox1: 0,
+        }
+    }
+
+    /// Install the color callback. Voxlap's `vx5.colfunc`. Called
+    /// for each newly-exposed voxel produced by edits.
+    pub fn set_colfunc<F>(&mut self, f: F)
+    where
+        F: FnMut(i32, i32, i32) -> i32 + 'v,
+    {
+        self.colfunc = Box::new(f);
+    }
+
+    /// Open column `(x, y)` for editing; returns its b2 buffer.
+    /// Caller mutates via [`delslab`] / [`insslab`].
+    ///
+    /// Auto-flushes any prior y row that's no longer in the rolling
+    /// window. Returns `None` if `(x, y)` is out of world bounds.
+    pub fn scum2(&mut self, x: i32, y: i32) -> Option<&mut [i32]> {
+        let vsid = self.vxl.vsid as i32;
+        if x < 0 || x >= vsid || y < 0 || y >= vsid {
+            return None;
+        }
+
+        if y != self.scoy {
+            if self.scoy != SCOY_NONE {
+                self.scum2_line();
+                while self.scoy < y - 1 {
+                    self.scx0 = i32::MAX;
+                    self.scx1 = i32::MIN;
+                    self.advance_row();
+                    self.scum2_line();
+                }
+                self.advance_row();
+            } else {
+                self.scoox0 = i32::MAX;
+                self.scox0 = i32::MAX;
+                self.sceox0 = x + 1;
+                self.scex0 = x + 1;
+                self.sceox1 = x;
+                self.scex1 = x;
+                self.scoy = y;
+                self.scoym3 = SCOYM3_INITIAL;
+            }
+            self.scx0 = x;
+        } else {
+            // Same y row as previous call: fill any skipped columns
+            // between scx1 and x so the 3-row window stays continuous.
+            while self.scx1 < x - 1 {
+                self.scx1 += 1;
+                let scx1 = self.scx1;
+                self.expand_column_into_row(scx1, y, self.scoym3);
+            }
+        }
+
+        let radar_idx = self.scoym3 + (x as usize) * SCPITCH * 3;
+        self.scx1 = x;
+        self.expand_column_into_row(x, y, self.scoym3);
+        Some(&mut self.radar[radar_idx..radar_idx + SCPITCH])
+    }
+
+    /// Drain the last 2 rows and consume the context. MUST be called
+    /// — Drop does not auto-finish (voxlap contract).
+    pub fn finish(mut self) {
+        if self.scoy == SCOY_NONE {
+            return;
+        }
+        for _ in 0..2 {
+            self.scum2_line();
+            self.scx0 = i32::MAX;
+            self.scx1 = i32::MIN;
+            self.advance_row();
+        }
+        self.scum2_line();
+        self.scoy = SCOY_NONE;
+    }
+
+    /// Bump scoy by 1 and advance scoym3 in the radar ring.
+    fn advance_row(&mut self) {
+        self.scoy += 1;
+        self.scoym3 += SCPITCH;
+        if self.scoym3 == SCOYM3_WRAP {
+            self.scoym3 = SCOYM3_INITIAL;
+        }
+    }
+
+    /// Load column `(x, y)` from the slab pool into the radar slot
+    /// at `row_base + x * SCPITCH * 3`. Out-of-world columns get the
+    /// all-solid sentinel `[0, MAXZDIM]` (matches voxlap's expandrle
+    /// out-of-bounds behaviour).
+    fn expand_column_into_row(&mut self, x: i32, y: i32, row_base: usize) {
+        let vsid = self.vxl.vsid as i32;
+        // Radar offset; voxlap relies on the prefix slack for x = -1.
+        let radar_idx_signed = (row_base as isize) + (x as isize) * (SCPITCH as isize) * 3;
+        if radar_idx_signed < 0 {
+            return;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let radar_idx = radar_idx_signed as usize;
+        if radar_idx + SCPITCH > self.radar.len() {
+            return;
+        }
+        if x < 0 || x >= vsid || y < 0 || y >= vsid {
+            self.radar[radar_idx] = 0;
+            self.radar[radar_idx + 1] = MAXZDIM;
+            return;
+        }
+        let idx = (y as usize) * (vsid as usize) + (x as usize);
+        let slab = self.vxl.column_data(idx);
+        expandrle(slab, &mut self.radar[radar_idx..radar_idx + SCPITCH]);
+    }
+
+    /// Flush row `scoy - 1` (the middle of the rolling 3-row window).
+    /// Voxlap5.c:4431.
+    #[allow(clippy::too_many_lines)]
+    fn scum2_line(&mut self) {
+        let vsid = self.vxl.vsid as i32;
+
+        // x0 = min(scox0-1, min(scx0, scoox0)); x1 = max(scox1+1, max(scx1, scoox1))
+        let x0 = (self.scox0 - 1).min(self.scx0).min(self.scoox0);
+        self.scoox0 = self.scox0;
+        self.scox0 = self.scx0;
+        let x1 = (self.scox1 + 1).max(self.scx1).max(self.scoox1);
+        self.scoox1 = self.scox1;
+        self.scox1 = self.scx1;
+
+        let uptr = wrap_radar(self.scoym3 + SCPITCH);
+        let mptr = wrap_radar(uptr + SCPITCH);
+
+        // Load row scoy-2 (uptr) for [x0, x1] minus [sceox0, sceox1].
+        let scoy_2 = self.scoy - 2;
+        if x1 < self.sceox0 || x0 > self.sceox1 {
+            for x in x0..=x1 {
+                self.expand_column_into_row(x, scoy_2, uptr);
+            }
+        } else {
+            for x in x0..self.sceox0 {
+                self.expand_column_into_row(x, scoy_2, uptr);
+            }
+            let mut x = x1;
+            while x > self.sceox1 {
+                self.expand_column_into_row(x, scoy_2, uptr);
+                x -= 1;
+            }
+        }
+
+        // Load row scoy-1 (mptr) for [x0-1, x1+1].
+        let scoy_1 = self.scoy - 1;
+        if (self.scex1 | x1) >= 0 {
+            for x in (x1 + 2)..self.scex0 {
+                self.expand_column_into_row(x, scoy_1, mptr);
+            }
+            let mut x = x0 - 2;
+            while x > self.scex1 {
+                self.expand_column_into_row(x, scoy_1, mptr);
+                x -= 1;
+            }
+        }
+        if x1 + 1 < self.scex0 || x0 - 1 > self.scex1 {
+            for x in (x0 - 1)..=(x1 + 1) {
+                self.expand_column_into_row(x, scoy_1, mptr);
+            }
+        } else {
+            for x in (x0 - 1)..self.scex0 {
+                self.expand_column_into_row(x, scoy_1, mptr);
+            }
+            let mut x = x1 + 1;
+            while x > self.scex1 {
+                self.expand_column_into_row(x, scoy_1, mptr);
+                x -= 1;
+            }
+        }
+        self.sceox0 = (x0 - 1).min(self.scex0);
+        self.sceox1 = (x1 + 1).max(self.scex1);
+
+        // Load row scoy (scoym3) for [x0, x1] minus [scx0, scx1].
+        let scoy_0 = self.scoy;
+        let scoym3 = self.scoym3;
+        if x1 < self.scx0 || x0 > self.scx1 {
+            for x in x0..=x1 {
+                self.expand_column_into_row(x, scoy_0, scoym3);
+            }
+        } else {
+            for x in x0..self.scx0 {
+                self.expand_column_into_row(x, scoy_0, scoym3);
+            }
+            let mut x = x1;
+            while x > self.scx1 {
+                self.expand_column_into_row(x, scoy_0, scoym3);
+                x -= 1;
+            }
+        }
+        self.scex0 = x0;
+        self.scex1 = x1;
+
+        // Flush row scoy-1: re-encode each column in [x0, x1] within
+        // [0, vsid).
+        let y = self.scoy - 1;
+        if !(0..vsid).contains(&y) {
+            return;
+        }
+        let x0_clamped = x0.max(0);
+        let x1_clamped = x1.min(vsid - 1);
+
+        for x in x0_clamped..=x1_clamped {
+            self.flush_column(x, y, mptr, uptr, scoym3);
+        }
+    }
+
+    /// Re-encode column (x, y) using its b2 buffer in `mptr` and
+    /// neighbor b2s in mptr (left/right) + uptr (above) + scoym3
+    /// (below). Commits the new bytes to the slab pool.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    fn flush_column(&mut self, x: i32, y: i32, mptr: usize, uptr: usize, scoym3: usize) {
+        let vsid = self.vxl.vsid as usize;
+        let k = (x as usize) * SCPITCH * 3;
+        let n0_pos = mptr + k;
+        let n1_pos_signed = (mptr as isize) + (k as isize) - (SCPITCH as isize) * 3;
+        let n2_pos = mptr + k + SCPITCH * 3;
+        let n3_pos = uptr + k;
+        let n4_pos = scoym3 + k;
+
+        // n1_pos may be at a negative offset for x = 0; voxlap relies
+        // on radar prefix slack. Skip if the slot is outside our radar.
+        if n1_pos_signed < 0 {
+            return;
+        }
+        let n1_pos = n1_pos_signed as usize;
+
+        let idx = (y as usize) * vsid + (x as usize);
+
+        // Snapshot original column bytes — compilerle reads colors
+        // from them, and we overwrite them later via voxalloc + copy.
+        let original_bytes: Vec<u8> = self.vxl.column_data(idx).to_vec();
+
+        let written = {
+            let radar = &self.radar;
+            let n0 = &radar[n0_pos..n0_pos + SCPITCH];
+            let n1 = &radar[n1_pos..n1_pos + SCPITCH];
+            let n2 = &radar[n2_pos..n2_pos + SCPITCH];
+            let n3 = &radar[n3_pos..n3_pos + SCPITCH];
+            let n4 = &radar[n4_pos..n4_pos + SCPITCH];
+            compilerle(
+                n0,
+                n1,
+                n2,
+                n3,
+                n4,
+                &mut self.cbuf,
+                &original_bytes,
+                x,
+                y,
+                &mut *self.colfunc,
+            )
+        };
+
+        let old_offset = self.vxl.column_offset[idx];
+        self.vxl.voxdealloc(old_offset);
+        let new_offset = self.vxl.voxalloc(written as u32);
+        self.vxl.data[new_offset as usize..new_offset as usize + written]
+            .copy_from_slice(&self.cbuf[..written]);
+        self.vxl.column_offset[idx] = new_offset;
+    }
+}
+
+/// Wrap a radar offset back into the rolling-window range
+/// `[SCOYM3_INITIAL, SCOYM3_WRAP)`.
+fn wrap_radar(off: usize) -> usize {
+    if off == SCOYM3_WRAP {
+        SCOYM3_INITIAL
+    } else {
+        off
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 mod tests {
     use super::*;
 
@@ -1067,5 +1469,187 @@ mod tests {
         expandrle(&cbuf[..written], &mut b2_round);
         assert_eq!(b2_round[0], 10);
         assert_eq!(b2_round[1], MAXZDIM);
+    }
+
+    // ---- ScumCtx (CD.2.5) ---------------------------------------------
+
+    /// Build a 1×1 Vxl with a single fully-solid column. Minimal slab
+    /// encoding: 1 floor color = 8 bytes total.
+    fn build_1x1_min_solid_vxl() -> Vxl {
+        let column = vec![0u8, 0, 0, 0, 0xff, 0x80, 0x40, 0x20];
+        let column_offset = vec![0u32, column.len() as u32].into_boxed_slice();
+        Vxl {
+            vsid: 1,
+            ipo: [0.0; 3],
+            ist: [1.0, 0.0, 0.0],
+            ihe: [0.0, 0.0, 1.0],
+            ifo: [0.0, 1.0, 0.0],
+            data: column.into_boxed_slice(),
+            column_offset,
+            mip_base_offsets: Box::new([0, 2]),
+            vbit: Box::new([]),
+            vbiti: 0,
+        }
+    }
+
+    #[test]
+    fn scum2_no_edit_round_trip_1x1_minimal_column() {
+        // Open a batch on a minimal-encoded 1×1 column, run scum2 +
+        // finish without mutating, verify the column's b2 shape is
+        // preserved.
+        let mut vxl = build_1x1_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+
+        let mut ctx = ScumCtx::new(&mut vxl);
+        let _b2 = ctx.scum2(0, 0).expect("column 0,0 in bounds");
+        ctx.finish();
+
+        let column = vxl.column_data(0);
+        let mut b2_after = vec![0i32; SCPITCH];
+        expandrle(column, &mut b2_after);
+        assert_eq!(b2_after[0], 0);
+        assert_eq!(b2_after[1], MAXZDIM);
+    }
+
+    #[test]
+    fn scum2_carve_edit_1x1_creates_air_gap() {
+        // Carve a hole in a fully-solid column; verify the post-edit
+        // b2 reflects the carve.
+        let mut vxl = build_1x1_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+
+        let mut ctx = ScumCtx::new(&mut vxl);
+        ctx.set_colfunc(|_x, _y, _z| 0x80_60_40_20u32 as i32);
+        {
+            let b2 = ctx.scum2(0, 0).expect("column 0,0 in bounds");
+            // Carve [50, 100) to air.
+            delslab(b2, 50, 100);
+        }
+        ctx.finish();
+
+        let column = vxl.column_data(0);
+        let mut b2_after = vec![0i32; SCPITCH];
+        expandrle(column, &mut b2_after);
+        // Two solid runs now: [0, 50) and [100, MAXZDIM).
+        assert_eq!(b2_after[0], 0);
+        assert_eq!(b2_after[1], 50);
+        assert_eq!(b2_after[2], 100);
+        assert_eq!(b2_after[3], MAXZDIM);
+    }
+
+    /// Build a 4×4 Vxl with all 16 columns sharing the same minimal
+    /// fully-solid encoding. Useful for testing batch edits.
+    fn build_4x4_min_solid_vxl() -> Vxl {
+        const COL: [u8; 8] = [0, 0, 0, 0, 0xff, 0x80, 0x40, 0x20];
+        let mut data = Vec::with_capacity(16 * 8);
+        let mut offsets = Vec::with_capacity(17);
+        for i in 0..16 {
+            offsets.push((i * 8) as u32);
+            data.extend_from_slice(&COL);
+        }
+        offsets.push((16 * 8) as u32);
+        Vxl {
+            vsid: 4,
+            ipo: [0.0; 3],
+            ist: [1.0, 0.0, 0.0],
+            ihe: [0.0, 0.0, 1.0],
+            ifo: [0.0, 1.0, 0.0],
+            data: data.into_boxed_slice(),
+            column_offset: offsets.into_boxed_slice(),
+            mip_base_offsets: Box::new([0, 17]),
+            vbit: Box::new([]),
+            vbiti: 0,
+        }
+    }
+
+    #[test]
+    fn scum2_batch_edits_multiple_columns_same_row() {
+        // Edit columns (1, 2) and (2, 2) — same y row. Both should
+        // get the same carve.
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(8192);
+
+        let mut ctx = ScumCtx::new(&mut vxl);
+        ctx.set_colfunc(|_x, _y, _z| 0);
+        {
+            let b2 = ctx.scum2(1, 2).unwrap();
+            delslab(b2, 50, 100);
+        }
+        {
+            let b2 = ctx.scum2(2, 2).unwrap();
+            delslab(b2, 50, 100);
+        }
+        ctx.finish();
+
+        for x in [1, 2] {
+            let idx = 2 * 4 + x;
+            let mut b2_after = vec![0i32; SCPITCH];
+            expandrle(vxl.column_data(idx), &mut b2_after);
+            assert_eq!(b2_after[0], 0);
+            assert_eq!(b2_after[1], 50);
+            assert_eq!(b2_after[2], 100);
+            assert_eq!(b2_after[3], MAXZDIM);
+        }
+        // Untouched columns retain their original b2.
+        for x in [0, 3] {
+            let idx = 2 * 4 + x;
+            let mut b2_after = vec![0i32; SCPITCH];
+            expandrle(vxl.column_data(idx), &mut b2_after);
+            assert_eq!(b2_after[0], 0);
+            assert_eq!(b2_after[1], MAXZDIM);
+        }
+    }
+
+    #[test]
+    fn scum2_batch_edits_across_rows() {
+        // Edit column (1, 1) then column (1, 2) — y advances, prior
+        // row gets flushed automatically.
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(8192);
+
+        let mut ctx = ScumCtx::new(&mut vxl);
+        ctx.set_colfunc(|_x, _y, _z| 0);
+        {
+            let b2 = ctx.scum2(1, 1).unwrap();
+            delslab(b2, 60, 80);
+        }
+        {
+            let b2 = ctx.scum2(1, 2).unwrap();
+            delslab(b2, 60, 80);
+        }
+        ctx.finish();
+
+        for y in [1, 2] {
+            let idx = y * 4 + 1;
+            let mut b2_after = vec![0i32; SCPITCH];
+            expandrle(vxl.column_data(idx), &mut b2_after);
+            assert_eq!(b2_after[0], 0);
+            assert_eq!(b2_after[1], 60);
+            assert_eq!(b2_after[2], 80);
+            assert_eq!(b2_after[3], MAXZDIM);
+        }
+    }
+
+    #[test]
+    fn scum2_finish_without_any_edit_is_noop() {
+        // Begin then immediately finish without any scum2 call.
+        let mut vxl = build_1x1_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+        let original = vxl.column_data(0).to_vec();
+        let ctx = ScumCtx::new(&mut vxl);
+        ctx.finish();
+        assert_eq!(vxl.column_data(0), &original[..]);
+    }
+
+    #[test]
+    fn scum2_returns_none_for_out_of_bounds() {
+        let mut vxl = build_1x1_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+        let mut ctx = ScumCtx::new(&mut vxl);
+        assert!(ctx.scum2(-1, 0).is_none());
+        assert!(ctx.scum2(0, -1).is_none());
+        assert!(ctx.scum2(1, 0).is_none());
+        assert!(ctx.scum2(0, 1).is_none());
+        ctx.finish();
     }
 }
