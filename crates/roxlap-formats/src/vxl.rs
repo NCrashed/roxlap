@@ -82,6 +82,19 @@ pub struct Vxl {
     /// the trailing sentinel equals `column_offset.len()`. Initial
     /// state after `parse`: `[0, vsid² + 1]` (one mip).
     pub mip_base_offsets: Box<[usize]>,
+    /// Slab-pool allocation bitmap — 1 bit per dword in [`Vxl::data`].
+    /// A set bit marks the dword as belonging to an allocated column
+    /// or mip-segment; clear bits are free space available to
+    /// [`Vxl::voxalloc`]. Voxlap's `vbit` (`voxlap5.c:72`).
+    ///
+    /// Empty after [`parse`] — read-only Vxls have no allocator
+    /// state. Call [`Vxl::reserve_edit_capacity`] to upgrade to a
+    /// mutation-ready slab pool.
+    pub vbit: Box<[u32]>,
+    /// Roving allocator index, in dwords. Voxlap's `vbiti`
+    /// (`voxlap5.c:72`). Advances past each successful
+    /// [`Vxl::voxalloc`] to amortise the search.
+    pub vbiti: u32,
 }
 
 impl Vxl {
@@ -227,6 +240,228 @@ impl Vxl {
             src_z_bound = dst_z_bound;
         }
     }
+
+    // ---- slab allocator (CD.2 cave-demo edit API) ---------------------
+    //
+    // Voxlap's `vbuf`/`vbit`/`voxalloc`/`voxdealloc` (`voxlap5.c:64-862`)
+    // are a bitmap free-list allocator over the slab byte pool. Roxlap
+    // re-uses [`Vxl::data`] as that pool: existing column bytes stay
+    // put, headroom appended at the tail is the free region. Granularity
+    // is one bit per dword (matches voxlap; column data is dword-aligned
+    // by construction since slabs are 4-byte records).
+    //
+    // The allocator is opt-in. Read-only Vxls leave `vbit` empty and
+    // never call alloc/dealloc.
+
+    /// Upgrade this Vxl to a mutation-ready slab pool.
+    ///
+    /// Grows [`Vxl::data`] by `headroom_bytes` (rounded up to dword)
+    /// and initialises [`Vxl::vbit`] with one bit per dword: bits in
+    /// the prefix covered by every existing mip's columns are marked
+    /// allocated; the appended headroom is free space available to
+    /// [`Vxl::voxalloc`].
+    ///
+    /// Cost: O(total mip dwords) for the bit-marking pass, plus the
+    /// data grow (one allocation + memcpy of existing bytes).
+    ///
+    /// After this call, [`serialize`] no longer round-trips byte-equally
+    /// with the parsed file (the appended headroom is included in
+    /// `data` and would be emitted as trailing zeros). Post-edit save
+    /// requires walking columns in index order — landing in CD.2.5
+    /// when on-disk save matters.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new total byte length does not fit in `u32`
+    /// (would prevent column offsets from indexing into the pool).
+    pub fn reserve_edit_capacity(&mut self, headroom_bytes: usize) {
+        let headroom_aligned = (headroom_bytes + 3) & !3;
+        let old_len = self.data.len();
+        let new_len = old_len + headroom_aligned;
+        u32::try_from(new_len).expect("vbuf size fits in u32");
+
+        let mut new_data = Vec::with_capacity(new_len);
+        new_data.extend_from_slice(&self.data);
+        new_data.resize(new_len, 0);
+        self.data = new_data.into_boxed_slice();
+
+        let total_dwords = new_len / 4;
+        let n_words = total_dwords.div_ceil(32);
+        let mut vbit = vec![0u32; n_words].into_boxed_slice();
+
+        // Mark every column's dword range as allocated. Iterates over
+        // all built mips so mip-1+ tail data is preserved as
+        // "allocated" (never repurposed by voxalloc, which finds runs
+        // only in genuinely-clear bits).
+        for mip in 0..self.mip_count() {
+            let table = self.column_offset_for_mip(mip);
+            for window in table.windows(2) {
+                let lo = (window[0] / 4) as usize;
+                let hi = (window[1] / 4) as usize;
+                for d in lo..hi {
+                    vbit[d >> 5] |= 1u32 << (d & 31);
+                }
+            }
+        }
+
+        self.vbit = vbit;
+        self.vbiti = 0;
+    }
+
+    /// Allocate `n_bytes` of slab pool, returning a byte offset into
+    /// [`Vxl::data`]. Voxlap's `voxalloc` (`voxlap5.c:841`).
+    ///
+    /// `n_bytes` MUST be a positive multiple of 4 (slab records are
+    /// dword-aligned).
+    ///
+    /// # Panics
+    ///
+    /// - Panics if [`Vxl::reserve_edit_capacity`] was not called first
+    ///   (`vbit` is empty).
+    /// - Panics if `n_bytes == 0` or not a multiple of 4.
+    /// - Panics if the pool is full (after two scan passes from
+    ///   `vbiti` and from 0). Callers should size the headroom in
+    ///   `reserve_edit_capacity` to absorb expected churn.
+    pub fn voxalloc(&mut self, n_bytes: u32) -> u32 {
+        assert!(
+            !self.vbit.is_empty(),
+            "voxalloc requires reserve_edit_capacity"
+        );
+        assert!(
+            n_bytes > 0 && n_bytes % 4 == 0,
+            "voxalloc n_bytes must be a positive multiple of 4 (got {n_bytes})"
+        );
+
+        let danum = n_bytes / 4;
+        let total_dwords = u32::try_from(self.data.len() / 4).expect("pool dwords fit in u32");
+        assert!(
+            danum <= total_dwords,
+            "voxalloc: requested span > pool size"
+        );
+        let vend = total_dwords - danum;
+
+        for _badcnt in 0..2 {
+            while self.vbiti < vend {
+                if vbit_is_set(&self.vbit, self.vbiti) {
+                    self.vbiti += danum;
+                    continue;
+                }
+                // Walk back to the first dword of the surrounding
+                // free run.
+                let mut p0 = self.vbiti;
+                while p0 > 0 && !vbit_is_set(&self.vbit, p0 - 1) {
+                    p0 -= 1;
+                }
+                // Verify [p0, p0+danum) is entirely free by probing
+                // backward from p0+danum-1 down to vbiti+1 (the
+                // [p0..=vbiti] half is already proven free by the walk
+                // above, plus vbiti's own bit which we know is clear).
+                let mut p1 = p0 + danum - 1;
+                let mut found = true;
+                while p1 > self.vbiti {
+                    if vbit_is_set(&self.vbit, p1) {
+                        found = false;
+                        break;
+                    }
+                    p1 -= 1;
+                }
+                if !found {
+                    self.vbiti += danum;
+                    continue;
+                }
+
+                self.vbiti = p0 + danum;
+                for k in p0..self.vbiti {
+                    self.vbit[(k >> 5) as usize] |= 1u32 << (k & 31);
+                }
+                return p0 * 4;
+            }
+            self.vbiti = 0;
+        }
+        panic!("voxalloc: vbuf full (cannot allocate {n_bytes} bytes)");
+    }
+
+    /// Free the slab at `byte_offset` (which must point at the start
+    /// of a slab chain previously returned by [`Vxl::voxalloc`] or
+    /// recorded in a column table). Voxlap's `voxdealloc`
+    /// (`voxlap5.c:822`).
+    ///
+    /// Length is recovered by walking the slab chain via [`slng`] —
+    /// the caller does not pass it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`Vxl::reserve_edit_capacity`] was not called first.
+    pub fn voxdealloc(&mut self, byte_offset: u32) {
+        assert!(
+            !self.vbit.is_empty(),
+            "voxdealloc requires reserve_edit_capacity"
+        );
+        let len_bytes = u32::try_from(slng(&self.data[byte_offset as usize..]))
+            .expect("slab length fits in u32");
+        let i = byte_offset / 4;
+        let j = (byte_offset + len_bytes) / 4;
+        let i_word = (i >> 5) as usize;
+        let j_word = (j >> 5) as usize;
+        let i_bit = i & 31;
+        let j_bit = j & 31;
+
+        if i_word == j_word {
+            // Range fits in a single word.
+            let mask = p2m(j_bit) ^ p2m(i_bit);
+            self.vbit[i_word] &= !mask;
+        } else {
+            self.vbit[i_word] &= p2m(i_bit);
+            self.vbit[j_word] &= !p2m(j_bit);
+            for w in (i_word + 1)..j_word {
+                self.vbit[w] = 0;
+            }
+        }
+    }
+}
+
+/// Slab-chain length helper. Voxlap's `slng` (`voxlap5.c:814`). Walks
+/// the next-slab pointer chain rooted at `slab[0]` until the
+/// terminator (`v[0] == 0`), then adds the last slab's floor-colour
+/// bytes (`(z1c - z1 + 1) * 4`) plus the terminating slab's 4-byte
+/// header. Returns total bytes used by the column.
+///
+/// # Panics
+///
+/// Panics on a malformed slab where the chain walk runs past the end
+/// of `slab`, or where the last-slab header reaches outside the
+/// slice. Both are caller errors — `slab` must be a valid voxlap slab
+/// chain originating at `slab[0]`.
+#[must_use]
+pub fn slng(slab: &[u8]) -> usize {
+    let mut i = 0usize;
+    while slab[i] != 0 {
+        i += usize::from(slab[i]) * 4;
+    }
+    let z1 = i32::from(slab[i + 1]);
+    let z1c = i32::from(slab[i + 2]);
+    let n_floor = usize::try_from((z1c - z1 + 1).max(0)).expect("n_floor non-negative");
+    i + n_floor * 4 + 4
+}
+
+/// `p2m[k]` — bitmask with the low `k` bits set (`(1 << k) - 1`).
+/// Voxlap's `p2m` table (a 32-entry static array). `k` MUST be in
+/// `0..=31`.
+#[inline]
+fn p2m(k: u32) -> u32 {
+    debug_assert!(k <= 31, "p2m takes 0..=31 (got {k})");
+    if k == 0 {
+        0
+    } else {
+        (1u32 << k) - 1
+    }
+}
+
+#[inline]
+fn vbit_is_set(vbit: &[u32], dword_idx: u32) -> bool {
+    let word = (dword_idx >> 5) as usize;
+    let bit = dword_idx & 31;
+    (vbit[word] >> bit) & 1 != 0
 }
 
 // ---------- multi-mip generation -----------------------------------------
@@ -752,6 +987,8 @@ pub fn parse(bytes: &[u8]) -> Result<Vxl, ParseError> {
         data,
         column_offset: column_offset.into_boxed_slice(),
         mip_base_offsets,
+        vbit: Box::new([]),
+        vbiti: 0,
     })
 }
 
@@ -912,6 +1149,8 @@ mod tests {
             data: data.into_boxed_slice(),
             column_offset,
             mip_base_offsets: Box::new([0, 5]),
+            vbit: Box::new([]),
+            vbiti: 0,
         }
     }
 
@@ -1001,5 +1240,213 @@ mod tests {
         }
         // Mip-0 byte data must be untouched (multi-mip layout appends).
         assert_eq!(&vxl.data[..mip0_data_len], &mip0_data_snapshot[..]);
+    }
+
+    // ---- slab allocator (CD.2.0/2.1/2.2) ------------------------------
+
+    #[test]
+    fn slng_single_slab_with_one_floor_voxel() {
+        // [nextptr=0, z1=10, z1c=10, z0=0] + 4-byte colour = 8 bytes.
+        let slab = [0u8, 10, 10, 0, 0xff, 0, 0, 0];
+        assert_eq!(slng(&slab), 8);
+    }
+
+    #[test]
+    fn slng_single_slab_with_three_floor_voxels() {
+        // [nextptr=0, z1=10, z1c=12, z0=0] + 3 colours = 16 bytes.
+        let slab = [0u8, 10, 12, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+        assert_eq!(slng(&slab), 16);
+    }
+
+    #[test]
+    fn slng_single_slab_empty_floor() {
+        // z1c < z1 → no floor colours; voxlap5.c stores n_floor as 0.
+        // [nextptr=0, z1=10, z1c=9, z0=0] = 4 bytes only.
+        let slab = [0u8, 10, 9, 0];
+        assert_eq!(slng(&slab), 4);
+    }
+
+    #[test]
+    fn slng_two_slab_chain() {
+        // Slab 0: nextptr=2 (8 bytes) + 1 ceiling colour record + ...
+        //   [2, 10, 11, 0, c0, c0, c0, c0]
+        // Slab 1 (last): [0, 20, 22, 12] + 3 floor colours = 16 bytes
+        //   total = 8 + 16 = 24.
+        let slab = [
+            2u8, 10, 11, 0, // slab 0 header
+            0xaa, 0, 0, 0, // ceiling colour
+            0, 20, 22, 12, // slab 1 (last) header
+            0xbb, 0, 0, 0, // floor 0
+            0xcc, 0, 0, 0, // floor 1
+            0xdd, 0, 0, 0, // floor 2
+        ];
+        assert_eq!(slng(&slab), 24);
+    }
+
+    #[test]
+    fn reserve_edit_capacity_grows_data_and_marks_existing() {
+        let mut vxl = build_synthetic_2x2([0xaa, 0xbb, 0xcc, 0xdd]);
+        let original_len = vxl.data.len();
+        assert_eq!(original_len, 32);
+
+        vxl.reserve_edit_capacity(64);
+
+        // Data grew by aligned headroom.
+        assert_eq!(vxl.data.len(), 32 + 64);
+        // Existing bytes unchanged.
+        assert_eq!(vxl.data[0..4], [0, 10, 10, 0]);
+        // vbit sized = ceil(96 / 4 / 32) = 1.
+        assert_eq!(vxl.vbit.len(), 1);
+        // First 8 dwords (32 bytes / 4) marked allocated.
+        // bits 0..=7 set → 0xff.
+        assert_eq!(vxl.vbit[0], 0xff);
+        // vbiti reset.
+        assert_eq!(vxl.vbiti, 0);
+    }
+
+    #[test]
+    fn reserve_edit_capacity_aligns_headroom_up_to_dword() {
+        let mut vxl = build_synthetic_2x2([1, 2, 3, 4]);
+        // Asking for 5 bytes should round up to 8.
+        vxl.reserve_edit_capacity(5);
+        assert_eq!(vxl.data.len(), 32 + 8);
+    }
+
+    #[test]
+    fn voxalloc_returns_offset_in_headroom() {
+        let mut vxl = build_synthetic_2x2([1, 2, 3, 4]);
+        vxl.reserve_edit_capacity(64);
+        let off = vxl.voxalloc(8);
+        // First free dword is at byte offset 32 (just past the
+        // 8 packed columns).
+        assert_eq!(off, 32);
+        // Bits 8 and 9 (dwords past existing data) now set.
+        assert_eq!(vxl.vbit[0] & ((1 << 8) | (1 << 9)), (1 << 8) | (1 << 9));
+    }
+
+    #[test]
+    fn voxalloc_successive_returns_non_overlapping() {
+        let mut vxl = build_synthetic_2x2([1, 2, 3, 4]);
+        vxl.reserve_edit_capacity(128);
+        let a = vxl.voxalloc(8);
+        let b = vxl.voxalloc(8);
+        let c = vxl.voxalloc(16);
+        assert_eq!(a, 32);
+        assert_eq!(b, 40);
+        assert_eq!(c, 48);
+    }
+
+    #[test]
+    fn voxdealloc_clears_bits() {
+        let mut vxl = build_synthetic_2x2([1, 2, 3, 4]);
+        vxl.reserve_edit_capacity(128);
+        let off = vxl.voxalloc(8);
+        // off=32 → dword 8, len=8 → dwords 8..10 marked allocated.
+        assert_eq!((vxl.vbit[0] >> 8) & 1, 1);
+        assert_eq!((vxl.vbit[0] >> 9) & 1, 1);
+        // Plant a valid slab at off so slng can recover the length.
+        // [nextptr=0, z1=5, z1c=5, z0=0] + 1 colour = 8 bytes.
+        vxl.data[off as usize..off as usize + 8]
+            .copy_from_slice(&[0, 5, 5, 0, 0xa1, 0xa2, 0xa3, 0xa4]);
+        vxl.voxdealloc(off);
+        assert_eq!((vxl.vbit[0] >> 8) & 1, 0);
+        assert_eq!((vxl.vbit[0] >> 9) & 1, 0);
+    }
+
+    #[test]
+    fn voxdealloc_freed_region_reused_after_full_scan() {
+        // Pool: 32 (existing) + 32 headroom = 64 bytes = 16 dwords.
+        // Three 8-byte allocs fill dwords 8..14; vbiti reaches vend=14.
+        // After freeing alloc #1, the next voxalloc resets vbiti to 0
+        // and finds the freed dwords on the second pass.
+        let mut vxl = build_synthetic_2x2([1, 2, 3, 4]);
+        vxl.reserve_edit_capacity(32);
+        let a = vxl.voxalloc(8);
+        let _b = vxl.voxalloc(8);
+        let _c = vxl.voxalloc(8);
+        vxl.data[a as usize..a as usize + 8].copy_from_slice(&[0, 5, 5, 0, 0xa1, 0xa2, 0xa3, 0xa4]);
+        vxl.voxdealloc(a);
+        let reused = vxl.voxalloc(8);
+        assert_eq!(reused, a, "freed region should be reused on rescan");
+    }
+
+    #[test]
+    fn voxdealloc_cross_word_boundary() {
+        let mut vxl = build_synthetic_2x2([1, 2, 3, 4]);
+        // Build a ~200-byte pool: 32 (existing) + 192 headroom = 224 bytes
+        // = 56 dwords. Words 0..=1 cover this — dword 31 is bit 31 of word 0,
+        // dword 32 is bit 0 of word 1.
+        vxl.reserve_edit_capacity(192);
+        // Force vbiti up so successive allocs cross word boundary 31/32.
+        // At this point bits 0..=7 are set (existing columns).
+        // Allocate 24 dwords (96 bytes) starting at dword 8 → covers
+        // dwords 8..=31 (still in word 0).
+        let _ = vxl.voxalloc(96);
+        assert_eq!(vxl.vbiti, 32);
+        // Allocate another 16 bytes (4 dwords) — covers dwords 32..=35
+        // in word 1.
+        let off = vxl.voxalloc(16);
+        assert_eq!(off, 32 * 4); // dword 32 → byte 128
+                                 // Place a slab whose slng = 16 at off.
+                                 // [nextptr=0, z1=0, z1c=2, z0=0] + 3 colours = 16 bytes.
+        vxl.data[off as usize..off as usize + 16]
+            .copy_from_slice(&[0, 0, 2, 0, 0xa, 0, 0, 0, 0xb, 0, 0, 0, 0xc, 0, 0, 0]);
+        // The dword range to clear is [32, 36) — but it's within
+        // word 1 entirely, so single-word path. Construct a different
+        // case: free a span that crosses 31/32.
+        // We need an allocation that spans dwords 30..=33 (cross word).
+        // Reset: do a fresh upgrade.
+        let mut vxl2 = build_synthetic_2x2([1, 2, 3, 4]);
+        vxl2.reserve_edit_capacity(192);
+        // Skip past existing 8 dwords with a 22-dword pad alloc.
+        let pad = vxl2.voxalloc(22 * 4);
+        assert_eq!(pad, 32);
+        // Now allocate 16 bytes (4 dwords) at dword 30 — crosses 31/32.
+        let cross = vxl2.voxalloc(16);
+        assert_eq!(cross, 30 * 4);
+        // Verify bits 30, 31 in word 0 and bits 0, 1 in word 1 set.
+        assert!(
+            (vxl2.vbit[0] >> 30) & 1 == 1
+                && (vxl2.vbit[0] >> 31) & 1 == 1
+                && vxl2.vbit[1] & 1 == 1
+                && (vxl2.vbit[1] >> 1) & 1 == 1,
+            "bits across word boundary should all be set"
+        );
+        // Plant a 16-byte slab so slng works.
+        vxl2.data[cross as usize..cross as usize + 16]
+            .copy_from_slice(&[0, 0, 2, 0, 0xa, 0, 0, 0, 0xb, 0, 0, 0, 0xc, 0, 0, 0]);
+        vxl2.voxdealloc(cross);
+        // Cross-boundary bits cleared.
+        assert_eq!((vxl2.vbit[0] >> 30) & 1, 0);
+        assert_eq!((vxl2.vbit[0] >> 31) & 1, 0);
+        assert_eq!(vxl2.vbit[1] & 1, 0);
+        assert_eq!((vxl2.vbit[1] >> 1) & 1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "voxalloc requires reserve_edit_capacity")]
+    fn voxalloc_panics_without_reserve() {
+        let mut vxl = build_synthetic_2x2([1, 2, 3, 4]);
+        let _ = vxl.voxalloc(8);
+    }
+
+    #[test]
+    #[should_panic(expected = "voxalloc n_bytes must be a positive multiple of 4")]
+    fn voxalloc_panics_on_bad_size() {
+        let mut vxl = build_synthetic_2x2([1, 2, 3, 4]);
+        vxl.reserve_edit_capacity(64);
+        let _ = vxl.voxalloc(7);
+    }
+
+    #[test]
+    #[should_panic(expected = "voxalloc: vbuf full")]
+    fn voxalloc_panics_when_pool_full() {
+        let mut vxl = build_synthetic_2x2([1, 2, 3, 4]);
+        // Headroom = 16 bytes = 4 dwords. Alloc 8 bytes twice → 4 dwords used,
+        // 0 left. Third alloc must fail.
+        vxl.reserve_edit_capacity(16);
+        let _ = vxl.voxalloc(8);
+        let _ = vxl.voxalloc(8);
+        let _ = vxl.voxalloc(8); // panics
     }
 }
