@@ -10,7 +10,7 @@
 
 use crate::pack::pack_dense_grid_to_vxl;
 use crate::perlin::PerlinNoise3D;
-use crate::worley::worley_classify_grid;
+use crate::worley::{anisotropic_dist_sq, place_seeds, worley_classify_grid, Seed};
 use crate::{CaveParams, Generator, Vxl, MAXZDIM};
 
 /// Frequency of the colour-Perlin sampler in voxel units. Lower
@@ -137,6 +137,122 @@ fn apply_intensity(color: u32, factor: f32) -> u32 {
     let brightness = (color >> 24) & 0xff;
     let scaled = |c: u8| (f32::from(c) * factor).clamp(0.0, 255.0).round() as u32;
     (brightness << 24) | (scaled(r) << 16) | (scaled(g) << 8) | scaled(b)
+}
+
+// ====================================================================
+// MagCaveGenerator (CD.7) — magenta base + yellow-green edge highlight.
+// ====================================================================
+
+/// Magenta-cave preset matching Ken's `cavemag3m.jpg`.
+///
+/// Magenta base across the cave surfaces; voxels whose distance to
+/// the nearest air seed roughly equals the distance to the nearest
+/// solid seed (i.e. right on the Worley boundary) get a yellow-green
+/// edge highlight blended in. Per-voxel intensity wobbles ±25% via
+/// a dedicated colour Perlin sampler.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MagCaveGenerator;
+
+impl MagCaveGenerator {
+    /// Default cave parameters tuned to match `cavemag3m.jpg`.
+    /// Higher anisotropy (1.5) + lower air ratio (0.4) + extra
+    /// Perlin octaves give the magenta variant more sinuous,
+    /// densely-walled corridors than the blue variant.
+    #[must_use]
+    pub fn default_params() -> CaveParams {
+        CaveParams {
+            seed: 7,
+            seed_count: 128,
+            air_ratio: 0.4,
+            anisotropy: 1.5,
+            perlin_octaves: 4,
+            perlin_amplitude: 0.25,
+        }
+    }
+}
+
+impl Generator for MagCaveGenerator {
+    type Params = CaveParams;
+
+    fn generate(&self, params: &Self::Params, vsid: u32) -> Vxl {
+        // Mag's colour function needs the Worley seeds (the edge
+        // highlight is keyed on `|d_a - d_s|`), so we place seeds
+        // here and reuse them for both classify + colour.
+        let shape_seeds = place_seeds(params, vsid);
+        let grid = worley_classify_grid(params, vsid);
+        let color = build_mag_color_grid(params, vsid, &grid, &shape_seeds);
+        pack_dense_grid_to_vxl(&grid, &color, vsid)
+    }
+}
+
+/// Build the per-voxel colour grid for the mag preset. Reuses the
+/// shape-pass seeds for the edge-highlight distance check, plus a
+/// dedicated Perlin sampler for intensity wobble.
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+fn build_mag_color_grid(params: &CaveParams, vsid: u32, grid: &[u8], seeds: &[Seed]) -> Vec<u32> {
+    let perlin = PerlinNoise3D::new(params.seed.wrapping_add(COLOR_SEED_OFFSET));
+    let vsid_u = vsid as usize;
+    let maxzdim_u = MAXZDIM as usize;
+    let mut color = vec![0u32; grid.len()];
+    for y in 0..vsid {
+        for x in 0..vsid {
+            for z in 0..MAXZDIM {
+                let idx = (y as usize * vsid_u + x as usize) * maxzdim_u + z as usize;
+                if grid[idx] != 0 {
+                    color[idx] = mag_cave_color(x, y, z, &perlin, seeds, params.anisotropy);
+                }
+            }
+        }
+    }
+    color
+}
+
+/// Magenta base; voxels close to the Worley boundary
+/// (`|d_a − d_s|` small) blend toward yellow-green. Per-voxel
+/// intensity perturbed ±25% via colour Perlin.
+#[allow(clippy::cast_precision_loss)]
+fn mag_cave_color(
+    x: u32,
+    y: u32,
+    z: i32,
+    perlin: &PerlinNoise3D,
+    seeds: &[Seed],
+    anisotropy: f32,
+) -> u32 {
+    const MAGENTA: u32 = 0x80_a0_40_a0;
+    const YELLOW_GREEN: u32 = 0x80_b0_b0_20;
+    /// Edge-highlight reach in voxel-distance units. Voxels with
+    /// `|d_a − d_s|` ≤ this get full highlight; voxels well past
+    /// it get pure magenta. Tuned for `seed_count = 128` at
+    /// `vsid = 256` (typical `d_a ≈ 16`).
+    const EDGE_THRESHOLD: f32 = 4.0;
+    const INTENSITY_AMPLITUDE: f32 = 0.25;
+
+    let p = [x as f32, y as f32, z as f32];
+    let mut d_air_sq = f32::INFINITY;
+    let mut d_solid_sq = f32::INFINITY;
+    for seed in seeds {
+        let d_sq = anisotropic_dist_sq(p, seed.pos, anisotropy);
+        if seed.is_air {
+            if d_sq < d_air_sq {
+                d_air_sq = d_sq;
+            }
+        } else if d_sq < d_solid_sq {
+            d_solid_sq = d_sq;
+        }
+    }
+    let d_air = d_air_sq.sqrt();
+    let d_solid = d_solid_sq.sqrt();
+    let edge_factor = (1.0 - (d_air - d_solid).abs() / EDGE_THRESHOLD).clamp(0.0, 1.0);
+    let base = lerp_rgb(MAGENTA, YELLOW_GREEN, edge_factor);
+
+    let perlin_val = perlin.sample(
+        (x as f32) * COLOR_PERLIN_FREQUENCY,
+        (y as f32) * COLOR_PERLIN_FREQUENCY,
+        (z as f32) * COLOR_PERLIN_FREQUENCY,
+    );
+    let intensity = 1.0 + INTENSITY_AMPLITUDE * perlin_val;
+    apply_intensity(base, intensity)
 }
 
 #[inline]
@@ -294,6 +410,154 @@ mod tests {
         assert!(
             (i32::from(b) - 0x30).abs() <= 2,
             "B close to 0x30: got {b:#04x}"
+        );
+    }
+
+    // ---- MagCaveGenerator (CD.7) -------------------------------------
+
+    #[test]
+    fn mag_default_params_match_plan() {
+        let p = MagCaveGenerator::default_params();
+        assert_eq!(p.seed_count, 128);
+        assert!((p.air_ratio - 0.4).abs() < 1e-6, "air_ratio");
+        assert!((p.anisotropy - 1.5).abs() < 1e-6, "anisotropy");
+        assert_eq!(p.perlin_octaves, 4);
+        assert!((p.perlin_amplitude - 0.25).abs() < 1e-6, "amplitude");
+    }
+
+    #[test]
+    fn mag_generate_byte_stable_in_seed() {
+        let p = CaveParams {
+            seed_count: 16,
+            ..MagCaveGenerator::default_params()
+        };
+        let a = MagCaveGenerator.generate(&p, 16);
+        let b = MagCaveGenerator.generate(&p, 16);
+        assert_eq!(a.column_offset.as_ref(), b.column_offset.as_ref());
+        assert_eq!(a.data.as_ref(), b.data.as_ref());
+    }
+
+    #[test]
+    fn mag_generate_yields_mixed_air_and_solid() {
+        let p = CaveParams {
+            seed_count: 16,
+            ..MagCaveGenerator::default_params()
+        };
+        let vxl = MagCaveGenerator.generate(&p, 16);
+        let mut total_runs = 0;
+        for idx in 0..(16 * 16) {
+            let mut b2 = vec![0i32; 256];
+            roxlap_formats::edit::expandrle(vxl.column_data(idx), &mut b2);
+            let mut i = 0;
+            while b2[i + 1] < MAXZDIM {
+                i += 2;
+            }
+            total_runs += (i + 2) / 2;
+        }
+        assert!(
+            total_runs > 256,
+            "expected multi-run columns from cave gen; got {total_runs} total runs"
+        );
+    }
+
+    #[test]
+    fn mag_far_from_boundary_skews_magenta() {
+        // Voxel deep inside a solid region (close to a solid seed,
+        // far from any air seed) → |d_a - d_s| large → no edge
+        // highlight → magenta base.
+        // Use synthetic seeds: solid at origin, air far away.
+        let seeds = vec![
+            Seed {
+                pos: [0.0, 0.0, 0.0],
+                is_air: false,
+            },
+            Seed {
+                pos: [100.0, 100.0, 100.0],
+                is_air: true,
+            },
+        ];
+        let perlin = PerlinNoise3D::new(0);
+        // Voxel at integer coords (Perlin == 0 there) close to the
+        // solid seed → magenta survives.
+        let c = mag_cave_color(1, 0, 0, &perlin, &seeds, 1.0);
+        let (r, g, b) = unpack_rgb(c);
+        // MAGENTA = 0x80_a0_40_a0 → R=0xa0, G=0x40, B=0xa0.
+        // Allow ±2 per channel for f32 round.
+        assert!(
+            (i32::from(r) - 0xa0).abs() <= 2,
+            "R magenta-ish: got {r:#04x}"
+        );
+        assert!(
+            (i32::from(g) - 0x40).abs() <= 2,
+            "G magenta-ish: got {g:#04x}"
+        );
+        assert!(
+            (i32::from(b) - 0xa0).abs() <= 2,
+            "B magenta-ish: got {b:#04x}"
+        );
+    }
+
+    #[test]
+    fn mag_at_boundary_skews_yellow_green() {
+        // Voxel equidistant from one air + one solid seed → full
+        // edge-highlight → yellow-green.
+        let seeds = vec![
+            Seed {
+                pos: [0.0, 0.0, 0.0],
+                is_air: false,
+            },
+            Seed {
+                pos: [2.0, 0.0, 0.0],
+                is_air: true,
+            },
+        ];
+        let perlin = PerlinNoise3D::new(0);
+        // Voxel at (1, 0, 0): equidistant from both seeds (d=1.0 each
+        // → |d_a - d_s| = 0 → full highlight).
+        let c = mag_cave_color(1, 0, 0, &perlin, &seeds, 1.0);
+        let (r, g, b) = unpack_rgb(c);
+        // YELLOW_GREEN = 0x80_b0_b0_20 → R=0xb0, G=0xb0, B=0x20.
+        assert!(
+            (i32::from(r) - 0xb0).abs() <= 2,
+            "R yellow-green-ish: got {r:#04x}"
+        );
+        assert!(
+            (i32::from(g) - 0xb0).abs() <= 2,
+            "G yellow-green-ish: got {g:#04x}"
+        );
+        assert!(
+            (i32::from(b) - 0x20).abs() <= 2,
+            "B yellow-green-ish: got {b:#04x}"
+        );
+    }
+
+    #[test]
+    fn mag_and_blue_diverge_in_byte_output() {
+        // Same seed + vsid; the two presets produce different Vxls.
+        // (Mag uses different defaults for air_ratio / anisotropy /
+        // perlin_octaves / amplitude, so cave shape differs even
+        // before colour.)
+        let p = CaveParams {
+            seed_count: 16,
+            ..BlueCaveGenerator::default_params()
+        };
+        let blue = BlueCaveGenerator.generate(&p, 16);
+        let q = CaveParams {
+            seed_count: 16,
+            ..MagCaveGenerator::default_params()
+        };
+        let mag = MagCaveGenerator.generate(&q, 16);
+        // Shape differs: their grid structure should disagree on at
+        // least some columns.
+        let mut differing = 0;
+        for idx in 0..(16 * 16) {
+            if blue.column_data(idx) != mag.column_data(idx) {
+                differing += 1;
+            }
+        }
+        assert!(
+            differing > 0,
+            "Blue and Mag presets should produce different output"
         );
     }
 }

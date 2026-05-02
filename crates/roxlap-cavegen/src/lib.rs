@@ -30,7 +30,7 @@ mod worley;
 
 pub use pack::{pack_dense_grid_to_vxl, MAXZDIM};
 pub use perlin::PerlinNoise3D;
-pub use presets::BlueCaveGenerator;
+pub use presets::{BlueCaveGenerator, MagCaveGenerator};
 pub use worley::{
     classify_voxel, classify_voxel_with_perlin, place_seeds, worley_classify_grid, Seed,
 };
@@ -99,13 +99,5 @@ pub trait Generator {
     fn generate(&self, params: &Self::Params, vsid: u32) -> Vxl;
 }
 
-// ---- Preset stubs --------------------------------------------------
-//
-// `BlueCaveGenerator` lands at CD.6 in `presets.rs`. CD.7 will add
-// `MagCaveGenerator` there too.
-
-/// Magenta-cave preset matching Ken's `cavemag3m.jpg`. Magenta base,
-/// yellow-green edge highlight. CD.7 lands the implementation; this
-/// stub holds the type.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MagCaveGenerator;
+// `BlueCaveGenerator` (CD.6) and `MagCaveGenerator` (CD.7) live in
+// `presets.rs`; re-exported above.

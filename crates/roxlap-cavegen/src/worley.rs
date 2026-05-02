@@ -203,7 +203,7 @@ pub fn worley_classify_grid(params: &CaveParams, vsid: u32) -> Vec<u8> {
 }
 
 #[inline]
-fn anisotropic_dist_sq(a: [f32; 3], b: [f32; 3], anisotropy: f32) -> f32 {
+pub(crate) fn anisotropic_dist_sq(a: [f32; 3], b: [f32; 3], anisotropy: f32) -> f32 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
     let dz = (a[2] - b[2]) * anisotropy;
