@@ -84,9 +84,9 @@ pub struct ScanScratch {
     // we group them on ScanScratch so each render call owns them and
     // there is no hidden mutable global state.
     // ---------------------------------------------------------------
-    /// `cf[129]` — voxlap's cfasm scratch. The seed slot at
-    /// [`CF_SEED_INDEX`](crate::grouscan::CF_SEED_INDEX) is filled by
-    /// `gline` before each ray; grouscan pops / pushes from there.
+    /// `cf[129]` — voxlap's cfasm scratch. The seed slot at index
+    /// `CF_SEED_INDEX` (= 128) is filled by `gline` before each ray;
+    /// grouscan pops / pushes from there.
     pub cf: Vec<crate::grouscan::CfType>,
     /// `gpz[2]` — distance to next voxel-grid line per axis,
     /// `PREC`-scaled. Set by gline per ray; grouscan walks it.

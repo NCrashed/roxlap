@@ -6,7 +6,7 @@
 //! visible (border) voxels into a fresh `kv6` sprite.
 //!
 //! Supporting helpers:
-//! - [`lightvox`] — alpha-byte face shader (voxlap5.c:623-632).
+//! - `lightvox` — alpha-byte face shader (voxlap5.c:623-632).
 //! - [`PowerTables`] + [`PowerTables::build_tempfloatbuf`] — the
 //!   factr / logint / tempfloatbuf machinery (voxlap5.c:118-120
 //!   statics, :12224-12236 init, :10240-10252 per-call build).
@@ -26,11 +26,11 @@ use crate::world_query::{getcube, Cube};
 
 /// Voxlap's `SETSPHMAXRAD` (voxlap5.c:117). Upper bound on
 /// `hitrad`; the fast-pow tables are sized to this.
-pub const SETSPHMAXRAD: usize = 256;
+pub(crate) const SETSPHMAXRAD: usize = 256;
 
 /// Voxlap's `MAXZDIM` (voxlap5.h:10) — voxlap stores z as a single
 /// byte, so the world is at most 256 voxels tall.
-pub const MAXZDIM: i32 = 256;
+pub(crate) const MAXZDIM: i32 = 256;
 
 /// Apply alpha-byte face shading to a packed voxlap colour.
 ///
@@ -44,7 +44,7 @@ pub const MAXZDIM: i32 = 256;
 /// `BR(rgb)`-style packed colour through `lightvox` so the resulting
 /// `Voxel::col` is plain `0x00rrggbb`.
 #[must_use]
-pub fn lightvox(i: u32) -> u32 {
+pub(crate) fn lightvox(i: u32) -> u32 {
     let b = i >> 24;
     let r = ((((i >> 16) & 0xff) * b) >> 7).min(255);
     let g = ((((i >> 8) & 0xff) * b) >> 7).min(255);

@@ -44,16 +44,16 @@
 use crate::engine::LightSrc;
 
 /// Voxlap's `MAXZDIM` (`voxlap5.c`). World z runs `0..MAXZDIM`.
-pub const MAXZDIM: i32 = 256;
+pub(crate) const MAXZDIM: i32 = 256;
 
 /// Voxlap's `ESTNORMRAD == 2` cache window radius. The estnorm
 /// neighbourhood is `(2*RAD+1)³ = 5×5×5` voxels.
-pub const ESTNORMRAD: i32 = 2;
+pub(crate) const ESTNORMRAD: i32 = 2;
 
 /// Per-byte popcount table. Voxlap's `bitnum[32]` (voxlap5.c:1477)
 /// — number of set bits in the low 5 bits of each index. Used by
 /// estnorm's neighbourhood-vote reduction.
-pub const BITNUM: [i8; 32] = [
+pub(crate) const BITNUM: [i8; 32] = [
     0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
 ];
 
@@ -63,7 +63,7 @@ pub const BITNUM: [i8; 32] = [
 /// The exact derivation is in voxlap's comment block; values
 /// reproduced verbatim.
 #[rustfmt::skip]
-pub const BITSNUM: [i32; 32] = [
+pub(crate) const BITSNUM: [i32; 32] = [
     0,           1 - (2 << 16), 1 - (1 << 16), 2 - (3 << 16),
     1,           2 - (2 << 16), 2 - (1 << 16), 3 - (3 << 16),
     1 + (1 << 16), 2 - (1 << 16), 2,           3 - (2 << 16),
@@ -77,7 +77,7 @@ pub const BITSNUM: [i32; 32] = [
 /// `xbsflor[k] = -1i32 << k` — bits `k..31` set, low `k` bits
 /// clear. Used by `expandbit256` to splat air→solid transitions
 /// onto a partial 32-bit word.
-pub const fn xbsflor(k: usize) -> u32 {
+pub(crate) const fn xbsflor(k: usize) -> u32 {
     if k >= 32 {
         0
     } else {
@@ -87,7 +87,7 @@ pub const fn xbsflor(k: usize) -> u32 {
 
 /// `xbsceil[k] = ~xbsflor[k]` — low `k` bits set. Solid→air
 /// transitions.
-pub const fn xbsceil(k: usize) -> u32 {
+pub(crate) const fn xbsceil(k: usize) -> u32 {
     !xbsflor(k)
 }
 
@@ -105,7 +105,7 @@ pub const fn xbsceil(k: usize) -> u32 {
 /// pending whole-words (full air `0` or full solid `-1`) until
 /// it lands inside the partial word containing the transition,
 /// then OR/ANDs the partial mask via `xbsflor` / `xbsceil`.
-pub fn expandbit256(column: &[u8], bits: &mut [u32; 8]) {
+pub(crate) fn expandbit256(column: &[u8], bits: &mut [u32; 8]) {
     let mut src_idx: usize = 0;
     let mut dst_idx: usize = 0;
     let mut bitpos: i32 = 32;
@@ -185,7 +185,8 @@ pub fn expandbit256(column: &[u8], bits: &mut [u32; 8]) {
 /// the bake. Memory cost stays manageable: a 448×448 bake (the
 /// `diag_down_lit` oracle scope, which extends to 452×452 with
 /// padding) needs about 6.4 MB.
-pub struct EstNormCache {
+#[allow(dead_code)] // vsid field/method preserved for voxlap-parity inspection
+pub(crate) struct EstNormCache {
     /// Per-column bit arrays. `bits[(yidx) * width + (xidx)]` is
     /// the slab bit-mask of column `(origin_x + xidx, origin_y +
     /// yidx)`. `xidx ∈ 0..width`, mapping abs-x into
@@ -410,7 +411,8 @@ impl EstNormCache {
 
     /// Voxel-grid limit; used by callers to bound their iteration.
     #[must_use]
-    pub fn vsid(&self) -> i32 {
+    #[allow(dead_code)] // preserved for voxlap-parity inspection
+    pub(crate) fn vsid(&self) -> i32 {
         self.vsid
     }
 }

@@ -14,6 +14,12 @@
 //! - **R4.3e**: findslab / slab-split / deletez column advance.
 //! - **R4.3f**: remiporend (mip transition) + startsky.
 
+// Several scratch structs preserve voxlap-C state for parity even when
+// individual fields aren't yet read (e.g. SkyRef::row_stride is derived
+// in from_sky but the rasterizer indexes via lat[]). Module-level
+// allow keeps the parity-driven layout intact without per-field churn.
+#![allow(dead_code)]
+
 /// One entry on grouscan's `cf` stack — voxlap's `cftype`
 /// (`voxlap5.c:128`):
 ///

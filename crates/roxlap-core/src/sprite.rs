@@ -68,7 +68,7 @@ const MAX_LIGHTS: usize = 16;
 /// model the lowermip chain in `roxlap-formats::Kv6`, so the mip
 /// descent loop in `kv6_draw_prepare` is structurally faithful but
 /// effectively a no-op until that lands.
-pub const KV6_MIPFACTOR_DEFAULT: i32 = 128;
+pub(crate) const KV6_MIPFACTOR_DEFAULT: i32 = 128;
 
 /// Post-cull state derived from a sprite + camera pair — what the
 /// per-voxel iteration in R6.3+ needs to start its setup. Borrows

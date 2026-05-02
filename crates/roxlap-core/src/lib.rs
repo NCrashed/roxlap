@@ -9,27 +9,27 @@
 
 mod camera;
 pub mod camera_math;
-pub mod column_walk;
+pub(crate) mod column_walk;
 pub mod drawtile;
 mod engine;
-pub mod equivec;
-pub mod fixed;
+pub(crate) mod equivec;
+pub(crate) mod fixed;
 pub mod gline;
-pub mod grouscan;
+pub(crate) mod grouscan;
 pub mod kfa_draw;
 pub mod meltsphere;
 pub mod opticast;
 pub mod opticast_prelude;
-pub mod projection;
-pub mod ptfaces16;
+pub(crate) mod projection;
+pub(crate) mod ptfaces16;
 pub mod rasterizer;
-pub mod ray_step;
+pub(crate) mod ray_step;
 pub mod scalar_rasterizer;
-pub mod scan_loops;
+pub(crate) mod scan_loops;
 pub mod sky;
 pub mod sprite;
 pub mod world_lighting;
-pub mod world_query;
+pub(crate) mod world_query;
 
 pub use camera::Camera;
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
