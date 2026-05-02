@@ -261,6 +261,52 @@ mod tests {
     }
 
     #[test]
+    fn pack_round_trip_through_worley_grid() {
+        // worley_classify_grid → pack_dense_grid_to_vxl yields a Vxl
+        // whose every column is parseable. Tests the integration
+        // between cave shape generation and slab packing.
+        use crate::{worley_classify_grid, CaveParams};
+        let params = CaveParams {
+            seed: 42,
+            seed_count: 16,
+            air_ratio: 0.5,
+            anisotropy: 1.0,
+            perlin_octaves: 0,
+            perlin_amplitude: 0.0,
+        };
+        let vsid = 8u32;
+        let grid = worley_classify_grid(&params, vsid);
+        // Build a colour grid: each solid voxel gets z-as-low-byte.
+        let vsid_u = vsid as usize;
+        let maxzdim_u = MAXZDIM as usize;
+        let mut color = vec![0u32; vsid_u * vsid_u * maxzdim_u];
+        for (i, &g) in grid.iter().enumerate() {
+            if g != 0 {
+                let z = (i % maxzdim_u) as u32;
+                color[i] = 0x8060_4020 | z;
+            }
+        }
+        let vxl = pack_dense_grid_to_vxl(&grid, &color, vsid);
+        // Sanity: every column should be expandrle-decodable into a
+        // valid b2 buffer (sentinel-terminated).
+        for idx in 0..(vsid_u * vsid_u) {
+            let mut b2 = vec![0i32; 256];
+            expandrle(vxl.column_data(idx), &mut b2);
+            // Walk to sentinel; runs must satisfy top < bot.
+            let mut i = 0;
+            while b2[i + 1] < MAXZDIM {
+                assert!(
+                    b2[i] < b2[i + 1],
+                    "col {idx} run {i}: top={} bot={}",
+                    b2[i],
+                    b2[i + 1]
+                );
+                i += 2;
+            }
+        }
+    }
+
+    #[test]
     fn pack_grid_size_assert() {
         // Wrong-sized grid panics.
         let result = std::panic::catch_unwind(|| {
