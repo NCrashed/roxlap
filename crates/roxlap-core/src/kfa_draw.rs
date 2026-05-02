@@ -36,11 +36,12 @@
     clippy::useless_vec
 )]
 
-use roxlap_formats::kfa::{Hinge, Point3};
+use roxlap_formats::kfa::{Hinge, KfaSprite, Point3};
+use roxlap_formats::sprite::Sprite;
 
 use crate::camera_math::CameraState;
 use crate::opticast::OpticastSettings;
-use crate::sprite::{draw_sprite, mat2, DrawTarget, Sprite, SpriteLighting};
+use crate::sprite::{draw_sprite, mat2, DrawTarget, SpriteLighting};
 
 /// Voxlap's `genperp` — given a non-zero axis vector `a`, build
 /// two orthonormal vectors `b`, `c` such that `(a, b, c)` form a
@@ -49,8 +50,7 @@ use crate::sprite::{draw_sprite, mat2, DrawTarget, Sprite, SpriteLighting};
 ///
 /// If `a` is zero, returns `([0; 3], [0; 3])` (matches voxlap's
 /// degenerate-input zeroing).
-#[must_use]
-pub fn genperp(a: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+fn genperp(a: [f32; 3]) -> ([f32; 3], [f32; 3]) {
     if a == [0.0, 0.0, 0.0] {
         return ([0.0; 3], [0.0; 3]);
     }
@@ -203,131 +203,6 @@ fn setlimb(limbs: &mut [Sprite], hinges: &[Hinge], i: usize, parent: usize, htyp
     child.p = co;
 }
 
-/// Build the hinge-sort order — voxlap's `kfasorthinge`
-/// (voxlap5.c:9427-9450). The result is an array of hinge
-/// indices ordered such that **walking from index `n-1` down to
-/// 0** visits parents before children (= valid topological
-/// order for the chain of `setlimb` calls in `kfa_draw`).
-///
-/// Voxlap mutates the hinges in place during sort and restores
-/// them; our port produces the same `hsort` array without
-/// touching the hinges.
-#[must_use]
-pub fn sort_hinges(hinges: &[Hinge]) -> Vec<usize> {
-    let n = hinges.len();
-    let mut hsort = vec![0usize; n];
-    // First pass: roots at the end, non-roots at the start.
-    let mut head = 0usize;
-    let mut tail = n;
-    for i in (0..n).rev() {
-        if hinges[i].parent < 0 {
-            tail -= 1;
-            hsort[tail] = i;
-        } else {
-            hsort[head] = i;
-            head += 1;
-        }
-    }
-
-    // `solved[h]` = true once hinge h's parent has been settled
-    // into the "tail" half. Voxlap encodes this in-place by
-    // flipping the parent field to -2-parent; we use a side
-    // bitmap to leave the input immutable.
-    let mut solved = vec![false; n];
-    for i in (tail..n).rev() {
-        solved[hsort[i]] = true;
-    }
-
-    // Iterative pass: pick non-root entries in head whose parent
-    // is already solved; move them to the tail.
-    let mut idx = head; // idx walks the head [0..head) backward
-    while tail > 0 {
-        if idx == 0 {
-            idx = head;
-        }
-        idx -= 1;
-        let j = hsort[idx];
-        let parent = hinges[j].parent;
-        if parent < 0 {
-            // Already in the tail (shouldn't happen since the
-            // first pass sorted these out).
-            continue;
-        }
-        if solved[parent as usize] {
-            solved[j] = true;
-            tail -= 1;
-            hsort[idx] = hsort[tail];
-            hsort[tail] = j;
-            head -= 1;
-        }
-        if head == 0 {
-            break;
-        }
-    }
-    hsort
-}
-
-/// One animated KFA sprite — bones + hinges + per-bone live
-/// animation values. The host owns one of these per animated
-/// model, updates `kfaval[]` over time, and passes it to
-/// [`draw_kfa_sprite`] each frame.
-#[derive(Clone)]
-pub struct KfaSprite {
-    /// One [`Sprite`] per bone. Limb `i`'s `(s, h, f, p)` is
-    /// computed per frame in [`draw_kfa_sprite`] from the parent's
-    /// transform + hinge math; the `kv6` field holds the bone's
-    /// kv6 mesh and never changes.
-    pub limbs: Vec<Sprite>,
-    /// Bone hierarchy. Mirror of voxlap's `kfatype.hinge[]`.
-    pub hinges: Vec<Hinge>,
-    /// Topological sort of bone indices — populated once at
-    /// construction, used by [`draw_kfa_sprite`]'s render loop.
-    pub hinge_sort: Vec<usize>,
-    /// Per-bone animation value. Voxlap's `vx5.kfaval[]`. Q15
-    /// angle (full circle = 65536). Host updates per frame.
-    pub kfaval: Vec<i16>,
-    /// World-space anchor of the root limb's `hinge.p[0]`. The
-    /// root limb is positioned so `hinge.p[0]` lands at this
-    /// point given the world basis below.
-    pub p: [f32; 3],
-    /// World-space basis for the root limb. Mirror of
-    /// `vx5sprite.{s, h, f}` for the root.
-    pub s: [f32; 3],
-    pub h: [f32; 3],
-    pub f: [f32; 3],
-}
-
-impl KfaSprite {
-    /// Build a KFA sprite from a list of `(Sprite, Hinge)` bones.
-    /// `limbs.len()` must equal `hinges.len()`. The first bone with
-    /// `parent < 0` is the root.
-    ///
-    /// `kfaval` is initialised to all zeros; the host should set
-    /// per-bone angles before / between [`draw_kfa_sprite`] calls.
-    #[must_use]
-    pub fn new(limbs: Vec<Sprite>, hinges: Vec<Hinge>, root_pos: [f32; 3]) -> Self {
-        assert_eq!(
-            limbs.len(),
-            hinges.len(),
-            "limbs ({}) and hinges ({}) length mismatch",
-            limbs.len(),
-            hinges.len()
-        );
-        let n = hinges.len();
-        let hinge_sort = sort_hinges(&hinges);
-        Self {
-            limbs,
-            hinges,
-            hinge_sort,
-            kfaval: vec![0i16; n],
-            p: root_pos,
-            s: [1.0, 0.0, 0.0],
-            h: [0.0, 1.0, 0.0],
-            f: [0.0, 0.0, 1.0],
-        }
-    }
-}
-
 /// Render an animated KFA sprite — voxlap's `kfadraw`
 /// (voxlap5.c:9759). Walks the bone tree in topological order
 /// (parents first), computes each limb's world transform from
@@ -382,11 +257,6 @@ pub fn draw_kfa_sprite(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roxlap_formats::kfa::Point3;
-
-    fn axis(x: f32, y: f32, z: f32) -> Point3 {
-        Point3 { x, y, z }
-    }
 
     /// genperp produces an orthonormal basis with the input axis
     /// as the dominant direction.
@@ -414,41 +284,5 @@ mod tests {
         let (b, c) = genperp([0.0, 0.0, 0.0]);
         assert_eq!(b, [0.0, 0.0, 0.0]);
         assert_eq!(c, [0.0, 0.0, 0.0]);
-    }
-
-    /// sort_hinges puts roots at high indices and children at low.
-    /// 3-bone chain: root → child1 → child2.
-    #[test]
-    fn sort_hinges_three_bone_chain() {
-        let h = |parent: i32| Hinge {
-            parent,
-            p: [axis(0.0, 0.0, 0.0); 2],
-            v: [axis(1.0, 0.0, 0.0); 2],
-            vmin: 0,
-            vmax: 0,
-            htype: 0,
-            filler: [0; 7],
-        };
-        // hinge[0] = root, hinge[1] child of 0, hinge[2] child of 1.
-        let hinges = vec![h(-1), h(0), h(1)];
-        let sort = sort_hinges(&hinges);
-        // High index = root → 0 must be at index 2 (= hinges.len()-1).
-        // Walking sort backward should visit: root (0), child of root
-        // (1), child of 1 (2).
-        // The exact ordering of the lower indices depends on voxlap's
-        // sweep, but we can verify "walking sort[i] for i=n-1..=0 gives
-        // an order where every bone's parent appears earlier".
-        let mut seen = vec![false; 3];
-        for k in (0..3).rev() {
-            let j = sort[k];
-            seen[j] = true;
-            let p = hinges[j].parent;
-            if p >= 0 {
-                assert!(
-                    seen[p as usize],
-                    "bone {j}'s parent {p} not yet visited at descent step k={k}"
-                );
-            }
-        }
     }
 }

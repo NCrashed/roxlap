@@ -287,6 +287,141 @@ fn write_hinge(out: &mut Vec<u8>, h: &Hinge) {
     out.extend_from_slice(&h.filler);
 }
 
+// --- KFA sprite (host-facing scene type) --------------------------------
+
+/// One animated KFA sprite — bones + hinges + per-bone live
+/// animation values.
+///
+/// The host owns one of these per animated model, updates `kfaval[]`
+/// over time, and passes it to roxlap-core's `draw_kfa_sprite` each
+/// frame. Construction is data-only (this crate); rendering is in
+/// `roxlap-core`.
+#[derive(Clone)]
+pub struct KfaSprite {
+    /// One [`crate::sprite::Sprite`] per bone. Limb `i`'s
+    /// `(s, h, f, p)` is computed per frame by the renderer from
+    /// the parent's transform + hinge math; the `kv6` field holds
+    /// the bone's kv6 mesh and never changes.
+    pub limbs: Vec<crate::sprite::Sprite>,
+    /// Bone hierarchy. Mirror of voxlap's `kfatype.hinge[]`.
+    pub hinges: Vec<Hinge>,
+    /// Topological sort of bone indices — populated once at
+    /// construction, used by the renderer's per-frame loop.
+    pub hinge_sort: Vec<usize>,
+    /// Per-bone animation value. Voxlap's `vx5.kfaval[]`. Q15
+    /// angle (full circle = 65536). Host updates per frame.
+    pub kfaval: Vec<i16>,
+    /// World-space anchor of the root limb's `hinge.p[0]`. The
+    /// root limb is positioned so `hinge.p[0]` lands at this
+    /// point given the world basis below.
+    pub p: [f32; 3],
+    /// World-space basis for the root limb. Mirror of
+    /// `vx5sprite.{s, h, f}` for the root.
+    pub s: [f32; 3],
+    pub h: [f32; 3],
+    pub f: [f32; 3],
+}
+
+impl KfaSprite {
+    /// Build a KFA sprite from a list of `(Sprite, Hinge)` bones.
+    /// `limbs.len()` must equal `hinges.len()`. The first bone with
+    /// `parent < 0` is the root.
+    ///
+    /// `kfaval` is initialised to all zeros; the host should set
+    /// per-bone angles before / between render calls.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `limbs.len() != hinges.len()`.
+    #[must_use]
+    pub fn new(limbs: Vec<crate::sprite::Sprite>, hinges: Vec<Hinge>, root_pos: [f32; 3]) -> Self {
+        assert_eq!(
+            limbs.len(),
+            hinges.len(),
+            "limbs ({}) and hinges ({}) length mismatch",
+            limbs.len(),
+            hinges.len()
+        );
+        let n = hinges.len();
+        let hinge_sort = sort_hinges(&hinges);
+        Self {
+            limbs,
+            hinges,
+            hinge_sort,
+            kfaval: vec![0i16; n],
+            p: root_pos,
+            s: [1.0, 0.0, 0.0],
+            h: [0.0, 1.0, 0.0],
+            f: [0.0, 0.0, 1.0],
+        }
+    }
+}
+
+/// Build the hinge-sort order — voxlap's `kfasorthinge`
+/// (`voxlap5.c:9427-9450`). The result is an array of hinge
+/// indices ordered such that **walking from index `n-1` down to
+/// 0** visits parents before children — a valid topological order
+/// for the chain of `setlimb` calls in voxlap's `kfadraw`.
+///
+/// Voxlap mutates the hinges in place during sort and restores
+/// them; this port produces the same `hsort` array without
+/// touching the input.
+#[must_use]
+#[allow(clippy::cast_sign_loss)] // parent >= 0 checked immediately above
+pub fn sort_hinges(hinges: &[Hinge]) -> Vec<usize> {
+    let n = hinges.len();
+    let mut hsort = vec![0usize; n];
+    // First pass: roots at the end, non-roots at the start.
+    let mut head = 0usize;
+    let mut tail = n;
+    for i in (0..n).rev() {
+        if hinges[i].parent < 0 {
+            tail -= 1;
+            hsort[tail] = i;
+        } else {
+            hsort[head] = i;
+            head += 1;
+        }
+    }
+
+    // `solved[h]` = true once hinge h's parent has been settled
+    // into the "tail" half. Voxlap encodes this in-place by
+    // flipping the parent field to -2-parent; we use a side
+    // bitmap to leave the input immutable.
+    let mut solved = vec![false; n];
+    for i in (tail..n).rev() {
+        solved[hsort[i]] = true;
+    }
+
+    // Iterative pass: pick non-root entries in head whose parent
+    // is already solved; move them to the tail.
+    let mut idx = head; // idx walks the head [0..head) backward
+    while tail > 0 {
+        if idx == 0 {
+            idx = head;
+        }
+        idx -= 1;
+        let j = hsort[idx];
+        let parent = hinges[j].parent;
+        if parent < 0 {
+            // Already in the tail (shouldn't happen since the
+            // first pass sorted these out).
+            continue;
+        }
+        if solved[parent as usize] {
+            solved[j] = true;
+            tail -= 1;
+            hsort[idx] = hsort[tail];
+            hsort[tail] = j;
+            head -= 1;
+        }
+        if head == 0 {
+            break;
+        }
+    }
+    hsort
+}
+
 // --- tests --------------------------------------------------------------
 
 #[cfg(test)]
@@ -421,5 +556,39 @@ mod tests {
         let truncated = &bytes[..30];
         let r = parse(truncated);
         assert!(matches!(r, Err(ParseError::Truncated { .. })));
+    }
+
+    /// `sort_hinges` puts roots at high indices and children at low.
+    /// 3-bone chain: root → child1 → child2.
+    #[test]
+    #[allow(clippy::cast_sign_loss)] // p >= 0 checked at the assert site
+    fn sort_hinges_three_bone_chain() {
+        let axis = |x: f32, y: f32, z: f32| Point3 { x, y, z };
+        let h = |parent: i32| Hinge {
+            parent,
+            p: [axis(0.0, 0.0, 0.0); 2],
+            v: [axis(1.0, 0.0, 0.0); 2],
+            vmin: 0,
+            vmax: 0,
+            htype: 0,
+            filler: [0; 7],
+        };
+        // hinge[0] = root, hinge[1] child of 0, hinge[2] child of 1.
+        let hinges = vec![h(-1), h(0), h(1)];
+        let sort = sort_hinges(&hinges);
+        // Walking sort[i] for i=n-1..=0 must visit each bone's parent
+        // before the bone itself.
+        let mut seen = [false; 3];
+        for k in (0..3).rev() {
+            let j = sort[k];
+            seen[j] = true;
+            let p = hinges[j].parent;
+            if p >= 0 {
+                assert!(
+                    seen[p as usize],
+                    "bone {j}'s parent {p} not yet visited at descent step k={k}"
+                );
+            }
+        }
     }
 }

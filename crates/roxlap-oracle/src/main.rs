@@ -45,10 +45,11 @@ use roxlap_core::camera_math;
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
-use roxlap_core::sprite::{draw_sprite, DrawTarget, Sprite, SpriteLighting};
+use roxlap_core::sprite::{draw_sprite, DrawTarget, SpriteLighting};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
+use roxlap_formats::sprite::Sprite;
 use roxlap_formats::{kv6, vxl};
 
 const XRES: u32 = 640;

@@ -48,6 +48,7 @@
 )]
 
 use roxlap_formats::kv6::{Kv6, Voxel};
+use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_INVISIBLE, SPRITE_FLAG_KFA, SPRITE_FLAG_NO_Z};
 
 use crate::camera_math::CameraState;
 use crate::engine::{Engine, LightSrc, DEFAULT_KV6COL};
@@ -68,63 +69,6 @@ const MAX_LIGHTS: usize = 16;
 /// descent loop in `kv6_draw_prepare` is structurally faithful but
 /// effectively a no-op until that lands.
 pub const KV6_MIPFACTOR_DEFAULT: i32 = 128;
-
-/// Voxlap's sprite-flags bit 0: disable normal-based face shading.
-pub const SPRITE_FLAG_NO_SHADING: u32 = 1 << 0;
-/// Voxlap's sprite-flags bit 1: voxnum points at a `kfatype`
-/// (animated). When clear (default), points at a `kv6data`.
-pub const SPRITE_FLAG_KFA: u32 = 1 << 1;
-/// Voxlap's sprite-flags bit 2: skip rendering entirely.
-pub const SPRITE_FLAG_INVISIBLE: u32 = 1 << 2;
-/// Voxlap's sprite-flags bit 3: render without z-buffer test.
-pub const SPRITE_FLAG_NO_Z: u32 = 1 << 3;
-
-/// A KV6 voxel sprite positioned in world space.
-///
-/// Mirror of voxlap's `vx5sprite` for the kv6 case (`flags &
-/// SPRITE_FLAG_KFA == 0`). Owns its `Kv6` by value — the sprite
-/// data the engine needs to access during rendering. `p` / `s` /
-/// `h` / `f` are voxlap's per-axis world-space basis: `s` is
-/// the `kv6.xsiz` direction, `h` the `ysiz` direction, `f` the
-/// `zsiz` direction. For an axis-aligned sprite, `s = [1,0,0]`,
-/// `h = [0,1,0]`, `f = [0,0,1]`.
-#[derive(Debug, Clone)]
-pub struct Sprite {
-    /// Voxel data + bounding-box pivots. Built either by
-    /// [`crate::meltsphere::meltsphere`] (extracted from a world)
-    /// or loaded from a `.kv6` file via `roxlap_formats::kv6::parse`.
-    pub kv6: Kv6,
-    /// World-space position of the sprite's pivot (xpiv, ypiv,
-    /// zpiv inside the kv6 maps to this point).
-    pub p: [f32; 3],
-    /// World-space basis vector for the kv6's local +x. Length
-    /// scales the sprite along that axis (typically `1.0` for
-    /// unit-scale).
-    pub s: [f32; 3],
-    /// World-space basis vector for the kv6's local +y.
-    pub h: [f32; 3],
-    /// World-space basis vector for the kv6's local +z.
-    pub f: [f32; 3],
-    /// Voxlap-style flags bitfield. See `SPRITE_FLAG_*` constants.
-    pub flags: u32,
-}
-
-impl Sprite {
-    /// Convenience constructor for an axis-aligned sprite at
-    /// world position `pos`. Basis is identity, flags = 0
-    /// (kv6 + normal shading + visible + z-tested).
-    #[must_use]
-    pub fn axis_aligned(kv6: Kv6, pos: [f32; 3]) -> Self {
-        Self {
-            kv6,
-            p: pos,
-            s: [1.0, 0.0, 0.0],
-            h: [0.0, 1.0, 0.0],
-            f: [0.0, 0.0, 1.0],
-            flags: 0,
-        }
-    }
-}
 
 /// Post-cull state derived from a sprite + camera pair — what the
 /// per-voxel iteration in R6.3+ needs to start its setup. Borrows

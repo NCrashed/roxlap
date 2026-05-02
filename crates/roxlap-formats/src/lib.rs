@@ -15,6 +15,7 @@ pub mod kfa;
 pub mod kv6;
 pub mod kvx;
 pub mod palette;
+pub mod sprite;
 pub mod vxl;
 
 pub use palette::Rgb6;
