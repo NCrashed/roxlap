@@ -551,6 +551,168 @@ struct RenderOpts {
 /// Lives next to `roxlap-hashes.txt`; one PPM per pose dropped in.
 const DEFAULT_PPM_DIR: &str = "roxlap-oracle-out";
 
+/// `cmd_bench` options parsed off the CLI. `pose_name = None`
+/// benchmarks every pose; `Some(name)` runs that one pose only.
+struct BenchOpts {
+    pose_name: Option<String>,
+    iters: usize,
+    warmup: usize,
+}
+
+/// Microbenchmark the render pipeline over the oracle poses.
+/// Reports per-pose min / p50 / mean / p99 / max ms and a derived
+/// FPS, plus a grand total when running the full set. Uses the same
+/// `render_pose` path the oracle and CI exercise — sticky lighting
+/// bake on the first `pose.lit` entry, fresh framebuffer + zbuffer
+/// per run.
+///
+/// Defaults: `iters = 30`, `warmup = 5`. The warmup smooths over
+/// CPU frequency ramp / cache-warming on the first few iterations;
+/// the measure phase records per-iter `Instant::elapsed`.
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+fn cmd_bench(opts: &BenchOpts) -> std::io::Result<()> {
+    let mut engine = Engine::new();
+    engine.set_fog(0x0087_ceeb, 1024);
+    let mut vxl_world = load_oracle_vxl();
+
+    let pixel_count = (XRES as usize) * (YRES as usize);
+    let mut framebuffer = vec![0u32; pixel_count];
+    let mut zbuffer = vec![0.0f32; pixel_count];
+    let mut scratch = ScanScratch::new_for_size(XRES, YRES, vxl_world.vsid);
+
+    let target_poses: Vec<&Pose> = match opts.pose_name.as_deref() {
+        None | Some("all") => POSES.iter().collect(),
+        Some(name) => {
+            if let Some(p) = POSES.iter().find(|p| p.name == name) {
+                vec![p]
+            } else {
+                let _ = writeln!(std::io::stderr(), "unknown pose: {name}");
+                let names: Vec<&str> = POSES.iter().map(|p| p.name).collect();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "available: {} (or `all`)",
+                    names.join(", ")
+                );
+                std::process::exit(2);
+            }
+        }
+    };
+
+    println!(
+        "Bench: {} iter{} per pose, {} warmup, {}×{} framebuffer",
+        opts.iters,
+        if opts.iters == 1 { "" } else { "s" },
+        opts.warmup,
+        XRES,
+        YRES
+    );
+    println!();
+    println!(
+        "{:<14}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "pose", "min ms", "p50 ms", "mean ms", "p99 ms", "max ms", "fps"
+    );
+
+    let mut lighting_baked = false;
+    let mut grand_total = std::time::Duration::ZERO;
+    let mut grand_iters = 0usize;
+
+    for pose in target_poses {
+        if pose.lit && !lighting_baked {
+            engine.set_lightmode(2);
+            engine.add_light(roxlap_core::LightSrc {
+                pos: [1100.0, 1100.0, 70.0],
+                r2: 600.0 * 600.0,
+                sc: 1.0,
+            });
+            roxlap_core::update_lighting(
+                &mut vxl_world.data,
+                &vxl_world.column_offset,
+                vxl_world.vsid,
+                800,
+                800,
+                0,
+                1248,
+                1248,
+                200,
+                engine.lightmode(),
+                engine.lights(),
+            );
+            lighting_baked = true;
+        }
+
+        for _ in 0..opts.warmup {
+            let _ = render_pose(
+                &engine,
+                &vxl_world,
+                pose,
+                &mut framebuffer,
+                &mut zbuffer,
+                &mut scratch,
+            );
+        }
+
+        let mut samples: Vec<std::time::Duration> = Vec::with_capacity(opts.iters);
+        for _ in 0..opts.iters {
+            let t0 = std::time::Instant::now();
+            let _ = render_pose(
+                &engine,
+                &vxl_world,
+                pose,
+                &mut framebuffer,
+                &mut zbuffer,
+                &mut scratch,
+            );
+            samples.push(t0.elapsed());
+        }
+
+        samples.sort_unstable();
+        let min = samples[0];
+        let max = samples[samples.len() - 1];
+        let p50 = samples[samples.len() / 2];
+        // p99 with len < 100 falls back to max — that's fine; the
+        // signal is that large-N runs see real percentile data.
+        let p99_idx = samples
+            .len()
+            .saturating_sub(1)
+            .min(samples.len() * 99 / 100);
+        let p99 = samples[p99_idx];
+        let total: std::time::Duration = samples.iter().sum();
+        // `as u32` cast: opts.iters is u32-bounded by the CLI parser.
+        #[allow(clippy::cast_possible_truncation)]
+        let mean = total / opts.iters as u32;
+        let fps = 1.0 / mean.as_secs_f64();
+
+        println!(
+            "{:<14}  {:>8.3}  {:>8.3}  {:>8.3}  {:>8.3}  {:>8.3}  {:>8.1}",
+            pose.name,
+            min.as_secs_f64() * 1000.0,
+            p50.as_secs_f64() * 1000.0,
+            mean.as_secs_f64() * 1000.0,
+            p99.as_secs_f64() * 1000.0,
+            max.as_secs_f64() * 1000.0,
+            fps
+        );
+
+        grand_total += total;
+        grand_iters += opts.iters;
+    }
+
+    if grand_iters > 1 {
+        #[allow(clippy::cast_possible_truncation)]
+        let grand_mean = grand_total / grand_iters as u32;
+        println!();
+        println!(
+            "Total: {:.3} ms across {} renders, mean {:.3} ms/frame, {:.1} fps",
+            grand_total.as_secs_f64() * 1000.0,
+            grand_iters,
+            grand_mean.as_secs_f64() * 1000.0,
+            1.0 / grand_mean.as_secs_f64()
+        );
+    }
+
+    Ok(())
+}
+
 /// Render every pose and write `roxlap-hashes.txt` next to the
 /// invocation cwd. With `--ppm[=DIR]` (or `ROXLAP_ORACLE_PPM=1`),
 /// also dumps a P6 PPM per pose into `DIR` (default
@@ -803,6 +965,11 @@ fn print_help() {
                                          quadrant scanline. For diff against voxlap C\n\
                                          debug prints. Known poses: north, east,\n\
                                          diag_down, high_down.\n\
+             roxlap-oracle bench [--pose NAME|all] [--iters N] [--warmup N]\n\
+                                         microbenchmark render_pose; reports per-pose\n\
+                                         min/p50/mean/p99/max ms + FPS, plus a grand\n\
+                                         total when running `all`. Defaults:\n\
+                                         --pose all, --iters 30, --warmup 5.\n\
          \n\
          Env:\n\
              ROXLAP_ORACLE_PPM=1        legacy alias for --ppm (dumps to cwd)\n\
@@ -1097,6 +1264,7 @@ fn parse_render_opts(args: &[String]) -> std::io::Result<RenderOpts> {
     Ok(RenderOpts { ppm_dir })
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Default subcommand is `render`. Treating a leading `--`-flag
@@ -1155,6 +1323,67 @@ fn main() -> std::io::Result<()> {
         "debug-gline" => {
             let pose_name = args.get(1).cloned().unwrap_or_else(|| "north".to_string());
             cmd_debug_gline(&pose_name)
+        }
+        "bench" => {
+            let mut opts = BenchOpts {
+                pose_name: None,
+                iters: 30,
+                warmup: 5,
+            };
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--pose" => {
+                        opts.pose_name = Some(args.get(i + 1).cloned().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--pose expects a name (or `all`)",
+                            )
+                        })?);
+                        i += 2;
+                    }
+                    "--iters" => {
+                        let raw = args.get(i + 1).cloned().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--iters expects an integer",
+                            )
+                        })?;
+                        opts.iters = raw.parse().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("--iters: not an integer ({raw})"),
+                            )
+                        })?;
+                        i += 2;
+                    }
+                    "--warmup" => {
+                        let raw = args.get(i + 1).cloned().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--warmup expects an integer",
+                            )
+                        })?;
+                        opts.warmup = raw.parse().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("--warmup: not an integer ({raw})"),
+                            )
+                        })?;
+                        i += 2;
+                    }
+                    other => {
+                        let _ = writeln!(std::io::stderr(), "unknown bench arg: {other}");
+                        print_help();
+                        std::process::exit(2);
+                    }
+                }
+            }
+            if opts.iters == 0 {
+                let _ = writeln!(std::io::stderr(), "--iters must be >= 1");
+                std::process::exit(2);
+            }
+            cmd_bench(&opts)
         }
         "find-hairlines" => {
             // Default: ./roxlap-capture.txt — what the host writes
