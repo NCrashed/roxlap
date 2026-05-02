@@ -87,10 +87,10 @@ MATCH    north  326a7c41c3cc659d
 MATCH    east  3e00f1d0d62d5be0
 MATCH    diag_down  118de3c1132d0f6b
 MATCH    high_down  cd1ceac6e21c55f4
-MATCH    sprite_above  79b87c92dd96a59b
+MATCH    sprite_above  c92ebd054aa7c12e        (roxlap-frozen)
 MATCH    sprite_front  87c7de0ddeb0f7ce        (roxlap-frozen)
 MATCH    sprite_iso  9caf71069594fde6          (roxlap-frozen)
-MATCH    sprite_coco  0c8f30141c9e7a4e         (roxlap-frozen)
+MATCH    sprite_coco  bf0f4329b473c69e         (roxlap-frozen)
 MATCH    diag_down_lit  b536ce3fdf771b9e       (roxlap-frozen)
 9 match, 0 mismatch, 0 missing-from-golden (9 total roxlap rows)
 ```
