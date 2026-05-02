@@ -196,7 +196,260 @@ pub(crate) fn expandrle(slab: &[u8], uind: &mut [i32]) {
     uind[i - 1] = MAXZDIM;
 }
 
+/// One color-lookup record: original column's color for `z` in
+/// `[z_start, z_end)`. Built from a column's slab bytes by
+/// [`build_color_table`].
+#[derive(Debug)]
+struct ColorRange<'s> {
+    z_start: i32,
+    z_end: i32,
+    /// Colors for `[z_start, z_end)`, BGRA, 4 bytes per voxel,
+    /// ordered by `z`. Length `(z_end - z_start) * 4`.
+    colors: &'s [u8],
+}
+
+/// Build the `tbuf2` color-lookup table for a column. Voxlap's
+/// initial loop in `compilerle` (voxlap5.c:4163-4174). For each slab
+/// emits a floor-color range and (for non-first slabs) a ceiling-
+/// color range. Sentinel-terminated by a record at `z_start = MAXZDIM`.
+fn build_color_table(slab: &[u8]) -> Vec<ColorRange<'_>> {
+    let mut ranges = Vec::new();
+    let mut v = 0usize;
+    loop {
+        let z_start = i32::from(slab[v + 1]);
+        let z1c = i32::from(slab[v + 2]);
+        let z_end = z1c + 1;
+        let n_voxels = usize::try_from((z_end - z_start).max(0)).expect("voxel count >= 0");
+        let off = v + 4;
+        ranges.push(ColorRange {
+            z_start,
+            z_end,
+            colors: &slab[off..off + n_voxels * 4],
+        });
+
+        let nextptr = slab[v];
+        if nextptr == 0 {
+            break;
+        }
+        let prev_v = v;
+        v += usize::from(nextptr) * 4;
+        let ze = i32::from(slab[v + 3]);
+        // Ceiling color list of new slab. Voxlap stores these in the
+        // tail of the *previous* slab's bytes — between its floor
+        // colors and the new slab's header.
+        //
+        // C: ic[0] = ze + p.z - ia - i + 2, ic[1] = ze, ic[2] = v - ze*4
+        // where p.z = z1c_prev, ia = z1_prev, i = nextptr_prev.
+        let prev_z1 = i32::from(slab[prev_v + 1]);
+        let prev_z1c = i32::from(slab[prev_v + 2]);
+        let prev_nextptr = i32::from(slab[prev_v]);
+        let ceil_z_start = ze + prev_z1c - prev_z1 - prev_nextptr + 2;
+        let ceil_z_end = ze;
+        let ceil_n =
+            usize::try_from((ceil_z_end - ceil_z_start).max(0)).expect("ceiling voxel count >= 0");
+        // Colors live at slab[v - ceil_n*4 .. v].
+        let ceil_start = v - ceil_n * 4;
+        ranges.push(ColorRange {
+            z_start: ceil_z_start,
+            z_end: ceil_z_end,
+            colors: &slab[ceil_start..v],
+        });
+    }
+    ranges.push(ColorRange {
+        z_start: MAXZDIM,
+        z_end: MAXZDIM,
+        colors: &[],
+    });
+    ranges
+}
+
+/// Re-encode a column's `b2` z-range buffer to slab bytes.
+///
+/// Port of `compilerle` (voxlap5.c:4154). Walks `n0` (this column's
+/// b2) voxel-by-voxel, writing one BGRA color record per exposed
+/// solid voxel into `cbuf`. Color values are pulled from the
+/// `original_column`'s slab bytes (where present) or from
+/// `colfunc(px, py, z)` for newly-exposed voxels created by edits.
+///
+/// `n1..n4` are the four neighbor columns' b2 buffers (left, right,
+/// north, south, in voxlap's order); they drive the "exposed" flag
+/// `ia` that decides whether each voxel needs a color record.
+///
+/// Returns the number of bytes written to `cbuf`. Voxlap sizes
+/// `cbuf` to `MAXCSIZ = 1028` bytes — the caller must do the same.
+///
+/// # Panics
+///
+/// Panics if a `b2` z value (always in `0..=MAXZDIM`) doesn't fit in
+/// `u8` — would indicate a malformed b2 buffer.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::missing_panics_doc
+)]
+pub(crate) fn compilerle(
+    n0: &[i32],
+    n1: &[i32],
+    n2: &[i32],
+    n3: &[i32],
+    n4: &[i32],
+    cbuf: &mut [u8],
+    original_column: &[u8],
+    px: i32,
+    py: i32,
+    colfunc: &mut dyn FnMut(i32, i32, i32) -> i32,
+) -> usize {
+    let tbuf2 = build_color_table(original_column);
+
+    let mut p_z: i32 = n0[0];
+    // Voxlap's char narrowing semantics: cbuf is byte-addressed, and
+    // `cbuf[n+1] = n0[i]` in C truncates to the low 8 bits. The
+    // sentinel run at the tail of `n0` carries MAXZDIM (=256) which
+    // wraps to 0 — voxlap uses that as part of the terminator slab.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let to_u8 = |v: i32| (v & 0xff) as u8;
+
+    cbuf[1] = to_u8(p_z);
+    let mut ze: i32 = n0[1];
+    cbuf[2] = to_u8(ze - 1);
+    cbuf[3] = 0;
+
+    let mut i = 0usize;
+    let mut onext = 0usize;
+    let mut ic = 0usize;
+    let mut ia: i32 = 15;
+    let mut n = 4usize;
+    let mut zend = if ze == MAXZDIM { -1 } else { ze - 1 };
+
+    let mut n1_idx = 0usize;
+    let mut n2_idx = 0usize;
+    let mut n3_idx = 0usize;
+    let mut n4_idx = 0usize;
+
+    'outer: loop {
+        let mut dacnt = 0;
+        'middle: loop {
+            // do { write voxel; ... } while (ia || p_z == zend)
+            let exit_to_rlendit2 = loop {
+                while p_z >= tbuf2[ic].z_end {
+                    ic += 1;
+                }
+                let color: i32 = if p_z >= tbuf2[ic].z_start {
+                    let off =
+                        usize::try_from((p_z - tbuf2[ic].z_start) * 4).expect("color offset >= 0");
+                    let bytes = &tbuf2[ic].colors[off..off + 4];
+                    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                } else {
+                    colfunc(px, py, p_z)
+                };
+                cbuf[n..n + 4].copy_from_slice(&color.to_le_bytes());
+                n += 4;
+                p_z += 1;
+                if p_z >= ze {
+                    break true; // goto rlendit2
+                }
+                while p_z >= n1[n1_idx] {
+                    n1_idx += 1;
+                    ia ^= 1;
+                }
+                while p_z >= n2[n2_idx] {
+                    n2_idx += 1;
+                    ia ^= 2;
+                }
+                while p_z >= n3[n3_idx] {
+                    n3_idx += 1;
+                    ia ^= 4;
+                }
+                while p_z >= n4[n4_idx] {
+                    n4_idx += 1;
+                    ia ^= 8;
+                }
+                if !(ia != 0 || p_z == zend) {
+                    break false; // exit do-while: buried voxel
+                }
+            };
+
+            if exit_to_rlendit2 {
+                if ze >= MAXZDIM {
+                    break 'outer;
+                }
+                i += 2;
+                cbuf[onext] = u8::try_from((n - onext) >> 2).expect("slab dword count fits in u8");
+                onext = n;
+                p_z = n0[i];
+                cbuf[n + 1] = to_u8(p_z);
+                cbuf[n + 3] = to_u8(ze);
+                ze = n0[i + 1];
+                cbuf[n + 2] = to_u8(ze - 1);
+                n += 4;
+                zend = if ze == MAXZDIM { -1 } else { ze - 1 };
+                break 'middle; // restart 'outer with dacnt = 0
+            }
+
+            // Buried voxel: close the floor list (or open a sub-slab
+            // for the next exposed run).
+            if dacnt == 0 {
+                cbuf[onext + 2] = to_u8(p_z - 1);
+                dacnt = 1;
+            } else {
+                cbuf[onext] = u8::try_from((n - onext) >> 2).expect("slab dword count fits in u8");
+                onext = n;
+                cbuf[n + 1] = to_u8(p_z);
+                cbuf[n + 2] = to_u8(p_z - 1);
+                cbuf[n + 3] = to_u8(p_z);
+                n += 4;
+            }
+
+            // Skip forward to the smallest neighbor breakpoint.
+            let n1_v = n1[n1_idx];
+            let n2_v = n2[n2_idx];
+            let n3_v = n3[n3_idx];
+            let n4_v = n4[n4_idx];
+            if n1_v < n2_v && n1_v < n3_v && n1_v < n4_v {
+                if n1_v >= ze {
+                    p_z = ze - 1;
+                } else {
+                    p_z = n1_v;
+                    n1_idx += 1;
+                    ia ^= 1;
+                }
+            } else if n2_v < n3_v && n2_v < n4_v {
+                if n2_v >= ze {
+                    p_z = ze - 1;
+                } else {
+                    p_z = n2_v;
+                    n2_idx += 1;
+                    ia ^= 2;
+                }
+            } else if n3_v < n4_v {
+                if n3_v >= ze {
+                    p_z = ze - 1;
+                } else {
+                    p_z = n3_v;
+                    n3_idx += 1;
+                    ia ^= 4;
+                }
+            } else if n4_v >= ze {
+                p_z = ze - 1;
+            } else {
+                p_z = n4_v;
+                n4_idx += 1;
+                ia ^= 8;
+            }
+
+            if p_z == MAXZDIM - 1 {
+                break 'outer;
+            }
+            // continue 'middle: re-enter inner do-while with same dacnt
+        }
+    }
+
+    cbuf[onext] = 0;
+    n
+}
+
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 mod tests {
     use super::*;
 
@@ -565,5 +818,254 @@ mod tests {
         expandrle(&slab, &mut uind);
         let runs = read_uind(&uind[..4]);
         assert_eq!(runs, [(10, 30), (50, MAXZDIM)]);
+    }
+
+    // ---- build_color_table + compilerle (CD.2.4) ----------------------
+
+    /// Build a sentinel-terminated all-air b2 buffer for a neighbor.
+    /// Sized with slack so compilerle's index walks don't run off
+    /// the end (worst case = n0's voxel count + 1).
+    fn all_air_neighbor() -> Vec<i32> {
+        // Just the sentinel pair + slack.
+        let mut buf = vec![MAXZDIM, MAXZDIM];
+        buf.resize(buf.len() + MAXZDIM as usize, MAXZDIM);
+        buf
+    }
+
+    /// Build a sentinel-terminated b2 from a list of solid runs.
+    /// Compatible with [`compilerle`]'s input shape — the trailing
+    /// sentinel must come last with bot == MAXZDIM.
+    fn b2_from_runs(runs: &[(i32, i32)]) -> Vec<i32> {
+        let mut buf = Vec::new();
+        for &(top, bot) in runs {
+            buf.push(top);
+            buf.push(bot);
+        }
+        buf.push(MAXZDIM);
+        buf.push(MAXZDIM);
+        buf.resize(buf.len() + MAXZDIM as usize, MAXZDIM);
+        buf
+    }
+
+    #[test]
+    fn build_color_table_single_slab_one_floor_voxel() {
+        // [nextptr=0, z1=10, z1c=10, z0=0] + 1 colour.
+        let slab = [0u8, 10, 10, 0, 0xa1, 0xa2, 0xa3, 0xa4];
+        let table = build_color_table(&slab);
+        assert_eq!(table.len(), 2);
+        assert_eq!(table[0].z_start, 10);
+        assert_eq!(table[0].z_end, 11);
+        assert_eq!(table[0].colors, &[0xa1, 0xa2, 0xa3, 0xa4]);
+        // Sentinel.
+        assert_eq!(table[1].z_start, MAXZDIM);
+        assert_eq!(table[1].z_end, MAXZDIM);
+    }
+
+    #[test]
+    fn build_color_table_two_slabs_with_ceiling() {
+        // Slab 0: nextptr=4 (16 bytes total) — 4 hdr + 1 floor + 8 ceiling-of-slab1
+        //   Layout: [4, 10, 10, 0, F0,F0,F0,F0, C0,C0,C0,C0, C1,C1,C1,C1]
+        // Slab 1: [0, 50, 52, 30, ...]
+        //   Slab 1's ceiling list = 2 voxels at z=28..30 (stored in slab 0's tail).
+        let slab = [
+            4u8, 10, 10, 0, // slab 0 header
+            0xf0, 0xf0, 0xf0, 0xf0, // 1 floor color
+            0xc0, 0xc0, 0xc0, 0xc0, // ceiling color for z=28
+            0xc1, 0xc1, 0xc1, 0xc1, // ceiling color for z=29
+            0u8, 50, 52, 30, // slab 1 header
+            0xfa, 0xfa, 0xfa, 0xfa, // floor z=50
+            0xfb, 0xfb, 0xfb, 0xfb, // floor z=51
+            0xfc, 0xfc, 0xfc, 0xfc, // floor z=52
+        ];
+        let table = build_color_table(&slab);
+        assert_eq!(table.len(), 4);
+        // Slab 0 floor.
+        assert_eq!(table[0].z_start, 10);
+        assert_eq!(table[0].z_end, 11);
+        assert_eq!(table[0].colors.len(), 4);
+        // Slab 1 ceiling — 2 voxels at z=28..30.
+        assert_eq!(table[1].z_start, 28);
+        assert_eq!(table[1].z_end, 30);
+        assert_eq!(
+            table[1].colors,
+            &[0xc0, 0xc0, 0xc0, 0xc0, 0xc1, 0xc1, 0xc1, 0xc1]
+        );
+        // Slab 1 floor.
+        assert_eq!(table[2].z_start, 50);
+        assert_eq!(table[2].z_end, 53);
+        assert_eq!(table[2].colors.len(), 12);
+        // Sentinel.
+        assert_eq!(table[3].z_start, MAXZDIM);
+    }
+
+    #[test]
+    fn compilerle_round_trip_single_slab_solid_to_maxzdim() {
+        // Original column: solid from z=10 to MAXZDIM, full floor
+        // color list. compilerle with all-air neighbors should
+        // re-encode bit-equivalently in b2 shape.
+        let mut slab = vec![0u8, 10, (MAXZDIM - 1) as u8, 0];
+        for z in 10..MAXZDIM {
+            // Distinct color per z so we can verify exact output bytes.
+            slab.extend_from_slice(&[z as u8, (z + 1) as u8, (z + 2) as u8, 0]);
+        }
+
+        // Decode to b2.
+        let mut b2 = vec![0i32; (MAXZDIM as usize) + 4];
+        expandrle(&slab, &mut b2);
+        assert_eq!(b2[0], 10);
+        assert_eq!(b2[1], MAXZDIM);
+
+        // Re-encode with all-air neighbors → no buried-voxel skip.
+        let n_air = all_air_neighbor();
+        let mut cbuf = vec![0u8; 1028];
+        let mut colfunc_called = 0;
+        let mut colfunc = |_x: i32, _y: i32, _z: i32| -> i32 {
+            colfunc_called += 1;
+            0
+        };
+        let written = compilerle(
+            &b2,
+            &n_air,
+            &n_air,
+            &n_air,
+            &n_air,
+            &mut cbuf,
+            &slab,
+            0,
+            0,
+            &mut colfunc,
+        );
+        assert_eq!(colfunc_called, 0, "all colors should come from tbuf2");
+
+        // Output should match the input slab byte-for-byte (it's
+        // already the minimal full-floor encoding).
+        assert_eq!(written, slab.len());
+        assert_eq!(&cbuf[..written], &slab[..]);
+
+        // And expandrle on the output reproduces the same b2.
+        let mut b2_round = vec![0i32; (MAXZDIM as usize) + 4];
+        expandrle(&cbuf[..written], &mut b2_round);
+        assert_eq!(b2_round[0], 10);
+        assert_eq!(b2_round[1], MAXZDIM);
+    }
+
+    #[test]
+    fn compilerle_round_trip_two_solid_runs_with_cave() {
+        // b2 = [10, 30, 50, MAXZDIM] — one cave between two solid runs.
+        // Build a synthetic original column that has full floor color
+        // lists for both slabs; ceiling list for slab 1 is non-empty.
+        // For simplicity construct via compilerle from an all-air-
+        // neighbor first encode of the desired b2, then round-trip.
+
+        // Step 1: build a SEED column. We'll compilerle from a
+        // hand-rolled "all is colfunc" variant — colfunc returns z as
+        // its color, deterministic.
+        let dummy = vec![0u8, 0, (MAXZDIM - 1) as u8, 0];
+        let mut dummy_full = dummy;
+        dummy_full.extend(std::iter::repeat_n(0u8, (MAXZDIM as usize) * 4));
+
+        let n_air = all_air_neighbor();
+        let b2 = b2_from_runs(&[(10, 30), (50, MAXZDIM)]);
+        let mut seed = vec![0u8; 1028];
+        let mut colfunc = |_x: i32, _y: i32, z: i32| -> i32 { z };
+        let seed_len = compilerle(
+            &b2,
+            &n_air,
+            &n_air,
+            &n_air,
+            &n_air,
+            &mut seed,
+            &dummy_full,
+            0,
+            0,
+            &mut colfunc,
+        );
+        seed.truncate(seed_len);
+
+        // Step 2: decode the seed back to b2.
+        let mut b2_round = vec![0i32; (MAXZDIM as usize) + 4];
+        expandrle(&seed, &mut b2_round);
+        // Two solid runs followed by sentinel.
+        assert_eq!(b2_round[0], 10);
+        assert_eq!(b2_round[1], 30);
+        assert_eq!(b2_round[2], 50);
+        assert_eq!(b2_round[3], MAXZDIM);
+
+        // Step 3: compilerle again using the seed as the original
+        // column — should produce byte-identical output (idempotent
+        // round trip).
+        let mut cbuf = vec![0u8; 1028];
+        let mut never_called = 0;
+        let mut colfunc2 = |_x: i32, _y: i32, _z: i32| -> i32 {
+            never_called += 1;
+            0
+        };
+        let written = compilerle(
+            &b2,
+            &n_air,
+            &n_air,
+            &n_air,
+            &n_air,
+            &mut cbuf,
+            &seed,
+            0,
+            0,
+            &mut colfunc2,
+        );
+        assert_eq!(never_called, 0, "second pass needs no colfunc");
+        assert_eq!(written, seed_len);
+        assert_eq!(&cbuf[..written], &seed[..]);
+    }
+
+    #[test]
+    fn compilerle_buried_voxel_optimization_with_all_solid_neighbors() {
+        // All 4 neighbors solid means every voxel below the top one is
+        // buried — compilerle's dacnt path closes the floor list right
+        // after writing the first exposed voxel.
+
+        // Self column: solid [10, MAXZDIM). Voxlap's b2 convention has
+        // the last real solid run extending to MAXZDIM (solid below is
+        // implicit), so we never transition into the sentinel slab.
+        let b2 = b2_from_runs(&[(10, MAXZDIM)]);
+        let n_solid = b2_from_runs(&[(0, MAXZDIM)]);
+        // Original column over-encoded with a full floor color list so
+        // colfunc is never needed (verifies tbuf2 lookup for buried
+        // voxels we'd otherwise skip).
+        let mut slab = vec![0u8, 10, (MAXZDIM - 1) as u8, 0];
+        for z in 10..MAXZDIM {
+            slab.extend_from_slice(&[z as u8, 0, 0, 0]);
+        }
+        let mut cbuf = vec![0u8; 1028];
+        let mut colfunc_called = 0;
+        let mut colfunc = |_x: i32, _y: i32, _z: i32| -> i32 {
+            colfunc_called += 1;
+            0
+        };
+        let written = compilerle(
+            &b2,
+            &n_solid,
+            &n_solid,
+            &n_solid,
+            &n_solid,
+            &mut cbuf,
+            &slab,
+            0,
+            0,
+            &mut colfunc,
+        );
+        assert_eq!(colfunc_called, 0, "tbuf2 should cover every voxel");
+        // Compressed output: only the top voxel exposed (z=10) →
+        // 4-byte header + 1 color = 8 bytes.
+        assert_eq!(written, 8);
+        assert_eq!(cbuf[0], 0); // terminator nextptr
+        assert_eq!(cbuf[1], 10); // z1
+        assert_eq!(cbuf[2], 10); // z1c (only one exposed voxel)
+        assert_eq!(cbuf[3], 0); // z0 dummy
+                                // expandrle on output reproduces the b2 shape (still solid
+                                // from z=10 onward, despite the compressed encoding).
+        let mut b2_round = vec![0i32; (MAXZDIM as usize) + 4];
+        expandrle(&cbuf[..written], &mut b2_round);
+        assert_eq!(b2_round[0], 10);
+        assert_eq!(b2_round[1], MAXZDIM);
     }
 }
