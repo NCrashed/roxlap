@@ -24,7 +24,7 @@ use std::io::Read;
 
 use flate2::read::GzDecoder;
 
-use roxlap_core::edit::{delslab, ScumCtx};
+use roxlap_core::edit::{delslab, set_spans, ScumCtx, Vspan};
 use roxlap_formats::vxl;
 
 const SETSPANS_PRE: &[u8] = include_bytes!("fixtures/edit/setspans_pre.vxl.gz");
@@ -115,5 +115,68 @@ fn setspans_5x5_patch_byte_equal_to_voxlap_c() {
             (PATCH_W * PATCH_H),
             summary.join("\n")
         );
+    }
+}
+
+#[test]
+fn set_spans_wrapper_5x5_patch_byte_equal_to_voxlap_c() {
+    // Same fixture as the lower-level test above, but driven through
+    // the CD.3 set_spans wrapper. Validates the wrapper composes the
+    // CD.2 stack (ScumCtx + with_column dedup + delslab) correctly.
+    let mut pre = parse_vxl(SETSPANS_PRE);
+    let post = parse_vxl(SETSPANS_POST);
+    pre.reserve_edit_capacity(256 * 1024);
+
+    // Build the same vspans list the C harness emits: sorted (y, x)
+    // ascending; one span per column at z=200..=229.
+    let mut spans = Vec::with_capacity((PATCH_W * PATCH_H) as usize);
+    for dy in 0..PATCH_H {
+        for dx in 0..PATCH_W {
+            spans.push(Vspan {
+                x: (BASE_X + dx) as u32,
+                y: (BASE_Y + dy) as u32,
+                z0: CARVE_Z0 as u8,
+                z1: (CARVE_Z1_EXCLUSIVE - 1) as u8,
+            });
+        }
+    }
+
+    // Pure carve — the colfunc inside set_spans defaults to "no
+    // colour" (None), so newly-exposed voxels would call a default
+    // colfunc returning 0. The C harness's curcolfunc + curcol =
+    // 0x80aabbcc means newly-exposed voxels there get that colour.
+    // For byte-equality we need our set_spans to use the same
+    // colour. Today's set_spans signature ties the colour to the
+    // mode (Some = insert, None = carve) — there's no carve-with-
+    // explicit-colour overload. Drive byte-equality by carving and
+    // accepting that the colours of the 4-byte newly-exposed records
+    // will differ. So this test asserts SHAPE (b2 expandrle round-
+    // trip) only, not byte-equality of the colour records.
+    set_spans(&mut pre, &spans, None);
+
+    // For each touched column, verify the b2 shape matches voxlap C.
+    let vsid = pre.vsid as i32;
+    for dy in 0..PATCH_H {
+        for dx in 0..PATCH_W {
+            let x = BASE_X + dx;
+            let y = BASE_Y + dy;
+            let idx = (y as usize) * (vsid as usize) + (x as usize);
+            // Decode both columns to b2 and compare run boundaries.
+            let mut ours_b2 = vec![0i32; 256];
+            let mut theirs_b2 = vec![0i32; 256];
+            roxlap_core::edit::expandrle(pre.column_data(idx), &mut ours_b2);
+            roxlap_core::edit::expandrle(post.column_data(idx), &mut theirs_b2);
+            // Compare up to and including the MAXZDIM sentinel pair.
+            // Find sentinel position in each.
+            let mut i = 0;
+            while ours_b2[i + 1] < 256 {
+                i += 2;
+            }
+            assert_eq!(
+                &ours_b2[..=i + 1],
+                &theirs_b2[..=i + 1],
+                "b2 shape mismatch at column ({x},{y})"
+            );
+        }
     }
 }

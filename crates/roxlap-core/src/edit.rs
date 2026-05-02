@@ -180,7 +180,7 @@ pub fn insslab(b2: &mut [i32], y0: i32, y1: i32) {
 /// where ceiling-z is at or below floor-z (no air gap above this
 /// slab); voxlap merges it implicitly into the previous solid run by
 /// skipping the slab in `uind`.
-pub(crate) fn expandrle(slab: &[u8], uind: &mut [i32]) {
+pub fn expandrle(slab: &[u8], uind: &mut [i32]) {
     uind[0] = i32::from(slab[1]);
     let mut i = 2usize;
     let mut v = 0usize;
@@ -532,6 +532,14 @@ pub struct ScumCtx<'v> {
     scex1: i32,
     sceox0: i32,
     sceox1: i32,
+
+    /// `(x, y)` of the most-recent successful [`ScumCtx::scum2`] call,
+    /// or `None` if no column has been loaded since the last row
+    /// advance / context creation. Used by [`ScumCtx::with_column`]
+    /// to skip the redundant `expandrle` when successive edits hit
+    /// the same column — voxlap's `setspans` correctness contract:
+    /// re-loading from `sptr` would wipe pending in-radar edits.
+    last_scum2: Option<(i32, i32)>,
 }
 
 #[allow(
@@ -572,6 +580,7 @@ impl<'v> ScumCtx<'v> {
             scex1: 0,
             sceox0: 0,
             sceox1: 0,
+            last_scum2: None,
         }
     }
 
@@ -629,7 +638,33 @@ impl<'v> ScumCtx<'v> {
         let radar_idx = self.scoym3 + (x as usize) * SCPITCH * 3;
         self.scx1 = x;
         self.expand_column_into_row(x, y, self.scoym3);
+        self.last_scum2 = Some((x, y));
         Some(&mut self.radar[radar_idx..radar_idx + SCPITCH])
+    }
+
+    /// Edit one column with closure-based access. If `(x, y)` matches
+    /// the immediately-previous successful [`ScumCtx::scum2`] /
+    /// `with_column` call, reuses the cached b2 buffer in radar
+    /// (skipping the redundant `expandrle` that would wipe pending
+    /// edits). Otherwise calls `scum2` to load the column.
+    ///
+    /// This is the primary edit API for span-style batch operations
+    /// where multiple z ranges land on the same column —
+    /// [`set_spans`] is a thin wrapper. Returns `false` and skips
+    /// the closure if `(x, y)` is out of world bounds.
+    pub fn with_column<F>(&mut self, x: i32, y: i32, f: F) -> bool
+    where
+        F: FnOnce(&mut [i32]),
+    {
+        if self.last_scum2 != Some((x, y)) && self.scum2(x, y).is_none() {
+            return false;
+        }
+        // At this point either the cache hit or scum2 succeeded —
+        // both leave the column's b2 at scoym3 + x * SCPITCH * 3.
+        let radar_idx = self.scoym3 + (x as usize) * SCPITCH * 3;
+        let b2 = &mut self.radar[radar_idx..radar_idx + SCPITCH];
+        f(b2);
+        true
     }
 
     /// Drain the last 2 rows and consume the context. MUST be called
@@ -649,12 +684,17 @@ impl<'v> ScumCtx<'v> {
     }
 
     /// Bump scoy by 1 and advance scoym3 in the radar ring.
+    /// Invalidates the [`ScumCtx::with_column`] cache: the prior
+    /// row's column slots are still in the radar but their relative
+    /// offset to the new `scoym3` has shifted, so re-using the
+    /// cached `(x, y)` would index the wrong slot.
     fn advance_row(&mut self) {
         self.scoy += 1;
         self.scoym3 += SCPITCH;
         if self.scoym3 == SCOYM3_WRAP {
             self.scoym3 = SCOYM3_INITIAL;
         }
+        self.last_scum2 = None;
     }
 
     /// Load column `(x, y)` from the slab pool into the radar slot
@@ -846,11 +886,81 @@ fn wrap_radar(off: usize) -> usize {
     }
 }
 
+// ====================================================================
+// set_spans (CD.3) — thin wrapper over ScumCtx + delslab/insslab.
+// ====================================================================
+
+/// One vertical span on a column: `(x, y, z0..=z1)` solid voxels.
+///
+/// `z1` is INCLUSIVE per voxlap's `vspans` convention — the actual
+/// edited range is the half-open `[z0, z1 + 1)`. Same convention
+/// makes a `Vspan { z0: 100, z1: 100 }` carve / fill exactly one
+/// voxel at z=100.
+///
+/// `x` / `y` are full-world `u32` coordinates (cleaner than voxlap's
+/// 8-bit `vspans.x` + `setspans` `offs` trick — for our cave demo
+/// the patch-relative + offset machinery isn't needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vspan {
+    pub x: u32,
+    pub y: u32,
+    pub z0: u8,
+    pub z1: u8,
+}
+
+/// Apply a list of column-aligned vertical spans.
+///
+/// Voxlap5.c:5247 `setspans` ported as a thin wrapper. `color = None`
+/// carves to air (per-span [`delslab`]); `Some(c)` inserts solid
+/// with a constant-`c` color callback (per-span [`insslab`]).
+///
+/// **Contract**: `spans` MUST be sorted ascending by `(y, x)` and,
+/// within each `(x, y)` group, ascending by `z0`. Voxlap relies on
+/// this for correct row-flush ordering and for `with_column`'s
+/// caching invariant. Out-of-bounds spans (x or y >= vsid) are
+/// silently skipped.
+///
+/// Empty input is a no-op (no `ScumCtx` is created).
+///
+/// # Panics
+///
+/// Panics if `world.vbit` is empty — call
+/// [`Vxl::reserve_edit_capacity`] first.
+pub fn set_spans(world: &mut Vxl, spans: &[Vspan], color: Option<u32>) {
+    if spans.is_empty() {
+        return;
+    }
+    let inserting = color.is_some();
+    let mut ctx = ScumCtx::new(world);
+    if let Some(c) = color {
+        #[allow(clippy::cast_possible_wrap)]
+        let c_i32 = c as i32;
+        ctx.set_colfunc(move |_, _, _| c_i32);
+    }
+    for span in spans {
+        #[allow(clippy::cast_possible_wrap)]
+        let x = span.x as i32;
+        #[allow(clippy::cast_possible_wrap)]
+        let y = span.y as i32;
+        let z0 = i32::from(span.z0);
+        let z1 = i32::from(span.z1) + 1; // inclusive → half-open exclusive
+        ctx.with_column(x, y, |b2| {
+            if inserting {
+                insslab(b2, z0, z1);
+            } else {
+                delslab(b2, z0, z1);
+            }
+        });
+    }
+    ctx.finish();
+}
+
 #[cfg(test)]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::items_after_statements
 )]
 mod tests {
     use super::*;
@@ -1651,5 +1761,165 @@ mod tests {
         assert!(ctx.scum2(1, 0).is_none());
         assert!(ctx.scum2(0, 1).is_none());
         ctx.finish();
+    }
+
+    // ---- set_spans (CD.3) --------------------------------------------
+
+    #[test]
+    fn set_spans_empty_is_noop() {
+        let mut vxl = build_1x1_min_solid_vxl();
+        let original = vxl.column_data(0).to_vec();
+        set_spans(&mut vxl, &[], None);
+        // Nothing should have changed — and we never reserved edit
+        // capacity, so this also tests that empty input is fully
+        // short-circuited (no ScumCtx::new + assert).
+        assert_eq!(vxl.column_data(0), &original[..]);
+    }
+
+    #[test]
+    fn set_spans_single_carve_creates_air_gap() {
+        let mut vxl = build_1x1_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+        set_spans(
+            &mut vxl,
+            &[Vspan {
+                x: 0,
+                y: 0,
+                z0: 50,
+                z1: 99,
+            }],
+            None,
+        );
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(0), &mut b2);
+        // Half-open exclusive end is z1+1 = 100.
+        assert_eq!(b2[0], 0);
+        assert_eq!(b2[1], 50);
+        assert_eq!(b2[2], 100);
+        assert_eq!(b2[3], MAXZDIM);
+    }
+
+    #[test]
+    fn set_spans_multi_span_same_column_accumulates() {
+        // Two non-overlapping carves on the same column. Voxlap's
+        // setspans correctness relies on the with_column dedup —
+        // re-calling scum2 between spans would wipe the first carve.
+        let mut vxl = build_1x1_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+        set_spans(
+            &mut vxl,
+            &[
+                Vspan {
+                    x: 0,
+                    y: 0,
+                    z0: 30,
+                    z1: 49,
+                },
+                Vspan {
+                    x: 0,
+                    y: 0,
+                    z0: 100,
+                    z1: 119,
+                },
+            ],
+            None,
+        );
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(0), &mut b2);
+        // Three solid runs: [0, 30), [50, 100), [120, MAXZDIM).
+        assert_eq!(b2[0], 0);
+        assert_eq!(b2[1], 30);
+        assert_eq!(b2[2], 50);
+        assert_eq!(b2[3], 100);
+        assert_eq!(b2[4], 120);
+        assert_eq!(b2[5], MAXZDIM);
+    }
+
+    #[test]
+    fn set_spans_insert_color_fills_air() {
+        // Start with a column that's already partly carved, fill the
+        // air gap back in with a known color.
+        let mut vxl = build_1x1_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+        // First carve [50, 100) to create air.
+        set_spans(
+            &mut vxl,
+            &[Vspan {
+                x: 0,
+                y: 0,
+                z0: 50,
+                z1: 99,
+            }],
+            None,
+        );
+        // Now fill [60, 80) back to solid with a known color.
+        const FILL: u32 = 0x80_aa_bb_cc;
+        set_spans(
+            &mut vxl,
+            &[Vspan {
+                x: 0,
+                y: 0,
+                z0: 60,
+                z1: 79,
+            }],
+            Some(FILL),
+        );
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(0), &mut b2);
+        // Three solid runs: [0, 50), [60, 80), [100, MAXZDIM).
+        assert_eq!(b2[0], 0);
+        assert_eq!(b2[1], 50);
+        assert_eq!(b2[2], 60);
+        assert_eq!(b2[3], 80);
+        assert_eq!(b2[4], 100);
+        assert_eq!(b2[5], MAXZDIM);
+    }
+
+    #[test]
+    fn set_spans_skips_out_of_bounds_silently() {
+        let mut vxl = build_1x1_min_solid_vxl();
+        vxl.reserve_edit_capacity(4096);
+        set_spans(
+            &mut vxl,
+            &[Vspan {
+                x: 7,
+                y: 9,
+                z0: 50,
+                z1: 99,
+            }],
+            None,
+        );
+        // Column (0,0) untouched — out-of-bounds span had no effect.
+        let mut b2 = vec![0i32; SCPITCH];
+        expandrle(vxl.column_data(0), &mut b2);
+        assert_eq!(b2[0], 0);
+        assert_eq!(b2[1], MAXZDIM);
+    }
+
+    #[test]
+    fn set_spans_4x4_batch_carves_each_listed_column() {
+        // Sorted (y, x) ascending; each column gets the same carve.
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(8192);
+        let spans: Vec<Vspan> = (0..4)
+            .flat_map(|y| {
+                (0..4).map(move |x| Vspan {
+                    x,
+                    y,
+                    z0: 50,
+                    z1: 99,
+                })
+            })
+            .collect();
+        set_spans(&mut vxl, &spans, None);
+        // Every column should have the [50, 100) carve.
+        for idx in 0..16 {
+            let mut b2 = vec![0i32; SCPITCH];
+            expandrle(vxl.column_data(idx), &mut b2);
+            assert_eq!(b2[0], 0, "col {idx}");
+            assert_eq!(b2[1], 50, "col {idx}");
+            assert_eq!(b2[2], 100, "col {idx}");
+            assert_eq!(b2[3], MAXZDIM, "col {idx}");
+        }
     }
 }
