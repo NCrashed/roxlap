@@ -25,9 +25,11 @@ use roxlap_cavegen::{BlueCaveGenerator, Generator, MAXZDIM};
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::world_query::{getcube, Cube};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
+use roxlap_formats::edit::set_sphere;
 use roxlap_formats::vxl;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -51,6 +53,15 @@ const FAST_MULT: f64 = 4.0;
 const MOUSE_SENS: f64 = 0.0025;
 /// Pitch is clamped just shy of ±90° to keep the basis well-conditioned.
 const PITCH_LIMIT: f64 = 88.0_f64 * std::f64::consts::PI / 180.0;
+
+/// Maximum LMB-fire ray distance, in voxel units. ~64 voxels is
+/// more than enough for in-cave shooting; rays that travel further
+/// without hitting solid usually mean the player is shooting into
+/// open space and nothing happens.
+const FIRE_MAX_DIST: f64 = 64.0;
+
+/// Sphere carve radius for LMB fire, in voxels.
+const FIRE_RADIUS: u32 = 4;
 
 /// Movement key flags packed into a single byte. Bit layout matches
 /// the order of [`KeyCode`] queries in the input handler.
@@ -98,7 +109,12 @@ impl App {
         // Generate the cave world. ~1-2 s at VSID=128.
         eprintln!("cave-demo: generating BlueCaveGenerator world (vsid={VSID})…");
         let t0 = Instant::now();
-        let vxl = BlueCaveGenerator.generate(&BlueCaveGenerator::default_params(), VSID);
+        let mut vxl = BlueCaveGenerator.generate(&BlueCaveGenerator::default_params(), VSID);
+        // Reserve headroom for runtime edits (LMB sphere carves). At
+        // VSID=128 the cave's column data is ~1-2 MB; 4 MB headroom
+        // covers ~thousands of carve impacts before the slab pool
+        // fragments enough to overflow.
+        vxl.reserve_edit_capacity(4 * 1024 * 1024);
         eprintln!(
             "cave-demo: world generated in {:.2}s",
             t0.elapsed().as_secs_f32()
@@ -204,6 +220,18 @@ impl App {
                 self.cam_pos[i] += delta[i] / mag * speed * dt;
             }
         }
+    }
+
+    /// LMB fire — cast a ray from the camera along forward, find the
+    /// first solid voxel within `FIRE_MAX_DIST`, and carve a sphere
+    /// at that voxel. Silently no-ops if the ray exits the world or
+    /// hits nothing.
+    fn fire(&mut self) {
+        let cam = self.camera();
+        let Some(hit) = cast_ray(&self.vxl, cam.pos, cam.forward, FIRE_MAX_DIST) else {
+            return;
+        };
+        set_sphere(&mut self.vxl, hit, FIRE_RADIUS, None);
     }
 
     fn redraw(&mut self) {
@@ -331,7 +359,11 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                self.set_grabbed(true);
+                if self.grabbed {
+                    self.fire();
+                } else {
+                    self.set_grabbed(true);
+                }
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -380,6 +412,91 @@ impl ApplicationHandler for App {
             w.request_redraw();
         }
     }
+}
+
+/// 3D voxel-grid ray traversal (Amanatides + Woo DDA).
+///
+/// Walks from `origin` along `dir` (unnormalised; magnitudes
+/// don't affect the voxel sequence) one voxel-boundary crossing
+/// at a time, calling [`getcube`] to test each voxel. Returns the
+/// integer coords of the first non-air voxel within `max_dist`
+/// voxel units, or `None` if the ray exits the search volume
+/// without hitting anything.
+///
+/// Skips the voxel containing `origin` — otherwise firing from
+/// inside an air pocket whose neighboring voxel is solid would
+/// trivially hit the *adjacent* voxel rather than the surface
+/// the player aimed at.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn cast_ray(vxl: &vxl::Vxl, origin: [f64; 3], dir: [f64; 3], max_dist: f64) -> Option<[i32; 3]> {
+    let mut x = origin[0].floor() as i32;
+    let mut y = origin[1].floor() as i32;
+    let mut z = origin[2].floor() as i32;
+
+    let step_x: i32 = if dir[0] >= 0.0 { 1 } else { -1 };
+    let step_y: i32 = if dir[1] >= 0.0 { 1 } else { -1 };
+    let step_z: i32 = if dir[2] >= 0.0 { 1 } else { -1 };
+
+    let inv = |d: f64| {
+        if d.abs() > 1e-9 {
+            1.0 / d.abs()
+        } else {
+            f64::INFINITY
+        }
+    };
+    let t_delta = [inv(dir[0]), inv(dir[1]), inv(dir[2])];
+
+    // Initial t to the next voxel boundary along each axis.
+    let frac = |o: f64, step: i32| -> f64 {
+        let f = o - o.floor();
+        if step > 0 {
+            1.0 - f
+        } else if f == 0.0 {
+            // On a boundary, stepping negatively immediately
+            // re-enters the previous voxel.
+            1.0
+        } else {
+            f
+        }
+    };
+    let mut t_max = [
+        frac(origin[0], step_x) * t_delta[0],
+        frac(origin[1], step_y) * t_delta[1],
+        frac(origin[2], step_z) * t_delta[2],
+    ];
+
+    // Skip the origin voxel — first iteration steps once before the test.
+    let max_iters = (max_dist as i32).saturating_mul(3) + 8;
+    for _ in 0..max_iters {
+        // Step in axis with smallest t_max.
+        let t = if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
+            x += step_x;
+            let crossed = t_max[0];
+            t_max[0] += t_delta[0];
+            crossed
+        } else if t_max[1] < t_max[2] {
+            y += step_y;
+            let crossed = t_max[1];
+            t_max[1] += t_delta[1];
+            crossed
+        } else {
+            z += step_z;
+            let crossed = t_max[2];
+            t_max[2] += t_delta[2];
+            crossed
+        };
+        if t > max_dist {
+            return None;
+        }
+        if !(0..MAXZDIM).contains(&z) {
+            return None;
+        }
+        match getcube(&vxl.data, &vxl.column_offset, vxl.vsid, x, y, z) {
+            Cube::Air => {}
+            _ => return Some([x, y, z]),
+        }
+    }
+    None
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

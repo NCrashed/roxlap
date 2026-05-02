@@ -29,7 +29,7 @@ pub(crate) mod scan_loops;
 pub mod sky;
 pub mod sprite;
 pub mod world_lighting;
-pub(crate) mod world_query;
+pub mod world_query;
 
 pub use camera::Camera;
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
