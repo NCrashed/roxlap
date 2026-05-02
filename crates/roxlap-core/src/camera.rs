@@ -9,6 +9,16 @@
 /// voxel); the basis is right-handed with `down` aligned to +z (i.e.
 /// z grows downward into the map, matching voxlap's coordinate
 /// system).
+///
+/// # Examples
+///
+/// ```
+/// use roxlap_core::Camera;
+///
+/// let cam = Camera::default();
+/// assert_eq!(cam.pos, [1024.0, 1024.0, 128.0]);
+/// assert_eq!(cam.forward, [0.0, 1.0, 0.0]); // looking +y (north)
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
     /// Camera position (`ipo` / `dpoint3d` in voxlaptest).

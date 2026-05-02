@@ -74,6 +74,24 @@ impl Sprite {
     /// Convenience constructor for an axis-aligned sprite at
     /// world position `pos`. Basis is identity, flags = 0
     /// (kv6 + normal shading + visible + z-tested).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use roxlap_formats::kv6::Kv6;
+    /// use roxlap_formats::sprite::Sprite;
+    ///
+    /// # let kv6 = Kv6 {
+    /// #     xsiz: 1, ysiz: 1, zsiz: 1,
+    /// #     xpiv: 0.5, ypiv: 0.5, zpiv: 0.5,
+    /// #     voxels: vec![], xlen: vec![0], ylen: vec![vec![0]],
+    /// #     palette: None,
+    /// # };
+    /// // ... after `let kv6 = kv6::parse(&bytes)?;` or similar:
+    /// let sprite = Sprite::axis_aligned(kv6, [1024.0, 1024.0, 100.0]);
+    /// assert_eq!(sprite.flags, 0);
+    /// assert_eq!(sprite.s, [1.0, 0.0, 0.0]);
+    /// ```
     #[must_use]
     pub fn axis_aligned(kv6: Kv6, pos: [f32; 3]) -> Self {
         Self {

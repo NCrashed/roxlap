@@ -79,6 +79,19 @@ impl Default for Engine {
 }
 
 impl Engine {
+    /// Construct a new [`Engine`] with default state — voxlap-blue
+    /// sky, no fog, no per-side shading, default kv6 colour, no
+    /// lights, no sky texture.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use roxlap_core::Engine;
+    ///
+    /// let mut engine = Engine::new();
+    /// engine.set_sky_color(0x80aa_ddff);
+    /// assert_eq!(engine.sky_color(), 0x80aa_ddff);
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()

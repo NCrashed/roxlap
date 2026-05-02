@@ -127,6 +127,27 @@ const PALETTE_LEN: usize = 768;
 /// header, if the `"Kvxl"` magic does not match, or if a sequential
 /// read for any of the voxel / xlen / ylen / palette regions runs past
 /// EOF.
+///
+/// # Examples
+///
+/// Round-trip a synthetic empty kv6 through [`serialize`] + [`parse`]:
+///
+/// ```
+/// use roxlap_formats::kv6::{self, Kv6};
+///
+/// let original = Kv6 {
+///     xsiz: 1, ysiz: 1, zsiz: 1,
+///     xpiv: 0.5, ypiv: 0.5, zpiv: 0.5,
+///     voxels: vec![],
+///     xlen: vec![0],
+///     ylen: vec![vec![0]],
+///     palette: None,
+/// };
+/// let bytes = kv6::serialize(&original);
+/// let parsed = kv6::parse(&bytes).unwrap();
+/// assert_eq!(parsed.xsiz, original.xsiz);
+/// assert_eq!(parsed.voxels.len(), 0);
+/// ```
 pub fn parse(bytes: &[u8]) -> Result<Kv6, ParseError> {
     if bytes.len() < HEADER_LEN {
         return Err(ParseError::TooSmall { got: bytes.len() });

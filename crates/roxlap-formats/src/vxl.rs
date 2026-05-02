@@ -649,6 +649,23 @@ impl From<OutOfBounds> for ParseError {
 /// the [`ParseError::FileTooLarge`] gate at the top of the function
 /// proves fits in `u32`. The internal `expect` calls would only fire
 /// on a logic bug in the walker.
+///
+/// # Examples
+///
+/// ```no_run
+/// use roxlap_formats::vxl;
+///
+/// let bytes = std::fs::read("oracle.vxl")?;
+/// let world = vxl::parse(&bytes)?;
+/// println!(
+///     "{}×{} VSID, {} mip levels, camera at {:?}",
+///     world.vsid,
+///     world.vsid,
+///     world.mip_base_offsets.len() - 1,
+///     world.ipo,
+/// );
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn parse(bytes: &[u8]) -> Result<Vxl, ParseError> {
     if bytes.len() < HEADER_LEN {
         return Err(ParseError::TooSmall { got: bytes.len() });
