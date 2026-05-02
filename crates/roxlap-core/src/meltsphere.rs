@@ -228,6 +228,7 @@ pub struct MeltsphereOutput {
 ///   truncated to f32, then float-multiplied by the f32-cast
 ///   centroid sum).
 #[allow(clippy::too_many_lines, clippy::similar_names)]
+#[must_use]
 pub fn meltsphere(
     slab_buf: &[u8],
     column_offsets: &[u32],

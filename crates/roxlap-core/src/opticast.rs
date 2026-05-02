@@ -108,6 +108,7 @@ pub enum OpticastOutcome {
 // xres / yres → i32 casts are bounded by realistic framebuffer
 // dimensions and won't wrap.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
+#[must_use]
 pub fn opticast<R: Rasterizer>(
     rasterizer: &mut R,
     scratch: &mut ScanScratch,
