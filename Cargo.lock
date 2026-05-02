@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "flate2",
  "roxlap-formats",
@@ -1163,14 +1163,14 @@ dependencies = [
 
 [[package]]
 name = "roxlap-formats"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "flate2",
 ]
 
 [[package]]
 name = "roxlap-host"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "flate2",
  "png",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-oracle"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "flate2",
  "roxlap-core",

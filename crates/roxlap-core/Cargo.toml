@@ -6,12 +6,18 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+readme.workspace = true
 description = "Pure-Rust port of Ken Silverman's Voxlap voxel engine — engine core."
+documentation = "https://docs.rs/roxlap-core"
+keywords = ["voxlap", "voxel", "renderer", "raycaster", "engine"]
+categories = ["game-development", "graphics", "rendering::engine"]
 
 [dependencies]
 # R6: meltsphere builds Kv6 sprites from world voxel data; the Kv6
 # type lives in the formats crate alongside the parser/serialiser.
-roxlap-formats = { path = "../roxlap-formats" }
+# Path used during local development; version is what cargo publish
+# records for downstream resolution.
+roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
 
 [dev-dependencies]
 # R6.0e: integration test loads the gzipped oracle.vxl fixture and

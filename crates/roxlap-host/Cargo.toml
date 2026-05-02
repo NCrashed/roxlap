@@ -6,15 +6,31 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+readme.workspace = true
 description = "winit + softbuffer demo host for the roxlap engine."
+documentation = "https://docs.rs/roxlap-host"
+keywords = ["voxlap", "voxel", "demo", "winit", "viewer"]
+categories = ["game-development", "graphics", "rendering"]
+# Assets the host's `include_bytes!` calls reference (oracle world,
+# kv6 sprites, sky panorama). Paths are relative to this crate's
+# directory; cargo preserves the workspace-relative layout in the
+# published tarball so `include_bytes!("../../../assets/...")`
+# still resolves at downstream-build time.
+include = [
+    "src/**/*",
+    "../../assets/coco.kv6",
+    "../../assets/oracle.vxl.gz",
+    "../../assets/sky.png",
+    "../../crates/roxlap-core/tests/fixtures/sprite_meltsphere.kv6",
+]
 
 [[bin]]
 name = "roxlap-host"
 path = "src/main.rs"
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core" }
-roxlap-formats = { path = "../roxlap-formats" }
+roxlap-core = { path = "../roxlap-core", version = "0.1" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
 # winit + softbuffer is a pure-Rust windowing + framebuffer-blit pair
 # that compiles on Linux / Windows / macOS today and on wasm32 once
 # R10 lands.

@@ -7,14 +7,18 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "Cross-engine render-hash oracle for roxlap (R8)."
+# Test harness, not for downstream consumption — never publish to
+# crates.io. The oracle's purpose is regression-gating against
+# voxlaptest C, useful only inside this workspace.
+publish = false
 
 [[bin]]
 name = "roxlap-oracle"
 path = "src/main.rs"
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core" }
-roxlap-formats = { path = "../roxlap-formats" }
+roxlap-core = { path = "../roxlap-core", version = "0.1" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [lints]

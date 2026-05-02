@@ -6,7 +6,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+readme.workspace = true
 description = "Voxlap on-disk format parsers (.vxl, .kv6, .kvx, .kfa)."
+documentation = "https://docs.rs/roxlap-formats"
+keywords = ["voxlap", "voxel", "parser", "kv6", "vxl"]
+categories = ["parser-implementations", "game-development", "graphics"]
 
 [dev-dependencies]
 # R2.3: oracle.vxl.gz fixture is the procedurally-built world voxlaptest
