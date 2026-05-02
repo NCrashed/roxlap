@@ -11,6 +11,7 @@ mod camera;
 pub mod camera_math;
 pub(crate) mod column_walk;
 pub mod drawtile;
+pub(crate) mod edit;
 mod engine;
 pub(crate) mod equivec;
 pub(crate) mod fixed;
