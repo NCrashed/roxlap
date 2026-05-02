@@ -908,11 +908,30 @@ pub struct Vspan {
     pub z1: u8,
 }
 
-/// Apply a list of column-aligned vertical spans.
+/// Operation for span-style edits.
 ///
-/// Voxlap5.c:5247 `setspans` ported as a thin wrapper. `color = None`
-/// carves to air (per-span [`delslab`]); `Some(c)` inserts solid
-/// with a constant-`c` color callback (per-span [`insslab`]).
+/// `Carve` flips the listed voxels to air (per-span [`delslab`]) —
+/// the colfunc is consulted by [`compilerle`] for newly-exposed
+/// voxels just outside the carved range (above and below) which
+/// weren't previously in the column's color list.
+///
+/// `Insert` flips the listed voxels to solid (per-span [`insslab`])
+/// — the colfunc is consulted for the inserted voxels themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanOp {
+    Carve,
+    Insert,
+}
+
+/// Apply a list of column-aligned vertical spans with a custom color
+/// callback. Voxlap5.c:5247 `setspans` ported with full `vx5.colfunc`
+/// flexibility — the closure can capture arbitrary state to implement
+/// voxlap's `curcolfunc` / `jitcolfunc` / `pngcolfunc` / `dust` /
+/// procedural colour patterns.
+///
+/// `colfunc(x, y, z) -> i32` returns the BGRA colour for any voxel
+/// that needs one: the inserted voxels (Insert op) or the newly-
+/// exposed voxels just outside the carved range (Carve op).
 ///
 /// **Contract**: `spans` MUST be sorted ascending by `(y, x)` and,
 /// within each `(x, y)` group, ascending by `z0`. Voxlap relies on
@@ -926,21 +945,19 @@ pub struct Vspan {
 ///
 /// Panics if `world.vbit` is empty — call
 /// [`Vxl::reserve_edit_capacity`] first.
-pub fn set_spans(world: &mut Vxl, spans: &[Vspan], color: Option<u32>) {
+#[allow(clippy::cast_possible_wrap)]
+pub fn set_spans_with_colfunc<F>(world: &mut Vxl, spans: &[Vspan], op: SpanOp, colfunc: F)
+where
+    F: FnMut(i32, i32, i32) -> i32,
+{
     if spans.is_empty() {
         return;
     }
-    let inserting = color.is_some();
+    let inserting = op == SpanOp::Insert;
     let mut ctx = ScumCtx::new(world);
-    if let Some(c) = color {
-        #[allow(clippy::cast_possible_wrap)]
-        let c_i32 = c as i32;
-        ctx.set_colfunc(move |_, _, _| c_i32);
-    }
+    ctx.set_colfunc(colfunc);
     for span in spans {
-        #[allow(clippy::cast_possible_wrap)]
         let x = span.x as i32;
-        #[allow(clippy::cast_possible_wrap)]
         let y = span.y as i32;
         let z0 = i32::from(span.z0);
         let z1 = i32::from(span.z1) + 1; // inclusive → half-open exclusive
@@ -953,6 +970,30 @@ pub fn set_spans(world: &mut Vxl, spans: &[Vspan], color: Option<u32>) {
         });
     }
     ctx.finish();
+}
+
+/// Apply a list of column-aligned vertical spans with a constant
+/// colour. Convenience wrapper over [`set_spans_with_colfunc`] for
+/// the common cases:
+///
+/// - `color = None` → carve. Newly-exposed voxels get colour 0.
+/// - `color = Some(c)` → insert. Inserted voxels get colour `c`.
+///
+/// For non-constant colours (jitter, texture-mapped, position-
+/// dependent, gradient by depth), use [`set_spans_with_colfunc`]
+/// directly with a closure capturing the relevant state.
+///
+/// See [`set_spans_with_colfunc`] for the sort-order contract and
+/// panic semantics.
+pub fn set_spans(world: &mut Vxl, spans: &[Vspan], color: Option<u32>) {
+    let op = if color.is_some() {
+        SpanOp::Insert
+    } else {
+        SpanOp::Carve
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    let c_i32 = color.unwrap_or(0) as i32;
+    set_spans_with_colfunc(world, spans, op, move |_, _, _| c_i32);
 }
 
 #[cfg(test)]
@@ -1894,6 +1935,83 @@ mod tests {
         expandrle(vxl.column_data(0), &mut b2);
         assert_eq!(b2[0], 0);
         assert_eq!(b2[1], MAXZDIM);
+    }
+
+    #[test]
+    fn set_spans_with_colfunc_z_dependent_colour() {
+        // Insert solid with a colour that depends on z. To make every
+        // voxel in [60, 80) exposed (and thus needing a colfunc call
+        // each), use a 4x4 world with neighbors carved to air at the
+        // same z range. Center column (1, 1) is then surrounded by
+        // air on all 4 sides at [60, 80), giving compilerle a full
+        // floor list to fill via the closure.
+        let mut vxl = build_4x4_min_solid_vxl();
+        vxl.reserve_edit_capacity(8192);
+        // Step 1: carve [50, 100) on every column so the insert sits
+        // in air on every side.
+        let carve_spans: Vec<Vspan> = (0..4)
+            .flat_map(|y| {
+                (0..4).map(move |x| Vspan {
+                    x,
+                    y,
+                    z0: 50,
+                    z1: 99,
+                })
+            })
+            .collect();
+        set_spans(&mut vxl, &carve_spans, None);
+        // Step 2: insert [60, 80) on the center column with a
+        // z-dependent colour.
+        set_spans_with_colfunc(
+            &mut vxl,
+            &[Vspan {
+                x: 1,
+                y: 1,
+                z0: 60,
+                z1: 79,
+            }],
+            SpanOp::Insert,
+            |_x, _y, z| (0x80ff_ff00u32 as i32) | z,
+        );
+        // Walk column (1,1) and find the slab with z1=60; verify each
+        // floor colour matches the closure's output.
+        let idx = 4 + 1; // y=1, x=1 in a 4-wide world
+        let column = vxl.column_data(idx);
+        let mut v = 0usize;
+        let mut found = false;
+        loop {
+            let nextptr = column[v];
+            let z1 = column[v + 1];
+            if z1 == 60 {
+                let z1c = column[v + 2];
+                assert_eq!(z1c, 79, "z1c");
+                let n_voxels = usize::from(z1c) - usize::from(z1) + 1;
+                for i in 0..n_voxels {
+                    let off = v + 4 + i * 4;
+                    let c = u32::from_le_bytes([
+                        column[off],
+                        column[off + 1],
+                        column[off + 2],
+                        column[off + 3],
+                    ]);
+                    let z = u32::from(z1) + (i as u32);
+                    assert_eq!(
+                        c,
+                        0x80ff_ff00 | z,
+                        "z={z}: expected colour {:#010x}, got {:#010x}",
+                        0x80ff_ff00 | z,
+                        c
+                    );
+                }
+                found = true;
+                break;
+            }
+            if nextptr == 0 {
+                break;
+            }
+            v += usize::from(nextptr) * 4;
+        }
+        assert!(found, "did not find a slab with z1=60");
     }
 
     #[test]
