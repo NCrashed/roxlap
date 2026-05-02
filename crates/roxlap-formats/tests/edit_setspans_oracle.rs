@@ -24,7 +24,7 @@ use std::io::Read;
 
 use flate2::read::GzDecoder;
 
-use roxlap_core::edit::{delslab, set_spans_with_colfunc, ScumCtx, SpanOp, Vspan};
+use roxlap_formats::edit::{delslab, set_spans_with_colfunc, ScumCtx, SpanOp, Vspan};
 use roxlap_formats::vxl;
 
 const SETSPANS_PRE: &[u8] = include_bytes!("fixtures/edit/setspans_pre.vxl.gz");

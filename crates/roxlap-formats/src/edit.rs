@@ -476,7 +476,7 @@ pub(crate) fn compilerle(
 // advances (so the 3-row neighborhood is stable). `finish` drains
 // the last 2 rows.
 
-use roxlap_formats::vxl::Vxl;
+use crate::vxl::Vxl;
 
 /// Voxlap's `SCPITCH` (`voxlap5.c:202`) — per-column-per-row stride
 /// (in i32 units) inside the radar buffer. b2 buffer for column X

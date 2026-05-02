@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/roxlap-cavegen",
     "crates/roxlap-core",
     "crates/roxlap-formats",
     "crates/roxlap-host",

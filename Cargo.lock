@@ -1154,6 +1154,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxlap-cavegen"
+version = "0.1.0"
+dependencies = [
+ "roxlap-formats",
+]
+
+[[package]]
 name = "roxlap-core"
 version = "0.1.0"
 dependencies = [
