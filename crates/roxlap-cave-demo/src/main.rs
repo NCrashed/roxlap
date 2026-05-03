@@ -5,23 +5,25 @@
 //! engine's `opticast` rasterizer. Fly through with WASD + mouse-
 //! look; click in the window to grab the cursor.
 //!
-//! Controls (CD.8.0 — minimal viable build):
+//! Controls:
 //! - Click in the window → grab cursor (mouse-look active).
 //! - `W`/`A`/`S`/`D` → forward / strafe-left / back / strafe-right.
 //! - `Space` → up (world `-z`); `LShift` → down (world `+z`).
 //! - Hold `LCtrl` for fast-fly (≈4× speed).
+//! - `LMB` (while grabbed) → fire a plasma bullet that flies along
+//!   camera-forward and carves a sphere into the world on impact.
+//! - `F` → toggle blue ↔ mag cave preset (regenerates the world).
+//! - `R` → regenerate the world with the next seed (preset preserved).
 //! - `Esc` → release cursor (or exit if already released).
 //! - Window close → exit.
 //!
-//! CD.8.1+ will wire LMB sphere carve, F preset toggle, R
-//! regenerate, and fog. This commit lands the minimum-viable
-//! cave-on-startup pipeline.
+//! CD.8.3 will add fog + collision detection.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::Instant;
 
-use roxlap_cavegen::{BlueCaveGenerator, Generator, MAXZDIM};
+use roxlap_cavegen::{BlueCaveGenerator, CaveParams, Generator, MagCaveGenerator, MAXZDIM};
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScanScratch;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
@@ -54,14 +56,76 @@ const MOUSE_SENS: f64 = 0.0025;
 /// Pitch is clamped just shy of ±90° to keep the basis well-conditioned.
 const PITCH_LIMIT: f64 = 88.0_f64 * std::f64::consts::PI / 180.0;
 
-/// Maximum LMB-fire ray distance, in voxel units. ~64 voxels is
-/// more than enough for in-cave shooting; rays that travel further
-/// without hitting solid usually mean the player is shooting into
-/// open space and nothing happens.
-const FIRE_MAX_DIST: f64 = 64.0;
+/// Maximum bullet flight distance, in voxel units. Bullets that
+/// exceed this without hitting are despawned silently.
+const BULLET_MAX_DIST: f64 = 96.0;
 
-/// Sphere carve radius for LMB fire, in voxels.
+/// Bullet velocity, in voxels / second. Tuned so a bullet fired
+/// across an open chamber takes ~1 s to land — visible "plasma
+/// bolt" arc, not an instant ray.
+const BULLET_VEL: f64 = 60.0;
+
+/// Sphere carve radius applied at bullet impact, in voxels.
 const FIRE_RADIUS: u32 = 4;
+
+/// Pixel radius of the bullet's screen-space billboard.
+const BULLET_RADIUS_PX: i32 = 3;
+
+/// Bullet colour (softbuffer u32 = `0x00_RR_GG_BB`). Bright
+/// magenta-cyan plasma; visible against both blue and mag caves.
+const BULLET_COLOR_CORE: u32 = 0x00FF_FFFF;
+const BULLET_COLOR_HALO: u32 = 0x00C0_C0FF;
+
+/// In-flight plasma bullet. Travels in a straight line until it hits
+/// a solid voxel (carved into a sphere via [`set_sphere`]) or exits
+/// the world / max-flight envelope.
+#[derive(Debug, Clone, Copy)]
+struct Bullet {
+    pos: [f64; 3],
+    vel: [f64; 3],
+    /// Distance travelled so far; bullet despawns past `BULLET_MAX_DIST`.
+    travelled: f64,
+}
+
+/// Which cave-gen preset is currently active. F toggles between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preset {
+    Blue,
+    Mag,
+}
+
+impl Preset {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Blue => "blue",
+            Self::Mag => "mag",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Blue => Self::Mag,
+            Self::Mag => Self::Blue,
+        }
+    }
+
+    fn default_params(self) -> CaveParams {
+        match self {
+            Self::Blue => BlueCaveGenerator::default_params(),
+            Self::Mag => MagCaveGenerator::default_params(),
+        }
+    }
+
+    /// Generate a Vxl with this preset's pipeline + the given seed.
+    fn generate(self, seed: u64) -> roxlap_formats::vxl::Vxl {
+        let mut params = self.default_params();
+        params.seed = seed;
+        match self {
+            Self::Blue => BlueCaveGenerator.generate(&params, VSID),
+            Self::Mag => MagCaveGenerator.generate(&params, VSID),
+        }
+    }
+}
 
 /// Movement key flags packed into a single byte. Bit layout matches
 /// the order of [`KeyCode`] queries in the input handler.
@@ -102,23 +166,21 @@ struct App {
     keys: KeyState,
     grabbed: bool,
     last_tick: Option<Instant>,
+    /// Active cave-gen preset; toggled by `F`.
+    preset: Preset,
+    /// Current world seed; bumped by `R` (preset preserved).
+    seed: u64,
+    /// Bullets currently in flight. Spawned on LMB while grabbed,
+    /// integrated each frame, removed on impact / out-of-bounds /
+    /// past `BULLET_MAX_DIST`.
+    bullets: Vec<Bullet>,
 }
 
 impl App {
     fn new() -> Self {
-        // Generate the cave world. ~1-2 s at VSID=128.
-        eprintln!("cave-demo: generating BlueCaveGenerator world (vsid={VSID})…");
-        let t0 = Instant::now();
-        let mut vxl = BlueCaveGenerator.generate(&BlueCaveGenerator::default_params(), VSID);
-        // Reserve headroom for runtime edits (LMB sphere carves). At
-        // VSID=128 the cave's column data is ~1-2 MB; 4 MB headroom
-        // covers ~thousands of carve impacts before the slab pool
-        // fragments enough to overflow.
-        vxl.reserve_edit_capacity(4 * 1024 * 1024);
-        eprintln!(
-            "cave-demo: world generated in {:.2}s",
-            t0.elapsed().as_secs_f32()
-        );
+        let preset = Preset::Blue;
+        let seed = preset.default_params().seed;
+        let vxl = build_world(preset, seed);
 
         let engine = Engine::new();
         let scratch = ScanScratch::new_for_size(WIDTH, HEIGHT, VSID);
@@ -146,7 +208,18 @@ impl App {
             keys: KeyState::default(),
             grabbed: false,
             last_tick: None,
+            preset,
+            seed,
+            bullets: Vec::new(),
         }
+    }
+
+    /// Rebuild the world from `self.preset` + `self.seed`. Resets
+    /// in-flight bullets (the old voxels they were aimed at no
+    /// longer exist).
+    fn regenerate(&mut self) {
+        self.vxl = build_world(self.preset, self.seed);
+        self.bullets.clear();
     }
 
     /// Build a [`Camera`] from the current `cam_pos` + `yaw` + `pitch`.
@@ -222,16 +295,78 @@ impl App {
         }
     }
 
-    /// LMB fire — cast a ray from the camera along forward, find the
-    /// first solid voxel within `FIRE_MAX_DIST`, and carve a sphere
-    /// at that voxel. Silently no-ops if the ray exits the world or
-    /// hits nothing.
+    /// LMB fire — spawn a plasma bullet that flies along the
+    /// camera's forward axis at `BULLET_VEL` voxels/sec. The bullet
+    /// is integrated each frame and carves a sphere at impact.
     fn fire(&mut self) {
         let cam = self.camera();
-        let Some(hit) = cast_ray(&self.vxl, cam.pos, cam.forward, FIRE_MAX_DIST) else {
+        // Spawn slightly ahead of the camera to avoid "shooting
+        // yourself in the chin" if the player is brushing a wall.
+        let pos = [
+            cam.pos[0] + cam.forward[0] * 0.5,
+            cam.pos[1] + cam.forward[1] * 0.5,
+            cam.pos[2] + cam.forward[2] * 0.5,
+        ];
+        let vel = [
+            cam.forward[0] * BULLET_VEL,
+            cam.forward[1] * BULLET_VEL,
+            cam.forward[2] * BULLET_VEL,
+        ];
+        self.bullets.push(Bullet {
+            pos,
+            vel,
+            travelled: 0.0,
+        });
+    }
+
+    /// Integrate bullet positions, check collision, and apply impact
+    /// carves. Removes bullets that hit, exit world bounds, or fly
+    /// past `BULLET_MAX_DIST`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn step_bullets(&mut self, dt: f64) {
+        if dt <= 0.0 {
             return;
-        };
-        set_sphere(&mut self.vxl, hit, FIRE_RADIUS, None);
+        }
+        let vsid = self.vxl.vsid;
+        // Accumulate impact carves; apply after the iteration so we
+        // don't borrow self.vxl mutably while iterating self.bullets.
+        let mut impacts: Vec<[i32; 3]> = Vec::new();
+        self.bullets.retain_mut(|b| {
+            let dx = b.vel[0] * dt;
+            let dy = b.vel[1] * dt;
+            let dz = b.vel[2] * dt;
+            b.pos[0] += dx;
+            b.pos[1] += dy;
+            b.pos[2] += dz;
+            b.travelled += (dx * dx + dy * dy + dz * dz).sqrt();
+            if b.travelled > BULLET_MAX_DIST {
+                return false;
+            }
+            let vx = b.pos[0].floor() as i32;
+            let vy = b.pos[1].floor() as i32;
+            let vz = b.pos[2].floor() as i32;
+            // Out of world.
+            if vx < 0
+                || vy < 0
+                || (vx as u32) >= vsid
+                || (vy as u32) >= vsid
+                || !(0..MAXZDIM).contains(&vz)
+            {
+                return false;
+            }
+            // Solid hit?
+            if !matches!(
+                getcube(&self.vxl.data, &self.vxl.column_offset, vsid, vx, vy, vz),
+                Cube::Air
+            ) {
+                impacts.push([vx, vy, vz]);
+                return false;
+            }
+            true
+        });
+        for hit in impacts {
+            set_sphere(&mut self.vxl, hit, FIRE_RADIUS, None);
+        }
     }
 
     fn redraw(&mut self) {
@@ -252,6 +387,7 @@ impl App {
             .map_or(0.0, |t| (now - t).as_secs_f64().min(0.1));
         self.last_tick = Some(now);
         self.integrate(dt);
+        self.step_bullets(dt);
 
         // Resize zbuffer + scratch if window changed.
         let pixel_count = (size.width as usize) * (size.height as usize);
@@ -303,6 +439,22 @@ impl App {
                 self.vxl.vsid,
                 &self.vxl.data,
                 &self.vxl.column_offset,
+            );
+        }
+
+        // Plasma-bullet billboards on top of the rasterized scene.
+        // Each bullet projects to a screen pixel; if its view-space
+        // depth is closer than the zbuffer there, draw a small filled
+        // disc of plasma colour.
+        for bullet in &self.bullets {
+            draw_bullet(
+                &mut buffer,
+                &self.zbuffer,
+                size.width,
+                size.height,
+                &cam,
+                &settings,
+                bullet,
             );
         }
 
@@ -390,6 +542,20 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                         }
                     }
+                    KeyCode::KeyF if pressed => {
+                        self.preset = self.preset.next();
+                        eprintln!("cave-demo: switched to preset = {}", self.preset.name());
+                        self.regenerate();
+                    }
+                    KeyCode::KeyR if pressed => {
+                        self.seed = self.seed.wrapping_add(1);
+                        eprintln!(
+                            "cave-demo: regenerating with preset = {}, seed = {}",
+                            self.preset.name(),
+                            self.seed
+                        );
+                        self.regenerate();
+                    }
                     _ => {}
                 }
             }
@@ -414,89 +580,97 @@ impl ApplicationHandler for App {
     }
 }
 
-/// 3D voxel-grid ray traversal (Amanatides + Woo DDA).
-///
-/// Walks from `origin` along `dir` (unnormalised; magnitudes
-/// don't affect the voxel sequence) one voxel-boundary crossing
-/// at a time, calling [`getcube`] to test each voxel. Returns the
-/// integer coords of the first non-air voxel within `max_dist`
-/// voxel units, or `None` if the ray exits the search volume
-/// without hitting anything.
-///
-/// Skips the voxel containing `origin` — otherwise firing from
-/// inside an air pocket whose neighboring voxel is solid would
-/// trivially hit the *adjacent* voxel rather than the surface
-/// the player aimed at.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn cast_ray(vxl: &vxl::Vxl, origin: [f64; 3], dir: [f64; 3], max_dist: f64) -> Option<[i32; 3]> {
-    let mut x = origin[0].floor() as i32;
-    let mut y = origin[1].floor() as i32;
-    let mut z = origin[2].floor() as i32;
+/// Generate a fresh world for the given preset + seed and reserve
+/// edit headroom so runtime [`set_sphere`] carves work.
+fn build_world(preset: Preset, seed: u64) -> vxl::Vxl {
+    eprintln!(
+        "cave-demo: generating {} world (vsid={VSID}, seed={seed})…",
+        preset.name()
+    );
+    let t0 = Instant::now();
+    let mut vxl = preset.generate(seed);
+    // 4 MB headroom covers ~thousands of carve impacts before the
+    // slab pool fragments enough to overflow.
+    vxl.reserve_edit_capacity(4 * 1024 * 1024);
+    eprintln!(
+        "cave-demo: world generated in {:.2}s",
+        t0.elapsed().as_secs_f32()
+    );
+    vxl
+}
 
-    let step_x: i32 = if dir[0] >= 0.0 { 1 } else { -1 };
-    let step_y: i32 = if dir[1] >= 0.0 { 1 } else { -1 };
-    let step_z: i32 = if dir[2] >= 0.0 { 1 } else { -1 };
-
-    let inv = |d: f64| {
-        if d.abs() > 1e-9 {
-            1.0 / d.abs()
-        } else {
-            f64::INFINITY
-        }
-    };
-    let t_delta = [inv(dir[0]), inv(dir[1]), inv(dir[2])];
-
-    // Initial t to the next voxel boundary along each axis.
-    let frac = |o: f64, step: i32| -> f64 {
-        let f = o - o.floor();
-        if step > 0 {
-            1.0 - f
-        } else if f == 0.0 {
-            // On a boundary, stepping negatively immediately
-            // re-enters the previous voxel.
-            1.0
-        } else {
-            f
-        }
-    };
-    let mut t_max = [
-        frac(origin[0], step_x) * t_delta[0],
-        frac(origin[1], step_y) * t_delta[1],
-        frac(origin[2], step_z) * t_delta[2],
+/// Project `bullet`'s world position to screen, depth-test against
+/// the framebuffer's zbuffer, and write a small filled-disc plasma
+/// billboard if visible.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments
+)]
+fn draw_bullet(
+    buffer: &mut [u32],
+    zbuffer: &[f32],
+    width: u32,
+    height: u32,
+    cam: &Camera,
+    settings: &OpticastSettings,
+    bullet: &Bullet,
+) {
+    // World → camera-relative.
+    let rel = [
+        bullet.pos[0] - cam.pos[0],
+        bullet.pos[1] - cam.pos[1],
+        bullet.pos[2] - cam.pos[2],
     ];
-
-    // Skip the origin voxel — first iteration steps once before the test.
-    let max_iters = (max_dist as i32).saturating_mul(3) + 8;
-    for _ in 0..max_iters {
-        // Step in axis with smallest t_max.
-        let t = if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
-            x += step_x;
-            let crossed = t_max[0];
-            t_max[0] += t_delta[0];
-            crossed
-        } else if t_max[1] < t_max[2] {
-            y += step_y;
-            let crossed = t_max[1];
-            t_max[1] += t_delta[1];
-            crossed
-        } else {
-            z += step_z;
-            let crossed = t_max[2];
-            t_max[2] += t_delta[2];
-            crossed
-        };
-        if t > max_dist {
-            return None;
-        }
-        if !(0..MAXZDIM).contains(&z) {
-            return None;
-        }
-        match getcube(&vxl.data, &vxl.column_offset, vxl.vsid, x, y, z) {
-            Cube::Air => {}
-            _ => return Some([x, y, z]),
+    // View basis projection.
+    let view_x = rel[0] * cam.right[0] + rel[1] * cam.right[1] + rel[2] * cam.right[2];
+    let view_y = rel[0] * cam.down[0] + rel[1] * cam.down[1] + rel[2] * cam.down[2];
+    let view_z = rel[0] * cam.forward[0] + rel[1] * cam.forward[1] + rel[2] * cam.forward[2];
+    if view_z < 0.5 {
+        // Behind / inside the camera.
+        return;
+    }
+    let inv_z = 1.0 / view_z;
+    let su = f64::from(settings.hx) + view_x * inv_z * f64::from(settings.hz);
+    let sv = f64::from(settings.hy) + view_y * inv_z * f64::from(settings.hz);
+    let cx = su.round() as i32;
+    let cy = sv.round() as i32;
+    if cx < 0 || cy < 0 || cx >= width as i32 || cy >= height as i32 {
+        return;
+    }
+    // Z test against the centre pixel — close enough for a small
+    // billboard. Skip the bullet if there's solid in front.
+    let zb_idx = (cy as usize) * (width as usize) + (cx as usize);
+    if zbuffer[zb_idx] < view_z as f32 {
+        return;
+    }
+    // Filled disc with halo. Outer ring (radius BULLET_RADIUS_PX +
+    // 1) gets a softer plasma colour; inner core gets the bright
+    // one.
+    let r_outer = BULLET_RADIUS_PX + 1;
+    let r_outer_sq = r_outer * r_outer;
+    let r_inner_sq = BULLET_RADIUS_PX * BULLET_RADIUS_PX;
+    for dy in -r_outer..=r_outer {
+        for dx in -r_outer..=r_outer {
+            let d_sq = dx * dx + dy * dy;
+            if d_sq > r_outer_sq {
+                continue;
+            }
+            let px = cx + dx;
+            let py = cy + dy;
+            if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                continue;
+            }
+            let idx = (py as usize) * (width as usize) + (px as usize);
+            buffer[idx] = if d_sq <= r_inner_sq {
+                BULLET_COLOR_CORE
+            } else {
+                BULLET_COLOR_HALO
+            };
         }
     }
-    None
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
