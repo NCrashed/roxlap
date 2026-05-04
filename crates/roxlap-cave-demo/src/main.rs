@@ -17,7 +17,8 @@
 //! - `Esc` → release cursor (or exit if already released).
 //! - Window close → exit.
 //!
-//! CD.8.3 will add fog + collision detection.
+//! Movement is collision-checked: the camera slides along walls
+//! instead of clipping through them.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -113,6 +114,14 @@ const FOG_COLOR: u32 = 0x0090_98B0;
 /// blend fully to `FOG_COLOR`. 48 voxels at vsid=128 is dense
 /// enough to dim distant cave walls without obscuring nearby ones.
 const FOG_MAX_SCAN_DIST: i32 = 48;
+
+/// Effective camera "skin" radius in voxel units. Movement is
+/// blocked when any voxel intersected by a ±`PLAYER_RADIUS` cube
+/// around the proposed new position is solid — this keeps the
+/// camera off walls instead of letting it touch them at sub-pixel
+/// distance. Small enough that the camera fits through the
+/// `SPAWN_BUBBLE_RADIUS = 6` carved bubble + bullet-impact craters.
+const PLAYER_RADIUS: f64 = 0.3;
 
 /// In-flight plasma bullet. Travels in a straight line until it hits
 /// a solid voxel (carved into a sphere via [`set_sphere`]) or exits
@@ -357,9 +366,26 @@ impl App {
         }
         // Normalise diagonal motion so two-key combos don't move √2× faster.
         let mag = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-        if mag > 1e-6 {
-            for i in 0..3 {
-                self.cam_pos[i] += delta[i] / mag * speed * dt;
+        if mag <= 1e-6 {
+            return;
+        }
+        let step = [
+            delta[0] / mag * speed * dt,
+            delta[1] / mag * speed * dt,
+            delta[2] / mag * speed * dt,
+        ];
+
+        // Per-axis collision: try each axis independently so the
+        // camera slides along walls instead of jamming when one
+        // component of movement collides. If the camera is already
+        // inside solid (e.g., regen edge case), skip the block test
+        // for that axis so we can still escape.
+        let already_stuck = is_blocked(&self.vxl, self.cam_pos);
+        for axis in 0..3 {
+            let mut candidate = self.cam_pos;
+            candidate[axis] += step[axis];
+            if already_stuck || !is_blocked(&self.vxl, candidate) {
+                self.cam_pos[axis] = candidate[axis];
             }
         }
     }
@@ -660,6 +686,44 @@ impl ApplicationHandler for App {
             w.request_redraw();
         }
     }
+}
+
+/// Test whether any voxel intersected by a ±[`PLAYER_RADIUS`] cube
+/// around `pos` is solid (or out-of-world). Out-of-bounds in any
+/// axis counts as solid so the camera can't fly off the edge of
+/// the cave-gen volume.
+///
+/// Cheap: at `PLAYER_RADIUS = 0.3` the cube spans at most 1 voxel
+/// per axis (typically), so this fans out to 1-8 [`getcube`] calls.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+fn is_blocked(vxl: &vxl::Vxl, pos: [f64; 3]) -> bool {
+    let lo_x = (pos[0] - PLAYER_RADIUS).floor() as i32;
+    let hi_x = (pos[0] + PLAYER_RADIUS).floor() as i32;
+    let lo_y = (pos[1] - PLAYER_RADIUS).floor() as i32;
+    let hi_y = (pos[1] + PLAYER_RADIUS).floor() as i32;
+    let lo_z = (pos[2] - PLAYER_RADIUS).floor() as i32;
+    let hi_z = (pos[2] + PLAYER_RADIUS).floor() as i32;
+    let vsid = vxl.vsid as i32;
+    for vz in lo_z..=hi_z {
+        for vy in lo_y..=hi_y {
+            for vx in lo_x..=hi_x {
+                if vx < 0 || vy < 0 || vz < 0 || vx >= vsid || vy >= vsid || vz >= MAXZDIM {
+                    return true;
+                }
+                if !matches!(
+                    getcube(&vxl.data, &vxl.column_offset, vxl.vsid, vx, vy, vz),
+                    Cube::Air
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// World-centre spawn point in integer voxel coords.
