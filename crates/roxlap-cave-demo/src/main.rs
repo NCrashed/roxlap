@@ -68,13 +68,20 @@ const BULLET_VEL: f64 = 60.0;
 /// Sphere carve radius applied at bullet impact, in voxels.
 const FIRE_RADIUS: u32 = 4;
 
-/// Pixel radius of the bullet's screen-space billboard.
-const BULLET_RADIUS_PX: i32 = 3;
+/// Initial pixel radius of the bullet's screen-space billboard.
+/// The bullet shrinks linearly with travelled distance so the
+/// player gets a depth cue even when firing along the camera's
+/// view axis (where parallax doesn't help).
+const BULLET_RADIUS_PX_MAX: i32 = 12;
+
+/// Bullet despawns when its scaled radius drops below this.
+const BULLET_RADIUS_PX_MIN: i32 = 1;
 
 /// Bullet colour (softbuffer u32 = `0x00_RR_GG_BB`). Bright
-/// magenta-cyan plasma; visible against both blue and mag caves.
-const BULLET_COLOR_CORE: u32 = 0x00FF_FFFF;
-const BULLET_COLOR_HALO: u32 = 0x00C0_C0FF;
+/// pink core + softer halo; visible against both blue and mag
+/// cave palettes.
+const BULLET_COLOR_CORE: u32 = 0x00FF_4080;
+const BULLET_COLOR_HALO: u32 = 0x00FF_A0C0;
 
 /// Voxlap colour stamped on the inner walls of the carved crater
 /// (the voxels that were buried before the carve and are now newly
@@ -84,6 +91,28 @@ const BULLET_COLOR_HALO: u32 = 0x00C0_C0FF;
 /// voxlap convention; brightness `0x80` is voxlap's neutral.
 #[allow(clippy::cast_possible_wrap)]
 const CARVE_COLOR: i32 = 0x8050_3018u32 as i32;
+
+/// Voxlap colour used when carving the spawn bubble — neutral mid-
+/// grey that doesn't betray the carve's source as much as the
+/// scorched-amber `CARVE_COLOR`.
+#[allow(clippy::cast_possible_wrap)]
+const SPAWN_BUBBLE_COLOR: i32 = 0x8060_6068u32 as i32;
+
+/// Radius of the carve performed at world centre so the camera
+/// always spawns inside an open pocket (cave-gen otherwise leaves
+/// the centre randomly air or solid).
+const SPAWN_BUBBLE_RADIUS: u32 = 6;
+
+/// Fog colour (BGR low-24-bit; brightness bit MUST be 0 per
+/// `project_oracle_fog_disabled.md` — `set_fogcol(BR(rgb))` with
+/// the brightness bit set silently disables fog because
+/// `vx5.fogcol < 0` short-circuits opticast's fog-enabled path).
+const FOG_COLOR: u32 = 0x0090_98B0;
+
+/// Fog "max scan distance" in voxels. At this distance pixels
+/// blend fully to `FOG_COLOR`. 48 voxels at vsid=128 is dense
+/// enough to dim distant cave walls without obscuring nearby ones.
+const FOG_MAX_SCAN_DIST: i32 = 48;
 
 /// In-flight plasma bullet. Travels in a straight line until it hits
 /// a solid voxel (carved into a sphere via [`set_sphere`]) or exits
@@ -189,15 +218,27 @@ impl App {
     fn new() -> Self {
         let preset = Preset::Blue;
         let seed = preset.default_params().seed;
-        let vxl = build_world(preset, seed);
+        let mut vxl = build_world(preset, seed);
 
-        let engine = Engine::new();
+        // Carve a guaranteed-open spawn bubble at world centre.
+        // Cave-gen otherwise leaves the centre randomly air or
+        // solid, so the camera frequently spawns inside a wall.
+        let centre = spawn_centre();
+        set_sphere_with_colfunc(
+            &mut vxl,
+            centre,
+            SPAWN_BUBBLE_RADIUS,
+            SpanOp::Carve,
+            |_, _, _| SPAWN_BUBBLE_COLOR,
+        );
+
+        let mut engine = Engine::new();
+        // Fog: low-24-bit colour (no brightness bit — see
+        // `project_oracle_fog_disabled.md`).
+        engine.set_fog(FOG_COLOR, FOG_MAX_SCAN_DIST);
         let scratch = ScanScratch::new_for_size(WIDTH, HEIGHT, VSID);
 
-        // Spawn the camera at world centre, midway up. The cave-gen
-        // produces solid + air mixed throughout, so the camera might
-        // start inside solid — that's fine for v1; CD.8.3 adds
-        // collision + a "find the largest air pocket" spawn search.
+        // Spawn the camera at the carved bubble's centre.
         let cam_pos = [
             f64::from(VSID) * 0.5,
             f64::from(VSID) * 0.5,
@@ -225,27 +266,46 @@ impl App {
 
     /// Rebuild the world from `self.preset` + `self.seed`. Resets
     /// in-flight bullets (the old voxels they were aimed at no
-    /// longer exist).
+    /// longer exist) and re-carves the spawn bubble at world
+    /// centre + teleports the camera back to it.
     fn regenerate(&mut self) {
-        self.vxl = build_world(self.preset, self.seed);
+        let mut vxl = build_world(self.preset, self.seed);
+        let centre = spawn_centre();
+        set_sphere_with_colfunc(
+            &mut vxl,
+            centre,
+            SPAWN_BUBBLE_RADIUS,
+            SpanOp::Carve,
+            |_, _, _| SPAWN_BUBBLE_COLOR,
+        );
+        self.vxl = vxl;
+        self.cam_pos = [
+            f64::from(VSID) * 0.5,
+            f64::from(VSID) * 0.5,
+            f64::from(MAXZDIM) * 0.5,
+        ];
         self.bullets.clear();
     }
 
     /// Build a [`Camera`] from the current `cam_pos` + `yaw` + `pitch`.
     fn camera(&self) -> Camera {
-        // Voxlap's right-handed basis with z growing downward:
-        //   forward = (cos(yaw) cos(pitch), sin(yaw) cos(pitch), sin(pitch))
-        //   right = (-sin(yaw), cos(yaw), 0)         (= ist)
-        //   down  = right × forward                  (= ihe)
+        // Voxlap's right-handed basis with z growing downward.
+        // Per `feedback_voxlap_basis_chirality.md`: the camera's
+        // down vector must satisfy `right × down == forward`. The
+        // cyclic relation is `forward × right = down` (NOT `right
+        // × forward`, which gives -down and silently inverts the
+        // image vertically + flips yaw direction). My initial port
+        // got the cross order wrong, hence the "bottom is top"
+        // bug.
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         let forward = [cy * cp, sy * cp, sp];
         let right = [-sy, cy, 0.0];
-        // down = right × forward
+        // down = forward × right
         let down = [
-            right[1] * forward[2] - right[2] * forward[1],
-            right[2] * forward[0] - right[0] * forward[2],
-            right[0] * forward[1] - right[1] * forward[0],
+            forward[1] * right[2] - forward[2] * right[1],
+            forward[2] * right[0] - forward[0] * right[2],
+            forward[0] * right[1] - forward[1] * right[0],
         ];
         Camera {
             pos: self.cam_pos,
@@ -348,7 +408,9 @@ impl App {
             b.pos[1] += dy;
             b.pos[2] += dz;
             b.travelled += (dx * dx + dy * dy + dz * dz).sqrt();
-            if b.travelled > BULLET_MAX_DIST {
+            // Bullet shrinks linearly with travelled distance; despawn
+            // when its on-screen radius would fall below the minimum.
+            if bullet_radius_px(b) < BULLET_RADIUS_PX_MIN {
                 return false;
             }
             let vx = b.pos[0].floor() as i32;
@@ -600,6 +662,27 @@ impl ApplicationHandler for App {
     }
 }
 
+/// World-centre spawn point in integer voxel coords.
+#[allow(clippy::cast_possible_wrap)]
+fn spawn_centre() -> [i32; 3] {
+    [(VSID / 2) as i32, (VSID / 2) as i32, MAXZDIM / 2]
+}
+
+/// Scaled bullet billboard radius — shrinks linearly from
+/// `BULLET_RADIUS_PX_MAX` at spawn to 0 at `BULLET_MAX_DIST`. The
+/// shrink gives the player a depth cue when firing along the view
+/// axis (where parallax doesn't help).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn bullet_radius_px(bullet: &Bullet) -> i32 {
+    let t = (bullet.travelled / BULLET_MAX_DIST).clamp(0.0, 1.0);
+    let r = (1.0 - t) * f64::from(BULLET_RADIUS_PX_MAX);
+    r.round() as i32
+}
+
 /// Generate a fresh world for the given preset + seed and reserve
 /// edit headroom so runtime [`set_sphere`] carves work.
 fn build_world(preset: Preset, seed: u64) -> vxl::Vxl {
@@ -666,12 +749,13 @@ fn draw_bullet(
     if zbuffer[zb_idx] < view_z as f32 {
         return;
     }
-    // Filled disc with halo. Outer ring (radius BULLET_RADIUS_PX +
-    // 1) gets a softer plasma colour; inner core gets the bright
-    // one.
-    let r_outer = BULLET_RADIUS_PX + 1;
+    // Filled disc with halo, shrinking with bullet travel so
+    // along-axis depth is readable. r_inner is the current scaled
+    // radius; r_outer adds a one-pixel halo.
+    let r_inner = bullet_radius_px(bullet);
+    let r_outer = r_inner + 1;
     let r_outer_sq = r_outer * r_outer;
-    let r_inner_sq = BULLET_RADIUS_PX * BULLET_RADIUS_PX;
+    let r_inner_sq = r_inner * r_inner;
     for dy in -r_outer..=r_outer {
         for dx in -r_outer..=r_outer {
             let d_sq = dx * dx + dy * dy;
