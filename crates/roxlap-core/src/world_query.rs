@@ -81,8 +81,14 @@ pub fn getcube(slab_buf: &[u8], column_offsets: &[u32], vsid: u32, x: i32, y: i3
     }
     let col_idx = (y as u32 * vsid + x as u32) as usize;
     let col_start = column_offsets[col_idx] as usize;
-    let col_end = column_offsets[col_idx + 1] as usize;
-    let col = &slab_buf[col_start..col_end];
+    // The slab walker self-terminates on `nextptr == 0`, so we don't
+    // need an explicit end bound. Using `column_offsets[idx + 1]` as
+    // the end was wrong post-edit: voxalloc scatters columns across
+    // vbuf, so adjacent indices in the offset table are no longer
+    // adjacent in the buffer (and may even overlap or appear in
+    // reverse order). The slab walker reads only what each column's
+    // own nextptr chain says, so slicing to end-of-buffer is safe.
+    let col = &slab_buf[col_start..];
 
     // Walk the slab chain. `pos` is the byte offset within `col` of
     // the current slab's header.

@@ -31,7 +31,7 @@ use roxlap_core::world_query::{getcube, Cube};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
-use roxlap_formats::edit::set_sphere;
+use roxlap_formats::edit::{set_sphere_with_colfunc, SpanOp};
 use roxlap_formats::vxl;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -75,6 +75,15 @@ const BULLET_RADIUS_PX: i32 = 3;
 /// magenta-cyan plasma; visible against both blue and mag caves.
 const BULLET_COLOR_CORE: u32 = 0x00FF_FFFF;
 const BULLET_COLOR_HALO: u32 = 0x00C0_C0FF;
+
+/// Voxlap colour stamped on the inner walls of the carved crater
+/// (the voxels that were buried before the carve and are now newly
+/// exposed). Charred dark grey with a faint orange tint reads as
+/// "scorched rock" against both blue and mag cave palettes.
+/// Encoded as `(brightness << 24) | (R << 16) | (G << 8) | B` per
+/// voxlap convention; brightness `0x80` is voxlap's neutral.
+#[allow(clippy::cast_possible_wrap)]
+const CARVE_COLOR: i32 = 0x8050_3018u32 as i32;
 
 /// In-flight plasma bullet. Travels in a straight line until it hits
 /// a solid voxel (carved into a sphere via [`set_sphere`]) or exits
@@ -365,7 +374,18 @@ impl App {
             true
         });
         for hit in impacts {
-            set_sphere(&mut self.vxl, hit, FIRE_RADIUS, None);
+            // Carve a sphere; newly-exposed voxels (= the inner
+            // crater walls that were previously buried solid) take
+            // CARVE_COLOR. Without an explicit colfunc, set_sphere's
+            // default returns 0 (black) which makes craters look
+            // like missing data.
+            set_sphere_with_colfunc(
+                &mut self.vxl,
+                hit,
+                FIRE_RADIUS,
+                SpanOp::Carve,
+                |_x, _y, _z| CARVE_COLOR,
+            );
         }
     }
 

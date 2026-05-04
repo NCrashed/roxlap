@@ -198,15 +198,18 @@ pub(crate) fn camera_column_slice<'a>(
     idx: u32,
 ) -> Option<&'a [u8]> {
     let i = idx as usize;
-    if i + 1 >= column_offsets.len() {
+    if i >= column_offsets.len() {
         return None;
     }
     let start = column_offsets[i] as usize;
-    let end = column_offsets[i + 1] as usize;
-    if start > end || end > slab_buf.len() {
+    if start >= slab_buf.len() {
         return None;
     }
-    Some(&slab_buf[start..end])
+    // Slice to end-of-buffer; the slab walker self-terminates on
+    // `nextptr == 0`. Using `column_offsets[i + 1]` as the end was
+    // wrong post-edit (voxalloc scatters columns across vbuf, so
+    // adjacent table indices are no longer adjacent in memory).
+    Some(&slab_buf[start..])
 }
 
 #[cfg(test)]

@@ -286,8 +286,12 @@ impl EstNormCache {
                 }
                 let col_idx = (y as u32) * vsid + (x as u32);
                 let off_start = column_offsets[col_idx as usize] as usize;
-                let off_end = column_offsets[col_idx as usize + 1] as usize;
-                let column = &world_data[off_start..off_end];
+                // Slice to end-of-buffer; the slab walker self-
+                // terminates via nextptr. Same fix as world_query +
+                // opticast post-edit-scatter — column_offsets[idx+1]
+                // is the next table entry, NOT the next-byte-offset
+                // after edits.
+                let column = &world_data[off_start..];
                 expandbit256(column, &mut bits[yi * width + xi]);
             }
         }
