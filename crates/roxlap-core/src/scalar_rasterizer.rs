@@ -778,8 +778,64 @@ impl Rasterizer for ScalarRasterizer<'_> {
             diry = vgetq_lane_f32(vdy, 0);
         }
 
-        // Scalar tail — handles 0..3 leftover pixels on x86_64
-        // and the full body on other targets.
+        // R10.3: wasm SIMD 4-pixel batch — equivalent of the SSE2
+        // / NEON paths above. Uses `1.0 / sqrt(x)` (full-precision
+        // `f32x4_sqrt` + `f32x4_div`) where SSE2 had `_mm_rsqrt_ps`
+        // and NEON had `vrsqrteq_f32`+Newton, since wasm SIMD has
+        // no rsqrt approximation. Wasm bytes therefore differ
+        // from both x86 and aarch64 goldens — captured by R10.4's
+        // separate `wasm-hashes.txt`.
+        #[cfg(target_arch = "wasm32")]
+        unsafe {
+            use core::arch::wasm32::{
+                f32x4, f32x4_add, f32x4_convert_i32x4, f32x4_div, f32x4_extract_lane, f32x4_mul,
+                f32x4_splat, f32x4_sqrt, i32x4, v128, v128_store,
+            };
+            let strx = rs.strx;
+            let stry = rs.stry;
+            let vstrx4 = f32x4_splat(strx * 4.0);
+            let vstry4 = f32x4_splat(stry * 4.0);
+            let one = f32x4_splat(1.0);
+            let mut vdx = f32x4(dirx, dirx + strx, dirx + 2.0 * strx, dirx + 3.0 * strx);
+            let mut vdy = f32x4(diry, diry + stry, diry + 2.0 * stry, diry + 3.0 * stry);
+            while p1 - x >= 4 {
+                // Scalar gather — same shape as SSE2 / NEON paths.
+                let mut col = [0i32; 4];
+                let mut dst = [0i32; 4];
+                for k in 0..4 {
+                    let ray_idx = (plc_local >> 16) as usize;
+                    let cd_offset = scratch.angstart[ray_idx] + j as isize;
+                    let cd = scratch.radar[cd_offset as usize];
+                    col[k] = cd.col;
+                    dst[k] = cd.dist;
+                    plc_local = plc_local.wrapping_add(incr);
+                }
+                if !scratch.foglut.is_empty() {
+                    for k in 0..4 {
+                        col[k] = fog_blend(col[k], dst[k], &scratch.foglut, scratch.fog_col);
+                    }
+                }
+                let vcol: v128 = i32x4(col[0], col[1], col[2], col[3]);
+                let vdsi: v128 = i32x4(dst[0], dst[1], dst[2], dst[3]);
+                let vdst = f32x4_convert_i32x4(vdsi);
+                let vsqr = f32x4_add(f32x4_mul(vdx, vdx), f32x4_mul(vdy, vdy));
+                let vinv = f32x4_div(one, f32x4_sqrt(vsqr));
+                let vz = f32x4_mul(vdst, vinv);
+
+                let pixel_idx = row_start + x as usize;
+                v128_store(self.target.fb_ptr().add(pixel_idx).cast::<v128>(), vcol);
+                v128_store(self.target.zb_ptr().add(pixel_idx).cast::<v128>(), vz);
+
+                vdx = f32x4_add(vdx, vstrx4);
+                vdy = f32x4_add(vdy, vstry4);
+                x += 4;
+            }
+            dirx = f32x4_extract_lane::<0>(vdx);
+            diry = f32x4_extract_lane::<0>(vdy);
+        }
+
+        // Scalar tail — handles 0..3 leftover pixels on x86_64 /
+        // aarch64 / wasm32 and the full body on other targets.
         while x < p1 {
             // ray index = signed shift right (voxlap's `plc >> 16`).
             let ray_idx = (plc_local >> 16) as usize;
@@ -972,8 +1028,77 @@ impl Rasterizer for ScalarRasterizer<'_> {
             diry = vgetq_lane_f32(vdy, 0);
         }
 
-        // Scalar tail — handles 0..3 leftover pixels on x86_64
-        // and the full body on other targets.
+        // R10.3: wasm SIMD 4-pixel batch for vrend — equivalent of
+        // the SSE2 / NEON paths above. Same scalar-gather + uurend
+        // read/write structure; full-precision `1.0 / sqrt(x)` for
+        // the inverse magnitude, since wasm SIMD has no rsqrt
+        // approximation. Bytes diverge from the other arches —
+        // R10.4's `wasm-hashes.txt` covers the divergence.
+        #[cfg(target_arch = "wasm32")]
+        unsafe {
+            use core::arch::wasm32::{
+                f32x4, f32x4_add, f32x4_convert_i32x4, f32x4_div, f32x4_extract_lane, f32x4_mul,
+                f32x4_splat, f32x4_sqrt, i32x4, v128, v128_store,
+            };
+            let strx = rs.strx;
+            let stry = rs.stry;
+            let vstrx4 = f32x4_splat(strx * 4.0);
+            let vstry4 = f32x4_splat(stry * 4.0);
+            let one = f32x4_splat(1.0);
+            let mut vdx = f32x4(dirx, dirx + strx, dirx + 2.0 * strx, dirx + 3.0 * strx);
+            let mut vdy = f32x4(diry, diry + stry, diry + 2.0 * stry, diry + 3.0 * stry);
+            while p1 - x >= 4 {
+                let xu = x as usize;
+                // Read 4 OLD uurend pairs (u, d).
+                let mut u = [0i32; 4];
+                let mut d = [0i32; 4];
+                for k in 0..4 {
+                    u[k] = scratch.uurend[xu + k];
+                    d[k] = scratch.uurend[xu + k + half_stride];
+                }
+                // Scalar gather — 4 castdat hits.
+                let mut col = [0i32; 4];
+                let mut dst = [0i32; 4];
+                for k in 0..4 {
+                    let ray_idx = (u[k] >> 16) as usize;
+                    let iplc_k = iplc_local.wrapping_add(iinc.wrapping_mul(k as i32));
+                    let cd_offset = scratch.angstart[ray_idx] + iplc_k as isize;
+                    let cd = scratch.radar[cd_offset as usize];
+                    col[k] = cd.col;
+                    dst[k] = cd.dist;
+                }
+                if !scratch.foglut.is_empty() {
+                    for k in 0..4 {
+                        col[k] = fog_blend(col[k], dst[k], &scratch.foglut, scratch.fog_col);
+                    }
+                }
+                let vcol: v128 = i32x4(col[0], col[1], col[2], col[3]);
+                let vdsi: v128 = i32x4(dst[0], dst[1], dst[2], dst[3]);
+                let vdst = f32x4_convert_i32x4(vdsi);
+                let vsqr = f32x4_add(f32x4_mul(vdx, vdx), f32x4_mul(vdy, vdy));
+                let vinv = f32x4_div(one, f32x4_sqrt(vsqr));
+                let vz = f32x4_mul(vdst, vinv);
+
+                let pixel_idx = row_start + xu;
+                v128_store(self.target.fb_ptr().add(pixel_idx).cast::<v128>(), vcol);
+                v128_store(self.target.zb_ptr().add(pixel_idx).cast::<v128>(), vz);
+
+                // Write back NEW uurend values — u + d per lane.
+                for k in 0..4 {
+                    scratch.uurend[xu + k] = u[k].wrapping_add(d[k]);
+                }
+
+                vdx = f32x4_add(vdx, vstrx4);
+                vdy = f32x4_add(vdy, vstry4);
+                iplc_local = iplc_local.wrapping_add(iinc.wrapping_mul(4));
+                x += 4;
+            }
+            dirx = f32x4_extract_lane::<0>(vdx);
+            diry = f32x4_extract_lane::<0>(vdy);
+        }
+
+        // Scalar tail — handles 0..3 leftover pixels on x86_64 /
+        // aarch64 / wasm32 and the full body on other targets.
         while x < p1 {
             // Vertical scan reads the per-column ray index from
             // uurend[sx] (>>16 to drop the fractional bits).

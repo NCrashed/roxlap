@@ -7,3 +7,12 @@
 # packages).
 [target.wasm32-unknown-unknown]
 runner = "wasm-bindgen-test-runner"
+# R10.3: enable WebAssembly SIMD (`simd128`) for the four
+# `core::arch::wasm32::f32x4_*` 4-pixel batches in
+# `roxlap-core/src/scalar_rasterizer.rs`. Without this flag the
+# intrinsics compile but lower to scalar wasm — so SIMD code looks
+# correct on the wire but doesn't actually accelerate. simd128 is
+# universally supported (Chrome 91+, Firefox 89+, Safari 16.4+ —
+# 94 %+ globally). Old browsers without simd128 fail at the wasm
+# loader stage; that's R10.X follow-up territory if it matters.
+rustflags = ["-C", "target-feature=+simd128"]
