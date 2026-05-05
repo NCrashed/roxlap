@@ -41,6 +41,10 @@
     clippy::if_not_else
 )]
 
+// R10.0: rayon is dropped on `wasm32-unknown-unknown` (no
+// `std::thread`); the parallel call-site below has a sequential
+// range-iter fallback under the opposite cfg.
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::engine::LightSrc;
@@ -500,7 +504,7 @@ pub fn update_lighting(
     // `update_lighting` per frame — at which point the parallel
     // path matters for interactive responsiveness.
     let world_view = WorldDataMutView::new(world_data);
-    (y0p..y1p).into_par_iter().for_each(|y| {
+    let row_body = |y: i32| {
         for x in x0p..x1p {
             let col_idx = (y as u32) * vsid + (x as u32);
             let off_start = column_offsets[col_idx as usize] as usize;
@@ -512,7 +516,14 @@ pub fn update_lighting(
             let column = unsafe { world_view.column_slice(off_start, off_end) };
             shade_column(column, x, y, z0p, z1p, lightmode, lights, &lightsub, &cache);
         }
-    });
+    };
+
+    // R10.0: wasm32 lacks rayon, so the per-row bake degrades to
+    // a sequential range walk. Same body, single thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    (y0p..y1p).into_par_iter().for_each(row_body);
+    #[cfg(target_arch = "wasm32")]
+    (y0p..y1p).for_each(row_body);
 }
 
 /// Raw-pointer view of `world_data` so the parallel

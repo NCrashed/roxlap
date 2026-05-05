@@ -17,6 +17,10 @@
 //! loops need (xres / yres / projection params / mip + scan-dist
 //! controls) so the orchestrator's signature stays compact.
 
+// R10.0: rayon is dropped on `wasm32-unknown-unknown` (no
+// `std::thread`); the parallel call-site below has a sequential
+// `iter_mut()` fallback under the opposite cfg.
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::camera_math;
@@ -330,54 +334,64 @@ fn run_strip_parallel<R: Rasterizer + Clone + Send + Sync>(
     let prelude_ref: &OpticastPrelude = prelude;
     let settings_ref: &OpticastSettings = settings;
 
+    let strip_body = |(i, scratch): (usize, &mut crate::rasterizer::ScanScratch)| {
+        #[allow(clippy::cast_possible_truncation)]
+        let strip_y_start = y_start_total.saturating_add((i as u32).saturating_mul(strip_height));
+        let strip_y_end = strip_y_start.saturating_add(strip_height).min(y_end_total);
+        if strip_y_start >= strip_y_end {
+            // Tail strip past the actual y-range — happens when
+            // n_strips > span (e.g., 16 strips on a 12-row span).
+            return;
+        }
+
+        let strip_proj = projection::derive_projection_with_y_range(
+            cs_ref,
+            settings_ref.xres,
+            settings_ref.yres,
+            strip_y_start,
+            strip_y_end,
+            settings_ref.hx,
+            settings_ref.hy,
+            settings_ref.hz,
+            settings_ref.anginc,
+        );
+        let strip_rs =
+            ray_step::derive_ray_step(cs_ref, strip_proj.cx, strip_proj.cy, settings_ref.hz);
+        #[allow(clippy::cast_possible_wrap)]
+        let strip_ctx = ScanContext {
+            proj: &strip_proj,
+            rs: &strip_rs,
+            prelude: prelude_ref,
+            xres: settings_ref.xres as i32,
+            y_start: strip_y_start as i32,
+            y_end: strip_y_end as i32,
+            anginc: settings_ref.anginc,
+            camera_state: cs_ref,
+            camera_gstartz0: gstartz0,
+            camera_gstartz1: gstartz1,
+            camera_vptr_offset,
+        };
+
+        let mut strip_rasterizer: R = rasterizer_template.clone();
+        top_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
+        right_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
+        bottom_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
+        left_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
+    };
+
+    // R10.0: wasm32 has no `std::thread`, so rayon isn't a dep on
+    // that target. Fall through to a sequential `iter_mut()` walk;
+    // shape is identical, just one strip at a time.
+    #[cfg(not(target_arch = "wasm32"))]
     pool.slots_mut_slice()
         .par_iter_mut()
         .enumerate()
-        .for_each(|(i, scratch)| {
-            #[allow(clippy::cast_possible_truncation)]
-            let strip_y_start =
-                y_start_total.saturating_add((i as u32).saturating_mul(strip_height));
-            let strip_y_end = strip_y_start.saturating_add(strip_height).min(y_end_total);
-            if strip_y_start >= strip_y_end {
-                // Tail strip past the actual y-range — happens when
-                // n_strips > span (e.g., 16 strips on a 12-row span).
-                return;
-            }
-
-            let strip_proj = projection::derive_projection_with_y_range(
-                cs_ref,
-                settings_ref.xres,
-                settings_ref.yres,
-                strip_y_start,
-                strip_y_end,
-                settings_ref.hx,
-                settings_ref.hy,
-                settings_ref.hz,
-                settings_ref.anginc,
-            );
-            let strip_rs =
-                ray_step::derive_ray_step(cs_ref, strip_proj.cx, strip_proj.cy, settings_ref.hz);
-            #[allow(clippy::cast_possible_wrap)]
-            let strip_ctx = ScanContext {
-                proj: &strip_proj,
-                rs: &strip_rs,
-                prelude: prelude_ref,
-                xres: settings_ref.xres as i32,
-                y_start: strip_y_start as i32,
-                y_end: strip_y_end as i32,
-                anginc: settings_ref.anginc,
-                camera_state: cs_ref,
-                camera_gstartz0: gstartz0,
-                camera_gstartz1: gstartz1,
-                camera_vptr_offset,
-            };
-
-            let mut strip_rasterizer: R = rasterizer_template.clone();
-            top_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
-            right_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
-            bottom_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
-            left_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
-        });
+        .for_each(strip_body);
+    #[cfg(target_arch = "wasm32")]
+    pool.slots_mut_slice()
+        .iter_mut()
+        .enumerate()
+        .for_each(strip_body);
 }
 
 /// Slice `slab_buf` at column `idx`'s byte range (per the

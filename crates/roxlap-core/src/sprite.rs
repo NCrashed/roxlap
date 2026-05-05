@@ -1479,17 +1479,25 @@ pub fn draw_sprites_parallel(
     lighting: &SpriteLighting<'_>,
     sprites: &[Sprite],
 ) -> u32 {
-    use rayon::prelude::*;
-    sprites
-        .par_iter()
-        .map(|sprite| {
-            // `target` is `Copy`, so each closure captures its own
-            // copy of the (raw fb / zb pointer) view. `cam`,
-            // `settings`, `lighting` are `&` borrows — Sync.
-            let mut t = target;
-            draw_sprite(&mut t, cam, settings, lighting, sprite)
-        })
-        .sum()
+    let render_one = |sprite: &Sprite| {
+        // `target` is `Copy`, so each closure captures its own
+        // copy of the (raw fb / zb pointer) view. `cam`,
+        // `settings`, `lighting` are `&` borrows — Sync.
+        let mut t = target;
+        draw_sprite(&mut t, cam, settings, lighting, sprite)
+    };
+
+    // R10.0: wasm32 lacks rayon; fall through to a sequential
+    // `iter().map(...).sum()`. Same per-sprite work, one thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        sprites.par_iter().map(render_one).sum()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        sprites.iter().map(render_one).sum()
+    }
 }
 
 pub fn draw_sprite(

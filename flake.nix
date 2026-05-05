@@ -37,6 +37,12 @@
               clippy
               rust-analyzer
               pkg-config
+              # R10.0: wasm32-unknown-unknown needs an LLD-class
+              # linker; nixpkgs's `rustc` doesn't bundle `rust-lld`,
+              # so we provide the system one. Cargo finds it via
+              # `lld` on PATH (rustc's wasm target spec invokes the
+              # bare name).
+              lld
               # Image inspection — imagemagick reads roxlap-oracle's
               # PPM dumps and voxlap C oracle's PNG outputs for byte-
               # level pixel diffing across the two engines.
