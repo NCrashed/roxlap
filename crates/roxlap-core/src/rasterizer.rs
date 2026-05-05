@@ -141,13 +141,24 @@ impl ScanScratch {
     /// Allocate a scratch buffer sized for an `xres × yres`
     /// framebuffer. Voxlap's per-frame `radar` buffer is
     /// `MAXXDIM * 6 * 256` `castdat` entries (`voxlap5.c:206`-area
-    /// declaration); over-provisioned by `xres * 6 * 256` here until
-    /// R4.1f3 nails down the exact upper bound. `uurend` /
-    /// `lastx` are sized to fit `xres` / `max(yres, vsid)` entries
-    /// respectively (R4.1f4b consumers).
+    /// declaration). Sized as `xres * max(6*256, yres*2)` — the
+    /// `yres*2` branch activates on HiDPI screens where per-quadrant
+    /// radar consumption exceeds the classic `6*256` per-column budget
+    /// due to corner-cut fan expansion at steep camera angles.
+    /// `uurend` / `lastx` are sized to fit `xres` / `max(yres, vsid)`
+    /// entries respectively (R4.1f4b consumers).
     #[must_use]
     pub fn new_for_size(xres: u32, yres: u32, vsid: u32) -> Self {
-        let radar_cap = (xres as usize) * 6 * 256;
+        // Radar holds all per-ray castdat entries for one quadrant (gscanptr
+        // resets per-quadrant). When the camera tilts down, cy >> yres makes
+        // the top/bottom fan wider than xres (corner-cut expansion), so more
+        // rays are cast and each center ray spans ~yres pixels. The original
+        // factor 6*256 = 1536 sufficed for yres ≤ 768 (classic 640×480 /
+        // 800×600); HiDPI screens (yres > 768) need proportionally more.
+        // Voxlap C side-stepped this by using a fixed MAXXDIM=2880 constant
+        // regardless of actual resolution.
+        let per_col_budget = std::cmp::max(6 * 256, (yres as usize) * 2);
+        let radar_cap = (xres as usize) * per_col_budget;
         let angstart_cap = (xres as usize) * 4;
         let half_stride = xres as usize;
         let lastx_cap = std::cmp::max(yres, vsid) as usize;
