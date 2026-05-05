@@ -56,7 +56,7 @@ per arch).
 | **R12.1** | Introduce `ScratchPool` (host-owned `Vec<ScanScratch>`). Opticast signature changes from `&mut ScanScratch` to `&mut ScratchPool`; R12.1 indexes slot 0 only. `ScratchPool::new` (1 slot, single-threaded) and `::new_parallel(.., n_threads)` (N slots). Per-frame setters broadcast to every slot. | 1–2 d | All existing tests pass; oracle goldens byte-stable at the default thread count (still 1, just now plumbed through the pool). |
 | **R12.2** | Per-quadrant 4-way via `rayon::join`. Each quadrant runs against its own pool slot. Framebuffer/zbuffer split via raw pointers + a wedge-disjoint invariant. Split into R12.2.0 (RasterTarget refactor — `ScalarRasterizer`'s fb/zb fields → `Copy + Send` raw-pointer view) and R12.2.1 (parallel dispatch + `--threads N` oracle flag). | 3–5 d (landed) | Oracle goldens byte-stable across `--threads 1` and `--threads 4` ✅. **Bench gate (≥2× on 6/12 poses) NOT met** — actual mean speedup 1.08× on Intel i7-12700H, best per-pose 1.77× (sprite_above), worst 1.0× (north). Per-quadrant geometry has fundamental load-imbalance: floor-heavy poses concentrate 60–80 % of rays in one quadrant, capping speedup at 1/(0.6..0.8). R12.3 per-tile parallelism is where the real perf landing happens. |
 | **R12.3** | Per-strip N-way via `rayon::par_iter_mut` over `pool.scratches[..]`. Each strip is a full opticast pass with `OpticastSettings::y_start` / `y_end` clipped to the strip's row range. Each strip clones the rasterizer (`RasterTarget` `Copy + Send + Sync`) and writes into its own row range — strip-disjoint pixel writes make the aliasing safe. Split into R12.3.0 (`y_start` / `y_end` plumbing through `OpticastSettings`, `derive_projection`, `ScanContext`, scan_loops sy-iteration clips) and R12.3.1 (parallel dispatch + R12.2.1 per-quadrant code retired). | 5–7 d (landed) | **Goldens byte-stable at `--threads 1` only** — see "Byte-stability tradeoff" below. R12.2.1's per-quadrant rayon::join was retired; per-strip is THE parallel mode. Bench peaks at N=4 (1.49× mean, 2.14× best pose; declining past N=8). |
-| **R12.4** | `update_lighting` per-column outer loop → `par_iter`. Sprites (`Engine::sprites`) → `par_iter` with z-test arbitrating final pixel writes. | 1–2 d | World-bake bench number; sprite oracle goldens (5 poses) byte-stable at every thread count. |
+| **R12.4** | `update_lighting` per-row outer loop → `rayon::par_iter` with raw-pointer-aliased column writes (voxalloc per-column-disjoint invariant). Sprites: new `draw_sprites_parallel` entry — `DrawTarget` refactored to `Copy + Send + Sync` with raw fb / zb pointers, `par_iter` over `&[Sprite]`, z-test arbitrates writes. | 1–2 d (landed) | **update_lighting**: 38 ms → 11 ms (3.35× peak) on the oracle bake region, RAYON_NUM_THREADS=20 default. **Sprites** (synthetic 64 / 256 sprite scenes): 4.42× / 6.13× peak, scaling near-linearly to ~8 threads. Sprite oracle goldens (5 poses) byte-stable: existing 2-sprite scenes are non-overlapping, so par_iter writes are pixel-disjoint and sequential-equivalent. |
 | **R12.5** | `roxlap-oracle bench --threads N` flag + scaling docs in `README.md` (or a new `BENCH.md`). Per-thread oracle (`oracle diff --threads N`) added to CI as a non-blocking job. | 0.5 d | Bench output reproducible across thread counts; CI green. |
 
 **Total scope**: ~2–3 weeks for R12.1–R12.4. R12.0 + R12.5 are
@@ -99,15 +99,37 @@ strips of 16 rows for a 480-row screen). Each strip runs its own
   per-strip memory is *less* than per-quadrant, but total memory
   scales with strip count.
 
-### Sprite + lighting bake — free correctness wins (R12.4)
+### Sprite + lighting bake — high-yield axes (R12.4 landed)
 
-- Sprites with z-test render mutually independently.
-  `rayon::par_iter` over `&[Sprite]` with per-sprite framebuffer
-  views; the z-test arbitrates pixel write order so output is
-  deterministic. Limited gain (the host has ~2 sprites) but free.
-- `update_lighting` is embarrassingly parallel per column.
-  Already an `for x in 0..vsid { for y in 0..vsid { ... } }`
-  shape. Convert the outer loop to `par_iter`.
+These sit OUTSIDE the per-frame opticast hot path but matter for
+real engine workloads. Both shipped 3–6× speedup on this hardware:
+
+- **Sprites**: `draw_sprites_parallel(target, cam, settings,
+  lighting, &[Sprite])` rayon-par_iter's over the sprite slice.
+  Each closure copies the now-`Copy + Send + Sync` `DrawTarget`
+  (raw fb / zb pointers) and calls `draw_sprite` against its own
+  copy. Z-test arbitrates concurrent writes — for non-overlapping
+  sprites, output is byte-identical to a sequential pass; for
+  overlapping pixels with tied z-values, the last-writer-wins is
+  non-deterministic but visually identical.
+  Bench (synthetic grid, oracle world, default RAYON pool):
+  - 64 sprites: 1.11 → 0.27 ms (**4.42×**, scaling to RAYON=16)
+  - 256 sprites: 2.48 → 0.42 ms (**6.13×**)
+  Use case: engines with massive sprite counts (particle effects,
+  many enemies, etc.) — the win scales with sprite count.
+
+- **`update_lighting`** (world voxel bake): par_iter over the
+  outer y-row loop; per-row x-loops stay serial to amortise
+  rayon's per-task overhead. Each column's slab range is byte-
+  disjoint from neighbours' (voxalloc invariant), so a raw-pointer
+  `WorldDataMutView` hands per-column `&mut [u8]` slices to threads
+  safely.
+  Bench (oracle bake region 448×448×200, RAYON=default):
+  - sequential: 38.11 ms
+  - parallel:   11.38 ms (**3.35× peak at RAYON=20**)
+  Use case: dynamic lighting / per-edit relighting — the bake
+  becomes interactive instead of "load a level once and never
+  redo it".
 
 ## API change shape (chosen: host-owned `ScratchPool`)
 

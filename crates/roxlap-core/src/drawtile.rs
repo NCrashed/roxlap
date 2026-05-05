@@ -154,7 +154,10 @@ pub fn drawtile(
                         let avg2 = (va_avg + vb_avg + 1) >> 1;
                         out |= avg2 << (b * 8);
                     }
-                    target.framebuffer[row_pixel + x as usize] = out;
+                    // SAFETY: row_pixel + x < pitch_pixels * height by
+                    // x0/x1/y0/y1 viewport clip; sequential blit, no
+                    // parallel aliasing.
+                    unsafe { target.fb_write(row_pixel + x as usize, out) };
                 }
             }
         } else {
@@ -170,7 +173,8 @@ pub fn drawtile(
                 let mut uu = plc;
                 for x in x0..x1 {
                     let src = tile_pixels[j_pixel + ((uu >> 16) as usize)];
-                    target.framebuffer[row_pixel + x as usize] = src as u32;
+                    // SAFETY: see Path 1's matching write.
+                    unsafe { target.fb_write(row_pixel + x as usize, src as u32) };
                     uu = uu.wrapping_add(ui);
                 }
             }
@@ -228,7 +232,8 @@ pub fn drawtile(
                 // 0xff alpha), write the pixel as-is.
                 if (i.wrapping_add(0x0100_0000) as u32) < 0x0200_0000 {
                     if i < 0 {
-                        target.framebuffer[row_pixel + x as usize] = i as u32;
+                        // SAFETY: see Path 1's matching write.
+                        unsafe { target.fb_write(row_pixel + x as usize, i as u32) };
                     }
                     continue;
                 }
@@ -236,7 +241,8 @@ pub fn drawtile(
                 // Alpha blend: dst.byte = clamp((mod-dst)*alpha/256
                 // + dst, 0, 255). Voxlap's psubw / psllw 4 / pshufw
                 // alpha / pmulhw / paddw / packuswb.
-                let dst = target.framebuffer[row_pixel + x as usize] & 0x00ff_ffff;
+                // SAFETY: same in-bounds argument as Path 1's write.
+                let dst = unsafe { target.fb_read(row_pixel + x as usize) } & 0x00ff_ffff;
                 let alpha_shifted = i32::from(mod_word[3]) << 4;
                 let mut blended: u32 = 0;
                 for (b, &mw) in mod_word.iter().enumerate() {
@@ -246,7 +252,8 @@ pub fn drawtile(
                     let r = (scaled + screen_byte).clamp(0, 255);
                     blended |= (r as u32) << (b * 8);
                 }
-                target.framebuffer[row_pixel + x as usize] = blended;
+                // SAFETY: see Path 1's matching write.
+                unsafe { target.fb_write(row_pixel + x as usize, blended) };
             }
         }
     }
@@ -264,13 +271,7 @@ mod tests {
     }
 
     fn make_target<'a>(fb: &'a mut [u32], zb: &'a mut [f32], w: u32, h: u32) -> DrawTarget<'a> {
-        DrawTarget {
-            framebuffer: fb,
-            zbuffer: zb,
-            pitch_pixels: w as usize,
-            width: w,
-            height: h,
-        }
+        DrawTarget::new(fb, zb, w as usize, w, h)
     }
 
     /// 1× zoom, no-alpha path: a 4×4 tile stamped at screen

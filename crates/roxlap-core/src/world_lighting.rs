@@ -41,6 +41,8 @@
     clippy::if_not_else
 )]
 
+use rayon::prelude::*;
+
 use crate::engine::LightSrc;
 
 /// Voxlap's `MAXZDIM` (`voxlap5.c`). World z runs `0..MAXZDIM`.
@@ -485,23 +487,80 @@ pub fn update_lighting(
     // to exactly zero at distance == sqrt(r2).
     let lightsub: Vec<f32> = lights.iter().map(|l| 1.0 / (l.r2.sqrt() * l.r2)).collect();
 
-    for y in y0p..y1p {
+    // R12.4.1: parallelise the per-row bake via rayon. Each `(x, y)`
+    // pair maps to a unique column slice in `world_data`
+    // (`column_offsets[col_idx]..[col_idx + 1]` ranges are pairwise
+    // disjoint — the voxalloc allocator's invariant). Rows split
+    // cleanly across worker threads; per-row x-loops stay serial to
+    // amortise rayon's per-task overhead. Speedup follows
+    // `RAYON_NUM_THREADS` (set `=1` to disable).
+    //
+    // Lighting bakes are typically rare (one-shot at scene load) but
+    // dynamic-lighting / per-edit relighting use cases call
+    // `update_lighting` per frame — at which point the parallel
+    // path matters for interactive responsiveness.
+    let world_view = WorldDataMutView::new(world_data);
+    (y0p..y1p).into_par_iter().for_each(|y| {
         for x in x0p..x1p {
             let col_idx = (y as u32) * vsid + (x as u32);
             let off_start = column_offsets[col_idx as usize] as usize;
             let off_end = column_offsets[col_idx as usize + 1] as usize;
-            shade_column(
-                &mut world_data[off_start..off_end],
-                x,
-                y,
-                z0p,
-                z1p,
-                lightmode,
-                lights,
-                &lightsub,
-                &cache,
-            );
+            // SAFETY: each (x, y) maps to a unique col_idx; column
+            // ranges `[off_start, off_end)` are pairwise disjoint
+            // across distinct `col_idx` (voxalloc invariant), so
+            // no two threads write to the same byte.
+            let column = unsafe { world_view.column_slice(off_start, off_end) };
+            shade_column(column, x, y, z0p, z1p, lightmode, lights, &lightsub, &cache);
         }
+    });
+}
+
+/// Raw-pointer view of `world_data` so the parallel
+/// [`update_lighting`] body can hand out per-column `&mut [u8]`
+/// slices to multiple threads without each thread needing
+/// `&mut Vec<u8>` (which is exclusive). Constructed from a single
+/// `&mut [u8]` borrow at the start of the parallel section; the
+/// borrow's lifetime gates `WorldDataMutView`'s usable lifetime.
+///
+/// # Safety contract
+/// Callers that hand out concurrent `column_slice` references MUST
+/// guarantee the requested ranges are pairwise non-overlapping
+/// across threads. [`update_lighting`]'s call site relies on
+/// voxalloc's per-column-disjoint-byte-range invariant.
+struct WorldDataMutView<'a> {
+    ptr: *mut u8,
+    len: usize,
+    _marker: std::marker::PhantomData<&'a mut [u8]>,
+}
+
+// SAFETY: `WorldDataMutView` is morally a `&mut [u8]` re-exposed as
+// raw pointers. The disjoint-write invariant is enforced by the
+// caller; concurrent reads of `ptr` / `len` fields are race-free
+// (immutable scalar fields).
+unsafe impl Send for WorldDataMutView<'_> {}
+unsafe impl Sync for WorldDataMutView<'_> {}
+
+impl<'a> WorldDataMutView<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self {
+            ptr: buf.as_mut_ptr(),
+            len: buf.len(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Carve out a sub-slice. Caller upholds the disjoint-write
+    /// invariant (see struct doc).
+    ///
+    /// # Safety
+    /// `off_start <= off_end <= self.len`, and the requested range
+    /// must not overlap with ranges concurrently held by other
+    /// threads.
+    unsafe fn column_slice(&self, off_start: usize, off_end: usize) -> &'a mut [u8] {
+        debug_assert!(off_start <= off_end, "column slice: start > end");
+        debug_assert!(off_end <= self.len, "column slice: end past buffer");
+        // SAFETY: caller asserts in-bounds + disjoint-from-other-threads.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(off_start), off_end - off_start) }
     }
 }
 
