@@ -526,13 +526,13 @@ impl App {
                 }
             }
 
-            let mut target = DrawTarget {
-                framebuffer: &mut buffer,
-                zbuffer: &mut self.zbuffer,
+            let mut target = DrawTarget::new(
+                &mut buffer,
+                &mut self.zbuffer,
                 pitch_pixels,
-                width: size.width,
-                height: size.height,
-            };
+                size.width,
+                size.height,
+            );
             // Snapshot the engine's lighting state once per frame.
             // Cheap to build (it's just three field reads + a slice
             // borrow) and lets sprite shading respond to runtime

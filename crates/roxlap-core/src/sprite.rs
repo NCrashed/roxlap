@@ -311,15 +311,116 @@ pub(crate) struct Kv6FullState<'a> {
 /// `height` must match the `OpticastSettings.xres` / `yres` used
 /// when the per-frame `Kv6FullState` was built — the bounds derived from
 /// `qsum0` / `qsum1` assume that geometry.
+///
+/// Internally a raw-pointer view (similar to
+/// [`crate::scalar_rasterizer::RasterTarget`]) so the type is `Copy
+/// + Send + Sync` and the R12.4.2 [`draw_sprites_parallel`] entry
+/// point can hand per-thread copies into rayon worker closures.
+/// Each parallel sprite-draw competes for the framebuffer / zbuffer
+/// via z-test; for non-overlapping sprites this is race-free, for
+/// overlapping pixels a tied-z race may leak (visually
+/// indistinguishable, hash non-deterministic).
+#[derive(Clone, Copy, Debug)]
 pub struct DrawTarget<'a> {
-    /// Packed BGRA pixels, row-major, length `pitch_pixels * height`.
-    pub framebuffer: &'a mut [u32],
-    /// Per-pixel z values, same layout as `framebuffer`.
-    pub zbuffer: &'a mut [f32],
-    /// Row stride in pixels (= `framebuffer.len() / height`).
+    fb_ptr: *mut u32,
+    fb_len: usize,
+    zb_ptr: *mut f32,
+    zb_len: usize,
+    /// Row stride in pixels.
     pub pitch_pixels: usize,
     pub width: u32,
     pub height: u32,
+    _marker: std::marker::PhantomData<&'a mut [u32]>,
+}
+
+// SAFETY: same shape as the (`&'a mut [u32]`, `&'a mut [f32]`) pair
+// the constructor consumed; both are auto-`Send` for `T: Send`. The
+// pointer-aliasing safety contract for [`draw_sprites_parallel`] is
+// "z-test arbitrates concurrent writes" — a tied-z race is a
+// determinism issue, not a memory-safety issue.
+unsafe impl Send for DrawTarget<'_> {}
+unsafe impl Sync for DrawTarget<'_> {}
+
+impl<'a> DrawTarget<'a> {
+    /// Build a target from exclusive slice borrows + framebuffer
+    /// dimensions. The slices are consumed (their `&'a mut`
+    /// re-borrow is what gates lifetime); subsequent access happens
+    /// via the raw pointers held in the struct.
+    #[must_use]
+    pub fn new(
+        framebuffer: &'a mut [u32],
+        zbuffer: &'a mut [f32],
+        pitch_pixels: usize,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            fb_ptr: framebuffer.as_mut_ptr(),
+            fb_len: framebuffer.len(),
+            zb_ptr: zbuffer.as_mut_ptr(),
+            zb_len: zbuffer.len(),
+            pitch_pixels,
+            width,
+            height,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Unconditional framebuffer write. Used by sequential 2D
+    /// blitters (`drawtile`) that don't engage z-testing.
+    ///
+    /// # Safety
+    /// `idx < self.fb_len`. The disjoint-write contract still
+    /// applies if multiple `Copy` instances of `DrawTarget` are in
+    /// flight across threads — this method does NOT arbitrate via
+    /// z-test.
+    #[inline]
+    pub unsafe fn fb_write(self, idx: usize, color: u32) {
+        debug_assert!(idx < self.fb_len, "fb idx {} >= len {}", idx, self.fb_len);
+        // SAFETY: caller asserts in-bounds + (for parallel use)
+        // disjoint writes.
+        unsafe { self.fb_ptr.add(idx).write(color) };
+    }
+
+    /// Read one framebuffer pixel. Used by alpha-blend paths
+    /// (`drawtile` modulate-and-blend) that read-modify-write.
+    ///
+    /// # Safety
+    /// `idx < self.fb_len`. Concurrent writers to the same `idx`
+    /// from another thread invalidate the read; sequential blits
+    /// are race-free.
+    #[inline]
+    #[must_use]
+    pub unsafe fn fb_read(self, idx: usize) -> u32 {
+        debug_assert!(idx < self.fb_len, "fb idx {} >= len {}", idx, self.fb_len);
+        // SAFETY: caller asserts in-bounds.
+        unsafe { self.fb_ptr.add(idx).read() }
+    }
+
+    /// Z-tested pixel write. If `z < zbuffer[idx]`, the new color +
+    /// z stamp the buffers; otherwise nothing changes.
+    ///
+    /// # Safety
+    /// `idx < self.fb_len`. For parallel callers, the wedge / z-test
+    /// arbitration contract on [`DrawTarget`] applies (see struct
+    /// doc).
+    #[inline]
+    pub unsafe fn z_test_write(self, idx: usize, color: u32, z: f32) -> bool {
+        debug_assert!(idx < self.fb_len, "fb idx {} >= len {}", idx, self.fb_len);
+        debug_assert!(idx < self.zb_len, "zb idx {} >= len {}", idx, self.zb_len);
+        // SAFETY: caller asserts in-bounds + concurrent-write contract.
+        unsafe {
+            let zp = self.zb_ptr.add(idx);
+            let cur_z = zp.read();
+            if z < cur_z {
+                zp.write(z);
+                self.fb_ptr.add(idx).write(color);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 #[inline]
@@ -1041,7 +1142,7 @@ pub(crate) fn drawboundcubesse(
         // Fill rectangle [pixel_min_x .. +dx) × [pixel_min_y .. +dy+1).
         // The qsum0/qsum1 clip + saturating sub guarantee the rect
         // sits inside the framebuffer, so no per-pixel bounds check
-        // needed beyond Rust's slice indexing.
+        // needed beyond DrawTarget's debug_assert.
         let z_val = origin_arr[2];
         let pitch = target.pitch_pixels;
         let x0 = pixel_min_x as usize;
@@ -1052,9 +1153,10 @@ pub(crate) fn drawboundcubesse(
             let row_start = y * pitch;
             for x in x0..x_end {
                 let idx = row_start + x;
-                if z_val < target.zbuffer[idx] {
-                    target.zbuffer[idx] = z_val;
-                    target.framebuffer[idx] = color;
+                // SAFETY: idx < pitch * height by qsum0/qsum1 clip;
+                // concurrent-write contract gated by z_test_write.
+                // (Outer `unsafe` block in this fn covers the call.)
+                if target.z_test_write(idx, color, z_val) {
                     written += 1;
                 }
             }
@@ -1346,6 +1448,50 @@ pub(crate) fn kv6_iterate<F: FnMut(&Voxel, u32, [f32; 4])>(
 /// the sprite (== sum of z-test passes). Zero means the sprite
 /// produced no visible pixels (culled, fully behind near plane, or
 /// totally occluded).
+/// Render a batch of sprites in parallel via `rayon::par_iter`.
+///
+/// Each sprite runs its own [`draw_sprite`] pass on its own thread,
+/// writing to the shared [`DrawTarget`] (raw pointers; `Copy + Send
+/// + Sync`) under the z-test arbitration contract: a pixel write
+/// only fires when the new sprite's z is strictly less than the
+/// current zbuffer value. For non-overlapping sprites the writes
+/// are pairwise-disjoint and the output is byte-identical to a
+/// sequential pass over the same sprite list. For overlapping
+/// pixels, two sprites at exactly tied z-values produce a
+/// non-deterministic last-writer-wins outcome — visually
+/// indistinguishable but hash-non-deterministic.
+///
+/// Returns the sum of `draw_sprite` return values (total pixels
+/// written across all sprites).
+///
+/// `RAYON_NUM_THREADS=1` (or no parallelism worth) ⇒ effectively
+/// sequential; rayon falls back to running each closure on the
+/// calling thread without contention.
+///
+/// Use this for engine scenes with dozens-to-hundreds of sprites;
+/// the per-sprite overhead amortises well past ~4 sprites on
+/// consumer-class hardware.
+#[allow(clippy::module_name_repetitions)]
+pub fn draw_sprites_parallel(
+    target: DrawTarget<'_>,
+    cam: &CameraState,
+    settings: &OpticastSettings,
+    lighting: &SpriteLighting<'_>,
+    sprites: &[Sprite],
+) -> u32 {
+    use rayon::prelude::*;
+    sprites
+        .par_iter()
+        .map(|sprite| {
+            // `target` is `Copy`, so each closure captures its own
+            // copy of the (raw fb / zb pointer) view. `cam`,
+            // `settings`, `lighting` are `&` borrows — Sync.
+            let mut t = target;
+            draw_sprite(&mut t, cam, settings, lighting, sprite)
+        })
+        .sum()
+}
+
 pub fn draw_sprite(
     target: &mut DrawTarget<'_>,
     cam: &CameraState,
@@ -1473,13 +1619,7 @@ mod tests {
     }
 
     fn make_target<'a>(fb: &'a mut [u32], zb: &'a mut [f32]) -> DrawTarget<'a> {
-        DrawTarget {
-            framebuffer: fb,
-            zbuffer: zb,
-            pitch_pixels: 640,
-            width: 640,
-            height: 480,
-        }
+        DrawTarget::new(fb, zb, 640, 640, 480)
     }
 
     /// Bit-pattern compare for two `[f32; 4]` vectors. The setup

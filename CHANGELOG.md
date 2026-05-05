@@ -71,6 +71,33 @@ Initial public release of the roxlap workspace.
 - High-level `Engine` + `Camera` types with idiomatic Rust
   constructors and getters; `OpticastSettings::for_oracle_framebuffer`
   convenience builder.
+- **Multicore CPU rendering** (R12) — three rayon-backed
+  parallelism axes:
+  - **Per-strip opticast** via `ScratchPool::new_parallel(.., n)`:
+    splits the framebuffer into `n` row strips, each running an
+    independent opticast pass over its strip's y-range. New
+    `OpticastSettings::y_start` / `y_end` clip the projection
+    + scan-loop iteration. Peaks at ~1.5× on 4 strips for the
+    oracle pose suite (i7-12700H); per-strip ray-fan
+    discretisation drifts sub-pixel across `n`, so goldens are
+    frozen at `n=1` (single-strip = full frame, byte-stable).
+  - **`update_lighting` parallel bake**: outer y-loop is
+    `rayon::par_iter`, per-column writes via raw-pointer view
+    under the voxalloc disjoint-byte-range invariant. ~3.4×
+    speedup on the oracle bake region — turns dynamic /
+    per-edit relighting from "pause-the-game" to interactive.
+    Bit-identical to sequential.
+  - **`draw_sprites_parallel`**: new entry point that par_iters
+    over `&[Sprite]` with z-test arbitrating concurrent fb / zb
+    writes. `DrawTarget` refactored to `Copy + Send + Sync` raw-
+    pointer view. ~4–6× speedup on synthetic many-sprite
+    scenes; sprite oracle goldens unchanged (existing 2-sprite
+    poses are non-overlapping). Tied-z races on overlapping
+    sprites are non-deterministic but visually identical.
+  - Three new oracle bench subcommands report scaling curves:
+    `bench --threads N`, `bench-lighting`, `bench-sprites`.
+  - Full design + measured numbers in
+    [`PORTING-MULTICORE.md`](PORTING-MULTICORE.md).
 
 #### `roxlap-host`
 
@@ -144,7 +171,6 @@ Initial public release of the roxlap workspace.
 
 - ARM NEON port (R9): scalar fallback used on aarch64.
 - wasm32 SIMD + browser host (R10): scalar fallback used on wasm32.
-- Multicore CPU rendering (R12): single-threaded today.
 - Voxlap's animation-curve playback (`animsprite` + per-frame
   interpolation): the host drives `kfaval[]` directly.
 - Sprite no-z (`SPRITE_FLAG_NO_Z`) overlay rendering: data type

@@ -118,8 +118,53 @@ MATCH    diag_down_lit  b536ce3fdf771b9e       (roxlap-frozen)
 ```
 
 Open work: ARM NEON (R9), wasm SIMD + browser host (R10), and
-multicore CPU rendering (R12, ~3-5× projected). See
-[PORTING-RUST.md](PORTING-RUST.md) for the full substage roadmap.
+crates.io publish (R11.9). See [PORTING-RUST.md](PORTING-RUST.md)
+for the full substage roadmap.
+
+## Multicore
+
+Three parallelism axes ship out of the box, all rayon-backed:
+
+```rust
+// 1. Per-strip render — split the framebuffer into N row strips,
+//    each runs an independent opticast pass. Pool size = strip count.
+let mut pool = ScratchPool::new_parallel(xres, yres, vsid, 4);
+
+// 2. World-voxel lighting bake — outer y-loop is rayon::par_iter.
+//    Honours RAYON_NUM_THREADS env var.
+roxlap_core::update_lighting(world, offsets, vsid, x0, y0, z0, x1, y1, z1, mode, &lights);
+
+// 3. Sprite batch — par_iter over &[Sprite], z-test arbitrates writes.
+let target = DrawTarget::new(fb, zb, pitch, w, h);
+draw_sprites_parallel(target, &cam_state, &settings, &lighting, &sprites);
+```
+
+Measured on Intel i7-12700H (6 P-cores + 8 E-cores, 24 MB L3):
+
+| workload | sequential | parallel (best) | speedup | RAYON_NUM_THREADS |
+|---|---|---|---|---|
+| opticast per-strip render (oracle, 12 poses, 640×480) | 10.98 ms | 7.36 ms | **1.49×** | 4 |
+| update_lighting (448×448×200 bake) | 38.11 ms | 11.38 ms | **3.35×** | default (20) |
+| draw_sprites (64 sprites, synthetic grid) | 1.19 ms | 0.27 ms | **4.42×** | 16 |
+| draw_sprites (256 sprites) | 2.48 ms | 0.42 ms | **6.13×** | default (20) |
+
+The opticast hot path has limited parallelism headroom (per-strip
+ray fans discretise differently per N — geometrically valid but
+not byte-stable across strip counts; CI freezes goldens at N=1).
+update_lighting and the sprite batch scale near-linearly past 8
+threads — they're the right axes for dynamic-light or
+massive-sprite scenes.
+
+Bench commands:
+
+```sh
+roxlap-oracle bench --threads N         # opticast scaling
+roxlap-oracle bench-lighting            # update_lighting scaling (RAYON_NUM_THREADS env)
+roxlap-oracle bench-sprites --sprites N # sprite scaling (RAYON_NUM_THREADS env)
+```
+
+Full design + tradeoffs in
+[PORTING-MULTICORE.md](PORTING-MULTICORE.md).
 
 ## Documentation
 

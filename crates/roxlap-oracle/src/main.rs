@@ -45,7 +45,7 @@ use roxlap_core::camera_math;
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
-use roxlap_core::sprite::{draw_sprite, DrawTarget, SpriteLighting};
+use roxlap_core::sprite::{draw_sprite, draw_sprites_parallel, DrawTarget, SpriteLighting};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
@@ -433,13 +433,7 @@ fn render_pose(
         let sprite = sprite_for_pose(kind);
         let cam_state =
             camera_math::derive(&cam, XRES, YRES, settings.hx, settings.hy, settings.hz);
-        let mut target = DrawTarget {
-            framebuffer,
-            zbuffer,
-            pitch_pixels,
-            width: XRES,
-            height: YRES,
-        };
+        let mut target = DrawTarget::new(framebuffer, zbuffer, pitch_pixels, XRES, YRES);
         // Match voxlap C oracle's lighting state at the time of
         // drawsprite: kv6col=0x808080, lightmode=0, no point lights.
         // The four sprite_* hashes were frozen against this exact
@@ -455,13 +449,7 @@ fn render_pose(
     // three voxlap C `drawtile` paths.
     if let Some(kind) = pose.tile {
         let tile_pixels = build_test_tile();
-        let mut target = DrawTarget {
-            framebuffer,
-            zbuffer,
-            pitch_pixels,
-            width: XRES,
-            height: YRES,
-        };
+        let mut target = DrawTarget::new(framebuffer, zbuffer, pitch_pixels, XRES, YRES);
         // Endpoint i32 cast wraps the high bit deliberately —
         // the alpha-blend branch reads sign-extended bytes from
         // the i32. clippy's wrap warning is the desired behaviour.
@@ -718,6 +706,260 @@ fn cmd_bench(opts: &BenchOpts) -> std::io::Result<()> {
             1.0 / grand_mean.as_secs_f64()
         );
     }
+
+    Ok(())
+}
+
+/// Microbenchmark `update_lighting` over the oracle bake region —
+/// the same `(800..1248) × (800..1248) × (0..200)` box `cmd_bench`
+/// uses for the lit poses. Reports min / p50 / mean / p99 / max
+/// across `iters` repetitions.
+///
+/// Defaults: `iters = 20`, `warmup = 3`. Rebakes are idempotent
+/// (same lights → same alpha bytes), so repeated calls are safe.
+/// Speedup follows `RAYON_NUM_THREADS` — set `=1` to measure the
+/// sequential baseline, leave unset to use rayon's default pool
+/// (= num_cpus). The R12.4.1 parallel path is always engaged;
+/// there is no `--threads` flag because `update_lighting`'s pool
+/// is rayon's global pool, not [`ScratchPool`].
+#[allow(clippy::unnecessary_wraps)]
+fn cmd_bench_lighting(iters: usize, warmup: usize) -> std::io::Result<()> {
+    let mut engine = Engine::new();
+    let mut vxl_world = load_oracle_vxl();
+
+    engine.set_lightmode(2);
+    engine.add_light(roxlap_core::LightSrc {
+        pos: [1100.0, 1100.0, 70.0],
+        r2: 600.0 * 600.0,
+        sc: 1.0,
+    });
+
+    let bake_region = ((800, 800, 0), (1248, 1248, 200));
+    println!(
+        "bench-lighting: {} iter{} ({} warmup), bake region ({:?}..{:?}), \
+         RAYON_NUM_THREADS={}",
+        iters,
+        if iters == 1 { "" } else { "s" },
+        warmup,
+        bake_region.0,
+        bake_region.1,
+        std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "<default>".to_string()),
+    );
+
+    for _ in 0..warmup {
+        roxlap_core::update_lighting(
+            &mut vxl_world.data,
+            &vxl_world.column_offset,
+            vxl_world.vsid,
+            bake_region.0 .0,
+            bake_region.0 .1,
+            bake_region.0 .2,
+            bake_region.1 .0,
+            bake_region.1 .1,
+            bake_region.1 .2,
+            engine.lightmode(),
+            engine.lights(),
+        );
+    }
+
+    let mut samples: Vec<std::time::Duration> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t0 = std::time::Instant::now();
+        roxlap_core::update_lighting(
+            &mut vxl_world.data,
+            &vxl_world.column_offset,
+            vxl_world.vsid,
+            bake_region.0 .0,
+            bake_region.0 .1,
+            bake_region.0 .2,
+            bake_region.1 .0,
+            bake_region.1 .1,
+            bake_region.1 .2,
+            engine.lightmode(),
+            engine.lights(),
+        );
+        samples.push(t0.elapsed());
+    }
+    samples.sort_unstable();
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let mean = (samples
+        .iter()
+        .map(std::time::Duration::as_secs_f64)
+        .sum::<f64>()
+        / samples.len() as f64)
+        * 1000.0;
+    let min = samples[0].as_secs_f64() * 1000.0;
+    let p50 = samples[samples.len() / 2].as_secs_f64() * 1000.0;
+    let p99_idx = ((samples.len() as f64) * 0.99) as usize;
+    let p99 = samples[p99_idx.min(samples.len() - 1)].as_secs_f64() * 1000.0;
+    let max = samples[samples.len() - 1].as_secs_f64() * 1000.0;
+
+    println!();
+    println!(
+        "{:<10}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "metric", "min ms", "p50 ms", "mean ms", "p99 ms", "max ms"
+    );
+    println!(
+        "{:<10}  {:>8.3}  {:>8.3}  {:>8.3}  {:>8.3}  {:>8.3}",
+        "bake", min, p50, mean, p99, max
+    );
+
+    Ok(())
+}
+
+/// Microbenchmark `draw_sprites_parallel` over a synthetic
+/// `n_sprites`-sprite scene. The sprites are meltsphere kv6
+/// instances scattered on a grid around the camera so each one
+/// projects to a distinct screen rect (no z-test contention,
+/// reproducible byte output regardless of thread scheduling).
+///
+/// Compares:
+///  - **sequential**: a manual `for sprite in &sprites { draw_sprite(...) }` loop.
+///  - **parallel**:   `draw_sprites_parallel(&sprites)` (rayon par_iter).
+///
+/// Reports min / p50 / mean / p99 / max for each variant. Speedup
+/// follows `RAYON_NUM_THREADS`; set `=1` for the sequential
+/// baseline of the parallel call (which lets us isolate rayon
+/// overhead from the actual parallel speedup).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::unnecessary_wraps,
+    clippy::too_many_lines
+)]
+fn cmd_bench_sprites(n_sprites: u32, iters: usize, warmup: usize) -> std::io::Result<()> {
+    let mut engine = Engine::new();
+    let vxl_world = load_oracle_vxl();
+    engine.set_fog(0x0087_ceeb, 1024);
+
+    let pixel_count = (XRES as usize) * (YRES as usize);
+    let mut framebuffer = vec![0u32; pixel_count];
+    let mut zbuffer = vec![0.0f32; pixel_count];
+    let mut pool = ScratchPool::new(XRES, YRES, vxl_world.vsid);
+
+    // Build the synthetic scene: one camera looking +y, sprites
+    // scattered on a grid of meltsphere instances at z=170 (just
+    // above the playable plane).
+    // Right-handed basis: right × down == forward. Looking +y with
+    // world +z down, right is -x. (LH basis triggers silent sprite
+    // cull in kv6_draw_prepare — see feedback_voxlap_basis_chirality.)
+    let cam = Camera {
+        pos: [1024.0, 980.0, 175.0],
+        right: [-1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+    };
+    let cam_state = camera_math::derive(
+        &cam,
+        XRES,
+        YRES,
+        XRES as f32 / 2.0,
+        YRES as f32 / 2.0,
+        XRES as f32 / 2.0,
+    );
+    let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+    let lighting = SpriteLighting::default_oracle();
+
+    let kv = kv6::parse(SPRITE_MELTSPHERE_KV6).expect("parse meltsphere fixture");
+    let n_grid = (n_sprites as f64).sqrt().ceil() as u32;
+    let cell = 12.0_f32;
+    let origin_x = cam.pos[0] as f32 - (n_grid as f32 * cell) / 2.0;
+    let origin_y = cam.pos[1] as f32 + 30.0;
+    let mut sprites: Vec<Sprite> = Vec::with_capacity(n_sprites as usize);
+    for i in 0..n_sprites {
+        let gx = i % n_grid;
+        let gy = i / n_grid;
+        let p = [
+            origin_x + (gx as f32) * cell,
+            origin_y + (gy as f32) * cell,
+            175.0,
+        ];
+        sprites.push(Sprite::axis_aligned(kv.clone(), p));
+    }
+
+    println!(
+        "bench-sprites: {n_sprites} sprites, {iters} iter{} ({warmup} warmup), \
+         RAYON_NUM_THREADS={}",
+        if iters == 1 { "" } else { "s" },
+        std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "<default>".to_string()),
+    );
+
+    // First, render world once so the framebuffer / zbuffer are
+    // populated to a representative state (sprite z-test reads
+    // existing zbuffer values).
+    let pitch_pixels = XRES as usize;
+    let sky = engine.sky_color();
+    framebuffer.fill(sky);
+    zbuffer.fill(f32::INFINITY);
+    {
+        let mut rasterizer = ScalarRasterizer::new(
+            &mut framebuffer,
+            &mut zbuffer,
+            pitch_pixels,
+            &vxl_world.data,
+            &vxl_world.column_offset,
+            &vxl_world.mip_base_offsets,
+            vxl_world.vsid,
+        );
+        let _ = opticast(
+            &mut rasterizer,
+            &mut pool,
+            &cam,
+            &settings,
+            vxl_world.vsid,
+            &vxl_world.data,
+            &vxl_world.column_offset,
+        );
+    }
+    // Snapshot the post-world fb / zb so each sprite-bench run
+    // starts from the same state.
+    let fb_snapshot = framebuffer.clone();
+    let zb_snapshot = zbuffer.clone();
+
+    let mut bench_loop = |label: &str, run: &dyn Fn(&mut [u32], &mut [f32])| {
+        for _ in 0..warmup {
+            framebuffer.copy_from_slice(&fb_snapshot);
+            zbuffer.copy_from_slice(&zb_snapshot);
+            run(&mut framebuffer, &mut zbuffer);
+        }
+        let mut samples: Vec<std::time::Duration> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            framebuffer.copy_from_slice(&fb_snapshot);
+            zbuffer.copy_from_slice(&zb_snapshot);
+            let t0 = std::time::Instant::now();
+            run(&mut framebuffer, &mut zbuffer);
+            samples.push(t0.elapsed());
+        }
+        samples.sort_unstable();
+        let mean_ms = (samples
+            .iter()
+            .map(std::time::Duration::as_secs_f64)
+            .sum::<f64>()
+            / samples.len() as f64)
+            * 1000.0;
+        let min = samples[0].as_secs_f64() * 1000.0;
+        let p50 = samples[samples.len() / 2].as_secs_f64() * 1000.0;
+        let p99_idx = ((samples.len() as f64) * 0.99) as usize;
+        let p99 = samples[p99_idx.min(samples.len() - 1)].as_secs_f64() * 1000.0;
+        let max = samples[samples.len() - 1].as_secs_f64() * 1000.0;
+        println!("{label:<14}  {min:>8.3}  {p50:>8.3}  {mean_ms:>8.3}  {p99:>8.3}  {max:>8.3}");
+    };
+
+    println!();
+    println!(
+        "{:<14}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "variant", "min ms", "p50 ms", "mean ms", "p99 ms", "max ms"
+    );
+    bench_loop("sequential", &|fb, zb| {
+        let mut target = DrawTarget::new(fb, zb, pitch_pixels, XRES, YRES);
+        for sprite in &sprites {
+            let _ = draw_sprite(&mut target, &cam_state, &settings, &lighting, sprite);
+        }
+    });
+    bench_loop("parallel", &|fb, zb| {
+        let target = DrawTarget::new(fb, zb, pitch_pixels, XRES, YRES);
+        let _ = draw_sprites_parallel(target, &cam_state, &settings, &lighting, &sprites);
+    });
 
     Ok(())
 }
@@ -985,6 +1227,17 @@ fn print_help() {
                                          --pose all, --iters 30, --warmup 5,\n\
                                          --threads 1. Pass --threads 4 to drive\n\
                                          opticast's parallel branch.\n\
+             roxlap-oracle bench-lighting [--iters N] [--warmup N]\n\
+                                         microbenchmark update_lighting on the\n\
+                                         oracle bake region (448 × 448 × 200).\n\
+                                         Speedup follows RAYON_NUM_THREADS\n\
+                                         (set =1 to measure sequential).\n\
+             roxlap-oracle bench-sprites [--sprites N] [--iters N] [--warmup N]\n\
+                                         microbenchmark sequential vs parallel\n\
+                                         sprite drawing on a synthetic grid scene.\n\
+                                         Defaults: --sprites 64, --iters 50,\n\
+                                         --warmup 5. Speedup follows\n\
+                                         RAYON_NUM_THREADS.\n\
          \n\
          Env:\n\
              ROXLAP_ORACLE_PPM=1        legacy alias for --ppm (dumps to cwd)\n\
@@ -1361,6 +1614,112 @@ fn main() -> std::io::Result<()> {
         "debug-gline" => {
             let pose_name = args.get(1).cloned().unwrap_or_else(|| "north".to_string());
             cmd_debug_gline(&pose_name)
+        }
+        "bench-sprites" => {
+            let mut n_sprites: u32 = 64;
+            let mut iters: usize = 50;
+            let mut warmup: usize = 5;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--sprites" => {
+                        let raw = args.get(i + 1).cloned().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--sprites expects an integer",
+                            )
+                        })?;
+                        n_sprites = raw.parse().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("--sprites: not an integer ({raw})"),
+                            )
+                        })?;
+                        i += 2;
+                    }
+                    "--iters" => {
+                        let raw = args.get(i + 1).cloned().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--iters expects an integer",
+                            )
+                        })?;
+                        iters = raw.parse().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("--iters: not an integer ({raw})"),
+                            )
+                        })?;
+                        i += 2;
+                    }
+                    "--warmup" => {
+                        let raw = args.get(i + 1).cloned().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--warmup expects an integer",
+                            )
+                        })?;
+                        warmup = raw.parse().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("--warmup: not an integer ({raw})"),
+                            )
+                        })?;
+                        i += 2;
+                    }
+                    other => {
+                        let _ = writeln!(std::io::stderr(), "unknown bench-sprites arg: {other}");
+                        print_help();
+                        std::process::exit(2);
+                    }
+                }
+            }
+            cmd_bench_sprites(n_sprites, iters, warmup)
+        }
+        "bench-lighting" => {
+            let mut iters: usize = 20;
+            let mut warmup: usize = 3;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--iters" => {
+                        let raw = args.get(i + 1).cloned().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--iters expects an integer",
+                            )
+                        })?;
+                        iters = raw.parse().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("--iters: not an integer ({raw})"),
+                            )
+                        })?;
+                        i += 2;
+                    }
+                    "--warmup" => {
+                        let raw = args.get(i + 1).cloned().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--warmup expects an integer",
+                            )
+                        })?;
+                        warmup = raw.parse().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("--warmup: not an integer ({raw})"),
+                            )
+                        })?;
+                        i += 2;
+                    }
+                    other => {
+                        let _ = writeln!(std::io::stderr(), "unknown bench-lighting arg: {other}");
+                        print_help();
+                        std::process::exit(2);
+                    }
+                }
+            }
+            cmd_bench_lighting(iters, warmup)
         }
         "bench" => {
             let mut opts = BenchOpts {

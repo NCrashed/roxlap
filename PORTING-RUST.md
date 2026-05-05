@@ -32,7 +32,7 @@ project intent and the relationship to
 | **R9** | ARM NEON via `core::arch::aarch64`; macOS arm64 + Linux aarch64 in CI. | not started | Own goldens (NEON ≠ x86 SSE bits); aarch64 CI green. |
 | **R10** | wasm SIMD via `core::arch::wasm32`; web host (canvas + js glue) as a separate crate. | not started | Browser perf benchmark; own wasm goldens. |
 | **R11** | Polish: docs, examples, version 0.1 publish to crates.io. | not started | Crates published; docs.rs renders. |
-| **R12** | Multicore CPU rendering via `rayon`. Sub-substages R12.0..R12.5 in [PORTING-MULTICORE.md](PORTING-MULTICORE.md). Lands *before* R9 / R10 in execution order so the cross-arch ports inherit the SMP structure for free. | R12.0 in progress | Oracle goldens byte-stable across `--threads {1, 2, 4, 8}`; bench shows ~3–5× on 8-core. |
+| **R12** | Multicore CPU rendering via `rayon`. Three parallelism axes: per-strip opticast (1.49× peak at N=4; sub-pixel drift across N, goldens at `--threads 1`), `update_lighting` per-row (3.35× peak), `draw_sprites_parallel` per-sprite (4.4× at 64 sprites, 6.1× at 256). Full sub-substage breakdown + measured numbers in [PORTING-MULTICORE.md](PORTING-MULTICORE.md). | landed | `--threads 1` byte-stable vs goldens (`10 match, 2 mismatch`, same as pre-R12); `bench-lighting`, `bench-sprites`, `bench --threads N` reproducible scaling curves. |
 
 ## Substage R4 — opticast + grouscan (the hard part)
 
