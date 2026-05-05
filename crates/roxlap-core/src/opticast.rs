@@ -17,9 +17,13 @@
 //! loops need (xres / yres / projection params / mip + scan-dist
 //! controls) so the orchestrator's signature stays compact.
 
+use rayon::prelude::*;
+
 use crate::camera_math;
+use crate::camera_math::CameraState;
 use crate::column_walk;
 use crate::opticast_prelude;
+use crate::opticast_prelude::OpticastPrelude;
 use crate::projection;
 use crate::rasterizer::{Rasterizer, ScratchPool};
 use crate::ray_step;
@@ -33,10 +37,23 @@ use crate::Camera;
 /// `vx5.maxscandist`) or a `setcamera` argument (`dahx` / `dahy` /
 /// `dahz`). `mip_levels` is voxlap's `gmipnum` — `1` for the oracle
 /// scene.
+///
+/// `y_start..y_end` is the strip-render iteration bound (R12.3).
+/// Default is the full framebuffer (`0..yres`), giving pre-R12.3
+/// full-frame opticast behaviour bit-exactly. Tile / strip callers
+/// set a sub-range to render only that horizontal strip — pass-1
+/// gline ray casts and pass-2 hrend / vrend writes both stay
+/// inside the strip's y-range. The camera projection center stays
+/// in absolute screen coords; only the viewport edges shrink.
 #[derive(Debug, Clone, Copy)]
 pub struct OpticastSettings {
     pub xres: u32,
     pub yres: u32,
+    /// First y-row this opticast call renders (inclusive). `0` for
+    /// full-frame.
+    pub y_start: u32,
+    /// One past the last y-row (exclusive). `yres` for full-frame.
+    pub y_end: u32,
     pub hx: f32,
     pub hy: f32,
     pub hz: f32,
@@ -49,7 +66,8 @@ pub struct OpticastSettings {
 impl OpticastSettings {
     /// Default settings for a `width × height` framebuffer with the
     /// voxlap-oracle convention `(hx, hy, hz) = (w/2, h/2, w/2)` and
-    /// `anginc = 1`, matching `tests/oracle/oracle.c`.
+    /// `anginc = 1`, matching `tests/oracle/oracle.c`. Renders the
+    /// full frame (`y_start = 0, y_end = height`).
     //
     // `width` / `height` cast to f32 is bounded by realistic screen
     // sizes (≤ 16M, well within f32's 24-bit mantissa).
@@ -61,6 +79,8 @@ impl OpticastSettings {
         Self {
             xres: width,
             yres: height,
+            y_start: 0,
+            y_end: height,
             hx: half_w,
             hy: half_h,
             hz: half_w,
@@ -69,6 +89,18 @@ impl OpticastSettings {
             mip_scan_dist: 4,
             max_scan_dist: 1024,
         }
+    }
+
+    /// Restrict this settings struct to the `[y_start, y_end)`
+    /// horizontal strip. Used by the per-strip parallel dispatch
+    /// (R12.3.1) — each strip clones the base settings and clamps
+    /// the y-range. Caller is responsible for ensuring `y_start <
+    /// y_end <= yres`.
+    #[must_use]
+    pub fn with_y_range(mut self, y_start: u32, y_end: u32) -> Self {
+        self.y_start = y_start;
+        self.y_end = y_end;
+        self
     }
 }
 
@@ -104,22 +136,34 @@ pub enum OpticastOutcome {
 /// Threading dial lives on the pool:
 /// - `pool.n_threads() == 1` → sequential. The four quadrants run
 ///   on the calling thread against `pool.slot_mut(0)`. Pre-R12
-///   shape, byte-stable.
-/// - `pool.n_threads() >= 4` → R12.2.1 parallel branch. The four
-///   quadrants run via `rayon::join` 4-way; each closure clones
-///   `rasterizer` (raw pointers + Clone), claims a distinct slot
-///   from `pool.split_first_4`, and writes into its own wedge of
-///   the framebuffer. Wedge-disjoint pixel writes make the
-///   pointer aliasing safe (see [`crate::scalar_rasterizer::RasterTarget`]).
-/// - `pool.n_threads()` in `2..4` → still sequential (no point
-///   parallelising 3 quadrants when load imbalance dominates;
-///   R12.3 per-tile parallelism scales smoothly).
+///   shape; the byte-stable golden baseline.
+/// - `pool.n_threads() >= 2` → R12.3.1 per-strip parallel. The
+///   framebuffer's y-range splits into N horizontal strips of
+///   `~yres/N` rows each. Each strip runs its own opticast pass
+///   (4 quadrants) against its own slot from
+///   `pool.slots_mut_slice()`, with [`OpticastSettings::y_start`] /
+///   `y_end` clipped to the strip. Strips run via
+///   `rayon::par_iter_mut`, each with a cloned rasterizer (raw
+///   fb / zb pointers shared, strip-disjoint row writes).
 ///
-/// `R: Clone + Send` is required by the parallel branch even when
-/// it doesn't fire — keeping the bound consistent across both
-/// paths means the generic body monomorphizes once. Test
-/// rasterizers (`Counts`, `RecordingRasterizer`) derive Clone +
-/// auto-Send so they satisfy the bound at no runtime cost.
+/// **Byte-stability caveat** (R12.3.1): per-strip rendering produces
+/// different pixel hashes than single-strip. Voxlap's screen-line
+/// interpolation in `gline` parameterises rays by viewport-y bounds
+/// (via the corner-cut quad's grd / dxy); strips have narrower
+/// y-bounds, so the per-strip ray fan discretises slightly
+/// differently. The image is geometrically valid — each pixel still
+/// samples a camera-correct ray — but the 1/N strip discretisation
+/// drifts by a fraction of a voxel from the full-frame
+/// discretisation. For CI, oracle goldens are frozen at
+/// `--threads 1` (single strip = full frame, byte-stable).
+///
+/// `R: Clone + Send + Sync` is required by the parallel branch even
+/// when it doesn't fire — keeping the bound consistent across both
+/// paths means the generic body monomorphizes once. The `Sync` bound
+/// shows up because `rayon::par_iter_mut`'s closure shares `&R` (the
+/// strip-cloning template) across worker threads. Test rasterizers
+/// (`Counts`, `RecordingRasterizer`) derive Clone + auto-Send/Sync
+/// so they satisfy the bound at no runtime cost.
 //
 // Sign convention: voxlap's opticast forwards everything as-is from
 // the static state; here it's all explicit parameters. The clippy
@@ -129,7 +173,7 @@ pub enum OpticastOutcome {
 // dimensions and won't wrap.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
 #[must_use]
-pub fn opticast<R: Rasterizer + Clone + Send>(
+pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     rasterizer: &mut R,
     pool: &mut ScratchPool,
     camera: &Camera,
@@ -170,23 +214,29 @@ pub fn opticast<R: Rasterizer + Clone + Send>(
         return OpticastOutcome::SkippedCameraInSolid;
     };
 
-    let proj = projection::derive_projection(
+    // Per-frame setup hook needs a `ScanContext` with cy / camera
+    // state populated; build a "setup-only" projection over the
+    // FULL frame y-range so frame_setup sees the same projection
+    // center the strips inherit.
+    let setup_proj = projection::derive_projection_with_y_range(
         &cs,
         settings.xres,
         settings.yres,
+        settings.y_start,
+        settings.y_end,
         settings.hx,
         settings.hy,
         settings.hz,
         settings.anginc,
     );
-    let rs = ray_step::derive_ray_step(&cs, proj.cx, proj.cy, settings.hz);
-
-    let ctx = ScanContext {
-        proj: &proj,
-        rs: &rs,
+    let setup_rs = ray_step::derive_ray_step(&cs, setup_proj.cx, setup_proj.cy, settings.hz);
+    let setup_ctx = ScanContext {
+        proj: &setup_proj,
+        rs: &setup_rs,
         prelude: &prelude,
         xres: settings.xres as i32,
-        yres: settings.yres as i32,
+        y_start: settings.y_start as i32,
+        y_end: settings.y_end as i32,
         anginc: settings.anginc,
         camera_state: &cs,
         camera_gstartz0: gstartz0,
@@ -200,62 +250,134 @@ pub fn opticast<R: Rasterizer + Clone + Send>(
     // parallel fan-out so subsequent clones inherit the populated
     // FrameCache. Stub rasterizers ignore via the trait's default
     // no-op.
-    rasterizer.frame_setup(&ctx);
+    rasterizer.frame_setup(&setup_ctx);
 
-    if pool.n_threads() >= 4 {
-        // R12.2.1 parallel branch — 4-way `rayon::join` nesting.
-        // Each quadrant runs on its own thread with:
-        //   * a clone of `rasterizer` (raw fb / zb pointers shared,
-        //     wedge-disjoint pixel writes safe);
-        //   * an exclusive `&mut ScanScratch` from one of the first
-        //     four pool slots;
-        //   * a shared `&ScanContext` (Sync — read-only).
-        // frame_setup ran above on the master, so all four clones
-        // already have FrameCache populated.
-        //
-        // Picked `rayon::join` over `rayon::scope` after benching
-        // both: scope's per-spawn overhead inflates p99 noticeably
-        // (~50 % spike on this hardware) for ~10 ms-frame renders;
-        // join's lower-latency path keeps the parallel branch from
-        // regressing the fast poses.
-        let mut r0 = rasterizer.clone();
-        let mut r1 = rasterizer.clone();
-        let mut r2 = rasterizer.clone();
-        let mut r3 = rasterizer.clone();
-        let (s0, s1, s2, s3) = pool.split_first_4();
-        let ctx_ref = &ctx;
-        // Quadrant ordering matters: rayon::join runs the first
-        // arg on the calling thread and pushes the second arg for
-        // a worker to steal. If the first arg finishes before any
-        // worker steals, the second runs on the calling thread
-        // (sequential fallback). Putting `bottom` first — typically
-        // the heaviest quadrant on looking-down poses — gives
-        // workers time to pick up the other three.
-        rayon::join(
-            || bottom_quadrant(&mut r0, s0, ctx_ref),
-            || {
-                rayon::join(
-                    || top_quadrant(&mut r1, s1, ctx_ref),
-                    || {
-                        rayon::join(
-                            || right_quadrant(&mut r2, s2, ctx_ref),
-                            || left_quadrant(&mut r3, s3, ctx_ref),
-                        )
-                    },
-                )
-            },
-        );
-    } else {
-        // Sequential — slot 0 only. Pre-R12.2 shape; byte-stable
-        // baseline that the oracle goldens are frozen against.
+    let n_strips = pool.n_threads();
+    if n_strips <= 1 {
+        // Sequential — slot 0, full settings. Byte-stable golden
+        // baseline.
         let scratch = pool.slot_mut(0);
-        top_quadrant(rasterizer, scratch, &ctx);
-        right_quadrant(rasterizer, scratch, &ctx);
-        bottom_quadrant(rasterizer, scratch, &ctx);
-        left_quadrant(rasterizer, scratch, &ctx);
+        top_quadrant(rasterizer, scratch, &setup_ctx);
+        right_quadrant(rasterizer, scratch, &setup_ctx);
+        bottom_quadrant(rasterizer, scratch, &setup_ctx);
+        left_quadrant(rasterizer, scratch, &setup_ctx);
+    } else {
+        // Per-strip parallel (R12.3.1). Slice the y-range into N
+        // strips of `~strip_height` rows each. Each strip runs its
+        // own opticast against its own slot. See
+        // `run_strip_parallel` for the per-strip body.
+        run_strip_parallel(
+            rasterizer,
+            pool,
+            settings,
+            &cs,
+            &prelude,
+            gstartz0,
+            gstartz1,
+            camera_vptr_offset,
+        );
     }
 
     OpticastOutcome::Rendered
+}
+
+/// Per-strip parallel body. Splits `[settings.y_start, settings.y_end)`
+/// into `pool.n_threads()` contiguous row strips and runs one
+/// opticast pass per strip via `rayon::par_iter_mut`. Each strip:
+///
+/// * clones `rasterizer` (raw fb / zb pointers in the
+///   [`crate::scalar_rasterizer::RasterTarget`] are `Copy`; the
+///   strip-disjoint row writes make the aliasing safe);
+/// * gets exclusive `&mut ScanScratch` access to one pool slot via
+///   `par_iter_mut`'s borrow split;
+/// * derives its own [`crate::projection::ProjectionRect`] with
+///   wy0 / wy1 clipped to the strip — `gline` and the four scan
+///   loops then auto-clip ray casts and pixel writes;
+/// * runs the four quadrants over its strip.
+//
+// Per-strip projection re-derivation is fast (a handful of f32
+// ops). prelude + camera_state are shared `&` borrows — Sync, no
+// per-strip allocation.
+#[allow(clippy::too_many_arguments)]
+fn run_strip_parallel<R: Rasterizer + Clone + Send + Sync>(
+    rasterizer: &mut R,
+    pool: &mut ScratchPool,
+    settings: &OpticastSettings,
+    cs: &CameraState,
+    prelude: &OpticastPrelude,
+    gstartz0: i32,
+    gstartz1: i32,
+    camera_vptr_offset: usize,
+) {
+    let n_strips = pool.n_threads();
+    let y_start_total = settings.y_start;
+    let y_end_total = settings.y_end;
+    let span = y_end_total.saturating_sub(y_start_total);
+    if span == 0 {
+        return;
+    }
+
+    // `(span + n - 1) / n` → ceiling-divide so trailing rows aren't
+    // dropped on non-divisible splits. Last strip may be smaller.
+    #[allow(clippy::cast_possible_truncation)]
+    let strip_height: u32 = ((span + n_strips as u32 - 1) / n_strips as u32).max(1);
+
+    // Capture borrowed copies for the parallel closure — closure
+    // needs `move` for the cloned rasterizer + slot, but the
+    // shared `&` borrows below are Send + Sync via auto-impl.
+    let rasterizer_template = &*rasterizer;
+    let cs_ref: &CameraState = cs;
+    let prelude_ref: &OpticastPrelude = prelude;
+    let settings_ref: &OpticastSettings = settings;
+
+    pool.slots_mut_slice()
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(i, scratch)| {
+            #[allow(clippy::cast_possible_truncation)]
+            let strip_y_start =
+                y_start_total.saturating_add((i as u32).saturating_mul(strip_height));
+            let strip_y_end = strip_y_start.saturating_add(strip_height).min(y_end_total);
+            if strip_y_start >= strip_y_end {
+                // Tail strip past the actual y-range — happens when
+                // n_strips > span (e.g., 16 strips on a 12-row span).
+                return;
+            }
+
+            let strip_proj = projection::derive_projection_with_y_range(
+                cs_ref,
+                settings_ref.xres,
+                settings_ref.yres,
+                strip_y_start,
+                strip_y_end,
+                settings_ref.hx,
+                settings_ref.hy,
+                settings_ref.hz,
+                settings_ref.anginc,
+            );
+            let strip_rs =
+                ray_step::derive_ray_step(cs_ref, strip_proj.cx, strip_proj.cy, settings_ref.hz);
+            #[allow(clippy::cast_possible_wrap)]
+            let strip_ctx = ScanContext {
+                proj: &strip_proj,
+                rs: &strip_rs,
+                prelude: prelude_ref,
+                xres: settings_ref.xres as i32,
+                y_start: strip_y_start as i32,
+                y_end: strip_y_end as i32,
+                anginc: settings_ref.anginc,
+                camera_state: cs_ref,
+                camera_gstartz0: gstartz0,
+                camera_gstartz1: gstartz1,
+                camera_vptr_offset,
+            };
+
+            let mut strip_rasterizer: R = rasterizer_template.clone();
+            top_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
+            right_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
+            bottom_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
+            left_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
+        });
 }
 
 /// Slice `slab_buf` at column `idx`'s byte range (per the

@@ -84,8 +84,16 @@ pub struct RasterTarget<'a> {
 // SAFETY: `RasterTarget` is morally a borrowed mutable slice pair —
 // the same shape `&'a mut [u32]` / `&'a mut [f32]` would have, both of
 // which are `Send` when `T: Send`. Multi-thread safety is enforced
-// by the wedge-disjoint invariant on copies (see struct doc).
+// by the wedge / strip-disjoint write invariant (see struct doc).
 unsafe impl Send for RasterTarget<'_> {}
+
+// SAFETY: sharing `&RasterTarget` across threads exposes only the
+// raw pointers + lengths. Reading a pointer field is itself free of
+// data races; concurrent writes through the pointer are gated by
+// the disjoint-write invariant the caller upholds. Required so
+// `ScalarRasterizer: Sync`, which `rayon::par_iter_mut` needs to
+// share `&rasterizer` across the strip-parallel closures (R12.3.1).
+unsafe impl Sync for RasterTarget<'_> {}
 
 impl<'a> RasterTarget<'a> {
     /// Build a target from exclusive slice borrows. The slices are
@@ -334,17 +342,18 @@ pub struct ScalarRasterizer<'a> {
     frame: Option<FrameCache>,
 }
 
-// R12.2.1: opticast's parallel branch fans the rasterizer across 4
-// rayon-managed threads — each thread owns its own clone. The clones
-// share `target: RasterTarget` (raw pointers; safe under the
-// wedge-disjoint pixel-write invariant documented on RasterTarget),
-// hold &-refs into the slab/column data (Sync), and have
-// independent FrameCache copies. Compile-time check: this fails if
-// any field becomes non-Send (e.g. Rc<...>) so the parallel path
-// can no longer hold.
+// R12.2.1 / R12.3.1: opticast's parallel branches fan the rasterizer
+// across rayon-managed threads — each thread owns its own clone. The
+// clones share `target: RasterTarget` (raw pointers; safe under the
+// strip-disjoint pixel-write invariant documented on RasterTarget),
+// hold &-refs into the slab/column data (Sync), and have independent
+// FrameCache copies. Compile-time checks: this fails if any field
+// becomes non-Send/non-Sync so the parallel path can no longer hold.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
     assert_send::<ScalarRasterizer<'_>>();
+    assert_sync::<ScalarRasterizer<'_>>();
 };
 
 impl<'a> ScalarRasterizer<'a> {
@@ -913,7 +922,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 64,
-            yres: 64,
+            y_start: 0,
+            y_end: 64,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -945,7 +955,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 64,
-            yres: 64,
+            y_start: 0,
+            y_end: 64,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -1050,7 +1061,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 64,
-            yres: 64,
+            y_start: 0,
+            y_end: 64,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -1196,7 +1208,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 64,
-            yres: 64,
+            y_start: 0,
+            y_end: 64,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -1252,7 +1265,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 64,
-            yres: 64,
+            y_start: 0,
+            y_end: 64,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,

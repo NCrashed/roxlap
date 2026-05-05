@@ -74,6 +74,39 @@ pub struct ProjectionRect {
 /// `xres` / `yres` globals plus the `(dahx, dahy, dahz)` parameters
 /// of `setcamera` and the `vx5.anginc` config knob. Oracle defaults
 /// are `(width / 2, height / 2, width / 2)` and `anginc = 1`.
+///
+/// Equivalent to [`derive_projection_with_y_range`] with
+/// `y_start = 0, y_end = yres` (full-frame opticast — the pre-R12.3
+/// behaviour preserved bit-exactly). Kept for the in-tree projection
+/// tests that exercise the full-frame math; opticast itself calls
+/// the `with_y_range` variant directly.
+#[allow(dead_code)]
+#[must_use]
+pub fn derive_projection(
+    camera_state: &CameraState,
+    xres: u32,
+    yres: u32,
+    hx: f32,
+    hy: f32,
+    hz: f32,
+    anginc: i32,
+) -> ProjectionRect {
+    derive_projection_with_y_range(camera_state, xres, yres, 0, yres, hx, hy, hz, anginc)
+}
+
+/// Derive the projection rectangle clipped to a horizontal strip
+/// `[y_start, y_end)`. R12.3.0 entry point — the per-strip parallel
+/// dispatch (R12.3.1) calls this once per strip with the strip's
+/// y-range.
+///
+/// The camera projection center `(cx, cy)` is computed in absolute
+/// screen coords, exactly as for the full-frame call — `cy` may
+/// even fall outside the strip (e.g. a top strip with the camera
+/// horizon above it). Only the viewport edges (`wy0` / `wy1` /
+/// `iwy0` / `iwy1`) and the corner-cut quadrilateral are clipped.
+/// `vline_clip` / `hline_clip` consume the clipped wy0/wy1, so
+/// pass-1 ray casts in scan_loops automatically restrict to the
+/// strip.
 //
 // clippy::float_cmp at `forward_z == 0.0` is intentional: voxlap's C
 // is `if (gifor.z == 0)` — exact zero check before dividing by it.
@@ -86,13 +119,16 @@ pub struct ProjectionRect {
     clippy::cast_sign_loss,
     clippy::float_cmp,
     clippy::similar_names,
+    clippy::too_many_arguments,
     clippy::too_many_lines
 )]
 #[must_use]
-pub fn derive_projection(
+pub fn derive_projection_with_y_range(
     camera_state: &CameraState,
     xres: u32,
-    yres: u32,
+    _yres: u32,
+    y_start: u32,
+    y_end: u32,
     hx: f32,
     hy: f32,
     hz: f32,
@@ -108,12 +144,14 @@ pub fn derive_projection(
     let cx = camera_state.right[2] * f + hx;
     let cy = camera_state.down[2] * f + hy;
 
-    // anginc-padded viewport.
+    // anginc-padded viewport, with the strip's y-range substituted
+    // for the full-frame `0..yres`. wx0 / wx1 are unaffected — strips
+    // are full-x.
     let anginc_f = anginc as f32;
     let wx0 = -anginc_f;
     let wx1 = (xres as i32 - 1) as f32 + anginc_f;
-    let wy0 = -anginc_f;
-    let wy1 = (yres as i32 - 1) as f32 + anginc_f;
+    let wy0 = (y_start as i32) as f32 - anginc_f;
+    let wy1 = (y_end as i32 - 1) as f32 + anginc_f;
     let iwx0 = wx0.round_ties_even() as i32;
     let iwx1 = wx1.round_ties_even() as i32;
     let iwy0 = wy0.round_ties_even() as i32;

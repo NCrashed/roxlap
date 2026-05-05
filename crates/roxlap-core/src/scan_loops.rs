@@ -24,13 +24,23 @@ use crate::ray_step::RayStep;
 /// arguments each. None of the borrows are mutable — the loops only
 /// produce calls through the [`Rasterizer`] trait + side effects on
 /// [`ScanScratch`].
+///
+/// `y_start..y_end` is the iteration range in screen-y this scan
+/// covers. For full-frame opticast this is `0..yres` (pre-R12.3
+/// behaviour). For per-strip parallel rendering (R12.3.1+) each
+/// strip narrows the range; the four scan loops clip their sy
+/// iteration accordingly.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanContext<'a> {
     pub proj: &'a ProjectionRect,
     pub rs: &'a RayStep,
     pub prelude: &'a OpticastPrelude,
     pub xres: i32,
-    pub yres: i32,
+    /// First sy this strip processes (inclusive).
+    pub y_start: i32,
+    /// One past the last sy (exclusive). Equals the framebuffer's
+    /// `yres` for full-frame opticast.
+    pub y_end: i32,
     pub anginc: i32,
     /// Camera basis + frustum corners. Concrete rasterizers' real
     /// `gline` (R4.3a-rewire-3b) projects per-ray endpoints through
@@ -222,23 +232,24 @@ pub fn top_quadrant<R: Rasterizer>(
     let mut p1 = lbound0(p1_init, ctx.xres);
 
     let mut sy = (p.cy - 0.50005).round_ties_even() as i32;
-    if sy >= ctx.yres {
-        sy = ctx.yres - 1;
+    if sy >= ctx.y_end {
+        sy = ctx.y_end - 1;
     }
 
     // Anti-crash: voxlap's float-overflow guard. Step sy down until
     // ftol(f_scale) won't push (sy<<16)-cy16 into a value the
-    // shldiv16 below would overflow on.
+    // shldiv16 below would overflow on. Clipped to ctx.y_start so
+    // strip renders don't iterate below the strip's top edge.
     let ff_check = ((p1 as f32 - p.cx).abs() + 1.0) * f_scale / 2_147_483_647.0 + p.cy;
-    while ff_check < sy as f32 && sy >= 0 {
+    while ff_check < sy as f32 && sy >= ctx.y_start {
         sy -= 1;
     }
-    if sy < 0 {
+    if sy < ctx.y_start {
         return;
     }
 
     let kmul = ftol(f_scale);
-    while sy >= 0 {
+    while sy >= ctx.y_start {
         if isshldiv16safe(kmul, (sy << 16) - rs.cy16) != 0 {
             break;
         }
@@ -249,7 +260,7 @@ pub fn top_quadrant<R: Rasterizer>(
     // -giforzsgn (i.e. when looking up sy decreases, i increases for
     // -1 sign or decreases for +1 sign).
     let mut i = if forward_z_sign < 0 { -sy } else { sy };
-    while sy >= 0 {
+    while sy >= ctx.y_start {
         let ui = shldiv16(kmul, (sy << 16) - rs.cy16);
         let mut u = mulshr16((p0 << 16) - rs.cx16, ui) + kadd;
 
@@ -352,20 +363,20 @@ pub fn bottom_quadrant<R: Rasterizer>(
     let mut p1 = lbound0(p1_init, ctx.xres);
 
     let mut sy = (p.cy + 0.50005).round_ties_even() as i32;
-    if sy < 0 {
-        sy = 0;
+    if sy < ctx.y_start {
+        sy = ctx.y_start;
     }
 
     let ff_check = ((p1 as f32 - p.cx).abs() + 1.0) * f_scale / 2_147_483_647.0 + p.cy;
-    while ff_check > sy as f32 && sy < ctx.yres {
+    while ff_check > sy as f32 && sy < ctx.y_end {
         sy += 1;
     }
-    if sy >= ctx.yres {
+    if sy >= ctx.y_end {
         return;
     }
 
     let kmul = ftol(f_scale);
-    while sy < ctx.yres {
+    while sy < ctx.y_end {
         if isshldiv16safe(kmul, (sy << 16) - rs.cy16) != 0 {
             break;
         }
@@ -373,7 +384,7 @@ pub fn bottom_quadrant<R: Rasterizer>(
     }
 
     let mut i = if forward_z_sign < 0 { sy } else { -sy };
-    while sy < ctx.yres {
+    while sy < ctx.y_end {
         let ui = shldiv16(kmul, (sy << 16) - rs.cy16);
         let mut u = mulshr16((p0 << 16) - rs.cx16, ui) + kadd;
 
@@ -464,8 +475,11 @@ pub fn right_quadrant<R: Rasterizer>(
     let kadd = ftol((p.cy - p.y1) * grd * f_scale);
 
     let p1_init = (p.cy - 0.5).round_ties_even() as i32;
-    let mut p0 = lbound0(p1_init + 1, ctx.yres);
-    let mut p1 = lbound0(p1_init, ctx.yres);
+    // Strip-aware clamp: p0/p1 are sy values that must stay inside
+    // [y_start, y_end). lbound0 only clamps to [0, b]; for strip
+    // renders that y_start > 0, the extra `.max(y_start)` floors it.
+    let mut p0 = lbound0(p1_init + 1, ctx.y_end).max(ctx.y_start);
+    let mut p1 = lbound0(p1_init, ctx.y_end).max(ctx.y_start);
 
     let mut sx = (p.cx + 0.50005).round_ties_even() as i32;
     if sx < 0 {
@@ -492,8 +506,8 @@ pub fn right_quadrant<R: Rasterizer>(
         let ui = shldiv16(kmul, (sx << 16) - rs.cx16);
         let mut u = mulshr16((p0 << 16) - rs.cy16, ui) + kadd;
 
-        // Walk p0 left, populating lastx along the way.
-        while p0 > 0 && u >= ui {
+        // Walk p0 left (toward strip top), populating lastx.
+        while p0 > ctx.y_start && u >= ui {
             u -= ui;
             p0 -= 1;
             scratch.lastx[p0 as usize] = sx;
@@ -502,8 +516,8 @@ pub fn right_quadrant<R: Rasterizer>(
         scratch.uurend[sx as usize] = u;
         scratch.uurend[sx as usize + scratch.uurend_half_stride] = ui;
         u += (p1 - p0) * ui;
-        // Walk p1 right, populating lastx.
-        while p1 < ctx.yres && u < j_fixed {
+        // Walk p1 right (toward strip bottom), populating lastx.
+        while p1 < ctx.y_end && u < j_fixed {
             u += ui;
             scratch.lastx[p1 as usize] = sx;
             p1 += 1;
@@ -596,8 +610,9 @@ pub fn left_quadrant<R: Rasterizer>(
     let kadd = ftol((p.cy - p.y0) * grd * f_scale);
 
     let p1_init = (p.cy - 0.5).round_ties_even() as i32;
-    let mut p0 = lbound0(p1_init + 1, ctx.yres);
-    let mut p1 = lbound0(p1_init, ctx.yres);
+    // Strip-aware p0/p1 clamp; see right_quadrant for the same shape.
+    let mut p0 = lbound0(p1_init + 1, ctx.y_end).max(ctx.y_start);
+    let mut p1 = lbound0(p1_init, ctx.y_end).max(ctx.y_start);
 
     let mut sx = (p.cx - 0.50005).round_ties_even() as i32;
     if sx >= ctx.xres {
@@ -624,7 +639,7 @@ pub fn left_quadrant<R: Rasterizer>(
         let ui = shldiv16(kmul, (sx << 16) - rs.cx16);
         let mut u = mulshr16((p0 << 16) - rs.cy16, ui) + kadd;
 
-        while p0 > 0 && u >= ui {
+        while p0 > ctx.y_start && u >= ui {
             u -= ui;
             p0 -= 1;
             scratch.lastx[p0 as usize] = sx;
@@ -632,7 +647,7 @@ pub fn left_quadrant<R: Rasterizer>(
         scratch.uurend[sx as usize] = u;
         scratch.uurend[sx as usize + scratch.uurend_half_stride] = ui;
         u += (p1 - p0) * ui;
-        while p1 < ctx.yres && u < j_fixed {
+        while p1 < ctx.y_end && u < j_fixed {
             u += ui;
             scratch.lastx[p1 as usize] = sx;
             p1 += 1;
@@ -858,7 +873,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -885,7 +901,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -911,7 +928,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -940,7 +958,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -966,7 +985,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -988,7 +1008,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -1016,7 +1037,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -1040,7 +1062,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -1062,7 +1085,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -1085,7 +1109,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -1106,7 +1131,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,
@@ -1141,7 +1167,8 @@ mod tests {
             rs: &rs,
             prelude: &prelude,
             xres: 640,
-            yres: 480,
+            y_start: 0,
+            y_end: 480,
             anginc: 1,
             camera_state: &cs,
             camera_gstartz0: 0,

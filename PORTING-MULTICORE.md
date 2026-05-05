@@ -45,7 +45,7 @@ per arch).
 | 3 | **CI stays single-threaded; multicore is opt-in.** The 12 voxlap-C oracle goldens are byte-stable bit-exactness gates, not perf gates — they run with `n_threads = 1` regardless of host threading. | Bit-exact regression detection survives R12 untouched. A separate per-thread oracle run (added in R12.5) asserts hash equality across `--threads {1, 2, 4, 8}`. |
 | 4 | **Per-quadrant first (R12.2), per-tile second (R12.3).** Per-quadrant's seam already exists in `scan_loops.rs`; landing it first proves the per-thread `ScanScratch` plumbing before tackling the larger tile restructure. | Two perf milestones (~2–3× then ~3–5×) instead of one big-bang. Each ships as its own commit with its own bench numbers. |
 | 5 | **`split_at_mut` where possible, raw pointers only where required.** Per-tile row strips are contiguous and split safely; per-quadrant wedges are pixel-disjoint but row-overlapping, so quadrants either use unsafe disjoint pointers with a wedge invariant or per-thread render-then-merge. R12.2 picks one based on Rust borrow-checker friction. | Maximises safe-Rust coverage. Any unsafe is localised to one or two functions with a documented invariant. |
-| 6 | **Pixel-write determinism per thread.** Each thread writes only to its own region (its quadrant wedge or its tile row range). `gscanptr`, `radar[]`, `uurend[]`, `cf[]` are all in per-thread `ScanScratch`. No cross-thread atomics on the hot path. | Output is deterministic regardless of `rayon`'s work-stealing schedule. Same input → same bytes. |
+| 6 | **Pixel-write determinism per thread; output deterministic at fixed N.** Each strip writes only to its own row range. `gscanptr`, `radar[]`, `uurend[]`, `cf[]` are all in per-thread `ScanScratch`. No cross-thread atomics on the hot path. The same render at the same N produces bit-identical bytes; **the same render at different N produces drifted bytes** (see "Byte-stability tradeoff" below) — this is fundamental to voxlap's per-ray screen-line interpolation, not a bug in the parallelisation. | Output deterministic at fixed N, drifts across N. CI freezes goldens at N=1. |
 | 7 | **Default thread count = `rayon`'s global pool default.** That's `num_cpus::get()` unless overridden by `RAYON_NUM_THREADS`. Hosts that want explicit control pass `n_threads` to `new_parallel`. | One less knob to document. Standard rayon ergonomics. |
 
 ## Sub-substage roadmap
@@ -55,7 +55,7 @@ per arch).
 | **R12.0** | Author `PORTING-MULTICORE.md` (this doc) + add `rayon` workspace dep. No code wired yet. | 0.5 d | Doc lands; `cargo build` green; `cargo test` green. |
 | **R12.1** | Introduce `ScratchPool` (host-owned `Vec<ScanScratch>`). Opticast signature changes from `&mut ScanScratch` to `&mut ScratchPool`; R12.1 indexes slot 0 only. `ScratchPool::new` (1 slot, single-threaded) and `::new_parallel(.., n_threads)` (N slots). Per-frame setters broadcast to every slot. | 1–2 d | All existing tests pass; oracle goldens byte-stable at the default thread count (still 1, just now plumbed through the pool). |
 | **R12.2** | Per-quadrant 4-way via `rayon::join`. Each quadrant runs against its own pool slot. Framebuffer/zbuffer split via raw pointers + a wedge-disjoint invariant. Split into R12.2.0 (RasterTarget refactor — `ScalarRasterizer`'s fb/zb fields → `Copy + Send` raw-pointer view) and R12.2.1 (parallel dispatch + `--threads N` oracle flag). | 3–5 d (landed) | Oracle goldens byte-stable across `--threads 1` and `--threads 4` ✅. **Bench gate (≥2× on 6/12 poses) NOT met** — actual mean speedup 1.08× on Intel i7-12700H, best per-pose 1.77× (sprite_above), worst 1.0× (north). Per-quadrant geometry has fundamental load-imbalance: floor-heavy poses concentrate 60–80 % of rays in one quadrant, capping speedup at 1/(0.6..0.8). R12.3 per-tile parallelism is where the real perf landing happens. |
-| **R12.3** | Per-tile N-way via `rayon::par_iter` over `Vec<RowStrip>`. Each strip has a restricted frustum + its own `ScanScratch` slot sized by the strip's pixel range. Strips ARE contiguous in row-major, so `framebuffer.split_at_mut` works (no unsafe). | 5–7 d | `bench --threads N` scaling curve for N ∈ {1, 2, 4, 8}; oracle goldens byte-stable at every N. |
+| **R12.3** | Per-strip N-way via `rayon::par_iter_mut` over `pool.scratches[..]`. Each strip is a full opticast pass with `OpticastSettings::y_start` / `y_end` clipped to the strip's row range. Each strip clones the rasterizer (`RasterTarget` `Copy + Send + Sync`) and writes into its own row range — strip-disjoint pixel writes make the aliasing safe. Split into R12.3.0 (`y_start` / `y_end` plumbing through `OpticastSettings`, `derive_projection`, `ScanContext`, scan_loops sy-iteration clips) and R12.3.1 (parallel dispatch + R12.2.1 per-quadrant code retired). | 5–7 d (landed) | **Goldens byte-stable at `--threads 1` only** — see "Byte-stability tradeoff" below. R12.2.1's per-quadrant rayon::join was retired; per-strip is THE parallel mode. Bench peaks at N=4 (1.49× mean, 2.14× best pose; declining past N=8). |
 | **R12.4** | `update_lighting` per-column outer loop → `par_iter`. Sprites (`Engine::sprites`) → `par_iter` with z-test arbitrating final pixel writes. | 1–2 d | World-bake bench number; sprite oracle goldens (5 poses) byte-stable at every thread count. |
 | **R12.5** | `roxlap-oracle bench --threads N` flag + scaling docs in `README.md` (or a new `BENCH.md`). Per-thread oracle (`oracle diff --threads N`) added to CI as a non-blocking job. | 0.5 d | Bench output reproducible across thread counts; CI green. |
 
@@ -255,62 +255,125 @@ Parallel bugs are non-deterministic. Mitigations:
 - Bench prints which thread count it ran at so flaky runs can
   always be re-checked single-threaded.
 
-## Bench projection vs measured (R12.2.1, 2026-05-05)
+## Byte-stability tradeoff (R12.3.1)
+
+R12.3.1 **drops** byte-stability across strip counts. The original
+plan promised "oracle goldens stay byte-stable at every N", but
+that's incompatible with how voxlap's `gline` / scan-loop
+algorithm works.
+
+`gline` parameterises a per-ray screen-space line via `(cast_x0,
+iy0, cast_x1, iy1)` endpoints derived from the corner-cut
+quadrilateral and viewport-y bounds (`wy0` / `wy1`). The line's
+`grd = 1 / (wy0 - cy)` and the cell-step `gi0 / gi1` both depend
+on viewport-y, so a strip with narrower y-bounds ends up
+discretising rays at slightly different cell positions than a full-
+frame pass would. At a strip boundary, an adjacent pixel rendered
+in strip `k` vs strip `k+1` reads slightly different cells from
+its radar — geometrically correct (still a camera-correct ray),
+but quantised differently.
+
+Concretely (worked out during R12.3.0 validation):
+
+- For a level-horizon pose (`cy ≈ 32240` for forward-z=0 / clamp
+  to `F_CLAMP`), full-frame `grd ≈ -3.103e-5`. Strip-bottom-half
+  `grd ≈ -3.114e-5`. ~0.4 % delta.
+- That delta cascades into the `dxy = (f_ray - cx) * grd`
+  per-pixel screen-x, so `sample_x(strip, sy=120) ≈ dxy_strip + f_ray`
+  vs `sample_x(full, sy=120) ≈ 120 * dxy_full + f_ray`. Different
+  world cell, different colour for the same screen pixel.
+
+The visual impact is sub-pixel: it looks identical to the eye
+across N. But the FNV-1a hashes of the framebuffer drift across
+strip counts. This is the same kind of drift that affects
+`sprite_above` / `sprite_coco` between CPU vendors via
+`_mm_rcp_ps` — geometric correctness preserved, bit-stability
+lost.
+
+### What's still byte-stable
+
+- **CI gate**: `--threads 1` produces single-strip = full-frame
+  opticast, byte-identical to pre-R12.3 hashes. Oracle goldens
+  remain frozen at `--threads 1`. Regressions there still
+  block merges.
+- **At fixed N**: rayon's work-stealing doesn't introduce
+  nondeterminism — strip `k`'s output depends only on the camera
+  + scene, not on which worker thread happened to pick it up.
+  Re-running `--threads 4` produces the same hashes.
+
+### What was considered and rejected
+
+- **Path A (parallel pass-2 only)**: pass-1 (`gline` ray cast)
+  runs sequentially; pass-2 (rasterization) splits sy across
+  strips. Byte-stable. But Amdahl-bounded: `gline` is the
+  dominant cost (~70 % typical), so even infinite-thread parallel
+  pass-2 caps speedup at ~1.4×. Right / left quadrants also have
+  inter-sy state in `uurend` that doesn't naturally split.
+- **Per-quadrant 4-way (R12.2.1)**: byte-stable, but capped at
+  ~1.7× by load imbalance and only achieved 1.08× mean in
+  practice on the dev hardware.
+
+Path B (this stage) trades the across-N byte-stability gate for
+real speedup. R12.2.1's per-quadrant code is retired.
+
+## Bench projection vs measured (R12.3.1, 2026-05-05)
 
 | variant | ms / frame | fps | speedup |
 |---|---|---|---|
-| **single-threaded (R12.1 baseline)** | 10.4 | 96.5 | 1× |
-| R12.2 per-quadrant 4-way (projected) | ~4–5 | 200–250 | 2–3× |
-| **R12.2 per-quadrant 4-way (measured, i7-12700H, 30 iters)** | **9.6** | **104.2** | **1.08× mean (1.77× best, 1.0× worst)** |
-| R12.3 per-tile 8-way | ~2–3 | 350–500 | 3–5× |
-| R12.3 per-tile 16-way (server) | ~1.5–2 | 500–700 | 5–7× |
+| **single-threaded (R12.1 baseline, retaken under R12.3.1)** | 10.98 | 91.1 | 1× |
+| R12.2 per-quadrant 4-way (retired, was 1.08× mean) | — | — | — |
+| **R12.3.1 per-strip 2-way** | 7.80 | 128.2 | 1.41× |
+| **R12.3.1 per-strip 4-way (peak)** | **7.36** | **135.8** | **1.49× mean (2.14× best, 1.14× worst)** |
+| R12.3.1 per-strip 8-way | 9.90 | 101.0 | 1.11× |
+| R12.3.1 per-strip 16-way | 11.06 | 90.4 | 1.01× |
 
-R12.2's projection turned out optimistic. Per-pose actuals on
-i7-12700H (20 logical / 14 physical cores; default rayon pool):
+R12.3.1 per-pose actuals on i7-12700H (20 logical / 14 physical
+cores; default rayon pool):
 
-| pose | 1-thread ms | 4-thread ms | speedup |
+| pose | 1-strip ms | 4-strip ms | speedup |
 |---|---|---|---|
-| north | 7.66 | 8.06 | 0.95× |
-| east | 7.67 | 8.54 | 0.90× |
-| diag_down | 11.39 | 10.99 | 1.04× |
-| high_down | 13.82 | 10.87 | 1.27× |
-| sprite_front | 7.30 | 7.25 | 1.01× |
-| sprite_above | 8.49 | 4.91 | 1.73× |
-| sprite_iso | 10.30 | 10.23 | 1.01× |
-| sprite_coco | 9.88 | 9.62 | 1.03× |
-| diag_down_lit | 11.94 | 11.27 | 1.06× |
-| tile_1x | 11.97 | 11.46 | 1.04× |
-| tile_half | 12.09 | 11.41 | 1.06× |
-| tile_blend | 11.86 | 11.45 | 1.04× |
+| north | 8.16 | 7.16 | 1.14× |
+| east | 8.03 | 6.78 | 1.18× |
+| diag_down | 12.07 | 8.31 | 1.45× |
+| high_down | 15.36 | 8.43 | 1.82× |
+| sprite_front | 7.68 | 6.68 | 1.15× |
+| sprite_above | 8.81 | 4.11 | **2.14×** |
+| sprite_iso | 11.21 | 7.54 | 1.49× |
+| sprite_coco | 10.22 | 6.95 | 1.47× |
+| diag_down_lit | 12.33 | 8.14 | 1.51× |
+| tile_1x | 12.62 | 7.75 | 1.63× |
+| tile_half | 12.23 | 8.54 | 1.43× |
+| tile_blend | 12.99 | 7.98 | 1.63× |
 
-Floor-heavy poses (high_down, sprite_above) get the most benefit
-because most rays land in one quadrant — the heavy quadrant takes
-the wall-clock floor, the others finish fast and idle. Balanced
-poses (north, east) actually regress slightly: rayon's fork-join
-overhead + 4× ScanScratch cache pressure (4 × 7.6 MB = 30 MB,
-borderline vs 24 MB L3) outweigh any parallel gain.
+Better than R12.2.1's 1.08× mean / 1.77× best, but still well
+below the 3–5× the original plan projected. Why per-strip fell
+short of projection:
 
-Why per-quadrant fell short of projection:
-1. **Load imbalance**: voxlap's 4-quadrant geometry is not 4× even
-   in practice. Even level-horizon shots have ~50–60 % of rays in
-   bottom (floor) and ~10–20 % each in top / right / left (sky +
-   horizon corners). Amdahl caps speedup at ~1/(0.5..0.6) ≈ 1.7–2×.
-2. **Cache pressure**: 4 × 7.6 MB scratches at 640×480 hovers
-   around L3 capacity; per-thread radar reads compete with
-   framebuffer / zbuffer writes for memory bandwidth.
-3. **`rayon::join` sequential fallback**: when the calling thread
-   completes its first quadrant before any worker steals the
-   second, rayon runs the second locally. Inevitable for
-   sub-millisecond quadrants on light poses.
+1. **Per-strip fixed overhead**: each strip re-derives projection
+   + ray-step (small but non-zero), clones the rasterizer's
+   `FrameCache` (one `Vec<i32>` alloc per strip), runs all four
+   quadrants' setup. With 8 strips of 60 rows each, fixed
+   overhead × 8 ≈ the parallel time saved.
+2. **Memory bandwidth**: 4–8 × 7.6 MB per-thread scratches
+   compete for the i7-12700H's 24 MB L3. Past N=4 we're spilling
+   to main memory.
+3. **rayon spawn overhead**: ~10–50 µs per task. With 16 strips
+   at ~0.7 ms each, overhead dominates the strip's wall time.
+4. **Hybrid CPU scheduling**: the i7-12700H is 6 P-cores + 8
+   E-cores. P-cores ~3–5 GHz, E-cores ~2–3 GHz. Past N=6, rayon
+   schedules onto E-cores which are slower per strip — worsening
+   the wallclock past the P-core count.
 
-R12.3 per-tile parallelism doesn't have any of these issues: each
-tile is a contiguous row strip with ~equal work, ScanScratch is
-sized per-strip (1/N the memory), and `par_iter` over a fixed-size
-strip vec doesn't have the sequential-fallback trap.
+Net: speedup peaks at N=4 (1.49× mean, 2.14× best), declines
+past that. **Reasonable default**: `ScratchPool::new_parallel(.., 4)`
+when callers want parallel rendering on consumer-class CPUs.
+Single-threaded `ScratchPool::new` remains the byte-stable
+default for tests / oracle / CI.
 
 The bench harness from CD.x (`roxlap-oracle bench`) captures
 min / p50 / mean / p99 / max per pose — same harness drives R12
-validation. `--threads N` flag added to bench + render in R12.2.1.
+validation. `--threads N` flag on bench + render switches between
+sequential and parallel paths.
 
 ## Reading list (for the implementing session)
 

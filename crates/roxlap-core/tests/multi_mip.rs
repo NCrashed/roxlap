@@ -84,6 +84,8 @@ fn render_and_hash(vxl: &vxl::Vxl, mip_levels: u32) -> u64 {
     let settings = OpticastSettings {
         xres: XRES,
         yres: YRES,
+        y_start: 0,
+        y_end: YRES,
         hx: half_w,
         hy: half_h,
         hz: half_w,
