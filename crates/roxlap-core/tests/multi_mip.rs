@@ -26,7 +26,7 @@ use std::io::Read;
 use flate2::read::GzDecoder;
 
 use roxlap_core::{
-    opticast, rasterizer::ScanScratch, scalar_rasterizer::ScalarRasterizer, Camera,
+    opticast, rasterizer::ScratchPool, scalar_rasterizer::ScalarRasterizer, Camera,
     OpticastOutcome, OpticastSettings,
 };
 use roxlap_formats::vxl;
@@ -63,7 +63,7 @@ fn render_and_hash(vxl: &vxl::Vxl, mip_levels: u32) -> u64 {
     let pixel_count = (XRES as usize) * (YRES as usize);
     let mut framebuffer = vec![0u32; pixel_count];
     let mut zbuffer = vec![0.0f32; pixel_count];
-    let mut scratch = ScanScratch::new_for_size(XRES, YRES, vxl.vsid);
+    let mut pool = ScratchPool::new(XRES, YRES, vxl.vsid);
 
     // Place camera inside the carved cavity (oracle world's playable
     // region is x=800..1248, y=800..1248) near the northern edge,
@@ -105,7 +105,7 @@ fn render_and_hash(vxl: &vxl::Vxl, mip_levels: u32) -> u64 {
         );
         let outcome = opticast(
             &mut rasterizer,
-            &mut scratch,
+            &mut pool,
             &cam,
             &settings,
             vxl.vsid,

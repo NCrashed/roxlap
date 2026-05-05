@@ -976,16 +976,17 @@ mod tests {
         // skycast into the radar — verify by setting a recognizable
         // skycast and asserting some pixels carry it.
         use crate::opticast as opticast_fn;
+        use crate::rasterizer::ScratchPool;
         use crate::OpticastSettings;
 
         let mut fb = vec![0u32; 640 * 480];
         let mut zb = vec![0.0f32; 640 * 480];
-        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let mut pool = ScratchPool::new(640, 480, 2048);
         // Recognizable sky colour — pixels filled by startsky's
         // solid-fill branch (the path the empty-colour-byte slab
         // ends up routing through) carry this.
         let sky_col = 0x80AB_CDEF_u32 as i32;
-        scratch.set_skycast(sky_col, 0x7FFF_FFFF);
+        pool.set_skycast(sky_col, 0x7FFF_FFFF);
 
         // Single solid slab at z = 200..254. cz = 128 < 200 →
         // air-above-the-slab, opticast renders. Synthetic world:
@@ -1021,7 +1022,7 @@ mod tests {
 
         let outcome = opticast_fn(
             &mut rasterizer,
-            &mut scratch,
+            &mut pool,
             &cam,
             &settings,
             2048,

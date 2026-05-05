@@ -271,6 +271,110 @@ impl ScanScratch {
     }
 }
 
+/// N-slot pool of [`ScanScratch`] buffers — one slot per render
+/// thread.
+///
+/// R12.0 introduced this as the host-owned ownership root for
+/// per-thread scratch. R12.1 wires it through [`crate::opticast`]
+/// (single slot in use). R12.2 will fan slots 0..4 across the four
+/// quadrant scan loops via `rayon::join`; R12.3 will distribute
+/// slots across N row strips via `par_iter`.
+///
+/// Per-frame setters ([`Self::set_skycast`] / [`Self::set_fog`] /
+/// [`Self::set_side_shades`]) broadcast to every slot — so once
+/// R12.2 fans out, each thread already sees the current frame's
+/// fog / sky / shading state on its private slot.
+///
+/// One slot is ~7.6 MB at 640 × 480 / vsid = 2048 (see
+/// `PORTING-MULTICORE.md` § "Memory cost"). Hosts allocate one
+/// pool at startup and reuse it across frames; the rasterizer is
+/// the per-frame object that borrows the framebuffer / zbuffer.
+#[derive(Debug)]
+pub struct ScratchPool {
+    scratches: Vec<ScanScratch>,
+}
+
+impl ScratchPool {
+    /// Single-slot pool — single-threaded rendering. Equivalent to
+    /// one [`ScanScratch::new_for_size`] allocation. The R12.0
+    /// default; preserves the pre-R12 single-threaded shape.
+    #[must_use]
+    pub fn new(xres: u32, yres: u32, vsid: u32) -> Self {
+        Self::new_parallel(xres, yres, vsid, 1)
+    }
+
+    /// `n_threads`-slot pool. Each slot holds its own ~7.6 MB
+    /// `ScanScratch`. Pass the value the host wants `rayon` to
+    /// fan out across; `n_threads = 0` is treated as 1 so
+    /// [`Self::slot_mut`]`(0)` is always valid.
+    ///
+    /// R12.1 only consumes slot 0; later sub-substages
+    /// (R12.2 / R12.3) start indexing additional slots.
+    #[must_use]
+    pub fn new_parallel(xres: u32, yres: u32, vsid: u32, n_threads: usize) -> Self {
+        let n = n_threads.max(1);
+        Self {
+            scratches: (0..n)
+                .map(|_| ScanScratch::new_for_size(xres, yres, vsid))
+                .collect(),
+        }
+    }
+
+    /// Number of slots in this pool — one per render thread.
+    #[must_use]
+    pub fn n_threads(&self) -> usize {
+        self.scratches.len()
+    }
+
+    /// Read-only access to one slot.
+    ///
+    /// # Panics
+    /// If `idx >= self.n_threads()`.
+    #[must_use]
+    pub fn slot(&self, idx: usize) -> &ScanScratch {
+        &self.scratches[idx]
+    }
+
+    /// Mutable access to one slot.
+    ///
+    /// # Panics
+    /// If `idx >= self.n_threads()`.
+    #[must_use]
+    pub fn slot_mut(&mut self, idx: usize) -> &mut ScanScratch {
+        &mut self.scratches[idx]
+    }
+
+    /// Mutable iterator over slots — used by the per-frame
+    /// broadcasters below.
+    pub(crate) fn slots_mut(&mut self) -> std::slice::IterMut<'_, ScanScratch> {
+        self.scratches.iter_mut()
+    }
+
+    /// Per-frame sky `(col, dist)` push, broadcast to every slot.
+    /// See [`ScanScratch::set_skycast`].
+    pub fn set_skycast(&mut self, col: i32, dist: i32) {
+        for s in self.slots_mut() {
+            s.set_skycast(col, dist);
+        }
+    }
+
+    /// Per-frame fog push, broadcast to every slot. See
+    /// [`ScanScratch::set_fog`].
+    pub fn set_fog(&mut self, col: i32, max_scan_dist: i32) {
+        for s in self.slots_mut() {
+            s.set_fog(col, max_scan_dist);
+        }
+    }
+
+    /// Per-frame side-shading push, broadcast to every slot. See
+    /// [`ScanScratch::set_side_shades`].
+    pub fn set_side_shades(&mut self, top: i8, bot: i8, left: i8, right: i8, up: i8, down: i8) {
+        for s in self.slots_mut() {
+            s.set_side_shades(top, bot, left, right, up, down);
+        }
+    }
+}
+
 /// Callback surface for the column-scan loop dispatch.
 ///
 /// - `gline` is voxlap's `gline` (R4.3 = grouscan): casts a ray of

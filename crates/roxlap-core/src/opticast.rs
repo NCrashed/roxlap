@@ -21,7 +21,7 @@ use crate::camera_math;
 use crate::column_walk;
 use crate::opticast_prelude;
 use crate::projection;
-use crate::rasterizer::{Rasterizer, ScanScratch};
+use crate::rasterizer::{Rasterizer, ScratchPool};
 use crate::ray_step;
 use crate::scan_loops::{
     bottom_quadrant, left_quadrant, right_quadrant, top_quadrant, ScanContext,
@@ -98,8 +98,12 @@ pub enum OpticastOutcome {
 ///
 /// Whatever real or stub [`Rasterizer`] is plugged in receives the
 /// `gline` / `hrend` / `vrend` calls the four-quadrant scan loops
-/// produce; `scratch` accumulates the radar / angstart / lastx /
-/// uurend buffers between those calls.
+/// produce; the [`ScratchPool`]'s slot 0 accumulates the radar /
+/// angstart / lastx / uurend buffers between those calls.
+///
+/// R12.1 single-threaded shape: opticast indexes `pool.slot_mut(0)`
+/// only. R12.2 fans the four quadrant calls across slots 0..3 via
+/// `rayon::join`; R12.3 distributes per-strip work across all slots.
 //
 // Sign convention: voxlap's opticast forwards everything as-is from
 // the static state; here it's all explicit parameters. The clippy
@@ -111,13 +115,14 @@ pub enum OpticastOutcome {
 #[must_use]
 pub fn opticast<R: Rasterizer>(
     rasterizer: &mut R,
-    scratch: &mut ScanScratch,
+    pool: &mut ScratchPool,
     camera: &Camera,
     settings: &OpticastSettings,
     vsid: u32,
     slab_buf: &[u8],
     column_offsets: &[u32],
 ) -> OpticastOutcome {
+    let scratch = pool.slot_mut(0);
     let cs = camera_math::derive(
         camera,
         settings.xres,
@@ -215,6 +220,7 @@ pub(crate) fn camera_column_slice<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rasterizer::ScanScratch;
 
     /// Recording rasterizer that counts the three callback kinds.
     #[derive(Debug, Default)]
@@ -283,7 +289,7 @@ mod tests {
         let cam = looking_down_camera();
         let settings = OpticastSettings::for_oracle_framebuffer(640, 480);
         let mut counts = Counts::default();
-        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let mut pool = ScratchPool::new(640, 480, 2048);
         let (slab_buf, column_offsets) = synthetic_world_with_camera_column(
             &solid_slab_z200_to_254(),
             LOOKING_DOWN_COL_INDEX,
@@ -292,7 +298,7 @@ mod tests {
 
         let outcome = opticast(
             &mut counts,
-            &mut scratch,
+            &mut pool,
             &cam,
             &settings,
             2048,
@@ -318,7 +324,7 @@ mod tests {
         cam.pos[2] = 220.0;
         let settings = OpticastSettings::for_oracle_framebuffer(640, 480);
         let mut counts = Counts::default();
-        let mut scratch = ScanScratch::new_for_size(640, 480, 2048);
+        let mut pool = ScratchPool::new(640, 480, 2048);
         let (slab_buf, column_offsets) = synthetic_world_with_camera_column(
             &solid_slab_z200_to_254(),
             LOOKING_DOWN_COL_INDEX,
@@ -327,7 +333,7 @@ mod tests {
 
         let outcome = opticast(
             &mut counts,
-            &mut scratch,
+            &mut pool,
             &cam,
             &settings,
             2048,

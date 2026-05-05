@@ -41,7 +41,7 @@ per arch).
 | # | Decision | Consequence |
 |---|---|---|
 | 1 | **`rayon` for the threading layer.** Rayon's work-stealing pool, `par_iter`, and `join` cover every parallelism axis we need (per-quadrant, per-tile, per-column lighting bake). | One workspace dependency. `RAYON_NUM_THREADS=1` is the kill-switch / single-threaded repro. No hand-rolled `std::thread` pool. |
-| 2 | **API shape (B): rasterizer owns an implicit `Vec<ScanScratch>` pool.** New `ScalarRasterizer::new_parallel(fb, zb, …, n_threads)` constructor. `n_threads = 1` preserves the existing single-threaded path bit-exactly. | Hosts call `Engine::render(...)` once; the rasterizer fans out internally. The existing `ScalarRasterizer::new` constructor stays as the explicit single-threaded path that oracle / tests use. |
+| 2 | **`ScratchPool` is a host-owned sibling type, not a rasterizer-internal pool.** `ScratchPool::new(xres, yres, vsid)` for single-threaded; `::new_parallel(.., n_threads)` for N slots. Opticast takes `&mut ScratchPool` (slot 0 in R12.1; slots 0..3 in R12.2; per-tile in R12.3). | The "rasterizer owns the pool" form was the original intent, but Rust borrow-rules make it awkward — `ScalarRasterizer` is generic and can't field-project a per-thread `ScanScratch` out of `&mut self` while simultaneously calling free functions like `top_quadrant` that take `(&mut R, &mut ScanScratch, &ctx)`. Host-owned pool side-steps this and keeps allocations long-lived (one ~7.6 MB allocation per slot survives across frames; the rasterizer remains the per-frame object). Per-frame setters (`pool.set_skycast` / `set_fog` / `set_side_shades`) broadcast to all slots so each thread sees current frame state on its private slot. |
 | 3 | **CI stays single-threaded; multicore is opt-in.** The 12 voxlap-C oracle goldens are byte-stable bit-exactness gates, not perf gates — they run with `n_threads = 1` regardless of host threading. | Bit-exact regression detection survives R12 untouched. A separate per-thread oracle run (added in R12.5) asserts hash equality across `--threads {1, 2, 4, 8}`. |
 | 4 | **Per-quadrant first (R12.2), per-tile second (R12.3).** Per-quadrant's seam already exists in `scan_loops.rs`; landing it first proves the per-thread `ScanScratch` plumbing before tackling the larger tile restructure. | Two perf milestones (~2–3× then ~3–5×) instead of one big-bang. Each ships as its own commit with its own bench numbers. |
 | 5 | **`split_at_mut` where possible, raw pointers only where required.** Per-tile row strips are contiguous and split safely; per-quadrant wedges are pixel-disjoint but row-overlapping, so quadrants either use unsafe disjoint pointers with a wedge invariant or per-thread render-then-merge. R12.2 picks one based on Rust borrow-checker friction. | Maximises safe-Rust coverage. Any unsafe is localised to one or two functions with a documented invariant. |
@@ -53,7 +53,7 @@ per arch).
 | # | Scope | Estimate | Validation |
 |---|---|---|---|
 | **R12.0** | Author `PORTING-MULTICORE.md` (this doc) + add `rayon` workspace dep. No code wired yet. | 0.5 d | Doc lands; `cargo build` green; `cargo test` green. |
-| **R12.1** | Refactor `ScanScratch` ownership into a `Vec<ScanScratch>` pool owned by the rasterizer. Single-threaded path uses `pool[0]`. New `ScalarRasterizer::new_parallel(..., n_threads)` constructor; `new` stays as the `n_threads = 1` shortcut. | 1–2 d | All existing tests pass; oracle goldens byte-stable at the default thread count (still 1, just now plumbed through the pool). |
+| **R12.1** | Introduce `ScratchPool` (host-owned `Vec<ScanScratch>`). Opticast signature changes from `&mut ScanScratch` to `&mut ScratchPool`; R12.1 indexes slot 0 only. `ScratchPool::new` (1 slot, single-threaded) and `::new_parallel(.., n_threads)` (N slots). Per-frame setters broadcast to every slot. | 1–2 d | All existing tests pass; oracle goldens byte-stable at the default thread count (still 1, just now plumbed through the pool). |
 | **R12.2** | Per-quadrant 4-way via `rayon::join`. Each quadrant runs against its own pool slot. Framebuffer/zbuffer split via raw pointers + a wedge-disjoint invariant *or* per-thread render-then-merge — pick whichever is cleaner under the borrow checker. | 3–5 d | Oracle goldens byte-stable across `--threads 1` and `--threads 4`; bench shows ≥2× on at least 6/12 poses. |
 | **R12.3** | Per-tile N-way via `rayon::par_iter` over `Vec<RowStrip>`. Each strip has a restricted frustum + its own `ScanScratch` slot sized by the strip's pixel range. Strips ARE contiguous in row-major, so `framebuffer.split_at_mut` works (no unsafe). | 5–7 d | `bench --threads N` scaling curve for N ∈ {1, 2, 4, 8}; oracle goldens byte-stable at every N. |
 | **R12.4** | `update_lighting` per-column outer loop → `par_iter`. Sprites (`Engine::sprites`) → `par_iter` with z-test arbitrating final pixel writes. | 1–2 d | World-bake bench number; sprite oracle goldens (5 poses) byte-stable at every thread count. |
@@ -109,11 +109,11 @@ strips of 16 rows for a 480-row screen). Each strip runs its own
   Already an `for x in 0..vsid { for y in 0..vsid { ... } }`
   shape. Convert the outer loop to `par_iter`.
 
-## API change shape (recommendation: B)
+## API change shape (chosen: host-owned `ScratchPool`)
 
-Two designs explored:
+Three designs evaluated; (C) is what landed in R12.1.
 
-### (A) Explicit, caller owns the pool
+### (A) Caller owns a raw `Vec<ScanScratch>`
 
 ```rust
 let mut scratches: Vec<ScanScratch> = (0..n_threads)
@@ -123,26 +123,59 @@ opticast_parallel(&mut rasterizer, &mut scratches, ...);
 ```
 
 - Pro: no API surprises; caller controls allocation.
-- Con: every host crate has to know about the pool.
+- Con: every host crate has to know about the pool's broadcast
+  ergonomics (per-frame `set_fog` etc. on each entry).
 
-### (B) Implicit, rasterizer owns the pool *(chosen)*
+### (B) Rasterizer owns the pool
 
 ```rust
 let mut rasterizer = ScalarRasterizer::new_parallel(
-    fb, zb, pitch, ..., n_threads, // n_threads == 1 ⇒ existing path
+    fb, zb, pitch, ..., n_threads,
 );
 opticast(&mut rasterizer, ...);  // internally par_iter when n_threads > 1
 ```
 
 - Pro: clean public API; `Engine::render(...)` stays one call.
-- Con: rasterizer holds N × ScanScratch even when single-threaded
-  (use `n_threads = 1` for the existing path; cost = one
-  `ScanScratch`).
+- **Con: doesn't compile cleanly.** `ScalarRasterizer` is generic
+  and the scan-loop dispatchers (`top_quadrant`, etc.) take
+  `(&mut R, &mut ScanScratch, &ctx)`. Field-projecting a per-thread
+  `ScanScratch` out of `&mut rasterizer` while *also* passing
+  `&mut rasterizer` to those free functions is a re-borrow conflict
+  the compiler rejects (no split-borrow accessor exists for a
+  generic type). Escapes are all costly: unsafe pointer
+  acrobatics, interior mutability with runtime overhead, or
+  reshaping the trait surface to drop the scratch parameter (a
+  larger restructure). Worse, the rasterizer is reconstructed each
+  frame because it borrows `&mut framebuffer` / `&mut zbuffer`,
+  which makes per-frame allocation of the pool wasteful (the pool
+  is ~7.6 MB per slot).
 
-`roxlap-oracle`'s bench / test fixtures keep
-`ScalarRasterizer::new` (single-threaded) so byte-stability gates
-don't depend on host-side threading decisions. The parallel
-constructor is opt-in.
+### (C) Host-owned `ScratchPool` *(chosen, R12.1)*
+
+```rust
+// long-lived, on the App / oracle struct
+let mut pool = ScratchPool::new_parallel(xres, yres, vsid, n_threads);
+
+// per frame
+let mut rasterizer = ScalarRasterizer::new(fb, zb, pitch, ..., vsid);
+opticast(&mut rasterizer, &mut pool, &cam, &settings, ...);
+```
+
+- Pro: compiles cleanly with no unsafe; pool's lifetime matches
+  the host (long-lived); rasterizer stays the per-frame object;
+  `n_threads` knob lives on the data structure that actually owns
+  the threads' working memory.
+- Pro: per-frame setters (`pool.set_skycast` / `set_fog` /
+  `set_side_shades`) broadcast to all slots, so once R12.2 fans
+  out, each thread already sees the current frame's state on its
+  private slot.
+- Con: pool is one extra type for hosts to know about; total
+  public-API delta is one `ScanScratch` field renamed to a
+  `ScratchPool` field.
+
+`roxlap-oracle`'s bench / test fixtures use `ScratchPool::new` (1
+slot) so byte-stability gates run identically to single-threaded.
+Multicore is opt-in via `::new_parallel`.
 
 ## Memory cost
 

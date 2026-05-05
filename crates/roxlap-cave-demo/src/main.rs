@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use roxlap_cavegen::{BlueCaveGenerator, CaveParams, Generator, MagCaveGenerator, MAXZDIM};
 use roxlap_core::opticast;
-use roxlap_core::rasterizer::ScanScratch;
+use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::world_query::{getcube, Cube};
 use roxlap_core::Camera;
@@ -205,7 +205,7 @@ struct App {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     engine: Engine,
     zbuffer: Vec<f32>,
-    scratch: ScanScratch,
+    pool: ScratchPool,
     vxl: vxl::Vxl,
     cam_pos: [f64; 3],
     yaw: f64,
@@ -245,7 +245,7 @@ impl App {
         // Fog: low-24-bit colour (no brightness bit — see
         // `project_oracle_fog_disabled.md`).
         engine.set_fog(FOG_COLOR, FOG_MAX_SCAN_DIST);
-        let scratch = ScanScratch::new_for_size(WIDTH, HEIGHT, VSID);
+        let pool = ScratchPool::new(WIDTH, HEIGHT, VSID);
 
         // Spawn the camera at the carved bubble's centre.
         let cam_pos = [
@@ -259,7 +259,7 @@ impl App {
             surface: None,
             engine,
             zbuffer: Vec::new(),
-            scratch,
+            pool,
             vxl,
             cam_pos,
             yaw: 0.0,
@@ -502,17 +502,17 @@ impl App {
         if self.zbuffer.len() < pixel_count {
             self.zbuffer.resize(pixel_count, 0.0);
         }
-        if self.scratch.uurend_half_stride < size.width as usize {
-            self.scratch = ScanScratch::new_for_size(size.width, size.height, self.vxl.vsid);
+        if self.pool.slot(0).uurend_half_stride < size.width as usize {
+            self.pool = ScratchPool::new(size.width, size.height, self.vxl.vsid);
         }
 
         let sky_col_i = i32::from_ne_bytes(self.engine.sky_color().to_ne_bytes());
-        self.scratch.set_skycast(sky_col_i, 0);
+        self.pool.set_skycast(sky_col_i, 0);
         let fog_col_i = i32::from_ne_bytes(self.engine.fog_color().to_ne_bytes());
-        self.scratch
+        self.pool
             .set_fog(fog_col_i, self.engine.fog_max_scan_dist());
         let s = self.engine.side_shades();
-        self.scratch
+        self.pool
             .set_side_shades(s[0], s[1], s[2], s[3], s[4], s[5]);
 
         let cam = self.camera();
@@ -541,7 +541,7 @@ impl App {
             );
             let _ = opticast(
                 &mut rasterizer,
-                &mut self.scratch,
+                &mut self.pool,
                 &cam,
                 &settings,
                 self.vxl.vsid,

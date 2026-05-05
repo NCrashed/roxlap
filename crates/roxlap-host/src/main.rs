@@ -28,7 +28,7 @@ use flate2::read::GzDecoder;
 use roxlap_core::camera_math;
 use roxlap_core::kfa_draw::draw_kfa_sprite;
 use roxlap_core::opticast;
-use roxlap_core::rasterizer::ScanScratch;
+use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::sprite::{draw_sprite, DrawTarget, SpriteLighting};
 use roxlap_core::Camera;
@@ -177,10 +177,11 @@ struct App {
     /// f32 z-buffer, allocated lazily / re-sized on first redraw and
     /// resized on window-resize.
     zbuffer: Vec<f32>,
-    /// `ScanScratch` (radar / angstart / lastx / uurend), reused across
-    /// frames. Sized at app construction for the initial window
-    /// resolution; resized on window-resize.
-    scratch: ScanScratch,
+    /// Per-thread `ScanScratch` pool (radar / angstart / lastx /
+    /// uurend), reused across frames. Sized at app construction for
+    /// the initial window resolution; resized on window-resize.
+    /// Single slot until R12.2's per-quadrant fan-out lands.
+    pool: ScratchPool,
     /// World loaded from `oracle.vxl.gz`. `vxl.data` is the flat
     /// slab buffer, `vxl.column_offset` the per-column byte offsets;
     /// `vxl.vsid` the world dimension; `vxl.ipo`/`ist`/`ihe`/`ifo`
@@ -416,31 +417,31 @@ impl App {
         if self.zbuffer.len() < pixel_count {
             self.zbuffer.resize(pixel_count, 0.0);
         }
-        if self.scratch.uurend_half_stride < size.width as usize {
-            self.scratch = ScanScratch::new_for_size(size.width, size.height, self.vxl.vsid);
+        if self.pool.slot(0).uurend_half_stride < size.width as usize {
+            self.pool = ScratchPool::new(size.width, size.height, self.vxl.vsid);
         }
 
-        // Wire engine sky colour onto scratch so grouscan's startsky
-        // has the right (col, dist) for any radar slot it drains.
-        // The `dist` seeded here is overwritten per-ray by gline
-        // based on the frustum-edge clip outcome.
-        // u32 → i32 reinterpret (preserves bits; `cast_signed` is
-        // 1.87+, beyond the workspace MSRV).
+        // Wire engine sky colour onto every pool slot so grouscan's
+        // startsky has the right (col, dist) for any radar slot it
+        // drains. The `dist` seeded here is overwritten per-ray by
+        // gline based on the frustum-edge clip outcome. u32 → i32
+        // reinterpret (preserves bits; `cast_signed` is 1.87+, beyond
+        // the workspace MSRV).
         let sky_col_i = i32::from_ne_bytes(self.engine.sky_color().to_ne_bytes());
-        self.scratch.set_skycast(sky_col_i, 0);
+        self.pool.set_skycast(sky_col_i, 0);
 
-        // Engine fog → ScanScratch foglut. Rebuilds the 2048-entry
+        // Engine fog → foglut on every slot. Rebuilds the 2048-entry
         // table only when fog params change.
         let fog_col_i = i32::from_ne_bytes(self.engine.fog_color().to_ne_bytes());
-        self.scratch
+        self.pool
             .set_fog(fog_col_i, self.engine.fog_max_scan_dist());
 
-        // Engine side-shades → ScanScratch gcsub. Default is
+        // Engine side-shades → gcsub on every slot. Default is
         // `[0; 6]` (no shading); the host bumps it to a moderate
         // value at startup so faces facing each direction read
         // visibly different.
         let s = self.engine.side_shades();
-        self.scratch
+        self.pool
             .set_side_shades(s[0], s[1], s[2], s[3], s[4], s[5]);
 
         let cam = self.camera();
@@ -480,7 +481,7 @@ impl App {
             };
             let _ = opticast(
                 &mut rasterizer,
-                &mut self.scratch,
+                &mut self.pool,
                 &cam,
                 &settings,
                 self.vxl.vsid,
@@ -816,7 +817,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let vxl_world = load_oracle_vxl();
-    let initial_scratch = ScanScratch::new_for_size(WIDTH, HEIGHT, vxl_world.vsid);
+    let initial_pool = ScratchPool::new(WIDTH, HEIGHT, vxl_world.vsid);
     let cam_pos = vxl_world.ipo;
 
     // Voxlap's classic per-side darkening (top, bot, left, right,
@@ -977,7 +978,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         surface: None,
         engine,
         zbuffer: Vec::new(),
-        scratch: initial_scratch,
+        pool: initial_pool,
         vxl: vxl_world,
         cam_pos,
         yaw: 0.0,

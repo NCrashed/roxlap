@@ -43,7 +43,7 @@ use std::io::{Read, Write};
 use flate2::read::GzDecoder;
 use roxlap_core::camera_math;
 use roxlap_core::opticast;
-use roxlap_core::rasterizer::ScanScratch;
+use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::sprite::{draw_sprite, DrawTarget, SpriteLighting};
 use roxlap_core::Camera;
@@ -386,7 +386,7 @@ fn render_pose(
     pose: &Pose,
     framebuffer: &mut [u32],
     zbuffer: &mut [f32],
-    scratch: &mut ScanScratch,
+    pool: &mut ScratchPool,
 ) -> u64 {
     // Pre-fill with sky-blue, matching voxlaptest's
     // `BR(0x87ceeb) = 0x8087ceeb` per-frame fill.
@@ -395,11 +395,11 @@ fn render_pose(
         *px = sky;
     }
 
-    // Wire engine sky / fog onto scratch (same shape as the host).
+    // Wire engine sky / fog onto every pool slot (same shape as the host).
     let sky_col_i = i32::from_ne_bytes(engine.sky_color().to_ne_bytes());
-    scratch.set_skycast(sky_col_i, 0);
+    pool.set_skycast(sky_col_i, 0);
     let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    scratch.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
 
     let cam = camera_for_pose(pose);
     let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
@@ -417,7 +417,7 @@ fn render_pose(
         );
         let _ = opticast(
             &mut rasterizer,
-            scratch,
+            pool,
             &cam,
             &settings,
             vxl.vsid,
@@ -579,7 +579,7 @@ fn cmd_bench(opts: &BenchOpts) -> std::io::Result<()> {
     let pixel_count = (XRES as usize) * (YRES as usize);
     let mut framebuffer = vec![0u32; pixel_count];
     let mut zbuffer = vec![0.0f32; pixel_count];
-    let mut scratch = ScanScratch::new_for_size(XRES, YRES, vxl_world.vsid);
+    let mut pool = ScratchPool::new(XRES, YRES, vxl_world.vsid);
 
     let target_poses: Vec<&Pose> = match opts.pose_name.as_deref() {
         None | Some("all") => POSES.iter().collect(),
@@ -648,7 +648,7 @@ fn cmd_bench(opts: &BenchOpts) -> std::io::Result<()> {
                 pose,
                 &mut framebuffer,
                 &mut zbuffer,
-                &mut scratch,
+                &mut pool,
             );
         }
 
@@ -661,7 +661,7 @@ fn cmd_bench(opts: &BenchOpts) -> std::io::Result<()> {
                 pose,
                 &mut framebuffer,
                 &mut zbuffer,
-                &mut scratch,
+                &mut pool,
             );
             samples.push(t0.elapsed());
         }
@@ -733,7 +733,7 @@ fn cmd_render(opts: &RenderOpts) -> std::io::Result<()> {
     let pixel_count = (XRES as usize) * (YRES as usize);
     let mut framebuffer = vec![0u32; pixel_count];
     let mut zbuffer = vec![0.0f32; pixel_count];
-    let mut scratch = ScanScratch::new_for_size(XRES, YRES, vxl_world.vsid);
+    let mut pool = ScratchPool::new(XRES, YRES, vxl_world.vsid);
 
     if let Some(dir) = &opts.ppm_dir {
         fs::create_dir_all(dir)?;
@@ -775,7 +775,7 @@ fn cmd_render(opts: &RenderOpts) -> std::io::Result<()> {
             pose,
             &mut framebuffer,
             &mut zbuffer,
-            &mut scratch,
+            &mut pool,
         );
         println!("{:<14}  {:016x}", pose.name, hash);
         if let Some(dir) = &opts.ppm_dir {
@@ -1101,7 +1101,7 @@ fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
     let pixel_count = (hx as usize) * (hy as usize);
     let mut framebuffer = vec![0u32; pixel_count];
     let mut zbuffer = vec![0.0f32; pixel_count];
-    let mut scratch = ScanScratch::new_for_size(hx, hy, vxl_world.vsid);
+    let mut pool = ScratchPool::new(hx, hy, vxl_world.vsid);
     // Host yaw/pitch convention (main.rs::App::camera): yaw=0 looks
     // +y; right = [cos, -sin, 0]; forward = [sin*cos, cos*cos, sin].
     let cyaw = yaw.cos();
@@ -1122,11 +1122,11 @@ fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
     let sentinel: u32 = 0x0000_0001;
     framebuffer.fill(sentinel);
     let sky_col_i = i32::from_ne_bytes(engine.sky_color().to_ne_bytes());
-    scratch.set_skycast(sky_col_i, 0);
+    pool.set_skycast(sky_col_i, 0);
     let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    scratch.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
     let s = engine.side_shades();
-    scratch.set_side_shades(s[0], s[1], s[2], s[3], s[4], s[5]);
+    pool.set_side_shades(s[0], s[1], s[2], s[3], s[4], s[5]);
 
     let settings = OpticastSettings::for_oracle_framebuffer(hx, hy);
     {
@@ -1141,7 +1141,7 @@ fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
         );
         let _ = opticast(
             &mut rasterizer,
-            &mut scratch,
+            &mut pool,
             &host_cam,
             &settings,
             vxl_world.vsid,
@@ -1462,23 +1462,9 @@ mod tests {
         let pixel_count = (XRES as usize) * (YRES as usize);
         let mut fb = vec![0u32; pixel_count];
         let mut zb = vec![0.0f32; pixel_count];
-        let mut scratch = ScanScratch::new_for_size(XRES, YRES, vxl_world.vsid);
-        let h1 = render_pose(
-            &engine,
-            &vxl_world,
-            &POSES[0],
-            &mut fb,
-            &mut zb,
-            &mut scratch,
-        );
-        let h2 = render_pose(
-            &engine,
-            &vxl_world,
-            &POSES[0],
-            &mut fb,
-            &mut zb,
-            &mut scratch,
-        );
+        let mut pool = ScratchPool::new(XRES, YRES, vxl_world.vsid);
+        let h1 = render_pose(&engine, &vxl_world, &POSES[0], &mut fb, &mut zb, &mut pool);
+        let h2 = render_pose(&engine, &vxl_world, &POSES[0], &mut fb, &mut zb, &mut pool);
         assert_eq!(h1, h2);
     }
 }

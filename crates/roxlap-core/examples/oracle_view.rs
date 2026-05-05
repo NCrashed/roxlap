@@ -16,7 +16,7 @@
 use std::io::{Read, Write};
 
 use flate2::read::GzDecoder;
-use roxlap_core::rasterizer::ScanScratch;
+use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::{opticast, Camera, OpticastSettings};
 use roxlap_formats::vxl;
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut fb = vec![0u32; (w as usize) * (h as usize)];
     let mut zb = vec![0.0f32; fb.len()];
-    let mut scratch = ScanScratch::new_for_size(w, h, world.vsid);
+    let mut pool = ScratchPool::new(w, h, world.vsid);
 
     let mut rast = ScalarRasterizer::new(
         &mut fb,
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = opticast(
         &mut rast,
-        &mut scratch,
+        &mut pool,
         &Camera::default(),
         &OpticastSettings::for_oracle_framebuffer(w, h),
         world.vsid,
