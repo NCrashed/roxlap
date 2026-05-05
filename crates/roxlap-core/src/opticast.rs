@@ -98,12 +98,28 @@ pub enum OpticastOutcome {
 ///
 /// Whatever real or stub [`Rasterizer`] is plugged in receives the
 /// `gline` / `hrend` / `vrend` calls the four-quadrant scan loops
-/// produce; the [`ScratchPool`]'s slot 0 accumulates the radar /
+/// produce; the [`ScratchPool`]'s slots accumulate the radar /
 /// angstart / lastx / uurend buffers between those calls.
 ///
-/// R12.1 single-threaded shape: opticast indexes `pool.slot_mut(0)`
-/// only. R12.2 fans the four quadrant calls across slots 0..3 via
-/// `rayon::join`; R12.3 distributes per-strip work across all slots.
+/// Threading dial lives on the pool:
+/// - `pool.n_threads() == 1` → sequential. The four quadrants run
+///   on the calling thread against `pool.slot_mut(0)`. Pre-R12
+///   shape, byte-stable.
+/// - `pool.n_threads() >= 4` → R12.2.1 parallel branch. The four
+///   quadrants run via `rayon::join` 4-way; each closure clones
+///   `rasterizer` (raw pointers + Clone), claims a distinct slot
+///   from `pool.split_first_4`, and writes into its own wedge of
+///   the framebuffer. Wedge-disjoint pixel writes make the
+///   pointer aliasing safe (see [`crate::scalar_rasterizer::RasterTarget`]).
+/// - `pool.n_threads()` in `2..4` → still sequential (no point
+///   parallelising 3 quadrants when load imbalance dominates;
+///   R12.3 per-tile parallelism scales smoothly).
+///
+/// `R: Clone + Send` is required by the parallel branch even when
+/// it doesn't fire — keeping the bound consistent across both
+/// paths means the generic body monomorphizes once. Test
+/// rasterizers (`Counts`, `RecordingRasterizer`) derive Clone +
+/// auto-Send so they satisfy the bound at no runtime cost.
 //
 // Sign convention: voxlap's opticast forwards everything as-is from
 // the static state; here it's all explicit parameters. The clippy
@@ -113,7 +129,7 @@ pub enum OpticastOutcome {
 // dimensions and won't wrap.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
 #[must_use]
-pub fn opticast<R: Rasterizer>(
+pub fn opticast<R: Rasterizer + Clone + Send>(
     rasterizer: &mut R,
     pool: &mut ScratchPool,
     camera: &Camera,
@@ -122,7 +138,6 @@ pub fn opticast<R: Rasterizer>(
     slab_buf: &[u8],
     column_offsets: &[u32],
 ) -> OpticastOutcome {
-    let scratch = pool.slot_mut(0);
     let cs = camera_math::derive(
         camera,
         settings.xres,
@@ -181,14 +196,64 @@ pub fn opticast<R: Rasterizer>(
 
     // Per-frame setup hook — concrete rasterizers (R4.2) cache the
     // bits of CameraState / RayStep / OpticastPrelude they need for
-    // the per-pixel math. Stub rasterizers ignore via the trait's
-    // default no-op.
+    // the per-pixel math. Runs on the calling thread before any
+    // parallel fan-out so subsequent clones inherit the populated
+    // FrameCache. Stub rasterizers ignore via the trait's default
+    // no-op.
     rasterizer.frame_setup(&ctx);
 
-    top_quadrant(rasterizer, scratch, &ctx);
-    right_quadrant(rasterizer, scratch, &ctx);
-    bottom_quadrant(rasterizer, scratch, &ctx);
-    left_quadrant(rasterizer, scratch, &ctx);
+    if pool.n_threads() >= 4 {
+        // R12.2.1 parallel branch — 4-way `rayon::join` nesting.
+        // Each quadrant runs on its own thread with:
+        //   * a clone of `rasterizer` (raw fb / zb pointers shared,
+        //     wedge-disjoint pixel writes safe);
+        //   * an exclusive `&mut ScanScratch` from one of the first
+        //     four pool slots;
+        //   * a shared `&ScanContext` (Sync — read-only).
+        // frame_setup ran above on the master, so all four clones
+        // already have FrameCache populated.
+        //
+        // Picked `rayon::join` over `rayon::scope` after benching
+        // both: scope's per-spawn overhead inflates p99 noticeably
+        // (~50 % spike on this hardware) for ~10 ms-frame renders;
+        // join's lower-latency path keeps the parallel branch from
+        // regressing the fast poses.
+        let mut r0 = rasterizer.clone();
+        let mut r1 = rasterizer.clone();
+        let mut r2 = rasterizer.clone();
+        let mut r3 = rasterizer.clone();
+        let (s0, s1, s2, s3) = pool.split_first_4();
+        let ctx_ref = &ctx;
+        // Quadrant ordering matters: rayon::join runs the first
+        // arg on the calling thread and pushes the second arg for
+        // a worker to steal. If the first arg finishes before any
+        // worker steals, the second runs on the calling thread
+        // (sequential fallback). Putting `bottom` first — typically
+        // the heaviest quadrant on looking-down poses — gives
+        // workers time to pick up the other three.
+        rayon::join(
+            || bottom_quadrant(&mut r0, s0, ctx_ref),
+            || {
+                rayon::join(
+                    || top_quadrant(&mut r1, s1, ctx_ref),
+                    || {
+                        rayon::join(
+                            || right_quadrant(&mut r2, s2, ctx_ref),
+                            || left_quadrant(&mut r3, s3, ctx_ref),
+                        )
+                    },
+                )
+            },
+        );
+    } else {
+        // Sequential — slot 0 only. Pre-R12.2 shape; byte-stable
+        // baseline that the oracle goldens are frozen against.
+        let scratch = pool.slot_mut(0);
+        top_quadrant(rasterizer, scratch, &ctx);
+        right_quadrant(rasterizer, scratch, &ctx);
+        bottom_quadrant(rasterizer, scratch, &ctx);
+        left_quadrant(rasterizer, scratch, &ctx);
+    }
 
     OpticastOutcome::Rendered
 }
@@ -223,7 +288,9 @@ mod tests {
     use crate::rasterizer::ScanScratch;
 
     /// Recording rasterizer that counts the three callback kinds.
-    #[derive(Debug, Default)]
+    /// `Clone` so the rasterizer satisfies opticast's `R: Clone +
+    /// Send` bound (R12.2.1).
+    #[derive(Debug, Default, Clone)]
     struct Counts {
         gline: u32,
         hrend: u32,

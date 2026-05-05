@@ -18,6 +18,11 @@ categories = ["game-development", "graphics", "rendering::engine"]
 # Path used during local development; version is what cargo publish
 # records for downstream resolution.
 roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
+# R12.2.1: rayon::join 4-way fan-out for the per-quadrant parallel
+# rendering path. Single-threaded callers (ScratchPool::new) skip
+# the parallel branch entirely; rayon's default thread pool only
+# warms up when the parallel branch fires.
+rayon = { workspace = true }
 
 [dev-dependencies]
 # R6.0e: integration test loads the gzipped oracle.vxl fixture and

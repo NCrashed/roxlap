@@ -258,6 +258,11 @@ fn sky_per_ray_update(
 /// it across many calls without re-borrowing each time. The
 /// `prelude` clone copies one `Vec<i32>` (the `y_lookup` mip
 /// table) per frame — cheap.
+//
+// `Clone` is used by [`ScalarRasterizer`]'s 4-way fan-out (R12.2.1)
+// to mint one rasterizer per quadrant thread; each clone copies the
+// (~few KB) y_lookup Vec — small per-frame allocation cost.
+#[derive(Clone)]
 struct FrameCache {
     ray_step: RayStep,
     camera_state: CameraState,
@@ -282,6 +287,7 @@ struct FrameCache {
 // call `grouscan_run` per ray. The current placeholder gline
 // doesn't read them yet, hence the dead_code allow.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct ScalarRasterizer<'a> {
     /// Framebuffer + zbuffer raw-pointer view. Stripped from the
     /// caller's `&mut [u32]` / `&mut [f32]` borrows at construction
@@ -327,6 +333,19 @@ pub struct ScalarRasterizer<'a> {
     /// call; gline panics if invoked before that.
     frame: Option<FrameCache>,
 }
+
+// R12.2.1: opticast's parallel branch fans the rasterizer across 4
+// rayon-managed threads — each thread owns its own clone. The clones
+// share `target: RasterTarget` (raw pointers; safe under the
+// wedge-disjoint pixel-write invariant documented on RasterTarget),
+// hold &-refs into the slab/column data (Sync), and have
+// independent FrameCache copies. Compile-time check: this fails if
+// any field becomes non-Send (e.g. Rc<...>) so the parallel path
+// can no longer hold.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<ScalarRasterizer<'_>>();
+};
 
 impl<'a> ScalarRasterizer<'a> {
     /// Create a rasterizer that will write into the supplied

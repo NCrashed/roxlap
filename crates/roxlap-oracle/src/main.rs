@@ -544,8 +544,12 @@ fn format_hashes(rows: &[(&str, u64)]) -> String {
 
 /// `cmd_render` options parsed off the CLI. `ppm_dir = Some(dir)`
 /// means "dump `<pose>.ppm` into `dir`" (creating it if missing).
+/// `threads >= 4` switches the rasterizer onto opticast's parallel
+/// branch (R12.2.1); `1` (default) is the single-threaded path the
+/// goldens are frozen against.
 struct RenderOpts {
     ppm_dir: Option<std::path::PathBuf>,
+    threads: usize,
 }
 
 /// Default output directory for `--ppm` without an explicit path.
@@ -554,10 +558,12 @@ const DEFAULT_PPM_DIR: &str = "roxlap-oracle-out";
 
 /// `cmd_bench` options parsed off the CLI. `pose_name = None`
 /// benchmarks every pose; `Some(name)` runs that one pose only.
+/// `threads >= 4` opts into opticast's parallel branch (R12.2.1).
 struct BenchOpts {
     pose_name: Option<String>,
     iters: usize,
     warmup: usize,
+    threads: usize,
 }
 
 /// Microbenchmark the render pipeline over the oracle poses.
@@ -579,7 +585,7 @@ fn cmd_bench(opts: &BenchOpts) -> std::io::Result<()> {
     let pixel_count = (XRES as usize) * (YRES as usize);
     let mut framebuffer = vec![0u32; pixel_count];
     let mut zbuffer = vec![0.0f32; pixel_count];
-    let mut pool = ScratchPool::new(XRES, YRES, vxl_world.vsid);
+    let mut pool = ScratchPool::new_parallel(XRES, YRES, vxl_world.vsid, opts.threads);
 
     let target_poses: Vec<&Pose> = match opts.pose_name.as_deref() {
         None | Some("all") => POSES.iter().collect(),
@@ -600,12 +606,14 @@ fn cmd_bench(opts: &BenchOpts) -> std::io::Result<()> {
     };
 
     println!(
-        "Bench: {} iter{} per pose, {} warmup, {}×{} framebuffer",
+        "Bench: {} iter{} per pose, {} warmup, {}×{} framebuffer, {} thread{}",
         opts.iters,
         if opts.iters == 1 { "" } else { "s" },
         opts.warmup,
         XRES,
-        YRES
+        YRES,
+        opts.threads,
+        if opts.threads == 1 { "" } else { "s" },
     );
     println!();
     println!(
@@ -733,7 +741,7 @@ fn cmd_render(opts: &RenderOpts) -> std::io::Result<()> {
     let pixel_count = (XRES as usize) * (YRES as usize);
     let mut framebuffer = vec![0u32; pixel_count];
     let mut zbuffer = vec![0.0f32; pixel_count];
-    let mut pool = ScratchPool::new(XRES, YRES, vxl_world.vsid);
+    let mut pool = ScratchPool::new_parallel(XRES, YRES, vxl_world.vsid, opts.threads);
 
     if let Some(dir) = &opts.ppm_dir {
         fs::create_dir_all(dir)?;
@@ -953,8 +961,12 @@ fn print_help() {
                                          with --ppm also drop a P6 PPM per pose into\n\
                                          DIR (default: roxlap-oracle-out/) for visual\n\
                                          inspection of hash-mismatched poses.\n\
-             roxlap-oracle render [--ppm[=DIR]]\n\
-                                         same as above\n\
+             roxlap-oracle render [--ppm[=DIR]] [--threads N]\n\
+                                         same as above. --threads >= 4 opts\n\
+                                         into the per-quadrant parallel render\n\
+                                         (R12.2.1); default 1 keeps the single-\n\
+                                         threaded path the goldens are frozen\n\
+                                         against.\n\
              roxlap-oracle diff [--golden PATH] [--ours PATH]\n\
                                          diff roxlap-hashes.txt against the in-tree\n\
                                          golden-hashes.txt; exits non-zero on any mismatch.\n\
@@ -966,11 +978,13 @@ fn print_help() {
                                          quadrant scanline. For diff against voxlap C\n\
                                          debug prints. Known poses: north, east,\n\
                                          diag_down, high_down.\n\
-             roxlap-oracle bench [--pose NAME|all] [--iters N] [--warmup N]\n\
+             roxlap-oracle bench [--pose NAME|all] [--iters N] [--warmup N] [--threads N]\n\
                                          microbenchmark render_pose; reports per-pose\n\
                                          min/p50/mean/p99/max ms + FPS, plus a grand\n\
                                          total when running `all`. Defaults:\n\
-                                         --pose all, --iters 30, --warmup 5.\n\
+                                         --pose all, --iters 30, --warmup 5,\n\
+                                         --threads 1. Pass --threads 4 to drive\n\
+                                         opticast's parallel branch.\n\
          \n\
          Env:\n\
              ROXLAP_ORACLE_PPM=1        legacy alias for --ppm (dumps to cwd)\n\
@@ -1228,6 +1242,7 @@ fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
 /// (legacy path: `=1` → cwd, `=DIR` → that dir).
 fn parse_render_opts(args: &[String]) -> std::io::Result<RenderOpts> {
     let mut ppm_dir: Option<std::path::PathBuf> = None;
+    let mut threads: usize = 1;
 
     // Env-var fallback (back-compat with the original gating).
     if let Ok(v) = std::env::var("ROXLAP_ORACLE_PPM") {
@@ -1255,6 +1270,28 @@ fn parse_render_opts(args: &[String]) -> std::io::Result<RenderOpts> {
         } else if let Some(rest) = a.strip_prefix("--ppm=") {
             ppm_dir = Some(std::path::PathBuf::from(rest));
             i += 1;
+        } else if a == "--threads" {
+            let raw = args.get(i + 1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--threads expects an integer",
+                )
+            })?;
+            threads = raw.parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("--threads: not an integer ({raw})"),
+                )
+            })?;
+            i += 2;
+        } else if let Some(rest) = a.strip_prefix("--threads=") {
+            threads = rest.parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("--threads: not an integer ({rest})"),
+                )
+            })?;
+            i += 1;
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1262,7 +1299,7 @@ fn parse_render_opts(args: &[String]) -> std::io::Result<RenderOpts> {
             ));
         }
     }
-    Ok(RenderOpts { ppm_dir })
+    Ok(RenderOpts { ppm_dir, threads })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1330,6 +1367,7 @@ fn main() -> std::io::Result<()> {
                 pose_name: None,
                 iters: 30,
                 warmup: 5,
+                threads: 1,
             };
             let mut i = 1;
             while i < args.len() {
@@ -1369,6 +1407,21 @@ fn main() -> std::io::Result<()> {
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 format!("--warmup: not an integer ({raw})"),
+                            )
+                        })?;
+                        i += 2;
+                    }
+                    "--threads" => {
+                        let raw = args.get(i + 1).cloned().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "--threads expects an integer",
+                            )
+                        })?;
+                        opts.threads = raw.parse().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("--threads: not an integer ({raw})"),
                             )
                         })?;
                         i += 2;

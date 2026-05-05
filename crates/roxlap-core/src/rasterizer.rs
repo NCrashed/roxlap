@@ -350,6 +350,33 @@ impl ScratchPool {
         self.scratches.iter_mut()
     }
 
+    /// Split-borrow the first four slots as four disjoint `&mut`
+    /// references — the shape `rayon::join` 4-way needs in
+    /// [`crate::opticast`]'s per-quadrant parallel branch (R12.2.1).
+    ///
+    /// # Panics
+    /// If `self.n_threads() < 4`. opticast guards on `n_threads() >=
+    /// 4` before calling this.
+    pub fn split_first_4(
+        &mut self,
+    ) -> (
+        &mut ScanScratch,
+        &mut ScanScratch,
+        &mut ScanScratch,
+        &mut ScanScratch,
+    ) {
+        assert!(
+            self.scratches.len() >= 4,
+            "ScratchPool::split_first_4 requires n_threads >= 4 (got {})",
+            self.scratches.len()
+        );
+        let (a, rest) = self.scratches.split_first_mut().unwrap();
+        let (b, rest) = rest.split_first_mut().unwrap();
+        let (c, rest) = rest.split_first_mut().unwrap();
+        let (d, _) = rest.split_first_mut().unwrap();
+        (a, b, c, d)
+    }
+
     /// Per-frame sky `(col, dist)` push, broadcast to every slot.
     /// See [`ScanScratch::set_skycast`].
     pub fn set_skycast(&mut self, col: i32, dist: i32) {

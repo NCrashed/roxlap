@@ -54,7 +54,7 @@ per arch).
 |---|---|---|---|
 | **R12.0** | Author `PORTING-MULTICORE.md` (this doc) + add `rayon` workspace dep. No code wired yet. | 0.5 d | Doc lands; `cargo build` green; `cargo test` green. |
 | **R12.1** | Introduce `ScratchPool` (host-owned `Vec<ScanScratch>`). Opticast signature changes from `&mut ScanScratch` to `&mut ScratchPool`; R12.1 indexes slot 0 only. `ScratchPool::new` (1 slot, single-threaded) and `::new_parallel(.., n_threads)` (N slots). Per-frame setters broadcast to every slot. | 1–2 d | All existing tests pass; oracle goldens byte-stable at the default thread count (still 1, just now plumbed through the pool). |
-| **R12.2** | Per-quadrant 4-way via `rayon::join`. Each quadrant runs against its own pool slot. Framebuffer/zbuffer split via raw pointers + a wedge-disjoint invariant *or* per-thread render-then-merge — pick whichever is cleaner under the borrow checker. | 3–5 d | Oracle goldens byte-stable across `--threads 1` and `--threads 4`; bench shows ≥2× on at least 6/12 poses. |
+| **R12.2** | Per-quadrant 4-way via `rayon::join`. Each quadrant runs against its own pool slot. Framebuffer/zbuffer split via raw pointers + a wedge-disjoint invariant. Split into R12.2.0 (RasterTarget refactor — `ScalarRasterizer`'s fb/zb fields → `Copy + Send` raw-pointer view) and R12.2.1 (parallel dispatch + `--threads N` oracle flag). | 3–5 d (landed) | Oracle goldens byte-stable across `--threads 1` and `--threads 4` ✅. **Bench gate (≥2× on 6/12 poses) NOT met** — actual mean speedup 1.08× on Intel i7-12700H, best per-pose 1.77× (sprite_above), worst 1.0× (north). Per-quadrant geometry has fundamental load-imbalance: floor-heavy poses concentrate 60–80 % of rays in one quadrant, capping speedup at 1/(0.6..0.8). R12.3 per-tile parallelism is where the real perf landing happens. |
 | **R12.3** | Per-tile N-way via `rayon::par_iter` over `Vec<RowStrip>`. Each strip has a restricted frustum + its own `ScanScratch` slot sized by the strip's pixel range. Strips ARE contiguous in row-major, so `framebuffer.split_at_mut` works (no unsafe). | 5–7 d | `bench --threads N` scaling curve for N ∈ {1, 2, 4, 8}; oracle goldens byte-stable at every N. |
 | **R12.4** | `update_lighting` per-column outer loop → `par_iter`. Sprites (`Engine::sprites`) → `par_iter` with z-test arbitrating final pixel writes. | 1–2 d | World-bake bench number; sprite oracle goldens (5 poses) byte-stable at every thread count. |
 | **R12.5** | `roxlap-oracle bench --threads N` flag + scaling docs in `README.md` (or a new `BENCH.md`). Per-thread oracle (`oracle diff --threads N`) added to CI as a non-blocking job. | 0.5 d | Bench output reproducible across thread counts; CI green. |
@@ -255,20 +255,62 @@ Parallel bugs are non-deterministic. Mitigations:
 - Bench prints which thread count it ran at so flaky runs can
   always be re-checked single-threaded.
 
-## Bench projection
+## Bench projection vs measured (R12.2.1, 2026-05-05)
 
 | variant | ms / frame | fps | speedup |
 |---|---|---|---|
-| **single-threaded (today)** | 10.0 | 100 | 1× |
-| R12.2 per-quadrant 4-way | ~4–5 | 200–250 | 2–3× |
+| **single-threaded (R12.1 baseline)** | 10.4 | 96.5 | 1× |
+| R12.2 per-quadrant 4-way (projected) | ~4–5 | 200–250 | 2–3× |
+| **R12.2 per-quadrant 4-way (measured, i7-12700H, 30 iters)** | **9.6** | **104.2** | **1.08× mean (1.77× best, 1.0× worst)** |
 | R12.3 per-tile 8-way | ~2–3 | 350–500 | 3–5× |
 | R12.3 per-tile 16-way (server) | ~1.5–2 | 500–700 | 5–7× |
 
-Projections based on voxlap's algorithm structure + typical rayon
-overhead. Actual numbers will land within ±30 % of these. The
-bench harness from CD.x (`roxlap-oracle bench`) captures
+R12.2's projection turned out optimistic. Per-pose actuals on
+i7-12700H (20 logical / 14 physical cores; default rayon pool):
+
+| pose | 1-thread ms | 4-thread ms | speedup |
+|---|---|---|---|
+| north | 7.66 | 8.06 | 0.95× |
+| east | 7.67 | 8.54 | 0.90× |
+| diag_down | 11.39 | 10.99 | 1.04× |
+| high_down | 13.82 | 10.87 | 1.27× |
+| sprite_front | 7.30 | 7.25 | 1.01× |
+| sprite_above | 8.49 | 4.91 | 1.73× |
+| sprite_iso | 10.30 | 10.23 | 1.01× |
+| sprite_coco | 9.88 | 9.62 | 1.03× |
+| diag_down_lit | 11.94 | 11.27 | 1.06× |
+| tile_1x | 11.97 | 11.46 | 1.04× |
+| tile_half | 12.09 | 11.41 | 1.06× |
+| tile_blend | 11.86 | 11.45 | 1.04× |
+
+Floor-heavy poses (high_down, sprite_above) get the most benefit
+because most rays land in one quadrant — the heavy quadrant takes
+the wall-clock floor, the others finish fast and idle. Balanced
+poses (north, east) actually regress slightly: rayon's fork-join
+overhead + 4× ScanScratch cache pressure (4 × 7.6 MB = 30 MB,
+borderline vs 24 MB L3) outweigh any parallel gain.
+
+Why per-quadrant fell short of projection:
+1. **Load imbalance**: voxlap's 4-quadrant geometry is not 4× even
+   in practice. Even level-horizon shots have ~50–60 % of rays in
+   bottom (floor) and ~10–20 % each in top / right / left (sky +
+   horizon corners). Amdahl caps speedup at ~1/(0.5..0.6) ≈ 1.7–2×.
+2. **Cache pressure**: 4 × 7.6 MB scratches at 640×480 hovers
+   around L3 capacity; per-thread radar reads compete with
+   framebuffer / zbuffer writes for memory bandwidth.
+3. **`rayon::join` sequential fallback**: when the calling thread
+   completes its first quadrant before any worker steals the
+   second, rayon runs the second locally. Inevitable for
+   sub-millisecond quadrants on light poses.
+
+R12.3 per-tile parallelism doesn't have any of these issues: each
+tile is a contiguous row strip with ~equal work, ScanScratch is
+sized per-strip (1/N the memory), and `par_iter` over a fixed-size
+strip vec doesn't have the sequential-fallback trap.
+
+The bench harness from CD.x (`roxlap-oracle bench`) captures
 min / p50 / mean / p99 / max per pose — same harness drives R12
-validation.
+validation. `--threads N` flag added to bench + render in R12.2.1.
 
 ## Reading list (for the implementing session)
 
