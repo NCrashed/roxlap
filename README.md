@@ -27,28 +27,43 @@ pose where the underlying SIMD allows.
 
 ## Quick start
 
-Try the interactive demo on a sample voxel world (no extra setup —
-all assets are bundled into the binary via `include_bytes!`):
+Try the procedural-cave demo — generates a Worley + Perlin cave
+network on startup, lets you fly through it, fire plasma bullets that
+carve the world in real time, and toggle between two visual presets
+matching Ken's reference screenshots:
 
 ```sh
 git clone https://github.com/NCrashed/roxlap
 cd roxlap
+cargo run --release -p roxlap-cave-demo
+```
+
+A window opens (~1-2 s startup for cave gen). Click in the window to
+grab the cursor; WASD + mouse-look to fly with collision-checked
+movement; `Space` / `LShift` for vertical; `LCtrl` for fast-fly;
+**LMB to fire a plasma bullet** that carves a crater on impact;
+`F` to toggle blue ↔ magenta cave preset (regenerates); `R` for a
+new seed; `Esc` to release the cursor or exit.
+
+For the engine-only demo (full-feature voxel world with kv6 sprites
+and panoramic sky, no cave-gen / editing):
+
+```sh
 cargo run --release -p roxlap-host
 ```
 
-A window opens with WASD + mouse-look fly-through over a procedurally-
-carved voxel landscape, with an animated KFA sprite and a textured
-panoramic sky. Press `L` to toggle baked world-voxel lighting.
-Press `F` to capture the current camera + framebuffer to
-`roxlap-capture.{txt,ppm}` for off-line repro of any render artifact.
+`L` toggles baked world-voxel lighting; `F` writes
+`roxlap-capture.{txt,ppm}` for off-line repro of render artifacts.
 
 ## Crates
 
 | Crate | Purpose |
 |-------|---------|
 | [`roxlap-core`](crates/roxlap-core) | The engine: framebuffer, camera, opticast raycaster, grouscan rasterizer, sprite + sky + voxel-lighting. |
-| [`roxlap-formats`](crates/roxlap-formats) | Pure parsers for voxlap's on-disk file formats — `.vxl`, `.kv6`, `.kvx`, `.kfa` — plus the `Sprite` / `KfaSprite` data types. No renderer dependency; useful standalone for asset pipelines. |
-| [`roxlap-host`](crates/roxlap-host) | Interactive demo binary (winit + softbuffer). |
+| [`roxlap-formats`](crates/roxlap-formats) | On-disk file format parsers (`.vxl`, `.kv6`, `.kvx`, `.kfa`) **plus the voxel-edit module** — `delslab` / `insslab` / `ScumCtx` plus high-level `set_spans` / `set_cube` / `set_sphere` / `set_rect` (with bit-exact byte equivalence to voxlap C's `setspans` validated against captured fixtures). No renderer dependency; useful standalone for level editors, asset converters, and procedural-world tools. |
+| [`roxlap-cavegen`](crates/roxlap-cavegen) | Procedural cave generation. Worley-distance shape classification + Perlin overlay, two visual presets (`BlueCaveGenerator`, `MagCaveGenerator`) matching Ken + Tom Dobrowolski's 2003 *Justfly* demo screenshots, and a `pack_dense_grid_to_vxl` helper that folds a dense voxel mask + colour grid into voxlap's slab format. Pure-Rust (no `cmake` / C++ build deps). |
+| [`roxlap-cave-demo`](crates/roxlap-cave-demo) | Procedural-cave showcase binary (winit + softbuffer). Cave-gen on startup, real-time edits via plasma bullets, fog, F/R preset+seed toggles. |
+| [`roxlap-host`](crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). |
 | [`roxlap-oracle`](crates/roxlap-oracle) | Cross-engine render-hash oracle: renders 12 fixed test poses, FNV-1a-hashes each framebuffer, diffs against voxlaptest's C goldens. CI gates on this. |
 
 The library API surface is documented at [docs.rs/roxlap-core](https://docs.rs/roxlap-core)
@@ -70,6 +85,13 @@ and [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
   matches; image-similarity correctness everywhere else, with frozen
   per-pose hashes pinning known sub-pixel rounding noise so any
   *unintentional* drift fails CI immediately.
+- **Real-time voxel editing.** Carve / fill spans, cubes, rectangles,
+  and spheres at runtime via `roxlap_formats::edit::*`. The same edit
+  pipeline drives the cave demo's bullet impacts and is byte-equality
+  validated against voxlap C's `setspans`. Closure-based colour
+  callbacks let you implement any of voxlap's `vx5.colfunc` patterns
+  (constant, jittered, position-dependent, texture-mapped) without
+  the global-state dance the original engine required.
 
 ## Status
 
