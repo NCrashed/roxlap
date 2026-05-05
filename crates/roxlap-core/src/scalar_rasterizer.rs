@@ -34,6 +34,8 @@
     clippy::similar_names
 )]
 
+use std::marker::PhantomData;
+
 use crate::camera_math::CameraState;
 use crate::fixed::ftol;
 use crate::gline::derive_gline_frustum;
@@ -43,6 +45,108 @@ use crate::opticast_prelude::{OpticastPrelude, PREC};
 use crate::rasterizer::{Rasterizer, ScanScratch};
 use crate::ray_step::RayStep;
 use crate::scan_loops::ScanContext;
+
+/// Borrowed view of the framebuffer + zbuffer as raw pointers.
+///
+/// R12.2.0 introduces this so the per-frame ScalarRasterizer can be
+/// `Copy` (for the per-thread fan-out R12.2.1 lands). Holding `&'a
+/// mut [u32]` / `&'a mut [f32]` directly forces exclusive borrows
+/// per instance, blocking the four quadrants from running on four
+/// threads even though their pixel writes are disjoint.
+///
+/// Constructed safely from exclusive slice borrows — the slices are
+/// consumed and re-exposed as raw pointers tied to lifetime `'a`
+/// via `PhantomData`. Once a `RasterTarget` exists, it is the sole
+/// path to the underlying memory; the slices cannot be used through
+/// any other channel for the duration of `'a`.
+///
+/// `Copy` lets opticast hand each quadrant thread its own copy of
+/// the same target. The four threads write disjoint pixels (top /
+/// bottom / left / right wedges of the screen, no overlap), so
+/// pointer aliasing is safe under the documented invariant.
+///
+/// # Safety contract for parallel use
+/// Callers that copy a `RasterTarget` and pass copies to multiple
+/// threads MUST guarantee that the threads collectively write to
+/// pairwise-disjoint pixel indices. opticast enforces this via the
+/// four-quadrant wedge geometry (see `scan_loops::{top,right,
+/// bottom,left}_quadrant`). Single-threaded callers (R12.1 default)
+/// hold one copy and trivially satisfy the invariant.
+#[derive(Clone, Copy, Debug)]
+pub struct RasterTarget<'a> {
+    fb_ptr: *mut u32,
+    fb_len: usize,
+    zb_ptr: *mut f32,
+    zb_len: usize,
+    _marker: PhantomData<&'a mut [u32]>,
+}
+
+// SAFETY: `RasterTarget` is morally a borrowed mutable slice pair —
+// the same shape `&'a mut [u32]` / `&'a mut [f32]` would have, both of
+// which are `Send` when `T: Send`. Multi-thread safety is enforced
+// by the wedge-disjoint invariant on copies (see struct doc).
+unsafe impl Send for RasterTarget<'_> {}
+
+impl<'a> RasterTarget<'a> {
+    /// Build a target from exclusive slice borrows. The slices are
+    /// consumed (their `&'a mut` reborrow is the load-bearing thing —
+    /// this constructor is the only way to mint a `RasterTarget`
+    /// from safe code).
+    #[must_use]
+    pub fn new(framebuffer: &'a mut [u32], zbuffer: &'a mut [f32]) -> Self {
+        Self {
+            fb_ptr: framebuffer.as_mut_ptr(),
+            fb_len: framebuffer.len(),
+            zb_ptr: zbuffer.as_mut_ptr(),
+            zb_len: zbuffer.len(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Framebuffer length in `u32` elements.
+    #[must_use]
+    pub fn fb_len(self) -> usize {
+        self.fb_len
+    }
+
+    /// Raw mutable framebuffer pointer. Used by SSE blocks that do
+    /// their own arithmetic + bounds reasoning.
+    ///
+    /// # Safety
+    /// Callers must respect `fb_len` and the parallel-use invariant.
+    #[must_use]
+    pub fn fb_ptr(self) -> *mut u32 {
+        self.fb_ptr
+    }
+
+    /// Raw mutable zbuffer pointer. Same contract as
+    /// [`Self::fb_ptr`].
+    #[must_use]
+    pub fn zb_ptr(self) -> *mut f32 {
+        self.zb_ptr
+    }
+
+    /// Write one ARGB pixel.
+    ///
+    /// # Safety
+    /// `idx < self.fb_len()`, plus the parallel-use invariant.
+    pub unsafe fn write_color(self, idx: usize, color: u32) {
+        debug_assert!(idx < self.fb_len, "fb idx {} >= len {}", idx, self.fb_len);
+        // SAFETY: caller asserts in-bounds + disjoint-from-other-threads.
+        unsafe { self.fb_ptr.add(idx).write(color) };
+    }
+
+    /// Write one z-buffer entry.
+    ///
+    /// # Safety
+    /// `idx < self.fb_len()` (zbuffer length matches fb), plus the
+    /// parallel-use invariant.
+    pub unsafe fn write_depth(self, idx: usize, z: f32) {
+        debug_assert!(idx < self.zb_len, "zb idx {} >= len {}", idx, self.zb_len);
+        // SAFETY: caller asserts in-bounds + disjoint-from-other-threads.
+        unsafe { self.zb_ptr.add(idx).write(z) };
+    }
+}
 
 // gcsub now lives on `ScanScratch::gcsub`; the host pokes it via
 // `ScanScratch::set_side_shades` per frame (mirrors voxlap's
@@ -179,8 +283,14 @@ struct FrameCache {
 // doesn't read them yet, hence the dead_code allow.
 #[allow(dead_code)]
 pub struct ScalarRasterizer<'a> {
-    framebuffer: &'a mut [u32],
-    zbuffer: &'a mut [f32],
+    /// Framebuffer + zbuffer raw-pointer view. Stripped from the
+    /// caller's `&mut [u32]` / `&mut [f32]` borrows at construction
+    /// (see [`Self::new`]) so the rasterizer can be `Copy` for the
+    /// per-thread quadrant fan-out R12.2.1 lands. Single-threaded
+    /// path holds one copy, parallel path will hold four (one per
+    /// quadrant — wedge-disjoint pixel writes; see
+    /// [`RasterTarget`]'s safety contract).
+    target: RasterTarget<'a>,
     /// Row stride in `u32` / `f32` elements (== framebuffer width
     /// for tightly-packed buffers; SDL streaming textures may add
     /// trailing padding).
@@ -244,8 +354,7 @@ impl<'a> ScalarRasterizer<'a> {
         vsid: u32,
     ) -> Self {
         Self {
-            framebuffer,
-            zbuffer,
+            target: RasterTarget::new(framebuffer, zbuffer),
             pitch_pixels,
             slab_buf,
             column_offsets,
@@ -571,14 +680,8 @@ impl Rasterizer for ScalarRasterizer<'_> {
                 let vz = _mm_mul_ps(vdst, vinv);
 
                 let pixel_idx = row_start + x as usize;
-                _mm_storeu_si128(
-                    self.framebuffer
-                        .as_mut_ptr()
-                        .add(pixel_idx)
-                        .cast::<__m128i>(),
-                    vcol,
-                );
-                _mm_storeu_ps(self.zbuffer.as_mut_ptr().add(pixel_idx), vz);
+                _mm_storeu_si128(self.target.fb_ptr().add(pixel_idx).cast::<__m128i>(), vcol);
+                _mm_storeu_ps(self.target.zb_ptr().add(pixel_idx), vz);
 
                 vdx = _mm_add_ps(vdx, vstrx4);
                 vdy = _mm_add_ps(vdy, vstry4);
@@ -600,10 +703,18 @@ impl Rasterizer for ScalarRasterizer<'_> {
             let col = fog_blend(cd.col, cd.dist, &scratch.foglut, scratch.fog_col);
 
             let pixel_idx = row_start + x as usize;
-            self.framebuffer[pixel_idx] = col as u32;
             #[allow(clippy::cast_precision_loss)]
             let z = cd.dist as f32 / (dirx * dirx + diry * diry).sqrt();
-            self.zbuffer[pixel_idx] = z;
+            // SAFETY: pixel_idx = sy*pitch + x, with sy < yres and x < p1
+            // ≤ xres (loop guard); p1 ≤ ctx.xres in scan_loops::top_quadrant /
+            // bottom_quadrant. fb / zb were allocated at pitch*height by the
+            // caller (asserted in Engine::render's preamble); pixel_idx is
+            // therefore in-range. Wedge-disjoint invariant: top + bottom
+            // quadrants own disjoint sy ranges.
+            unsafe {
+                self.target.write_color(pixel_idx, col as u32);
+                self.target.write_depth(pixel_idx, z);
+            }
 
             dirx += rs.strx;
             diry += rs.stry;
@@ -691,14 +802,8 @@ impl Rasterizer for ScalarRasterizer<'_> {
                 let vz = _mm_mul_ps(vdst, vinv);
 
                 let pixel_idx = row_start + xu;
-                _mm_storeu_si128(
-                    self.framebuffer
-                        .as_mut_ptr()
-                        .add(pixel_idx)
-                        .cast::<__m128i>(),
-                    vcol,
-                );
-                _mm_storeu_ps(self.zbuffer.as_mut_ptr().add(pixel_idx), vz);
+                _mm_storeu_si128(self.target.fb_ptr().add(pixel_idx).cast::<__m128i>(), vcol);
+                _mm_storeu_ps(self.target.zb_ptr().add(pixel_idx), vz);
 
                 // Write back NEW uurend values — u + d per lane.
                 for k in 0..4 {
@@ -726,10 +831,16 @@ impl Rasterizer for ScalarRasterizer<'_> {
             let col = fog_blend(cd.col, cd.dist, &scratch.foglut, scratch.fog_col);
 
             let pixel_idx = row_start + xu;
-            self.framebuffer[pixel_idx] = col as u32;
             #[allow(clippy::cast_precision_loss)]
             let z = cd.dist as f32 / (dirx * dirx + diry * diry).sqrt();
-            self.zbuffer[pixel_idx] = z;
+            // SAFETY: see hrend's matching write — pixel_idx is in-bounds
+            // by the same scan_loops geometry argument; right + left
+            // quadrants own disjoint sx ranges so cross-thread writes
+            // are pairwise pixel-disjoint.
+            unsafe {
+                self.target.write_color(pixel_idx, col as u32);
+                self.target.write_depth(pixel_idx, z);
+            }
 
             dirx += rs.strx;
             diry += rs.stry;
