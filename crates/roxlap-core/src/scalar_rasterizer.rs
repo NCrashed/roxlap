@@ -721,6 +721,63 @@ impl Rasterizer for ScalarRasterizer<'_> {
             diry = _mm_cvtss_f32(vdy);
         }
 
+        // R9: NEON 4-pixel batch — aarch64 equivalent of the SSE2
+        // path above. Uses `vrsqrteq_f32` + one Newton–Raphson step
+        // via `vrsqrtsq_f32` for ~16-bit precision (vs SSE2's ~12-bit
+        // without Newton). NEON is baseline on all AArch64 — no
+        // runtime feature check needed. Stores are naturally unaligned.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use core::arch::aarch64::{
+                float32x4_t, vaddq_f32, vcvtq_f32_s32, vdupq_n_f32, vgetq_lane_f32, vld1q_f32,
+                vld1q_s32, vmulq_f32, vreinterpretq_u32_s32, vrsqrteq_f32, vrsqrtsq_f32,
+                vst1q_f32, vst1q_u32,
+            };
+            let strx = rs.strx;
+            let stry = rs.stry;
+            let vstrx4 = vdupq_n_f32(strx * 4.0);
+            let vstry4 = vdupq_n_f32(stry * 4.0);
+            let dx_arr: [f32; 4] = [dirx, dirx + strx, dirx + 2.0 * strx, dirx + 3.0 * strx];
+            let dy_arr: [f32; 4] = [diry, diry + stry, diry + 2.0 * stry, diry + 3.0 * stry];
+            let mut vdx: float32x4_t = vld1q_f32(dx_arr.as_ptr());
+            let mut vdy: float32x4_t = vld1q_f32(dy_arr.as_ptr());
+            while p1 - x >= 4 {
+                // Scalar gather — same as SSE2 path.
+                let mut col = [0i32; 4];
+                let mut dst = [0i32; 4];
+                for k in 0..4 {
+                    let ray_idx = (plc_local >> 16) as usize;
+                    let cd_offset = scratch.angstart[ray_idx] + j as isize;
+                    let cd = scratch.radar[cd_offset as usize];
+                    col[k] = cd.col;
+                    dst[k] = cd.dist;
+                    plc_local = plc_local.wrapping_add(incr);
+                }
+                if !scratch.foglut.is_empty() {
+                    for k in 0..4 {
+                        col[k] = fog_blend(col[k], dst[k], &scratch.foglut, scratch.fog_col);
+                    }
+                }
+                let vcol = vreinterpretq_u32_s32(vld1q_s32(col.as_ptr()));
+                let vdst = vcvtq_f32_s32(vld1q_s32(dst.as_ptr()));
+                let vsqr = vaddq_f32(vmulq_f32(vdx, vdx), vmulq_f32(vdy, vdy));
+                // One Newton–Raphson step: est * vrsqrts(x * est, est).
+                let est = vrsqrteq_f32(vsqr);
+                let vinv = vmulq_f32(est, vrsqrtsq_f32(vmulq_f32(vsqr, est), est));
+                let vz = vmulq_f32(vdst, vinv);
+
+                let pixel_idx = row_start + x as usize;
+                vst1q_u32(self.target.fb_ptr().add(pixel_idx), vcol);
+                vst1q_f32(self.target.zb_ptr().add(pixel_idx), vz);
+
+                vdx = vaddq_f32(vdx, vstrx4);
+                vdy = vaddq_f32(vdy, vstry4);
+                x += 4;
+            }
+            dirx = vgetq_lane_f32(vdx, 0);
+            diry = vgetq_lane_f32(vdy, 0);
+        }
+
         // Scalar tail — handles 0..3 leftover pixels on x86_64
         // and the full body on other targets.
         while x < p1 {
@@ -845,6 +902,74 @@ impl Rasterizer for ScalarRasterizer<'_> {
             }
             dirx = _mm_cvtss_f32(vdx);
             diry = _mm_cvtss_f32(vdy);
+        }
+
+        // R9: NEON 4-pixel batch for vrend — aarch64 equivalent.
+        // Same structure as hrend NEON: scalar gather + uurend
+        // read/write, NEON rsqrt for z, vectorized store.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use core::arch::aarch64::{
+                float32x4_t, vaddq_f32, vcvtq_f32_s32, vdupq_n_f32, vgetq_lane_f32, vld1q_f32,
+                vld1q_s32, vmulq_f32, vreinterpretq_u32_s32, vrsqrteq_f32, vrsqrtsq_f32,
+                vst1q_f32, vst1q_u32,
+            };
+            let strx = rs.strx;
+            let stry = rs.stry;
+            let vstrx4 = vdupq_n_f32(strx * 4.0);
+            let vstry4 = vdupq_n_f32(stry * 4.0);
+            let dx_arr: [f32; 4] = [dirx, dirx + strx, dirx + 2.0 * strx, dirx + 3.0 * strx];
+            let dy_arr: [f32; 4] = [diry, diry + stry, diry + 2.0 * stry, diry + 3.0 * stry];
+            let mut vdx: float32x4_t = vld1q_f32(dx_arr.as_ptr());
+            let mut vdy: float32x4_t = vld1q_f32(dy_arr.as_ptr());
+            while p1 - x >= 4 {
+                let xu = x as usize;
+                // Read 4 OLD uurend pairs (u, d).
+                let mut u = [0i32; 4];
+                let mut d = [0i32; 4];
+                for k in 0..4 {
+                    u[k] = scratch.uurend[xu + k];
+                    d[k] = scratch.uurend[xu + k + half_stride];
+                }
+                // Scalar gather — 4 castdat hits.
+                let mut col = [0i32; 4];
+                let mut dst = [0i32; 4];
+                for k in 0..4 {
+                    let ray_idx = (u[k] >> 16) as usize;
+                    let iplc_k = iplc_local.wrapping_add(iinc.wrapping_mul(k as i32));
+                    let cd_offset = scratch.angstart[ray_idx] + iplc_k as isize;
+                    let cd = scratch.radar[cd_offset as usize];
+                    col[k] = cd.col;
+                    dst[k] = cd.dist;
+                }
+                if !scratch.foglut.is_empty() {
+                    for k in 0..4 {
+                        col[k] = fog_blend(col[k], dst[k], &scratch.foglut, scratch.fog_col);
+                    }
+                }
+                let vcol = vreinterpretq_u32_s32(vld1q_s32(col.as_ptr()));
+                let vdst = vcvtq_f32_s32(vld1q_s32(dst.as_ptr()));
+                let vsqr = vaddq_f32(vmulq_f32(vdx, vdx), vmulq_f32(vdy, vdy));
+                let est = vrsqrteq_f32(vsqr);
+                let vinv = vmulq_f32(est, vrsqrtsq_f32(vmulq_f32(vsqr, est), est));
+                let vz = vmulq_f32(vdst, vinv);
+
+                let pixel_idx = row_start + xu;
+                vst1q_u32(self.target.fb_ptr().add(pixel_idx), vcol);
+                vst1q_f32(self.target.zb_ptr().add(pixel_idx), vz);
+
+                // Write back NEW uurend values — u + d per lane.
+                for k in 0..4 {
+                    scratch.uurend[xu + k] = u[k].wrapping_add(d[k]);
+                }
+
+                vdx = vaddq_f32(vdx, vstrx4);
+                vdy = vaddq_f32(vdy, vstry4);
+                iplc_local = iplc_local.wrapping_add(iinc.wrapping_mul(4));
+                x += 4;
+            }
+            dirx = vgetq_lane_f32(vdx, 0);
+            diry = vgetq_lane_f32(vdy, 0);
         }
 
         // Scalar tail — handles 0..3 leftover pixels on x86_64
