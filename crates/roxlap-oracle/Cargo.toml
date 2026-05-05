@@ -21,5 +21,24 @@ roxlap-core = { path = "../roxlap-core", version = "0.1" }
 roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
+# R10.1: wasm-bindgen-test scaffolding. Pulled in only when the
+# build target is wasm32; native cargo runs (the bin's golden-diff
+# CLI, the bench harness) skip these entirely.
+#
+# `wasm-bindgen` is pinned to `=0.2.117` because the bindgen schema
+# version baked into the .wasm by `#[wasm_bindgen]` macros must
+# match the schema version of the `wasm-bindgen-test-runner` /
+# `wasm-bindgen` CLI shipped by `nixpkgs.wasm-bindgen-cli`. Bumping
+# nixpkgs may move the CLI to a newer version; if it does, lift
+# this pin to match. `wasm-bindgen-test` is pinned to the
+# corresponding `0.3.x` release. `console_error_panic_hook` makes
+# panic backtraces show up in Node's stderr instead of being
+# swallowed.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen = "=0.2.117"
+wasm-bindgen-test = "=0.3.67"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
 [lints]
 workspace = true

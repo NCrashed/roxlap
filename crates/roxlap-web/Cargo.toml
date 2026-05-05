@@ -1,0 +1,55 @@
+[package]
+name = "roxlap-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "roxlap web demo — wasm32 + wasm-bindgen + canvas frontend for the engine."
+# Bin-shaped: a wasm bundle, not a library to link against. Never
+# publishable to crates.io (the deliverable is the static HTML +
+# wasm bundle that `trunk build` emits, not a Rust dep).
+publish = false
+
+# `cdylib` is the crate-type wasm-bindgen needs to produce its JS
+# glue. `rlib` lets `cargo doc` and intra-workspace consumers (none
+# planned today) link against it normally.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+roxlap-core = { path = "../roxlap-core", version = "0.1" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# wasm-bindgen / web-sys versions pinned to the same major+minor as
+# `wasm-bindgen-cli` shipped by nixpkgs (see crates/roxlap-oracle/
+# Cargo.toml's R10.1 block for the schema-mismatch reasoning). When
+# nixpkgs bumps the CLI, lift these in lockstep.
+wasm-bindgen = "=0.2.117"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+version = "0.3"
+# Minimal feature set: just what `start()` touches today
+# (`<canvas>`, 2D context, ImageData blit, RAF, frame timer,
+# input events). Adding more in R10.2.X bumps the bundle size,
+# so be deliberate.
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "ImageData",
+    "Performance",
+    "console",
+    "KeyboardEvent",
+    "MouseEvent",
+]
+
+[lints]
+workspace = true

@@ -43,6 +43,18 @@
               # `lld` on PATH (rustc's wasm target spec invokes the
               # bare name).
               lld
+              # R10.1: `wasm-bindgen-test` runs the test wasm under
+              # Node (V8). `wasm-bindgen-cli` produces the JS shim
+              # (its `wasm-bindgen-test-runner` is the cargo runner);
+              # Node executes the shim.
+              wasm-bindgen-cli
+              nodejs
+              # R10.2: `trunk` is the dev-server / bundler for the
+              # `roxlap-web` crate. `trunk serve` from
+              # `crates/roxlap-web/` starts a hot-reloading
+              # localhost:8080 demo; `trunk build --release` emits
+              # the production static bundle.
+              trunk
               # Image inspection — imagemagick reads roxlap-oracle's
               # PPM dumps and voxlap C oracle's PNG outputs for byte-
               # level pixel diffing across the two engines.

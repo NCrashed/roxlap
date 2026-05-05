@@ -1,0 +1,9 @@
+# R10.1: wasm32-unknown-unknown test binaries can't be executed
+# directly; cargo needs a runner that loads the wasm under a JS
+# host. `wasm-bindgen-test-runner` (shipped inside the
+# `wasm-bindgen-cli` package) wraps the wasm + a generated JS shim
+# and invokes Node. The `nix develop` shell exposes both via
+# `pkgs.wasm-bindgen-cli` + `pkgs.nodejs` (see flake.nix R10.1
+# packages).
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

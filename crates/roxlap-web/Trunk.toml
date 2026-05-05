@@ -1,0 +1,14 @@
+# Trunk config for the roxlap web demo. `trunk serve` from this
+# directory opens the demo at http://localhost:8080. CI invokes
+# `trunk build --release` for the production bundle.
+#
+# Default target HTML is `index.html` next to this file; default
+# `dist/` output dir under the crate. Both work for development;
+# release builds may want `dist = "../dist"` if the deployment
+# pipeline expects a workspace-level output dir.
+
+[build]
+# Embed assets via `include_bytes!` (R10 locked decision #6) — no
+# `copy-file` / `copy-dir` declarations needed today. Sky / sprite
+# bundling is an R10.X follow-up.
+public_url = "/"

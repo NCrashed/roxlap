@@ -1,0 +1,4 @@
+# Trunk's build output. `trunk build` regenerates this from
+# index.html + Cargo.toml + the cdylib build, so there's no
+# reason to track it. CI deploys produce their own dist/.
+dist/

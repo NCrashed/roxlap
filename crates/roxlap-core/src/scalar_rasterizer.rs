@@ -730,8 +730,8 @@ impl Rasterizer for ScalarRasterizer<'_> {
         unsafe {
             use core::arch::aarch64::{
                 float32x4_t, vaddq_f32, vcvtq_f32_s32, vdupq_n_f32, vgetq_lane_f32, vld1q_f32,
-                vld1q_s32, vmulq_f32, vreinterpretq_u32_s32, vrsqrteq_f32, vrsqrtsq_f32,
-                vst1q_f32, vst1q_u32,
+                vld1q_s32, vmulq_f32, vreinterpretq_u32_s32, vrsqrteq_f32, vrsqrtsq_f32, vst1q_f32,
+                vst1q_u32,
             };
             let strx = rs.strx;
             let stry = rs.stry;
@@ -911,8 +911,8 @@ impl Rasterizer for ScalarRasterizer<'_> {
         unsafe {
             use core::arch::aarch64::{
                 float32x4_t, vaddq_f32, vcvtq_f32_s32, vdupq_n_f32, vgetq_lane_f32, vld1q_f32,
-                vld1q_s32, vmulq_f32, vreinterpretq_u32_s32, vrsqrteq_f32, vrsqrtsq_f32,
-                vst1q_f32, vst1q_u32,
+                vld1q_s32, vmulq_f32, vreinterpretq_u32_s32, vrsqrteq_f32, vrsqrtsq_f32, vst1q_f32,
+                vst1q_u32,
             };
             let strx = rs.strx;
             let stry = rs.stry;
