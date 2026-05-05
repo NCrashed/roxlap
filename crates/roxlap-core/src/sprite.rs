@@ -282,16 +282,16 @@ pub(crate) struct Kv6FullState<'a> {
     /// negative components of post-swap `nstr.z` / `nhei.z` /
     /// `nfor.z`. `0.0` if all three are non-negative.
     pub scisdist: f32,
-    /// Viewport-clip biases (voxlap5.c:8947-8948).
-    /// `qsum0[2] = qsum0[0] = 0x7fff - (xres - hx as i32)`,
-    /// `qsum0[3] = qsum0[1] = 0x7fff - (yres - hy as i32)`.
+    /// Viewport-clip biases (voxlap5.c:8947-8948). Used by the SSE2
+    /// path's `paddsw` / `pmaxsw` AABB clipping; the scalar port clips
+    /// directly against `target.width` / `target.height`.
+    #[allow(dead_code)]
     pub qsum0: [i16; 4],
-    /// Viewport-clip floor (voxlap5.c:11120). After the saturated
-    /// add of `qsum0`, the screen-AABB is clamped from below by
-    /// `qsum1[0/2] = 0x7fff - xres`, `qsum1[1/3] = 0x7fff - yres`.
+    /// Viewport-clip floor (voxlap5.c:11120).
+    #[allow(dead_code)]
     pub qsum1: [i16; 4],
     /// Framebuffer pixel-stride packed for `pmaddwd` (voxlap5.c:11121).
-    /// `qbplbpp[0/2] = 4` (bytes per pixel), `qbplbpp[1/3] = pitch_bytes`.
+    #[allow(dead_code)]
     pub qbplbpp: [i16; 4],
     /// Per-direction colour modulation table built by
     /// [`update_reflects`]. Indexed by `v.dir` (256 entries). Each
@@ -1165,19 +1165,127 @@ pub(crate) fn drawboundcubesse(
     }
 }
 
-/// Non-x86_64 fallback. Same signature, no rendering. R9 / R10 will
-/// add NEON / wasm ports with their own goldens.
+/// R9: scalar port for non-x86_64 (aarch64 / wasm). Same algorithm as
+/// the SSE2 version but uses IEEE 754 `1.0 / z` instead of `_mm_rcp_ps`
+/// for perspective projection, so screen-space vertex positions (and
+/// therefore per-arch goldens) will differ by ±1 pixel at edges.
+/// Colour modulation replicates the `_mm_mulhi_epu16` + `_mm_packus_epi16`
+/// byte arithmetic exactly.
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub(crate) fn drawboundcubesse(
-    _v: &Voxel,
-    _mask: u32,
-    _state: &Kv6FullState<'_>,
-    _r0: [f32; 4],
-    _mm5_tail: &mut u32,
-    _target: &mut DrawTarget<'_>,
+    v: &Voxel,
+    mask: u32,
+    state: &Kv6FullState<'_>,
+    r0: [f32; 4],
+    mm5_tail: &mut u32,
+    target: &mut DrawTarget<'_>,
 ) -> u32 {
-    0
+    let effmask = (mask & u32::from(v.vis)) as usize;
+    if effmask == 0 || effmask >= PTFACES16.len() {
+        return 0;
+    }
+    let face = PTFACES16[effmask];
+    if face[0] == 0 {
+        return 0;
+    }
+
+    // origin = r0 + ztab4_per_z[v.z]
+    let z_idx = v.z as usize;
+    if z_idx >= state.ztab4_per_z.len() {
+        return 0;
+    }
+    let origin = vec4_add(r0, state.ztab4_per_z[z_idx]);
+    if origin[2] < state.scisdist {
+        return 0;
+    }
+
+    // The SSE2 path's qsum0/qsum1 mechanism embeds the screen-center
+    // offset (hx, hy) into the viewport clip; recover it here for
+    // the direct screen-coordinate projection.
+    let hx = (i32::from(state.qsum0[0]) - i32::from(state.qsum1[0])) as f32;
+    let hy = (i32::from(state.qsum0[1]) - i32::from(state.qsum1[1])) as f32;
+
+    // Project one vertex: screen_xy = (cadd4[idx] + origin).xy / .z + (hx, hy)
+    let project = |off: u8| -> (f32, f32) {
+        let wv = vec4_add(state.cadd4[(off >> 4) as usize], origin);
+        let inv_z = 1.0 / wv[2];
+        (wv[0] * inv_z + hx, wv[1] * inv_z + hy)
+    };
+
+    // Project 4 or 6 vertices, track screen AABB via truncation.
+    let (a0x, a0y) = project(face[1]);
+    let (a1x, a1y) = project(face[2]);
+    let (a2x, a2y) = project(face[3]);
+    let (a3x, a3y) = project(face[4]);
+    let mut min_x = a0x.min(a1x).min(a2x).min(a3x) as i32;
+    let mut min_y = a0y.min(a1y).min(a2y).min(a3y) as i32;
+    let mut max_x = a0x.max(a1x).max(a2x).max(a3x) as i32;
+    let mut max_y = a0y.max(a1y).max(a2y).max(a3y) as i32;
+
+    if face[0] != 4 {
+        let (a4x, a4y) = project(face[5]);
+        let (a5x, a5y) = project(face[6]);
+        min_x = min_x.min(a4x as i32).min(a5x as i32);
+        min_y = min_y.min(a4y as i32).min(a5y as i32);
+        max_x = max_x.max(a4x as i32).max(a5x as i32);
+        max_y = max_y.max(a4y as i32).max(a5y as i32);
+    }
+
+    // Viewport clip (mirrors the qsum0/qsum1 saturating-add + max
+    // sequence from the SSE2 path, but in direct screen coords).
+    let fb_w = target.width as i32;
+    let fb_h = target.height as i32;
+    min_x = min_x.max(0);
+    min_y = min_y.max(0);
+    max_x = max_x.min(fb_w - 1);
+    max_y = max_y.min(fb_h - 1);
+    if min_x > max_x || min_y > max_y {
+        return 0;
+    }
+
+    // Colour modulation — replicates the SSE2 byte arithmetic:
+    //   interleave = unpacklo_epi8(tail, col)  → 4 × u16
+    //   result     = mulhi_epu16(interleave, kv6colmul[dir]) + kv6coladd
+    //   color      = packus_epi16(result)      → 4 × u8 → u32
+    let t = mm5_tail.to_le_bytes();
+    let c = v.col.to_le_bytes();
+    let interleaved: [u16; 4] = [
+        (u16::from(c[0]) << 8) | u16::from(t[0]),
+        (u16::from(c[1]) << 8) | u16::from(t[1]),
+        (u16::from(c[2]) << 8) | u16::from(t[2]),
+        (u16::from(c[3]) << 8) | u16::from(t[3]),
+    ];
+    let kvm = state.kv6colmul[v.dir as usize];
+    let kva = state.kv6coladd;
+    let mut color_bytes = [0u8; 4];
+    for i in 0..4 {
+        let km = ((kvm >> (i * 16)) & 0xffff) as u16;
+        let ka = ((kva >> (i * 16)) & 0xffff) as u16;
+        let hi = ((u32::from(interleaved[i]) * u32::from(km)) >> 16) as u16;
+        let val = hi.wrapping_add(ka) as i16;
+        color_bytes[i] = val.clamp(0, 255) as u8;
+    }
+    let color = u32::from_le_bytes(color_bytes);
+    *mm5_tail = color;
+
+    // Fill rectangle with z-test.
+    let z_val = origin[2];
+    let pitch = target.pitch_pixels;
+    let mut written: u32 = 0;
+    for y in min_y..=max_y {
+        let row_start = y as usize * pitch;
+        for x in min_x..=max_x {
+            let idx = row_start + x as usize;
+            // SAFETY: viewport clip above guarantees idx < pitch * height.
+            unsafe {
+                if target.z_test_write(idx, color, z_val) {
+                    written += 1;
+                }
+            }
+        }
+    }
+    written
 }
 
 /// One iteration of voxlap's `DRAWBOUNDCUBELINE` macro
