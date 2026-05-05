@@ -21,6 +21,13 @@ rust-version = "1.77"
 # same pitch document.
 readme = "README.md"
 
+[workspace.dependencies]
+# R12 multicore rendering — rayon's work-stealing pool, par_iter, and
+# join cover every parallelism axis we need (per-quadrant in R12.2,
+# per-tile in R12.3, per-column lighting bake in R12.4). Declared
+# here in R12.0; first consumer is roxlap-core in R12.1.
+rayon = "1.10"
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
