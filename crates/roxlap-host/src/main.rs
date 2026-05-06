@@ -31,9 +31,9 @@ use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::sprite::{draw_sprite, DrawTarget, SpriteLighting};
+use roxlap_core::world_query::{getcube, Cube};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
-use roxlap_core::LightSrc;
 use roxlap_core::OpticastSettings;
 use roxlap_formats::kfa::{Hinge, KfaSprite, Point3};
 use roxlap_formats::sprite::Sprite;
@@ -58,6 +58,18 @@ const MOUSE_SENS: f64 = 0.0025;
 /// Pitch is clamped just shy of ±90° to keep the basis well-conditioned
 /// (a perfectly straight-up/down camera collapses `right × forward`).
 const PITCH_LIMIT: f64 = 88.0_f64 * std::f64::consts::PI / 180.0;
+
+/// Voxlap's hard z-axis ceiling. Worlds live in `[0, MAXZDIM)` along
+/// the `+z` axis (which is *down* in voxlap's convention).
+const MAXZDIM: i32 = 256;
+
+/// Effective camera "skin" radius in voxel units. Movement is
+/// blocked when any voxel intersected by a ±`PLAYER_RADIUS` cube
+/// around the proposed new position is solid — keeps the camera
+/// off walls instead of letting it touch / clip them. 0.3 matches
+/// the cave demo's tuning; comfortable through corridors but
+/// tight enough that the player feels obstacle contact.
+const PLAYER_RADIUS: f64 = 0.3;
 
 /// Embedded gzipped oracle world. Same fixture roxlap-formats uses
 /// in its parser tests — no extra disk I/O at startup.
@@ -227,7 +239,6 @@ struct App {
     /// light (visible directional shading) and `lightmode=0` (no
     /// lighting at all → sprites render at full ambient via the
     /// nolighta path), giving a clear A/B visual comparison.
-    demo_light: LightSrc,
     /// Snapshot of the pristine (unbaked) `vxl.data` taken at
     /// startup. The `L` toggle restores from this when switching
     /// the light off so the world voxel intensities revert to
@@ -281,14 +292,17 @@ impl App {
     fn toggle_light(&mut self) {
         self.light_on = !self.light_on;
         if self.light_on {
-            self.engine.set_lightmode(2);
-            self.engine.clear_lights();
-            self.engine.add_light(self.demo_light);
+            // Lightmode 1 (directional sun-style) — every voxel
+            // gets `(tp.y * 0.5 + tp.z) * 64 + 103.5` from its
+            // surface normal. No `LightSrc` consulted; mode 1
+            // ignores `engine.lights()`. Smooth gradient across
+            // the whole oracle world rather than mode 2's tightly
+            // localised point lights.
+            self.engine.set_lightmode(1);
             self.swap_in_baked_world();
-            eprintln!("light: ON  (lightmode=2, 1 light, world baked)");
+            eprintln!("light: ON  (lightmode=1, world baked)");
         } else {
             self.engine.set_lightmode(0);
-            self.engine.clear_lights();
             self.swap_in_pristine_world();
             eprintln!("light: OFF (lightmode=0, world unbaked)");
         }
@@ -348,46 +362,69 @@ impl App {
     }
 
     fn integrate(&mut self, dt: f64) {
+        if dt <= 0.0 {
+            return;
+        }
         let cam = self.camera();
         let fast = if self.keys.has(KeyState::FAST) {
             FAST_MULT
         } else {
             1.0
         };
-        let speed = MOVE_SPEED * fast * dt;
-        let mut dx = 0.0;
-        let mut dy = 0.0;
-        let mut dz = 0.0;
+        let speed = MOVE_SPEED * fast;
+        let mut delta = [0.0f64; 3];
         if self.keys.has(KeyState::FORWARD) {
-            dx += cam.forward[0];
-            dy += cam.forward[1];
-            dz += cam.forward[2];
+            for (d, &c) in delta.iter_mut().zip(cam.forward.iter()) {
+                *d += c;
+            }
         }
         if self.keys.has(KeyState::BACK) {
-            dx -= cam.forward[0];
-            dy -= cam.forward[1];
-            dz -= cam.forward[2];
+            for (d, &c) in delta.iter_mut().zip(cam.forward.iter()) {
+                *d -= c;
+            }
         }
         if self.keys.has(KeyState::RIGHT) {
-            dx += cam.right[0];
-            dy += cam.right[1];
-            dz += cam.right[2];
+            for (d, &c) in delta.iter_mut().zip(cam.right.iter()) {
+                *d += c;
+            }
         }
         if self.keys.has(KeyState::LEFT) {
-            dx -= cam.right[0];
-            dy -= cam.right[1];
-            dz -= cam.right[2];
+            for (d, &c) in delta.iter_mut().zip(cam.right.iter()) {
+                *d -= c;
+            }
         }
         if self.keys.has(KeyState::DOWN) {
             // World-down (+z), independent of camera pitch.
-            dz += 1.0;
+            delta[2] += 1.0;
         }
         if self.keys.has(KeyState::UP) {
-            dz -= 1.0;
+            delta[2] -= 1.0;
         }
-        self.cam_pos[0] += dx * speed;
-        self.cam_pos[1] += dy * speed;
-        self.cam_pos[2] += dz * speed;
+        // Normalise diagonal motion so two-key combos don't move √2× faster.
+        let mag = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        if mag <= 1e-6 {
+            return;
+        }
+        let step = [
+            delta[0] / mag * speed * dt,
+            delta[1] / mag * speed * dt,
+            delta[2] / mag * speed * dt,
+        ];
+
+        // Per-axis collision-checked move: try each axis
+        // independently so the camera slides along walls instead of
+        // jamming when one component would collide. If we're already
+        // inside solid (e.g., the camera spawned next to a sprite or
+        // a baked world's brightness change re-classified a voxel),
+        // skip the test for that axis so we can still escape.
+        let already_stuck = is_blocked(&self.vxl, self.cam_pos);
+        for axis in 0..3 {
+            let mut candidate = self.cam_pos;
+            candidate[axis] += step[axis];
+            if already_stuck || !is_blocked(&self.vxl, candidate) {
+                self.cam_pos[axis] = candidate[axis];
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)] // straight-line per-frame work; splitting hurts readability
@@ -811,6 +848,43 @@ fn load_oracle_vxl() -> vxl::Vxl {
     vxl::parse(&bytes).expect("parse oracle.vxl")
 }
 
+/// Test whether any voxel intersected by a ±[`PLAYER_RADIUS`] cube
+/// around `pos` is solid (or out-of-world). Out-of-bounds in any
+/// axis counts as solid so the camera can't fly off the world
+/// edge. Cheap: at `PLAYER_RADIUS = 0.3` the cube spans at most 1
+/// voxel per axis (typically), so this fans out to 1-8
+/// [`getcube`] calls. Mirror of `roxlap-cave-demo::is_blocked`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+fn is_blocked(vxl: &vxl::Vxl, pos: [f64; 3]) -> bool {
+    let lo_x = (pos[0] - PLAYER_RADIUS).floor() as i32;
+    let hi_x = (pos[0] + PLAYER_RADIUS).floor() as i32;
+    let lo_y = (pos[1] - PLAYER_RADIUS).floor() as i32;
+    let hi_y = (pos[1] + PLAYER_RADIUS).floor() as i32;
+    let lo_z = (pos[2] - PLAYER_RADIUS).floor() as i32;
+    let hi_z = (pos[2] + PLAYER_RADIUS).floor() as i32;
+    let vsid = vxl.vsid as i32;
+    for vz in lo_z..=hi_z {
+        for vy in lo_y..=hi_y {
+            for vx in lo_x..=hi_x {
+                if vx < 0 || vy < 0 || vz < 0 || vx >= vsid || vy >= vsid || vz >= MAXZDIM {
+                    return true;
+                }
+                if !matches!(
+                    getcube(&vxl.data, &vxl.column_offset, vxl.vsid, vx, vy, vz),
+                    Cube::Air
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_lines)] // straight-line setup; splitting hurts readability
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
@@ -870,22 +944,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coco_sprite =
         Sprite::axis_aligned(coco_kv6, [cam_f32[0] + 24.0, cam_f32[1] + 12.0, cam_f32[2]]);
 
-    // Demo lighting: lightmode=2 + one bright point light parked
-    // exactly between the two sprites (each 12 voxels lateral
-    // from this point), at sprite-z. Both sprites get strong
-    // directional shading — the face turned toward the light at
-    // 0x80 (full ambient) brightness, the back face deeply
-    // shadowed. The voxlap lighting falloff `(1/d³ - 1/r³) * sc *
-    // 16` is a steep inverse-cube curve, so generous `sc` is
-    // needed to push shadow contrast up; `r2 = 60²` cuts the light
-    // off cleanly past 60 voxels.
-    let demo_light = LightSrc {
-        pos: [cam_f32[0] + 24.0, cam_f32[1], cam_f32[2]],
-        r2: 60.0 * 60.0,
-        sc: 8192.0,
-    };
-    // Engine starts in the unlit state (light_on=false). The L
-    // hotkey applies lightmode + light + world bake on demand.
+    // Lightmode 1 (directional sun-style) is the default — every
+    // voxel gets `(tp.y * 0.5 + tp.z) * 64 + 103.5` from its
+    // surface normal. The bake runs once at startup, after world
+    // load, in `App::new`'s caller path via `App::start_lit`. The
+    // L hotkey toggles back to unlit (lightmode 0) for visual
+    // comparison; the post-bake snapshot is reused on toggle so
+    // re-enabling lighting is an O(memcpy) restore.
 
     // Procedural 2-bone KFA: meltsphere body + coco arm hinged
     // 15 voxels to the body's right via a z-axis rotation joint.
@@ -990,12 +1055,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sprites: vec![meltsphere_sprite, coco_sprite],
         spawn_time: Instant::now(),
         kfa_demo,
-        demo_light,
         pristine_world,
         baked_world: None,
         bake_bbox,
+        // R-host: lightmode 1 active at startup. `App::new`'s
+        // direct callers want this on; the L hotkey toggles
+        // back to unlit (`lightmode = 0`) for visual comparison.
+        // We initialise `light_on = false` so the toggle path
+        // performs the first-time bake + snapshot, then flips
+        // the flag — same code path as a runtime L press.
         light_on: false,
     };
+    eprintln!("baking initial lightmode-1 directional bake — first call is a few seconds…");
+    app.toggle_light();
     event_loop.run_app(&mut app)?;
     Ok(())
 }
