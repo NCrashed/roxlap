@@ -28,6 +28,7 @@ use roxlap_cavegen::{BlueCaveGenerator, CaveParams, Generator, MagCaveGenerator,
 use roxlap_core::opticast;
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::update_lighting;
 use roxlap_core::world_query::{getcube, Cube};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
@@ -103,6 +104,29 @@ const SPAWN_BUBBLE_COLOR: i32 = 0x8060_6068u32 as i32;
 /// always spawns inside an open pocket (cave-gen otherwise leaves
 /// the centre randomly air or solid).
 const SPAWN_BUBBLE_RADIUS: u32 = 6;
+
+/// Voxlap lightmode driving `update_lighting`'s per-voxel
+/// brightness bake.
+///
+/// - `0` → no bake (default; scene reads as flat colour scaled
+///   only by side-shading).
+/// - `1` → directional sun-style bake: every visible voxel gets
+///   `(tp.y * 0.5 + tp.z) * 64 + 103.5` from its surface normal,
+///   clamped to `[0, 255]`. Smooth gradient across the whole
+///   cave, baseline brightness ~104 (close to voxlap's neutral
+///   128). No `LightSrc` consulted.
+/// - `2` → per-light Lambertian point-source bake. The contribution
+///   per light is `g · h · sc` where `g = 1/d³ − 1/r³`, so the
+///   cube falloff drops to ~0 within ~64 voxels even at large
+///   `sc`. Suitable for tight rooms with dense light placement;
+///   not great for a 128³ cave from a handful of point lights.
+///   Empirically tested at sc=5000 — still went black at ~64
+///   voxels from any light.
+///
+/// Mode 1 reads better in this demo (smooth, every wall lit) and
+/// `relight_bbox` still re-bakes carved regions correctly because
+/// `update_lighting` recomputes surface normals after the edit.
+const LIGHTMODE: u32 = 1;
 
 /// Fog colour (BGR low-24-bit; brightness bit MUST be 0 per
 /// `project_oracle_fog_disabled.md` — `set_fogcol(BR(rgb))` with
@@ -245,6 +269,15 @@ impl App {
         // Fog: low-24-bit colour (no brightness bit — see
         // `project_oracle_fog_disabled.md`).
         engine.set_fog(FOG_COLOR, FOG_MAX_SCAN_DIST);
+
+        // Directional sun-style lighting (lightmode 1). No
+        // `LightSrc` needed — the bake reads only the voxel's
+        // surface normal. Initial whole-world bake at startup;
+        // bullet impacts re-bake just the local edit region in
+        // `step_bullets` so dynamic carves stay correctly lit.
+        engine.set_lightmode(LIGHTMODE);
+        relight_world(&mut vxl, &engine);
+
         let pool = ScratchPool::new(WIDTH, HEIGHT, VSID);
 
         // Spawn the camera at the carved bubble's centre.
@@ -287,6 +320,11 @@ impl App {
             SpanOp::Carve,
             |_, _, _| SPAWN_BUBBLE_COLOR,
         );
+        // Re-bake the static spawn-bubble light over the fresh
+        // world. The light's position is pinned to the spawn
+        // bubble centre so the world-space coords don't change;
+        // only the voxel data does.
+        relight_world(&mut vxl, &self.engine);
         self.vxl = vxl;
         self.cam_pos = [
             f64::from(VSID) * 0.5,
@@ -474,6 +512,14 @@ impl App {
                 SpanOp::Carve,
                 |_x, _y, _z| CARVE_COLOR,
             );
+            // Local relight: voxlap's per-voxel intensity depends
+            // on surface normal + line-of-sight to each light. A
+            // carve changes both for voxels around the impact, so
+            // re-bake just the carve's bbox rather than the whole
+            // world. update_lighting pads the bbox by ESTNORMRAD
+            // internally, so we only need the geometric edit
+            // bounds here.
+            relight_bbox(&mut self.vxl, &self.engine, hit, FIRE_RADIUS);
         }
     }
 
@@ -730,6 +776,60 @@ fn is_blocked(vxl: &vxl::Vxl, pos: [f64; 3]) -> bool {
 #[allow(clippy::cast_possible_wrap)]
 fn spawn_centre() -> [i32; 3] {
     [(VSID / 2) as i32, (VSID / 2) as i32, MAXZDIM / 2]
+}
+
+/// Rebake voxel intensities for the entire world under the
+/// engine's current `lightmode` + `lights`. Run once at
+/// startup + after `regenerate`; per-frame relight is too
+/// expensive (~ms per call at VSID=128 / MAXZDIM=256).
+fn relight_world(vxl: &mut vxl::Vxl, engine: &Engine) {
+    #[allow(clippy::cast_possible_wrap)]
+    update_lighting(
+        &mut vxl.data,
+        &vxl.column_offset,
+        vxl.vsid,
+        0,
+        0,
+        0,
+        vxl.vsid as i32,
+        vxl.vsid as i32,
+        MAXZDIM,
+        engine.lightmode(),
+        engine.lights(),
+    );
+}
+
+/// Rebake voxel intensities in just the bounding box around a
+/// sphere edit `[centre - radius, centre + radius + 1]`,
+/// clamped to world bounds. `update_lighting` itself pads by
+/// `ESTNORMRAD` internally so estnorm has enough neighbourhood
+/// — we only need the geometric edit extent here.
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+fn relight_bbox(vxl: &mut vxl::Vxl, engine: &Engine, centre: [i32; 3], radius: u32) {
+    let r = radius as i32;
+    let vsid_i = vxl.vsid as i32;
+    let x0 = (centre[0] - r).max(0);
+    let y0 = (centre[1] - r).max(0);
+    let z0 = (centre[2] - r).max(0);
+    let x1 = (centre[0] + r + 1).min(vsid_i);
+    let y1 = (centre[1] + r + 1).min(vsid_i);
+    let z1 = (centre[2] + r + 1).min(MAXZDIM);
+    if x0 >= x1 || y0 >= y1 || z0 >= z1 {
+        return;
+    }
+    update_lighting(
+        &mut vxl.data,
+        &vxl.column_offset,
+        vxl.vsid,
+        x0,
+        y0,
+        z0,
+        x1,
+        y1,
+        z1,
+        engine.lightmode(),
+        engine.lights(),
+    );
 }
 
 /// Scaled bullet billboard radius — shrinks linearly from
