@@ -55,6 +55,20 @@ cargo run --release -p roxlap-host
 `L` toggles baked world-voxel lighting; `F` writes
 `roxlap-capture.{txt,ppm}` for off-line repro of render artifacts.
 
+For the **browser demo** — same engine, wasm32 + WebAssembly SIMD,
+running on a `<canvas>`:
+
+```sh
+cd crates/roxlap-web
+trunk serve         # opens http://localhost:8080
+```
+
+WASD / arrows move, Space / Shift up &amp; down, click the canvas to
+mouse-look, `B` runs an in-browser 300-frame bench (results in
+the devtools console). `trunk build --release` produces a static
+`dist/` (~360 KB wasm + 18 KB JS) suitable for any static-file
+host. Full setup + perf notes in [crates/roxlap-web/README.md](crates/roxlap-web/README.md).
+
 ## Crates
 
 | Crate | Purpose |
@@ -64,6 +78,7 @@ cargo run --release -p roxlap-host
 | [`roxlap-cavegen`](crates/roxlap-cavegen) | Procedural cave generation. Worley-distance shape classification + Perlin overlay, two visual presets (`BlueCaveGenerator`, `MagCaveGenerator`) matching Ken + Tom Dobrowolski's 2003 *Justfly* demo screenshots, and a `pack_dense_grid_to_vxl` helper that folds a dense voxel mask + colour grid into voxlap's slab format. Pure-Rust (no `cmake` / C++ build deps). |
 | [`roxlap-cave-demo`](crates/roxlap-cave-demo) | Procedural-cave showcase binary (winit + softbuffer). Cave-gen on startup, real-time edits via plasma bullets, fog, F/R preset+seed toggles. |
 | [`roxlap-host`](crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). |
+| [`roxlap-web`](crates/roxlap-web) | Browser demo (wasm32 + wasm-bindgen + canvas). Same engine, WebAssembly SIMD batches, ~360 KB wasm bundle. Run via `trunk serve` for dev / `trunk build --release` for deploy. |
 | [`roxlap-oracle`](crates/roxlap-oracle) | Cross-engine render-hash oracle: renders 12 fixed test poses, FNV-1a-hashes each framebuffer, diffs against voxlaptest's C goldens. CI gates on this. |
 
 The library API surface is documented at [docs.rs/roxlap-core](https://docs.rs/roxlap-core)
@@ -74,10 +89,12 @@ and [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
 - **Cross-platform from one source.** Linux, Windows, macOS (x86_64 +
   arm64), wasm — all from one Cargo workspace. No `#ifdef _MSC_VER`,
   no MASM, no C FFI.
-- **SIMD per architecture.** SSE2 on x86_64 today; NEON on aarch64
-  and v128 on wasm planned (R9 / R10). All via `core::arch::*`
-  intrinsics. A portable scalar fallback exists as the correctness
-  reference.
+- **SIMD per architecture.** SSE2 on x86_64, NEON on aarch64,
+  WebAssembly simd128 (`f32x4_*`) on wasm32 — all via
+  `core::arch::*` intrinsics. A portable scalar fallback exists as
+  the correctness reference, and per-arch goldens pin each path's
+  output bit-for-bit (rsqrt-approximation precision differs across
+  arches by design).
 - **Idiomatic safe Rust public API.** RAII handles, `Result` at every
   external boundary, no globals leaked across an FFI seam because there
   is no FFI.
@@ -117,9 +134,9 @@ MATCH    diag_down_lit  b536ce3fdf771b9e       (roxlap-frozen)
 9 match, 0 mismatch, 0 missing-from-golden (9 total roxlap rows)
 ```
 
-Open work: ARM NEON (R9), wasm SIMD + browser host (R10), and
-crates.io publish (R11.9). See [PORTING-RUST.md](PORTING-RUST.md)
-for the full substage roadmap.
+ARM NEON (R9) and wasm SIMD + browser host (R10) landed. Open
+work: crates.io publish (R11.9). See
+[PORTING-RUST.md](PORTING-RUST.md) for the full substage roadmap.
 
 ## Multicore
 

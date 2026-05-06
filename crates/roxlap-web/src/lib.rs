@@ -67,6 +67,20 @@ struct State {
     input: Input,
     last_frame_ms: f64,
     ctx: web_sys::CanvasRenderingContext2d,
+    /// R10.5: in-flight bench session. `None` when idle; the
+    /// 'B' keybind seeds this with a fresh `Bench` and the RAF
+    /// loop fills `samples_ms` until it hits `target_frames`,
+    /// at which point stats are dumped to the console and the
+    /// field is cleared back to `None`.
+    bench: Option<Bench>,
+}
+
+/// In-flight bench session — captures per-frame `render+pack+
+/// blit` cost so the user can compare wasm vs native at the
+/// same workload.
+struct Bench {
+    target_frames: u32,
+    samples_ms: Vec<f64>,
 }
 
 #[derive(Default)]
@@ -200,10 +214,12 @@ fn integrate_input(state: &mut State, dt: f64) {
     }
 }
 
-fn frame_tick(state_rc: &Rc<RefCell<State>>, now_ms: f64) {
+fn frame_tick(state_rc: &Rc<RefCell<State>>, perf: &web_sys::Performance, now_ms: f64) {
     let mut state = state_rc.borrow_mut();
     let dt = dt_seconds(state.last_frame_ms, now_ms);
     state.last_frame_ms = now_ms;
+
+    let frame_start_ms = perf.now();
 
     integrate_input(&mut state, dt);
     render_frame(&mut state);
@@ -224,6 +240,44 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, now_ms: f64) {
     {
         let _ = state.ctx.put_image_data(&image_data, 0.0, 0.0);
     }
+
+    // R10.5: if a bench session is in flight, record the work
+    // we just did and check whether we've hit the target frame
+    // count. The first frame after press is excluded from the
+    // sample (RAF cadence + input-handler cold path inflate it).
+    let frame_ms = perf.now() - frame_start_ms;
+    if let Some(bench) = state.bench.as_mut() {
+        bench.samples_ms.push(frame_ms);
+        if bench.samples_ms.len() as u32 >= bench.target_frames {
+            let report = report_bench(&bench.samples_ms);
+            web_sys::console::log_1(&report.into());
+            state.bench = None;
+        }
+    }
+}
+
+/// Format min / p50 / mean / p99 / max + fps over `samples_ms`.
+/// Mirrors the native `cmd_bench` output shape so devtools-vs-CLI
+/// comparison is one-line readable.
+fn report_bench(samples_ms: &[f64]) -> String {
+    if samples_ms.is_empty() {
+        return "roxlap-web bench: no samples".to_string();
+    }
+    let mut sorted = samples_ms.to_vec();
+    // f64 has no Ord; partial_cmp is total under the
+    // assumption no NaN slips in (performance.now() doesn't
+    // emit NaN).
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let min = sorted[0];
+    let max = sorted[n - 1];
+    let p50 = sorted[n / 2];
+    let p99 = sorted[(n.saturating_sub(1) * 99) / 100];
+    let mean = sorted.iter().sum::<f64>() / n as f64;
+    let fps = 1000.0 / mean;
+    format!(
+        "roxlap-web bench: {n} frames | min {min:.2} | p50 {p50:.2} | mean {mean:.2} | p99 {p99:.2} | max {max:.2} ms — {fps:.0} fps"
+    )
 }
 
 fn request_animation_frame(window: &web_sys::Window, f: &Closure<dyn FnMut(f64)>) {
@@ -292,12 +346,13 @@ pub fn start() -> Result<(), JsValue> {
         input: Input::default(),
         last_frame_ms: now_ms,
         ctx,
+        bench: None,
     };
     let state = Rc::new(RefCell::new(state));
 
     web_sys::console::log_1(
         &format!(
-            "roxlap-web: parsed oracle.vxl in {:.1} ms — controls: WASD move, Space/Shift up/down, click canvas to look around",
+            "roxlap-web: parsed oracle.vxl in {:.1} ms — controls: WASD move, Space/Shift up/down, click canvas to look around, B to bench",
             t_parse_end - t_parse_start,
         )
         .into(),
@@ -319,6 +374,20 @@ fn install_input_handlers(
     let on_keydown = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
         if let Ok(mut s) = key_state.try_borrow_mut() {
             if set_key(&mut s.input, &ev.code(), true) {
+                ev.prevent_default();
+                return;
+            }
+            // R10.5: 'B' starts a 300-frame bench. Render keeps
+            // running; the RAF loop accumulates per-frame ms and
+            // dumps stats to console once the target is hit.
+            // Re-pressing while a session is active is a no-op so
+            // we don't lose in-flight samples.
+            if ev.code() == "KeyB" && s.bench.is_none() {
+                s.bench = Some(Bench {
+                    target_frames: 300,
+                    samples_ms: Vec::with_capacity(300),
+                });
+                web_sys::console::log_1(&"roxlap-web bench: starting 300-frame timing run".into());
                 ev.prevent_default();
             }
         }
@@ -415,14 +484,17 @@ fn spawn_raf_loop(window: &web_sys::Window, state: &Rc<RefCell<State>>) {
     let g = f.clone();
     let state_for_raf = state.clone();
     let window_for_raf = window.clone();
+    let perf = window
+        .performance()
+        .expect("performance API on Window — required for RAF + bench timing");
     let mut frame_count: u32 = 0;
     let mut log_accum_ms: f64 = 0.0;
     let mut log_accum_frames: u32 = 0;
 
     *g.borrow_mut() = Some(Closure::<dyn FnMut(f64)>::new(move |now_ms: f64| {
         let t_frame_start = now_ms;
-        frame_tick(&state_for_raf, now_ms);
-        let t_frame_end = window_for_raf.performance().map_or(now_ms, |p| p.now());
+        frame_tick(&state_for_raf, &perf, now_ms);
+        let t_frame_end = perf.now();
         let frame_ms = t_frame_end - t_frame_start;
         log_accum_ms += frame_ms;
         log_accum_frames += 1;
