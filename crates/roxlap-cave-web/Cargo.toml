@@ -1,0 +1,47 @@
+[package]
+name = "roxlap-cave-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "roxlap cave demo for the browser — cave-gen + bullets + carves on wasm32 + canvas."
+# Bin-shaped: a wasm bundle, not a library to link against. The
+# deliverable is the static HTML + wasm bundle that `trunk build`
+# emits, not a Rust dep.
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+roxlap-core = { path = "../roxlap-core", version = "0.1" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.1" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
+
+# wasm-bindgen / web-sys versions pinned to the same major+minor as
+# `wasm-bindgen-cli` shipped by nixpkgs (see crates/roxlap-oracle/
+# Cargo.toml's R10.1 block for the schema-mismatch reasoning).
+wasm-bindgen = "=0.2.117"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "ImageData",
+    "Performance",
+    "console",
+    "KeyboardEvent",
+    "MouseEvent",
+]
+
+[lints]
+workspace = true

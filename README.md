@@ -55,19 +55,27 @@ cargo run --release -p roxlap-host
 `L` toggles baked world-voxel lighting; `F` writes
 `roxlap-capture.{txt,ppm}` for off-line repro of render artifacts.
 
-For the **browser demo** — same engine, wasm32 + WebAssembly SIMD,
+For the **browser demos** — same engine, wasm32 + WebAssembly SIMD,
 running on a `<canvas>`:
 
 ```sh
+# Engine demo (oracle world, ~360 KB wasm + 18 KB JS)
 cd crates/roxlap-web
 trunk serve         # opens http://localhost:8080
+
+# Cave demo (procedural Worley + Perlin caves with bullets +
+# carving + local relight, ~130 KB wasm)
+cd crates/roxlap-cave-web
+trunk serve
 ```
 
-WASD / arrows move, Space / Shift up &amp; down, click the canvas to
-mouse-look, `B` runs an in-browser 300-frame bench (results in
-the devtools console). `trunk build --release` produces a static
-`dist/` (~360 KB wasm + 18 KB JS) suitable for any static-file
-host. Full setup + perf notes in [crates/roxlap-web/README.md](crates/roxlap-web/README.md).
+Both use WASD / arrows + click-to-mouse-look + Space / Shift for
+vertical. The cave demo adds Ctrl for fast-fly, click-while-locked
+to fire bullets, F to toggle blue ↔ mag preset, R for next seed.
+The engine demo's `B` runs an in-browser 300-frame bench (results
+in the devtools console). `trunk build --release` produces a
+static `dist/` suitable for any static-file host. Full setup +
+perf notes in [crates/roxlap-web/README.md](crates/roxlap-web/README.md).
 
 ## Crates
 
@@ -78,7 +86,8 @@ host. Full setup + perf notes in [crates/roxlap-web/README.md](crates/roxlap-web
 | [`roxlap-cavegen`](crates/roxlap-cavegen) | Procedural cave generation. Worley-distance shape classification + Perlin overlay, two visual presets (`BlueCaveGenerator`, `MagCaveGenerator`) matching Ken + Tom Dobrowolski's 2003 *Justfly* demo screenshots, and a `pack_dense_grid_to_vxl` helper that folds a dense voxel mask + colour grid into voxlap's slab format. Pure-Rust (no `cmake` / C++ build deps). |
 | [`roxlap-cave-demo`](crates/roxlap-cave-demo) | Procedural-cave showcase binary (winit + softbuffer). Cave-gen on startup, real-time edits via plasma bullets, fog, F/R preset+seed toggles. |
 | [`roxlap-host`](crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). |
-| [`roxlap-web`](crates/roxlap-web) | Browser demo (wasm32 + wasm-bindgen + canvas). Same engine, WebAssembly SIMD batches, ~360 KB wasm bundle. Run via `trunk serve` for dev / `trunk build --release` for deploy. |
+| [`roxlap-web`](crates/roxlap-web) | Engine demo for the browser (wasm32 + wasm-bindgen + canvas). Oracle world + WebAssembly SIMD batches, ~360 KB wasm bundle. Run via `trunk serve` for dev / `trunk build --release` for deploy. |
+| [`roxlap-cave-web`](crates/roxlap-cave-web) | Cave demo for the browser — Worley + Perlin cave-gen, fly + fire + carve with local relight on impact, all on wasm32. ~130 KB wasm bundle (no embedded asset; cave is generated client-side). |
 | [`roxlap-oracle`](crates/roxlap-oracle) | Cross-engine render-hash oracle: renders 12 fixed test poses, FNV-1a-hashes each framebuffer, diffs against voxlaptest's C goldens. CI gates on this. |
 
 The library API surface is documented at [docs.rs/roxlap-core](https://docs.rs/roxlap-core)

@@ -1,0 +1,810 @@
+//! roxlap-cave-web — procedural cave demo on wasm32 + canvas.
+//!
+//! Combines the engine + cave-gen pipeline from
+//! `roxlap-cave-demo` with the canvas / `requestAnimationFrame`
+//! / pointer-lock scaffolding from `roxlap-web`. The whole
+//! pipeline (Worley + Perlin cave gen, voxlap renderer, sphere
+//! carve, lightmode-1 bake) runs in the browser; the player
+//! flies through with WASD + mouse-look, fires plasma bullets
+//! that carve craters with local relight on impact, and can
+//! regenerate the cave via `F` (preset) or `R` (seed).
+
+#![cfg(target_arch = "wasm32")]
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use roxlap_cavegen::{BlueCaveGenerator, CaveParams, Generator, MagCaveGenerator, MAXZDIM};
+use roxlap_core::opticast::opticast;
+use roxlap_core::rasterizer::ScratchPool;
+use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::update_lighting;
+use roxlap_core::world_query::{getcube, Cube};
+use roxlap_core::{Camera, Engine, OpticastSettings};
+use roxlap_formats::edit::{set_sphere_with_colfunc, SpanOp};
+use roxlap_formats::vxl;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::Clamped;
+use web_sys::{HtmlCanvasElement, ImageData, KeyboardEvent, MouseEvent};
+
+// ----- World / camera tuning (mirrors roxlap-cave-demo) ----------------------
+
+const XRES: u32 = 640;
+const YRES: u32 = 480;
+const VSID: u32 = 128;
+
+const MOVE_SPEED: f64 = 32.0;
+const FAST_MULT: f64 = 4.0;
+const MOUSE_SENSITIVITY: f64 = 0.0025;
+const PITCH_LIMIT: f64 = std::f64::consts::FRAC_PI_2 - 0.05;
+const PLAYER_RADIUS: f64 = 0.3;
+
+const BULLET_MAX_DIST: f64 = 96.0;
+const BULLET_VEL: f64 = 60.0;
+const FIRE_RADIUS: u32 = 4;
+const BULLET_RADIUS_PX_MAX: i32 = 12;
+const BULLET_RADIUS_PX_MIN: i32 = 1;
+const BULLET_COLOR_CORE: u32 = 0x00FF_4080;
+const BULLET_COLOR_HALO: u32 = 0x00FF_A0C0;
+
+#[allow(clippy::cast_possible_wrap)]
+const CARVE_COLOR: i32 = 0x8050_3018u32 as i32;
+#[allow(clippy::cast_possible_wrap)]
+const SPAWN_BUBBLE_COLOR: i32 = 0x8060_6068u32 as i32;
+const SPAWN_BUBBLE_RADIUS: u32 = 6;
+
+const LIGHTMODE: u32 = 1;
+
+const FOG_COLOR: u32 = 0x0090_98B0;
+const FOG_MAX_SCAN_DIST: i32 = 128;
+
+// ----- Types ----------------------------------------------------------------
+
+type RafCell = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
+
+#[derive(Debug, Clone, Copy)]
+struct Bullet {
+    pos: [f64; 3],
+    vel: [f64; 3],
+    travelled: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preset {
+    Blue,
+    Mag,
+}
+
+impl Preset {
+    fn next(self) -> Self {
+        match self {
+            Self::Blue => Self::Mag,
+            Self::Mag => Self::Blue,
+        }
+    }
+    fn default_params(self) -> CaveParams {
+        match self {
+            Self::Blue => BlueCaveGenerator::default_params(),
+            Self::Mag => MagCaveGenerator::default_params(),
+        }
+    }
+    fn generate(self, seed: u64) -> vxl::Vxl {
+        let mut params = self.default_params();
+        params.seed = seed;
+        match self {
+            Self::Blue => BlueCaveGenerator.generate(&params, VSID),
+            Self::Mag => MagCaveGenerator.generate(&params, VSID),
+        }
+    }
+}
+
+struct State {
+    engine: Engine,
+    vxl: vxl::Vxl,
+    pool: ScratchPool,
+    fb: Vec<u32>,
+    zb: Vec<f32>,
+    rgba: Vec<u8>,
+    cam_pos: [f64; 3],
+    yaw: f64,
+    pitch: f64,
+    input: Input,
+    last_frame_ms: f64,
+    ctx: web_sys::CanvasRenderingContext2d,
+    bullets: Vec<Bullet>,
+    preset: Preset,
+    seed: u64,
+}
+
+#[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
+struct Input {
+    forward: bool,
+    backward: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    fast: bool,
+    /// Pointer-lock-driven yaw/pitch deltas, accumulated since
+    /// the last frame integration.
+    dyaw: f64,
+    dpitch: f64,
+}
+
+// ----- World gen + lighting --------------------------------------------------
+
+#[allow(clippy::cast_possible_wrap)]
+fn spawn_centre() -> [i32; 3] {
+    [(VSID / 2) as i32, (VSID / 2) as i32, MAXZDIM / 2]
+}
+
+fn build_world(preset: Preset, seed: u64) -> vxl::Vxl {
+    let mut vxl = preset.generate(seed);
+    let centre = spawn_centre();
+    set_sphere_with_colfunc(
+        &mut vxl,
+        centre,
+        SPAWN_BUBBLE_RADIUS,
+        SpanOp::Carve,
+        |_, _, _| SPAWN_BUBBLE_COLOR,
+    );
+    vxl
+}
+
+fn relight_world(vxl: &mut vxl::Vxl, engine: &Engine) {
+    #[allow(clippy::cast_possible_wrap)]
+    update_lighting(
+        &mut vxl.data,
+        &vxl.column_offset,
+        vxl.vsid,
+        0,
+        0,
+        0,
+        vxl.vsid as i32,
+        vxl.vsid as i32,
+        MAXZDIM,
+        engine.lightmode(),
+        engine.lights(),
+    );
+}
+
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+fn relight_bbox(vxl: &mut vxl::Vxl, engine: &Engine, centre: [i32; 3], radius: u32) {
+    let r = radius as i32;
+    let vsid_i = vxl.vsid as i32;
+    let x0 = (centre[0] - r).max(0);
+    let y0 = (centre[1] - r).max(0);
+    let z0 = (centre[2] - r).max(0);
+    let x1 = (centre[0] + r + 1).min(vsid_i);
+    let y1 = (centre[1] + r + 1).min(vsid_i);
+    let z1 = (centre[2] + r + 1).min(MAXZDIM);
+    if x0 >= x1 || y0 >= y1 || z0 >= z1 {
+        return;
+    }
+    update_lighting(
+        &mut vxl.data,
+        &vxl.column_offset,
+        vxl.vsid,
+        x0,
+        y0,
+        z0,
+        x1,
+        y1,
+        z1,
+        engine.lightmode(),
+        engine.lights(),
+    );
+}
+
+// ----- Camera + collision ---------------------------------------------------
+
+fn cam_from_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
+    let cy = yaw.cos();
+    let sy = yaw.sin();
+    let cp = pitch.cos();
+    let sp = pitch.sin();
+    Camera {
+        pos,
+        right: [-sy, cy, 0.0],
+        down: [-cy * sp, -sy * sp, cp],
+        forward: [cy * cp, sy * cp, sp],
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+fn is_blocked(vxl: &vxl::Vxl, pos: [f64; 3]) -> bool {
+    let lo_x = (pos[0] - PLAYER_RADIUS).floor() as i32;
+    let hi_x = (pos[0] + PLAYER_RADIUS).floor() as i32;
+    let lo_y = (pos[1] - PLAYER_RADIUS).floor() as i32;
+    let hi_y = (pos[1] + PLAYER_RADIUS).floor() as i32;
+    let lo_z = (pos[2] - PLAYER_RADIUS).floor() as i32;
+    let hi_z = (pos[2] + PLAYER_RADIUS).floor() as i32;
+    let vsid = vxl.vsid as i32;
+    for vz in lo_z..=hi_z {
+        for vy in lo_y..=hi_y {
+            for vx in lo_x..=hi_x {
+                if vx < 0 || vy < 0 || vz < 0 || vx >= vsid || vy >= vsid || vz >= MAXZDIM {
+                    return true;
+                }
+                if !matches!(
+                    getcube(&vxl.data, &vxl.column_offset, vxl.vsid, vx, vy, vz),
+                    Cube::Air
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn dt_seconds(prev_ms: f64, now_ms: f64) -> f64 {
+    let dt_ms = (now_ms - prev_ms).clamp(0.0, 100.0);
+    dt_ms / 1000.0
+}
+
+fn integrate_input(state: &mut State, dt: f64) {
+    state.yaw += state.input.dyaw * MOUSE_SENSITIVITY;
+    state.pitch =
+        (state.pitch + state.input.dpitch * MOUSE_SENSITIVITY).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    state.input.dyaw = 0.0;
+    state.input.dpitch = 0.0;
+
+    let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
+    let mut delta = [0.0f64; 3];
+    if state.input.forward {
+        for (d, &c) in delta.iter_mut().zip(cam.forward.iter()) {
+            *d += c;
+        }
+    }
+    if state.input.backward {
+        for (d, &c) in delta.iter_mut().zip(cam.forward.iter()) {
+            *d -= c;
+        }
+    }
+    if state.input.right {
+        for (d, &c) in delta.iter_mut().zip(cam.right.iter()) {
+            *d += c;
+        }
+    }
+    if state.input.left {
+        for (d, &c) in delta.iter_mut().zip(cam.right.iter()) {
+            *d -= c;
+        }
+    }
+    if state.input.up {
+        delta[2] -= 1.0;
+    }
+    if state.input.down {
+        delta[2] += 1.0;
+    }
+    let mag = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+    if mag <= 1e-6 {
+        return;
+    }
+    let speed = if state.input.fast {
+        MOVE_SPEED * FAST_MULT
+    } else {
+        MOVE_SPEED
+    };
+    let step = [
+        delta[0] / mag * speed * dt,
+        delta[1] / mag * speed * dt,
+        delta[2] / mag * speed * dt,
+    ];
+    let already_stuck = is_blocked(&state.vxl, state.cam_pos);
+    for axis in 0..3 {
+        let mut candidate = state.cam_pos;
+        candidate[axis] += step[axis];
+        if already_stuck || !is_blocked(&state.vxl, candidate) {
+            state.cam_pos[axis] = candidate[axis];
+        }
+    }
+}
+
+// ----- Bullets --------------------------------------------------------------
+
+fn fire_bullet(state: &mut State) {
+    let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
+    let pos = [
+        cam.pos[0] + cam.forward[0] * 0.5,
+        cam.pos[1] + cam.forward[1] * 0.5,
+        cam.pos[2] + cam.forward[2] * 0.5,
+    ];
+    let vel = [
+        cam.forward[0] * BULLET_VEL,
+        cam.forward[1] * BULLET_VEL,
+        cam.forward[2] * BULLET_VEL,
+    ];
+    state.bullets.push(Bullet {
+        pos,
+        vel,
+        travelled: 0.0,
+    });
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn step_bullets(state: &mut State, dt: f64) {
+    if dt <= 0.0 {
+        return;
+    }
+    let vsid = state.vxl.vsid;
+    let mut impacts: Vec<[i32; 3]> = Vec::new();
+    state.bullets.retain_mut(|b| {
+        let dx = b.vel[0] * dt;
+        let dy = b.vel[1] * dt;
+        let dz = b.vel[2] * dt;
+        b.pos[0] += dx;
+        b.pos[1] += dy;
+        b.pos[2] += dz;
+        b.travelled += (dx * dx + dy * dy + dz * dz).sqrt();
+        if bullet_radius_px(b) < BULLET_RADIUS_PX_MIN {
+            return false;
+        }
+        let vx = b.pos[0].floor() as i32;
+        let vy = b.pos[1].floor() as i32;
+        let vz = b.pos[2].floor() as i32;
+        if vx < 0
+            || vy < 0
+            || (vx as u32) >= vsid
+            || (vy as u32) >= vsid
+            || !(0..MAXZDIM).contains(&vz)
+        {
+            return false;
+        }
+        if !matches!(
+            getcube(&state.vxl.data, &state.vxl.column_offset, vsid, vx, vy, vz),
+            Cube::Air
+        ) {
+            impacts.push([vx, vy, vz]);
+            return false;
+        }
+        true
+    });
+    for hit in impacts {
+        set_sphere_with_colfunc(
+            &mut state.vxl,
+            hit,
+            FIRE_RADIUS,
+            SpanOp::Carve,
+            |_x, _y, _z| CARVE_COLOR,
+        );
+        relight_bbox(&mut state.vxl, &state.engine, hit, FIRE_RADIUS);
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn bullet_radius_px(bullet: &Bullet) -> i32 {
+    let t = (bullet.travelled / BULLET_MAX_DIST).clamp(0.0, 1.0);
+    let r = (1.0 - t) * f64::from(BULLET_RADIUS_PX_MAX);
+    r.round() as i32
+}
+
+// ----- Render ---------------------------------------------------------------
+
+fn render_frame(state: &mut State) {
+    let sky = state.engine.sky_color();
+    state.fb.fill(sky);
+    for z in &mut state.zb {
+        *z = 0.0;
+    }
+    let sky_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    state.pool.set_skycast(sky_i, 0);
+    let fog_i = i32::from_ne_bytes(state.engine.fog_color().to_ne_bytes());
+    state.pool.set_fog(fog_i, state.engine.fog_max_scan_dist());
+
+    let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
+    let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+    let mut rasterizer = ScalarRasterizer::new(
+        &mut state.fb,
+        &mut state.zb,
+        XRES as usize,
+        &state.vxl.data,
+        &state.vxl.column_offset,
+        &state.vxl.mip_base_offsets,
+        state.vxl.vsid,
+    );
+    let _ = opticast(
+        &mut rasterizer,
+        &mut state.pool,
+        &cam,
+        &settings,
+        state.vxl.vsid,
+        &state.vxl.data,
+        &state.vxl.column_offset,
+    );
+    drop(rasterizer);
+
+    // Bullet billboards on top of the rasterized scene.
+    let cam_for_bullet = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
+    let settings_for_bullet = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+    for bullet in &state.bullets {
+        draw_bullet(
+            &mut state.fb,
+            &state.zb,
+            XRES,
+            YRES,
+            &cam_for_bullet,
+            &settings_for_bullet,
+            bullet,
+        );
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::similar_names
+)]
+fn draw_bullet(
+    fb: &mut [u32],
+    zb: &[f32],
+    width: u32,
+    height: u32,
+    cam: &Camera,
+    settings: &OpticastSettings,
+    bullet: &Bullet,
+) {
+    // World-space → camera-space
+    let dx = bullet.pos[0] - cam.pos[0];
+    let dy = bullet.pos[1] - cam.pos[1];
+    let dz = bullet.pos[2] - cam.pos[2];
+    // Voxlap basis projection: x_cam = right · delta, y_cam = down ·
+    // delta, z_cam = forward · delta. Cull anything behind the eye.
+    let zc = cam.forward[0] * dx + cam.forward[1] * dy + cam.forward[2] * dz;
+    if zc <= 1e-3 {
+        return;
+    }
+    let xc = cam.right[0] * dx + cam.right[1] * dy + cam.right[2] * dz;
+    let yc = cam.down[0] * dx + cam.down[1] * dy + cam.down[2] * dz;
+    let inv_z = 1.0 / zc;
+    let cx = f64::from(settings.hx) + xc * inv_z * f64::from(settings.hz);
+    let cy = f64::from(settings.hy) + yc * inv_z * f64::from(settings.hz);
+    let r_px = bullet_radius_px(bullet);
+    if r_px < 1 {
+        return;
+    }
+    let r2 = r_px * r_px;
+    let r_halo2 = (r_px - 1).max(0).pow(2);
+    let cx_i = cx.round() as i32;
+    let cy_i = cy.round() as i32;
+    let z_value = zc as f32;
+    let w = width as i32;
+    let h = height as i32;
+    for py in (cy_i - r_px)..=(cy_i + r_px) {
+        if py < 0 || py >= h {
+            continue;
+        }
+        for px in (cx_i - r_px)..=(cx_i + r_px) {
+            if px < 0 || px >= w {
+                continue;
+            }
+            let ddx = px - cx_i;
+            let ddy = py - cy_i;
+            let d2 = ddx * ddx + ddy * ddy;
+            if d2 > r2 {
+                continue;
+            }
+            let idx = (py as usize) * (width as usize) + px as usize;
+            // z-test: bullet is in front of the world voxel here.
+            if zb[idx] > 0.0 && zb[idx] < z_value {
+                continue;
+            }
+            fb[idx] = if d2 <= r_halo2 {
+                BULLET_COLOR_CORE
+            } else {
+                BULLET_COLOR_HALO
+            };
+        }
+    }
+}
+
+fn pack_rgba(framebuffer: &[u32], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), framebuffer.len() * 4);
+    for (i, &px) in framebuffer.iter().enumerate() {
+        let r = ((px >> 16) & 0xff) as u8;
+        let g = ((px >> 8) & 0xff) as u8;
+        let b = (px & 0xff) as u8;
+        out[i * 4] = r;
+        out[i * 4 + 1] = g;
+        out[i * 4 + 2] = b;
+        out[i * 4 + 3] = 0xff;
+    }
+}
+
+fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_ms: f64) {
+    let mut state = state_rc.borrow_mut();
+    let dt = dt_seconds(state.last_frame_ms, now_ms);
+    state.last_frame_ms = now_ms;
+
+    integrate_input(&mut state, dt);
+    step_bullets(&mut state, dt);
+    render_frame(&mut state);
+
+    let fb_ptr = state.fb.as_ptr();
+    let fb_len = state.fb.len();
+    // SAFETY: pack_rgba only reads `fb`. Splitting the borrow
+    // through a raw pointer avoids two `&mut state` at once.
+    let fb_slice = unsafe { std::slice::from_raw_parts(fb_ptr, fb_len) };
+    pack_rgba(fb_slice, &mut state.rgba);
+
+    if let Ok(image_data) =
+        ImageData::new_with_u8_clamped_array_and_sh(Clamped(&state.rgba), XRES, YRES)
+    {
+        let _ = state.ctx.put_image_data(&image_data, 0.0, 0.0);
+    }
+}
+
+// ----- Regenerate -----------------------------------------------------------
+
+fn regenerate(state: &mut State) {
+    state.vxl = build_world(state.preset, state.seed);
+    relight_world(&mut state.vxl, &state.engine);
+    state.cam_pos = [
+        f64::from(VSID) * 0.5,
+        f64::from(VSID) * 0.5,
+        f64::from(MAXZDIM) * 0.5,
+    ];
+    state.bullets.clear();
+    state.pool = ScratchPool::new(XRES, YRES, state.vxl.vsid);
+}
+
+// ----- Init -----------------------------------------------------------------
+
+/// wasm-bindgen `start` hook — invoked by the JS shim once the
+/// module finishes loading. Generates a cave, bakes lighting,
+/// hooks input, kicks off the RAF loop.
+///
+/// # Errors
+/// Returns a JS-bridged error if the DOM doesn't have the
+/// expected `<canvas id="roxlap-canvas">`, or if a 2D rendering
+/// context can't be acquired.
+#[wasm_bindgen(start)]
+pub fn start() -> Result<(), JsValue> {
+    console_error_panic_hook::set_once();
+
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
+    let document = window
+        .document()
+        .ok_or_else(|| JsValue::from_str("no document"))?;
+    let canvas: HtmlCanvasElement = document
+        .get_element_by_id("roxlap-canvas")
+        .ok_or_else(|| JsValue::from_str("no #roxlap-canvas element"))?
+        .dyn_into::<HtmlCanvasElement>()
+        .map_err(|_| JsValue::from_str("#roxlap-canvas is not a <canvas>"))?;
+    canvas.set_width(XRES);
+    canvas.set_height(YRES);
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("no 2d context"))?
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+        .map_err(|_| JsValue::from_str("got the wrong context type"))?;
+
+    let perf = window.performance();
+    let preset = Preset::Blue;
+    let seed = preset.default_params().seed;
+    let t_gen_start = perf.as_ref().map_or(0.0, web_sys::Performance::now);
+    let mut vxl = build_world(preset, seed);
+    let t_gen_end = perf.as_ref().map_or(0.0, web_sys::Performance::now);
+
+    let mut engine = Engine::new();
+    engine.set_fog(FOG_COLOR, FOG_MAX_SCAN_DIST);
+    engine.set_lightmode(LIGHTMODE);
+    let t_bake_start = perf.as_ref().map_or(0.0, web_sys::Performance::now);
+    relight_world(&mut vxl, &engine);
+    let t_bake_end = perf.as_ref().map_or(0.0, web_sys::Performance::now);
+
+    let pool = ScratchPool::new(XRES, YRES, vxl.vsid);
+    let fb = vec![0u32; (XRES * YRES) as usize];
+    let zb = vec![0f32; (XRES * YRES) as usize];
+    let rgba = vec![0u8; (XRES * YRES * 4) as usize];
+
+    let now_ms = perf.as_ref().map_or(0.0, web_sys::Performance::now);
+    let state = State {
+        engine,
+        vxl,
+        pool,
+        fb,
+        zb,
+        rgba,
+        cam_pos: [
+            f64::from(VSID) * 0.5,
+            f64::from(VSID) * 0.5,
+            f64::from(MAXZDIM) * 0.5,
+        ],
+        yaw: 0.0,
+        pitch: 0.0,
+        input: Input::default(),
+        last_frame_ms: now_ms,
+        ctx,
+        bullets: Vec::new(),
+        preset,
+        seed,
+    };
+    let state = Rc::new(RefCell::new(state));
+
+    web_sys::console::log_1(
+        &format!(
+            "roxlap-cave-web: cave-gen {:.0} ms, lightmode-1 bake {:.0} ms — controls: WASD move, Space/Shift up/down, Shift+/Ctrl fast, click canvas to look around, click again to fire, F preset, R reseed",
+            t_gen_end - t_gen_start,
+            t_bake_end - t_bake_start,
+        )
+        .into(),
+    );
+
+    install_input_handlers(&document, &canvas, &state)?;
+    spawn_raf_loop(&window, &state);
+    Ok(())
+}
+
+fn install_input_handlers(
+    document: &web_sys::Document,
+    canvas: &HtmlCanvasElement,
+    state: &Rc<RefCell<State>>,
+) -> Result<(), JsValue> {
+    // Keyboard
+    let key_state = state.clone();
+    let on_keydown = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
+        if let Ok(mut s) = key_state.try_borrow_mut() {
+            let code = ev.code();
+            if set_key(&mut s.input, &code, true) {
+                ev.prevent_default();
+                return;
+            }
+            // Single-press actions.
+            match code.as_str() {
+                "KeyF" => {
+                    s.preset = s.preset.next();
+                    regenerate(&mut s);
+                    ev.prevent_default();
+                }
+                "KeyR" => {
+                    s.seed = s.seed.wrapping_add(1);
+                    regenerate(&mut s);
+                    ev.prevent_default();
+                }
+                _ => {}
+            }
+        }
+    });
+    document.add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref())?;
+    on_keydown.forget();
+
+    let key_state = state.clone();
+    let on_keyup = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
+        if let Ok(mut s) = key_state.try_borrow_mut() {
+            if set_key(&mut s.input, &ev.code(), false) {
+                ev.prevent_default();
+            }
+        }
+    });
+    document.add_event_listener_with_callback("keyup", on_keyup.as_ref().unchecked_ref())?;
+    on_keyup.forget();
+
+    // Click — first time grabs pointer lock, subsequent clicks fire bullets.
+    let click_state = state.clone();
+    let canvas_for_click = canvas.clone();
+    let on_canvas_click = Closure::<dyn FnMut(MouseEvent)>::new(move |_ev: MouseEvent| {
+        let Some(doc) = canvas_for_click.owner_document() else {
+            return;
+        };
+        let locked = doc.pointer_lock_element().as_ref() == Some(canvas_for_click.unchecked_ref());
+        if locked {
+            if let Ok(mut s) = click_state.try_borrow_mut() {
+                fire_bullet(&mut s);
+            }
+        } else {
+            canvas_for_click.request_pointer_lock();
+        }
+    });
+    canvas.add_event_listener_with_callback("click", on_canvas_click.as_ref().unchecked_ref())?;
+    on_canvas_click.forget();
+
+    // Mouse-move (yaw/pitch only while pointer-locked)
+    let mouse_state = state.clone();
+    let canvas_for_check = canvas.clone();
+    let on_mousemove = Closure::<dyn FnMut(MouseEvent)>::new(move |ev: MouseEvent| {
+        let Some(doc) = canvas_for_check.owner_document() else {
+            return;
+        };
+        if doc.pointer_lock_element().as_ref() != Some(canvas_for_check.unchecked_ref()) {
+            return;
+        }
+        if let Ok(mut s) = mouse_state.try_borrow_mut() {
+            s.input.dyaw += f64::from(ev.movement_x());
+            s.input.dpitch += f64::from(ev.movement_y());
+        }
+    });
+    document
+        .add_event_listener_with_callback("mousemove", on_mousemove.as_ref().unchecked_ref())?;
+    on_mousemove.forget();
+
+    Ok(())
+}
+
+fn set_key(input: &mut Input, code: &str, down: bool) -> bool {
+    match code {
+        "KeyW" | "ArrowUp" => {
+            input.forward = down;
+            true
+        }
+        "KeyS" | "ArrowDown" => {
+            input.backward = down;
+            true
+        }
+        "KeyA" | "ArrowLeft" => {
+            input.left = down;
+            true
+        }
+        "KeyD" | "ArrowRight" => {
+            input.right = down;
+            true
+        }
+        "Space" => {
+            input.up = down;
+            true
+        }
+        "ShiftLeft" | "ShiftRight" => {
+            input.down = down;
+            true
+        }
+        "ControlLeft" | "ControlRight" => {
+            input.fast = down;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn spawn_raf_loop(window: &web_sys::Window, state: &Rc<RefCell<State>>) {
+    let f: RafCell = Rc::new(RefCell::new(None));
+    let g = f.clone();
+    let state_for_raf = state.clone();
+    let window_for_raf = window.clone();
+    let perf = window
+        .performance()
+        .expect("performance API on Window — required for RAF + bench timing");
+    let mut frame_count: u32 = 0;
+    let mut log_accum_ms: f64 = 0.0;
+    let mut log_accum_frames: u32 = 0;
+
+    *g.borrow_mut() = Some(Closure::<dyn FnMut(f64)>::new(move |now_ms: f64| {
+        let t_frame_start = now_ms;
+        frame_tick(&state_for_raf, &perf, now_ms);
+        let t_frame_end = perf.now();
+        let frame_ms = t_frame_end - t_frame_start;
+        log_accum_ms += frame_ms;
+        log_accum_frames += 1;
+        frame_count += 1;
+        if log_accum_frames >= 60 {
+            let mean_ms = log_accum_ms / f64::from(log_accum_frames);
+            web_sys::console::log_1(
+                &format!(
+                    "roxlap-cave-web: frame {frame_count} | mean {mean_ms:.1} ms over last {log_accum_frames}"
+                )
+                .into(),
+            );
+            log_accum_ms = 0.0;
+            log_accum_frames = 0;
+        }
+        request_animation_frame(&window_for_raf, f.borrow().as_ref().unwrap());
+    }));
+
+    request_animation_frame(window, g.borrow().as_ref().unwrap());
+}
+
+fn request_animation_frame(window: &web_sys::Window, f: &Closure<dyn FnMut(f64)>) {
+    let _ = window.request_animation_frame(f.as_ref().unchecked_ref());
+}

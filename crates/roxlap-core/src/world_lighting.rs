@@ -503,16 +503,35 @@ pub fn update_lighting(
     // dynamic-lighting / per-edit relighting use cases call
     // `update_lighting` per frame — at which point the parallel
     // path matters for interactive responsiveness.
+    // Per-column byte extents `(start, end)`. After voxalloc-driven
+    // edits (e.g. cave-gen's heavy `set_spans` carve, or runtime
+    // bullet-impact carves), columns are scattered in the slab
+    // pool, so `column_offsets[i+1]` is NOT column `i`'s end byte
+    // — voxlap walks each column's slab chain via `slng()` to
+    // recover length. We pre-compute extents here serially before
+    // moving `world_data` into the parallel mutable view; the
+    // slng walk is O(slab_count) per column, typically 1-3 slabs
+    // → tens of microseconds per row at vsid = 1024. Negligible
+    // next to the bake itself.
+    let n_cols = (vsid as usize) * (vsid as usize);
+    let column_extents: Vec<(usize, usize)> = (0..n_cols)
+        .map(|col_idx| {
+            let start = column_offsets[col_idx] as usize;
+            let end = start + roxlap_formats::vxl::slng(&world_data[start..]);
+            (start, end)
+        })
+        .collect();
+
     let world_view = WorldDataMutView::new(world_data);
     let row_body = |y: i32| {
         for x in x0p..x1p {
             let col_idx = (y as u32) * vsid + (x as u32);
-            let off_start = column_offsets[col_idx as usize] as usize;
-            let off_end = column_offsets[col_idx as usize + 1] as usize;
+            let (off_start, off_end) = column_extents[col_idx as usize];
             // SAFETY: each (x, y) maps to a unique col_idx; column
-            // ranges `[off_start, off_end)` are pairwise disjoint
-            // across distinct `col_idx` (voxalloc invariant), so
-            // no two threads write to the same byte.
+            // byte ranges `[off_start, off_end)` are pairwise
+            // disjoint across distinct `col_idx` (voxalloc's
+            // free-list invariant), so no two threads write to
+            // the same byte.
             let column = unsafe { world_view.column_slice(off_start, off_end) };
             shade_column(column, x, y, z0p, z1p, lightmode, lights, &lightsub, &cache);
         }

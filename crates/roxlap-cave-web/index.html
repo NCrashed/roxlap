@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>roxlap cave demo (web) — pure-Rust voxlap port</title>
+    <link data-trunk rel="rust" />
+    <style>
+      html, body {
+        margin: 0;
+        background: #0c0d12;
+        color: #eee;
+        font: 14px/1.4 system-ui, sans-serif;
+      }
+      main {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 12px;
+        padding: 16px;
+      }
+      canvas {
+        image-rendering: pixelated;
+        background: #000;
+        max-width: 100%;
+        height: auto;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+        cursor: crosshair;
+      }
+      h1 {
+        font-size: 16px;
+        font-weight: 500;
+        margin: 0;
+      }
+      kbd {
+        background: #2a2c34;
+        border: 1px solid #444;
+        border-bottom-width: 2px;
+        border-radius: 3px;
+        padding: 0 4px;
+        font: 11px/1 ui-monospace, monospace;
+      }
+      a {
+        color: #6cf;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>roxlap cave demo · procedural Worley + Perlin · in browser</h1>
+      <canvas id="roxlap-canvas" width="640" height="480"></canvas>
+      <p>
+        <kbd>WASD</kbd>/arrows move · <kbd>Space</kbd>/<kbd>Shift</kbd> up &amp; down · <kbd>Ctrl</kbd> fast-fly ·
+        click canvas → mouse-look · click while locked → fire plasma ·
+        <kbd>F</kbd> swap blue ↔ mag preset · <kbd>R</kbd> next seed
+      </p>
+    </main>
+  </body>
+</html>

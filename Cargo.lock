@@ -1290,6 +1290,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxlap-cave-web"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "js-sys",
+ "roxlap-cavegen",
+ "roxlap-core",
+ "roxlap-formats",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "roxlap-cavegen"
 version = "0.1.0"
 dependencies = [

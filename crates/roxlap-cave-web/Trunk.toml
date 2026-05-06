@@ -1,0 +1,6 @@
+# Trunk config for roxlap-cave-web. `trunk serve` from this
+# directory hosts the demo at http://localhost:8080. Production
+# bundles via `trunk build --release`.
+
+[build]
+public_url = "/"
