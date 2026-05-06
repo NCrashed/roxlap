@@ -111,9 +111,9 @@ const SPAWN_BUBBLE_RADIUS: u32 = 6;
 const FOG_COLOR: u32 = 0x0090_98B0;
 
 /// Fog "max scan distance" in voxels. At this distance pixels
-/// blend fully to `FOG_COLOR`. 48 voxels at vsid=128 is dense
+/// blend fully to `FOG_COLOR`. 128 voxels at vsid=128 is dense
 /// enough to dim distant cave walls without obscuring nearby ones.
-const FOG_MAX_SCAN_DIST: i32 = 48;
+const FOG_MAX_SCAN_DIST: i32 = 128;
 
 /// Effective camera "skin" radius in voxel units. Movement is
 /// blocked when any voxel intersected by a ±`PLAYER_RADIUS` cube
