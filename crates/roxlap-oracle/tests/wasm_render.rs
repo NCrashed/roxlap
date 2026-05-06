@@ -1,125 +1,97 @@
-//! R10.1 — wasm32 scalar render baseline.
+//! R10.1 + R10.4 — wasm32 render goldens.
 //!
-//! A wasm-bindgen-test that allocates a 640×480 framebuffer + zbuffer,
-//! parses the embedded oracle world, runs `opticast` for the `north`
-//! pose, FNV-1a64-hashes the framebuffer bytes, and prints the hash
-//! to Node's console. Runs the render twice to verify the wasm
-//! scalar path is deterministic (no goldens yet — those land in
-//! R10.4).
+//! Iterates all 12 oracle poses (the same set the native bin
+//! renders), FNV-1a64-hashes each framebuffer, and asserts the
+//! result against `tests/wasm-hashes.txt` line-for-line. The
+//! goldens file is committed; on a fresh wasm port edit (e.g.
+//! R10.3 SIMD changes) the failing test prints the new hashes
+//! so an authorised refreeze is a straight `cp` of the printed
+//! lines into the file.
 //!
-//! On native (non-wasm32) targets the whole file is cfg-gated out;
-//! `cargo test` over native builds skips it without trying to pull
-//! the wasm-bindgen-test deps.
+//! On native (non-wasm32) targets the file is fully cfg-gated
+//! out; the native bin's `cargo run -- diff` covers the same
+//! 12 poses against `tests/golden-hashes.txt`.
 
 #![cfg(target_arch = "wasm32")]
 
-use flate2::read::GzDecoder;
-use roxlap_core::opticast::opticast;
-use roxlap_core::rasterizer::ScratchPool;
-use roxlap_core::scalar_rasterizer::ScalarRasterizer;
-use roxlap_core::{Camera, Engine, OpticastSettings};
-use roxlap_formats::vxl;
-use std::io::Read;
+use roxlap_oracle::{load_oracle_vxl, render_all_poses, POSES};
+use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_node_experimental);
 
-const XRES: u32 = 640;
-const YRES: u32 = 480;
-
-// Embedded oracle world — same gzipped fixture the native bin uses.
-// `include_bytes!` keeps the wasm self-contained (no fetch / async
-// asset loading needed for v1; that's R10.X).
-const ORACLE_VXL_GZ: &[u8] = include_bytes!("../../../assets/oracle.vxl.gz");
-
-fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-/// `north` pose from `oracle.c`: yaw = π/2, pitch = 0 at world
-/// (1024, 1024, 128). Hand-rolled basis matches voxlap's
-/// `set_camera_yaw_pitch` exactly (right × down = forward, RH).
-fn camera_north() -> Camera {
-    Camera {
-        pos: [1024.0, 1024.0, 128.0],
-        right: [-1.0, 0.0, 0.0],
-        down: [0.0, 0.0, 1.0],
-        forward: [0.0, 1.0, 0.0],
-    }
-}
-
-fn render_north(world: &vxl::Vxl, engine: &Engine) -> u64 {
-    let sky = engine.sky_color();
-    let mut fb = vec![sky; (XRES * YRES) as usize];
-    let mut zb = vec![0f32; (XRES * YRES) as usize];
-
-    let mut pool = ScratchPool::new(XRES, YRES, world.vsid);
-    let sky_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_i, 0);
-    let fog_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_i, engine.fog_max_scan_dist());
-
-    let cam = camera_north();
-    let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-    {
-        let mut rasterizer = ScalarRasterizer::new(
-            &mut fb,
-            &mut zb,
-            XRES as usize,
-            &world.data,
-            &world.column_offset,
-            &world.mip_base_offsets,
-            world.vsid,
-        );
-        let _ = opticast(
-            &mut rasterizer,
-            &mut pool,
-            &cam,
-            &settings,
-            world.vsid,
-            &world.data,
-            &world.column_offset,
-        );
-    }
-
-    let mut bytes = Vec::with_capacity(fb.len() * 4);
-    for &px in fb.iter() {
-        bytes.extend_from_slice(&px.to_ne_bytes());
-    }
-    fnv1a64(&bytes)
-}
+const WASM_GOLDENS: &str = include_str!("wasm-hashes.txt");
 
 #[wasm_bindgen_test]
-fn north_pose_hash_is_stable() {
+fn all_12_poses_match_wasm_goldens() {
     console_error_panic_hook::set_once();
 
-    let mut bytes = Vec::with_capacity(40 * 1024 * 1024);
-    GzDecoder::new(ORACLE_VXL_GZ)
-        .read_to_end(&mut bytes)
-        .expect("gunzip oracle.vxl.gz");
-    let world = vxl::parse(&bytes).expect("parse oracle.vxl");
-    let engine = Engine::new();
+    let mut vxl = load_oracle_vxl();
+    let mut engine = roxlap_core::Engine::new();
+    let rows = render_all_poses(&mut engine, &mut vxl);
 
-    let h1 = render_north(&world, &engine);
-    let h2 = render_north(&world, &engine);
+    // Pretty-print the actual hashes so a refreeze is a copy-paste.
+    let mut got = String::new();
+    for (name, hash) in &rows {
+        got.push_str(&format!("{name:<20}{hash:016x}\n"));
+    }
+    web_sys_console_log("R10.4 wasm pose hashes:");
+    web_sys_console_log(&got);
 
-    web_sys_console_log(&format!("R10.1 north pose fb fnv1a64 = {h1:016x}"));
-    assert_eq!(h1, h2, "wasm scalar render produced non-deterministic hash");
+    // Parse the goldens file the same way: name [whitespace] hex.
+    let mut want: Vec<(&str, u64)> = Vec::with_capacity(POSES.len());
+    for (i, line) in WASM_GOLDENS.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_ascii_whitespace();
+        let name = parts.next().unwrap_or_else(|| {
+            panic!("wasm-hashes.txt:{}: missing name", i + 1);
+        });
+        let hex = parts.next().unwrap_or_else(|| {
+            panic!("wasm-hashes.txt:{}: missing hash", i + 1);
+        });
+        let hash = u64::from_str_radix(hex, 16).unwrap_or_else(|e| {
+            panic!("wasm-hashes.txt:{}: invalid hex {hex:?}: {e}", i + 1);
+        });
+        want.push((name, hash));
+    }
+
+    assert_eq!(
+        rows.len(),
+        want.len(),
+        "pose count mismatch: rendered {} poses but goldens has {} entries",
+        rows.len(),
+        want.len(),
+    );
+
+    let mut mismatches = 0_usize;
+    for ((got_name, got_hash), (want_name, want_hash)) in rows.iter().zip(want.iter()) {
+        assert_eq!(
+            got_name, want_name,
+            "pose name order drift: got {got_name:?}, expected {want_name:?}",
+        );
+        if got_hash != want_hash {
+            mismatches += 1;
+        }
+    }
+    assert!(
+        mismatches == 0,
+        "{} of {} wasm pose hashes differ from tests/wasm-hashes.txt — paste the table below over the file to refreeze:\n{}",
+        mismatches,
+        rows.len(),
+        got,
+    );
 }
 
 // Tiny inline shim so we don't need the full `web-sys` crate just
 // to print one string. wasm-bindgen-test pipes Node's `console.log`
-// to its captured-output channel; this is the canonical way to
-// surface diagnostic strings from a wasm test.
-#[wasm_bindgen::prelude::wasm_bindgen]
+// to its captured-output channel.
+#[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen::prelude::wasm_bindgen(js_namespace = console, js_name = log)]
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
     fn console_log(s: &str);
 }
 fn web_sys_console_log(s: &str) {

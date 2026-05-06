@@ -1,0 +1,25 @@
+# R10.4 — wasm32 oracle goldens. One line per pose, name + space +
+# hex hash (FNV-1a64 of the framebuffer bytes). Format matches
+# voxlaptest's `golden-hashes.txt` so the same parser can read both.
+#
+# These hashes diverge from x86_64 / aarch64 goldens. Wasm SIMD has
+# no rsqrt/rcp approximation — `f32x4_sqrt` + `f32x4_div` are full-
+# precision IEEE-754, so wasm produces different bytes than SSE2's
+# `_mm_rsqrt_ps` (12-bit) or NEON's `vrsqrteq_f32` + Newton (~16-bit).
+# Documented divergence per PORTING-WASM.md § R10.3.
+#
+# Refreeze: run `cargo test --target wasm32-unknown-unknown -p
+# roxlap-oracle --test wasm_render` and paste the printed
+# `name<spaces>hash` lines from the panic message into this file.
+north               409ae24871dfe474
+east                fd575e24449c9c53
+diag_down           41a470e50a57f65c
+high_down           13131fc5e975c483
+sprite_front        32fd7801d92d7e79
+sprite_above        71f64415352d688c
+sprite_iso          e4989c734179a840
+sprite_coco         482ee5788aed5594
+diag_down_lit       83170f0d90279c5e
+tile_1x             436e3c39ac1a78a5
+tile_half           8808756e167d4ede
+tile_blend          edc95588ba1a15ef
