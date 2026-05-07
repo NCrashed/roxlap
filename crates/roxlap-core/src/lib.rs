@@ -23,6 +23,7 @@ pub mod opticast_prelude;
 pub(crate) mod projection;
 pub(crate) mod ptfaces16;
 pub mod rasterizer;
+pub mod ray_aabb;
 pub(crate) mod ray_step;
 pub mod scalar_rasterizer;
 pub(crate) mod scan_loops;
