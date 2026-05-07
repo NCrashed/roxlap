@@ -42,6 +42,12 @@ features = [
     "console",
     "KeyboardEvent",
     "MouseEvent",
+    # R10.X.4: touch input for mobile.
+    "Touch",
+    "TouchEvent",
+    "TouchList",
+    "DomRect",
+    "HtmlElement",
     "WebGl2RenderingContext",
     "WebGlBuffer",
     "WebGlProgram",

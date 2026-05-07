@@ -34,21 +34,32 @@ console_error_panic_hook = "0.1"
 
 [dependencies.web-sys]
 version = "0.3"
-# Minimal feature set: just what `start()` touches today
-# (`<canvas>`, 2D context, ImageData blit, RAF, frame timer,
-# input events). Adding more in R10.2.X bumps the bundle size,
-# so be deliberate.
+# R10.X.3: WebGL2 blit replaces the 2D `putImageData` path —
+# texture upload + fullscreen-quad draw. The fragment shader
+# does the BGRA→RGBA swizzle on GPU, so the per-frame
+# `pack_rgba` step disappears entirely. Frame time benefit at
+# 640×480 is ~1-2 ms.
 features = [
     "Window",
     "Document",
     "Element",
     "HtmlCanvasElement",
-    "CanvasRenderingContext2d",
-    "ImageData",
     "Performance",
     "console",
     "KeyboardEvent",
     "MouseEvent",
+    # R10.X.4: touch input for mobile.
+    "Touch",
+    "TouchEvent",
+    "TouchList",
+    "DomRect",
+    "WebGl2RenderingContext",
+    "WebGlBuffer",
+    "WebGlProgram",
+    "WebGlShader",
+    "WebGlTexture",
+    "WebGlUniformLocation",
+    "WebGlVertexArrayObject",
 ]
 
 [lints]

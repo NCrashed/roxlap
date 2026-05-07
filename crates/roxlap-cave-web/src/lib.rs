@@ -113,6 +113,31 @@ struct State {
     bullets: Vec<Bullet>,
     preset: Preset,
     seed: u64,
+    /// R10.X.4: per-frame multi-touch state. Empty on desktop;
+    /// 1-2 entries while a phone player holds the canvas.
+    touches: Vec<ActiveTouch>,
+}
+
+/// R10.X.4: multi-touch tracking. Each entry covers one
+/// finger; `id` is `Touch.identifier`. A finger that touches
+/// down in one zone stays in that zone for its lifetime.
+#[derive(Debug, Clone, Copy)]
+struct ActiveTouch {
+    id: i32,
+    zone: TouchZone,
+    last: (f64, f64),
+    origin: (f64, f64),
+    /// `performance.now()` at touchstart — used to classify a
+    /// short Look-zone touch as a tap (= fire bullet).
+    started_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TouchZone {
+    /// Left half: virtual joystick → movement.
+    Joy,
+    /// Right half: drag → yaw/pitch; quick tap → fire bullet.
+    Look,
 }
 
 /// R10.X.3: GPU-side framebuffer presenter — same shape as
@@ -318,6 +343,13 @@ struct Input {
     /// the last frame integration.
     dyaw: f64,
     dpitch: f64,
+    /// R10.X.4: virtual-joystick deflection in `[-1, 1]`. `None`
+    /// when no finger is on the joystick zone.
+    joy: Option<(f64, f64)>,
+    /// R10.X.4: tap-to-fire flag — touchend on the look zone
+    /// after a short hold sets this `true`; the next frame's
+    /// `step_bullets` consumes it (drains to `false`).
+    tap_fire: bool,
 }
 
 // ----- World gen + lighting --------------------------------------------------
@@ -470,6 +502,18 @@ fn integrate_input(state: &mut State, dt: f64) {
     }
     if state.input.down {
         delta[2] += 1.0;
+    }
+    // R10.X.4: virtual-joystick deflection on the canvas's
+    // left half. jy points "up" → forward; jx points right →
+    // strafe right. We add the unnormalised contribution so a
+    // half-stick deflection moves at half MOVE_SPEED.
+    if let Some((jx, jy)) = state.input.joy {
+        for (d, &c) in delta.iter_mut().zip(cam.forward.iter()) {
+            *d += c * (-jy);
+        }
+        for (d, &c) in delta.iter_mut().zip(cam.right.iter()) {
+            *d += c * jx;
+        }
     }
     let mag = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
     if mag <= 1e-6 {
@@ -704,6 +748,13 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_m
     state.last_frame_ms = now_ms;
 
     integrate_input(&mut state, dt);
+    // R10.X.4: tap-to-fire — touchend on the look zone after a
+    // short hold sets `tap_fire`; consume here so a tap can't
+    // double-fire across frames.
+    if state.input.tap_fire {
+        state.input.tap_fire = false;
+        fire_bullet(&mut state);
+    }
     step_bullets(&mut state, dt);
     render_frame(&mut state);
 
@@ -795,6 +846,7 @@ pub fn start() -> Result<(), JsValue> {
         bullets: Vec::new(),
         preset,
         seed,
+        touches: Vec::new(),
     };
     let state = Rc::new(RefCell::new(state));
 
@@ -894,6 +946,182 @@ fn install_input_handlers(
         .add_event_listener_with_callback("mousemove", on_mousemove.as_ref().unchecked_ref())?;
     on_mousemove.forget();
 
+    install_touch_handlers(canvas, state)?;
+    install_button_handlers(document, state)?;
+    Ok(())
+}
+
+/// R10.X.4: virtual-joystick deadzone in canvas pixels.
+const JOY_RADIUS: f64 = 60.0;
+
+/// R10.X.4: a Look-zone touch that ends within this many ms
+/// without dragging more than `TAP_MAX_DRAG_PX` is treated as
+/// a tap → fire bullet.
+const TAP_MAX_DURATION_MS: f64 = 250.0;
+const TAP_MAX_DRAG_PX: f64 = 16.0;
+
+#[allow(clippy::too_many_lines)] // straight-line touch wiring; splitting hurts readability
+fn install_touch_handlers(
+    canvas: &HtmlCanvasElement,
+    state: &Rc<RefCell<State>>,
+) -> Result<(), JsValue> {
+    use web_sys::TouchEvent;
+
+    let canvas_ref = canvas.clone();
+    let state_for_start = state.clone();
+    let on_start = Closure::<dyn FnMut(TouchEvent)>::new(move |ev: TouchEvent| {
+        ev.prevent_default();
+        let rect = canvas_ref.get_bounding_client_rect();
+        let scale_x = f64::from(canvas_ref.width()) / rect.width();
+        let scale_y = f64::from(canvas_ref.height()) / rect.height();
+        let half_w = f64::from(canvas_ref.width()) * 0.5;
+        let now_ms = now_perf();
+        let Ok(mut s) = state_for_start.try_borrow_mut() else {
+            return;
+        };
+        let changed = ev.changed_touches();
+        for i in 0..changed.length() {
+            let Some(t) = changed.get(i) else { continue };
+            let cx = (f64::from(t.client_x()) - rect.left()) * scale_x;
+            let cy = (f64::from(t.client_y()) - rect.top()) * scale_y;
+            let zone = if cx < half_w {
+                TouchZone::Joy
+            } else {
+                TouchZone::Look
+            };
+            s.touches.push(ActiveTouch {
+                id: t.identifier(),
+                zone,
+                last: (cx, cy),
+                origin: (cx, cy),
+                started_ms: now_ms,
+            });
+            if zone == TouchZone::Joy {
+                s.input.joy = Some((0.0, 0.0));
+            }
+        }
+    });
+    canvas.add_event_listener_with_callback("touchstart", on_start.as_ref().unchecked_ref())?;
+    on_start.forget();
+
+    let canvas_ref = canvas.clone();
+    let state_for_move = state.clone();
+    let on_move = Closure::<dyn FnMut(TouchEvent)>::new(move |ev: TouchEvent| {
+        ev.prevent_default();
+        let rect = canvas_ref.get_bounding_client_rect();
+        let scale_x = f64::from(canvas_ref.width()) / rect.width();
+        let scale_y = f64::from(canvas_ref.height()) / rect.height();
+        let Ok(mut s) = state_for_move.try_borrow_mut() else {
+            return;
+        };
+        let changed = ev.changed_touches();
+        for i in 0..changed.length() {
+            let Some(t) = changed.get(i) else { continue };
+            let id = t.identifier();
+            let cx = (f64::from(t.client_x()) - rect.left()) * scale_x;
+            let cy = (f64::from(t.client_y()) - rect.top()) * scale_y;
+            let Some(active) = s.touches.iter_mut().find(|a| a.id == id) else {
+                continue;
+            };
+            let (last_x, last_y) = active.last;
+            let (origin_x, origin_y) = active.origin;
+            active.last = (cx, cy);
+            match active.zone {
+                TouchZone::Joy => {
+                    let jx = ((cx - origin_x) / JOY_RADIUS).clamp(-1.0, 1.0);
+                    let jy = ((cy - origin_y) / JOY_RADIUS).clamp(-1.0, 1.0);
+                    s.input.joy = Some((jx, jy));
+                }
+                TouchZone::Look => {
+                    s.input.dyaw += cx - last_x;
+                    s.input.dpitch += cy - last_y;
+                }
+            }
+        }
+    });
+    canvas.add_event_listener_with_callback("touchmove", on_move.as_ref().unchecked_ref())?;
+    on_move.forget();
+
+    let state_for_end = state.clone();
+    let on_end = Closure::<dyn FnMut(TouchEvent)>::new(move |ev: TouchEvent| {
+        ev.prevent_default();
+        let now_ms = now_perf();
+        let Ok(mut s) = state_for_end.try_borrow_mut() else {
+            return;
+        };
+        let changed = ev.changed_touches();
+        for i in 0..changed.length() {
+            let Some(t) = changed.get(i) else { continue };
+            let id = t.identifier();
+            // Tap-to-fire: a Look-zone touch that ended quickly
+            // and didn't drag far is a tap.
+            if let Some(active) = s.touches.iter().find(|a| a.id == id).copied() {
+                if active.zone == TouchZone::Look {
+                    let duration = now_ms - active.started_ms;
+                    let (lx, ly) = active.last;
+                    let (ox, oy) = active.origin;
+                    let drag = ((lx - ox).powi(2) + (ly - oy).powi(2)).sqrt();
+                    if duration <= TAP_MAX_DURATION_MS && drag <= TAP_MAX_DRAG_PX {
+                        s.input.tap_fire = true;
+                    }
+                }
+            }
+            s.touches.retain(|a| a.id != id);
+        }
+        if !s.touches.iter().any(|a| a.zone == TouchZone::Joy) {
+            s.input.joy = None;
+        }
+    });
+    canvas.add_event_listener_with_callback("touchend", on_end.as_ref().unchecked_ref())?;
+    canvas.add_event_listener_with_callback("touchcancel", on_end.as_ref().unchecked_ref())?;
+    on_end.forget();
+
+    Ok(())
+}
+
+/// `performance.now()` lookup; returns `0.0` if `Performance`
+/// isn't available (vanishingly rare in modern browsers).
+fn now_perf() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map_or(0.0, |p| p.now())
+}
+
+/// On-screen action buttons for mobile — `#fire-btn` mirrors
+/// `tap_fire`, `#preset-btn` cycles preset (mirror of F),
+/// `#seed-btn` advances seed (mirror of R). Buttons live in
+/// `index.html`; here we wire the click handlers.
+fn install_button_handlers(
+    document: &web_sys::Document,
+    state: &Rc<RefCell<State>>,
+) -> Result<(), JsValue> {
+    let bind = |id: &str, action: fn(&mut State)| -> Result<(), JsValue> {
+        let Some(el) = document.get_element_by_id(id) else {
+            return Ok(()); // button missing in HTML — silent no-op
+        };
+        let target = el.dyn_into::<web_sys::HtmlElement>()?;
+        let state_for_btn = state.clone();
+        let on_click =
+            Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |_ev: web_sys::MouseEvent| {
+                if let Ok(mut s) = state_for_btn.try_borrow_mut() {
+                    action(&mut s);
+                }
+            });
+        target.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())?;
+        on_click.forget();
+        Ok(())
+    };
+    bind("fire-btn", |s| {
+        s.input.tap_fire = true;
+    })?;
+    bind("preset-btn", |s| {
+        s.preset = s.preset.next();
+        regenerate(s);
+    })?;
+    bind("seed-btn", |s| {
+        s.seed = s.seed.wrapping_add(1);
+        regenerate(s);
+    })?;
     Ok(())
 }
 

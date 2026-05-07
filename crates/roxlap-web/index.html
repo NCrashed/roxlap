@@ -30,6 +30,13 @@
         max-width: 100%;
         height: auto;
         box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+        /* R10.X.4: stop the browser from intercepting touch
+           gestures (page-pinch zoom, double-tap zoom, swipe-
+           to-go-back). The wasm side handles every touch
+           event; `touch-action: none` is the universal
+           opt-out. */
+        touch-action: none;
+        user-select: none;
       }
       h1 {
         font-size: 16px;
@@ -46,7 +53,8 @@
       <h1>roxlap web demo · oracle world</h1>
       <canvas id="roxlap-canvas" width="640" height="480"></canvas>
       <p>
-        WASD / arrows move · Space / Shift up &amp; down · click canvas to mouse-look · <kbd>B</kbd> runs a 300-frame bench (results in devtools console)
+        Desktop: WASD / arrows move · Space / Shift up &amp; down · click canvas to mouse-look · <kbd>B</kbd> runs a 300-frame bench (results in devtools console).<br>
+        Mobile: drag the left half of the canvas as a virtual joystick to move; drag the right half to look around.
       </p>
     </main>
   </body>

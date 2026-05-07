@@ -26,6 +26,10 @@
         height: auto;
         box-shadow: 0 4px 16px rgba(0,0,0,0.5);
         cursor: crosshair;
+        /* R10.X.4: take over all touch gestures so the browser
+           doesn't intercept double-tap zoom or pinch. */
+        touch-action: none;
+        user-select: none;
       }
       h1 {
         font-size: 16px;
@@ -40,6 +44,26 @@
         padding: 0 4px;
         font: 11px/1 ui-monospace, monospace;
       }
+      .controls {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      button {
+        background: #2a2c34;
+        color: #eee;
+        border: 1px solid #555;
+        border-radius: 6px;
+        padding: 10px 18px;
+        font: 14px/1 system-ui, sans-serif;
+        cursor: pointer;
+        touch-action: manipulation;
+        user-select: none;
+      }
+      button:active {
+        background: #3a3d48;
+      }
       a {
         color: #6cf;
       }
@@ -49,10 +73,16 @@
     <main>
       <h1>roxlap cave demo · procedural Worley + Perlin · in browser</h1>
       <canvas id="roxlap-canvas" width="640" height="480"></canvas>
+      <div class="controls">
+        <button id="fire-btn" type="button">Fire</button>
+        <button id="preset-btn" type="button">Preset</button>
+        <button id="seed-btn" type="button">Reseed</button>
+      </div>
       <p>
-        <kbd>WASD</kbd>/arrows move · <kbd>Space</kbd>/<kbd>Shift</kbd> up &amp; down · <kbd>Ctrl</kbd> fast-fly ·
+        Desktop: <kbd>WASD</kbd>/arrows move · <kbd>Space</kbd>/<kbd>Shift</kbd> up &amp; down · <kbd>Ctrl</kbd> fast-fly ·
         click canvas → mouse-look · click while locked → fire plasma ·
-        <kbd>F</kbd> swap blue ↔ mag preset · <kbd>R</kbd> next seed
+        <kbd>F</kbd> swap preset · <kbd>R</kbd> next seed.<br>
+        Mobile: drag the left half of the canvas as a virtual joystick to move; drag the right half to look around; quick tap on the right half fires; buttons above for preset / reseed.
       </p>
     </main>
   </body>
