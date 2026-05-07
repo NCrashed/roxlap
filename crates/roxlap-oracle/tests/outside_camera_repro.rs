@@ -28,14 +28,17 @@ fn outside_camera_renders_without_panic() {
     let vxl = load_oracle_vxl();
     let engine = Engine::new();
 
-    // 512 voxels east of the world's east face, looking back west
-    // and tilted 30° downward (in voxlap z-down convention, +pitch
-    // tilts the view DOWN). Camera at z=20 so it's above the
-    // terrain top (~z=64) rather than embedded in the east-face
-    // wall.
-    let pos = [f64::from(vxl.vsid) + 512.0, f64::from(vxl.vsid) / 2.0, 20.0];
+    // Camera high above the world, looking back-and-down. Above
+    // the terrain top so rays enter through the X face high in
+    // voxlap-z (small cz = sky) and pierce DOWN into terrain
+    // colours. This is the canonical "orbit" viewpoint S1 wants.
+    let pos = [
+        f64::from(vxl.vsid) + 512.0,
+        f64::from(vxl.vsid) / 2.0,
+        -300.0,
+    ];
     let yaw: f64 = std::f64::consts::PI;
-    let pitch: f64 = std::f64::consts::FRAC_PI_6;
+    let pitch: f64 = std::f64::consts::FRAC_PI_4;
 
     let cy = yaw.cos();
     let sy = yaw.sin();
@@ -86,15 +89,7 @@ fn outside_camera_renders_without_panic() {
     );
     drop(rasterizer);
 
-    // S1.2: the outside-camera dispatch fork now distinguishes this
-    // case from "camera in solid". S1.3 fills in the body that
-    // actually renders; today the stub leaves the framebuffer
-    // untouched so the visible result is unchanged.
-    assert_eq!(
-        outcome,
-        OpticastOutcome::OutsideCamera,
-        "outside-XY camera should route through opticast_outside, not SkippedCameraInSolid"
-    );
+    assert_eq!(outcome, OpticastOutcome::OutsideCamera);
 
     let mut bytes = Vec::with_capacity(framebuffer.len() * 4);
     for &px in framebuffer.iter() {
