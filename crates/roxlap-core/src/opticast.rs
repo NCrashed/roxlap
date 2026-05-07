@@ -430,36 +430,85 @@ fn run_strip_parallel<R: Rasterizer + Clone + Send + Sync>(
         .for_each(strip_body);
 }
 
-/// S1.2: outside-camera render entry point. Voxlap C bails before
+/// S1.3: outside-camera render entry point. Voxlap C bails before
 /// reaching the per-frame projection setup when the camera is
 /// outside the column grid; roxlap reroutes here instead.
 ///
-/// **S1.2 status**: dispatch wired, body is a no-op stub. The
-/// framebuffer the caller pre-filled with sky stays as-is, so
-/// today's behaviour is identical to the pre-S1 code (which
-/// silently fell through `camera_column_slice → None →
-/// SkippedCameraInSolid` and left the framebuffer untouched). The
-/// only externally-observable change is that callers can now
-/// distinguish "camera in solid" from "camera outside grid" via
-/// [`OpticastOutcome::OutsideCamera`].
+/// Strategy: install
+/// [`Rasterizer::set_outside_camera_active`]`(true)` on the
+/// rasterizer, run the standard four-quadrant scan loops, then
+/// clear the flag. While active, [`Rasterizer::gline`] auto-clips
+/// each scanline's ray against the world XY AABB and synthesises
+/// the per-scanline `OutsideRayContext` (entry column, fractional
+/// XY, air-gap z-bounds). Rays that miss the AABB take a sky-fill
+/// fast path; rays that hit run gline as if the camera were at
+/// the entry point.
 ///
-/// **S1.3 will fill in** the per-ray AABB clip + face-hit gline init:
-/// for each scanline, intersect the ray against the world's XY
-/// AABB via [`crate::ray_aabb::clip_ray_to_xy_aabb`]; rays that
-/// miss leave their pixels as the pre-filled sky; rays that hit
-/// run gline starting at `t = t_enter` and the entry-face column,
-/// not from `prelude.li_pos / column_index` (which is past `vsid`).
+/// First cut is sequential-only — the per-strip parallel branch
+/// from the inside path is gated to `pool.n_threads() == 1`. The
+/// outside flag is set on the rasterizer before clones happen, so
+/// each clone inherits it; a follow-up can lift the parallel guard
+/// once we've verified the per-strip path doesn't shake the auto-
+/// clip output.
+///
+/// `camera_gstartz0` / `camera_gstartz1` / `camera_vptr_offset` in
+/// the synthesised `ScanContext` are placeholders (0). The inside
+/// path uses them as the cf-seed defaults; outside mode supplies
+/// per-scanline overrides via the rasterizer's auto-clip path so
+/// the placeholders are never read for actual rays.
 #[allow(clippy::too_many_arguments)]
 fn opticast_outside<R: Rasterizer + Clone + Send + Sync>(
-    _rasterizer: &mut R,
-    _pool: &mut ScratchPool,
-    _cs: &CameraState,
-    _prelude: &OpticastPrelude,
-    _settings: &OpticastSettings,
+    rasterizer: &mut R,
+    pool: &mut ScratchPool,
+    cs: &CameraState,
+    prelude: &OpticastPrelude,
+    settings: &OpticastSettings,
     _vsid: u32,
     _slab_buf: &[u8],
     _column_offsets: &[u32],
 ) -> OpticastOutcome {
+    let setup_proj = projection::derive_projection_with_y_range(
+        cs,
+        settings.xres,
+        settings.yres,
+        settings.y_start,
+        settings.y_end,
+        settings.hx,
+        settings.hy,
+        settings.hz,
+        settings.anginc,
+    );
+    let setup_rs = ray_step::derive_ray_step(cs, setup_proj.cx, setup_proj.cy, settings.hz);
+    #[allow(clippy::cast_possible_wrap)]
+    let setup_ctx = ScanContext {
+        proj: &setup_proj,
+        rs: &setup_rs,
+        prelude,
+        xres: settings.xres as i32,
+        y_start: settings.y_start as i32,
+        y_end: settings.y_end as i32,
+        anginc: settings.anginc,
+        camera_state: cs,
+        camera_gstartz0: 0,
+        camera_gstartz1: 0,
+        camera_vptr_offset: 0,
+    };
+
+    rasterizer.set_outside_camera_active(true);
+    rasterizer.frame_setup(&setup_ctx);
+
+    // Sequential only for S1 first-cut. The per-strip parallel
+    // branch clones the rasterizer; each clone inherits the active
+    // flag, but we haven't yet verified that the per-strip y-range
+    // restriction doesn't interact badly with the auto-clip path.
+    let scratch = pool.slot_mut(0);
+    top_quadrant(rasterizer, scratch, &setup_ctx);
+    right_quadrant(rasterizer, scratch, &setup_ctx);
+    bottom_quadrant(rasterizer, scratch, &setup_ctx);
+    left_quadrant(rasterizer, scratch, &setup_ctx);
+
+    rasterizer.set_outside_camera_active(false);
+
     OpticastOutcome::OutsideCamera
 }
 

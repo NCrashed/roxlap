@@ -28,14 +28,14 @@ fn outside_camera_renders_without_panic() {
     let vxl = load_oracle_vxl();
     let engine = Engine::new();
 
-    // 256 voxels east of the world's east face, looking back west.
-    let pos = [
-        f64::from(vxl.vsid) + 256.0,
-        f64::from(vxl.vsid) / 2.0,
-        128.0,
-    ];
-    let yaw: f64 = std::f64::consts::PI; // look toward -X
-    let pitch: f64 = 0.0;
+    // 512 voxels east of the world's east face, looking back west
+    // and tilted 30° downward (in voxlap z-down convention, +pitch
+    // tilts the view DOWN). Camera at z=20 so it's above the
+    // terrain top (~z=64) rather than embedded in the east-face
+    // wall.
+    let pos = [f64::from(vxl.vsid) + 512.0, f64::from(vxl.vsid) / 2.0, 20.0];
+    let yaw: f64 = std::f64::consts::PI;
+    let pitch: f64 = std::f64::consts::FRAC_PI_6;
 
     let cy = yaw.cos();
     let sy = yaw.sin();
@@ -112,4 +112,19 @@ fn outside_camera_renders_without_panic() {
         100.0 * sky_pixels as f64 / total as f64,
         100.0 * world_pixels as f64 / total as f64,
     );
+
+    // Dump a PPM next to the test binary so we can eyeball the
+    // result. Path is dynamic ($CARGO_TARGET_DIR or default) but
+    // for a test it's enough to land it in /tmp.
+    let mut ppm = format!("P6\n{XRES} {YRES}\n255\n").into_bytes();
+    for &px in &framebuffer {
+        let bytes = px.to_le_bytes();
+        // voxlap framebuffer is BGRA-ish; PPM wants RGB.
+        ppm.push(bytes[2]);
+        ppm.push(bytes[1]);
+        ppm.push(bytes[0]);
+    }
+    let path = "/tmp/outside_orbit.ppm";
+    std::fs::write(path, ppm).expect("write ppm");
+    eprintln!("  wrote {path}");
 }
