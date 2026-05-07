@@ -11,11 +11,13 @@ session should read this top to bottom before touching code; it
 captures everything that's been decided up front so the
 implementer doesn't re-litigate the easy questions.
 
-## Status as of 2026-05-05
+## Status as of 2026-05-07
 
-R12 multicore landed. R11.9 publish (0.1.0 to crates.io) is the
-nominally-next stage but the user opted to do R10 first. R9
-(ARM NEON) is still ahead.
+R10 (R10.0..R10.5) and four of the six R10.X follow-ups are
+landed; see the [R10.X follow-up status](#r10x-follow-up-status)
+table below. R9 (ARM NEON) merged from `r9-neon` on 2026-05-05.
+R12 multicore landed earlier. R11 polish + 0.1.0 crates.io
+publish is the next stage.
 
 Pre-R10 baseline (workspace state the implementer inherits):
 
@@ -449,24 +451,19 @@ In order:
    Definitively R10.X — out of scope for v1. Document in this
    doc that R12's parallel paths are sequential on wasm.
 
-## Out of scope (R10.X follow-ups)
+## R10.X follow-up status
 
-- **Wasm threads** via `wasm-bindgen-rayon` + SharedArrayBuffer
-  + COOP/COEP headers. Re-enables R12's parallel paths in
-  browser. Real browser-deploy complexity (COOP/COEP needs
-  server-side header config; pages.dev / netlify don't all
-  support this).
-- **Cave demo on web** — would showcase real-time edits +
-  bullets, but doubles the input-handler / state-mgmt work.
-- **Async asset loading** — fetch + decompress at startup
-  instead of `include_bytes!`. Necessary if assets grow past
-  ~5 MB.
-- **Older-browser fallback build** without simd128. Probably
-  unnecessary given current browser-support stats.
-- **WebGL / WebGPU framebuffer blit** — currently using 2D canvas
-  + `putImageData`. WebGL is faster for fb blits but adds JS
-  surface area. R10.X if frame-blit becomes a bottleneck.
-- **Mobile / touch input** — keyboard + mouse only for v1.
+Originally listed as "out of scope" for R10 v1; tracked here
+post-implementation.
+
+| # | Item | Status |
+|---|---|---|
+| **R10.X.1** | Cave demo on web — real-time edits + bullets + per-impact relight in the browser. | **landed (2026-05-06)**: new `roxlap-cave-web` cdylib (Worley+Perlin cave-gen, WASD + mouse-look, click-to-fire bullets, per-edit local lighting refresh via `roxlap_formats::vxl::slng()`-walked column scatter); ~128 KB wasm bundle. |
+| **R10.X.2** | Wasm threads via `wasm-bindgen-rayon` + SharedArrayBuffer + COOP/COEP headers. Re-enables R12's parallel axes in-browser. | **landed (2026-05-07)**: nightly toolchain via `rust-overlay` flake input + `rust-toolchain.toml`; `+atomics,+bulk-memory,+mutable-globals` rustflags + `[unstable] build-std`; rust-lld `--shared-memory --import-memory --max-memory --export=__wasm_init_tls/...`; `wasm-opt --enable-threads --enable-bulk-memory`; Trunk `[serve.headers]` adds COOP/COEP for cross-origin isolation; `filehash = false` + `no_sri = true` + post-build sed hook patches `wasm-bindgen-rayon`'s baked-in `await import('../../..')` to point at trunk's emitted JS shim. Both web demos drop sequential R10.0 fallbacks; rayon path is unconditional. |
+| **R10.X.3** | WebGL / WebGPU framebuffer blit (replacing 2D canvas + `putImageData`). | **landed (2026-05-07)**: WebGL2 texture-upload blit replaces the per-frame `pack_rgba` CPU step in both web demos. |
+| **R10.X.4** | Mobile / touch input — virtual joystick + look + tap-to-fire. | **landed (2026-05-07)**: virtual joystick + look stick + tap-to-fire (cave-web only) on both web demos. |
+| — | **Async asset loading** — fetch + decompress at startup instead of `include_bytes!`. | **deferred**. Bundle today is ~1.5 MB; the threshold for switching is ~5 MB. |
+| — | **Older-browser fallback build** without `simd128`. | **deferred**. WebAssembly SIMD is at ~94% global support per caniuse; not worth the second build matrix today. |
 
 ## How to apply
 
