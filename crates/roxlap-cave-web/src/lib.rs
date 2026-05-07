@@ -25,8 +25,7 @@ use roxlap_core::{Camera, Engine, OpticastSettings};
 use roxlap_formats::edit::{set_sphere_with_colfunc, SpanOp};
 use roxlap_formats::vxl;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::Clamped;
-use web_sys::{HtmlCanvasElement, ImageData, KeyboardEvent, MouseEvent};
+use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent, WebGl2RenderingContext as Gl};
 
 // ----- World / camera tuning (mirrors roxlap-cave-demo) ----------------------
 
@@ -105,16 +104,204 @@ struct State {
     pool: ScratchPool,
     fb: Vec<u32>,
     zb: Vec<f32>,
-    rgba: Vec<u8>,
     cam_pos: [f64; 3],
     yaw: f64,
     pitch: f64,
     input: Input,
     last_frame_ms: f64,
-    ctx: web_sys::CanvasRenderingContext2d,
+    blit: WebGlBlit,
     bullets: Vec<Bullet>,
     preset: Preset,
     seed: u64,
+}
+
+/// R10.X.3: GPU-side framebuffer presenter — same shape as
+/// `roxlap-web::WebGlBlit`. See that crate for the full design
+/// notes; in short, the frag shader swizzles voxlap's BGRA byte
+/// order to RGBA on the GPU and forces alpha = 1.0, dropping
+/// the per-frame `pack_rgba` step.
+struct WebGlBlit {
+    gl: Gl,
+    texture: web_sys::WebGlTexture,
+    width: u32,
+    height: u32,
+}
+
+const QUAD_VS: &str = "#version 300 es
+in vec2 a_pos;
+in vec2 a_uv;
+out vec2 v_uv;
+void main() {
+    v_uv = a_uv;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+";
+
+const QUAD_FS: &str = "#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_tex;
+out vec4 frag;
+void main() {
+    vec4 c = texture(u_tex, v_uv);
+    frag = vec4(c.bgr, 1.0);
+}
+";
+
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+impl WebGlBlit {
+    fn new(canvas: &HtmlCanvasElement, width: u32, height: u32) -> Result<Self, JsValue> {
+        let gl: Gl = canvas
+            .get_context("webgl2")?
+            .ok_or_else(|| JsValue::from_str("no webgl2 context"))?
+            .dyn_into::<Gl>()
+            .map_err(|_| JsValue::from_str("got the wrong webgl context type"))?;
+        let program = compile_program(&gl, QUAD_VS, QUAD_FS)?;
+        gl.use_program(Some(&program));
+        #[rustfmt::skip]
+        let quad: [f32; 16] = [
+            -1.0, -1.0, 0.0, 1.0,
+             1.0, -1.0, 1.0, 1.0,
+            -1.0,  1.0, 0.0, 0.0,
+             1.0,  1.0, 1.0, 0.0,
+        ];
+        let vao = gl
+            .create_vertex_array()
+            .ok_or_else(|| JsValue::from_str("create_vertex_array failed"))?;
+        gl.bind_vertex_array(Some(&vao));
+        let vbo = gl
+            .create_buffer()
+            .ok_or_else(|| JsValue::from_str("create_buffer failed"))?;
+        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&vbo));
+        unsafe {
+            // SAFETY: js_sys::Float32Array::view borrows wasm
+            // linear-memory backing of `quad`; bufferData copies
+            // into the GPU before the view escapes.
+            let view = js_sys::Float32Array::view(&quad);
+            gl.buffer_data_with_array_buffer_view(Gl::ARRAY_BUFFER, &view, Gl::STATIC_DRAW);
+        }
+        let stride = (4 * std::mem::size_of::<f32>()) as i32;
+        let pos_loc = gl.get_attrib_location(&program, "a_pos");
+        let uv_loc = gl.get_attrib_location(&program, "a_uv");
+        if pos_loc < 0 || uv_loc < 0 {
+            return Err(JsValue::from_str("attribute lookup failed"));
+        }
+        let pos_loc_u = pos_loc as u32;
+        let uv_loc_u = uv_loc as u32;
+        gl.enable_vertex_attrib_array(pos_loc_u);
+        gl.vertex_attrib_pointer_with_i32(pos_loc_u, 2, Gl::FLOAT, false, stride, 0);
+        gl.enable_vertex_attrib_array(uv_loc_u);
+        gl.vertex_attrib_pointer_with_i32(
+            uv_loc_u,
+            2,
+            Gl::FLOAT,
+            false,
+            stride,
+            (2 * std::mem::size_of::<f32>()) as i32,
+        );
+
+        let texture = gl
+            .create_texture()
+            .ok_or_else(|| JsValue::from_str("create_texture failed"))?;
+        gl.active_texture(Gl::TEXTURE0);
+        gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
+        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
+        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
+        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
+        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
+        gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+            Gl::TEXTURE_2D,
+            0,
+            Gl::RGBA8 as i32,
+            width as i32,
+            height as i32,
+            0,
+            Gl::RGBA,
+            Gl::UNSIGNED_BYTE,
+            None,
+        )?;
+
+        let u_tex = gl.get_uniform_location(&program, "u_tex");
+        gl.uniform1i(u_tex.as_ref(), 0);
+        gl.viewport(0, 0, width as i32, height as i32);
+
+        Ok(Self {
+            gl,
+            texture,
+            width,
+            height,
+        })
+    }
+
+    fn present(&self, framebuffer: &[u32]) -> Result<(), JsValue> {
+        debug_assert_eq!(framebuffer.len(), (self.width * self.height) as usize);
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                framebuffer.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(framebuffer),
+            )
+        };
+        self.gl.bind_texture(Gl::TEXTURE_2D, Some(&self.texture));
+        self.gl
+            .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
+                Gl::TEXTURE_2D,
+                0,
+                0,
+                0,
+                self.width as i32,
+                self.height as i32,
+                Gl::RGBA,
+                Gl::UNSIGNED_BYTE,
+                Some(bytes),
+            )?;
+        self.gl.draw_arrays(Gl::TRIANGLE_STRIP, 0, 4);
+        Ok(())
+    }
+}
+
+fn compile_shader(gl: &Gl, kind: u32, src: &str) -> Result<web_sys::WebGlShader, JsValue> {
+    let shader = gl
+        .create_shader(kind)
+        .ok_or_else(|| JsValue::from_str("create_shader failed"))?;
+    gl.shader_source(&shader, src);
+    gl.compile_shader(&shader);
+    if !gl
+        .get_shader_parameter(&shader, Gl::COMPILE_STATUS)
+        .as_bool()
+        .unwrap_or(false)
+    {
+        let log = gl
+            .get_shader_info_log(&shader)
+            .unwrap_or_else(|| "?".into());
+        return Err(JsValue::from_str(&format!("shader compile: {log}")));
+    }
+    Ok(shader)
+}
+
+fn compile_program(gl: &Gl, vs: &str, fs: &str) -> Result<web_sys::WebGlProgram, JsValue> {
+    let vs = compile_shader(gl, Gl::VERTEX_SHADER, vs)?;
+    let fs = compile_shader(gl, Gl::FRAGMENT_SHADER, fs)?;
+    let program = gl
+        .create_program()
+        .ok_or_else(|| JsValue::from_str("create_program failed"))?;
+    gl.attach_shader(&program, &vs);
+    gl.attach_shader(&program, &fs);
+    gl.link_program(&program);
+    if !gl
+        .get_program_parameter(&program, Gl::LINK_STATUS)
+        .as_bool()
+        .unwrap_or(false)
+    {
+        let log = gl
+            .get_program_info_log(&program)
+            .unwrap_or_else(|| "?".into());
+        return Err(JsValue::from_str(&format!("program link: {log}")));
+    }
+    Ok(program)
 }
 
 #[derive(Default)]
@@ -511,19 +698,6 @@ fn draw_bullet(
     }
 }
 
-fn pack_rgba(framebuffer: &[u32], out: &mut [u8]) {
-    debug_assert_eq!(out.len(), framebuffer.len() * 4);
-    for (i, &px) in framebuffer.iter().enumerate() {
-        let r = ((px >> 16) & 0xff) as u8;
-        let g = ((px >> 8) & 0xff) as u8;
-        let b = (px & 0xff) as u8;
-        out[i * 4] = r;
-        out[i * 4 + 1] = g;
-        out[i * 4 + 2] = b;
-        out[i * 4 + 3] = 0xff;
-    }
-}
-
 fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_ms: f64) {
     let mut state = state_rc.borrow_mut();
     let dt = dt_seconds(state.last_frame_ms, now_ms);
@@ -533,18 +707,13 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_m
     step_bullets(&mut state, dt);
     render_frame(&mut state);
 
-    let fb_ptr = state.fb.as_ptr();
-    let fb_len = state.fb.len();
-    // SAFETY: pack_rgba only reads `fb`. Splitting the borrow
-    // through a raw pointer avoids two `&mut state` at once.
-    let fb_slice = unsafe { std::slice::from_raw_parts(fb_ptr, fb_len) };
-    pack_rgba(fb_slice, &mut state.rgba);
-
-    if let Ok(image_data) =
-        ImageData::new_with_u8_clamped_array_and_sh(Clamped(&state.rgba), XRES, YRES)
-    {
-        let _ = state.ctx.put_image_data(&image_data, 0.0, 0.0);
-    }
+    // R10.X.3: GPU-side blit — texture upload + cached
+    // fullscreen quad. Frag shader does the BGRA→RGBA swizzle
+    // and forces alpha = 1.0 so voxlap's brightness byte
+    // doesn't darken via canvas compositing. ~1-2 ms/frame
+    // faster than the prior 2D `pack_rgba + putImageData`
+    // path.
+    let _ = state.blit.present(&state.fb);
 }
 
 // ----- Regenerate -----------------------------------------------------------
@@ -586,11 +755,7 @@ pub fn start() -> Result<(), JsValue> {
         .map_err(|_| JsValue::from_str("#roxlap-canvas is not a <canvas>"))?;
     canvas.set_width(XRES);
     canvas.set_height(YRES);
-    let ctx = canvas
-        .get_context("2d")?
-        .ok_or_else(|| JsValue::from_str("no 2d context"))?
-        .dyn_into::<web_sys::CanvasRenderingContext2d>()
-        .map_err(|_| JsValue::from_str("got the wrong context type"))?;
+    let blit = WebGlBlit::new(&canvas, XRES, YRES)?;
 
     let perf = window.performance();
     let preset = Preset::Blue;
@@ -609,7 +774,6 @@ pub fn start() -> Result<(), JsValue> {
     let pool = ScratchPool::new(XRES, YRES, vxl.vsid);
     let fb = vec![0u32; (XRES * YRES) as usize];
     let zb = vec![0f32; (XRES * YRES) as usize];
-    let rgba = vec![0u8; (XRES * YRES * 4) as usize];
 
     let now_ms = perf.as_ref().map_or(0.0, web_sys::Performance::now);
     let state = State {
@@ -618,7 +782,6 @@ pub fn start() -> Result<(), JsValue> {
         pool,
         fb,
         zb,
-        rgba,
         cam_pos: [
             f64::from(VSID) * 0.5,
             f64::from(VSID) * 0.5,
@@ -628,7 +791,7 @@ pub fn start() -> Result<(), JsValue> {
         pitch: 0.0,
         input: Input::default(),
         last_frame_ms: now_ms,
-        ctx,
+        blit,
         bullets: Vec::new(),
         preset,
         seed,

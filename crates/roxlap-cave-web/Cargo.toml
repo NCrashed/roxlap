@@ -30,17 +30,25 @@ console_error_panic_hook = "0.1"
 
 [dependencies.web-sys]
 version = "0.3"
+# R10.X.3: WebGL2 blit (texture upload + fullscreen quad) replaces
+# the 2D `putImageData` path. Frag shader does the BGRA→RGBA
+# swizzle on GPU; pack_rgba step disappears entirely.
 features = [
     "Window",
     "Document",
     "Element",
     "HtmlCanvasElement",
-    "CanvasRenderingContext2d",
-    "ImageData",
     "Performance",
     "console",
     "KeyboardEvent",
     "MouseEvent",
+    "WebGl2RenderingContext",
+    "WebGlBuffer",
+    "WebGlProgram",
+    "WebGlShader",
+    "WebGlTexture",
+    "WebGlUniformLocation",
+    "WebGlVertexArrayObject",
 ]
 
 [lints]
