@@ -1,13 +1,28 @@
 {
   description = "roxlap — pure-Rust port of Ken Silverman's Voxlap voxel engine";
 
-  inputs.nixpkgs.url = "flake:nixpkgs";
+  inputs = {
+    nixpkgs.url = "flake:nixpkgs";
+    # R10.X.2: nightly Rust toolchain for wasm-bindgen-rayon. Needs
+    # `-Z build-std` to rebuild std with `+atomics` enabled, plus
+    # `rust-src` available as a component. rust-overlay is the
+    # idiomatic Nix way to get a custom rustc.
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
       forAllSystems = f:
         nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ]
-          (system: f { pkgs = import nixpkgs { inherit system; }; });
+          (system: f {
+            pkgs = import nixpkgs {
+              inherit system;
+              overlays = [ rust-overlay.overlays.default ];
+            };
+          });
     in {
       devShells = forAllSystems ({ pkgs }:
         let
@@ -26,16 +41,26 @@
             libxrandr
             libxcb
           ];
+
+          # R10.X.2: pin a specific nightly via rust-toolchain.toml.
+          # The toolchain bundles `rust-src` (required by
+          # `-Z build-std`) and the wasm32-unknown-unknown target so
+          # cargo can rebuild std with `+atomics` for wasm threads.
+          # `pkgs.rust-bin.fromRustupToolchainFile` reads the same
+          # rust-toolchain.toml `cargo` itself uses, so a single
+          # source-of-truth controls both Nix devShell and ad-hoc
+          # `cargo +stable` overrides.
+          rustToolchain =
+            pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         in {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              # Rust toolchain. Stable until we need nightly (wasm
-              # SIMD features in R10 may push us there).
-              rustc
-              cargo
-              rustfmt
-              clippy
-              rust-analyzer
+              # R10.X.2: nightly Rust toolchain replaces the previous
+              # stable `rustc + cargo + rustfmt + clippy +
+              # rust-analyzer` set. The fenix/rust-overlay-built
+              # bundle includes all of those plus rust-src and the
+              # wasm32-unknown-unknown target.
+              rustToolchain
               pkg-config
               # R10.0: wasm32-unknown-unknown needs an LLD-class
               # linker; nixpkgs's `rustc` doesn't bundle `rust-lld`,
@@ -50,10 +75,7 @@
               wasm-bindgen-cli
               nodejs
               # R10.2: `trunk` is the dev-server / bundler for the
-              # `roxlap-web` crate. `trunk serve` from
-              # `crates/roxlap-web/` starts a hot-reloading
-              # localhost:8080 demo; `trunk build --release` emits
-              # the production static bundle.
+              # `roxlap-web` + `roxlap-cave-web` crates.
               trunk
               # Image inspection — imagemagick reads roxlap-oracle's
               # PPM dumps and voxlap C oracle's PNG outputs for byte-

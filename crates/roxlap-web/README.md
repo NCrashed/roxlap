@@ -33,7 +33,32 @@ trunk build --release
 ```
 
 `trunk build --release` runs `wasm-opt` on the wasm output, which
-typically halves the binary (debug ~760 KB → release ~360 KB).
+typically halves the binary (debug ~900 KB → release ~460 KB).
+
+### Cross-origin isolation (required for wasm threads)
+
+R10.X.2's `wasm-bindgen-rayon` thread pool relies on
+`SharedArrayBuffer`, which the browser only enables when the
+page is **cross-origin isolated**. The static host serving
+`dist/` must attach two response headers to the HTML and wasm:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Trunk's dev server attaches these automatically (see
+`Trunk.toml` `[serve.headers]`). For production:
+
+* **Cloudflare Pages**: add a `_headers` file at the dist root.
+* **Netlify**: `netlify.toml` `[[headers]]` block.
+* **GitHub Pages**: not currently supported — needs a custom
+  domain + Cloudflare in front, or use a different host.
+* **Custom nginx / caddy / traefik**: add the headers per the
+  upstream docs.
+
+Without these headers, the demo loads but `initThreadPool`
+hangs at the worker spawn step.
 
 ## Controls
 

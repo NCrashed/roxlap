@@ -19,17 +19,19 @@ categories = ["game-development", "graphics", "rendering::engine"]
 # records for downstream resolution.
 roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
 
-# R10.0: rayon doesn't compile on `wasm32-unknown-unknown` (no
-# `std::thread`). Cfg-gating the dep keeps native builds parallel
-# while wasm falls through to the sequential fallbacks marked
-# `#[cfg(target_arch = "wasm32")]` in opticast / world_lighting /
-# sprite. Wasm threads (SharedArrayBuffer + wasm-bindgen-rayon)
-# are an R10.X follow-up.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # R12.2.1: rayon's par_iter for the per-strip / per-row / per-sprite
 # parallel rendering paths. Single-threaded callers
 # (`ScratchPool::new`) skip the parallel branch entirely; rayon's
 # default thread pool only warms up when the parallel branch fires.
+#
+# R10.X.2: rayon now works on wasm32 too via wasm-bindgen-rayon's
+# Web-Worker-backed thread pool — the host crate (`roxlap-web` or
+# `roxlap-cave-web`) re-exports `wasm_bindgen_rayon::init_thread_pool`
+# so JS can `await initThreadPool(N)` before any rayon-using code
+# runs. Builds need `-Z build-std` (nightly) +
+# `-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals` —
+# see `.cargo/config.toml` and `rust-toolchain.toml` for the
+# pinned setup.
 rayon = { workspace = true }
 
 [dev-dependencies]

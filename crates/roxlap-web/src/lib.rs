@@ -548,21 +548,58 @@ fn request_animation_frame(window: &web_sys::Window, f: &Closure<dyn FnMut(f64)>
     let _ = window.request_animation_frame(f.as_ref().unchecked_ref());
 }
 
-/// wasm-bindgen `start` hook — invoked by the JS shim as soon as
-/// the module finishes loading. Sets up the canvas + input
-/// listeners + RAF loop, then returns. Returning `Result<(),
-/// JsValue>` lets early-init failures bubble up as JS exceptions
-/// visible in the browser devtools console.
+// R10.X.2: re-export `wasm_bindgen_rayon::init_thread_pool` so the
+// macro that generates the JS-side `initThreadPool` shim hooks up
+// the worker module. We never call it from JS; instead we await
+// it from Rust below.
+pub use wasm_bindgen_rayon::init_thread_pool;
+
+/// `#[wasm_bindgen(start)]` auto-runs once trunk's loader-shim
+/// `init()` resolves. We schedule an async task that spins up the
+/// rayon thread pool (`init_thread_pool(N)` returns a JS
+/// `Promise`; we await it via `JsFuture`) and only then runs the
+/// real demo init. Doing the dance Rust-side keeps the trunk
+/// auto-import path intact — no custom JS bootstrap file.
+#[wasm_bindgen(start)]
+pub fn auto_start() {
+    console_error_panic_hook::set_once();
+    let n_threads = navigator_hardware_concurrency();
+    web_sys::console::log_1(
+        &format!("roxlap-web: spinning up {n_threads} rayon worker(s)…").into(),
+    );
+    wasm_bindgen_futures::spawn_local(async move {
+        let promise = init_thread_pool(n_threads);
+        if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
+            web_sys::console::error_2(&"roxlap-web: initThreadPool failed".into(), &e);
+            return;
+        }
+        if let Err(e) = start() {
+            web_sys::console::error_2(&"roxlap-web: start() failed".into(), &e);
+        }
+    });
+}
+
+/// `navigator.hardwareConcurrency` clamped to `[1, 16]` — caps
+/// thread spam on hyper-threaded servers / dev machines while
+/// staying useful on phones (typically 4–8 cores).
+fn navigator_hardware_concurrency() -> usize {
+    web_sys::window()
+        .as_ref()
+        .map(web_sys::Window::navigator)
+        .map(|n| n.hardware_concurrency() as usize)
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+/// Demo init body — same shape as before R10.X.2; just runs after
+/// the rayon thread pool is ready.
 ///
 /// # Errors
 /// Returns a JS-bridged error if the DOM doesn't have the
-/// expected `<canvas id="roxlap-canvas">`, if a 2D rendering
+/// expected `<canvas id="roxlap-canvas">`, if a WebGL2 rendering
 /// context can't be acquired, or if the embedded
 /// `oracle.vxl.gz` fails to decompress / parse.
-#[wasm_bindgen(start)]
-pub fn start() -> Result<(), JsValue> {
-    console_error_panic_hook::set_once();
-
+fn start() -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
     let document = window
         .document()

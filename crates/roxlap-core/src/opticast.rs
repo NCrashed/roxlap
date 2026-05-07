@@ -17,10 +17,6 @@
 //! loops need (xres / yres / projection params / mip + scan-dist
 //! controls) so the orchestrator's signature stays compact.
 
-// R10.0: rayon is dropped on `wasm32-unknown-unknown` (no
-// `std::thread`); the parallel call-site below has a sequential
-// `iter_mut()` fallback under the opposite cfg.
-#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 use crate::camera_math;
@@ -379,17 +375,8 @@ fn run_strip_parallel<R: Rasterizer + Clone + Send + Sync>(
         left_quadrant(&mut strip_rasterizer, scratch, &strip_ctx);
     };
 
-    // R10.0: wasm32 has no `std::thread`, so rayon isn't a dep on
-    // that target. Fall through to a sequential `iter_mut()` walk;
-    // shape is identical, just one strip at a time.
-    #[cfg(not(target_arch = "wasm32"))]
     pool.slots_mut_slice()
         .par_iter_mut()
-        .enumerate()
-        .for_each(strip_body);
-    #[cfg(target_arch = "wasm32")]
-    pool.slots_mut_slice()
-        .iter_mut()
         .enumerate()
         .for_each(strip_body);
 }

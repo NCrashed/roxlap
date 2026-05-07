@@ -31,6 +31,17 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 wasm-bindgen = "=0.2.117"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
+# R10.X.2: spin a Web-Worker-backed rayon thread pool. The
+# crate exposes an `init_thread_pool` JS export that we re-
+# export from `lib.rs` so JS can `await initThreadPool(N)`
+# before any rayon-using code runs. Worker count is chosen JS-
+# side via `navigator.hardwareConcurrency`.
+wasm-bindgen-rayon = "1.3"
+# R10.X.2: `JsFuture::from(promise).await` lets us await
+# `wasm_bindgen_rayon::init_thread_pool`'s JS Promise from
+# Rust inside a `spawn_local` future. That keeps the JS init
+# dance Rust-side rather than fighting trunk's auto-imports.
+wasm-bindgen-futures = "0.4"
 
 [dependencies.web-sys]
 version = "0.3"
@@ -53,6 +64,9 @@ features = [
     "TouchEvent",
     "TouchList",
     "DomRect",
+    # R10.X.2: `Navigator.hardwareConcurrency` decides how many
+    # rayon worker threads to spin up.
+    "Navigator",
     "WebGl2RenderingContext",
     "WebGlBuffer",
     "WebGlProgram",

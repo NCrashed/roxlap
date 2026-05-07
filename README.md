@@ -73,9 +73,18 @@ Both use WASD / arrows + click-to-mouse-look + Space / Shift for
 vertical. The cave demo adds Ctrl for fast-fly, click-while-locked
 to fire bullets, F to toggle blue ↔ mag preset, R for next seed.
 The engine demo's `B` runs an in-browser 300-frame bench (results
-in the devtools console). `trunk build --release` produces a
-static `dist/` suitable for any static-file host. Full setup +
-perf notes in [crates/roxlap-web/README.md](crates/roxlap-web/README.md).
+in the devtools console). Mobile: drag the canvas's left half as
+a virtual joystick, right half to look around (cave demo: tap to
+fire). Both demos use `wasm-bindgen-rayon` to fan rayon's render
+parallelism (per-strip, per-light-row, per-sprite) across Web
+Workers, so a 4-core phone gets ~3× the frame rate of a single-
+threaded build. `trunk build --release` produces a static `dist/`
+that needs **cross-origin-isolation headers**
+(`Cross-Origin-Opener-Policy: same-origin` +
+`Cross-Origin-Embedder-Policy: require-corp`) on the host —
+without them, `SharedArrayBuffer` is disabled and the thread pool
+won't spin up. Full setup + per-host header config in
+[crates/roxlap-web/README.md](crates/roxlap-web/README.md).
 
 ## Crates
 

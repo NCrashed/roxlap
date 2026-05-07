@@ -4,11 +4,12 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>roxlap — pure-Rust voxlap port (web demo)</title>
-    <!-- trunk inlines the wasm-bindgen JS glue + .wasm next to this
-         file when it sees the data-trunk attribute. The crate's
-         `start()` hook auto-runs after import. No `data-bin` —
-         roxlap-web is a `cdylib` lib target, not a [[bin]]; trunk
-         picks up the lib automatically. -->
+    <!-- trunk auto-imports the wasm-bindgen JS glue + .wasm and
+         calls our `#[wasm_bindgen(start)]` entry. The Rust side
+         (R10.X.2) `spawn_local`s an async task that awaits
+         `initThreadPool(navigator.hardwareConcurrency)` from
+         wasm-bindgen-rayon before any rayon-using render
+         work fires. -->
     <link data-trunk rel="rust" />
     <style>
       html, body {

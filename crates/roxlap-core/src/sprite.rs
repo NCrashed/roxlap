@@ -1595,17 +1595,8 @@ pub fn draw_sprites_parallel(
         draw_sprite(&mut t, cam, settings, lighting, sprite)
     };
 
-    // R10.0: wasm32 lacks rayon; fall through to a sequential
-    // `iter().map(...).sum()`. Same per-sprite work, one thread.
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use rayon::prelude::*;
-        sprites.par_iter().map(render_one).sum()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        sprites.iter().map(render_one).sum()
-    }
+    use rayon::prelude::*;
+    sprites.par_iter().map(render_one).sum()
 }
 
 pub fn draw_sprite(

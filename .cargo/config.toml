@@ -11,8 +11,55 @@ runner = "wasm-bindgen-test-runner"
 # `core::arch::wasm32::f32x4_*` 4-pixel batches in
 # `roxlap-core/src/scalar_rasterizer.rs`. Without this flag the
 # intrinsics compile but lower to scalar wasm — so SIMD code looks
-# correct on the wire but doesn't actually accelerate. simd128 is
-# universally supported (Chrome 91+, Firefox 89+, Safari 16.4+ —
-# 94 %+ globally). Old browsers without simd128 fail at the wasm
-# loader stage; that's R10.X follow-up territory if it matters.
-rustflags = ["-C", "target-feature=+simd128"]
+# correct on the wire but doesn't actually accelerate.
+#
+# R10.X.2: enable wasm threads via `wasm-bindgen-rayon`. The
+# `+atomics`, `+bulk-memory`, `+mutable-globals` features expose
+# the wasm-threads instruction set (atomic load/store/cmpxchg,
+# `memory.atomic.wait/notify`, shared-memory grow). The std crate
+# is not built with these by default on wasm32-unknown-unknown,
+# so `[unstable] build-std` below rebuilds it from `rust-src`
+# (provided via the nightly toolchain in `rust-toolchain.toml`).
+# Wasm threads also require browser-side cross-origin isolation
+# (COOP `same-origin` + COEP `require-corp`); see each web
+# crate's `Trunk.toml`.
+rustflags = [
+    "-C",
+    "target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals",
+    # R10.X.2: enabling `+atomics` is necessary but not sufficient.
+    # The wasm linker (`rust-lld`) only marks the produced wasm
+    # memory as `shared` if it sees `--shared-memory` AND the
+    # memory is imported (not internal) — `--import-memory` flips
+    # that. `--max-memory` is required by the spec for shared
+    # memories. Without these, wasm-bindgen-rayon's
+    # `Atomics.waitAsync(int32, ...)` blows up at runtime with
+    # "is not a shared typed array" because the wasm memory is a
+    # regular ArrayBuffer.
+    "-C",
+    "link-arg=--shared-memory",
+    "-C",
+    "link-arg=--import-memory",
+    "-C",
+    "link-arg=--max-memory=4294967296",
+    # `wasm-bindgen` looks up `__wasm_init_tls` while preparing the
+    # module for threading; the linker would otherwise GC it as
+    # unused. Same for `__wasm_init_memory_flag` and
+    # `__tls_size` which the rayon worker entry needs to know.
+    "-C",
+    "link-arg=--export=__wasm_init_tls",
+    "-C",
+    "link-arg=--export=__wasm_init_memory_flag",
+    "-C",
+    "link-arg=--export=__tls_size",
+    "-C",
+    "link-arg=--export=__tls_align",
+    "-C",
+    "link-arg=--export=__tls_base",
+]
+
+# R10.X.2: rebuild std with the threading-enabled features above
+# so rayon's `std::thread::Thread`-using code paths compile under
+# wasm-bindgen-rayon's Worker-backed pool. Requires nightly cargo
+# (the channel pinned in `rust-toolchain.toml`).
+[unstable]
+build-std = ["std", "panic_abort"]

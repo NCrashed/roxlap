@@ -783,16 +783,50 @@ fn regenerate(state: &mut State) {
 
 // ----- Init -----------------------------------------------------------------
 
-/// wasm-bindgen `start` hook — invoked by the JS shim once the
-/// module finishes loading. Generates a cave, bakes lighting,
-/// hooks input, kicks off the RAF loop.
+// R10.X.2: re-export `wasm_bindgen_rayon::init_thread_pool` so the
+// generator macro hooks up the JS-side worker module.
+pub use wasm_bindgen_rayon::init_thread_pool;
+
+/// `#[wasm_bindgen(start)]` auto-runs after trunk's `init()`. We
+/// schedule an async task that spins up the rayon thread pool
+/// (Promise-returning `init_thread_pool` awaited via JsFuture)
+/// before running the demo. Same pattern as `roxlap-web`'s
+/// `auto_start`.
+#[wasm_bindgen(start)]
+pub fn auto_start() {
+    console_error_panic_hook::set_once();
+    let n_threads = navigator_hardware_concurrency();
+    web_sys::console::log_1(
+        &format!("roxlap-cave-web: spinning up {n_threads} rayon worker(s)…").into(),
+    );
+    wasm_bindgen_futures::spawn_local(async move {
+        let promise = init_thread_pool(n_threads);
+        if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
+            web_sys::console::error_2(&"roxlap-cave-web: initThreadPool failed".into(), &e);
+            return;
+        }
+        if let Err(e) = start() {
+            web_sys::console::error_2(&"roxlap-cave-web: start() failed".into(), &e);
+        }
+    });
+}
+
+fn navigator_hardware_concurrency() -> usize {
+    web_sys::window()
+        .as_ref()
+        .map(web_sys::Window::navigator)
+        .map(|n| n.hardware_concurrency() as usize)
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
+/// Demo init — runs after the rayon thread pool is ready.
 ///
 /// # Errors
 /// Returns a JS-bridged error if the DOM doesn't have the
-/// expected `<canvas id="roxlap-canvas">`, or if a 2D rendering
-/// context can't be acquired.
-#[wasm_bindgen(start)]
-pub fn start() -> Result<(), JsValue> {
+/// expected `<canvas id="roxlap-canvas">`, or if a WebGL2
+/// rendering context can't be acquired.
+fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;

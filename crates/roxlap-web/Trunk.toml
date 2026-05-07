@@ -12,3 +12,46 @@
 # `copy-file` / `copy-dir` declarations needed today. Sky / sprite
 # bundling is an R10.X follow-up.
 public_url = "/"
+
+# R10.X.2: pass `--enable-threads --enable-bulk-memory` to
+# wasm-opt so it preserves the shared-memory + atomics directives
+# the wasm-bindgen-rayon worker pool relies on. Without these
+# flags wasm-opt assumes single-threaded wasm and strips the
+# `(memory $... shared)` declaration, causing an
+# `Atomics.waitAsync ... is not a shared typed array` runtime
+# error in the browser console once the worker pool tries to
+# park.
+wasm_opt_params = ["--enable-threads", "--enable-bulk-memory"]
+
+# R10.X.2: stable JS shim filename so wasm-bindgen-rayon's Web
+# Workers can dynamic-import it. See
+# `crates/roxlap-cave-web/Trunk.toml` for the full reasoning.
+filehash = false
+
+# R10.X.2: disable SRI so the post-build sed rewrite of
+# workerHelpers.js doesn't trip the integrity check the browser
+# would otherwise enforce against the pre-rewrite hash. See
+# `crates/roxlap-cave-web/Trunk.toml` for the full explanation.
+no_sri = true
+
+# R10.X.2: patch the wasm-bindgen-rayon worker import path to
+# resolve to trunk's emitted JS shim. See
+# `crates/roxlap-cave-web/Trunk.toml` for the explanation.
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = [
+    "-c",
+    "find $TRUNK_STAGING_DIR/snippets -name workerHelpers.js -exec sed -i \"s|await import('\\.\\./\\.\\./\\.\\.')|await import('../../../roxlap-web.js')|g\" {} +",
+]
+
+# R10.X.2: SharedArrayBuffer (the substrate for wasm-bindgen-rayon's
+# Web Worker pool) is gated on cross-origin isolation. The browser
+# only enables it when the response carries both COOP and COEP
+# headers below. Trunk's dev server adds them per-request; for
+# production deploys, you must configure your static host to set
+# the same headers (Cloudflare Pages, Netlify, GitHub Pages all
+# support custom headers via _headers / netlify.toml / etc.).
+[serve.headers]
+"Cross-Origin-Opener-Policy" = "same-origin"
+"Cross-Origin-Embedder-Policy" = "require-corp"

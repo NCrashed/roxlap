@@ -4,3 +4,49 @@
 
 [build]
 public_url = "/"
+
+# R10.X.2: keep wasm-opt from stripping the shared-memory +
+# atomics constructs that wasm-bindgen-rayon relies on.
+wasm_opt_params = ["--enable-threads", "--enable-bulk-memory"]
+
+# R10.X.2: disable trunk's per-asset content-hash filenames so
+# `wasm-bindgen-rayon`'s `workerHelpers.js` can find the JS
+# shim at a stable URL. wasm-bindgen-rayon's worker thread
+# does `await import('../../..')`, which from
+# `dist/snippets/wasm-bindgen-rayon-XYZ/src/workerHelpers.js`
+# resolves to `/`. wasm-pack's output adds a `package.json`
+# `main` field at that level so bundler-style resolution
+# finds the JS shim; trunk just serves raw files, so we
+# rewrite the import below in a `[[hooks]]` post-build step.
+filehash = false
+
+# R10.X.2: disable subresource integrity. Trunk computes SHA-384
+# digests during the build and embeds them on the
+# `<link rel="modulepreload">` tags in index.html; our post-build
+# hook then mutates `workerHelpers.js`, so the browser would
+# refuse to load the patched file because its hash no longer
+# matches. With SRI off, the browser skips the integrity check
+# entirely and the patched worker loads cleanly.
+no_sri = true
+
+# R10.X.2: rewrite `wasm-bindgen-rayon`'s baked-in
+# `await import('../../..')` to point directly at the JS
+# shim trunk emits at `dist/roxlap-cave-web.js`. Without
+# the rewrite the worker's dynamic-import resolves to the
+# page root, the static server returns index.html, and the
+# browser refuses the module on MIME mismatch.
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = [
+    "-c",
+    "find $TRUNK_STAGING_DIR/snippets -name workerHelpers.js -exec sed -i \"s|await import('\\.\\./\\.\\./\\.\\.')|await import('../../../roxlap-cave-web.js')|g\" {} +",
+]
+
+# R10.X.2: SharedArrayBuffer (the substrate for wasm-bindgen-rayon's
+# Web Worker pool) requires cross-origin isolation. Trunk's dev
+# server attaches these headers; production deploys must do the
+# same via the static host's header config.
+[serve.headers]
+"Cross-Origin-Opener-Policy" = "same-origin"
+"Cross-Origin-Embedder-Policy" = "require-corp"
