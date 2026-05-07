@@ -5,7 +5,7 @@ voxel engine — a CPU-rendered 3D voxel renderer from the Build-engine era.
 Runs on Linux / macOS / Windows from one Cargo workspace, no GPU required,
 no C dependency, idiomatic safe Rust with per-architecture SIMD.
 
-![sample render from roxlap-oracle](docs/screenshot.png)
+![sample render from roxlap-oracle](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/screenshot.png)
 
 ## What is Voxlap?
 
