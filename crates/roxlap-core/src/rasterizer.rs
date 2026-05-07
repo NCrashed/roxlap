@@ -286,7 +286,7 @@ impl ScanScratch {
 /// thread.
 ///
 /// R12.0 introduced this as the host-owned ownership root for
-/// per-thread scratch. R12.1 wires it through [`crate::opticast`]
+/// per-thread scratch. R12.1 wires it through [`crate::opticast()`]
 /// (single slot in use). R12.2 will fan slots 0..4 across the four
 /// quadrant scan loops via `rayon::join`; R12.3 will distribute
 /// slots across N row strips via `par_iter`.

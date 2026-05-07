@@ -148,8 +148,8 @@ const FOG_MAX_SCAN_DIST: i32 = 128;
 const PLAYER_RADIUS: f64 = 0.3;
 
 /// In-flight plasma bullet. Travels in a straight line until it hits
-/// a solid voxel (carved into a sphere via [`set_sphere`]) or exits
-/// the world / max-flight envelope.
+/// a solid voxel (carved into a sphere via [`set_sphere_with_colfunc`])
+/// or exits the world / max-flight envelope.
 #[derive(Debug, Clone, Copy)]
 struct Bullet {
     pos: [f64; 3],
@@ -848,7 +848,7 @@ fn bullet_radius_px(bullet: &Bullet) -> i32 {
 }
 
 /// Generate a fresh world for the given preset + seed and reserve
-/// edit headroom so runtime [`set_sphere`] carves work.
+/// edit headroom so runtime [`set_sphere_with_colfunc`] carves work.
 fn build_world(preset: Preset, seed: u64) -> vxl::Vxl {
     eprintln!(
         "cave-demo: generating {} world (vsid={VSID}, seed={seed})…",

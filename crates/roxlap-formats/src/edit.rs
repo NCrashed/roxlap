@@ -463,7 +463,7 @@ pub(crate) fn compilerle(
 //
 // ```ignore
 // vxl.reserve_edit_capacity(headroom);
-// let mut ctx = vxl.scum2_begin();
+// let mut ctx = ScumCtx::new(&mut vxl);
 // ctx.set_colfunc(|x, y, z| 0xff_8080_80);
 // for span in spans {
 //     let b2 = ctx.scum2(span.x, span.y).unwrap();
@@ -499,7 +499,8 @@ const SCOYM3_INITIAL: usize = SCPITCH * 6;
 /// `SCOYM3_INITIAL`. Voxlap's `&radar[SCPITCH*9]` test.
 const SCOYM3_WRAP: usize = SCPITCH * 9;
 
-/// Column-edit batch context. Acquired via [`Vxl::scum2_begin`].
+/// Column-edit batch context. Construct via [`ScumCtx::new`] after
+/// calling [`Vxl::reserve_edit_capacity`] on the world.
 ///
 /// Holds a `&mut Vxl` borrow plus the rolling 3-row b2 buffer cache.
 /// Mutate columns via [`ScumCtx::scum2`] — it returns the b2 buffer
@@ -911,9 +912,9 @@ pub struct Vspan {
 /// Operation for span-style edits.
 ///
 /// `Carve` flips the listed voxels to air (per-span [`delslab`]) —
-/// the colfunc is consulted by [`compilerle`] for newly-exposed
-/// voxels just outside the carved range (above and below) which
-/// weren't previously in the column's color list.
+/// the colfunc is consulted by the internal RLE re-compile step for
+/// newly-exposed voxels just outside the carved range (above and
+/// below) which weren't previously in the column's color list.
 ///
 /// `Insert` flips the listed voxels to solid (per-span [`insslab`])
 /// — the colfunc is consulted for the inserted voxels themselves.
