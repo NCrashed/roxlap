@@ -1190,12 +1190,30 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     // an empty slice so `column_byte_at` reads return the `0`
     // sentinel and the slab-walk phases short-circuit without
     // drawing — i.e., OOB columns render as fully empty / sky.
+    //
+    // S1.Z: when in-bounds, RECOMPUTE the linear index from the
+    // signed (cx, cy) instead of trusting `ixy_sptr_col_idx`. The
+    // wrapping_add_signed advance is in `usize`, which is `u64`
+    // on 64-bit hosts; this means the wrap-arithmetic that maps
+    // negative camera positions to small post-wrap u32 indices
+    // (which voxlap C relies on) doesn't trigger when the index
+    // drifts past 2^32. For cy < 0 the initial column_index
+    // u32-wraps to a value near u32::MAX, then advancing +vsid
+    // per y-step on u64 leaves it past 2^32 forever — `.get()`
+    // returns None and the world never refreshes once (cx, cy)
+    // cross into bounds. Recomputing from signed coords sidesteps
+    // the host-pointer-width sensitivity.
     let in_bounds = state.cx >= 0
         && state.cy >= 0
         && state.cx < state.vsid_signed
         && state.cy < state.vsid_signed;
     if in_bounds {
-        if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
+        #[allow(clippy::cast_sign_loss)]
+        let correct_idx = (state.cy as u32)
+            .wrapping_mul(state.vsid)
+            .wrapping_add(state.cx as u32) as usize;
+        state.ixy_sptr_col_idx = correct_idx;
+        if let Some(&col_off) = state.column_offsets.get(correct_idx) {
             let off = col_off as usize;
             if off <= state.slab_buf.len() {
                 state.column = &state.slab_buf[off..];

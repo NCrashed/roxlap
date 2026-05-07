@@ -96,10 +96,21 @@ pub fn derive_prelude(
 ) -> OpticastPrelude {
     let forward_z_sign = if camera_state.forward[2] < 0.0 { -1 } else { 1 };
 
+    // Floor (not `as i32` truncate) — voxlap C uses lrintf which
+    // for integer-position cameras (the 12 oracle poses) rounds to
+    // the same value, but for fractional-position OOB cameras with
+    // negative coords (e.g. cy=-18.29), `as i32` truncates to -18
+    // while floor produces -19. Voxlap's pos_xfrac/pos_yfrac
+    // convention requires the fractional part to be in [0, 1) —
+    // truncation puts it in (-1, 0] for negative positions, which
+    // makes gline's gpz[lane] init negative and the per-column DDA
+    // skips ahead by 1 voxel-col on the first y-step. Visible as
+    // "world doesn't render at all" when camera flies into the
+    // -Y OOB strip with a fractional Y position.
     let li_pos = [
-        camera_state.pos[0] as i32,
-        camera_state.pos[1] as i32,
-        camera_state.pos[2] as i32,
+        camera_state.pos[0].floor() as i32,
+        camera_state.pos[1].floor() as i32,
+        camera_state.pos[2].floor() as i32,
     ];
 
     // S1.Z: signed copies for the negative-index outside-camera walk.
