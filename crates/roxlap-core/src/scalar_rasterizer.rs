@@ -442,7 +442,8 @@ impl Rasterizer for ScalarRasterizer<'_> {
         //    gixy/gpz/gdz). voxlap5.c:1153-1175.
         let f = derive_gline_frustum(
             &cache.camera_state,
-            &cache.prelude,
+            cache.prelude.pos_xfrac,
+            cache.prelude.pos_yfrac,
             self.vsid,
             length,
             x0,

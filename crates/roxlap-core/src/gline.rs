@@ -25,7 +25,6 @@
 
 use crate::camera_math::CameraState;
 use crate::fixed::ftol;
-use crate::opticast_prelude::OpticastPrelude;
 use crate::opticast_prelude::PREC;
 
 /// Per-scanline frustum data — what the `grouscan` ray-walker
@@ -58,6 +57,13 @@ pub struct GlineFrustum {
 
 /// Compute the per-scanline frustum.
 ///
+/// `pos_xfrac` / `pos_yfrac` are the bilinear lane weights for the
+/// initial DDA position — for an inside-grid camera these come from
+/// `OpticastPrelude::{pos_xfrac, pos_yfrac}`; for the S1.3 outside-
+/// camera path each scanline supplies a different pair derived from
+/// the AABB-entry XY (the gline DDA starts at the entry point, not
+/// at the camera position, since the camera sits past `vsid`).
+///
 /// `leng` is voxlap's `leng` parameter (the pixel run length the
 /// caller will write into `radar`). It is *not* used by the
 /// projection math here — it's part of the broader gline signature
@@ -80,7 +86,8 @@ pub struct GlineFrustum {
 #[must_use]
 pub fn derive_gline_frustum(
     cs: &CameraState,
-    prelude: &OpticastPrelude,
+    pos_xfrac: [f32; 2],
+    pos_yfrac: [f32; 2],
     vsid: u32,
     _leng: u32,
     x0: f32,
@@ -163,13 +170,13 @@ pub fn derive_gline_frustum(
     let (gdz_clamped_0, gpz_0) = if gdz_0 <= 0 {
         (0, i32::MAX)
     } else {
-        let gp = ftol(prelude.pos_xfrac[xfrac_idx] * gdz_0 as f32);
+        let gp = ftol(pos_xfrac[xfrac_idx] * gdz_0 as f32);
         (gdz_0, gp)
     };
     let (gdz_clamped_1, gpz_1) = if gdz_1 <= 0 {
         (0, i32::MAX)
     } else {
-        let gp = ftol(prelude.pos_yfrac[yfrac_idx] * gdz_1 as f32);
+        let gp = ftol(pos_yfrac[yfrac_idx] * gdz_1 as f32);
         (gdz_1, gp)
     };
 
@@ -191,6 +198,7 @@ mod tests {
     use super::*;
     use crate::camera_math;
     use crate::opticast_prelude;
+    use crate::opticast_prelude::OpticastPrelude;
     use crate::Camera;
 
     /// Looking-down camera at world origin, 640×480 viewport.
@@ -216,7 +224,17 @@ mod tests {
     fn world_space_ray_endpoints_for_top_scanline() {
         // Scanline along the top edge of viewport: (0,0) → (640,0).
         let (cs, prelude) = looking_down_state();
-        let g = derive_gline_frustum(&cs, &prelude, 2048, 640, 0.0, 0.0, 640.0, 0.0);
+        let g = derive_gline_frustum(
+            &cs,
+            prelude.pos_xfrac,
+            prelude.pos_yfrac,
+            2048,
+            640,
+            0.0,
+            0.0,
+            640.0,
+            0.0,
+        );
 
         // Right ray endpoint: vx1 = 640*1 + 0*0 + (-320) = 320.
         // vy1 = 640*0 + 0*1 + (-240) = -240.
@@ -232,7 +250,17 @@ mod tests {
     fn vd1_equals_ground_plane_magnitude() {
         // For (0,0)→(640,0): vd1 = sqrt(320² + 240²) = sqrt(160000) = 400.
         let (cs, prelude) = looking_down_state();
-        let g = derive_gline_frustum(&cs, &prelude, 2048, 640, 0.0, 0.0, 640.0, 0.0);
+        let g = derive_gline_frustum(
+            &cs,
+            prelude.pos_xfrac,
+            prelude.pos_yfrac,
+            2048,
+            640,
+            0.0,
+            0.0,
+            640.0,
+            0.0,
+        );
         assert_eq!(bit(g.vd1), bit(400.0));
     }
 
@@ -242,7 +270,17 @@ mod tests {
         // branch. vd0_x = -320 (gcorn[0].x), f1 = 400/320 = 1.25.
         // vd0 = -320 * 1.25 = -400 → clamped to 0.
         let (cs, prelude) = looking_down_state();
-        let g = derive_gline_frustum(&cs, &prelude, 2048, 640, 0.0, 0.0, 640.0, 0.0);
+        let g = derive_gline_frustum(
+            &cs,
+            prelude.pos_xfrac,
+            prelude.pos_yfrac,
+            2048,
+            640,
+            0.0,
+            0.0,
+            640.0,
+            0.0,
+        );
         assert_eq!(bit(g.vd0), bit(0.0));
     }
 
@@ -250,7 +288,17 @@ mod tests {
     fn gixy_signs_match_ray_direction() {
         // (0,0)→(640,0): vx1=320 > 0 → +1. vy1=-240 < 0 → -vsid.
         let (cs, prelude) = looking_down_state();
-        let g = derive_gline_frustum(&cs, &prelude, 2048, 640, 0.0, 0.0, 640.0, 0.0);
+        let g = derive_gline_frustum(
+            &cs,
+            prelude.pos_xfrac,
+            prelude.pos_yfrac,
+            2048,
+            640,
+            0.0,
+            0.0,
+            640.0,
+            0.0,
+        );
         assert_eq!(g.gixy[0], 1);
         // For our origin-position prelude column_index = 0 (x=0,
         // y=0); vsid_signed extraction is sketchy when li_pos[1] = 0.
@@ -264,7 +312,17 @@ mod tests {
         };
         let cs2 = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
         let prelude2 = opticast_prelude::derive_prelude(&cs2, 2048, 1, 4, 1024);
-        let g2 = derive_gline_frustum(&cs2, &prelude2, 2048, 640, 0.0, 0.0, 640.0, 0.0);
+        let g2 = derive_gline_frustum(
+            &cs2,
+            prelude2.pos_xfrac,
+            prelude2.pos_yfrac,
+            2048,
+            640,
+            0.0,
+            0.0,
+            640.0,
+            0.0,
+        );
         assert!(
             g2.gixy[1] < 0,
             "gixy[1] = {}, expected negative",
@@ -280,7 +338,17 @@ mod tests {
         // f1 = 400/320 = 1.25 → gdz[0] = 1.25 * PREC = 1310720.
         // f2 = 400/(-240) ≈ -1.6667 → |f2| * PREC ≈ 1747626.7 → 1747627.
         let (cs, prelude) = looking_down_state();
-        let g = derive_gline_frustum(&cs, &prelude, 2048, 640, 0.0, 0.0, 640.0, 0.0);
+        let g = derive_gline_frustum(
+            &cs,
+            prelude.pos_xfrac,
+            prelude.pos_yfrac,
+            2048,
+            640,
+            0.0,
+            0.0,
+            640.0,
+            0.0,
+        );
         assert_eq!(g.gdz[0], (1.25_f32 * PREC as f32).round_ties_even() as i32);
         assert_eq!(
             g.gdz[1],
@@ -297,7 +365,17 @@ mod tests {
         // puts vx1 = vd0_x = (320*1 + 0*0 - 320) = 0 (but at endpoint
         // x1 = 320, f_at_x1 = 320*1 + 480*0 - 320 = 0 too). So vx1=0.
         let (cs, prelude) = looking_down_state();
-        let g = derive_gline_frustum(&cs, &prelude, 2048, 640, 320.0, 0.0, 320.0, 480.0);
+        let g = derive_gline_frustum(
+            &cs,
+            prelude.pos_xfrac,
+            prelude.pos_yfrac,
+            2048,
+            640,
+            320.0,
+            0.0,
+            320.0,
+            480.0,
+        );
         // vx1 = 0 → f1 = inf → gdz[0] clamped to 0, gpz[0] = i32::MAX.
         assert_eq!(g.gdz[0], 0);
         assert_eq!(g.gpz[0], i32::MAX);

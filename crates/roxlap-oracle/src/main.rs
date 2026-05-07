@@ -730,7 +730,17 @@ fn cmd_debug_gline(pose_name: &str) -> std::io::Result<()> {
     // voxlap5.c:gline at line ~1146 with the same inputs and dump
     // the same fields.
     let leng = 240; // |y1 - y0| = 480 - 240
-    let f = derive_gline_frustum(&cs, &prelude, 2048, leng, 320.0, 240.0, 320.0, 480.0);
+    let f = derive_gline_frustum(
+        &cs,
+        prelude.pos_xfrac,
+        prelude.pos_yfrac,
+        2048,
+        leng,
+        320.0,
+        240.0,
+        320.0,
+        480.0,
+    );
     println!("\ngline frustum (x0=320, y0=240, x1=320, y1=480, leng={leng}):");
     println!("  vd0 = {} (post-rescale)", f.vd0);
     println!("  vd1 = {} (= f = sqrt(vx1²+vy1²))", f.vd1);
