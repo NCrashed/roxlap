@@ -114,6 +114,33 @@ pub enum OpticastOutcome {
     /// from `opticast` early in this case (no render, screen retains
     /// previous contents — the host can pre-fill with sky).
     SkippedCameraInSolid,
+    /// S1.2: camera position lies outside the column grid in X or Y.
+    /// Voxlap C cannot render this case (the per-frame
+    /// `camera_column_air_gap` walk has no valid camera column);
+    /// roxlap routes through [`opticast_outside`] which clips each
+    /// ray against the world AABB and starts gline at the entry
+    /// face. S1.2 wires the dispatch but the body is still a stub —
+    /// S1.3 fills in the per-ray walk.
+    OutsideCamera,
+}
+
+/// S1.2: is the camera's integer position outside the column grid's
+/// XY footprint? `li_pos` comes from
+/// [`opticast_prelude::OpticastPrelude::li_pos`] — voxlap floors the
+/// f32 camera pos to i32 to derive `column_index`, and that index
+/// silently wraps when either component is `>= vsid` or `< 0`. This
+/// helper is the precondition the dispatch fork in [`opticast`]
+/// checks.
+///
+/// Z is intentionally not checked: voxlap's existing sky-walk-down
+/// already handles "camera above the world top," and "camera below
+/// `z = 0`" is not in S1's scope.
+#[must_use]
+#[inline]
+fn camera_outside_xy(li_pos: &[i32; 3], vsid: u32) -> bool {
+    #[allow(clippy::cast_possible_wrap)]
+    let vsid_signed = vsid as i32;
+    li_pos[0] < 0 || li_pos[1] < 0 || li_pos[0] >= vsid_signed || li_pos[1] >= vsid_signed
 }
 
 /// Drive one frame of opticast. The caller supplies:
@@ -198,6 +225,28 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         settings.mip_scan_dist,
         settings.max_scan_dist,
     );
+
+    // S1.2: camera outside the column grid's XY footprint? The
+    // per-frame `camera_column_air_gap` walk below has no valid
+    // camera column to walk — without this fork the prelude's
+    // `column_index` (which is `li_pos.y * vsid + li_pos.x` and
+    // silently wraps when either component is past `vsid`) feeds
+    // `camera_column_slice` with garbage; today that returns `None`
+    // and we fall out via `SkippedCameraInSolid`. The OUTSIDE case
+    // wants the per-ray AABB-clip path instead — see
+    // [`opticast_outside`].
+    if camera_outside_xy(&prelude.li_pos, vsid) {
+        return opticast_outside(
+            rasterizer,
+            pool,
+            &cs,
+            &prelude,
+            settings,
+            vsid,
+            slab_buf,
+            column_offsets,
+        );
+    }
 
     // gstartv walk — early-out if the camera is inside solid voxel
     // material. Slice `slab_buf` at the camera column's range
@@ -379,6 +428,39 @@ fn run_strip_parallel<R: Rasterizer + Clone + Send + Sync>(
         .par_iter_mut()
         .enumerate()
         .for_each(strip_body);
+}
+
+/// S1.2: outside-camera render entry point. Voxlap C bails before
+/// reaching the per-frame projection setup when the camera is
+/// outside the column grid; roxlap reroutes here instead.
+///
+/// **S1.2 status**: dispatch wired, body is a no-op stub. The
+/// framebuffer the caller pre-filled with sky stays as-is, so
+/// today's behaviour is identical to the pre-S1 code (which
+/// silently fell through `camera_column_slice → None →
+/// SkippedCameraInSolid` and left the framebuffer untouched). The
+/// only externally-observable change is that callers can now
+/// distinguish "camera in solid" from "camera outside grid" via
+/// [`OpticastOutcome::OutsideCamera`].
+///
+/// **S1.3 will fill in** the per-ray AABB clip + face-hit gline init:
+/// for each scanline, intersect the ray against the world's XY
+/// AABB via [`crate::ray_aabb::clip_ray_to_xy_aabb`]; rays that
+/// miss leave their pixels as the pre-filled sky; rays that hit
+/// run gline starting at `t = t_enter` and the entry-face column,
+/// not from `prelude.li_pos / column_index` (which is past `vsid`).
+#[allow(clippy::too_many_arguments)]
+fn opticast_outside<R: Rasterizer + Clone + Send + Sync>(
+    _rasterizer: &mut R,
+    _pool: &mut ScratchPool,
+    _cs: &CameraState,
+    _prelude: &OpticastPrelude,
+    _settings: &OpticastSettings,
+    _vsid: u32,
+    _slab_buf: &[u8],
+    _column_offsets: &[u32],
+) -> OpticastOutcome {
+    OpticastOutcome::OutsideCamera
 }
 
 /// Slice `slab_buf` at column `idx`'s byte range (per the

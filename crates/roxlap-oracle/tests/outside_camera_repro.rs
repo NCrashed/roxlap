@@ -17,7 +17,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use roxlap_core::camera_math;
-use roxlap_core::opticast::opticast;
+use roxlap_core::opticast::{opticast, OpticastOutcome};
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::{Camera, Engine, OpticastSettings};
@@ -75,7 +75,7 @@ fn outside_camera_renders_without_panic() {
         &vxl.mip_base_offsets,
         vxl.vsid,
     );
-    let _ = opticast(
+    let outcome = opticast(
         &mut rasterizer,
         &mut pool,
         &cam,
@@ -85,6 +85,16 @@ fn outside_camera_renders_without_panic() {
         &vxl.column_offset,
     );
     drop(rasterizer);
+
+    // S1.2: the outside-camera dispatch fork now distinguishes this
+    // case from "camera in solid". S1.3 fills in the body that
+    // actually renders; today the stub leaves the framebuffer
+    // untouched so the visible result is unchanged.
+    assert_eq!(
+        outcome,
+        OpticastOutcome::OutsideCamera,
+        "outside-XY camera should route through opticast_outside, not SkippedCameraInSolid"
+    );
 
     let mut bytes = Vec::with_capacity(framebuffer.len() * 4);
     for &px in framebuffer.iter() {
