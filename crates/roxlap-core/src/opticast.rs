@@ -226,41 +226,43 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         settings.max_scan_dist,
     );
 
-    // S1.2: camera outside the column grid's XY footprint? The
-    // per-frame `camera_column_air_gap` walk below has no valid
-    // camera column to walk — without this fork the prelude's
-    // `column_index` (which is `li_pos.y * vsid + li_pos.x` and
-    // silently wraps when either component is past `vsid`) feeds
-    // `camera_column_slice` with garbage; today that returns `None`
-    // and we fall out via `SkippedCameraInSolid`. The OUTSIDE case
-    // wants the per-ray AABB-clip path instead — see
-    // [`opticast_outside`].
-    if camera_outside_xy(&prelude.li_pos, vsid) {
-        return opticast_outside(
-            rasterizer,
-            pool,
-            &cs,
-            &prelude,
-            settings,
-            vsid,
-            slab_buf,
-            column_offsets,
-        );
-    }
-
-    // gstartv walk — early-out if the camera is inside solid voxel
-    // material. Slice `slab_buf` at the camera column's range
-    // (computed by the prelude as `column_index = li_pos.y * vsid +
-    // li_pos.x`); a malformed or out-of-bounds offset table is
-    // treated as "camera in solid" so we early-out cleanly.
-    let camera_column = camera_column_slice(slab_buf, column_offsets, prelude.column_index);
-    let Some(camera_column_data) = camera_column else {
-        return OpticastOutcome::SkippedCameraInSolid;
-    };
-    let Some((gstartz0, gstartz1, camera_vptr_offset)) =
-        column_walk::camera_column_air_gap(camera_column_data, prelude.li_pos[2])
-    else {
-        return OpticastOutcome::SkippedCameraInSolid;
+    // S1.Z: outside-XY camera path. When the camera sits past
+    // [0, vsid)² in X or Y, `prelude.column_index` is wrapped junk
+    // (`li_pos.y * vsid + li_pos.x` with `as u32` cast aliases
+    // negative values to large in-range integers). Skip the
+    // per-frame `camera_column_slice + camera_column_air_gap` walk
+    // and synthesise a full-air-gap ScanContext — the column-walk
+    // DDA will then traverse OOB columns as empty until it crosses
+    // into the world (handled per-step in grouscan.rs's
+    // `phase_after_delete_kept_presync`).
+    //
+    // For inside-XY camera, the original gstartv walk runs as
+    // before; the negative-index path is a no-op.
+    let (gstartz0, gstartz1, camera_vptr_offset) = if prelude.in_bounds_xy {
+        let camera_column = camera_column_slice(slab_buf, column_offsets, prelude.column_index);
+        let Some(camera_column_data) = camera_column else {
+            return OpticastOutcome::SkippedCameraInSolid;
+        };
+        let Some(triple) =
+            column_walk::camera_column_air_gap(camera_column_data, prelude.li_pos[2])
+        else {
+            return OpticastOutcome::SkippedCameraInSolid;
+        };
+        triple
+    } else {
+        // Camera sits in the void outside the column grid. There is
+        // no camera column; synthesise the "full air gap" answer
+        // (z0 = 0, z1 = MAXZDIM, vptr_offset = 0) so the per-frame
+        // setup proceeds. Per-scanline cf-seed semantics are
+        // unchanged because gline reads gstartz0/z1 only as the
+        // initial cf z bounds — nothing's solid above the void
+        // camera so the full-z-range answer is geometrically
+        // correct.
+        // z bounds match what camera_column_air_gap returns for
+        // "camera above all slabs" of a typical column: (0,
+        // first_z1, 0). 255 is voxlap's MAXZDIM - 1 — the "below
+        // any solid" sentinel.
+        (0, 255, 0)
     };
 
     // Per-frame setup hook needs a `ScanContext` with cy / camera

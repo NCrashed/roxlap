@@ -733,6 +733,22 @@ impl ApplicationHandler for App {
                     }
                     KeyCode::KeyF if pressed => {
                         self.capture_pending = true;
+                        // S1.Y debugging: print camera pose so any
+                        // screenshot taken via F can be paired with
+                        // the exact camera state that produced it.
+                        let vsid = self.vxl.vsid;
+                        let in_xy = self.cam_pos[0] >= 0.0
+                            && self.cam_pos[1] >= 0.0
+                            && self.cam_pos[0] < f64::from(vsid)
+                            && self.cam_pos[1] < f64::from(vsid);
+                        eprintln!(
+                            "F: vsid={vsid}  pos=({:.2}, {:.2}, {:.2})  yaw={:.4}  pitch={:.4}  in_xy={in_xy}",
+                            self.cam_pos[0],
+                            self.cam_pos[1],
+                            self.cam_pos[2],
+                            self.yaw,
+                            self.pitch,
+                        );
                     }
                     KeyCode::KeyL if pressed => {
                         self.toggle_light();
@@ -867,7 +883,7 @@ fn load_oracle_vxl() -> vxl::Vxl {
 /// S1.X: hand-built flyable test scene.
 ///
 /// Layout (voxlap z-down: z=0 is up, z=255 is down):
-/// - Flat ground plane at z = `GROUND_Z`..`MAXZDIM`. Solid.
+/// - Flat ground plane at z = `GROUND_Z` (one voxel thick).
 /// - Starting platform at world centre, raised 8 voxels above
 ///   ground, 16×16 voxel footprint, light grey.
 /// - Red cube 24³ east of platform.
@@ -905,14 +921,19 @@ fn build_small_test_scene() -> vxl::Vxl {
     const SPHERE_COL: u32 = 0x80_30_60_e0; // blue
     const TOWER_COL: u32 = 0x80_e0_d0_30; // yellow
 
-    // 1. Flat ground plane covering the whole XY footprint.
+    // 1. Flat ground plane covering the whole XY footprint, ONE
+    //    voxel thick — anything below `GROUND_Z` is empty so rays
+    //    looking up through the floor from outside the world render
+    //    as sky (S1.Z negative-index walk + Startsky drain). A
+    //    thicker ground would visually appear as an "infinite slab"
+    //    extending downward when viewed from outside, which is
+    //    geometrically correct but not what the scene-engine probe
+    //    wants.
     for y in 0..vsid_u {
         for x in 0..vsid_u {
-            for z in GROUND_Z..max_z {
-                let i = idx(x, y, z);
-                grid[i] = 1;
-                color[i] = GROUND_COL;
-            }
+            let i = idx(x, y, GROUND_Z);
+            grid[i] = 1;
+            color[i] = GROUND_COL;
         }
     }
 

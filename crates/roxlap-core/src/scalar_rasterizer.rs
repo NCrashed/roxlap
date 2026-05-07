@@ -325,6 +325,33 @@ pub struct OutsideRayContext {
     /// entry column to the slab whose top bounds the air gap from
     /// below. Passed to `grouscan_run`.
     pub vptr_offset: usize,
+    /// S1.Y: ray-parameter at which this scanline's `(x1, y1)` ray
+    /// enters the world AABB, in voxlap's `s` units (where `s=1` is
+    /// the screen-pixel endpoint).
+    ///
+    /// Used only by the cf-seed shift in
+    /// [`ScalarRasterizer::gline`]: the per-pixel `plc` cursor must
+    /// advance through Q12.20 coordinates relative to the entry
+    /// point (where the column walk starts), not the camera. The
+    /// column walk itself (`gixy / gpz / gdz`) stays camera-
+    /// relative — those are direction-only and shift-invariant.
+    ///
+    /// Inside camera leaves this 0.0 (no shift). The shift formula
+    /// for vd-units is:
+    ///
+    /// ```text
+    /// vd0_shifted = vd0 - t_enter * vd1
+    /// vd1_shifted = (1 - t_enter) * vd1
+    /// vz0_shifted = vz0 - t_enter * vz1
+    /// vz1_shifted = (1 - t_enter) * vz1
+    /// ```
+    ///
+    /// Derivation: entry sits at `t_enter * v1` along the
+    /// `(x1, y1)` ray from camera, so `v0_entry_rel = v0_cam_rel -
+    /// t_enter * v1` and `v1_entry_rel = (1 - t_enter) * v1`.
+    /// Projecting onto the dominant ground-plane axis with `f1` /
+    /// `f2` collapses `t_enter * vx1 * f1` to `t_enter * vd1`.
+    pub t_enter: f32,
     /// Scanline whose ray misses the world AABB entirely (no entry
     /// point exists). gline takes the sky-fill path: cf seed gets
     /// safe placeholder values, gxmax = 0, skycast.dist = i32::MAX,
@@ -527,6 +554,7 @@ impl<'a> ScalarRasterizer<'a> {
             gstartz0: 0,
             gstartz1: 0,
             vptr_offset: 0,
+            t_enter: 0.0,
             force_miss: true,
         };
 
@@ -575,6 +603,7 @@ impl<'a> ScalarRasterizer<'a> {
             gstartz0,
             gstartz1,
             vptr_offset,
+            t_enter,
             force_miss: false,
         }
     }
@@ -648,8 +677,19 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // range with skycast directly so hrend / vrend produces
         // sky-colored pixels at z = far. No grouscan walk needed —
         // there's nothing to walk.
+        //
+        // S1.Y: also reset `sky_off` to 0 so the NEXT scanline's
+        // `phase_startsky` dispatch (in grouscan) sees the textured-
+        // sky-disabled state for THIS scanline's drained slots.
+        // Without this reset, sky_off retained its stale value
+        // from the last non-miss scanline; subsequent grouscan calls
+        // routed through `phase_startsky_textured`, sampled
+        // sky.png at stale longitudes, and overwrote sky slots
+        // with the "fan blade" sky-texture artifact the user
+        // observed in missing quadrants.
         if or_ctx.is_some_and(|c| c.force_miss) {
             scratch.skycast.dist = i32::MAX;
+            scratch.sky_off = 0;
             let start = scratch.gscanptr;
             let end = (start + length as usize).min(scratch.radar.len());
             let sk = scratch.skycast;
@@ -710,19 +750,29 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // the i32 boundary for world-coord magnitudes near VSID
         // (= 2048) × PREC (= 2²⁰); Rust's `as i32` saturates and
         // diverges for those edge cases.
+        // S1.Y: shift vd0/vd1/vz0/vz1 to entry-relative coordinates
+        // for the cf-seed ONLY. gixy/gpz/gdz/dominant-axis selection
+        // (already in `f`) stay camera-relative — those are
+        // direction-only and shift-invariant. Inside camera passes
+        // t_enter = 0 → no shift, byte-exact with pre-S1.Y.
+        let t_enter_shift = or_ctx.map_or(0.0_f32, |o| o.t_enter);
+        let vd0 = f.vd0 - t_enter_shift * f.vd1;
+        let vd1 = (1.0 - t_enter_shift) * f.vd1;
+        let vz0 = f.vz0 - t_enter_shift * f.vz1;
+        let vz1 = (1.0 - t_enter_shift) * f.vz1;
         let (gi0, gi1, cx0, cy0) = if cache.prelude.forward_z_sign < 0 {
             (
-                ftol((f.vd1 - f.vd0) * cmprecip),
-                ftol((f.vz1 - f.vz0) * cmprecip),
-                ftol(f.vd0 * cmpprec),
-                ftol(f.vz0 * cmpprec),
+                ftol((vd1 - vd0) * cmprecip),
+                ftol((vz1 - vz0) * cmprecip),
+                ftol(vd0 * cmpprec),
+                ftol(vz0 * cmpprec),
             )
         } else {
             (
-                ftol((f.vd0 - f.vd1) * cmprecip),
-                ftol((f.vz0 - f.vz1) * cmprecip),
-                ftol(f.vd1 * cmpprec),
-                ftol(f.vz1 * cmpprec),
+                ftol((vd0 - vd1) * cmprecip),
+                ftol((vz0 - vz1) * cmprecip),
+                ftol(vd1 * cmpprec),
+                ftol(vz1 * cmpprec),
             )
         };
         let cx1 = leng.wrapping_mul(gi0).wrapping_add(cx0);
@@ -795,11 +845,18 @@ impl Rasterizer for ScalarRasterizer<'_> {
         }
 
         // 6. Build inputs and call grouscan_run. The starting
-        //    column is the camera's column (or, in outside mode,
-        //    the AABB-entry column supplied by the override). The
-        //    slab walker handles the rest.
-        let column =
-            camera_column_slice(self.slab_buf, self.column_offsets, column_index).unwrap_or(&[]);
+        //    column is the camera's column. For OOB cameras
+        //    (S1.Z) the linear `column_index` is u32-junk that
+        //    may alias to an unrelated in-range column in the
+        //    offsets table — gate on `in_bounds_xy` so the walk
+        //    starts with an empty column and the per-step OOB
+        //    path in grouscan continues to feed empty columns
+        //    until (cx, cy) cross into the world.
+        let column = if cache.prelude.in_bounds_xy {
+            camera_column_slice(self.slab_buf, self.column_offsets, column_index).unwrap_or(&[])
+        } else {
+            &[]
+        };
         // Copy gcsub out of scratch so the GrouscanInputs immutable
         // borrow doesn't collide with the `&mut scratch` grouscan_run
         // takes below. `[i64; 9]` is 72 bytes — cheap.
@@ -839,6 +896,8 @@ impl Rasterizer for ScalarRasterizer<'_> {
             &inputs,
             vptr_offset,
             column_index as usize,
+            cache.prelude.cx,
+            cache.prelude.cy,
             cache.prelude.x_mip,
             gmipnum.max(1),
         );

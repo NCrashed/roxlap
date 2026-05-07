@@ -50,6 +50,21 @@ pub struct OpticastPrelude {
     pub y_lookup: Vec<i32>,
     pub x_mip: i32,
     pub max_scan_dist: i32,
+    /// S1.Z: signed integer column coordinates of the camera. For
+    /// in-bounds camera, equal to `(li_pos[0], li_pos[1])`. For
+    /// outside-XY camera (camera position past `[0, vsid)`), these
+    /// can be negative or `>= vsid` and the grouscan walk traverses
+    /// out-of-bounds columns as empty until it crosses into the
+    /// world. `column_index` cannot be used for OOB classification
+    /// because `as u32` wraps negative values to large positive
+    /// integers that may alias to in-range columns.
+    pub cx: i32,
+    pub cy: i32,
+    /// S1.Z: `cx, cy ∈ [0, vsid)`. Inside-camera path uses this to
+    /// gate the existing `camera_column_air_gap` precondition (which
+    /// requires real column data); outside path skips that and
+    /// synthesises full-air-gap placeholders.
+    pub in_bounds_xy: bool,
 }
 
 /// Derive the per-frame [`OpticastPrelude`].
@@ -87,8 +102,20 @@ pub fn derive_prelude(
         camera_state.pos[2] as i32,
     ];
 
-    // li_pos.x and li_pos.y are non-negative for any in-bounds camera
-    // (clamped at the engine layer); we sign-loss-cast here only.
+    // S1.Z: signed copies for the negative-index outside-camera walk.
+    // li_pos[0] / [1] can legitimately be negative when the camera
+    // sits past [0, vsid) in X or Y; the cast-to-u32 below would
+    // alias such values to wrap-around in-range column indices, which
+    // is wrong. We carry the signed values forward separately.
+    let cx = li_pos[0];
+    let cy = li_pos[1];
+    let vsid_signed = vsid as i32;
+    let in_bounds_xy = cx >= 0 && cy >= 0 && cx < vsid_signed && cy < vsid_signed;
+
+    // For in-bounds cameras, this is the canonical voxlap
+    // `gpixy = ipy*VSID + ipx` index. For OOB cameras the value is
+    // garbage (u32 wrap) but is never read — every read site gates
+    // on `in_bounds_xy` first.
     let column_index = (li_pos[1] as u32) * vsid + (li_pos[0] as u32);
 
     let xfrac1 = camera_state.pos[0] - li_pos[0] as f32;
@@ -132,6 +159,9 @@ pub fn derive_prelude(
         y_lookup,
         x_mip,
         max_scan_dist: max_scan_dist_clamped,
+        cx,
+        cy,
+        in_bounds_xy,
     }
 }
 

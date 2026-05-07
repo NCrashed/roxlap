@@ -89,7 +89,10 @@ fn outside_camera_renders_without_panic() {
     );
     drop(rasterizer);
 
-    assert_eq!(outcome, OpticastOutcome::OutsideCamera);
+    // S1.Z: outside-XY camera now goes through the standard
+    // inside-camera path with a signed-coords negative-index walk.
+    // Expect Rendered.
+    assert_eq!(outcome, OpticastOutcome::Rendered);
 
     let mut bytes = Vec::with_capacity(framebuffer.len() * 4);
     for &px in framebuffer.iter() {

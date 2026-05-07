@@ -251,6 +251,21 @@ pub(crate) struct GrouscanState<'a> {
     /// step path via `gixy[lane]`. `gline` seeds it before invoking
     /// `grouscan_run`; the fill-loop phases never touch it.
     pub ixy_sptr_col_idx: usize,
+    /// S1.Z: signed column coordinates carried alongside
+    /// [`Self::ixy_sptr_col_idx`] so the column-step path can
+    /// classify out-of-bounds reads independently of the wrapping
+    /// u32 linear index. For in-bounds camera, `(cx, cy)` track the
+    /// same column the linear index points at; for outside-XY camera
+    /// they go negative or `>= vsid` while the linear index wraps
+    /// to whatever u32 arithmetic yields. Advanced in
+    /// [`phase_after_delete_kept_presync`] by ±1 per axis based on
+    /// `lane` and `sign(gixy[lane])`.
+    pub cx: i32,
+    pub cy: i32,
+    /// `vsid as i32`, cached so the OOB check in the column-step
+    /// path doesn't re-cast every iteration. Mip transitions rescale
+    /// this — see [`phase_remiporend`].
+    pub vsid_signed: i32,
 
     /// Voxlap's `gmipcnt` — current mip level walked. Starts at 0;
     /// incremented inside `remiporend` each time the column step's
@@ -265,11 +280,14 @@ pub(crate) struct GrouscanState<'a> {
 impl<'a> GrouscanState<'a> {
     /// Build a fresh state from the cf[128] seed slot. Mirrors
     /// voxlap5.c:11601-11606.
+    #[allow(clippy::too_many_arguments)]
     fn from_seed(
         scratch: &'a mut ScanScratch,
         inputs: &GrouscanInputs<'a>,
         vptr_offset: usize,
         ixy_sptr_col_idx: usize,
+        cx: i32,
+        cy: i32,
         gmipnum: u32,
     ) -> Self {
         let c = scratch.cf[CF_SEED_INDEX];
@@ -304,6 +322,10 @@ impl<'a> GrouscanState<'a> {
             ce_idx: CF_SEED_INDEX,
             c_presync_idx: usize::MAX,
             ixy_sptr_col_idx,
+            cx,
+            cy,
+            #[allow(clippy::cast_possible_wrap)]
+            vsid_signed: inputs.vsid as i32,
             gmipcnt: 0,
             gmipnum,
         }
@@ -467,17 +489,27 @@ pub enum InitialDispatch {
 // The full grouscan body is sub-staged across R4.3c..f; this stub
 // returns the prologue snapshot so the prologue's behaviour is
 // unit-testable in isolation.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn grouscan_run(
     scratch: &mut ScanScratch,
     inputs: &GrouscanInputs<'_>,
     vptr_offset: usize,
     ixy_sptr_col_idx: usize,
+    cx: i32,
+    cy: i32,
     gxmip: i32,
     gmipnum: u32,
 ) -> GrouscanPrologue {
-    let mut state =
-        GrouscanState::from_seed(scratch, inputs, vptr_offset, ixy_sptr_col_idx, gmipnum);
+    let mut state = GrouscanState::from_seed(
+        scratch,
+        inputs,
+        vptr_offset,
+        ixy_sptr_col_idx,
+        cx,
+        cy,
+        gmipnum,
+    );
 
     // --- ngxmax = min(gxmax, gxmip) when multiple mips exist. ---
     state.ngxmax = state.scratch.gxmax;
@@ -889,7 +921,12 @@ fn phase_draw_ceil(state: &mut GrouscanState<'_>) -> Phase {
     // gy_raw = gylookoff[z0].
     let z0_idx = state.z0 as usize;
     if z0_idx >= state.gylookup.len() {
-        return Phase::PreDeleteZ;
+        // S1.Z: empty/OOB column path — column-step instead of
+        // popping the cf stack. Same rationale as drawflor's
+        // matching early-out: keeps the walk progressing through
+        // void columns until either an in-bounds column produces
+        // voxels or gxmax fires (Remiporend → Startsky).
+        return Phase::AfterDelete;
     }
     state.gy_raw = state.gylookup[z0_idx];
 
@@ -898,11 +935,18 @@ fn phase_draw_ceil(state: &mut GrouscanState<'_>) -> Phase {
     // this (drawceil isn't reachable at column-top — drawcwall
     // detects column-top first and routes to predrawflor).
     if state.vptr_offset < 4 {
-        return Phase::PreDeleteZ;
+        // S1.Z: see above. For OOB camera the dispatch chain
+        // drawflor (column-top) → AfterDelete → column-step →
+        // Skipixy3 → DrawFwall (empty) → DrawCwall (empty) →
+        // PreDrawCeil → DrawCeil routes here for any column-step
+        // landing on another OOB column. Sending it to AfterDelete
+        // (column-step again) keeps the cf seed alive so the walk
+        // can keep progressing.
+        return Phase::AfterDelete;
     }
     let vox_off = state.vptr_offset - 4;
     if vox_off + 4 > state.column.len() {
-        return Phase::PreDeleteZ;
+        return Phase::AfterDelete;
     }
     let vox = u32::from_le_bytes(
         state.column[vox_off..vox_off + 4]
@@ -977,7 +1021,14 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
     // gy_raw = gylookoff[z1].
     let z1_idx = state.z1 as usize;
     if z1_idx >= state.gylookup.len() {
-        return Phase::PreDeleteZ;
+        // S1.Z: route empty-column drawflor through AfterDelete so
+        // the walk column-steps WITHOUT popping the cf stack — the
+        // cf seed survives to drive subsequent columns until either
+        // an in-bounds column produces voxels or gxmax fires
+        // (Remiporend → Startsky). Pre-S1.Z this returned
+        // PreDeleteZ → DeleteZ → Done, leaving radar slots at
+        // default zero (= black) for OOB camera.
+        return Phase::AfterDelete;
     }
     state.gy_raw = state.gylookup[z1_idx];
 
@@ -986,7 +1037,10 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
     // == 0 → slab starts at column[0..4], floor voxel at column[4]).
     let vox_off = state.vptr_offset + 4;
     if vox_off + 4 > state.column.len() {
-        return Phase::PreDeleteZ;
+        // Same S1.Z fix as above — empty / too-short column means
+        // there's no voxel data to draw; column-step rather than
+        // popping the cf stack.
+        return Phase::AfterDelete;
     }
     let vox = u32::from_le_bytes(
         state.column[vox_off..vox_off + 4]
@@ -1117,15 +1171,38 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     let step = state.scratch.gixy[state.lane] as isize;
     state.ixy_sptr_col_idx = state.ixy_sptr_col_idx.wrapping_add_signed(step);
 
-    // Refresh state.column from the world buffers. If the new
-    // index is out of range or the offset points past the buffer,
-    // leave column unchanged — a malformed world shouldn't crash
-    // us; the fill loops have bounds checks of their own.
-    if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
-        let off = col_off as usize;
-        if off <= state.slab_buf.len() {
-            state.column = &state.slab_buf[off..];
+    // S1.Z: advance the signed (cx, cy) cursor in lockstep. The
+    // ixy_sptr_col_idx u32-wrap path silently aliases out-of-bounds
+    // indices to in-range columns when the camera sits past
+    // [0, vsid)²; (cx, cy) preserve the geometric truth.
+    //
+    // gixy[0] = ±1 (one x-column step) when lane=0; gixy[1] = ±vsid
+    // (one y-column step) when lane=1. The `signum` recovers the
+    // ±1 cx/cy increment.
+    if state.lane == 0 {
+        state.cx += state.scratch.gixy[0].signum();
+    } else {
+        state.cy += state.scratch.gixy[1].signum();
+    }
+
+    // Refresh state.column from the world buffers, gated on the
+    // signed-coords OOB check. For OOB columns, point `column` at
+    // an empty slice so `column_byte_at` reads return the `0`
+    // sentinel and the slab-walk phases short-circuit without
+    // drawing — i.e., OOB columns render as fully empty / sky.
+    let in_bounds = state.cx >= 0
+        && state.cy >= 0
+        && state.cx < state.vsid_signed
+        && state.cy < state.vsid_signed;
+    if in_bounds {
+        if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
+            let off = col_off as usize;
+            if off <= state.slab_buf.len() {
+                state.column = &state.slab_buf[off..];
+            }
         }
+    } else {
+        state.column = &[];
     }
     // Voxlap's `v = *ixy_sptr_col` resets v to the new column's
     // base — vptr_offset was relative to the OLD column's slab
@@ -1899,7 +1976,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         s.gxmax = 999_999;
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 50_000, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 0, 0, 50_000, 1);
         assert_eq!(p.z0, 5);
         assert_eq!(p.z1, 50);
         assert_eq!(p.cx0, 100);
@@ -1914,14 +1991,14 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 0, 0, 1, 1);
         assert_eq!(p.lane, 0);
 
         // Reverse: gpz[1] = 500 < gpz[0] = 800 → lane 1 wins.
         let mut s = fresh_scratch();
         s.gpz = [800, 500];
         s.gdz = [10, 20];
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 0, 0, 1, 1);
         assert_eq!(p.lane, 1);
     }
 
@@ -1931,7 +2008,7 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [1_000, 2_000];
         s.gdz = [256, 999];
-        let _ = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
+        let _ = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 0, 0, 1, 1);
         assert_eq!(s.gpz[0], 1_256);
         // Lane 1 is untouched.
         assert_eq!(s.gpz[1], 2_000);
@@ -1944,7 +2021,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         s.gxmax = 1_000_000;
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 50_000, 2);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 0, 0, 50_000, 2);
         assert_eq!(p.ngxmax, 50_000);
 
         // Single-mip case: ngxmax = gxmax regardless of gxmip.
@@ -1952,7 +2029,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         s.gxmax = 1_000_000;
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 50_000, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 0, 0, 50_000, 1);
         assert_eq!(p.ngxmax, 1_000_000);
     }
 
@@ -2028,7 +2105,7 @@ mod tests {
             vsid: 64,
             sky: None,
         };
-        GrouscanState::from_seed(scratch, &inputs, 0, 0, 1)
+        GrouscanState::from_seed(scratch, &inputs, 0, 0, 0, 0, 1)
     }
 
     fn state_for_drawcwall<'a>(
@@ -2048,7 +2125,7 @@ mod tests {
             vsid: 64,
             sky: None,
         };
-        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
+        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 0, 0, 1)
     }
 
     #[test]
@@ -2209,14 +2286,14 @@ mod tests {
             vsid: 64,
             sky: None,
         };
-        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 1)
+        GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 0, 0, 1)
     }
 
     #[test]
     fn predrawceil_swaps_ogx_and_gx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.ogx = 0x1111;
         state.gx = 0x2222;
         assert_eq!(phase_pre_draw_ceil(&mut state), Phase::DrawCeil);
@@ -2278,21 +2355,22 @@ mod tests {
 
     #[test]
     fn drawceil_bails_when_z0_out_of_gylookup() {
-        // z0 = 64, gylookup len = 64 → out-of-range, bail to PreDeleteZ.
+        // z0 = 64, gylookup len = 64 → out-of-range, bail to
+        // AfterDelete (S1.Z: column-step instead of cf-stack pop).
         let mut s = fresh_scratch();
         s.cf[CF_SEED_INDEX].z0 = 64;
         let column = vec![0u8; 8];
         let gylookup = [0i32; 64];
         let gcsub = [0i64; 9];
         let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 4);
-        assert_eq!(phase_draw_ceil(&mut state), Phase::PreDeleteZ);
+        assert_eq!(phase_draw_ceil(&mut state), Phase::AfterDelete);
     }
 
     #[test]
     fn predrawflor_swaps_ogx_and_gx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.ogx = 0x3333;
         state.gx = 0x4444;
         assert_eq!(phase_pre_draw_flor(&mut state), Phase::DrawFlor);
@@ -2352,20 +2430,22 @@ mod tests {
 
     #[test]
     fn drawflor_bails_when_z1_out_of_gylookup() {
+        // S1.Z: bail to AfterDelete (column-step) instead of
+        // PreDeleteZ (cf-stack pop).
         let mut s = fresh_scratch();
         s.cf[CF_SEED_INDEX].z1 = 64;
         let column = vec![0u8; 8];
         let gylookup = [0i32; 64];
         let gcsub = [0i64; 9];
         let mut state = state_for_drawceil(&mut s, &column, &gylookup, &gcsub, 0);
-        assert_eq!(phase_draw_flor(&mut state), Phase::PreDeleteZ);
+        assert_eq!(phase_draw_flor(&mut state), Phase::AfterDelete);
     }
 
     #[test]
     fn predeletez_swaps_ogx_and_gx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.ogx = 0xAAAA;
         state.gx = 0xBBBB;
         assert_eq!(phase_pre_delete_z(&mut state), Phase::DeleteZ);
@@ -2380,7 +2460,7 @@ mod tests {
         // ce_idx == CF_SEED_INDEX.
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         assert_eq!(state.ce_idx, CF_SEED_INDEX);
         assert_eq!(phase_delete_z(&mut state), Phase::Done);
     }
@@ -2391,7 +2471,7 @@ mod tests {
         // route to AfterDelete.
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.ce_idx = CF_SEED_INDEX + 2;
         state.c_idx = CF_SEED_INDEX + 2;
         assert_eq!(phase_delete_z(&mut state), Phase::AfterDelete);
@@ -2417,7 +2497,7 @@ mod tests {
             ..Default::default()
         };
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.ce_idx = CF_SEED_INDEX + 2;
         state.c_idx = CF_SEED_INDEX + 1;
         assert_eq!(phase_delete_z(&mut state), Phase::AfterDeleteKeptPresync);
@@ -2431,7 +2511,7 @@ mod tests {
     fn from_seed_initialises_cf_indices_to_seed() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         assert_eq!(state.c_idx, CF_SEED_INDEX);
         assert_eq!(state.ce_idx, CF_SEED_INDEX);
         assert_eq!(state.c_presync_idx, usize::MAX);
@@ -2441,7 +2521,7 @@ mod tests {
     fn afterdelete_sets_presync_and_routes_to_kept() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX + 1;
         state.c_presync_idx = usize::MAX;
         assert_eq!(
@@ -2457,7 +2537,7 @@ mod tests {
         // SkipixyWithPresync (intra-column case).
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX + 1;
         assert_eq!(
             phase_after_delete_kept_presync(&mut state),
@@ -2478,7 +2558,7 @@ mod tests {
         //   - c_presync_idx (= usize::MAX) != c_idx → SyncFromPresync
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX;
         assert_eq!(
             phase_after_delete_kept_presync(&mut state),
@@ -2519,7 +2599,7 @@ mod tests {
         };
         let mut s = fresh_scratch();
         s.gixy = [1, 4]; // x-step = 1, y-step = 4
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 5, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 5, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX; // → c-- below seed → column step
         state.lane = 0; // step by gixy[0] = 1
 
@@ -2558,7 +2638,7 @@ mod tests {
         // smaller gpz, so the *winning* lane is the one whose gpz
         // is also above ngxmax.
         s.gpz = [0x100, 0x200];
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.ngxmax = 0xFF;
         state.c_idx = CF_SEED_INDEX;
 
@@ -2575,7 +2655,7 @@ mod tests {
         // scenes always take.
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.gmipcnt = 0;
         assert_eq!(phase_remiporend(&mut state), Phase::Startsky);
     }
@@ -2592,7 +2672,7 @@ mod tests {
         // why the full body is gated on multi-mip column_offsets.
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 4);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 4);
         state.gmipcnt = 0;
         assert_eq!(phase_remiporend(&mut state), Phase::Startsky);
     }
@@ -2601,7 +2681,7 @@ mod tests {
     fn startsky_returns_done_when_stack_below_seed() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         // ce_idx below seed (defensive — unreachable in normal flow,
         // but voxlap explicitly guards `if (c > ce) goto retsub`).
         state.ce_idx = CF_SEED_INDEX - 1;
@@ -2617,7 +2697,7 @@ mod tests {
         s.cf[CF_SEED_INDEX].i0 = 10;
         s.cf[CF_SEED_INDEX].i1 = 13;
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         // Single entry at the seed slot.
         state.ce_idx = CF_SEED_INDEX;
 
@@ -2641,7 +2721,7 @@ mod tests {
         s.cf[CF_SEED_INDEX + 1].i0 = 5;
         s.cf[CF_SEED_INDEX + 1].i1 = 6;
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.ce_idx = CF_SEED_INDEX + 1;
 
         assert_eq!(phase_startsky(&mut state), Phase::Done);
@@ -2670,7 +2750,7 @@ mod tests {
             sky: None,
         };
         let mut s = fresh_scratch();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX;
         // c is reset to ce inside column step. If presync == ce
         // already, the post-reset c equals presync → Skipixy3.
@@ -2695,7 +2775,7 @@ mod tests {
             sky: None,
         };
         let mut s = fresh_scratch();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 32, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 32, 0, 0, 0, 1);
         state.c_idx = CF_SEED_INDEX;
         let _ = phase_after_delete_kept_presync(&mut state);
         assert_eq!(state.vptr_offset, 0);
@@ -2864,7 +2944,7 @@ mod tests {
     fn skipixy_with_presync_swaps_ogx_and_routes_to_sync() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         state.ogx = 0xAAAA;
         state.gx = 0xBBBB;
 
@@ -2898,7 +2978,7 @@ mod tests {
             cy1: 600,
         };
         let inputs = dummy_inputs();
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 1);
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
         // Working state = "A".
         state.z0 = 1;
         state.z1 = 2;
@@ -2939,7 +3019,7 @@ mod tests {
     fn from_seed_carries_ixy_sptr_col_idx() {
         let mut s = fresh_scratch();
         let inputs = dummy_inputs();
-        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 42, 1);
+        let state = GrouscanState::from_seed(&mut s, &inputs, 0, 42, 0, 0, 1);
         assert_eq!(state.ixy_sptr_col_idx, 42);
     }
 
@@ -2948,7 +3028,7 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 0, 0, 1, 1);
         assert_eq!(p.dispatch, InitialDispatch::DrawFlor);
     }
 
@@ -2958,7 +3038,7 @@ mod tests {
         s.gpz = [1_000, 2_000];
         s.gdz = [10, 20];
         // vptr_offset > 0 → camera in interior.
-        let p = grouscan_run(&mut s, &dummy_inputs(), 16, 0, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 16, 0, 0, 0, 1, 1);
         assert_eq!(p.dispatch, InitialDispatch::DrawCeil);
     }
 
@@ -2968,7 +3048,7 @@ mod tests {
         let mut s = fresh_scratch();
         s.gpz = [0x1234_5678, 0x7FFF_FFFF];
         s.gdz = [0, 0];
-        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 1, 1);
+        let p = grouscan_run(&mut s, &dummy_inputs(), 0, 0, 0, 0, 1, 1);
         assert_eq!(p.lane, 0);
         // 0x1234_0000 fits i32 positively (high bit clear).
         assert_eq!(p.ogx, 0x1234_0000_i32);
