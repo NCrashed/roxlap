@@ -75,6 +75,22 @@ const PLAYER_RADIUS: f64 = 0.3;
 /// in its parser tests — no extra disk I/O at startup.
 const ORACLE_VXL_GZ: &[u8] = include_bytes!("../../../assets/oracle.vxl.gz");
 
+/// S1.X: when `true`, replace the 2048-VSID oracle world with a
+/// small hand-built test scene — a flat ground plane with a
+/// starting platform and a handful of colour-coded primitives
+/// (cube, sphere, tower). No walls, no roof — flyable from
+/// outside in any direction for the scene-engine work
+/// (Substage S in PORTING-SCENE.md). Default `false` keeps the
+/// existing oracle demo bit-stable; flip to `true` to probe
+/// outside-camera rendering.
+const USE_SMALL_TEST_SCENE: bool = true;
+
+/// Edge dimension of the test scene. Wider than the used z
+/// extent (~64 vox) so the world is visibly flat — a useful
+/// probe for outside-camera flying both vertically (up through
+/// the open top) and horizontally (off the XY edge).
+const SMALL_VSID: u32 = 256;
+
 /// Embedded coco kv6 sprite (Voxlap's iconic logo). Demoes the
 /// rotated `drawboundcubesse` path: the host spins the basis about
 /// the world z-axis once per ~12 seconds.
@@ -848,12 +864,213 @@ fn load_oracle_vxl() -> vxl::Vxl {
     vxl::parse(&bytes).expect("parse oracle.vxl")
 }
 
+/// S1.X: hand-built flyable test scene.
+///
+/// Layout (voxlap z-down: z=0 is up, z=255 is down):
+/// - Flat ground plane at z = `GROUND_Z`..`MAXZDIM`. Solid.
+/// - Starting platform at world centre, raised 8 voxels above
+///   ground, 16×16 voxel footprint, light grey.
+/// - Red cube 24³ east of platform.
+/// - Blue sphere radius 12 west of platform.
+/// - Yellow tower 8×8×64 north of platform.
+/// - Everything else is air. No walls, no roof.
+///
+/// Camera spawns 1 voxel above the platform centre, looking +x
+/// (toward the red cube). Fly any direction to leave the world
+/// boundary and see the scene from outside.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn build_small_test_scene() -> vxl::Vxl {
+    use roxlap_cavegen::{pack_dense_grid_to_vxl, MAXZDIM};
+
+    /// Top of the ground plane. Anything at z ≥ this is solid
+    /// ground; anything above is air.
+    const GROUND_Z: usize = 200;
+
+    let vsid = SMALL_VSID;
+    let vsid_u = vsid as usize;
+    let max_z = MAXZDIM as usize;
+    let total = vsid_u * vsid_u * max_z;
+
+    let mut grid = vec![0u8; total];
+    let mut color = vec![0u32; total];
+
+    // (y, x, z) order per pack_dense_grid_to_vxl's contract.
+    let idx = |x: usize, y: usize, z: usize| -> usize { (y * vsid_u + x) * max_z + z };
+
+    // Voxlap colour packing: (brightness << 24) | (R << 16) | (G << 8) | B.
+    // 0x80 brightness = engine-default "neutral" lighting amplitude.
+    const GROUND_COL: u32 = 0x80_3a_8a_3a; // mossy green
+    const PLATFORM_COL: u32 = 0x80_b0_b0_b8; // light grey
+    const CUBE_COL: u32 = 0x80_e0_30_30; // red
+    const SPHERE_COL: u32 = 0x80_30_60_e0; // blue
+    const TOWER_COL: u32 = 0x80_e0_d0_30; // yellow
+
+    // 1. Flat ground plane covering the whole XY footprint.
+    for y in 0..vsid_u {
+        for x in 0..vsid_u {
+            for z in GROUND_Z..max_z {
+                let i = idx(x, y, z);
+                grid[i] = 1;
+                color[i] = GROUND_COL;
+            }
+        }
+    }
+
+    // 2. Starting platform: 16×16 footprint at world centre,
+    //    raised 8 voxels above ground (so platform top is at
+    //    z = GROUND_Z - 8).
+    let cx = vsid_u / 2;
+    let cy = vsid_u / 2;
+    const PLATFORM_HALF: usize = 8;
+    const PLATFORM_HEIGHT: usize = 8;
+    let plat_top_z = GROUND_Z - PLATFORM_HEIGHT;
+    for y in (cy - PLATFORM_HALF)..(cy + PLATFORM_HALF) {
+        for x in (cx - PLATFORM_HALF)..(cx + PLATFORM_HALF) {
+            for z in plat_top_z..GROUND_Z {
+                let i = idx(x, y, z);
+                grid[i] = 1;
+                color[i] = PLATFORM_COL;
+            }
+        }
+    }
+
+    // 3. Red cube 24³, 32 voxels east of platform centre, sitting
+    //    on the ground.
+    fill_box(
+        &mut grid,
+        &mut color,
+        vsid_u,
+        max_z,
+        cx + 32,
+        cy - 12,
+        GROUND_Z - 24,
+        24,
+        24,
+        24,
+        CUBE_COL,
+    );
+
+    // 4. Blue sphere radius 12, 32 voxels west of platform centre,
+    //    centred 12 voxels above ground.
+    fill_sphere(
+        &mut grid,
+        &mut color,
+        vsid_u,
+        max_z,
+        (cx as i32 - 32, cy as i32, GROUND_Z as i32 - 12),
+        12,
+        SPHERE_COL,
+    );
+
+    // 5. Yellow tower 8×8 footprint, 64 voxels tall, 32 voxels
+    //    north of platform.
+    fill_box(
+        &mut grid,
+        &mut color,
+        vsid_u,
+        max_z,
+        cx - 4,
+        cy + 32,
+        GROUND_Z - 64,
+        8,
+        8,
+        64,
+        TOWER_COL,
+    );
+
+    let mut vxl = pack_dense_grid_to_vxl(&grid, &color, vsid);
+    // Spawn 2 voxels above the platform top, looking +x toward
+    // the red cube.
+    vxl.ipo = [cx as f64, cy as f64, (plat_top_z - 2) as f64];
+    vxl.ist = [0.0, 1.0, 0.0]; // right (+y)
+    vxl.ihe = [0.0, 0.0, 1.0]; // down (+z, voxlap z-down)
+    vxl.ifo = [1.0, 0.0, 0.0]; // forward (+x)
+    vxl
+}
+
+/// Fill an axis-aligned box `[ox, ox+sx) × [oy, oy+sy) × [oz, oz+sz)`
+/// in the dense grid, clamping at world bounds. Helper for
+/// [`build_small_test_scene`].
+#[allow(clippy::too_many_arguments)]
+fn fill_box(
+    grid: &mut [u8],
+    color: &mut [u32],
+    vsid_u: usize,
+    max_z: usize,
+    ox: usize,
+    oy: usize,
+    oz: usize,
+    sx: usize,
+    sy: usize,
+    sz: usize,
+    col: u32,
+) {
+    let xe = (ox + sx).min(vsid_u);
+    let ye = (oy + sy).min(vsid_u);
+    let ze = (oz + sz).min(max_z);
+    for y in oy..ye {
+        for x in ox..xe {
+            for z in oz..ze {
+                let i = (y * vsid_u + x) * max_z + z;
+                grid[i] = 1;
+                color[i] = col;
+            }
+        }
+    }
+}
+
+/// Fill a sphere centred at `(cx, cy, cz)` with radius `r` voxels
+/// in the dense grid, clamping at world bounds.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+fn fill_sphere(
+    grid: &mut [u8],
+    color: &mut [u32],
+    vsid_u: usize,
+    max_z: usize,
+    centre: (i32, i32, i32),
+    r: i32,
+    col: u32,
+) {
+    let (cx, cy, cz) = centre;
+    let r2 = r * r;
+    for dz in -r..=r {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy + dz * dz > r2 {
+                    continue;
+                }
+                let x = cx + dx;
+                let y = cy + dy;
+                let z = cz + dz;
+                if x < 0 || y < 0 || z < 0 {
+                    continue;
+                }
+                let (xu, yu, zu) = (x as usize, y as usize, z as usize);
+                if xu >= vsid_u || yu >= vsid_u || zu >= max_z {
+                    continue;
+                }
+                let i = (yu * vsid_u + xu) * max_z + zu;
+                grid[i] = 1;
+                color[i] = col;
+            }
+        }
+    }
+}
+
 /// Test whether any voxel intersected by a ±[`PLAYER_RADIUS`] cube
-/// around `pos` is solid (or out-of-world). Out-of-bounds in any
-/// axis counts as solid so the camera can't fly off the world
-/// edge. Cheap: at `PLAYER_RADIUS = 0.3` the cube spans at most 1
-/// voxel per axis (typically), so this fans out to 1-8
-/// [`getcube`] calls. Mirror of `roxlap-cave-demo::is_blocked`.
+/// around `pos` is solid. Cheap: at `PLAYER_RADIUS = 0.3` the cube
+/// spans at most 1 voxel per axis (typically), so this fans out to
+/// 1-8 [`getcube`] calls. Mirror of `roxlap-cave-demo::is_blocked`.
+///
+/// S1.X: out-of-world positions count as AIR (not solid) so the
+/// camera can fly past the world's XY/Z bounds. The original
+/// behaviour (out-of-world == solid) was to keep the camera
+/// inside-grid for voxlap C parity; the scene-engine work needs
+/// outside-camera as a first-class flight regime.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -871,7 +1088,8 @@ fn is_blocked(vxl: &vxl::Vxl, pos: [f64; 3]) -> bool {
         for vy in lo_y..=hi_y {
             for vx in lo_x..=hi_x {
                 if vx < 0 || vy < 0 || vz < 0 || vx >= vsid || vy >= vsid || vz >= MAXZDIM {
-                    return true;
+                    // Out-of-world is air — camera can fly outside.
+                    continue;
                 }
                 if !matches!(
                     getcube(&vxl.data, &vxl.column_offset, vxl.vsid, vx, vy, vz),
@@ -890,7 +1108,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let vxl_world = load_oracle_vxl();
+    let vxl_world = if USE_SMALL_TEST_SCENE {
+        build_small_test_scene()
+    } else {
+        load_oracle_vxl()
+    };
+    eprintln!(
+        "loaded world: vsid={}, ipo=({:.1}, {:.1}, {:.1})",
+        vxl_world.vsid, vxl_world.ipo[0], vxl_world.ipo[1], vxl_world.ipo[2],
+    );
     let initial_pool = ScratchPool::new(WIDTH, HEIGHT, vxl_world.vsid);
     let cam_pos = vxl_world.ipo;
 
