@@ -205,12 +205,17 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     // S1.Z: outside-XY camera path. When the camera sits past
     // [0, vsid)² in X or Y, `prelude.column_index` is wrapped junk
     // (`li_pos.y * vsid + li_pos.x` with `as u32` cast aliases
-    // negative values to large in-range integers). Skip the
-    // per-frame `camera_column_slice + camera_column_air_gap` walk
-    // and synthesise a full-air-gap ScanContext — the column-walk
-    // DDA will then traverse OOB columns as empty until it crosses
-    // into the world (handled per-step in grouscan.rs's
-    // `phase_after_delete_kept_presync`).
+    // negative values to large in-range integers). For the cf-seed
+    // bounds, query the air gap of a REPRESENTATIVE in-bounds
+    // column (nearest to the camera, clamped into [0, vsid)²) at
+    // the camera's z. drawflor dispatches on cf.z1 (= the floor's
+    // top z); a constant `(0, 255)` synthesis would project the
+    // floor at the wrong screen row and the below-floor pixels
+    // would never get sky-filled by Startsky.
+    //
+    // The column-walk DDA still traverses OOB columns as empty
+    // until (cx, cy) cross into the world — handled per-step in
+    // grouscan.rs's `phase_after_delete_kept_presync`.
     //
     // For inside-XY camera, the original gstartv walk runs as
     // before; the negative-index path is a no-op.
@@ -226,19 +231,18 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         };
         triple
     } else {
-        // Camera sits in the void outside the column grid. There is
-        // no camera column; synthesise the "full air gap" answer
-        // (z0 = 0, z1 = MAXZDIM, vptr_offset = 0) so the per-frame
-        // setup proceeds. Per-scanline cf-seed semantics are
-        // unchanged because gline reads gstartz0/z1 only as the
-        // initial cf z bounds — nothing's solid above the void
-        // camera so the full-z-range answer is geometrically
-        // correct.
-        // z bounds match what camera_column_air_gap returns for
-        // "camera above all slabs" of a typical column: (0,
-        // first_z1, 0). 255 is voxlap's MAXZDIM - 1 — the "below
-        // any solid" sentinel.
-        (0, 255, 0)
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+        let cx_clamped = prelude.cx.clamp(0, vsid as i32 - 1) as u32;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+        let cy_clamped = prelude.cy.clamp(0, vsid as i32 - 1) as u32;
+        let representative_idx = cy_clamped * vsid + cx_clamped;
+        camera_column_slice(slab_buf, column_offsets, representative_idx)
+            .and_then(|c| column_walk::camera_column_air_gap(c, prelude.li_pos[2]))
+            // Conservative fallback: full-air column. Hits if the
+            // representative column has no slab above the camera's
+            // z (e.g., camera is below world's bedrock or the
+            // column is malformed).
+            .unwrap_or((0, 255, 0))
     };
 
     // Per-frame setup hook needs a `ScanContext` with cy / camera

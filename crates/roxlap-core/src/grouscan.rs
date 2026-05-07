@@ -1905,10 +1905,19 @@ fn phase_startsky_textured(state: &mut GrouscanState<'_>) -> Phase {
             }
 
             let pixel_idx = row_pixel_base + sky_edi as usize;
+            // S1.Z: out-of-range texel falls back to skycast.col
+            // (the solid sky color), not 0 (which renders BLACK).
+            // For inside camera the OOB lookup almost never fires;
+            // for outside camera with steep angles + OOB walks the
+            // sky_edi search can land past the panorama's pixel
+            // buffer, and the previous `else { 0 }` fallback drew
+            // a hard-edged black pentagon under the world (visible
+            // when flying just outside the world's XY footprint and
+            // looking back through the floor).
             let col = if pixel_idx < sky.pixels.len() {
                 sky.pixels[pixel_idx]
             } else {
-                0
+                state.scratch.skycast.col
             };
             if let Some(slot) = state.scratch.radar.get_mut(p as usize) {
                 slot.col = col;
