@@ -37,14 +37,12 @@
 use std::marker::PhantomData;
 
 use crate::camera_math::CameraState;
-use crate::column_walk;
 use crate::fixed::ftol;
 use crate::gline::derive_gline_frustum;
 use crate::grouscan::{grouscan_run, CfType, GrouscanInputs, CF_SEED_INDEX};
 use crate::opticast::camera_column_slice;
 use crate::opticast_prelude::{OpticastPrelude, PREC};
 use crate::rasterizer::{Rasterizer, ScanScratch};
-use crate::ray_aabb::clip_ray_to_xy_aabb;
 use crate::ray_step::RayStep;
 use crate::scan_loops::ScanContext;
 
@@ -285,82 +283,6 @@ struct FrameCache {
     vptr_offset: usize,
 }
 
-/// S1.3: per-scanline override of the camera-position-specific
-/// state that [`ScalarRasterizer::gline`] would otherwise read from
-/// [`FrameCache`]. The outside-camera dispatch in
-/// [`crate::opticast::opticast_outside`] sets one of these before
-/// each `gline` call, with the AABB-entry-point's column / fractional
-/// XY / air-gap z-bounds in place of the camera's. When `None` (the
-/// default for inside-camera frames), `gline` reads directly from
-/// the frame cache and behaviour is bit-exact with pre-S1.3.
-///
-/// Set at the [`ScalarRasterizer`] level rather than the
-/// [`Rasterizer`] trait so stub / test rasterizers don't need to
-/// know about outside mode — opticast_outside threads through the
-/// concrete-typed setter explicitly.
-#[derive(Clone, Copy, Debug)]
-pub struct OutsideRayContext {
-    /// Override for `prelude.li_pos[0..2]` — the entry column's
-    /// signed integer XY. Used to compute the j0/j1 lanes in the
-    /// gxmax frustum-edge clip.
-    pub li_pos_xy: [i32; 2],
-    /// Override for `prelude.column_index` — `li_pos_y * vsid +
-    /// li_pos_x` at the entry column.
-    pub column_index: u32,
-    /// Override for `prelude.pos_xfrac` — fractional X at the AABB-
-    /// entry point, packed as `[1 - frac, frac]`. Goes through
-    /// [`crate::gline::derive_gline_frustum`] for the per-scanline
-    /// `gpz[0]` lane.
-    pub pos_xfrac: [f32; 2],
-    /// Override for `prelude.pos_yfrac` — same shape as `pos_xfrac`
-    /// for the y axis.
-    pub pos_yfrac: [f32; 2],
-    /// Override for `cache.gstartz0` — air-gap top z at the entry
-    /// column for the entry-point z. Seeds `cf[CF_SEED_INDEX].z0`.
-    pub gstartz0: i32,
-    /// Override for `cache.gstartz1` — air-gap bottom z. Seeds
-    /// `cf[CF_SEED_INDEX].z1`.
-    pub gstartz1: i32,
-    /// Override for `cache.vptr_offset` — byte offset within the
-    /// entry column to the slab whose top bounds the air gap from
-    /// below. Passed to `grouscan_run`.
-    pub vptr_offset: usize,
-    /// S1.Y: ray-parameter at which this scanline's `(x1, y1)` ray
-    /// enters the world AABB, in voxlap's `s` units (where `s=1` is
-    /// the screen-pixel endpoint).
-    ///
-    /// Used only by the cf-seed shift in
-    /// [`ScalarRasterizer::gline`]: the per-pixel `plc` cursor must
-    /// advance through Q12.20 coordinates relative to the entry
-    /// point (where the column walk starts), not the camera. The
-    /// column walk itself (`gixy / gpz / gdz`) stays camera-
-    /// relative — those are direction-only and shift-invariant.
-    ///
-    /// Inside camera leaves this 0.0 (no shift). The shift formula
-    /// for vd-units is:
-    ///
-    /// ```text
-    /// vd0_shifted = vd0 - t_enter * vd1
-    /// vd1_shifted = (1 - t_enter) * vd1
-    /// vz0_shifted = vz0 - t_enter * vz1
-    /// vz1_shifted = (1 - t_enter) * vz1
-    /// ```
-    ///
-    /// Derivation: entry sits at `t_enter * v1` along the
-    /// `(x1, y1)` ray from camera, so `v0_entry_rel = v0_cam_rel -
-    /// t_enter * v1` and `v1_entry_rel = (1 - t_enter) * v1`.
-    /// Projecting onto the dominant ground-plane axis with `f1` /
-    /// `f2` collapses `t_enter * vx1 * f1` to `t_enter * vd1`.
-    pub t_enter: f32,
-    /// Scanline whose ray misses the world AABB entirely (no entry
-    /// point exists). gline takes the sky-fill path: cf seed gets
-    /// safe placeholder values, gxmax = 0, skycast.dist = i32::MAX,
-    /// grouscan_run's startsky phase fills every radar slot in the
-    /// scanline's range with the engine's sky color. The other
-    /// override fields are ignored when this is true.
-    pub force_miss: bool,
-}
-
 /// Scalar rasterizer that writes pixels and a z-buffer entry per
 /// screen position.
 ///
@@ -418,23 +340,6 @@ pub struct ScalarRasterizer<'a> {
     /// Per-frame state cache. `None` until the first `frame_setup`
     /// call; gline panics if invoked before that.
     frame: Option<FrameCache>,
-    /// S1.3: per-scanline override for the camera-position-specific
-    /// fields in [`FrameCache`]. `None` (the default) means `gline`
-    /// reads from the cache as voxlap C does — the inside-camera
-    /// path. `Some(_)` swaps in the entry-point context.
-    ///
-    /// When [`Self::outside_camera_active`] is `true` AND this is
-    /// `None`, `gline` auto-computes a fresh per-scanline override
-    /// inline by clipping each scanline's ray against the world AABB.
-    /// Setting this manually overrides the auto-computation (used by
-    /// tests / advanced callers).
-    outside_ray_context: Option<OutsideRayContext>,
-    /// S1.3: when `true`, `gline` clips each scanline's ray against
-    /// the world XY AABB `[0, vsid] × [0, vsid]` and builds an
-    /// [`OutsideRayContext`] inline. `opticast_outside` sets this
-    /// for the duration of the outside-camera frame and clears it
-    /// at exit.
-    outside_camera_active: bool,
 }
 
 // R12.2.1 / R12.3.1: opticast's parallel branches fan the rasterizer
@@ -485,8 +390,6 @@ impl<'a> ScalarRasterizer<'a> {
             vsid,
             sky: None,
             frame: None,
-            outside_ray_context: None,
-            outside_camera_active: false,
         }
     }
 
@@ -499,121 +402,9 @@ impl<'a> ScalarRasterizer<'a> {
         self.sky = Some(sky);
         self
     }
-
-    /// S1.3: install or clear the per-scanline outside-camera
-    /// override. `Some(_)` swaps the entry-point context into the
-    /// next `gline` call's frame-cache reads; `None` (the default)
-    /// reverts to the camera-inside-grid path. Useful for tests
-    /// and advanced callers; the outside_orbit pose path uses
-    /// [`Self::set_outside_camera_active`] instead.
-    pub fn set_outside_ray_context(&mut self, ctx: Option<OutsideRayContext>) {
-        self.outside_ray_context = ctx;
-    }
-
-    /// S1.3: per-scanline AABB-clip helper. For the scanline whose
-    /// far-end is screen pixel `(x1, y1)`, project the world-space
-    /// ray from the camera through that pixel, clip it against the
-    /// world XY AABB `[0, vsid]²`, and build an
-    /// [`OutsideRayContext`] anchored at the AABB-entry point.
-    ///
-    /// Miss → `OutsideRayContext { force_miss: true, .. }`. Hit
-    /// where the entry column is in solid voxels → also `force_miss`
-    /// for now (S1 first-cut; wall rendering is out-of-scope).
-    /// Hit with valid air gap at entry → full hit context.
-    ///
-    /// Per-scanline cost: one AABB clip (~10 f32 ops), one column
-    /// air-gap walk (slab list traversal — typically a few bytes).
-    /// Cheap enough to run per scanline.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn compute_outside_ray_context_for_scanline(
-        cs: &CameraState,
-        vsid: u32,
-        slab_buf: &[u8],
-        column_offsets: &[u32],
-        x1: f32,
-        y1: f32,
-    ) -> OutsideRayContext {
-        // Voxlap's per-scanline ray endpoint in world-relative coords:
-        // (x1, y1) on screen projects to a 3D direction via the
-        // camera basis. Same formula `derive_gline_frustum` uses for
-        // (vx1, vy1, vz1).
-        let dir = [
-            x1 * cs.right[0] + y1 * cs.down[0] + cs.corn[0][0],
-            x1 * cs.right[1] + y1 * cs.down[1] + cs.corn[0][1],
-            x1 * cs.right[2] + y1 * cs.down[2] + cs.corn[0][2],
-        ];
-        let cam_xy = [cs.pos[0], cs.pos[1]];
-        let dir_xy = [dir[0], dir[1]];
-        let aabb_max = [vsid as f32, vsid as f32];
-
-        let miss = OutsideRayContext {
-            li_pos_xy: [0, 0],
-            column_index: 0,
-            pos_xfrac: [1.0, 0.0],
-            pos_yfrac: [1.0, 0.0],
-            gstartz0: 0,
-            gstartz1: 0,
-            vptr_offset: 0,
-            t_enter: 0.0,
-            force_miss: true,
-        };
-
-        let Some((t_enter, _t_exit)) = clip_ray_to_xy_aabb(cam_xy, dir_xy, [0.0, 0.0], aabb_max)
-        else {
-            return miss;
-        };
-        // Negative t_enter means camera is already inside the XY
-        // footprint — that's an inside-camera situation that
-        // shouldn't reach this path; treat as miss to be safe.
-        if t_enter < 0.0 {
-            return miss;
-        }
-
-        // Entry point in world coords, nudged inward by a tiny
-        // epsilon along each axis to keep the floor / column-index
-        // from sliding to vsid (out-of-bounds) at exactly-on-face
-        // entries (e.g. yaw=π hitting x=vsid).
-        const EPS: f32 = 1e-4;
-        let entry_x = cs.pos[0] + t_enter * dir[0] + EPS * dir[0].signum();
-        let entry_y = cs.pos[1] + t_enter * dir[1] + EPS * dir[1].signum();
-        let entry_z = cs.pos[2] + t_enter * dir[2];
-
-        let li_x = (entry_x.floor() as i32).clamp(0, vsid as i32 - 1);
-        let li_y = (entry_y.floor() as i32).clamp(0, vsid as i32 - 1);
-        let column_index = (li_y as u32) * vsid + (li_x as u32);
-        let xfrac1 = entry_x - li_x as f32;
-        let yfrac1 = entry_y - li_y as f32;
-
-        // Air-gap walk at the entry column for the entry-z. None if
-        // the entry point lies inside solid voxels — first-cut
-        // behaviour is to treat as miss (no wall rendering yet).
-        let column = camera_column_slice(slab_buf, column_offsets, column_index).unwrap_or(&[]);
-        let entry_z_int = entry_z.floor() as i32;
-        let Some((gstartz0, gstartz1, vptr_offset)) =
-            column_walk::camera_column_air_gap(column, entry_z_int)
-        else {
-            return miss;
-        };
-
-        OutsideRayContext {
-            li_pos_xy: [li_x, li_y],
-            column_index,
-            pos_xfrac: [1.0 - xfrac1, xfrac1],
-            pos_yfrac: [1.0 - yfrac1, yfrac1],
-            gstartz0,
-            gstartz1,
-            vptr_offset,
-            t_enter,
-            force_miss: false,
-        }
-    }
 }
 
 impl Rasterizer for ScalarRasterizer<'_> {
-    fn set_outside_camera_active(&mut self, active: bool) {
-        self.outside_camera_active = active;
-    }
-
     fn frame_setup(&mut self, ctx: &ScanContext<'_>) {
         // Cache everything per-frame so gline doesn't re-borrow on
         // every call. Prelude is cloned (one Vec<i32> alloc per
@@ -649,65 +440,19 @@ impl Rasterizer for ScalarRasterizer<'_> {
 
         // S1.3: resolve the camera-position-specific state once at
         // the top so the rest of `gline` reads from locals. With no
-        // outside-mode state set (the default for inside-camera
-        // frames) every value falls through to the cache and the
-        // function is bit-exact with the pre-S1.3 body. Outside
-        // mode supplies AABB-entry-point values per scanline:
-        // 1. Manual `set_outside_ray_context` wins if present.
-        // 2. Otherwise, if `outside_camera_active` is on, auto-clip
-        //    this scanline's ray against the world AABB.
-        // 3. Otherwise, None → inside path.
-        let or_ctx: Option<OutsideRayContext> = self.outside_ray_context.or_else(|| {
-            if self.outside_camera_active {
-                Some(Self::compute_outside_ray_context_for_scanline(
-                    &cache.camera_state,
-                    self.vsid,
-                    self.slab_buf,
-                    self.column_offsets,
-                    x1,
-                    y1,
-                ))
-            } else {
-                None
-            }
-        });
-
-        // Outside-mode miss: the scanline's ray doesn't enter the
-        // world AABB (or enters in solid voxels). Fill the radar
-        // range with skycast directly so hrend / vrend produces
-        // sky-colored pixels at z = far. No grouscan walk needed —
-        // there's nothing to walk.
-        //
-        // S1.Y: also reset `sky_off` to 0 so the NEXT scanline's
-        // `phase_startsky` dispatch (in grouscan) sees the textured-
-        // sky-disabled state for THIS scanline's drained slots.
-        // Without this reset, sky_off retained its stale value
-        // from the last non-miss scanline; subsequent grouscan calls
-        // routed through `phase_startsky_textured`, sampled
-        // sky.png at stale longitudes, and overwrote sky slots
-        // with the "fan blade" sky-texture artifact the user
-        // observed in missing quadrants.
-        if or_ctx.is_some_and(|c| c.force_miss) {
-            scratch.skycast.dist = i32::MAX;
-            scratch.sky_off = 0;
-            let start = scratch.gscanptr;
-            let end = (start + length as usize).min(scratch.radar.len());
-            let sk = scratch.skycast;
-            for slot in &mut scratch.radar[start..end] {
-                *slot = sk;
-            }
-            return;
-        }
-
-        let pos_xfrac = or_ctx.map_or(cache.prelude.pos_xfrac, |o| o.pos_xfrac);
-        let pos_yfrac = or_ctx.map_or(cache.prelude.pos_yfrac, |o| o.pos_yfrac);
-        let li_pos_xy = or_ctx.map_or([cache.prelude.li_pos[0], cache.prelude.li_pos[1]], |o| {
-            o.li_pos_xy
-        });
-        let column_index = or_ctx.map_or(cache.prelude.column_index, |o| o.column_index);
-        let gstartz0 = or_ctx.map_or(cache.gstartz0, |o| o.gstartz0);
-        let gstartz1 = or_ctx.map_or(cache.gstartz1, |o| o.gstartz1);
-        let vptr_offset = or_ctx.map_or(cache.vptr_offset, |o| o.vptr_offset);
+        // S1.Z: with the negative-index walk, `gline` reads
+        // camera-position-specific state directly from the cache —
+        // no per-scanline override needed. OOB cameras flow through
+        // the same path; their (cx, cy) signed coords carry into
+        // grouscan via the prelude and the column-step path skips
+        // OOB columns as empty.
+        let pos_xfrac = cache.prelude.pos_xfrac;
+        let pos_yfrac = cache.prelude.pos_yfrac;
+        let li_pos_xy = [cache.prelude.li_pos[0], cache.prelude.li_pos[1]];
+        let column_index = cache.prelude.column_index;
+        let gstartz0 = cache.gstartz0;
+        let gstartz1 = cache.gstartz1;
+        let vptr_offset = cache.vptr_offset;
 
         // 1. Project per-ray frustum (vd0/vd1/vz0/vx1/vy1/vz1 +
         //    gixy/gpz/gdz). voxlap5.c:1153-1175.
@@ -750,29 +495,19 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // the i32 boundary for world-coord magnitudes near VSID
         // (= 2048) × PREC (= 2²⁰); Rust's `as i32` saturates and
         // diverges for those edge cases.
-        // S1.Y: shift vd0/vd1/vz0/vz1 to entry-relative coordinates
-        // for the cf-seed ONLY. gixy/gpz/gdz/dominant-axis selection
-        // (already in `f`) stay camera-relative — those are
-        // direction-only and shift-invariant. Inside camera passes
-        // t_enter = 0 → no shift, byte-exact with pre-S1.Y.
-        let t_enter_shift = or_ctx.map_or(0.0_f32, |o| o.t_enter);
-        let vd0 = f.vd0 - t_enter_shift * f.vd1;
-        let vd1 = (1.0 - t_enter_shift) * f.vd1;
-        let vz0 = f.vz0 - t_enter_shift * f.vz1;
-        let vz1 = (1.0 - t_enter_shift) * f.vz1;
         let (gi0, gi1, cx0, cy0) = if cache.prelude.forward_z_sign < 0 {
             (
-                ftol((vd1 - vd0) * cmprecip),
-                ftol((vz1 - vz0) * cmprecip),
-                ftol(vd0 * cmpprec),
-                ftol(vz0 * cmpprec),
+                ftol((f.vd1 - f.vd0) * cmprecip),
+                ftol((f.vz1 - f.vz0) * cmprecip),
+                ftol(f.vd0 * cmpprec),
+                ftol(f.vz0 * cmpprec),
             )
         } else {
             (
-                ftol((vd0 - vd1) * cmprecip),
-                ftol((vz0 - vz1) * cmprecip),
-                ftol(vd1 * cmpprec),
-                ftol(vz1 * cmpprec),
+                ftol((f.vd0 - f.vd1) * cmprecip),
+                ftol((f.vz0 - f.vz1) * cmprecip),
+                ftol(f.vd1 * cmpprec),
+                ftol(f.vz1 * cmpprec),
             )
         };
         let cx1 = leng.wrapping_mul(gi0).wrapping_add(cx0);

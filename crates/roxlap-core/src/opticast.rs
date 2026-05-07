@@ -109,38 +109,14 @@ impl OpticastSettings {
 pub enum OpticastOutcome {
     /// All four quadrants dispatched (some or all may have early-
     /// outed on their own geometry guards — that is normal).
+    /// Outside-XY cameras (S1.Z negative-index walk) also report
+    /// `Rendered` since they go through the same scan path with
+    /// signed `(cx, cy)` carrying the OOB signal into grouscan.
     Rendered,
     /// Camera position lies in solid voxel material. Voxlap returns
     /// from `opticast` early in this case (no render, screen retains
     /// previous contents — the host can pre-fill with sky).
     SkippedCameraInSolid,
-    /// S1.2: camera position lies outside the column grid in X or Y.
-    /// Voxlap C cannot render this case (the per-frame
-    /// `camera_column_air_gap` walk has no valid camera column);
-    /// roxlap routes through [`opticast_outside`] which clips each
-    /// ray against the world AABB and starts gline at the entry
-    /// face. S1.2 wires the dispatch but the body is still a stub —
-    /// S1.3 fills in the per-ray walk.
-    OutsideCamera,
-}
-
-/// S1.2: is the camera's integer position outside the column grid's
-/// XY footprint? `li_pos` comes from
-/// [`opticast_prelude::OpticastPrelude::li_pos`] — voxlap floors the
-/// f32 camera pos to i32 to derive `column_index`, and that index
-/// silently wraps when either component is `>= vsid` or `< 0`. This
-/// helper is the precondition the dispatch fork in [`opticast`]
-/// checks.
-///
-/// Z is intentionally not checked: voxlap's existing sky-walk-down
-/// already handles "camera above the world top," and "camera below
-/// `z = 0`" is not in S1's scope.
-#[must_use]
-#[inline]
-fn camera_outside_xy(li_pos: &[i32; 3], vsid: u32) -> bool {
-    #[allow(clippy::cast_possible_wrap)]
-    let vsid_signed = vsid as i32;
-    li_pos[0] < 0 || li_pos[1] < 0 || li_pos[0] >= vsid_signed || li_pos[1] >= vsid_signed
 }
 
 /// Drive one frame of opticast. The caller supplies:
@@ -430,88 +406,6 @@ fn run_strip_parallel<R: Rasterizer + Clone + Send + Sync>(
         .par_iter_mut()
         .enumerate()
         .for_each(strip_body);
-}
-
-/// S1.3: outside-camera render entry point. Voxlap C bails before
-/// reaching the per-frame projection setup when the camera is
-/// outside the column grid; roxlap reroutes here instead.
-///
-/// Strategy: install
-/// [`Rasterizer::set_outside_camera_active`]`(true)` on the
-/// rasterizer, run the standard four-quadrant scan loops, then
-/// clear the flag. While active, [`Rasterizer::gline`] auto-clips
-/// each scanline's ray against the world XY AABB and synthesises
-/// the per-scanline `OutsideRayContext` (entry column, fractional
-/// XY, air-gap z-bounds). Rays that miss the AABB take a sky-fill
-/// fast path; rays that hit run gline as if the camera were at
-/// the entry point.
-///
-/// First cut is sequential-only — the per-strip parallel branch
-/// from the inside path is gated to `pool.n_threads() == 1`. The
-/// outside flag is set on the rasterizer before clones happen, so
-/// each clone inherits it; a follow-up can lift the parallel guard
-/// once we've verified the per-strip path doesn't shake the auto-
-/// clip output.
-///
-/// `camera_gstartz0` / `camera_gstartz1` / `camera_vptr_offset` in
-/// the synthesised `ScanContext` are placeholders (0). The inside
-/// path uses them as the cf-seed defaults; outside mode supplies
-/// per-scanline overrides via the rasterizer's auto-clip path so
-/// the placeholders are never read for actual rays.
-#[allow(clippy::too_many_arguments)]
-fn opticast_outside<R: Rasterizer + Clone + Send + Sync>(
-    rasterizer: &mut R,
-    pool: &mut ScratchPool,
-    cs: &CameraState,
-    prelude: &OpticastPrelude,
-    settings: &OpticastSettings,
-    _vsid: u32,
-    _slab_buf: &[u8],
-    _column_offsets: &[u32],
-) -> OpticastOutcome {
-    let setup_proj = projection::derive_projection_with_y_range(
-        cs,
-        settings.xres,
-        settings.yres,
-        settings.y_start,
-        settings.y_end,
-        settings.hx,
-        settings.hy,
-        settings.hz,
-        settings.anginc,
-    );
-    let setup_rs = ray_step::derive_ray_step(cs, setup_proj.cx, setup_proj.cy, settings.hz);
-    #[allow(clippy::cast_possible_wrap)]
-    let setup_ctx = ScanContext {
-        proj: &setup_proj,
-        rs: &setup_rs,
-        prelude,
-        xres: settings.xres as i32,
-        y_start: settings.y_start as i32,
-        y_end: settings.y_end as i32,
-        anginc: settings.anginc,
-        camera_state: cs,
-        camera_gstartz0: 0,
-        camera_gstartz1: 0,
-        camera_vptr_offset: 0,
-    };
-
-    rasterizer.set_outside_camera_active(true);
-    rasterizer.frame_setup(&setup_ctx);
-
-    // Sequential only for S1 first-cut. The per-strip parallel
-    // branch clones the rasterizer; each clone inherits the active
-    // flag, but we haven't yet verified that the per-strip y-range
-    // restriction doesn't interact badly with the auto-clip path.
-    let scratch = pool.slot_mut(0);
-    top_quadrant(rasterizer, scratch, &setup_ctx);
-    right_quadrant(rasterizer, scratch, &setup_ctx);
-    bottom_quadrant(rasterizer, scratch, &setup_ctx);
-    left_quadrant(rasterizer, scratch, &setup_ctx);
-
-    rasterizer.set_outside_camera_active(false);
-
-    OpticastOutcome::OutsideCamera
 }
 
 /// Slice `slab_buf` at column `idx`'s byte range (per the

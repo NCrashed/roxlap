@@ -437,14 +437,6 @@ pub trait Rasterizer {
     );
 
     fn vrend(&mut self, scratch: &mut ScanScratch, sx: i32, sy: i32, p1: i32, iplc: i32, iinc: i32);
-
-    /// S1.3: enable / disable per-scanline AABB-clip outside-camera
-    /// mode. Concrete rasterizers that render world voxels (e.g.
-    /// [`crate::scalar_rasterizer::ScalarRasterizer`]) override this;
-    /// stub / recording rasterizers ignore it via the default no-op.
-    /// `crate::opticast::opticast_outside` calls this with `true` on
-    /// entry and `false` on exit.
-    fn set_outside_camera_active(&mut self, _active: bool) {}
 }
 
 #[cfg(test)]
