@@ -283,6 +283,48 @@ struct FrameCache {
     vptr_offset: usize,
 }
 
+/// S1.3: per-scanline override of the camera-position-specific
+/// state that [`ScalarRasterizer::gline`] would otherwise read from
+/// [`FrameCache`]. The outside-camera dispatch in
+/// [`crate::opticast::opticast_outside`] sets one of these before
+/// each `gline` call, with the AABB-entry-point's column / fractional
+/// XY / air-gap z-bounds in place of the camera's. When `None` (the
+/// default for inside-camera frames), `gline` reads directly from
+/// the frame cache and behaviour is bit-exact with pre-S1.3.
+///
+/// Set at the [`ScalarRasterizer`] level rather than the
+/// [`Rasterizer`] trait so stub / test rasterizers don't need to
+/// know about outside mode — opticast_outside threads through the
+/// concrete-typed setter explicitly.
+#[derive(Clone, Copy, Debug)]
+pub struct OutsideRayContext {
+    /// Override for `prelude.li_pos[0..2]` — the entry column's
+    /// signed integer XY. Used to compute the j0/j1 lanes in the
+    /// gxmax frustum-edge clip.
+    pub li_pos_xy: [i32; 2],
+    /// Override for `prelude.column_index` — `li_pos_y * vsid +
+    /// li_pos_x` at the entry column.
+    pub column_index: u32,
+    /// Override for `prelude.pos_xfrac` — fractional X at the AABB-
+    /// entry point, packed as `[1 - frac, frac]`. Goes through
+    /// [`crate::gline::derive_gline_frustum`] for the per-scanline
+    /// `gpz[0]` lane.
+    pub pos_xfrac: [f32; 2],
+    /// Override for `prelude.pos_yfrac` — same shape as `pos_xfrac`
+    /// for the y axis.
+    pub pos_yfrac: [f32; 2],
+    /// Override for `cache.gstartz0` — air-gap top z at the entry
+    /// column for the entry-point z. Seeds `cf[CF_SEED_INDEX].z0`.
+    pub gstartz0: i32,
+    /// Override for `cache.gstartz1` — air-gap bottom z. Seeds
+    /// `cf[CF_SEED_INDEX].z1`.
+    pub gstartz1: i32,
+    /// Override for `cache.vptr_offset` — byte offset within the
+    /// entry column to the slab whose top bounds the air gap from
+    /// below. Passed to `grouscan_run`.
+    pub vptr_offset: usize,
+}
+
 /// Scalar rasterizer that writes pixels and a z-buffer entry per
 /// screen position.
 ///
@@ -340,6 +382,13 @@ pub struct ScalarRasterizer<'a> {
     /// Per-frame state cache. `None` until the first `frame_setup`
     /// call; gline panics if invoked before that.
     frame: Option<FrameCache>,
+    /// S1.3: per-scanline override for the camera-position-specific
+    /// fields in [`FrameCache`]. `None` (the default) means `gline`
+    /// reads from the cache as voxlap C does — the inside-camera
+    /// path. `Some(_)` swaps in the entry-point context from the
+    /// outside-camera AABB clip; opticast_outside sets / clears this
+    /// per scanline.
+    outside_ray_context: Option<OutsideRayContext>,
 }
 
 // R12.2.1 / R12.3.1: opticast's parallel branches fan the rasterizer
@@ -390,6 +439,7 @@ impl<'a> ScalarRasterizer<'a> {
             vsid,
             sky: None,
             frame: None,
+            outside_ray_context: None,
         }
     }
 
@@ -401,6 +451,15 @@ impl<'a> ScalarRasterizer<'a> {
     pub fn with_sky(mut self, sky: &'a crate::sky::Sky) -> Self {
         self.sky = Some(sky);
         self
+    }
+
+    /// S1.3: install or clear the per-scanline outside-camera
+    /// override. `Some(_)` swaps the entry-point context into the
+    /// next `gline` call's frame-cache reads; `None` (the default)
+    /// reverts to the camera-inside-grid path. opticast_outside
+    /// calls this once per scanline.
+    pub fn set_outside_ray_context(&mut self, ctx: Option<OutsideRayContext>) {
+        self.outside_ray_context = ctx;
     }
 }
 
@@ -438,12 +497,29 @@ impl Rasterizer for ScalarRasterizer<'_> {
             .expect("gline called before frame_setup");
         let leng = length as i32;
 
+        // S1.3: resolve the camera-position-specific state once at
+        // the top so the rest of `gline` reads from locals. With no
+        // outside_ray_context set (the default for inside-camera
+        // frames) every value falls through to the cache and the
+        // function is bit-exact with the pre-S1.3 body. Outside
+        // mode supplies AABB-entry-point values per scanline.
+        let or_ctx = self.outside_ray_context;
+        let pos_xfrac = or_ctx.map_or(cache.prelude.pos_xfrac, |o| o.pos_xfrac);
+        let pos_yfrac = or_ctx.map_or(cache.prelude.pos_yfrac, |o| o.pos_yfrac);
+        let li_pos_xy = or_ctx.map_or([cache.prelude.li_pos[0], cache.prelude.li_pos[1]], |o| {
+            o.li_pos_xy
+        });
+        let column_index = or_ctx.map_or(cache.prelude.column_index, |o| o.column_index);
+        let gstartz0 = or_ctx.map_or(cache.gstartz0, |o| o.gstartz0);
+        let gstartz1 = or_ctx.map_or(cache.gstartz1, |o| o.gstartz1);
+        let vptr_offset = or_ctx.map_or(cache.vptr_offset, |o| o.vptr_offset);
+
         // 1. Project per-ray frustum (vd0/vd1/vz0/vx1/vy1/vz1 +
         //    gixy/gpz/gdz). voxlap5.c:1153-1175.
         let f = derive_gline_frustum(
             &cache.camera_state,
-            cache.prelude.pos_xfrac,
-            cache.prelude.pos_yfrac,
+            pos_xfrac,
+            pos_yfrac,
             self.vsid,
             length,
             x0,
@@ -506,8 +582,8 @@ impl Rasterizer for ScalarRasterizer<'_> {
         scratch.cf[CF_SEED_INDEX] = CfType {
             i0: gscanptr_isize,
             i1: gscanptr_isize + leng as isize,
-            z0: cache.gstartz0,
-            z1: cache.gstartz1,
+            z0: gstartz0,
+            z1: gstartz1,
             cx0,
             cy0,
             cx1,
@@ -528,12 +604,11 @@ impl Rasterizer for ScalarRasterizer<'_> {
         //    `dist`, which the z-buffer ends up carrying.
         let mut gxmax = cache.prelude.max_scan_dist;
         scratch.skycast.dist = gxmax;
-        let li_pos = cache.prelude.li_pos;
         let vsid_signed = self.vsid as i32;
         let j0 = if f.gixy[0] < 0 {
-            li_pos[0]
+            li_pos_xy[0]
         } else {
-            vsid_signed - 1 - li_pos[0]
+            vsid_signed - 1 - li_pos_xy[0]
         };
         let q0 = (i64::from(f.gdz[0]).wrapping_mul(i64::from(j0)))
             .wrapping_add(i64::from(f.gpz[0] as u32));
@@ -542,9 +617,9 @@ impl Rasterizer for ScalarRasterizer<'_> {
             scratch.skycast.dist = i32::MAX;
         }
         let j1 = if f.gixy[1] < 0 {
-            li_pos[1]
+            li_pos_xy[1]
         } else {
-            vsid_signed - 1 - li_pos[1]
+            vsid_signed - 1 - li_pos_xy[1]
         };
         let q1 = (i64::from(f.gdz[1]).wrapping_mul(i64::from(j1)))
             .wrapping_add(i64::from(f.gpz[1] as u32));
@@ -565,14 +640,11 @@ impl Rasterizer for ScalarRasterizer<'_> {
         }
 
         // 6. Build inputs and call grouscan_run. The starting
-        //    column is the camera's column (column_index from the
-        //    prelude); the slab walker handles the rest.
-        let column = camera_column_slice(
-            self.slab_buf,
-            self.column_offsets,
-            cache.prelude.column_index,
-        )
-        .unwrap_or(&[]);
+        //    column is the camera's column (or, in outside mode,
+        //    the AABB-entry column supplied by the override). The
+        //    slab walker handles the rest.
+        let column =
+            camera_column_slice(self.slab_buf, self.column_offsets, column_index).unwrap_or(&[]);
         // Copy gcsub out of scratch so the GrouscanInputs immutable
         // borrow doesn't collide with the `&mut scratch` grouscan_run
         // takes below. `[i64; 9]` is 72 bytes — cheap.
@@ -610,8 +682,8 @@ impl Rasterizer for ScalarRasterizer<'_> {
         let _ = grouscan_run(
             scratch,
             &inputs,
-            cache.vptr_offset,
-            cache.prelude.column_index as usize,
+            vptr_offset,
+            column_index as usize,
             cache.prelude.x_mip,
             gmipnum.max(1),
         );
