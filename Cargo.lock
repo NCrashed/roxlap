@@ -1358,6 +1358,7 @@ dependencies = [
  "console_error_panic_hook",
  "flate2",
  "js-sys",
+ "roxlap-cavegen",
  "roxlap-core",
  "roxlap-formats",
  "wasm-bindgen",

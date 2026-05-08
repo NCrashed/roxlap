@@ -1,0 +1,270 @@
+//! S1.W reproducer — BLACK pentagon under outside-camera world.
+//!
+//! Builds the same thin-floor scene as roxlap-host's
+//! `build_small_test_scene` (vsid=256, 1-voxel ground at z=200, a
+//! few primitives at world centre) and renders the user's reported
+//! BLACK-pentagon pose:
+//!
+//! ```
+//! pos=(-5.08, 53.28, 204.47)  yaw=-0.5525  pitch=0.1875
+//! ```
+//!
+//! The renderer leaves a wedge of below-the-world pixels at sky
+//! distance with `radar.col == 0` (BLACK) instead of the engine
+//! sky color.  This test loads that exact pose, dumps the PPM next
+//! to /tmp, and reports per-row stats so we can pinpoint the y-band
+//! where the leak fires.
+
+#![cfg(not(target_arch = "wasm32"))]
+
+use roxlap_cavegen::{pack_dense_grid_to_vxl, MAXZDIM};
+use roxlap_core::camera_math;
+use roxlap_core::opticast::{opticast, OpticastOutcome};
+use roxlap_core::rasterizer::ScratchPool;
+use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::{Camera, Engine, OpticastSettings};
+
+const VSID: u32 = 256;
+const XRES: u32 = 800;
+const YRES: u32 = 600;
+
+fn build_thin_floor_scene() -> roxlap_formats::vxl::Vxl {
+    const GROUND_Z: usize = 200;
+    const GROUND_COL: u32 = 0x80_3a_8a_3a;
+    const PLATFORM_COL: u32 = 0x80_b0_b0_b8;
+    const CUBE_COL: u32 = 0x80_e0_30_30;
+    const SPHERE_COL: u32 = 0x80_30_60_e0;
+    const TOWER_COL: u32 = 0x80_e0_d0_30;
+    let vsid = VSID;
+    let vsid_u = vsid as usize;
+    let max_z = MAXZDIM as usize;
+    let total = vsid_u * vsid_u * max_z;
+    let mut grid = vec![0u8; total];
+    let mut color = vec![0u32; total];
+    let idx = |x: usize, y: usize, z: usize| (y * vsid_u + x) * max_z + z;
+
+    // 1-voxel floor.
+    for y in 0..vsid_u {
+        for x in 0..vsid_u {
+            let i = idx(x, y, GROUND_Z);
+            grid[i] = 1;
+            color[i] = GROUND_COL;
+        }
+    }
+
+    // Platform 16×16 at centre, 8 voxels above ground.
+    let cx = vsid_u / 2;
+    let cy = vsid_u / 2;
+    let plat_top = GROUND_Z - 8;
+    for y in (cy - 8)..(cy + 8) {
+        for x in (cx - 8)..(cx + 8) {
+            for z in plat_top..GROUND_Z {
+                let i = idx(x, y, z);
+                grid[i] = 1;
+                color[i] = PLATFORM_COL;
+            }
+        }
+    }
+
+    // Red cube 24³ east.
+    for dz in 0..24 {
+        for dy in 0..24 {
+            for dx in 0..24 {
+                let x = cx + 32 + dx;
+                let y = cy.wrapping_sub(12).wrapping_add(dy);
+                let z = GROUND_Z - 24 + dz;
+                if x < vsid_u && y < vsid_u && z < max_z {
+                    let i = idx(x, y, z);
+                    grid[i] = 1;
+                    color[i] = CUBE_COL;
+                }
+            }
+        }
+    }
+
+    // Blue sphere r=12 west.
+    let scx = cx as i32 - 32;
+    let scy = cy as i32;
+    let scz = GROUND_Z as i32 - 12;
+    for dz in -12..=12 {
+        for dy in -12..=12 {
+            for dx in -12..=12 {
+                if dx * dx + dy * dy + dz * dz <= 12 * 12 {
+                    let x = scx + dx;
+                    let y = scy + dy;
+                    let z = scz + dz;
+                    if x >= 0 && y >= 0 && z >= 0 {
+                        let xu = x as usize;
+                        let yu = y as usize;
+                        let zu = z as usize;
+                        if xu < vsid_u && yu < vsid_u && zu < max_z {
+                            let i = idx(xu, yu, zu);
+                            grid[i] = 1;
+                            color[i] = SPHERE_COL;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Yellow tower 8×8×64 north.
+    for dz in 0..64 {
+        for dy in 0..8 {
+            for dx in 0..8 {
+                let x = cx - 4 + dx;
+                let y = cy + 32 + dy;
+                let z = GROUND_Z - 64 + dz;
+                if x < vsid_u && y < vsid_u && z < max_z {
+                    let i = idx(x, y, z);
+                    grid[i] = 1;
+                    color[i] = TOWER_COL;
+                }
+            }
+        }
+    }
+
+    pack_dense_grid_to_vxl(&grid, &color, vsid)
+}
+
+fn camera_from_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
+    let cy_ = yaw.cos();
+    let sy = yaw.sin();
+    let cp = pitch.cos();
+    let sp = pitch.sin();
+    Camera {
+        pos,
+        right: [-sy, cy_, 0.0],
+        down: [-cy_ * sp, -sy * sp, cp],
+        forward: [cy_ * cp, sy * cp, sp],
+    }
+}
+
+#[test]
+fn black_pentagon_under_oob_camera() {
+    let vxl = build_thin_floor_scene();
+    let engine = Engine::new();
+
+    // User's exact pose where BLACK pentagon shows below the world.
+    let pos = [-5.0815, 53.2772, 204.4685];
+    let yaw = -0.5525;
+    let pitch = 0.1875;
+    let cam = camera_from_yaw_pitch(pos, yaw, pitch);
+
+    let mut framebuffer = vec![0u32; (XRES * YRES) as usize];
+    let mut zbuffer = vec![0f32; (XRES * YRES) as usize];
+    let mut pool = ScratchPool::new(XRES, YRES, vxl.vsid);
+
+    let sky = engine.sky_color();
+    // Pre-fill with a SENTINEL color so any unwritten pixel is
+    // distinguishable from sky.  0x80FF00FF = magenta with the
+    // engine's brightness-bit; obvious in screenshots, byte-distinct
+    // from sky-blue (0x8087CEEB) and BLACK (0x00000000).
+    let sentinel = 0x80FF00FFu32;
+    for px in framebuffer.iter_mut() {
+        *px = sentinel;
+    }
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    // S1.W: treat the bedrock placeholder at z=MAXZDIM-1 as air so
+    // OOB-camera rays fall through to Startsky / textured sky
+    // instead of writing the BLACK bedrock color.
+    pool.set_treat_z_max_as_air(true);
+
+    let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+
+    let _cs = camera_math::derive(&cam, XRES, YRES, settings.hx, settings.hy, settings.hz);
+
+    let mut rasterizer = ScalarRasterizer::new(
+        &mut framebuffer,
+        &mut zbuffer,
+        XRES as usize,
+        &vxl.data,
+        &vxl.column_offset,
+        &vxl.mip_base_offsets,
+        vxl.vsid,
+    );
+    let outcome = opticast(
+        &mut rasterizer,
+        &mut pool,
+        &cam,
+        &settings,
+        vxl.vsid,
+        &vxl.data,
+        &vxl.column_offset,
+    );
+    drop(rasterizer);
+
+    assert_eq!(outcome, OpticastOutcome::Rendered);
+
+    // Per-row stats: count of sentinel/sky/black/other.
+    let mut total_sentinel = 0usize;
+    let mut total_sky = 0usize;
+    let mut total_black = 0usize;
+    let mut total_other = 0usize;
+    let mut row_with_max_black = (0usize, 0usize);
+    for y in 0..YRES as usize {
+        let row_start = y * XRES as usize;
+        let row_end = row_start + XRES as usize;
+        let row = &framebuffer[row_start..row_end];
+        let nb = row.iter().filter(|&&p| p == 0x0000_0000).count();
+        if nb > row_with_max_black.1 {
+            row_with_max_black = (y, nb);
+        }
+        for &p in row {
+            if p == sentinel {
+                total_sentinel += 1;
+            } else if p == sky {
+                total_sky += 1;
+            } else if p == 0x0000_0000 {
+                total_black += 1;
+            } else {
+                total_other += 1;
+            }
+        }
+    }
+    let total = framebuffer.len();
+    eprintln!("BLACK pentagon repro");
+    eprintln!(
+        "  sentinel={total_sentinel}/{total} ({:.2}%)",
+        100.0 * total_sentinel as f64 / total as f64
+    );
+    eprintln!(
+        "  sky=     {total_sky}/{total} ({:.2}%)",
+        100.0 * total_sky as f64 / total as f64
+    );
+    eprintln!(
+        "  black=   {total_black}/{total} ({:.2}%)",
+        100.0 * total_black as f64 / total as f64
+    );
+    eprintln!(
+        "  other=   {total_other}/{total} ({:.2}%)",
+        100.0 * total_other as f64 / total as f64
+    );
+    eprintln!(
+        "  max-black row: y={} count={}",
+        row_with_max_black.0, row_with_max_black.1
+    );
+
+    let mut ppm = format!("P6\n{XRES} {YRES}\n255\n").into_bytes();
+    for &px in &framebuffer {
+        let bytes = px.to_le_bytes();
+        ppm.push(bytes[2]);
+        ppm.push(bytes[1]);
+        ppm.push(bytes[0]);
+    }
+    let path = "/tmp/oob_pentagon.ppm";
+    std::fs::write(path, ppm).expect("write ppm");
+    eprintln!("  wrote {path}");
+
+    // The BLACK pentagon shows when grouscan exits without filling
+    // some radar slots.  When this assertion FAILS, the leak is
+    // present.  Once fixed, every unwritten slot should get filled
+    // by Startsky → sky color → no BLACK pixels.
+    assert_eq!(
+        total_black, 0,
+        "BLACK pentagon: {total_black} slots left unwritten by grouscan"
+    );
+}

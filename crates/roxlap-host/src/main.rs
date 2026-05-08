@@ -497,6 +497,13 @@ impl App {
         self.pool
             .set_side_shades(s[0], s[1], s[2], s[3], s[4], s[5]);
 
+        // S1.W: render voxlap's z=MAXZDIM-1 bedrock voxel as if it
+        // were air, so OOB-camera rays under the world's footprint
+        // continue to startsky and pick up the textured/solid sky
+        // instead of the bedrock's BLACK placeholder color. See
+        // `ScanScratch::treat_z_max_as_air`.
+        self.pool.set_treat_z_max_as_air(true);
+
         let cam = self.camera();
         let sky = self.engine.sky_color();
         let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);

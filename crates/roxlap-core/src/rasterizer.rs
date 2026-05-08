@@ -135,6 +135,30 @@ pub struct ScanScratch {
     /// `gcsub[4..7]` based on the sign of `gixy[0]`/`gixy[1]` so
     /// wall faces get directional darkening (voxlap5.c:1230-1234).
     pub sideshademode: bool,
+
+    /// S1.W: when `true`, draw phases that are about to read a voxel
+    /// at z=MAXZDIM-1 (=255, voxlap's bedrock z) bail to AfterDelete
+    /// instead of writing it to the radar. The ray then column-steps
+    /// past the bedrock until either an in-bounds slab fires or
+    /// `gxmax` triggers `Startsky` — which in turn fills the radar
+    /// with `skycast` (solid OR textured sky, depending on the
+    /// `SkyRef` binding).
+    ///
+    /// **Why this exists:** voxlap's `delslab` clamps every carve's
+    /// `y1` to `MAXZDIM-1`, so z=255 is ALWAYS solid post-pack
+    /// regardless of what the dense grid says. For typical voxlap
+    /// scenes that's fine — terrain reaches the bottom and the
+    /// "bedrock" voxel is hidden inside a multi-voxel slab. For
+    /// thin-floor / sparse scenes (and ANY scene viewed from outside
+    /// the XY footprint), the bedrock voxel is exposed and renders
+    /// as whatever color it carries. Without an explicit color
+    /// assignment that's `colfunc(x, y, 255) = 0` → BLACK pentagon
+    /// under the world.
+    ///
+    /// Default `false` to keep the 12 oracle hashes byte-identical;
+    /// host enables it when the scene's "below-the-world" expected
+    /// to look like sky.
+    pub treat_z_max_as_air: bool,
 }
 
 impl ScanScratch {
@@ -184,6 +208,7 @@ impl ScanScratch {
             foglut: Vec::new(),
             gcsub: [0x00ff_00ff_00ff_00ff; 9],
             sideshademode: false,
+            treat_z_max_as_air: false,
         }
     }
 
@@ -391,6 +416,14 @@ impl ScratchPool {
     pub fn set_side_shades(&mut self, top: i8, bot: i8, left: i8, right: i8, up: i8, down: i8) {
         for s in self.slots_mut() {
             s.set_side_shades(top, bot, left, right, up, down);
+        }
+    }
+
+    /// Toggle the "treat z=MAXZDIM-1 as air" mode. See
+    /// [`ScanScratch::treat_z_max_as_air`] for the full rationale.
+    pub fn set_treat_z_max_as_air(&mut self, on: bool) {
+        for s in self.slots_mut() {
+            s.treat_z_max_as_air = on;
         }
     }
 }

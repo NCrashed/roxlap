@@ -1018,6 +1018,27 @@ fn phase_pre_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
     clippy::similar_names
 )]
 fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
+    // S1.W: optional "below-the-world is air" mode. The slab's top
+    // voxel sits at z = column[vptr+1] (= z1c). When that's the
+    // bottom of the world (=0xff = MAXZDIM-1), this slab is voxlap's
+    // canonical bedrock placeholder — `delslab` clamps every carve's
+    // y1 to MAXZDIM-1 so z=255 stays solid even for fully-air
+    // dense-grid columns. Bailing to AfterDelete here lets the walk
+    // column-step past the bedrock until `gxmax` triggers
+    // `Startsky`, which fills the radar with `skycast` (solid OR
+    // textured sky depending on the SkyRef binding) — the visual
+    // result the user wants when the camera flies under the world.
+    //
+    // Gated on `treat_z_max_as_air` so the 12 oracle goldens stay
+    // byte-identical (oracle's canonical scene has its bedrock
+    // hidden behind terrain that reaches z=255 inside multi-voxel
+    // slabs, where z1c < 255).
+    if state.scratch.treat_z_max_as_air
+        && state.vptr_offset + 1 < state.column.len()
+        && state.column[state.vptr_offset + 1] == 0xff
+    {
+        return Phase::AfterDelete;
+    }
     // gy_raw = gylookoff[z1].
     let z1_idx = state.z1 as usize;
     if z1_idx >= state.gylookup.len() {
