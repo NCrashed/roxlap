@@ -1,18 +1,13 @@
-//! S1.0 reproducer — camera placed outside the world's X/Y bounds.
+//! S1 closeout — `outside_orbit` golden for the camera-outside-grid path.
 //!
-//! Today (pre-S1) voxlap's opticast assumes the camera sits inside
-//! the column grid. With camera at `(vsid + 256, vsid/2, 128)` the
-//! initial column index in `opticast_prelude::derive_prelude`
-//! silently overflows (the f32→i32→u32 cast wraps to a huge value),
-//! so the renderer either accesses garbage column data or, when
-//! `camera_column_slice` early-outs, the rest of the rasterizer
-//! sees uninitialised state.
-//!
-//! The test is intentionally non-asserting: it prints the output
-//! hash + a "sky vs world" pixel split so we can see at a glance
-//! whether the failure today is panic / all-sky / corrupt.
-//! After S1.2 + S1.3 land, the same harness becomes the validation
-//! for the fix.
+//! Pre-S1 this test was non-asserting (printed hash + sky/world
+//! split). After S1.0..S1.Z + S1.V + S1.X landed, the outside-XY
+//! render path is stable, so this freezes the framebuffer FNV-1a64
+//! as a roxlap-only golden — voxlap C can't render this pose at
+//! all, so there's no upstream reference to diff against. Per-arch
+//! values follow the same `(x86_64, aarch64)` split as
+//! `tests/golden-hashes*.txt`; aarch64 row is filled in when first
+//! run on that arch (same flow as R9.4).
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -23,8 +18,17 @@ use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::{Camera, Engine, OpticastSettings};
 use roxlap_oracle::{fnv1a64, load_oracle_vxl, XRES, YRES};
 
+/// Frozen `outside_orbit` framebuffer hash. `0` means "no golden
+/// pinned for this arch yet" — the test will print the rendered
+/// hash so the next run on that arch can paste it back here.
+const OUTSIDE_ORBIT_GOLDEN: u64 = if cfg!(target_arch = "x86_64") {
+    0xaa2b_4263_e714_667b
+} else {
+    0
+};
+
 #[test]
-fn outside_camera_renders_without_panic() {
+fn outside_orbit_matches_golden() {
     let vxl = load_oracle_vxl();
     let engine = Engine::new();
 
@@ -104,7 +108,7 @@ fn outside_camera_renders_without_panic() {
     let total = framebuffer.len();
     let world_pixels = total - sky_pixels;
 
-    eprintln!("outside_orbit (pre-S1) hash={hash:016x}");
+    eprintln!("outside_orbit hash={hash:016x}");
     eprintln!(
         "  sky={sky_pixels}/{total} ({:.1}%)  world={world_pixels} ({:.1}%)",
         100.0 * sky_pixels as f64 / total as f64,
@@ -125,4 +129,16 @@ fn outside_camera_renders_without_panic() {
     let path = "/tmp/outside_orbit.ppm";
     std::fs::write(path, ppm).expect("write ppm");
     eprintln!("  wrote {path}");
+
+    if OUTSIDE_ORBIT_GOLDEN == 0 {
+        eprintln!(
+            "  no frozen golden for this arch yet — paste {hash:016x} into \
+             OUTSIDE_ORBIT_GOLDEN's matching cfg arm to freeze."
+        );
+    } else {
+        assert_eq!(
+            hash, OUTSIDE_ORBIT_GOLDEN,
+            "outside_orbit hash drifted: got {hash:016x}, want {OUTSIDE_ORBIT_GOLDEN:016x}",
+        );
+    }
 }
