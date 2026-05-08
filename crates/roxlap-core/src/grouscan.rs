@@ -732,6 +732,8 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
         if row_offset + 4 > state.column.len() {
             // Malformed slab — bail out gracefully.
             state.scratch.cf[state.c_idx].i1 = state.ebx;
+            state.scratch.cf[state.c_idx].cx1 = state.cx1;
+            state.scratch.cf[state.c_idx].cy1 = state.cy1;
             return Phase::DrawCwall;
         }
         let vox = u32::from_le_bytes(
@@ -744,6 +746,8 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
         let z1_idx = state.z1 as usize;
         if z1_idx >= state.gylookup.len() {
             state.scratch.cf[state.c_idx].i1 = state.ebx;
+            state.scratch.cf[state.c_idx].cx1 = state.cx1;
+            state.scratch.cf[state.c_idx].cy1 = state.cy1;
             return Phase::DrawCwall;
         }
         state.gy_raw = state.gylookup[z1_idx];
@@ -757,7 +761,15 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
                     continue 'outer;
                 }
                 // c->i1 = ebx, then fall through to drawcwall.
+                // S1.V: also write cx1/cy1 so cf entry stays
+                // coherent with i1 (= position at post-drain i1).
+                // Without this, phase_startsky_textured's
+                // cx0+(i1-i0)*gi0 sx_init formula uses stale cx1
+                // and the sky checker shears across cf entries
+                // that drained from the back end.
                 state.scratch.cf[state.c_idx].i1 = state.ebx;
+                state.scratch.cf[state.c_idx].cx1 = state.cx1;
+                state.scratch.cf[state.c_idx].cy1 = state.cy1;
                 return Phase::DrawCwall;
             }
             // Advance right-edge ray left.
@@ -840,6 +852,8 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
         let row_offset_signed = state.vptr_offset as isize + (state.off as isize) * 4;
         if row_offset_signed < 0 || (row_offset_signed as usize) + 4 > state.column.len() {
             state.scratch.cf[state.c_idx].i0 = state.ebx;
+            state.scratch.cf[state.c_idx].cx0 = state.cx0;
+            state.scratch.cf[state.c_idx].cy0 = state.cy0;
             state.z0 = i32::from(state.column[state.vptr_offset + 3]);
             return Phase::PreDrawCeil;
         }
@@ -853,6 +867,8 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
         let z0_idx = state.z0 as usize;
         if z0_idx >= state.gylookup.len() {
             state.scratch.cf[state.c_idx].i0 = state.ebx;
+            state.scratch.cf[state.c_idx].cx0 = state.cx0;
+            state.scratch.cf[state.c_idx].cy0 = state.cy0;
             state.z0 = i32::from(state.column[state.vptr_offset + 3]);
             return Phase::PreDrawCeil;
         }
@@ -867,7 +883,15 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
                     continue 'outer;
                 }
                 // c->i0 = ebx, z0 = v[3], fall through to drawceil.
+                // S1.V: also write cx0/cy0 so cf entry stays
+                // coherent with i0 (= position at post-drain i0).
+                // Without this, phase_startsky_textured's sx_init
+                // is off by drain_count*gi0 and the sky checker
+                // shears under the floor's underside (visible in
+                // the below-floor checker_below_floor.ppm test).
                 state.scratch.cf[state.c_idx].i0 = state.ebx;
+                state.scratch.cf[state.c_idx].cx0 = state.cx0;
+                state.scratch.cf[state.c_idx].cy0 = state.cy0;
                 state.z0 = i32::from(state.column[state.vptr_offset + 3]);
                 return Phase::PreDrawCeil;
             }
@@ -957,6 +981,10 @@ fn phase_draw_ceil(state: &mut GrouscanState<'_>) -> Phase {
     loop {
         let test = grouscan_cross_sign(state.cx0, state.cy0, state.ogx, state.gy_raw);
         if test > 0 {
+            // S1.V: cf entry's i0 advanced via per-iter writes
+            // above; sync cx0/cy0 here so they track i0.
+            state.scratch.cf[state.c_idx].cx0 = state.cx0;
+            state.scratch.cf[state.c_idx].cy0 = state.cy0;
             return Phase::DrawFlor;
         }
         state.cx0 = state.cx0.wrapping_add(state.scratch.gi0);
@@ -979,6 +1007,9 @@ fn phase_draw_ceil(state: &mut GrouscanState<'_>) -> Phase {
             // through predeletez. Routing through PreDeleteZ here
             // adds a stray swap that perturbs subsequent ogx for
             // 1-bit shading drift on sphere-edge pixels.
+            // S1.V: sync cx0/cy0 to track post-drain i0.
+            state.scratch.cf[state.c_idx].cx0 = state.cx0;
+            state.scratch.cf[state.c_idx].cy0 = state.cy0;
             return Phase::DeleteZ;
         }
     }
@@ -1079,6 +1110,9 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
             // Without this route, sky-pointing rays exit drawflor
             // on the first cross-sign test and leave radar at
             // default zeros — those screen rows render as black.
+            // S1.V: sync cx1/cy1 to track post-drain i1.
+            state.scratch.cf[state.c_idx].cx1 = state.cx1;
+            state.scratch.cf[state.c_idx].cy1 = state.cy1;
             return Phase::AfterDelete;
         }
         state.cx1 = state.cx1.wrapping_sub(state.scratch.gi0);
@@ -1095,6 +1129,9 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
         if state.scratch.cf[state.c_idx].i1 < state.scratch.cf[state.c_idx].i0 {
             // drawflor exits to deletez direct (voxlap5.c:11790) —
             // NO `ogx ↔ gx` swap. See drawceil's matching note.
+            // S1.V: sync cx1/cy1 to track post-drain i1.
+            state.scratch.cf[state.c_idx].cx1 = state.cx1;
+            state.scratch.cf[state.c_idx].cy1 = state.cy1;
             return Phase::DeleteZ;
         }
     }

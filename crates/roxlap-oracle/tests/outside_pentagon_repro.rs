@@ -22,6 +22,7 @@ use roxlap_core::camera_math;
 use roxlap_core::opticast::{opticast, OpticastOutcome};
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::sky::Sky;
 use roxlap_core::{Camera, Engine, OpticastSettings};
 
 const VSID: u32 = 256;
@@ -266,5 +267,153 @@ fn black_pentagon_under_oob_camera() {
     assert_eq!(
         total_black, 0,
         "BLACK pentagon: {total_black} slots left unwritten by grouscan"
+    );
+}
+
+/// Build a procedural checkerboard sky, mirror of
+/// `roxlap-host::build_checkerboard_sky`. Width = elevation
+/// (horizon → zenith), height = azimuth wrap.
+fn build_checkerboard_sky() -> Sky {
+    const W: u32 = 64;
+    const H: u32 = 256;
+    const TILE_X: u32 = 8;
+    const TILE_Y: u32 = 16;
+    let mut pixels = Vec::with_capacity((W * H) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            let (r_base, g_base, b_base) = match (y * 4) / H {
+                0 => (0xe0u32, 0x40, 0x40),
+                1 => (0x40, 0xe0, 0x40),
+                2 => (0x40, 0x40, 0xe0),
+                _ => (0xe0, 0xd0, 0x40),
+            };
+            let dark = ((x / TILE_X) + (y / TILE_Y)) & 1 == 1;
+            let (r, g, b) = if dark {
+                (r_base / 4, g_base / 4, b_base / 4)
+            } else {
+                (r_base, g_base, b_base)
+            };
+            let (r, g, b) = if x == 0 {
+                (0xff, 0xff, 0xff)
+            } else if x == W - 1 {
+                (0, 0, 0)
+            } else {
+                (r, g, b)
+            };
+            #[allow(clippy::cast_possible_wrap)]
+            let px = ((0x80u32 << 24) | (r << 16) | (g << 8) | b) as i32;
+            pixels.push(px);
+        }
+    }
+    Sky::from_pixels(pixels, W, H)
+}
+
+/// Render the test scene at `cam` with the checkerboard sky and
+/// dump a PPM at `path`. Returns the framebuffer for further
+/// analysis.
+fn render_to_ppm(cam: Camera, path: &str) -> Vec<u32> {
+    let vxl = build_thin_floor_scene();
+    let mut engine = Engine::new();
+    engine.set_sky(Some(build_checkerboard_sky()));
+
+    let mut framebuffer = vec![0u32; (XRES * YRES) as usize];
+    let mut zbuffer = vec![0f32; (XRES * YRES) as usize];
+    let mut pool = ScratchPool::new(XRES, YRES, vxl.vsid);
+
+    let sky = engine.sky_color();
+    for px in framebuffer.iter_mut() {
+        *px = sky;
+    }
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+    let mut rasterizer = ScalarRasterizer::new(
+        &mut framebuffer,
+        &mut zbuffer,
+        XRES as usize,
+        &vxl.data,
+        &vxl.column_offset,
+        &vxl.mip_base_offsets,
+        vxl.vsid,
+    );
+    if let Some(sky_ref) = engine.sky() {
+        rasterizer = rasterizer.with_sky(sky_ref);
+    }
+    let outcome = opticast(
+        &mut rasterizer,
+        &mut pool,
+        &cam,
+        &settings,
+        vxl.vsid,
+        &vxl.data,
+        &vxl.column_offset,
+    );
+    drop(rasterizer);
+    assert_eq!(outcome, OpticastOutcome::Rendered);
+
+    let mut ppm = format!("P6\n{XRES} {YRES}\n255\n").into_bytes();
+    for &px in &framebuffer {
+        let bytes = px.to_le_bytes();
+        ppm.push(bytes[2]);
+        ppm.push(bytes[1]);
+        ppm.push(bytes[0]);
+    }
+    std::fs::write(path, ppm).expect("write ppm");
+    eprintln!("  wrote {path}");
+    framebuffer
+}
+
+/// S1.V — render the user's reported distortion pose alongside an
+/// in-bounds camera at the same yaw/pitch. The two PPMs at
+/// `/tmp/checker_oob.ppm` vs `/tmp/checker_in.ppm` let us A/B
+/// whether the seam/shear pattern is OOB-specific or voxlap-
+/// canonical (per-quadrant scanline orientation).
+#[test]
+fn checkerboard_sky_oob_vs_inbounds() {
+    // User's reported OOB pose.
+    let oob_pos = [-22.2338, 119.1835, 207.7956];
+    // In-bounds at world centre, same yaw/pitch.
+    let in_pos = [128.0, 128.0, 207.7956];
+    let yaw = -0.1950;
+    let pitch = 0.4375;
+
+    let _oob_fb = render_to_ppm(
+        camera_from_yaw_pitch(oob_pos, yaw, pitch),
+        "/tmp/checker_oob.ppm",
+    );
+    let _in_fb = render_to_ppm(
+        camera_from_yaw_pitch(in_pos, yaw, pitch),
+        "/tmp/checker_in.ppm",
+    );
+}
+
+/// S1.V — above-floor vs below-floor at the SAME OOB-X yaw/pitch.
+/// User's claim: the sky-checker distortion appears ONLY when the
+/// camera is below the floor (z > GROUND_Z = 200). Above the floor
+/// (z < 200), the same yaw/pitch should render a clean checker.
+///
+/// Both positions are OOB-X (cx=-22) so OOB-vs-inbounds is held
+/// constant. The floor crossing is the only variable.
+///
+/// Outputs:
+/// - `/tmp/checker_below_floor.ppm` — z=207.80 (≈ user's pose Z)
+/// - `/tmp/checker_above_floor.ppm` — z=192.00 (8 voxels above the
+///   floor, inside the air-above region)
+#[test]
+fn checkerboard_sky_above_vs_below_floor() {
+    let yaw = -0.1950;
+    let pitch = 0.4375;
+    let xy = [-22.2338, 119.1835];
+    let _below = render_to_ppm(
+        camera_from_yaw_pitch([xy[0], xy[1], 207.7956], yaw, pitch),
+        "/tmp/checker_below_floor.ppm",
+    );
+    let _above = render_to_ppm(
+        camera_from_yaw_pitch([xy[0], xy[1], 192.0], yaw, pitch),
+        "/tmp/checker_above_floor.ppm",
     );
 }

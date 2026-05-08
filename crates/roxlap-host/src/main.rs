@@ -167,6 +167,72 @@ fn load_png_sky(png_bytes: &[u8]) -> Result<roxlap_core::sky::Sky, String> {
     Ok(roxlap_core::sky::Sky::from_pixels(pixels, png_w, png_h))
 }
 
+/// Build a procedural checkerboard sky for visual-distortion
+/// debugging. Voxlap's mapping: width = elevation (horizon →
+/// zenith), height = azimuth (360° wrap-around).
+///
+/// Layout (64 elevation × 256 azimuth):
+/// - **azimuth quadrants** are color-coded so you can tell which
+///   way the camera faces just from a sky pixel:
+///     - `0°..90°`  (the +X-facing quadrant) → **red** base
+///     - `90°..180°` (+Y) → **green** base
+///     - `180°..270°` (-X) → **blue** base
+///     - `270°..360°` (-Y) → **yellow** base
+/// - **tiles** are 8 elevation × 16 azimuth pixels; alternating
+///   tiles use a darkened version of the base color so tile
+///   boundaries are obvious.
+/// - **horizon stripe** (elevation=0): a single white row makes
+///   the horizon line trivial to spot.
+/// - **zenith stripe** (elevation=63): black, same purpose for
+///   straight-up.
+///
+/// Each pixel is voxlap's BGRA-with-brightness-bit packing
+/// (`0x80 << 24 | r<<16 | g<<8 | b`).
+fn build_checkerboard_sky() -> roxlap_core::sky::Sky {
+    const W: u32 = 64; // elevation
+    const H: u32 = 256; // azimuth
+    const TILE_X: u32 = 8;
+    const TILE_Y: u32 = 16;
+    // Pixel order matches `Sky::from_pixels`: row-major in
+    // (azimuth y, elevation x) — outer y, inner x. The loop layout
+    // mirrors `load_png_sky`'s PNG-row iteration (PNG height = voxlap
+    // azimuth, PNG width = voxlap elevation).
+    let mut pixels = Vec::with_capacity((W * H) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            let (r_base, g_base, b_base) = match (y * 4) / H {
+                0 => (0xe0u32, 0x40, 0x40), // +X = red
+                1 => (0x40, 0xe0, 0x40),    // +Y = green
+                2 => (0x40, 0x40, 0xe0),    // -X = blue
+                _ => (0xe0, 0xd0, 0x40),    // -Y = yellow
+            };
+            let tile_x = x / TILE_X;
+            let tile_y = y / TILE_Y;
+            let dark = (tile_x + tile_y) & 1 == 1;
+            let (r, g, b) = if dark {
+                (r_base / 4, g_base / 4, b_base / 4)
+            } else {
+                (r_base, g_base, b_base)
+            };
+            // Horizon stripe: bright white at x=0 so you can tell
+            // up from down on a stranded checker. Zenith stripe:
+            // pure black at x=W-1 (straight-up). The interior is
+            // checkerboard-as-above.
+            let (r, g, b) = if x == 0 {
+                (0xffu32, 0xff, 0xff)
+            } else if x == W - 1 {
+                (0u32, 0, 0)
+            } else {
+                (r, g, b)
+            };
+            #[allow(clippy::cast_possible_wrap)]
+            let px = ((0x80u32 << 24) | (r << 16) | (g << 8) | b) as i32;
+            pixels.push(px);
+        }
+    }
+    roxlap_core::sky::Sky::from_pixels(pixels, W, H)
+}
+
 /// Tracks which movement keys are currently pressed. Polled each
 /// frame to integrate position; we don't act on the press/release
 /// edge directly because that would tie movement rate to key-repeat.
@@ -279,6 +345,13 @@ struct App {
     /// Tracks the toggle so press handling stays idempotent across
     /// rapid presses.
     light_on: bool,
+    /// `Y` hotkey: when `true`, the engine's sky is the procedural
+    /// checkerboard built by [`build_checkerboard_sky`]; when
+    /// `false`, the embedded `assets/sky.png` panorama. Used to
+    /// debug visual distortions under OOB-camera views — the
+    /// regular pattern of the checkerboard makes warping in the
+    /// sky-sphere lookup obvious at a glance.
+    use_checker_sky: bool,
 }
 
 impl App {
@@ -302,6 +375,23 @@ impl App {
             right,
             down,
             forward,
+        }
+    }
+
+    fn toggle_sky(&mut self) {
+        self.use_checker_sky = !self.use_checker_sky;
+        if self.use_checker_sky {
+            self.engine.set_sky(Some(build_checkerboard_sky()));
+            eprintln!("sky: CHECKERBOARD (64×256, color-coded by azimuth)");
+        } else {
+            // Re-decode the PNG. Falls back to blue gradient if the
+            // PNG is missing/corrupt — same behaviour as startup.
+            let sky = match load_png_sky(SKY_PNG) {
+                Ok(sky) => sky,
+                Err(_) => roxlap_core::sky::Sky::blue_gradient(),
+            };
+            self.engine.set_sky(Some(sky));
+            eprintln!("sky: PNG (assets/sky.png)");
         }
     }
 
@@ -759,6 +849,12 @@ impl ApplicationHandler for App {
                     }
                     KeyCode::KeyL if pressed => {
                         self.toggle_light();
+                    }
+                    KeyCode::KeyY if pressed => {
+                        // Toggle between the embedded `assets/sky.png`
+                        // and a procedural checkerboard sky for OOB-
+                        // distortion debugging.
+                        self.toggle_sky();
                     }
                     _ => {}
                 }
@@ -1319,6 +1415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // performs the first-time bake + snapshot, then flips
         // the flag — same code path as a runtime L press.
         light_on: false,
+        use_checker_sky: false,
     };
     eprintln!("baking initial lightmode-1 directional bake — first call is a few seconds…");
     app.toggle_light();
