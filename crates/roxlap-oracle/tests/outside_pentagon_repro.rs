@@ -391,6 +391,96 @@ fn checkerboard_sky_oob_vs_inbounds() {
     );
 }
 
+/// S1.W — camera below the bedrock placeholder (z > MAXZDIM-1 = 255)
+/// with `treat_z_max_as_air=true`. With the flag the bedrock is air,
+/// so a camera at z=261 looking up should see the floor at z=200.
+/// Repro of user-reported bug: render shows only sky (opticast
+/// returns SkippedCameraInSolid because column_walk reaches the end
+/// of the slab list with no visible air gap).
+///
+/// User pose: pos=(17.34, 182.69, 261.95) yaw=-0.7225 pitch=-0.7000.
+/// Test scene's floor is at z=200; bedrock placeholder at z=255.
+#[test]
+fn below_bedrock_camera_renders_world() {
+    let pos = [17.3422, 182.6868, 261.9467];
+    let yaw = -0.7225;
+    let pitch = -0.7000;
+    let cam = camera_from_yaw_pitch(pos, yaw, pitch);
+
+    let vxl = build_thin_floor_scene();
+    let mut engine = Engine::new();
+    engine.set_sky(Some(build_checkerboard_sky()));
+
+    let mut framebuffer = vec![0u32; (XRES * YRES) as usize];
+    let mut zbuffer = vec![0f32; (XRES * YRES) as usize];
+    let mut pool = ScratchPool::new(XRES, YRES, vxl.vsid);
+    let sky = engine.sky_color();
+    for px in framebuffer.iter_mut() {
+        *px = sky;
+    }
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+    let mut rasterizer = ScalarRasterizer::new(
+        &mut framebuffer,
+        &mut zbuffer,
+        XRES as usize,
+        &vxl.data,
+        &vxl.column_offset,
+        &vxl.mip_base_offsets,
+        vxl.vsid,
+    );
+    if let Some(sky_ref) = engine.sky() {
+        rasterizer = rasterizer.with_sky(sky_ref);
+    }
+    let outcome = opticast(
+        &mut rasterizer,
+        &mut pool,
+        &cam,
+        &settings,
+        vxl.vsid,
+        &vxl.data,
+        &vxl.column_offset,
+    );
+    drop(rasterizer);
+
+    let mut ppm = format!("P6\n{XRES} {YRES}\n255\n").into_bytes();
+    for &px in &framebuffer {
+        let bytes = px.to_le_bytes();
+        ppm.push(bytes[2]);
+        ppm.push(bytes[1]);
+        ppm.push(bytes[0]);
+    }
+    std::fs::write("/tmp/below_bedrock.ppm", ppm).expect("write ppm");
+    eprintln!("  wrote /tmp/below_bedrock.ppm");
+    eprintln!("  outcome={outcome:?}");
+
+    // Should NOT skip — the bedrock is air, camera is in air below
+    // the bedrock-as-air, looking up should see the floor at z=200.
+    assert_eq!(
+        outcome,
+        OpticastOutcome::Rendered,
+        "below-bedrock camera with treat_z_max_as_air should render the world",
+    );
+
+    // Most pixels should NOT be sky — the floor at z=200 occupies
+    // a non-trivial portion of the upper half of the screen at
+    // pitch=-0.70 (looking up). Allow up to 50% sky to account for
+    // the corners where rays escape past the world.
+    let sky_count = framebuffer.iter().filter(|&&p| p == sky).count();
+    let sky_frac = sky_count as f64 / framebuffer.len() as f64;
+    eprintln!("  sky fraction = {:.3}", sky_frac);
+    assert!(
+        sky_frac < 0.95,
+        "below-bedrock render is {:.1}% sky — looks like the world wasn't rendered",
+        100.0 * sky_frac,
+    );
+}
+
 /// S1.V — above-floor vs below-floor at the SAME OOB-X yaw/pitch.
 /// User's claim: the sky-checker distortion appears ONLY when the
 /// camera is below the floor (z > GROUND_Z = 200). Above the floor

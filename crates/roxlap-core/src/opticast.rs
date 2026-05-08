@@ -219,17 +219,20 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     //
     // For inside-XY camera, the original gstartv walk runs as
     // before; the negative-index path is a no-op.
+    let treat_z_max_as_air = pool.slot(0).treat_z_max_as_air;
     let (gstartz0, gstartz1, camera_vptr_offset) = if prelude.in_bounds_xy {
         let camera_column = camera_column_slice(slab_buf, column_offsets, prelude.column_index);
         let Some(camera_column_data) = camera_column else {
             return OpticastOutcome::SkippedCameraInSolid;
         };
-        let Some(triple) =
-            column_walk::camera_column_air_gap(camera_column_data, prelude.li_pos[2])
-        else {
-            return OpticastOutcome::SkippedCameraInSolid;
-        };
-        triple
+        match column_walk::camera_column_air_gap_with_bedrock(
+            camera_column_data,
+            prelude.li_pos[2],
+            treat_z_max_as_air,
+        ) {
+            Some(triple) => triple,
+            None => return OpticastOutcome::SkippedCameraInSolid,
+        }
     } else {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
         let cx_clamped = prelude.cx.clamp(0, vsid as i32 - 1) as u32;
@@ -237,7 +240,13 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         let cy_clamped = prelude.cy.clamp(0, vsid as i32 - 1) as u32;
         let representative_idx = cy_clamped * vsid + cx_clamped;
         camera_column_slice(slab_buf, column_offsets, representative_idx)
-            .and_then(|c| column_walk::camera_column_air_gap(c, prelude.li_pos[2]))
+            .and_then(|c| {
+                column_walk::camera_column_air_gap_with_bedrock(
+                    c,
+                    prelude.li_pos[2],
+                    treat_z_max_as_air,
+                )
+            })
             // Conservative fallback: full-air column. Hits if the
             // representative column has no slab above the camera's
             // z (e.g., camera is below world's bedrock or the

@@ -34,7 +34,25 @@
 /// - `None` — camera is inside a slab (hidden interior or below the
 ///   final slab); opticast returns early with no render.
 #[must_use]
+#[allow(dead_code)] // Kept as the simple voxlap-canonical entry; production callers go through the bedrock-aware variant.
 pub fn camera_column_air_gap(column: &[u8], cz: i32) -> Option<(i32, i32, usize)> {
+    camera_column_air_gap_with_bedrock(column, cz, false)
+}
+
+/// Variant of [`camera_column_air_gap`] with the `treat_z_max_as_air`
+/// option. When set, the bedrock placeholder slab (z1 = 0xff =
+/// MAXZDIM-1 = 255) is treated as transparent: a camera past every
+/// real slab synthesises an air gap whose top is the previous slab's
+/// floor and whose bottom is the bedrock's top z. Without this, a
+/// camera below the bedrock falls through the slab list with no
+/// visible air gap and the renderer returns SkippedCameraInSolid
+/// (entire frame stays at the host-cleared sky colour).
+#[must_use]
+pub fn camera_column_air_gap_with_bedrock(
+    column: &[u8],
+    cz: i32,
+    treat_z_max_as_air: bool,
+) -> Option<(i32, i32, usize)> {
     if column.len() < 4 {
         return None;
     }
@@ -45,14 +63,40 @@ pub fn camera_column_air_gap(column: &[u8], cz: i32) -> Option<(i32, i32, usize)
         return Some((0, first_z1, 0));
     }
 
+    // Track the previous slab's floor so the bedrock-as-air synthesis
+    // below has a sensible "ceiling" for the synthetic gap.
     let mut pos = 0usize;
+    let mut prev_floor_z1c = first_z1; // ceiling defaults to first slab's top
     loop {
         let nextptr = column[pos];
         if nextptr == 0 {
             // Reached the last slab without finding an air gap above
-            // the camera; voxlap returns early (no render).
+            // the camera. Without treat_z_max_as_air this matches
+            // voxlap C: returns None → opticast bails as
+            // SkippedCameraInSolid.
+            //
+            // With treat_z_max_as_air on AND the last slab is the
+            // bedrock placeholder (z1 == 0xff), the bedrock IS air, so
+            // a camera past every solid slab is in air below the
+            // world. Synthesise an air gap so grouscan can render the
+            // visible scene above the camera. The gap's ceiling is
+            // the previous slab's floor (where solids are still real);
+            // its floor is the bedrock placeholder's z1 (= 255). The
+            // vptr offset stays at the bedrock slab so drawcwall /
+            // drawceil's `v[-4]` lookups land in the previous slab's
+            // last colour entry (the floor's underside colour).
+            if treat_z_max_as_air {
+                let last_z1 = i32::from(column[pos + 1]);
+                if last_z1 == 0xff {
+                    return Some((prev_floor_z1c, last_z1, pos));
+                }
+            }
             return None;
         }
+        // z1c = bottom of floor-colour list - 1 (= last solid voxel
+        // z of the slab + 1 == ceiling z of the air gap below this
+        // slab). Used as the bedrock-air synthesis's ceiling.
+        prev_floor_z1c = i32::from(column[pos + 2]) + 1;
         pos = pos.checked_add(usize::from(nextptr) * 4)?;
         // Need 4 header bytes at the new position.
         if pos.checked_add(4)? > column.len() {
@@ -176,5 +220,33 @@ mod tests {
         let col = vec![99, 10, 14, 0];
         // cz = 100 forces walk-forward; nextptr advances past EOF.
         assert_eq!(camera_column_air_gap(&col, 100), None);
+    }
+
+    /// Floor + bedrock placeholder: cz past the bedrock returns None
+    /// without `treat_z_max_as_air`, but synthesises an air gap when
+    /// the flag is on. Mirrors the test scene used by
+    /// `outside_pentagon_repro::below_bedrock_camera_renders_world`.
+    #[test]
+    fn below_bedrock_synthesises_air_when_flag_set() {
+        // Slab 0: 1-voxel floor at z = 200. nextptr = 2 (header + 1
+        // colour record = 8 bytes = 2 dwords). z1 = z1c = 200.
+        // Slab 1: bedrock placeholder at z = 255. nextptr = 0 (last).
+        let mut col = Vec::new();
+        col.extend_from_slice(&[2, 200, 200, 0]); // floor header
+        col.extend_from_slice(&[0xff; 4]); // floor colour
+        col.extend_from_slice(&[0, 255, 255, 201]); // bedrock header
+        col.extend_from_slice(&[0xff; 4]); // bedrock colour
+                                           // Without flag — voxlap-canonical None.
+        assert_eq!(camera_column_air_gap_with_bedrock(&col, 261, false), None);
+        // With flag — synthesises (z0=201, z1=255, vptr=8).
+        // z0 = floor's z1c+1 = 201 (top of synthetic gap, just below
+        // floor's last solid voxel).
+        // z1 = bedrock's z1 = 255.
+        // vptr = bedrock's offset = 8 (so drawceil reads
+        // column[vptr-4..vptr] = floor's colour).
+        assert_eq!(
+            camera_column_air_gap_with_bedrock(&col, 261, true),
+            Some((201, 255, 8))
+        );
     }
 }
