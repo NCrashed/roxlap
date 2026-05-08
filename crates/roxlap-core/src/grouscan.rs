@@ -2684,7 +2684,11 @@ mod tests {
         };
         let mut s = fresh_scratch();
         s.gixy = [1, 4]; // x-step = 1, y-step = 4
-        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 5, 0, 0, 1);
+                         // S1.Z: column-step recomputes ixy_sptr_col_idx from the signed
+                         // (cx, cy) cursor (cy*vsid + cx), so the seed must match — for
+                         // idx=5 in a 4×4 world, that's (cx=1, cy=1). After lane=0 step:
+                         //   cx 1→2, cy=1 → recomputed idx = 1*4 + 2 = 6.
+        let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 5, 1, 1, 1);
         state.c_idx = CF_SEED_INDEX; // → c-- below seed → column step
         state.lane = 0; // step by gixy[0] = 1
 

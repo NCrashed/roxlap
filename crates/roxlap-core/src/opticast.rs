@@ -225,7 +225,7 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         let Some(camera_column_data) = camera_column else {
             return OpticastOutcome::SkippedCameraInSolid;
         };
-        match column_walk::camera_column_air_gap_with_bedrock(
+        match column_walk::camera_column_air_gap(
             camera_column_data,
             prelude.li_pos[2],
             treat_z_max_as_air,
@@ -241,11 +241,7 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         let representative_idx = cy_clamped * vsid + cx_clamped;
         camera_column_slice(slab_buf, column_offsets, representative_idx)
             .and_then(|c| {
-                column_walk::camera_column_air_gap_with_bedrock(
-                    c,
-                    prelude.li_pos[2],
-                    treat_z_max_as_air,
-                )
+                column_walk::camera_column_air_gap(c, prelude.li_pos[2], treat_z_max_as_air)
             })
             // Conservative fallback: full-air column. Hits if the
             // representative column has no slab above the camera's

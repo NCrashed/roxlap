@@ -32,23 +32,18 @@
 ///   to dispatch the initial drawflor (top-of-column) vs drawceil
 ///   (interior) branch.
 /// - `None` — camera is inside a slab (hidden interior or below the
-///   final slab); opticast returns early with no render.
+///   final slab without the `treat_z_max_as_air` synthesis below);
+///   opticast returns early with no render.
+///
+/// `treat_z_max_as_air`: when `true`, the bedrock placeholder slab
+/// (z1 = 0xff = MAXZDIM-1 = 255) is treated as transparent. A camera
+/// past every real slab synthesises an air gap whose top is the
+/// previous slab's floor and whose bottom is the bedrock's top z.
+/// Without this, a camera below the bedrock returns `None` and the
+/// renderer reports SkippedCameraInSolid (entire frame stays at the
+/// host-cleared sky colour).
 #[must_use]
-#[allow(dead_code)] // Kept as the simple voxlap-canonical entry; production callers go through the bedrock-aware variant.
-pub fn camera_column_air_gap(column: &[u8], cz: i32) -> Option<(i32, i32, usize)> {
-    camera_column_air_gap_with_bedrock(column, cz, false)
-}
-
-/// Variant of [`camera_column_air_gap`] with the `treat_z_max_as_air`
-/// option. When set, the bedrock placeholder slab (z1 = 0xff =
-/// MAXZDIM-1 = 255) is treated as transparent: a camera past every
-/// real slab synthesises an air gap whose top is the previous slab's
-/// floor and whose bottom is the bedrock's top z. Without this, a
-/// camera below the bedrock falls through the slab list with no
-/// visible air gap and the renderer returns SkippedCameraInSolid
-/// (entire frame stays at the host-cleared sky colour).
-#[must_use]
-pub fn camera_column_air_gap_with_bedrock(
+pub fn camera_column_air_gap(
     column: &[u8],
     cz: i32,
     treat_z_max_as_air: bool,
@@ -155,8 +150,8 @@ mod tests {
     #[test]
     fn camera_above_first_slab_returns_zero_to_z1() {
         let col = single_slab_5_15();
-        assert_eq!(camera_column_air_gap(&col, 0), Some((0, 5, 0)));
-        assert_eq!(camera_column_air_gap(&col, 4), Some((0, 5, 0)));
+        assert_eq!(camera_column_air_gap(&col, 0, false), Some((0, 5, 0)));
+        assert_eq!(camera_column_air_gap(&col, 4, false), Some((0, 5, 0)));
     }
 
     #[test]
@@ -164,9 +159,9 @@ mod tests {
         let col = single_slab_5_15();
         // cz = 10 is inside the only slab. We walk forward, hit
         // nextptr = 0, return None.
-        assert_eq!(camera_column_air_gap(&col, 10), None);
+        assert_eq!(camera_column_air_gap(&col, 10, false), None);
         // cz = 100 (way past the column) does the same thing.
-        assert_eq!(camera_column_air_gap(&col, 100), None);
+        assert_eq!(camera_column_air_gap(&col, 100, false), None);
     }
 
     #[test]
@@ -174,7 +169,7 @@ mod tests {
         let col = two_slabs_air_at_20_30();
         // cz = 5 is above slab 0's z1 = 10.
         // Column-top — vptr_offset = 0.
-        assert_eq!(camera_column_air_gap(&col, 5), Some((0, 10, 0)));
+        assert_eq!(camera_column_air_gap(&col, 5, false), Some((0, 10, 0)));
     }
 
     #[test]
@@ -184,9 +179,9 @@ mod tests {
         // Interior gap — vptr_offset points to slab 1's header.
         // Slab 0's nextptr = 6 → 24-byte stride (6 × 4); slab 1
         // starts at column[24].
-        assert_eq!(camera_column_air_gap(&col, 25), Some((20, 30, 24)));
-        assert_eq!(camera_column_air_gap(&col, 20), Some((20, 30, 24)));
-        assert_eq!(camera_column_air_gap(&col, 29), Some((20, 30, 24)));
+        assert_eq!(camera_column_air_gap(&col, 25, false), Some((20, 30, 24)));
+        assert_eq!(camera_column_air_gap(&col, 20, false), Some((20, 30, 24)));
+        assert_eq!(camera_column_air_gap(&col, 29, false), Some((20, 30, 24)));
     }
 
     #[test]
@@ -195,7 +190,7 @@ mod tests {
         // cz = 12 is inside slab 0 (z1 = 10..14). The walker advances
         // to slab 1, which has z1 = 30 (cz < z1) and z0 = 20 (cz < z0)
         // → hidden interior → None.
-        assert_eq!(camera_column_air_gap(&col, 12), None);
+        assert_eq!(camera_column_air_gap(&col, 12, false), None);
     }
 
     #[test]
@@ -203,15 +198,15 @@ mod tests {
         let col = two_slabs_air_at_20_30();
         // cz = 35 is inside slab 1 (z1 = 30..39). The walker advances
         // to slab 1, sees cz >= z1 = 30, hits nextptr = 0 → None.
-        assert_eq!(camera_column_air_gap(&col, 35), None);
+        assert_eq!(camera_column_air_gap(&col, 35, false), None);
         // cz = 1000 — same path.
-        assert_eq!(camera_column_air_gap(&col, 1000), None);
+        assert_eq!(camera_column_air_gap(&col, 1000, false), None);
     }
 
     #[test]
     fn malformed_too_short_returns_none() {
         // Less than a single header.
-        assert_eq!(camera_column_air_gap(&[1, 2, 3], 10), None);
+        assert_eq!(camera_column_air_gap(&[1, 2, 3], 10, false), None);
     }
 
     #[test]
@@ -219,7 +214,7 @@ mod tests {
         // Single slab with nextptr = 99 but no following slab.
         let col = vec![99, 10, 14, 0];
         // cz = 100 forces walk-forward; nextptr advances past EOF.
-        assert_eq!(camera_column_air_gap(&col, 100), None);
+        assert_eq!(camera_column_air_gap(&col, 100, false), None);
     }
 
     /// Floor + bedrock placeholder: cz past the bedrock returns None
@@ -237,16 +232,13 @@ mod tests {
         col.extend_from_slice(&[0, 255, 255, 201]); // bedrock header
         col.extend_from_slice(&[0xff; 4]); // bedrock colour
                                            // Without flag — voxlap-canonical None.
-        assert_eq!(camera_column_air_gap_with_bedrock(&col, 261, false), None);
+        assert_eq!(camera_column_air_gap(&col, 261, false), None);
         // With flag — synthesises (z0=201, z1=255, vptr=8).
         // z0 = floor's z1c+1 = 201 (top of synthetic gap, just below
         // floor's last solid voxel).
         // z1 = bedrock's z1 = 255.
         // vptr = bedrock's offset = 8 (so drawceil reads
         // column[vptr-4..vptr] = floor's colour).
-        assert_eq!(
-            camera_column_air_gap_with_bedrock(&col, 261, true),
-            Some((201, 255, 8))
-        );
+        assert_eq!(camera_column_air_gap(&col, 261, true), Some((201, 255, 8)));
     }
 }
