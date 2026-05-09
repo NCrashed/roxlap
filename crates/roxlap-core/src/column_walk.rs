@@ -40,8 +40,8 @@
 /// past every real slab synthesises an air gap whose top is the
 /// previous slab's floor and whose bottom is the bedrock's top z.
 /// Without this, a camera below the bedrock returns `None` and the
-/// renderer reports SkippedCameraInSolid (entire frame stays at the
-/// host-cleared sky colour).
+/// renderer reports `SkippedCameraInSolid` (entire frame stays at
+/// the host-cleared sky colour).
 #[must_use]
 pub fn camera_column_air_gap(
     column: &[u8],

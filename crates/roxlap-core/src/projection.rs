@@ -105,7 +105,7 @@ pub fn derive_projection(
 /// horizon above it). Only the viewport edges (`wy0` / `wy1` /
 /// `iwy0` / `iwy1`) and the corner-cut quadrilateral are clipped.
 /// `vline_clip` / `hline_clip` consume the clipped wy0/wy1, so
-/// pass-1 ray casts in scan_loops automatically restrict to the
+/// pass-1 ray casts in `scan_loops` automatically restrict to the
 /// strip.
 //
 // clippy::float_cmp at `forward_z == 0.0` is intentional: voxlap's C

@@ -174,7 +174,11 @@ pub enum OpticastOutcome {
 // (a struct-of-args variant just renames the same data). The
 // xres / yres → i32 casts are bounded by realistic framebuffer
 // dimensions and won't wrap.
-#[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_wrap,
+    clippy::similar_names
+)]
 #[must_use]
 pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     rasterizer: &mut R,
@@ -356,7 +360,7 @@ fn run_strip_parallel<R: Rasterizer + Clone + Send + Sync>(
     // `(span + n - 1) / n` → ceiling-divide so trailing rows aren't
     // dropped on non-divisible splits. Last strip may be smaller.
     #[allow(clippy::cast_possible_truncation)]
-    let strip_height: u32 = ((span + n_strips as u32 - 1) / n_strips as u32).max(1);
+    let strip_height: u32 = span.div_ceil(n_strips as u32).max(1);
 
     // Capture borrowed copies for the parallel closure — closure
     // needs `move` for the cloned rasterizer + slot, but the

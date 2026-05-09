@@ -222,6 +222,7 @@ pub const POSES: &[Pose] = &[
 
 /// Voxlap's `BR(rgb) = 0x80000000 | rgb`.
 #[allow(clippy::cast_possible_wrap)]
+#[must_use]
 pub const fn br(rgb: u32) -> i32 {
     (0x8000_0000_u32 | rgb) as i32
 }
@@ -254,6 +255,11 @@ pub fn build_test_tile() -> Vec<i32> {
 }
 
 /// Build a [`Sprite`] for a given pose.
+///
+/// # Panics
+/// If the embedded `meltsphere` or `coco` KV6 fixture bytes can't
+/// parse — they're built into the binary, so a panic here means
+/// the build is broken, not a runtime fault.
 #[must_use]
 pub fn sprite_for_pose(kind: SpriteKind) -> Sprite {
     match kind {
@@ -310,6 +316,11 @@ pub fn camera_for_pose(pose: &Pose) -> Camera {
 }
 
 /// Decompress + parse the embedded oracle world.
+///
+/// # Panics
+/// If the embedded `oracle.vxl.gz` bytes fail to gunzip or parse.
+/// The asset is built into the binary, so a panic here means the
+/// build is broken.
 #[must_use]
 pub fn load_oracle_vxl() -> vxl::Vxl {
     let mut decoder = GzDecoder::new(ORACLE_VXL_GZ);

@@ -16,6 +16,16 @@
 //! where the leak fires.
 
 #![cfg(not(target_arch = "wasm32"))]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::explicit_iter_loop,
+    clippy::too_many_lines,
+    clippy::unreadable_literal,
+    clippy::uninlined_format_args
+)]
 
 use roxlap_cavegen::{pack_dense_grid_to_vxl, MAXZDIM};
 use roxlap_core::camera_math;
@@ -395,8 +405,8 @@ fn checkerboard_sky_oob_vs_inbounds() {
 /// with `treat_z_max_as_air=true`. With the flag the bedrock is air,
 /// so a camera at z=261 looking up should see the floor at z=200.
 /// Repro of user-reported bug: render shows only sky (opticast
-/// returns SkippedCameraInSolid because column_walk reaches the end
-/// of the slab list with no visible air gap).
+/// returns `SkippedCameraInSolid` because `column_walk` reaches the
+/// end of the slab list with no visible air gap).
 ///
 /// User pose: pos=(17.34, 182.69, 261.95) yaw=-0.7225 pitch=-0.7000.
 /// Test scene's floor is at z=200; bedrock placeholder at z=255.
@@ -483,8 +493,9 @@ fn below_bedrock_camera_renders_world() {
 
 /// S1.V — above-floor vs below-floor at the SAME OOB-X yaw/pitch.
 /// User's claim: the sky-checker distortion appears ONLY when the
-/// camera is below the floor (z > GROUND_Z = 200). Above the floor
-/// (z < 200), the same yaw/pitch should render a clean checker.
+/// camera is below the floor (z > `GROUND_Z` = 200). Above the
+/// floor (z < 200), the same yaw/pitch should render a clean
+/// checker.
 ///
 /// Both positions are OOB-X (cx=-22) so OOB-vs-inbounds is held
 /// constant. The floor crossing is the only variable.

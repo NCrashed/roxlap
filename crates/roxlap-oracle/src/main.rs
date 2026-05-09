@@ -282,10 +282,15 @@ fn cmd_bench(opts: &BenchOpts) -> std::io::Result<()> {
 /// (same lights → same alpha bytes), so repeated calls are safe.
 /// Speedup follows `RAYON_NUM_THREADS` — set `=1` to measure the
 /// sequential baseline, leave unset to use rayon's default pool
-/// (= num_cpus). The R12.4.1 parallel path is always engaged;
+/// (= `num_cpus`). The R12.4.1 parallel path is always engaged;
 /// there is no `--threads` flag because `update_lighting`'s pool
 /// is rayon's global pool, not [`ScratchPool`].
-#[allow(clippy::unnecessary_wraps)]
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn cmd_bench_lighting(iters: usize, warmup: usize) -> std::io::Result<()> {
     let mut engine = Engine::new();
     let mut vxl_world = load_oracle_vxl();
@@ -379,7 +384,7 @@ fn cmd_bench_lighting(iters: usize, warmup: usize) -> std::io::Result<()> {
 ///
 /// Compares:
 ///  - **sequential**: a manual `for sprite in &sprites { draw_sprite(...) }` loop.
-///  - **parallel**:   `draw_sprites_parallel(&sprites)` (rayon par_iter).
+///  - **parallel**:   `draw_sprites_parallel(&sprites)` (rayon `par_iter`).
 ///
 /// Reports min / p50 / mean / p99 / max for each variant. Speedup
 /// follows `RAYON_NUM_THREADS`; set `=1` for the sequential
@@ -387,6 +392,9 @@ fn cmd_bench_lighting(iters: usize, warmup: usize) -> std::io::Result<()> {
 /// overhead from the actual parallel speedup).
 #[allow(
     clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
     clippy::unnecessary_wraps,
     clippy::too_many_lines
 )]

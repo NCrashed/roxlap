@@ -137,7 +137,7 @@ pub struct ScanScratch {
     pub sideshademode: bool,
 
     /// S1.W: when `true`, draw phases that are about to read a voxel
-    /// at z=MAXZDIM-1 (=255, voxlap's bedrock z) bail to AfterDelete
+    /// at z=MAXZDIM-1 (=255, voxlap's bedrock z) bail to `AfterDelete`
     /// instead of writing it to the radar. The ray then column-steps
     /// past the bedrock until either an in-bounds slab fires or
     /// `gxmax` triggers `Startsky` — which in turn fills the radar
@@ -166,7 +166,7 @@ impl ScanScratch {
     /// framebuffer. Voxlap's per-frame `radar` buffer is
     /// `MAXXDIM * 6 * 256` `castdat` entries (`voxlap5.c:206`-area
     /// declaration). Sized as `xres * max(6*256, yres*2)` — the
-    /// `yres*2` branch activates on HiDPI screens where per-quadrant
+    /// `yres*2` branch activates on `HiDPI` screens where per-quadrant
     /// radar consumption exceeds the classic `6*256` per-column budget
     /// due to corner-cut fan expansion at steep camera angles.
     /// `uurend` / `lastx` are sized to fit `xres` / `max(yres, vsid)`

@@ -261,6 +261,7 @@ impl KeyState {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct App {
     /// Window handle. Wrapped in `Rc` because softbuffer's `Context`
     /// and `Surface` each take a clone — both need the same handle
@@ -997,13 +998,27 @@ fn load_oracle_vxl() -> vxl::Vxl {
 /// Camera spawns 1 voxel above the platform centre, looking +x
 /// (toward the red cube). Fly any direction to leave the world
 /// boundary and see the scene from outside.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
 fn build_small_test_scene() -> vxl::Vxl {
     use roxlap_cavegen::{pack_dense_grid_to_vxl, MAXZDIM};
 
     /// Top of the ground plane. Anything at z ≥ this is solid
     /// ground; anything above is air.
     const GROUND_Z: usize = 200;
+    // Voxlap colour packing: (brightness << 24) | (R << 16) | (G << 8) | B.
+    // 0x80 brightness = engine-default "neutral" lighting amplitude.
+    const GROUND_COL: u32 = 0x80_3a_8a_3a; // mossy green
+    const PLATFORM_COL: u32 = 0x80_b0_b0_b8; // light grey
+    const CUBE_COL: u32 = 0x80_e0_30_30; // red
+    const SPHERE_COL: u32 = 0x80_30_60_e0; // blue
+    const TOWER_COL: u32 = 0x80_e0_d0_30; // yellow
+    const PLATFORM_HALF: usize = 8;
+    const PLATFORM_HEIGHT: usize = 8;
 
     let vsid = SMALL_VSID;
     let vsid_u = vsid as usize;
@@ -1015,14 +1030,6 @@ fn build_small_test_scene() -> vxl::Vxl {
 
     // (y, x, z) order per pack_dense_grid_to_vxl's contract.
     let idx = |x: usize, y: usize, z: usize| -> usize { (y * vsid_u + x) * max_z + z };
-
-    // Voxlap colour packing: (brightness << 24) | (R << 16) | (G << 8) | B.
-    // 0x80 brightness = engine-default "neutral" lighting amplitude.
-    const GROUND_COL: u32 = 0x80_3a_8a_3a; // mossy green
-    const PLATFORM_COL: u32 = 0x80_b0_b0_b8; // light grey
-    const CUBE_COL: u32 = 0x80_e0_30_30; // red
-    const SPHERE_COL: u32 = 0x80_30_60_e0; // blue
-    const TOWER_COL: u32 = 0x80_e0_d0_30; // yellow
 
     // 1. Flat ground plane covering the whole XY footprint, ONE
     //    voxel thick — anything below `GROUND_Z` is empty so rays
@@ -1045,8 +1052,6 @@ fn build_small_test_scene() -> vxl::Vxl {
     //    z = GROUND_Z - 8).
     let cx = vsid_u / 2;
     let cy = vsid_u / 2;
-    const PLATFORM_HALF: usize = 8;
-    const PLATFORM_HEIGHT: usize = 8;
     let plat_top_z = GROUND_Z - PLATFORM_HEIGHT;
     for y in (cy - PLATFORM_HALF)..(cy + PLATFORM_HALF) {
         for x in (cx - PLATFORM_HALF)..(cx + PLATFORM_HALF) {
@@ -1148,7 +1153,8 @@ fn fill_box(
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names
 )]
 fn fill_sphere(
     grid: &mut [u8],

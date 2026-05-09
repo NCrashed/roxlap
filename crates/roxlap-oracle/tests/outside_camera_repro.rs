@@ -10,6 +10,7 @@
 //! run on that arch (same flow as R9.4).
 
 #![cfg(not(target_arch = "wasm32"))]
+#![allow(clippy::cast_precision_loss, clippy::explicit_iter_loop)]
 
 use roxlap_core::camera_math;
 use roxlap_core::opticast::{opticast, OpticastOutcome};

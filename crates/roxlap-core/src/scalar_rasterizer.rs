@@ -48,7 +48,7 @@ use crate::scan_loops::ScanContext;
 
 /// Borrowed view of the framebuffer + zbuffer as raw pointers.
 ///
-/// R12.2.0 introduces this so the per-frame ScalarRasterizer can be
+/// R12.2.0 introduces this so the per-frame `ScalarRasterizer` can be
 /// `Copy` (for the per-thread fan-out R12.2.1 lands). Holding `&'a
 /// mut [u32]` / `&'a mut [f32]` directly forces exclusive borrows
 /// per instance, blocking the four quadrants from running on four
@@ -646,6 +646,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // sphere position in diag_down / high_down.
     }
 
+    #[allow(clippy::too_many_lines)]
     fn hrend(
         &mut self,
         scratch: &mut ScanScratch,
@@ -886,6 +887,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn vrend(
         &mut self,
         scratch: &mut ScanScratch,

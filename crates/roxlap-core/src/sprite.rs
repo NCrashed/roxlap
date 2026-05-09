@@ -313,13 +313,13 @@ pub(crate) struct Kv6FullState<'a> {
 /// `qsum0` / `qsum1` assume that geometry.
 ///
 /// Internally a raw-pointer view (similar to
-/// [`crate::scalar_rasterizer::RasterTarget`]) so the type is `Copy
-/// + Send + Sync` and the R12.4.2 [`draw_sprites_parallel`] entry
-/// point can hand per-thread copies into rayon worker closures.
-/// Each parallel sprite-draw competes for the framebuffer / zbuffer
-/// via z-test; for non-overlapping sprites this is race-free, for
-/// overlapping pixels a tied-z race may leak (visually
-/// indistinguishable, hash non-deterministic).
+/// [`crate::scalar_rasterizer::RasterTarget`]) so the type is
+/// `Copy + Send + Sync` and the R12.4.2 [`draw_sprites_parallel`]
+/// entry point can hand per-thread copies into rayon worker
+/// closures. Each parallel sprite-draw competes for the
+/// framebuffer / zbuffer via z-test; for non-overlapping sprites
+/// this is race-free, for overlapping pixels a tied-z race may
+/// leak (visually indistinguishable, hash non-deterministic).
 #[derive(Clone, Copy, Debug)]
 pub struct DrawTarget<'a> {
     fb_ptr: *mut u32,
@@ -405,6 +405,7 @@ impl<'a> DrawTarget<'a> {
     /// arbitration contract on [`DrawTarget`] applies (see struct
     /// doc).
     #[inline]
+    #[must_use]
     pub unsafe fn z_test_write(self, idx: usize, color: u32, z: f32) -> bool {
         debug_assert!(idx < self.fb_len, "fb idx {} >= len {}", idx, self.fb_len);
         debug_assert!(idx < self.zb_len, "zb idx {} >= len {}", idx, self.zb_len);
@@ -1559,12 +1560,12 @@ pub(crate) fn kv6_iterate<F: FnMut(&Voxel, u32, [f32; 4])>(
 /// Render a batch of sprites in parallel via `rayon::par_iter`.
 ///
 /// Each sprite runs its own [`draw_sprite`] pass on its own thread,
-/// writing to the shared [`DrawTarget`] (raw pointers; `Copy + Send
-/// + Sync`) under the z-test arbitration contract: a pixel write
-/// only fires when the new sprite's z is strictly less than the
-/// current zbuffer value. For non-overlapping sprites the writes
-/// are pairwise-disjoint and the output is byte-identical to a
-/// sequential pass over the same sprite list. For overlapping
+/// writing to the shared [`DrawTarget`] (raw pointers;
+/// `Copy + Send + Sync`) under the z-test arbitration contract: a
+/// pixel write only fires when the new sprite's z is strictly less
+/// than the current zbuffer value. For non-overlapping sprites the
+/// writes are pairwise-disjoint and the output is byte-identical
+/// to a sequential pass over the same sprite list. For overlapping
 /// pixels, two sprites at exactly tied z-values produce a
 /// non-deterministic last-writer-wins outcome — visually
 /// indistinguishable but hash-non-deterministic.
@@ -1580,6 +1581,7 @@ pub(crate) fn kv6_iterate<F: FnMut(&Voxel, u32, [f32; 4])>(
 /// the per-sprite overhead amortises well past ~4 sprites on
 /// consumer-class hardware.
 #[allow(clippy::module_name_repetitions)]
+#[must_use]
 pub fn draw_sprites_parallel(
     target: DrawTarget<'_>,
     cam: &CameraState,
@@ -1587,6 +1589,8 @@ pub fn draw_sprites_parallel(
     lighting: &SpriteLighting<'_>,
     sprites: &[Sprite],
 ) -> u32 {
+    use rayon::prelude::*;
+
     let render_one = |sprite: &Sprite| {
         // `target` is `Copy`, so each closure captures its own
         // copy of the (raw fb / zb pointer) view. `cam`,
@@ -1595,7 +1599,6 @@ pub fn draw_sprites_parallel(
         draw_sprite(&mut t, cam, settings, lighting, sprite)
     };
 
-    use rayon::prelude::*;
     sprites.par_iter().map(render_one).sum()
 }
 
