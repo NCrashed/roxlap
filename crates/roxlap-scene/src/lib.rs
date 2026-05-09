@@ -18,17 +18,24 @@
 //! allocation) and the [`Grid`] edit API ([`Grid::set_voxel`],
 //! [`Grid::set_rect`], [`Grid::set_sphere`]) which decompose
 //! multi-chunk operations and delegate to
-//! [`roxlap_formats::edit`]. Rendering composition is still owed
-//! (S3+).
+//! [`roxlap_formats::edit`]. S2.3 adds the [`snapshot`] module —
+//! a serde-friendly view of the scene that round-trips through
+//! `Serialize` + `Deserialize` (chunks encode via
+//! [`roxlap_formats::vxl::serialize`] / [`parse`]). Rendering
+//! composition is still owed (S3+).
+//!
+//! [`parse`]: roxlap_formats::vxl::parse
 
 pub mod addr;
 pub mod chunks;
 pub mod edit;
+pub mod snapshot;
 
 use std::collections::HashMap;
 
 use glam::{DQuat, DVec3, IVec3, UVec3};
 use roxlap_formats::vxl::Vxl;
+use serde::{Deserialize, Serialize};
 
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
 
@@ -47,7 +54,7 @@ pub const CHUNK_SIZE_Z: u32 = 256;
 /// Stable identifier for a grid registered in a [`Scene`]. Issued
 /// by [`Scene::add_grid`]; persists across edits but a removed
 /// grid's id is not reissued.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GridId(u32);
 
 impl GridId {
@@ -64,7 +71,7 @@ impl GridId {
 /// chunk `(0, 0, 0)`'s `(0, 0, 0)` voxel maps to
 /// `origin + rotation * vec3(0, 0, 0)` (i.e. just `origin`).
 /// Voxel size is fixed at 1 world unit / voxel for v1.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GridTransform {
     pub origin: DVec3,
     pub rotation: DQuat,
@@ -105,7 +112,7 @@ impl Default for GridTransform {
 /// grid's local origin and may extend in either direction. `voxel`
 /// is unsigned and must satisfy
 /// `(voxel.x, voxel.y) < CHUNK_SIZE_XY` and `voxel.z < CHUNK_SIZE_Z`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GridAddr {
     pub grid: GridId,
     pub chunk: IVec3,

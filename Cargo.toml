@@ -34,7 +34,12 @@ rayon = "1.10"
 # rotation. `DVec3` covers the universe-level position math and
 # `DQuat` is the per-grid orientation primitive S5 will compose with
 # camera basis vectors. Pinned to a stable 0.x; std-only build.
-glam = { version = "0.30", default-features = false, features = ["std"] }
+# `serde` feature enabled for S2.3 scene-snapshot round-trip.
+glam = { version = "0.30", default-features = false, features = ["std", "serde"] }
+# S2.3 — serde derives for the scene snapshot (Scene → bytes → Scene
+# round-trip). Format-agnostic — downstream picks bincode / postcard
+# / json / etc.
+serde = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

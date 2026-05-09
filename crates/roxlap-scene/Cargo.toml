@@ -15,6 +15,14 @@ categories = ["game-development", "graphics"]
 [dependencies]
 glam = { workspace = true }
 roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
+serde = { workspace = true }
+
+[dev-dependencies]
+# S2.3 round-trip test serialises through a real binary codec to
+# exercise the snapshot end-to-end (not just the field-by-field
+# Serialize impls). bincode is the most common choice in the rust
+# game-engine ecosystem; pinned to 1.x for stability.
+bincode = "1"
 
 [lints]
 workspace = true
