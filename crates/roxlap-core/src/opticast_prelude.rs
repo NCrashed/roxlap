@@ -126,8 +126,13 @@ pub fn derive_prelude(
     // For in-bounds cameras, this is the canonical voxlap
     // `gpixy = ipy*VSID + ipx` index. For OOB cameras the value is
     // garbage (u32 wrap) but is never read — every read site gates
-    // on `in_bounds_xy` first.
-    let column_index = (li_pos[1] as u32) * vsid + (li_pos[0] as u32);
+    // on `in_bounds_xy` first. `wrapping_*` makes the intent
+    // explicit and avoids debug-mode overflow panics for cameras
+    // far outside the world (large negative `li_pos` casts to
+    // u32::MAX-ish values whose product with `vsid` exceeds `u32::MAX`).
+    let column_index = (li_pos[1] as u32)
+        .wrapping_mul(vsid)
+        .wrapping_add(li_pos[0] as u32);
 
     let xfrac1 = camera_state.pos[0] - li_pos[0] as f32;
     let yfrac1 = camera_state.pos[1] - li_pos[1] as f32;
