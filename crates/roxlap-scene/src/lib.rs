@@ -29,6 +29,7 @@
 pub mod addr;
 pub mod chunks;
 pub mod edit;
+pub mod render;
 pub mod snapshot;
 
 use std::collections::HashMap;
