@@ -7,7 +7,7 @@
 
 use glam::DVec3;
 use roxlap_core::Camera;
-use roxlap_scene::{GridTransform, Scene};
+use roxlap_scene::{GridId, GridTransform, Scene, CHUNK_SIZE_Z};
 
 use crate::{ship, terrain};
 
@@ -45,6 +45,13 @@ pub fn build_demo() -> SceneAndCamera {
     let ship_id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, -100.0)));
     ship::build_ship(scene.grid_mut(ship_id).expect("ship grid present"));
 
+    // Bake lightmode-1 directional shading into every chunk's slab
+    // alpha bytes. Pure surface-normal-based gradient — voxlap's
+    // `(tp.y * 0.5 + tp.z) * 64 + 103.5` formula. Done once at
+    // scene-build time; the renderer reads the baked values via
+    // hrend / vrend without needing further setup.
+    bake_lightmode_1(&mut scene);
+
     let initial_pos = [64.0, -120.0, 50.0];
     let initial_yaw = std::f64::consts::FRAC_PI_2; // looks +y
     let initial_pitch = 0.0;
@@ -76,5 +83,41 @@ impl SceneAndCamera {
     /// pitch)` state. Call after any input that touches them.
     pub fn refresh_camera(&mut self) {
         self.camera = camera_for_yaw_pitch(self.cam_pos, self.yaw, self.pitch);
+    }
+}
+
+/// Bake voxlap's lightmode-1 (sun-style directional) shading into
+/// every chunk of every grid. Mode 1 uses surface normals only —
+/// no `LightSrc` consulted — so we pass an empty `lights` slice.
+///
+/// Cost: linear in solid-voxel count per chunk; for our 2-chunk
+/// demo (one full of terrain, one mostly air around a saucer)
+/// this completes well under a second.
+#[allow(clippy::cast_possible_wrap)]
+fn bake_lightmode_1(scene: &mut Scene) {
+    const LIGHTMODE: u32 = 1;
+    let ids: Vec<GridId> = scene.grids().map(|(id, _)| id).collect();
+    for id in ids {
+        let grid = scene.grid_mut(id).expect("grid present");
+        let cs_xy = grid.chunks.values().next().map_or(0, |c| c.vsid as i32);
+        if cs_xy == 0 {
+            continue;
+        }
+        let cs_z = CHUNK_SIZE_Z as i32;
+        for chunk in grid.chunks.values_mut() {
+            roxlap_core::update_lighting(
+                &mut chunk.data,
+                &chunk.column_offset,
+                chunk.vsid,
+                0,
+                0,
+                0,
+                cs_xy,
+                cs_xy,
+                cs_z,
+                LIGHTMODE,
+                &[],
+            );
+        }
     }
 }
