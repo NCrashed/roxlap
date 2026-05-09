@@ -10,15 +10,20 @@
 //! (S5), far-LOD billboards / planet proxies (S6), and streaming +
 //! procedural generation (S7).
 //!
-//! S2.0 lands the **type skeleton + grid registration only** — no
-//! chunk storage logic, no edit API, no rendering. Later S2.x
-//! sub-substages flesh out the address math, sparse chunk storage,
-//! and edit API.
+//! S2.0 lands the **type skeleton + grid registration only**.
+//! S2.1 adds the [`addr`] module — world ↔ grid-local ↔ chunk +
+//! voxel-in-chunk decomposition, the canonical f64↔i32 boundary
+//! helper called out by risk R5 in `PORTING-SCENE.md`. Sparse
+//! chunk storage logic, edit API, and rendering are still owed.
+
+pub mod addr;
 
 use std::collections::HashMap;
 
 use glam::{DQuat, DVec3, IVec3, UVec3};
 use roxlap_formats::vxl::Vxl;
+
+pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
 /// chunks compact (~2 MB worst-case dense-slab footprint inside

@@ -1,0 +1,396 @@
+//! Address math for the world ↔ grid-local ↔ chunk + voxel
+//! coordinate spaces.
+//!
+//! Three spaces:
+//!
+//! 1. **World** (f64). Universe-level positions; one [`DVec3`]
+//!    per point.
+//! 2. **Grid-local** (f64). Position in a grid's local frame
+//!    (origin + rotation already applied). Voxel size is fixed
+//!    at 1 unit / voxel; integer voxel coordinate `v` covers
+//!    grid-local space `[v, v+1)` on each axis.
+//! 3. **Chunk + voxel-in-chunk** (i32 + u32). A grid-local voxel
+//!    coordinate `v: IVec3` decomposes into a chunk index
+//!    `c: IVec3` and a voxel offset `u: UVec3` within that
+//!    chunk. Chunks are XY = [`CHUNK_SIZE_XY`], Z =
+//!    [`CHUNK_SIZE_Z`], so `u.x, u.y < CHUNK_SIZE_XY` and
+//!    `u.z < CHUNK_SIZE_Z`.
+//!
+//! Negative voxel coords decompose with [`i32::div_euclid`] /
+//! [`i32::rem_euclid`] semantics: voxel `-1` lives in chunk `-1`
+//! at position `(CHUNK_SIZE - 1)`. This matches the natural
+//! "voxel slots tile the integer line, chunks tile groups of
+//! slots" intuition; using truncating division would put voxel
+//! `-1` in chunk `0` at position `-1`, splitting the chunk-0 /
+//! chunk-(-1) boundary inconsistently.
+//!
+//! All conversions go through these helpers — risk R5 in
+//! `PORTING-SCENE.md` calls out the f64↔i32 boundary as a common
+//! off-by-one source, so concentrating the casts here lets the
+//! property tests pin them.
+
+// `CHUNK_SIZE_XY` (128) and `CHUNK_SIZE_Z` (256) both fit in
+// i32::MAX/2 with room to spare, so all `as i32` casts in this
+// module are exact. Same for `voxel_in_chunk: UVec3` components,
+// which are bounded by those constants and only cast for
+// arithmetic on signed `IVec3`.
+#![allow(clippy::cast_possible_wrap)]
+
+use glam::{DVec3, IVec3, UVec3, Vec3};
+
+use crate::{GridTransform, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+
+/// Decomposition of a grid-local position into discrete chunk +
+/// voxel + sub-voxel coordinates.
+///
+/// `chunk + voxel` reconstructs the integer voxel coordinate via
+/// [`voxel_global`]; adding `fract` (range `[0, 1)` per axis) and
+/// the rotated origin gets back to the original world position
+/// via [`grid_local_to_world`]. `fract` is f32 because per-chunk
+/// ray math is f32 throughout — keeping the boundary cast here
+/// means downstream code doesn't repeat it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridLocalPos {
+    /// Chunk index in grid-local space. Signed because chunks
+    /// can extend in either direction from the grid origin.
+    pub chunk: IVec3,
+    /// Voxel offset within `chunk`. `voxel.x, voxel.y` are in
+    /// `[0, CHUNK_SIZE_XY)`; `voxel.z` is in `[0, CHUNK_SIZE_Z)`.
+    pub voxel: UVec3,
+    /// Sub-voxel position within the voxel cell, `[0, 1)` per
+    /// axis. Cast to f32 because per-chunk ray math is f32.
+    pub fract: Vec3,
+}
+
+/// Per-axis chunk size as an [`IVec3`]. Used as the divisor for
+/// `div_euclid` / `rem_euclid` when splitting a grid-local voxel
+/// coordinate into chunk + voxel-in-chunk.
+#[inline]
+fn chunk_size_ivec3() -> IVec3 {
+    // `as i32` is exact: both constants are well under `i32::MAX`.
+    #[allow(clippy::cast_possible_wrap)]
+    IVec3::new(
+        CHUNK_SIZE_XY as i32,
+        CHUNK_SIZE_XY as i32,
+        CHUNK_SIZE_Z as i32,
+    )
+}
+
+/// Split a grid-local voxel coordinate into `(chunk, voxel-in-chunk)`.
+///
+/// Uses [`IVec3::div_euclid`] / [`IVec3::rem_euclid`] so negative
+/// voxel coordinates round toward `-∞`: voxel `-1` decomposes to
+/// `(chunk = -1, voxel = CHUNK_SIZE - 1)`, not `(0, -1)`. The
+/// returned `voxel-in-chunk` is always non-negative, so casting
+/// each component `as u32` is safe.
+#[must_use]
+pub fn voxel_split(voxel: IVec3) -> (IVec3, UVec3) {
+    let cs = chunk_size_ivec3();
+    let chunk = voxel.div_euclid(cs);
+    let in_chunk_i = voxel.rem_euclid(cs);
+    // rem_euclid postcondition: each component in [0, divisor).
+    // Cast is safe.
+    #[allow(clippy::cast_sign_loss)]
+    let in_chunk = UVec3::new(
+        in_chunk_i.x as u32,
+        in_chunk_i.y as u32,
+        in_chunk_i.z as u32,
+    );
+    (chunk, in_chunk)
+}
+
+/// Inverse of [`voxel_split`]: combine a chunk index and a
+/// voxel-in-chunk offset back into a grid-local voxel coordinate.
+///
+/// Caller is responsible for the `voxel_in_chunk` invariant
+/// (`x, y < CHUNK_SIZE_XY` and `z < CHUNK_SIZE_Z`); a stray
+/// out-of-range value just shifts the result by a chunk's worth.
+/// Debug builds panic via the [`debug_assert!`]s.
+#[must_use]
+pub fn voxel_global(chunk: IVec3, voxel_in_chunk: UVec3) -> IVec3 {
+    debug_assert!(voxel_in_chunk.x < CHUNK_SIZE_XY, "voxel.x out of range");
+    debug_assert!(voxel_in_chunk.y < CHUNK_SIZE_XY, "voxel.y out of range");
+    debug_assert!(voxel_in_chunk.z < CHUNK_SIZE_Z, "voxel.z out of range");
+    let cs = chunk_size_ivec3();
+    // `as i32` is safe: voxel_in_chunk components are < CHUNK_SIZE_*,
+    // which fit comfortably in i32.
+    #[allow(clippy::cast_possible_wrap)]
+    let in_chunk_i = IVec3::new(
+        voxel_in_chunk.x as i32,
+        voxel_in_chunk.y as i32,
+        voxel_in_chunk.z as i32,
+    );
+    chunk * cs + in_chunk_i
+}
+
+/// Project a world-space position into the grid-local frame and
+/// decompose into chunk + voxel + sub-voxel.
+///
+/// Steps:
+/// 1. Translate by `-transform.origin`.
+/// 2. Rotate by `transform.rotation.inverse()` (back to grid-local
+///    axes). Identity rotation (axis-aligned grid) collapses this
+///    to a no-op.
+/// 3. Floor each component to the integer voxel; keep the
+///    remainder as the sub-voxel fractional position (cast to
+///    f32 at the boundary).
+/// 4. Split the integer voxel into chunk + voxel-in-chunk via
+///    [`voxel_split`].
+///
+/// The full pipeline is the canonical world↔grid handoff — risk
+/// R5 in `PORTING-SCENE.md`. Round-tripping with
+/// [`grid_local_to_world`] reconstructs the original world point
+/// up to f32 precision in the fractional component (sub-millimetre
+/// at typical voxel scales).
+#[must_use]
+pub fn world_to_grid_local(world_pos: DVec3, transform: &GridTransform) -> GridLocalPos {
+    let local_d = transform.rotation.inverse() * (world_pos - transform.origin);
+    let voxel_d = local_d.floor();
+    // After `.floor()` the components are integer-valued; truncating
+    // to i32 is equivalent to flooring. Out-of-range coords saturate,
+    // which is acceptable behaviour for a degenerate input — the
+    // caller never sees a wrap. f32 fractional cast is lossy by
+    // design; sub-mm precision at 1-unit voxel scale.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    let voxel = IVec3::new(voxel_d.x as i32, voxel_d.y as i32, voxel_d.z as i32);
+    #[allow(clippy::cast_possible_truncation)]
+    let fract = (local_d - voxel_d).as_vec3();
+    let (chunk, in_chunk) = voxel_split(voxel);
+    GridLocalPos {
+        chunk,
+        voxel: in_chunk,
+        fract,
+    }
+}
+
+/// Inverse of [`world_to_grid_local`]: reconstruct the world-space
+/// position of a grid-local chunk + voxel + sub-voxel.
+///
+/// Round-trips with [`world_to_grid_local`] up to f32 precision in
+/// the fractional component (the `fract: Vec3` cast is the lossy
+/// step).
+#[must_use]
+pub fn grid_local_to_world(
+    chunk: IVec3,
+    voxel_in_chunk: UVec3,
+    fract: Vec3,
+    transform: &GridTransform,
+) -> DVec3 {
+    let voxel = voxel_global(chunk, voxel_in_chunk);
+    let local = voxel.as_dvec3() + fract.as_dvec3();
+    transform.origin + transform.rotation * local
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::DQuat;
+
+    // ---- voxel_split / voxel_global round-trip ----
+
+    #[test]
+    fn voxel_split_origin() {
+        let (c, v) = voxel_split(IVec3::ZERO);
+        assert_eq!(c, IVec3::ZERO);
+        assert_eq!(v, UVec3::ZERO);
+    }
+
+    #[test]
+    fn voxel_split_at_chunk_boundary_positive() {
+        // (CHUNK_SIZE_XY, 0, 0) is the first voxel of chunk (1,0,0).
+        let (c, v) = voxel_split(IVec3::new(CHUNK_SIZE_XY as i32, 0, 0));
+        assert_eq!(c, IVec3::new(1, 0, 0));
+        assert_eq!(v, UVec3::new(0, 0, 0));
+    }
+
+    #[test]
+    fn voxel_split_at_chunk_boundary_minus_one() {
+        // (-1, 0, 0) is the last voxel of chunk (-1, 0, 0).
+        let (c, v) = voxel_split(IVec3::new(-1, 0, 0));
+        assert_eq!(c, IVec3::new(-1, 0, 0));
+        assert_eq!(v, UVec3::new(CHUNK_SIZE_XY - 1, 0, 0));
+    }
+
+    #[test]
+    fn voxel_split_z_axis_uses_z_chunk_size() {
+        // z = 256 should fall into chunk (0, 0, 1) at z-offset 0,
+        // not into a 128-strided chunk like XY.
+        let (c, v) = voxel_split(IVec3::new(0, 0, CHUNK_SIZE_Z as i32));
+        assert_eq!(c, IVec3::new(0, 0, 1));
+        assert_eq!(v, UVec3::new(0, 0, 0));
+    }
+
+    #[test]
+    fn voxel_global_inverts_voxel_split() {
+        // Sample chunks/voxels covering positive, negative,
+        // boundary, and interior cases. Each should round-trip.
+        let cases = [
+            IVec3::ZERO,
+            IVec3::new(1, 1, 1),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, -1),
+            IVec3::new(CHUNK_SIZE_XY as i32, 0, 0),
+            IVec3::new(0, CHUNK_SIZE_XY as i32, 0),
+            IVec3::new(0, 0, CHUNK_SIZE_Z as i32),
+            IVec3::new(-(CHUNK_SIZE_XY as i32) - 5, 7, 33),
+            IVec3::new(127, 128, 256),
+            IVec3::new(1_000_000, -1_000_000, 500),
+        ];
+        for v in cases {
+            let (c, in_chunk) = voxel_split(v);
+            assert_eq!(
+                voxel_global(c, in_chunk),
+                v,
+                "round trip failed for v={v:?} → (c={c:?}, in_chunk={in_chunk:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn voxel_split_in_chunk_always_in_range() {
+        // Brute-force a 3-chunk-wide range around the origin so we
+        // hit positive, negative, and boundary voxels on all axes.
+        for vx in -200i32..200 {
+            for vy in -200i32..200 {
+                for vz in -300i32..300 {
+                    let (_, u) = voxel_split(IVec3::new(vx, vy, vz));
+                    assert!(u.x < CHUNK_SIZE_XY, "x={} out of range", u.x);
+                    assert!(u.y < CHUNK_SIZE_XY, "y={} out of range", u.y);
+                    assert!(u.z < CHUNK_SIZE_Z, "z={} out of range", u.z);
+                }
+            }
+        }
+    }
+
+    // ---- world_to_grid_local: identity transform ----
+
+    #[test]
+    fn world_to_local_identity_at_origin() {
+        let t = GridTransform::identity();
+        let p = world_to_grid_local(DVec3::ZERO, &t);
+        assert_eq!(p.chunk, IVec3::ZERO);
+        assert_eq!(p.voxel, UVec3::ZERO);
+        assert!(p.fract.abs_diff_eq(Vec3::ZERO, 1e-6));
+    }
+
+    #[test]
+    fn world_to_local_identity_at_voxel_centre() {
+        // (1.5, 2.5, 3.5) is the centre of voxel (1, 2, 3) — chunk
+        // (0, 0, 0), voxel-in-chunk (1, 2, 3), fractional (.5, .5, .5).
+        let t = GridTransform::identity();
+        let p = world_to_grid_local(DVec3::new(1.5, 2.5, 3.5), &t);
+        assert_eq!(p.chunk, IVec3::ZERO);
+        assert_eq!(p.voxel, UVec3::new(1, 2, 3));
+        assert!(p.fract.abs_diff_eq(Vec3::splat(0.5), 1e-6));
+    }
+
+    #[test]
+    fn world_to_local_negative_world_pos() {
+        // (-0.5, 0, 0) sits in voxel (-1, 0, 0) = chunk (-1, 0, 0)
+        // at position CHUNK_SIZE_XY - 1, fractional .5.
+        let t = GridTransform::identity();
+        let p = world_to_grid_local(DVec3::new(-0.5, 0.0, 0.0), &t);
+        assert_eq!(p.chunk, IVec3::new(-1, 0, 0));
+        assert_eq!(p.voxel, UVec3::new(CHUNK_SIZE_XY - 1, 0, 0));
+        assert!(p.fract.abs_diff_eq(Vec3::new(0.5, 0.0, 0.0), 1e-6));
+    }
+
+    #[test]
+    fn world_to_local_at_chunk_boundary() {
+        // World x = 128.0 == CHUNK_SIZE_XY: starts a new chunk.
+        let t = GridTransform::identity();
+        let p = world_to_grid_local(DVec3::new(f64::from(CHUNK_SIZE_XY), 0.0, 0.0), &t);
+        assert_eq!(p.chunk, IVec3::new(1, 0, 0));
+        assert_eq!(p.voxel, UVec3::ZERO);
+        assert!(p.fract.abs_diff_eq(Vec3::ZERO, 1e-6));
+    }
+
+    // ---- world_to_local: translated grid ----
+
+    #[test]
+    fn translation_offsets_world_position() {
+        // Grid placed at world (1000, 2000, 3000); world point
+        // (1000.5, 2000.5, 3000.5) is grid-local (0.5, 0.5, 0.5)
+        // → voxel (0, 0, 0), fractional (0.5, 0.5, 0.5).
+        let t = GridTransform::at(DVec3::new(1000.0, 2000.0, 3000.0));
+        let p = world_to_grid_local(DVec3::new(1000.5, 2000.5, 3000.5), &t);
+        assert_eq!(p.chunk, IVec3::ZERO);
+        assert_eq!(p.voxel, UVec3::ZERO);
+        assert!(p.fract.abs_diff_eq(Vec3::splat(0.5), 1e-6));
+    }
+
+    // ---- world_to_local: rotated grid ----
+
+    #[test]
+    fn rotation_90_z_swaps_x_and_y() {
+        // 90° rotation about +z maps grid-local +x to world +y.
+        // World point (0, 5, 0) is grid-local (5, 0, 0): rotation
+        // inverse takes world +y back to grid-local +x.
+        let t = GridTransform {
+            origin: DVec3::ZERO,
+            rotation: DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2),
+        };
+        let p = world_to_grid_local(DVec3::new(0.0, 5.5, 0.0), &t);
+        assert_eq!(p.chunk, IVec3::ZERO);
+        assert_eq!(p.voxel, UVec3::new(5, 0, 0));
+        // Quat math has tiny rounding error — allow 1e-6.
+        assert!(
+            p.fract.abs_diff_eq(Vec3::new(0.5, 0.0, 0.0), 1e-5),
+            "fract={:?} expected ~(0.5, 0, 0)",
+            p.fract
+        );
+    }
+
+    // ---- grid_local_to_world: round-trip ----
+
+    #[test]
+    fn world_local_world_round_trip_identity() {
+        let t = GridTransform::identity();
+        let world = DVec3::new(12.25, -7.75, 200.5);
+        let p = world_to_grid_local(world, &t);
+        let back = grid_local_to_world(p.chunk, p.voxel, p.fract, &t);
+        assert!(
+            back.abs_diff_eq(world, 1e-5),
+            "back={back:?} world={world:?}"
+        );
+    }
+
+    #[test]
+    fn world_local_world_round_trip_translated() {
+        let t = GridTransform::at(DVec3::new(500.0, -250.0, 100.0));
+        let world = DVec3::new(512.25, -260.5, 109.75);
+        let p = world_to_grid_local(world, &t);
+        let back = grid_local_to_world(p.chunk, p.voxel, p.fract, &t);
+        assert!(
+            back.abs_diff_eq(world, 1e-5),
+            "back={back:?} world={world:?}"
+        );
+    }
+
+    #[test]
+    fn world_local_world_round_trip_rotated() {
+        let t = GridTransform {
+            origin: DVec3::new(10.0, 20.0, 30.0),
+            rotation: DQuat::from_rotation_z(0.5).normalize(),
+        };
+        // Sample several points to exercise the rotation math.
+        let samples = [
+            DVec3::new(11.5, 22.5, 33.5),
+            DVec3::new(10.0, 20.0, 30.0),
+            DVec3::new(9.0, 19.0, 29.0),
+        ];
+        for world in samples {
+            let p = world_to_grid_local(world, &t);
+            let back = grid_local_to_world(p.chunk, p.voxel, p.fract, &t);
+            assert!(
+                back.abs_diff_eq(world, 1e-5),
+                "back={back:?} world={world:?}"
+            );
+        }
+    }
+}
