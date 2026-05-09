@@ -8,6 +8,7 @@ members = [
     "crates/roxlap-host",
     "crates/roxlap-oracle",
     "crates/roxlap-scene",
+    "crates/roxlap-scene-demo",
     "crates/roxlap-web",
 ]
 resolver = "2"

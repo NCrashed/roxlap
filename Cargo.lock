@@ -1395,6 +1395,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxlap-scene-demo"
+version = "0.1.1"
+dependencies = [
+ "glam",
+ "roxlap-core",
+ "roxlap-formats",
+ "roxlap-scene",
+ "softbuffer",
+ "winit",
+]
+
+[[package]]
 name = "roxlap-web"
 version = "0.1.1"
 dependencies = [

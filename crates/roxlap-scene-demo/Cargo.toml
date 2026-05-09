@@ -1,0 +1,26 @@
+[package]
+name = "roxlap-scene-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Interactive showcase of the roxlap scene-graph engine — multiple voxel grids in one world."
+# Demo binary; ships via `gh release create`, not crates.io.
+publish = false
+
+[[bin]]
+name = "roxlap-scene-demo"
+path = "src/main.rs"
+
+[dependencies]
+glam = { workspace = true }
+roxlap-core = { path = "../roxlap-core", version = "0.1" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.1" }
+softbuffer = "0.4"
+winit = "0.30"
+
+[lints]
+workspace = true
