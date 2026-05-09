@@ -59,14 +59,25 @@ debug for an interactive frame rate.
 
 ## Controls
 
-| Input                | Action                                                       |
-|----------------------|--------------------------------------------------------------|
-| Click in window      | Grab cursor (mouse-look active)                              |
-| `Esc`                | Release cursor (or close window if cursor isn't grabbed)     |
-| `W` / `A` / `S` / `D` | Forward / strafe-left / back / strafe-right (camera frame)   |
-| `Space` / `LShift`   | Up / down (world frame, voxlap convention `−z` / `+z`)       |
-| `LCtrl`              | Hold for 4× speed                                            |
-| Mouse                | Look around (yaw + pitch)                                    |
+| Input                 | Action                                                                            |
+|-----------------------|-----------------------------------------------------------------------------------|
+| Click in window       | Grab cursor (mouse-look active)                                                   |
+| `Esc`                 | Release cursor (or close window if cursor isn't grabbed)                          |
+| `W` / `A` / `S` / `D` | Forward / strafe-left / back / strafe-right (camera frame)                        |
+| `Space` / `LShift`    | Up / down (world frame, voxlap convention `−z` / `+z`)                            |
+| `LCtrl`               | Hold for 4× speed                                                                 |
+| Mouse                 | Look around (yaw + pitch)                                                         |
+| `F`                   | Capture current frame + camera state to `roxlap-scene-capture.{txt,ppm}` (debug). |
+
+The camera collides with solid voxels (per-axis sliding, ±0.3
+voxel skin) so you can't fly through the ground or the ship's
+hull. World-bounded scenes still let the camera escape past the
+chunk edges since out-of-grid positions count as air.
+
+Lighting is voxlap's **lightmode 1** directional sun bake — surface
+normals are shaded `(tp.y * 0.5 + tp.z) * 64 + 103.5` clamped to
+`[0, 255]`. Baked into each chunk's slab alpha bytes once at
+scene-build time; no per-frame light cost.
 
 ## Where the code lives
 
