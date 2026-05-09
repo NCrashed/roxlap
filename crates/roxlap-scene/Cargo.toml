@@ -1,0 +1,20 @@
+[package]
+name = "roxlap-scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Scene-graph layer for the roxlap voxel engine: many independent chunked voxel grids, each with f64 world position and Quat rotation."
+documentation = "https://docs.rs/roxlap-scene"
+keywords = ["voxlap", "voxel", "scene-graph", "chunk", "engine"]
+categories = ["game-development", "graphics"]
+
+[dependencies]
+glam = { workspace = true }
+roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
+
+[lints]
+workspace = true

@@ -7,6 +7,7 @@ members = [
     "crates/roxlap-formats",
     "crates/roxlap-host",
     "crates/roxlap-oracle",
+    "crates/roxlap-scene",
     "crates/roxlap-web",
 ]
 resolver = "2"
@@ -29,6 +30,11 @@ readme = "README.md"
 # per-tile in R12.3, per-column lighting bake in R12.4). Declared
 # here in R12.0; first consumer is roxlap-core in R12.1.
 rayon = "1.10"
+# S2.0 — scene-graph crate's f64 world coords + quaternion grid
+# rotation. `DVec3` covers the universe-level position math and
+# `DQuat` is the per-grid orientation primitive S5 will compose with
+# camera basis vectors. Pinned to a stable 0.x; std-only build.
+glam = { version = "0.30", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
