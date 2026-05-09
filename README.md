@@ -84,20 +84,20 @@ that needs **cross-origin-isolation headers**
 `Cross-Origin-Embedder-Policy: require-corp`) on the host —
 without them, `SharedArrayBuffer` is disabled and the thread pool
 won't spin up. Full setup + per-host header config in
-[crates/roxlap-web/README.md](crates/roxlap-web/README.md).
+[crates/roxlap-web/README.md](https://github.com/NCrashed/roxlap/blob/master/crates/roxlap-web/README.md).
 
 ## Crates
 
 | Crate | Purpose |
 |-------|---------|
-| [`roxlap-core`](crates/roxlap-core) | The engine: framebuffer, camera, opticast raycaster, grouscan rasterizer, sprite + sky + voxel-lighting. |
-| [`roxlap-formats`](crates/roxlap-formats) | On-disk file format parsers (`.vxl`, `.kv6`, `.kvx`, `.kfa`) **plus the voxel-edit module** — `delslab` / `insslab` / `ScumCtx` plus high-level `set_spans` / `set_cube` / `set_sphere` / `set_rect` (with bit-exact byte equivalence to voxlap C's `setspans` validated against captured fixtures). No renderer dependency; useful standalone for level editors, asset converters, and procedural-world tools. |
-| [`roxlap-cavegen`](crates/roxlap-cavegen) | Procedural cave generation. Worley-distance shape classification + Perlin overlay, two visual presets (`BlueCaveGenerator`, `MagCaveGenerator`) matching Ken + Tom Dobrowolski's 2003 *Justfly* demo screenshots, and a `pack_dense_grid_to_vxl` helper that folds a dense voxel mask + colour grid into voxlap's slab format. Pure-Rust (no `cmake` / C++ build deps). |
-| [`roxlap-cave-demo`](crates/roxlap-cave-demo) | Procedural-cave showcase binary (winit + softbuffer). Cave-gen on startup, real-time edits via plasma bullets, fog, F/R preset+seed toggles. |
-| [`roxlap-host`](crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). |
-| [`roxlap-web`](crates/roxlap-web) | Engine demo for the browser (wasm32 + wasm-bindgen + canvas). Oracle world + WebAssembly SIMD batches, ~360 KB wasm bundle. Run via `trunk serve` for dev / `trunk build --release` for deploy. |
-| [`roxlap-cave-web`](crates/roxlap-cave-web) | Cave demo for the browser — Worley + Perlin cave-gen, fly + fire + carve with local relight on impact, all on wasm32. ~130 KB wasm bundle (no embedded asset; cave is generated client-side). |
-| [`roxlap-oracle`](crates/roxlap-oracle) | Cross-engine render-hash oracle: renders 12 fixed test poses, FNV-1a-hashes each framebuffer, diffs against voxlaptest's C goldens. CI gates on this. |
+| [`roxlap-core`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-core) | The engine: framebuffer, camera, opticast raycaster, grouscan rasterizer, sprite + sky + voxel-lighting. |
+| [`roxlap-formats`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-formats) | On-disk file format parsers (`.vxl`, `.kv6`, `.kvx`, `.kfa`) **plus the voxel-edit module** — `delslab` / `insslab` / `ScumCtx` plus high-level `set_spans` / `set_cube` / `set_sphere` / `set_rect` (with bit-exact byte equivalence to voxlap C's `setspans` validated against captured fixtures). No renderer dependency; useful standalone for level editors, asset converters, and procedural-world tools. |
+| [`roxlap-cavegen`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cavegen) | Procedural cave generation. Worley-distance shape classification + Perlin overlay, two visual presets (`BlueCaveGenerator`, `MagCaveGenerator`) matching Ken + Tom Dobrowolski's 2003 *Justfly* demo screenshots, and a `pack_dense_grid_to_vxl` helper that folds a dense voxel mask + colour grid into voxlap's slab format. Pure-Rust (no `cmake` / C++ build deps). |
+| [`roxlap-cave-demo`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cave-demo) | Procedural-cave showcase binary (winit + softbuffer). Cave-gen on startup, real-time edits via plasma bullets, fog, F/R preset+seed toggles. |
+| [`roxlap-host`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). |
+| [`roxlap-web`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-web) | Engine demo for the browser (wasm32 + wasm-bindgen + canvas). Oracle world + WebAssembly SIMD batches, ~360 KB wasm bundle. Run via `trunk serve` for dev / `trunk build --release` for deploy. |
+| [`roxlap-cave-web`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cave-web) | Cave demo for the browser — Worley + Perlin cave-gen, fly + fire + carve with local relight on impact, all on wasm32. ~130 KB wasm bundle (no embedded asset; cave is generated client-side). |
+| [`roxlap-oracle`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-oracle) | Cross-engine render-hash oracle: renders 12 fixed test poses, FNV-1a-hashes each framebuffer, diffs against voxlaptest's C goldens. CI gates on this. |
 
 The library API surface is documented at [docs.rs/roxlap-core](https://docs.rs/roxlap-core)
 and [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
@@ -136,7 +136,7 @@ x86_64 SSE2 batches. The cross-engine oracle tracks 9 of 12 voxlap C
 poses — 5 byte-for-byte bit-exact with the C reference, 4 frozen as
 roxlap's own goldens after visual verification (sub-pixel rounding
 noise from `_mm_rcp_ps`-based vertex projection is documented in
-[PORTING-RUST.md](PORTING-RUST.md)).
+[PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md)).
 
 ```text
 $ cargo run --release -p roxlap-oracle -- diff
@@ -154,7 +154,7 @@ MATCH    diag_down_lit  b536ce3fdf771b9e       (roxlap-frozen)
 
 ARM NEON (R9) and wasm SIMD + browser host (R10) landed. Open
 work: crates.io publish (R11.9). See
-[PORTING-RUST.md](PORTING-RUST.md) for the full substage roadmap.
+[PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md) for the full substage roadmap.
 
 ## Multicore
 
@@ -199,13 +199,13 @@ roxlap-oracle bench-sprites --sprites N # sprite scaling (RAYON_NUM_THREADS env)
 ```
 
 Full design + tradeoffs in
-[PORTING-MULTICORE.md](PORTING-MULTICORE.md).
+[PORTING-MULTICORE.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-MULTICORE.md).
 
 ## Documentation
 
 - API: [docs.rs/roxlap-core](https://docs.rs/roxlap-core),
   [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
-- Algorithm + porting notes: [PORTING-RUST.md](PORTING-RUST.md).
+- Algorithm + porting notes: [PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md).
 - Reference C engine this ports from:
   [voxlaptest](https://github.com/NCrashed/voxlaptest).
 - Original Voxlap homepage: [advsys.net/ken/voxlap.htm](http://advsys.net/ken/voxlap.htm).
@@ -230,14 +230,14 @@ opinionated enough that a >2-second pre-commit hook would just get
 `--no-verify`'d. Run `cargo clippy --all-targets -- -D warnings`
 manually before pushing if you want the same gate locally; CI
 enforces it on every push regardless
-([.github/workflows/ci.yml](.github/workflows/ci.yml)).
+([.github/workflows/ci.yml](https://github.com/NCrashed/roxlap/blob/master/.github/workflows/ci.yml)).
 
 ## License
 
 Dual-licensed under either of:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/NCrashed/roxlap/blob/master/LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](https://github.com/NCrashed/roxlap/blob/master/LICENSE-MIT))
 
 at your option.
 
