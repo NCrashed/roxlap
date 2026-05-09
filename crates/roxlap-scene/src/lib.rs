@@ -13,10 +13,17 @@
 //! S2.0 lands the **type skeleton + grid registration only**.
 //! S2.1 adds the [`addr`] module — world ↔ grid-local ↔ chunk +
 //! voxel-in-chunk decomposition, the canonical f64↔i32 boundary
-//! helper called out by risk R5 in `PORTING-SCENE.md`. Sparse
-//! chunk storage logic, edit API, and rendering are still owed.
+//! helper called out by risk R5 in `PORTING-SCENE.md`. S2.2 adds
+//! the [`chunks`] module (sparse storage with on-demand chunk
+//! allocation) and the [`Grid`] edit API ([`Grid::set_voxel`],
+//! [`Grid::set_rect`], [`Grid::set_sphere`]) which decompose
+//! multi-chunk operations and delegate to
+//! [`roxlap_formats::edit`]. Rendering composition is still owed
+//! (S3+).
 
 pub mod addr;
+pub mod chunks;
+pub mod edit;
 
 use std::collections::HashMap;
 
