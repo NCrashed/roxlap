@@ -238,20 +238,16 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
             None => return OpticastOutcome::SkippedCameraInSolid,
         }
     } else {
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-        let cx_clamped = prelude.cx.clamp(0, vsid as i32 - 1) as u32;
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-        let cy_clamped = prelude.cy.clamp(0, vsid as i32 - 1) as u32;
-        let representative_idx = cy_clamped * vsid + cx_clamped;
-        camera_column_slice(slab_buf, column_offsets, representative_idx)
-            .and_then(|c| {
-                column_walk::camera_column_air_gap(c, prelude.li_pos[2], treat_z_max_as_air)
-            })
-            // Conservative fallback: full-air column. Hits if the
-            // representative column has no slab above the camera's
-            // z (e.g., camera is below world's bedrock or the
-            // column is malformed).
-            .unwrap_or((0, 255, 0))
+        // OOB-XY camera is not physically inside any column. The
+        // synthesised air gap from a representative column is
+        // **incorrect** — it creates a fake floor at the
+        // representative column's surface_z, which the renderer
+        // paints as a chunk-edge streak when rays graze the
+        // chunk's silhouette. Always use the bedrock placeholder
+        // (z=MAXZDIM-1) as the synthesized floor; with
+        // `treat_z_max_as_air = true` the renderer treats it as
+        // sky-passable, so no false-floor pixels appear.
+        (0, 255, 0)
     };
 
     // Per-frame setup hook needs a `ScanContext` with cy / camera

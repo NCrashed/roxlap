@@ -3,6 +3,8 @@
 //! evolution roadmap as the scene-graph substages land.
 
 mod collision;
+#[cfg(test)]
+mod repro;
 mod scene;
 mod ship;
 mod terrain;
