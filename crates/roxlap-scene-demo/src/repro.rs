@@ -44,10 +44,11 @@ fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
 
 /// Render `scene` from `camera` via `render_scene_composed` with
 /// the live demo's pool config (`treat_z_max_as_air` on, fog +
-/// skycast set from the engine defaults).
-fn render_pose(scene: &Scene, camera: &Camera) -> Vec<u32> {
+/// skycast set from the engine defaults). Pool vsid is sized for
+/// S4.0's 2-chunk-wide ground (combined vsid = 256).
+fn render_pose(scene: &mut Scene, camera: &Camera) -> Vec<u32> {
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, roxlap_scene::CHUNK_SIZE_XY);
+    let mut pool = ScratchPool::new(W, H, 2 * roxlap_scene::CHUNK_SIZE_XY);
     let sky = engine.sky_color();
     let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
     pool.set_skycast(sky_col_i, 0);
@@ -117,16 +118,18 @@ fn build_ground_only() -> Scene {
 /// the streaks come back.
 #[test]
 fn chunk_edge_streaking_bug_is_fixed() {
-    let scene = build_ground_only();
+    let mut scene = build_ground_only();
     let engine = Engine::new();
     let sky = engine.sky_color();
 
-    let render = |pos, yaw, pitch| {
-        let cam = camera_for_yaw_pitch(pos, yaw, pitch);
-        render_pose(&scene, &cam)
+    let nobug_fb = {
+        let cam = camera_for_yaw_pitch(NOBUG_POS, NOBUG_YAW, NOBUG_PITCH);
+        render_pose(&mut scene, &cam)
     };
-    let nobug_fb = render(NOBUG_POS, NOBUG_YAW, NOBUG_PITCH);
-    let bug_fb = render(BUG_POS, BUG_YAW, BUG_PITCH);
+    let bug_fb = {
+        let cam = camera_for_yaw_pitch(BUG_POS, BUG_YAW, BUG_PITCH);
+        render_pose(&mut scene, &cam)
+    };
 
     let sky_pre = nobug_fb.iter().filter(|&&p| p == sky).count();
     let sky_post = bug_fb.iter().filter(|&&p| p == sky).count();
@@ -150,9 +153,9 @@ fn chunk_edge_streaking_bug_is_fixed() {
 /// S5 (rotation) regress the OOB-XY render path.
 #[test]
 fn dump_bug_pose_ppm_for_inspection() {
-    let scene = build_ground_only();
+    let mut scene = build_ground_only();
     let cam = camera_for_yaw_pitch(BUG_POS, BUG_YAW, BUG_PITCH);
-    let fb = render_pose(&scene, &cam);
+    let fb = render_pose(&mut scene, &cam);
     write_ppm("/tmp/scene-demo-bug-pose.ppm", &fb);
     eprintln!("wrote /tmp/scene-demo-bug-pose.ppm");
 }

@@ -27,15 +27,17 @@ fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
 /// Build the demo scene + initial camera state.
 ///
 /// Layout (world coords, voxlap z-down: smaller z = up):
-/// - **Ground** grid origin at world `(0, 0, 0)` — terrain in
-///   chunk-local z ∈ [80..255].
+/// - **Ground** grid origin at world `(0, 0, 0)` — terrain spans
+///   `GROUND_CHUNKS_X × GROUND_CHUNKS_Y` chunks (S4.0: 2×1) in z ∈
+///   [80..255].
 /// - **Ship** grid origin at world `(0, 0, -100)` — ship body
 ///   in chunk-local z ∈ [56..72] → world z ∈ [-44..-28].
 ///   The ship sits comfortably in the sky band above the terrain
 ///   (terrain peaks at world z ≈ 80; sky is z < 80).
 ///
-/// Initial camera at world `(0, -120, 50)` looking +y, sees the
-/// ship dead-ahead with the terrain visible below the horizon.
+/// Initial camera at world `(128, -120, 50)` (centred over the
+/// 2-chunk-wide ground) looking +y, sees the ship dead-ahead with
+/// the terrain visible below the horizon.
 pub fn build_demo() -> SceneAndCamera {
     let mut scene = Scene::new();
 
@@ -52,7 +54,7 @@ pub fn build_demo() -> SceneAndCamera {
     // hrend / vrend without needing further setup.
     bake_lightmode_1(&mut scene);
 
-    let initial_pos = [64.0, -120.0, 50.0];
+    let initial_pos = [128.0, -120.0, 50.0];
     let initial_yaw = std::f64::consts::FRAC_PI_2; // looks +y
     let initial_pitch = 0.0;
     let camera = camera_for_yaw_pitch(initial_pos, initial_yaw, initial_pitch);
@@ -119,5 +121,10 @@ fn bake_lightmode_1(scene: &mut Scene) {
                 &[],
             );
         }
+        // Bake mutates each chunk's `data` in place via the slab
+        // bytes, bypassing the edit-API invalidation hooks. Drop
+        // the cached combined view so the next render rebuilds it
+        // against the freshly-lit slab bytes.
+        grid.invalidate_combined();
     }
 }

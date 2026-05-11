@@ -103,7 +103,12 @@ impl Grid {
     /// chunk first if it doesn't exist yet. The returned `&mut`
     /// is valid for editing via [`roxlap_formats::edit`] — the new
     /// chunk has [`Vxl::reserve_edit_capacity`] already applied.
+    ///
+    /// Always invalidates the cached [`crate::CombinedGridView`]
+    /// (caller is presumed to be about to edit through the returned
+    /// `&mut`).
     pub fn ensure_chunk(&mut self, chunk_idx: IVec3) -> &mut Vxl {
+        self.cached_combined = None;
         self.chunks.entry(chunk_idx).or_insert_with(empty_chunk_vxl)
     }
 

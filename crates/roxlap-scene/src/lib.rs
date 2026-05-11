@@ -28,6 +28,7 @@
 
 pub mod addr;
 pub mod chunks;
+pub mod combined;
 pub mod edit;
 pub mod render;
 pub mod snapshot;
@@ -39,6 +40,7 @@ use roxlap_formats::vxl::Vxl;
 use serde::{Deserialize, Serialize};
 
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
+pub use combined::CombinedGridView;
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
 /// chunks compact (~2 MB worst-case dense-slab footprint inside
@@ -136,6 +138,12 @@ pub struct Grid {
     /// Sparse chunk storage keyed by `(chx, chy, chz)` chunk
     /// coordinates. A missing entry means the chunk is fully air.
     pub chunks: HashMap<IVec3, Vxl>,
+    /// Cached "combined" virtual-world view (S4.0 Approach C).
+    /// Built lazily on the first [`Grid::combined_world`] call after
+    /// any chunk edit; the edit API and [`Grid::ensure_chunk`]
+    /// invalidate. External mutators of [`Grid::chunks`] must call
+    /// [`Grid::invalidate_combined`] explicitly when their pass ends.
+    pub(crate) cached_combined: Option<CombinedGridView>,
 }
 
 impl Grid {
@@ -145,7 +153,38 @@ impl Grid {
         Self {
             transform,
             chunks: HashMap::new(),
+            cached_combined: None,
         }
+    }
+
+    /// Get-or-build the cached [`CombinedGridView`]. Rebuild cost
+    /// is `O(virtual_vsid² + total slab bytes)`; subsequent calls
+    /// are `O(1)` until an edit invalidates.
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic in practice — the cache is always populated by
+    /// the time the unwrap runs. Defensive `expect` rather than a
+    /// silent `unwrap_or_default`.
+    pub fn combined_world(&mut self) -> &CombinedGridView {
+        if self.cached_combined.is_none() {
+            self.cached_combined = Some(CombinedGridView::build(&self.chunks));
+        }
+        // Cache populated above; unwrap is infallible here.
+        self.cached_combined
+            .as_ref()
+            .expect("cached_combined populated")
+    }
+
+    /// Mark the cached combined view stale so the next
+    /// [`Grid::combined_world`] call rebuilds it. Called automatically
+    /// by the edit API and [`Grid::ensure_chunk`]; external code that
+    /// mutates [`Grid::chunks`] (e.g. calling
+    /// [`roxlap_formats::edit`] primitives directly on a borrowed
+    /// `&mut Vxl`, or running a per-chunk lighting bake) must call
+    /// this once their mutation pass finishes.
+    pub fn invalidate_combined(&mut self) {
+        self.cached_combined = None;
     }
 }
 
@@ -205,6 +244,14 @@ impl Scene {
     /// Callers that need a stable order must sort by [`GridId`].
     pub fn grids(&self) -> impl Iterator<Item = (GridId, &Grid)> {
         self.grids.iter().map(|(id, g)| (*id, g))
+    }
+
+    /// Mutable iterator over all `(id, grid)` pairs. Yield order is
+    /// not guaranteed (HashMap-backed). Used by S4.0+
+    /// [`render::render_scene_composed`] so the per-grid combined
+    /// cache can be populated lazily during the render pass.
+    pub fn grids_mut(&mut self) -> impl Iterator<Item = (GridId, &mut Grid)> {
+        self.grids.iter_mut().map(|(id, g)| (*id, g))
     }
 }
 

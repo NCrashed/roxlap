@@ -67,6 +67,7 @@ impl Grid {
                 in_chunk.z as i32,
                 None,
             );
+            self.cached_combined = None;
         }
     }
 
@@ -150,6 +151,7 @@ fn apply_set_rect(
         set_rect(vxl, local_lo.into(), local_hi.into(), color);
     } else if let Some(vxl) = grid.chunks.get_mut(&chunk_idx) {
         set_rect(vxl, local_lo.into(), local_hi.into(), None);
+        grid.cached_combined = None;
     }
 }
 
@@ -165,6 +167,7 @@ fn apply_set_sphere(
         set_sphere(vxl, local_centre.into(), radius, color);
     } else if let Some(vxl) = grid.chunks.get_mut(&chunk_idx) {
         set_sphere(vxl, local_centre.into(), radius, None);
+        grid.cached_combined = None;
     }
 }
 

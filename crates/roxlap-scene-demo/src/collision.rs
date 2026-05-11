@@ -14,7 +14,7 @@
 
 use glam::IVec3;
 use roxlap_core::world_query::{getcube, Cube};
-use roxlap_scene::{Scene, CHUNK_SIZE_Z};
+use roxlap_scene::{voxel_split, Scene, CHUNK_SIZE_Z};
 
 /// Camera "skin" radius in voxel units. A move is blocked when any
 /// voxel inside the cube `pos ± PLAYER_RADIUS` is solid; matches
@@ -43,7 +43,7 @@ pub const PLAYER_RADIUS: f64 = 0.3;
 )]
 pub fn is_blocked_in_scene(scene: &Scene, world_pos: [f64; 3]) -> bool {
     for (_id, grid) in scene.grids() {
-        // S3.x: axis-aligned grids only — translate world → grid-local.
+        // S3.x..S4.x: axis-aligned grids only — translate world → grid-local.
         let lx_centre = world_pos[0] - grid.transform.origin.x;
         let ly_centre = world_pos[1] - grid.transform.origin.y;
         let lz_centre = world_pos[2] - grid.transform.origin.z;
@@ -54,37 +54,37 @@ pub fn is_blocked_in_scene(scene: &Scene, world_pos: [f64; 3]) -> bool {
         let lo_z = (lz_centre - PLAYER_RADIUS).floor() as i32;
         let hi_z = (lz_centre + PLAYER_RADIUS).floor() as i32;
 
-        // S3.x: single-chunk grids only — only chunk (0, 0, 0) is
-        // queried. S4 will lift this to a sparse-map walk over the
-        // chunk indices the cube intersects.
-        let Some(chunk) = grid.chunk(IVec3::ZERO) else {
-            continue;
-        };
-        let cs_xy = chunk.vsid as i32;
-        // `cs_z - 1`: bedrock placeholder at the deepest z is not
-        // collided against (see fn-level docs).
+        // S4.0: per-voxel chunk lookup. The probe cube's voxels may
+        // straddle chunk boundaries, so we split each grid-local
+        // voxel into (chunk_idx, in_chunk_voxel) and route the
+        // getcube query to the right chunk's slab data. Implicit-
+        // air chunks count as air; bedrock placeholders are skipped
+        // per the fn-level docs.
         let cs_z_solid = (CHUNK_SIZE_Z as i32) - 1;
         for vz in lo_z..=hi_z {
             for vy in lo_y..=hi_y {
                 for vx in lo_x..=hi_x {
-                    if vx < 0 || vy < 0 || vz < 0 || vx >= cs_xy || vy >= cs_xy || vz >= cs_z_solid
-                    {
-                        // Outside this chunk (or at the bedrock
-                        // placeholder) — keep walking (other grids
-                        // may still overlap).
+                    let (chunk_idx, in_chunk) = voxel_split(IVec3::new(vx, vy, vz));
+                    if (in_chunk.z as i32) >= cs_z_solid {
+                        // Bedrock placeholder — treat as air.
                         continue;
                     }
-                    // Block on any non-`Air` voxel. `Cube::Color` is a
-                    // visible voxel (terrain surface, saucer hull, the
-                    // bedrock placeholder at z=255). `Cube::UnexposedSolid`
-                    // is the *interior* of a solid run — hidden voxels
-                    // sandwiched between a slab's floor-colour list (top)
-                    // and the next slab's ceiling-colour list (bottom).
-                    // Both must block; "below the deepest visible slab"
-                    // is reported by getcube as `Air`, not UnexposedSolid,
-                    // so floating-chunk sparse columns don't false-block.
+                    let Some(chunk) = grid.chunk(chunk_idx) else {
+                        // Implicit-air chunk; nothing to collide with.
+                        continue;
+                    };
+                    // `Cube::Color` = visible surface voxel,
+                    // `Cube::UnexposedSolid` = hidden interior of a
+                    // solid run; both block. `Cube::Air` does not.
                     if !matches!(
-                        getcube(&chunk.data, &chunk.column_offset, chunk.vsid, vx, vy, vz),
+                        getcube(
+                            &chunk.data,
+                            &chunk.column_offset,
+                            chunk.vsid,
+                            in_chunk.x as i32,
+                            in_chunk.y as i32,
+                            in_chunk.z as i32,
+                        ),
                         Cube::Air
                     ) {
                         return true;

@@ -1,11 +1,16 @@
 //! Procedural ground / planet surface.
 //!
-//! S3.x: emits a single-chunk heightmap (128×128 cells) into the
-//! given grid's chunk `(0, 0, 0)`. The heightmap is the sum of a
-//! few sine waves — cheap, deterministic, no external noise dep,
-//! visibly hilly. Voxlap z-down convention: a smaller `z` value
-//! is closer to the sky; the surface lives at the heightmap's
-//! `z` and solid voxels extend toward `z = 255` (bedrock).
+//! S4.0: emits a `GROUND_CHUNKS_X × GROUND_CHUNKS_Y` lattice of
+//! chunks into the given grid. The S3.x single-chunk loop became
+//! the inner loop of a chunk-lattice walk; the per-column
+//! heightmap function takes grid-local world coordinates so it
+//! lands different terrain in each chunk without re-tiling.
+//!
+//! At S4.0 the lattice is locked to 2×1 chunks (`vsid = 256`) so
+//! the seam at grid-local x=128 exercises the cross-chunk gline
+//! path without the 4096²-column allocation cost of the planned
+//! 32×32 final demo. Bumping to 32×32 lands at S4.1 once S4.0
+//! has settled.
 //!
 //! Material palette:
 //! - `grass` for the topmost voxel of each column when the local
@@ -13,20 +18,19 @@
 //! - `stone` for the topmost voxel when the slope is steep.
 //! - `dirt` for a band immediately below grass.
 //! - `stone` everywhere below the dirt band.
-//!
-//! S4 evolution: replace the single-chunk loop with iteration
-//! over `n_chunks_xy² × n_chunks_z` chunks; the per-column
-//! heightmap function works at world coordinates so it doesn't
-//! care which chunk it lands in.
 
 // Voxel coords + heightmap values stay in `[0, CHUNK_SIZE_*]` so
 // every i32 ↔ f32 ↔ usize cast in this module is safe.
+// `world_x_extent` / `world_y_extent` differ by one letter; the
+// pair name follows from the X/Y axis split, which is more
+// readable than `extent_along_x` / `extent_along_y`.
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::similar_names
 )]
 
 use glam::IVec3;
@@ -45,44 +49,52 @@ const DIRT_BAND_THICKNESS: i32 = 4;
 /// stone — exposes the steeper hillsides as rock.
 const STONE_SLOPE_THRESHOLD: i32 = 3;
 
-/// Build the ground terrain into the grid's `(0, 0, 0)` chunk.
+/// Ground footprint in chunks along grid-local +x.
+pub const GROUND_CHUNKS_X: i32 = 2;
+/// Ground footprint in chunks along grid-local +y.
+pub const GROUND_CHUNKS_Y: i32 = 1;
+
+/// Build the ground terrain into a `GROUND_CHUNKS_X × GROUND_CHUNKS_Y`
+/// chunk lattice. Voxels are inserted via [`Grid::set_voxel`]
+/// against grid-local coordinates; the multi-chunk decomposition
+/// in [`crate::edit`] (re-exposed via the same `set_voxel` entry
+/// point) routes each voxel to its chunk.
 ///
-/// Generates a deterministic hilly heightmap, then walks columns
-/// to write grass / dirt / stone bands. Calls `Grid::set_voxel`
-/// per voxel — slow-ish for a 128×128×~30 voxel terrain but
-/// runs once at startup.
-///
-/// **S4 hook:** replace the `cx, cy in 0..CHUNK_SIZE_XY` loops
-/// below with iteration over a 32×32 chunk lattice; the
-/// heightmap function `terrain_height(world_x, world_y)` already
-/// works at world coordinates.
+/// `terrain_height` takes grid-local world coordinates, so the
+/// terrain stays continuous across chunk boundaries — there's no
+/// per-chunk re-tiling artefact at the seams.
 pub fn build_ground(grid: &mut Grid) {
     let cs_xy = CHUNK_SIZE_XY as i32;
+    let world_x_extent = GROUND_CHUNKS_X * cs_xy;
+    let world_y_extent = GROUND_CHUNKS_Y * cs_xy;
+
     // Pre-compute the heightmap so we can look up neighbour heights
-    // for slope detection without recomputing.
-    let mut heights = vec![0i32; (cs_xy * cs_xy) as usize];
-    for cy in 0..cs_xy {
-        for cx in 0..cs_xy {
-            heights[(cy * cs_xy + cx) as usize] = terrain_height(cx, cy);
+    // for slope detection without recomputing. Indexed by grid-local
+    // world (x, y).
+    let n_cells = (world_x_extent * world_y_extent) as usize;
+    let mut heights = vec![0i32; n_cells];
+    for wy in 0..world_y_extent {
+        for wx in 0..world_x_extent {
+            heights[(wy * world_x_extent + wx) as usize] = terrain_height(wx, wy);
         }
     }
     let h_at = |x: i32, y: i32| -> i32 {
-        let xc = x.clamp(0, cs_xy - 1);
-        let yc = y.clamp(0, cs_xy - 1);
-        heights[(yc * cs_xy + xc) as usize]
+        let xc = x.clamp(0, world_x_extent - 1);
+        let yc = y.clamp(0, world_y_extent - 1);
+        heights[(yc * world_x_extent + xc) as usize]
     };
 
     let z_max = (CHUNK_SIZE_Z as i32) - 1; // bedrock placeholder z
 
-    for cy in 0..cs_xy {
-        for cx in 0..cs_xy {
-            let surface_z = h_at(cx, cy);
+    for wy in 0..world_y_extent {
+        for wx in 0..world_x_extent {
+            let surface_z = h_at(wx, wy);
             // Local slope: max |dh| over the 4-neighbourhood.
             let slope = [
-                (h_at(cx - 1, cy) - surface_z).abs(),
-                (h_at(cx + 1, cy) - surface_z).abs(),
-                (h_at(cx, cy - 1) - surface_z).abs(),
-                (h_at(cx, cy + 1) - surface_z).abs(),
+                (h_at(wx - 1, wy) - surface_z).abs(),
+                (h_at(wx + 1, wy) - surface_z).abs(),
+                (h_at(wx, wy - 1) - surface_z).abs(),
+                (h_at(wx, wy + 1) - surface_z).abs(),
             ]
             .into_iter()
             .max()
@@ -91,7 +103,7 @@ pub fn build_ground(grid: &mut Grid) {
             let top_color = if top_is_stone { STONE } else { GRASS };
 
             // Surface voxel.
-            grid.set_voxel(IVec3::new(cx, cy, surface_z), Some(top_color));
+            grid.set_voxel(IVec3::new(wx, wy, surface_z), Some(top_color));
             // Dirt band — only when the surface is grass; under
             // stone hillsides, stone goes all the way down.
             for dz in 1..=DIRT_BAND_THICKNESS {
@@ -100,13 +112,13 @@ pub fn build_ground(grid: &mut Grid) {
                     break;
                 }
                 let band_color = if top_is_stone { STONE } else { DIRT };
-                grid.set_voxel(IVec3::new(cx, cy, z), Some(band_color));
+                grid.set_voxel(IVec3::new(wx, wy, z), Some(band_color));
             }
             // Stone fill from the bottom of the dirt band down to
             // (but not including) bedrock at z = z_max.
             let stone_top = surface_z + DIRT_BAND_THICKNESS + 1;
             for z in stone_top..z_max {
-                grid.set_voxel(IVec3::new(cx, cy, z), Some(STONE));
+                grid.set_voxel(IVec3::new(wx, wy, z), Some(STONE));
             }
         }
     }

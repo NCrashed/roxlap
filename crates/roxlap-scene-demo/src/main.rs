@@ -28,6 +28,12 @@ use crate::scene::{build_demo, SceneAndCamera};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
+/// Headroom for the per-frame [`ScratchPool`] sizing — `lastx`
+/// inside each pool slot is sized `max(yres, vsid)`. The S4.0 demo
+/// ships with a 2-chunk-wide ground (combined `vsid = 256`); pre-
+/// allocating for 32×32 chunks keeps later demo expansions
+/// allocation-free.
+const MAX_GRID_VSID: u32 = 32 * roxlap_scene::CHUNK_SIZE_XY;
 const MOVE_SPEED: f64 = 64.0;
 const FAST_MULT: f64 = 4.0;
 const MOUSE_SENS: f64 = 0.0025;
@@ -87,7 +93,11 @@ impl App {
     fn new() -> Self {
         let scene = build_demo();
         let engine = Engine::new();
-        let pool = ScratchPool::new(WIDTH, HEIGHT, roxlap_scene::CHUNK_SIZE_XY);
+        // Pool sized for the largest grid's combined virtual vsid.
+        // S4.0 bumps the demo to 2-chunk-wide ground (vsid = 256);
+        // budget for the planned 32×32 ground (vsid = 4096) so
+        // future demo expansions don't need a pool resize.
+        let pool = ScratchPool::new(WIDTH, HEIGHT, MAX_GRID_VSID);
         Self {
             window: None,
             surface: None,
@@ -131,7 +141,7 @@ impl App {
             self.zbuffer.resize(pixel_count, f32::INFINITY);
         }
         if self.pool.slot(0).uurend_half_stride < size.width as usize {
-            self.pool = ScratchPool::new(size.width, size.height, roxlap_scene::CHUNK_SIZE_XY);
+            self.pool = ScratchPool::new(size.width, size.height, MAX_GRID_VSID);
         }
 
         // Pool config — sky + fog colour. `treat_z_max_as_air` lets
@@ -173,7 +183,7 @@ impl App {
             size.width,
             size.height,
             &mut self.pool,
-            &self.scene.scene,
+            &mut self.scene.scene,
             &self.scene.camera,
             &settings,
             sky,

@@ -11,39 +11,39 @@
 //!   grid directly into the shared rasterizer. For single-grid
 //!   scenes this matches a direct opticast call byte-for-byte; for
 //!   multi-grid it's last-grid-wins (sky writes from grid B
-//!   overwrite grid A's hits). Useful for tests / single-chunk
-//!   demos that want the unscoped pass-through.
+//!   overwrite grid A's hits). Useful for tests / single-grid
+//!   sanity checks.
 //!
-//! Both APIs handle **axis-aligned, single-chunk grids only** at
-//! S3.x. For each grid, the world camera is translated by
-//! `-grid.transform.origin` (rotation-free) and the resulting
-//! grid-local pose is fed into the existing per-chunk opticast
-//! renderer over `grid.chunks[(0, 0, 0)]`.
+//! ## S4.0: Approach C combined-world stitch
 //!
-//! Higher-stage upgrades that go through this entry point:
-//! - **S4** — cross-chunk gline (replaces the
-//!   `chunks.get(&IVec3::ZERO)` lookup with a 3D DDA across the
-//!   sparse chunk map).
-//! - **S5** — full quaternion grid rotation (the camera transform
-//!   adds `rotation.inverse() *` after the translate).
-//! - **S6** — per-grid LOD selection (Near voxel raycast / Mid
-//!   coarse mip / Far billboard).
+//! Both APIs route per-grid rendering through
+//! [`crate::Grid::combined_world`] — the per-grid combined virtual
+//! world covers every populated chunk in the grid's XY footprint
+//! and is rendered as a single opticast pass. The 2D-DDA inside
+//! [`roxlap_core::grouscan`] already walks across an arbitrary
+//! `vsid × vsid` lattice, so cross-chunk seams collapse into normal
+//! column steps. Empty chunks contribute all-air placeholder
+//! columns.
+//!
+//! Per-grid rotation (S5) and per-grid LOD (S6) plug in at the
+//! same dispatch point: rotate the world camera into grid-local
+//! before the combined-view lookup, then dispatch coarse / fine /
+//! billboard based on grid-camera distance.
 
 // `fb` / `zb` (framebuffer / zbuffer) and the `_fb` / `_zb` suffixes
 // throughout this module are voxlap-canonical pairs — drilling them
 // apart with longer names just hurts readability.
 #![allow(clippy::similar_names)]
 
-use glam::IVec3;
 use roxlap_core::opticast::{opticast, OpticastOutcome, OpticastSettings};
-use roxlap_core::rasterizer::{Rasterizer, ScratchPool};
+use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
 
 use crate::Scene;
 
-/// Outcome of a [`render_scene`] call.
+/// Outcome of a [`render_scene`] / [`render_scene_composed`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderOutcome {
     /// At least one grid produced a render.
@@ -52,47 +52,46 @@ pub enum RenderOutcome {
         /// [`OpticastOutcome::Rendered`].
         grids_drawn: usize,
     },
-    /// No grid rendered. Either the scene was empty, all grids had
-    /// no chunk at `(0, 0, 0)` (the only address S3.0 inspects),
-    /// or every per-grid opticast call returned
+    /// No grid rendered. Either the scene was empty or every
+    /// per-grid opticast call returned
     /// [`OpticastOutcome::SkippedCameraInSolid`].
     Empty,
 }
 
-/// Render every grid in `scene` into the rasterizer's framebuffer.
+/// Render every grid in `scene` directly into `(fb, zb)` — no
+/// per-grid temp buffer, no compose merge. For multi-grid scenes
+/// this is last-grid-wins (later grids' opticast writes overwrite
+/// earlier grids' pixels indiscriminately, including sky), so it's
+/// only correct for single-grid scenes.
 ///
-/// Each grid's render uses a grid-local camera pose obtained by
-/// translating the world camera by `-grid.transform.origin`. S3.0
-/// ignores rotation (axis-aligned grids only) and only the chunk
-/// at `(0, 0, 0)` (single-chunk grids only) — non-zero chunks are
-/// skipped silently.
+/// Use this when you have one grid and want the byte-stable
+/// matches-direct-opticast property — the test suite uses it as a
+/// sanity check that the combined-world stitch + render harness
+/// doesn't drift vs. a raw [`opticast`] call.
 ///
-/// Caller responsibilities (same as a direct
-/// [`roxlap_core::opticast::opticast`] call):
-/// - Pre-fill the framebuffer with the desired sky colour.
-/// - Pre-fill the zbuffer (commonly to `0.0` matching the
-///   per-chunk renderer's convention).
-/// - Configure `pool` with skycast / fog colours.
-/// - Build the rasterizer over the framebuffer + zbuffer.
-///
-/// **Caveat (S3.0)**: when the scene has > 1 grid, output is
-/// last-grid-wins because opticast writes unconditionally.
-/// S3.1 will land per-grid temporary buffers + z-buffer
-/// composition.
-pub fn render_scene<R: Rasterizer + Clone + Send + Sync>(
-    rasterizer: &mut R,
+/// Caller pre-fills `fb` with the desired sky colour and `zb` with
+/// any value (typically `0.0` matching the per-chunk renderer's
+/// convention or `f32::INFINITY` for compose-friendly init); the
+/// rasterizer overwrites both per pixel that gets a hit.
+#[allow(clippy::too_many_arguments)]
+pub fn render_scene(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
     pool: &mut ScratchPool,
-    scene: &Scene,
+    scene: &mut Scene,
     camera: &Camera,
     settings: &OpticastSettings,
+    sky: Option<&Sky>,
 ) -> RenderOutcome {
+    debug_assert_eq!(fb.len(), zb.len());
+    let pixel_count = (width as usize) * (height as usize);
+    debug_assert_eq!(fb.len(), pixel_count);
+
     let mut grids_drawn = 0usize;
-    for (_id, grid) in scene.grids() {
-        let Some(chunk) = grid.chunks.get(&IVec3::ZERO) else {
-            // S3.0: only chunk (0,0,0) is rendered. Cross-chunk
-            // dispatch lands in S4.
-            continue;
-        };
+    for (_id, grid) in scene.grids_mut() {
         let local_cam = Camera {
             pos: [
                 camera.pos[0] - grid.transform.origin.x,
@@ -103,15 +102,30 @@ pub fn render_scene<R: Rasterizer + Clone + Send + Sync>(
             down: camera.down,
             forward: camera.forward,
         };
-        let outcome = opticast(
-            rasterizer,
-            pool,
-            &local_cam,
-            settings,
-            chunk.vsid,
-            &chunk.data,
-            &chunk.column_offset,
-        );
+        let combined = grid.combined_world();
+        let outcome = {
+            let mut rasterizer = ScalarRasterizer::new(
+                fb,
+                zb,
+                pitch_pixels,
+                &combined.data,
+                &combined.column_offset,
+                &combined.mip_base_offsets,
+                combined.vsid,
+            );
+            if let Some(sky_ref) = sky {
+                rasterizer = rasterizer.with_sky(sky_ref);
+            }
+            opticast(
+                &mut rasterizer,
+                pool,
+                &local_cam,
+                settings,
+                combined.vsid,
+                &combined.data,
+                &combined.column_offset,
+            )
+        };
         if outcome == OpticastOutcome::Rendered {
             grids_drawn += 1;
         }
@@ -163,7 +177,7 @@ pub fn compose_into(
 /// 2. For each grid, allocate a temporary `(temp_fb, temp_zb)` of
 ///    the same size, pre-fill them with sky / `INFINITY`, and run
 ///    [`opticast`] into them via a [`ScalarRasterizer`] over the
-///    temporary buffers.
+///    temporary buffers AND the grid's combined-world view (S4.0).
 /// 3. Merge the temporary buffers into the shared `(fb, zb)` via
 ///    [`compose_into`] — closer pixels (smaller `z`) win.
 ///
@@ -171,10 +185,6 @@ pub fn compose_into(
 /// with `z` = `gxmax` / `i32::MAX` (a very large value), so they
 /// always lose to any hit. Hits compete on actual perpendicular
 /// distance — the closer grid's surface is what gets composited.
-///
-/// **S3.x scope** (matches [`render_scene`]): axis-aligned,
-/// single-chunk grids only. The chunk lookup is `chunks[(0, 0, 0)]`.
-/// Grids that don't have that chunk are silently skipped.
 ///
 /// `pitch_pixels` is the framebuffer's row stride in pixels (×4 for
 /// bytes). `width` × `height` must equal `fb.len()` /
@@ -194,7 +204,7 @@ pub fn render_scene_composed(
     width: u32,
     height: u32,
     pool: &mut ScratchPool,
-    scene: &Scene,
+    scene: &mut Scene,
     camera: &Camera,
     settings: &OpticastSettings,
     sky_color: u32,
@@ -208,10 +218,7 @@ pub fn render_scene_composed(
     let mut temp_fb = vec![sky_color; pixel_count];
     let mut temp_zb = vec![f32::INFINITY; pixel_count];
 
-    for (_id, grid) in scene.grids() {
-        let Some(chunk) = grid.chunks.get(&IVec3::ZERO) else {
-            continue;
-        };
+    for (_id, grid) in scene.grids_mut() {
         // Reset temp to sky / INFINITY so each grid starts fresh.
         // The reset cost is O(pixels) per grid; for small grid counts
         // this is negligible vs the opticast work.
@@ -229,15 +236,16 @@ pub fn render_scene_composed(
             forward: camera.forward,
         };
 
+        let combined = grid.combined_world();
         let outcome = {
             let mut rasterizer = ScalarRasterizer::new(
                 &mut temp_fb,
                 &mut temp_zb,
                 pitch_pixels,
-                &chunk.data,
-                &chunk.column_offset,
-                &chunk.mip_base_offsets,
-                chunk.vsid,
+                &combined.data,
+                &combined.column_offset,
+                &combined.mip_base_offsets,
+                combined.vsid,
             );
             if let Some(sky_ref) = sky {
                 rasterizer = rasterizer.with_sky(sky_ref);
@@ -247,9 +255,9 @@ pub fn render_scene_composed(
                 pool,
                 &local_cam,
                 settings,
-                chunk.vsid,
-                &chunk.data,
-                &chunk.column_offset,
+                combined.vsid,
+                &combined.data,
+                &combined.column_offset,
             )
         };
         if outcome == OpticastOutcome::Rendered {
@@ -309,11 +317,11 @@ mod tests {
     }
 
     /// Spin up an engine + `ScratchPool` + framebuffers ready for
-    /// one `opticast` / `render_scene` pass. Mirrors the
-    /// boilerplate the `outside_*_repro` tests use.
-    fn render_setup() -> (Engine, ScratchPool, Vec<u32>, Vec<f32>) {
+    /// one `opticast` / `render_scene` pass. `pool_vsid` should
+    /// cover the largest grid's combined vsid.
+    fn render_setup(pool_vsid: u32) -> (Engine, ScratchPool, Vec<u32>, Vec<f32>) {
         let engine = Engine::new();
-        let mut pool = ScratchPool::new(XRES, YRES, CHUNK_SIZE_XY);
+        let mut pool = ScratchPool::new(XRES, YRES, pool_vsid);
         let sky = engine.sky_color();
         let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
         pool.set_skycast(sky_col_i, 0);
@@ -326,27 +334,23 @@ mod tests {
         (engine, pool, framebuffer, zbuffer)
     }
 
-    /// Render `scene` via [`render_scene`] and return the resulting
-    /// framebuffer.
-    fn render_via_scene(scene: &Scene, camera: &Camera) -> Vec<u32> {
-        let (_engine, mut pool, mut fb, mut zb) = render_setup();
+    /// Render `scene` via [`render_scene`] (single-grid no-compose
+    /// path) and return the resulting framebuffer.
+    fn render_via_scene(scene: &mut Scene, camera: &Camera) -> Vec<u32> {
+        let (_engine, mut pool, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-        let chunk_vsid = CHUNK_SIZE_XY;
-        // Need a chunk to seed the rasterizer with — borrow grid 0's
-        // chunk (0,0,0) since render_scene reads through it anyway.
-        let grid = scene.grids().next().expect("test scene has a grid").1;
-        let chunk = grid.chunk(IVec3::ZERO).expect("chunk (0,0,0) present");
-        let mut rasterizer = ScalarRasterizer::new(
+        let outcome = render_scene(
             &mut fb,
             &mut zb,
             XRES as usize,
-            &chunk.data,
-            &chunk.column_offset,
-            &chunk.mip_base_offsets,
-            chunk_vsid,
+            XRES,
+            YRES,
+            &mut pool,
+            scene,
+            camera,
+            &settings,
+            None,
         );
-        let outcome = render_scene(&mut rasterizer, &mut pool, scene, camera, &settings);
-        drop(rasterizer);
         assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
         fb
     }
@@ -355,7 +359,7 @@ mod tests {
     /// camera already in grid-local frame. The reference output
     /// for the round-trip test.
     fn render_via_direct_opticast(scene: &Scene, local_camera: &Camera) -> Vec<u32> {
-        let (_engine, mut pool, mut fb, mut zb) = render_setup();
+        let (_engine, mut pool, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         let grid = scene.grids().next().unwrap().1;
         let chunk = grid.chunk(IVec3::ZERO).unwrap();
@@ -384,13 +388,17 @@ mod tests {
     #[test]
     fn render_scene_at_origin_matches_direct_opticast() {
         // Grid at world origin → grid-local camera == world camera.
-        let (scene, _) = build_one_grid_scene(DVec3::ZERO);
+        // Single 1-chunk grid: combined view's bytes are byte-identical
+        // to the chunk's own column data (slng-walk equivalence), so
+        // render_scene must produce the same framebuffer as a direct
+        // opticast on the chunk.
+        let (mut scene, _) = build_one_grid_scene(DVec3::ZERO);
         let cam = camera_at([64.0, 0.0, 64.0]);
-        let via_scene = render_via_scene(&scene, &cam);
+        let via_scene = render_via_scene(&mut scene, &cam);
         let via_direct = render_via_direct_opticast(&scene, &cam);
         assert_eq!(
             via_scene, via_direct,
-            "render_scene with single grid at origin should match direct opticast"
+            "render_scene with single 1-chunk grid at origin should match direct opticast"
         );
     }
 
@@ -401,10 +409,10 @@ mod tests {
         // should produce the same output as a direct opticast call
         // with grid-local camera.
         let world_origin = DVec3::new(1000.0, 2000.0, 3000.0);
-        let (scene, _) = build_one_grid_scene(world_origin);
+        let (mut scene, _) = build_one_grid_scene(world_origin);
         let world_cam = camera_at([1064.0, 2000.0, 3064.0]);
         let local_cam = camera_at([64.0, 0.0, 64.0]);
-        let via_scene = render_via_scene(&scene, &world_cam);
+        let via_scene = render_via_scene(&mut scene, &world_cam);
         let via_direct = render_via_direct_opticast(&scene, &local_cam);
         assert_eq!(
             via_scene, via_direct,
@@ -414,65 +422,25 @@ mod tests {
 
     #[test]
     fn empty_scene_returns_empty_outcome() {
-        let scene = Scene::new();
-        let (_engine, mut pool, mut fb, mut zb) = render_setup();
+        let mut scene = Scene::new();
+        let (_engine, mut pool, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-        // No chunk to seed with — use a placeholder of zeroed bytes.
-        let placeholder_data = [0u8; 8];
-        let placeholder_offsets = [0u32, 8];
-        let placeholder_mip_offsets = [0usize, 2];
-        let mut rasterizer = ScalarRasterizer::new(
+        let outcome = render_scene(
             &mut fb,
             &mut zb,
             XRES as usize,
-            &placeholder_data,
-            &placeholder_offsets,
-            &placeholder_mip_offsets,
-            1,
-        );
-        let outcome = render_scene(
-            &mut rasterizer,
+            XRES,
+            YRES,
             &mut pool,
-            &scene,
+            &mut scene,
             &camera_at([0.0, 0.0, 0.0]),
             &settings,
+            None,
         );
         assert_eq!(outcome, RenderOutcome::Empty);
     }
 
-    #[test]
-    fn scene_with_grid_but_no_chunk_zero_returns_empty() {
-        let mut scene = Scene::new();
-        let id = scene.add_grid(GridTransform::identity());
-        // Add a chunk at (1, 0, 0) but NOT at (0, 0, 0).
-        scene
-            .grid_mut(id)
-            .unwrap()
-            .ensure_chunk(IVec3::new(1, 0, 0));
-        let (_engine, mut pool, mut fb, mut zb) = render_setup();
-        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-        let chunk = scene.grid(id).unwrap().chunk(IVec3::new(1, 0, 0)).unwrap();
-        let mut rasterizer = ScalarRasterizer::new(
-            &mut fb,
-            &mut zb,
-            XRES as usize,
-            &chunk.data,
-            &chunk.column_offset,
-            &chunk.mip_base_offsets,
-            chunk.vsid,
-        );
-        let outcome = render_scene(
-            &mut rasterizer,
-            &mut pool,
-            &scene,
-            &camera_at([64.0, 0.0, 64.0]),
-            &settings,
-        );
-        // S3.0 only inspects (0,0,0); (1,0,0) is silently skipped.
-        assert_eq!(outcome, RenderOutcome::Empty);
-    }
-
-    // ---- S3.1: render_scene_composed + 2-grid composition ----
+    // ---- S3.1 / S4.0: render_scene_composed + 2-grid composition ----
 
     /// Build a 2-grid scene with two distinguishable boxes placed
     /// side-by-side in world space along the camera's right axis.
@@ -505,9 +473,9 @@ mod tests {
         (scene, 0x80_88_22_22, 0x80_22_22_88)
     }
 
-    fn make_composed_pool() -> (Engine, ScratchPool, u32) {
+    fn make_composed_pool(pool_vsid: u32) -> (Engine, ScratchPool, u32) {
         let engine = Engine::new();
-        let mut pool = ScratchPool::new(XRES, YRES, CHUNK_SIZE_XY);
+        let mut pool = ScratchPool::new(XRES, YRES, pool_vsid);
         let sky_color = engine.sky_color();
         let sky_col_i = i32::from_ne_bytes(sky_color.to_ne_bytes());
         pool.set_skycast(sky_col_i, 0);
@@ -546,8 +514,8 @@ mod tests {
         // at world (~64, ~264, ~100); grid 1's box at world
         // (~264, ~264, ~100). Camera at world (160, 100, 100)
         // looking +y centres both in view.
-        let (scene, red, blue) = build_two_grid_side_by_side();
-        let (_engine, mut pool, sky_color) = make_composed_pool();
+        let (mut scene, red, blue) = build_two_grid_side_by_side();
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
 
@@ -560,7 +528,7 @@ mod tests {
             XRES,
             YRES,
             &mut pool,
-            &scene,
+            &mut scene,
             &camera,
             &settings,
             sky_color,
@@ -606,7 +574,7 @@ mod tests {
             Some(0x80_00_00_aa), // blue
         );
 
-        let (_engine, mut pool, sky_color) = make_composed_pool();
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
 
@@ -621,7 +589,7 @@ mod tests {
             XRES,
             YRES,
             &mut pool,
-            &scene,
+            &mut scene,
             &camera,
             &settings,
             sky_color,
@@ -663,7 +631,7 @@ mod tests {
             XRES,
             YRES,
             &mut pool,
-            &scene2,
+            &mut scene2,
             &camera,
             &settings,
             sky_color,
@@ -678,8 +646,8 @@ mod tests {
 
     #[test]
     fn render_scene_composed_empty_scene_returns_empty() {
-        let scene = Scene::new();
-        let (_engine, mut pool, sky_color) = make_composed_pool();
+        let mut scene = Scene::new();
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let camera = camera_at([0.0, 0.0, 0.0]);
@@ -691,7 +659,7 @@ mod tests {
             XRES,
             YRES,
             &mut pool,
-            &scene,
+            &mut scene,
             &camera,
             &settings,
             sky_color,
@@ -701,4 +669,161 @@ mod tests {
         // fb should be unchanged (still all sky).
         assert!(fb.iter().all(|&p| p == sky_color));
     }
+
+    /// FNV-1a 64-bit hash. Same offset/prime as the
+    /// `roxlap-oracle::fnv1a64` helper used by the wasm-render
+    /// goldens; pinning a render hash here is the same flavour of
+    /// regression catch.
+    fn fnv1a64(data: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in data {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    // ---- S4.0 cross-chunk smoke test ----
+
+    /// Two-chunk-wide grid: a recognisable shape spans the chunk
+    /// boundary at `virtual_x = 128`. The render must not have a
+    /// horizontal seam line at the boundary.
+    #[test]
+    fn render_scene_two_chunk_x_grid_no_seam() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 200.0, 0.0)));
+        let g = scene.grid_mut(id).unwrap();
+        // 100-voxel-tall stripe spanning x=[120..136] across the
+        // x=128 chunk seam at z=200, y=[60..68]. After bake-free
+        // render, every column in the stripe paints the same colour
+        // at the same z; a seam at x=128 would show as missing
+        // pixels in the column at virtual_x=128 / 129 / ...
+        g.set_rect(
+            IVec3::new(120, 60, 200),
+            IVec3::new(136, 67, 215),
+            Some(0x80_aa_55_22),
+        );
+        // Sanity: ensure both chunks were materialised.
+        assert_eq!(g.chunk_count(), 2);
+
+        // Render with a camera positioned to look at the stripe
+        // straight on. Stripe at world (120..136, 260..268, 200..215).
+        // Camera at (128, 100, 207) looking +y centres on it.
+        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let camera = camera_at([128.0, 100.0, 207.0]);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+
+        // Stripe colour should appear in roughly the centre of the
+        // framebuffer. A chunk-edge seam would manifest as a thin
+        // sky-coloured vertical line splitting the stripe in two.
+        let stripe = 0x80_aa_55_22;
+        let stripe_count = fb.iter().filter(|&&p| p == stripe).count();
+        assert!(
+            stripe_count > 200,
+            "stripe rendered too few pixels ({stripe_count}) — chunks may not be stitching"
+        );
+
+        // Walk the centre row left-to-right looking for a sky-pixel
+        // gap inside a stripe run. A gap 1+ pixels wide flags a
+        // chunk-edge seam.
+        let centre_y = (YRES / 2) as usize;
+        let row_start = centre_y * (XRES as usize);
+        let row = &fb[row_start..row_start + (XRES as usize)];
+        let mut in_stripe = false;
+        let mut seam_gaps = 0usize;
+        for &px in row {
+            if px == stripe {
+                in_stripe = true;
+            } else if in_stripe && px == sky_color {
+                // Stripe ended; if we re-enter it on this row that's
+                // a seam.
+                if row.iter().skip_while(|&&p| p != px).any(|&p| p == stripe) {
+                    // Look ahead for any further stripe pixel.
+                    seam_gaps += 1;
+                }
+                in_stripe = false;
+            }
+        }
+        // We allow seam_gaps to count the legitimate "stripe ended,
+        // didn't restart" transition once; more than that means
+        // multiple disjoint runs on the row → seam.
+        assert!(
+            seam_gaps <= 1,
+            "centre row has {seam_gaps} disjoint stripe runs — expected 1 (chunk-edge seam suspected)"
+        );
+    }
+
+    /// Pin the byte-exact FNV-1a64 of a 2-chunk render. Catches
+    /// any drift in the cross-chunk stitch / opticast path.
+    /// Refreeze the hash if a deliberate change to the rendering
+    /// pipeline lands; the seam test above is the
+    /// look-and-feel-correct check.
+    #[test]
+    fn render_scene_two_chunk_x_grid_hash_is_stable() {
+        // Frozen 2026-05-10 at S4.0 landing on x86_64.
+        const GOLDEN: u64 = 0x215e_d66d_7359_4725;
+        // Same scene shape as `render_scene_two_chunk_x_grid_no_seam`
+        // — kept distinct so the hash assertion doesn't share its
+        // setup with the structural seam check.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 200.0, 0.0)));
+        scene.grid_mut(id).unwrap().set_rect(
+            IVec3::new(120, 60, 200),
+            IVec3::new(136, 67, 215),
+            Some(0x80_aa_55_22),
+        );
+        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let camera = camera_at([128.0, 100.0, 207.0]);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+
+        let bytes: Vec<u8> = fb.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        let hash = fnv1a64(&bytes);
+        if GOLDEN == SENTINEL {
+            // First-run capture mode — print the hash so the
+            // developer can paste it into GOLDEN above.
+            eprintln!("render_scene_two_chunk_x_grid_hash_is_stable: capture hash = 0x{hash:016x}");
+            panic!("GOLDEN is the SENTINEL placeholder — paste 0x{hash:016x} into GOLDEN above");
+        }
+        assert_eq!(
+            hash, GOLDEN,
+            "2-chunk render hash drifted: expected 0x{GOLDEN:016x}, got 0x{hash:016x}"
+        );
+    }
+
+    /// Sentinel for first-run hash capture in
+    /// [`render_scene_two_chunk_x_grid_hash_is_stable`]. Replace
+    /// `GOLDEN`'s definition with the printed value once captured.
+    const SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 }
