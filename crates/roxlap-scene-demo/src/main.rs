@@ -34,6 +34,27 @@ const HEIGHT: u32 = 600;
 /// allocating for 32×32 chunks keeps later demo expansions
 /// allocation-free.
 const MAX_GRID_VSID: u32 = 32 * roxlap_scene::CHUNK_SIZE_XY;
+
+/// Max ray-march distance for the per-frame opticast pass.
+/// At vsid=4096 the per-ray DDA walks a flat 64-MB column-offset
+/// table; rays scanning past ~400 voxels overwhelm L3 and drop
+/// frame time below realtime. 512 keeps a healthy view distance
+/// while staying ≥40 FPS on a 4-core CPU. Bench numbers (4-thread
+/// strip-parallel at the demo's spawn camera):
+///     1024 → ~22 FPS · 768 → ~28 FPS · 512 → ~41 FPS ·
+///      384 → ~53 FPS · 256 → ~79 FPS.
+/// Mip-based distant-terrain LOD would unblock larger numbers
+/// without the FPS hit — that lands in the S6 substage.
+const MAX_SCAN_DIST: i32 = 512;
+
+/// Cap for `rayon`'s strip-parallel pool. Voxlap's per-strip
+/// projection re-derivation adds fixed overhead that amortises
+/// poorly past ~4 strips for an 800×600 frame; bench shows >4
+/// threads slows down (per-strip overhead > work). Set high
+/// enough to use modest multicore boost without going past the
+/// efficiency knee.
+const RENDER_THREADS: usize = 4;
+
 const MOVE_SPEED: f64 = 64.0;
 const FAST_MULT: f64 = 4.0;
 const MOUSE_SENS: f64 = 0.0025;
@@ -91,13 +112,20 @@ struct App {
 
 impl App {
     fn new() -> Self {
+        let mut engine = Engine::new();
+        // Match fog distance to the renderer's scan distance so the
+        // visible horizon fades into the sky colour instead of
+        // hard-cutting at the scan-dist limit. The fog colour is
+        // the engine's sky colour so the fade blends with the sky
+        // band above the horizon.
+        engine.set_fog(engine.sky_color(), MAX_SCAN_DIST);
+
         let scene = build_demo();
-        let engine = Engine::new();
-        // Pool sized for the largest grid's combined virtual vsid.
-        // S4.0 bumps the demo to 2-chunk-wide ground (vsid = 256);
-        // budget for the planned 32×32 ground (vsid = 4096) so
-        // future demo expansions don't need a pool resize.
-        let pool = ScratchPool::new(WIDTH, HEIGHT, MAX_GRID_VSID);
+        // One slot per render thread. Strip-parallel rendering
+        // (R12.3.1) splits each frame's y-range across the slots;
+        // RENDER_THREADS caps the count below the efficiency knee.
+        let n_threads = rayon::current_num_threads().clamp(1, RENDER_THREADS);
+        let pool = ScratchPool::new_parallel(WIDTH, HEIGHT, MAX_GRID_VSID, n_threads);
         Self {
             window: None,
             surface: None,
@@ -141,8 +169,13 @@ impl App {
             self.zbuffer.resize(pixel_count, f32::INFINITY);
         }
         if self.pool.slot(0).uurend_half_stride < size.width as usize {
-            self.pool = ScratchPool::new(size.width, size.height, MAX_GRID_VSID);
+            let n_threads = self.pool.n_threads().max(1);
+            self.pool =
+                ScratchPool::new_parallel(size.width, size.height, MAX_GRID_VSID, n_threads);
         }
+
+        let mut settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
+        settings.max_scan_dist = MAX_SCAN_DIST;
 
         // Pool config — sky + fog colour. `treat_z_max_as_air` lets
         // the ship grid render correctly even though the camera is
@@ -157,7 +190,6 @@ impl App {
             .set_fog(fog_col_i, self.engine.fog_max_scan_dist());
         self.pool.set_treat_z_max_as_air(true);
 
-        let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
         let pitch_pixels = size.width as usize;
 
         let Some(surface) = self.surface.as_mut() else {

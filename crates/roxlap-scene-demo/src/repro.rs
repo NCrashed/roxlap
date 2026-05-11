@@ -204,6 +204,91 @@ fn full_demo_scene_renders_without_panic() {
     );
 }
 
+/// Quick FPS benchmark: render N frames from the spawn camera at
+/// the full 32×32 ground + 4×6×1 ship, print average frame time.
+/// Ignored by default — only run when investigating perf
+/// regressions. Pool is sized for the full vsid=4096 ground and
+/// uses rayon's default thread count.
+#[test]
+#[ignore = "expensive: builds full demo + renders N frames (~15-30 s)"]
+fn bench_full_demo_render_fps() {
+    use std::time::Instant;
+    const N_FRAMES: usize = 30;
+
+    // Mirror the live demo's constants so the bench numbers
+    // reflect what users actually see.
+    const DEMO_RENDER_THREADS: usize = 4;
+    const DEMO_MAX_SCAN_DIST: i32 = 512;
+
+    let mut scene_and_cam = crate::scene::build_demo();
+    let mut engine = Engine::new();
+    engine.set_fog(engine.sky_color(), DEMO_MAX_SCAN_DIST);
+    // `BENCH_THREADS` / `BENCH_MAX_SCAN_DIST` env overrides let
+    // the bench be swept from a shell loop for tuning.
+    let n_threads = std::env::var("BENCH_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEMO_RENDER_THREADS)
+        .max(1);
+    let mut pool = ScratchPool::new_parallel(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY, n_threads);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.max_scan_dist = std::env::var("BENCH_MAX_SCAN_DIST")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(DEMO_MAX_SCAN_DIST);
+
+    // One warmup frame so cache populates + jit-y bits settle.
+    let _ = render_scene_composed(
+        &mut fb,
+        &mut zb,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut scene_and_cam.scene,
+        &scene_and_cam.camera,
+        &settings,
+        sky,
+        None,
+    );
+
+    let t_start = Instant::now();
+    for _ in 0..N_FRAMES {
+        fb.fill(sky);
+        zb.fill(f32::INFINITY);
+        let _ = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            W as usize,
+            W,
+            H,
+            &mut pool,
+            &mut scene_and_cam.scene,
+            &scene_and_cam.camera,
+            &settings,
+            sky,
+            None,
+        );
+    }
+    let elapsed = t_start.elapsed();
+    let avg_ms = elapsed.as_secs_f64() * 1000.0 / N_FRAMES as f64;
+    let fps = 1000.0 / avg_ms;
+    eprintln!(
+        "bench: {N_FRAMES} frames in {:.2} s — {avg_ms:.1} ms/frame ({fps:.1} FPS, {n_threads} threads, vsid=4096 ground + vsid=768 ship)",
+        elapsed.as_secs_f64()
+    );
+}
+
 /// Convenience: dump the bug-pose's framebuffer to `/tmp/` for
 /// quick visual inspection. Useful if S4 (cross-chunk gline) or
 /// S5 (rotation) regress the OOB-XY render path.
