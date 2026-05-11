@@ -115,6 +115,11 @@ impl SceneAndCamera {
 /// `EstNormCache` bit table; the per-chunk loop keeps each cache
 /// at ~135 KB (132²×8 bytes) and still gets correct cross-chunk
 /// neighbourhood sampling.
+/// Number of mip levels the demo's combined-view bake produces.
+/// 4 mips covers the demo's `MAX_SCAN_DIST` range; rays transition
+/// to coarser mips at every `MIP_SCAN_DIST` distance step.
+const MIP_LEVELS: u32 = 4;
+
 // chx_v / chy_v are voxlap-canonical paired names.
 #[allow(clippy::cast_possible_wrap, clippy::similar_names)]
 fn bake_lightmode_1(scene: &mut Scene) {
@@ -170,19 +175,14 @@ fn bake_lightmode_1(scene: &mut Scene) {
         grid.sync_combined_to_chunks();
 
         // **NOTE (2026-05-11):** mip generation was attempted as a
-        // perf fix for the vsid=4096 demo (would let the renderer
-        // sample coarser tables at distance, restoring large
-        // max_scan_dist). The combined-view `generate_mips`
-        // method is in place (and unit-tested for table shape),
-        // but rendering through it produced an all-sky frame even
-        // on minimal test scenes — and the issue reproduces with
-        // `Vxl::generate_mips` called directly on a set_rect-built
-        // chunk, while the oracle multi_mip integration test
-        // passes on a parsed VXL. There's a subtle interaction
-        // between the slab format produced by the edit API and
-        // `phase_remiporend` that needs deeper investigation; that
-        // belongs in the proper S6 mip work, not this session.
-        // For now the demo sticks with the max_scan_dist=512
-        // perf knob (~41 FPS).
+        // perf fix for the vsid=4096 demo. The combined-view
+        // `generate_mips` method is in place and unit-tested, but
+        // mip-1+ rendering produces an all-sky frame both at
+        // chunk-vsid (128) and at full grid-vsid (4096). Suspected
+        // root cause: `compilerle` emits only top-of-column floor
+        // voxels for buried-interior columns, so mip-1+ slab data
+        // lacks the depth information `phase_remiporend` needs.
+        // See `project_mip_attempt.md`. Deferred to S6 mip work.
+        let _ = MIP_LEVELS;
     }
 }

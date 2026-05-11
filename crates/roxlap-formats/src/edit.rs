@@ -161,6 +161,19 @@ pub fn insslab(b2: &mut [i32], y0: i32, y1: i32) {
             b2[i - delta] = b2[i];
             b2[i - delta + 1] = b2[i + 1];
         }
+        // Stamp a sentinel at the now-vacated `i+2-delta` slot.
+        // The shift loop above exits with `b2[i+1] >= MAXZDIM`
+        // (slab `i` is the sentinel) WITHOUT copying it forward —
+        // so the merged slabs' old top/bot values are left in
+        // place between `b2[z+2]` and `b2[i+1]`. Walkers using
+        // `b2[i] < MAXZDIM` (top-check, e.g. `voxel_is_solid`)
+        // and the subsequent compilerle re-emit then see phantom
+        // overlapping runs that corrupt the column.
+        //
+        // Writing both top and bot ensures BOTH walker conventions
+        // (top-check and bot-check `< MAXZDIM`) terminate here.
+        b2[i + 2 - delta] = MAXZDIM;
+        b2[i + 3 - delta] = MAXZDIM;
     }
     if y1 > b2[z + 1] {
         // y1 reaches past the bottom of slab z: extend the bot down.
@@ -1392,6 +1405,38 @@ mod tests {
         let mut b2 = build_b2(&[(50, 70)]);
         insslab(&mut b2, 60, 80);
         assert_eq!(read_slabs(&b2), [(50, 80)]);
+    }
+
+    #[test]
+    fn insslab_merge_into_last_slab_writes_sentinel() {
+        // Repro for the multi-call set_spans / terrain bug: inserting
+        // [105, 255) into a column that already has runs (100, 105)
+        // and (255, MAXZDIM) should produce a single run (100,
+        // MAXZDIM), with a clean sentinel at b2[2..]. Pre-fix this
+        // left phantom values at b2[2..4] = (255, MAXZDIM) that
+        // compilerle then re-emitted as overlapping garbage (column
+        // collapsed to just the first voxel at z=100).
+        // Built manually because `build_b2` rejects bot == MAXZDIM —
+        // expandrle does produce that pattern (the bedrock slab at
+        // z=255 lands as the last run with bot=MAXZDIM).
+        let mut b2: Vec<i32> = vec![100, 105, 255, MAXZDIM, MAXZDIM, MAXZDIM];
+        b2.resize(b2.len() + 32, 0); // slack
+        insslab(&mut b2, 105, 255);
+        // After: single run from z=100 to the bedrock-equivalent
+        // sentinel. read_slabs returns until b2[i+1] < MAXZDIM.
+        assert_eq!(b2[0], 100);
+        assert!(
+            b2[1] >= MAXZDIM,
+            "expected merged run to extend to MAXZDIM, got b2[1] = {}",
+            b2[1]
+        );
+        // The phantom (255, MAXZDIM) slot must NOT still be there —
+        // sentinel-stamping in the merge branch fix.
+        assert!(
+            b2[2] >= MAXZDIM,
+            "b2[2] should be sentinel, got {} (pre-fix this was 255 from the un-shifted phantom slab)",
+            b2[2]
+        );
     }
 
     #[test]

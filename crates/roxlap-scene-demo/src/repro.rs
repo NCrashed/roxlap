@@ -179,7 +179,12 @@ fn full_demo_scene_renders_without_panic() {
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
     let mut zb = vec![f32::INFINITY; pixel_count];
-    let settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    // Mirror the live demo's settings since `build_demo` now
+    // generates mips on the combined view; the rasterizer must
+    // see `mip_levels > 1` to consume them.
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
     let _ = render_scene_composed(
         &mut fb,
         &mut zb,
@@ -236,7 +241,10 @@ fn bench_full_demo_render_fps() {
     pool.set_skycast(sky_col_i, 0);
     let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
     pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
+    let treat_z_max_as_air = std::env::var("BENCH_TREAT_Z_MAX_AS_AIR")
+        .ok()
+        .map_or(true, |v| v == "1");
+    pool.set_treat_z_max_as_air(treat_z_max_as_air);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];

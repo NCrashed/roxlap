@@ -39,15 +39,9 @@ const MAX_GRID_VSID: u32 = 32 * roxlap_scene::CHUNK_SIZE_XY;
 /// At vsid=4096 the per-ray DDA walks a flat 64-MB column-offset
 /// table; rays scanning past ~400 voxels overwhelm L3 and drop
 /// frame time below realtime. 512 keeps a healthy view distance
-/// while staying ≥40 FPS on a 4-core CPU. Bench numbers (4-thread
-/// strip-parallel at the demo's spawn camera):
-///     1024 → ~22 FPS · 768 → ~28 FPS · 512 → ~41 FPS ·
-///      384 → ~53 FPS · 256 → ~79 FPS.
-/// Multi-mip distant-terrain LOD would unblock larger numbers
-/// without the FPS hit — `CombinedGridView::generate_mips` is in
-/// place but rendering through the produced mips currently
-/// all-skies on chunk-sized vsid (see scene.rs's
-/// `bake_lightmode_1` comment). The proper fix belongs in S6.
+/// while staying ≥40 FPS on a 4-core CPU. Multi-mip would unblock
+/// larger distances but mip-1+ rendering currently all-skies —
+/// see `project_mip_attempt.md`. Proper fix belongs in S6.
 const MAX_SCAN_DIST: i32 = 512;
 
 /// Cap for `rayon`'s strip-parallel pool. Voxlap's per-strip

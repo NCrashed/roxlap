@@ -1,17 +1,17 @@
 //! Procedural ground / planet surface.
 //!
 //! S4.1: emits a `GROUND_CHUNKS_X × GROUND_CHUNKS_Y` lattice of
-//! chunks into the given grid. The terrain builder skips
-//! `Grid::set_voxel`'s per-voxel scum2 path and goes straight to
-//! `roxlap_formats::edit::set_spans` per chunk — at 32×32 chunks
-//! the per-voxel path was ~3 billion `set_cube` calls; batched
-//! per-chunk spans land in seconds.
+//! chunks into the given grid. The terrain builder uses
+//! `roxlap_formats::edit::set_spans_with_colfunc` to insert each
+//! column's full z stack in **one** call with a colour-by-z
+//! closure — that compounds correctly into the column, while
+//! three back-to-back single-colour `set_spans` calls hit voxlap's
+//! `insslab` last-slab merge edge case and silently drop dirt /
+//! stone bands.
 //!
 //! S4.1 ships with the full 32×32 ground (combined `vsid = 4096`,
-//! 16M virtual columns) **centred on the grid origin** — chunks
-//! span grid-local chunk-XY `[-16..16) × [-16..16)`. The world
-//! feels like it surrounds the player rather than extending only
-//! in `+x / +y`. S4.0's 2×1 micro-bench has been retired.
+//! 16M virtual columns) centred on the grid origin — chunks
+//! span grid-local chunk-XY `[-16..16) × [-16..16)`.
 //!
 //! Material palette:
 //! - `grass` for the topmost voxel of each column when the local
@@ -32,8 +32,17 @@
 )]
 
 use glam::IVec3;
-use roxlap_formats::edit::{set_spans, Vspan};
+use roxlap_formats::edit::{set_spans_with_colfunc, SpanOp, Vspan};
 use roxlap_scene::{Grid, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+
+/// Per-column metadata the colfunc closure consults: each
+/// column's surface z and whether the top is stone (steep slope)
+/// or grass.
+#[derive(Clone, Copy)]
+struct ColMeta {
+    surface_z: i32,
+    top_is_stone: bool,
+}
 
 /// Voxlap-packed colour: `(brightness << 24) | (R << 16) | (G << 8) | B`.
 /// `0x80` brightness is voxlap's neutral / unlit baseline.
@@ -74,22 +83,21 @@ pub fn build_ground(grid: &mut Grid) {
 /// 1. Pre-compute the heightmap over the full grid-local world
 ///    extent so neighbour-height lookups for slope detection are
 ///    O(1).
-/// 2. For each chunk in the lattice, materialise it via
-///    [`Grid::ensure_chunk`] and stage three [`Vspan`] lists in
-///    chunk-local coords (grass / dirt / stone). One
-///    `set_spans` call per colour per chunk replaces ~150
-///    `set_voxel` calls per column.
+/// 2. For each chunk, walk its 128² columns in `(ly, lx)` order
+///    and emit ONE `Vspan` per column covering `[surface_z,
+///    z_max-1]`. Capture per-column `(surface_z, top_is_stone)`
+///    metadata so the colfunc closure picks grass / dirt / stone
+///    per voxel z.
+/// 3. One `set_spans_with_colfunc` call per chunk inserts the
+///    full vertical stack with the right colours.
 ///
 /// `terrain_height` takes grid-local world coordinates, so the
 /// terrain stays continuous across chunk boundaries — there's no
-/// per-chunk re-tiling artefact at the seams (though per-chunk
-/// lighting bake currently produces a brightness seam; see
-/// `project_chunk_edge_lighting_seam.md`).
+/// per-chunk re-tiling artefact at the seams. Per-chunk lighting
+/// bake uses the combined-view path to avoid the brightness-jump
+/// seam (`project_chunk_edge_lighting_seam.md`).
 pub fn build_ground_extent(grid: &mut Grid, chunks_x: i32, chunks_y: i32) {
     let cs_xy = CHUNK_SIZE_XY as i32;
-    // Half-extents in chunks; world spans
-    // `[-half_chunks_*, half_chunks_*)` along each axis. For an
-    // odd `chunks_x`/`chunks_y` the world slightly favours `+`.
     let half_chunks_x = chunks_x / 2;
     let half_chunks_y = chunks_y / 2;
     let world_x_lo = -half_chunks_x * cs_xy;
@@ -99,9 +107,6 @@ pub fn build_ground_extent(grid: &mut Grid, chunks_x: i32, chunks_y: i32) {
     let world_x_extent = world_x_hi - world_x_lo;
     let world_y_extent = world_y_hi - world_y_lo;
 
-    // Pre-compute the heightmap so we can look up neighbour heights
-    // for slope detection without recomputing. `heights` is indexed
-    // by (wy - world_y_lo) * world_x_extent + (wx - world_x_lo).
     let n_cells = (world_x_extent * world_y_extent) as usize;
     let mut heights = vec![0i32; n_cells];
     for wy in world_y_lo..world_y_hi {
@@ -119,30 +124,20 @@ pub fn build_ground_extent(grid: &mut Grid, chunks_x: i32, chunks_y: i32) {
 
     let z_max = (CHUNK_SIZE_Z as i32) - 1; // bedrock placeholder z
 
-    // Per-chunk pass over the centred chunk lattice.
     for chy in -half_chunks_y..(chunks_y - half_chunks_y) {
         for chx in -half_chunks_x..(chunks_x - half_chunks_x) {
             let chunk_origin_x = chx * cs_xy;
             let chunk_origin_y = chy * cs_xy;
 
-            // Three Vspan lists, accumulated in (y, x) order to
-            // satisfy set_spans's "sorted ascending by (y, x)
-            // then by z0" contract. Each (x, y) column contributes
-            // at most one span per colour, so within-column sort
-            // is trivially satisfied.
-            let mut grass_spans: Vec<Vspan> = Vec::new();
-            let mut dirt_spans: Vec<Vspan> = Vec::new();
-            let mut stone_spans: Vec<Vspan> = Vec::new();
-
+            // Stage spans + per-column metadata in (ly, lx) order
+            // — matches `set_spans`'s sort contract.
+            let mut col_meta: Vec<ColMeta> = Vec::with_capacity((cs_xy * cs_xy) as usize);
+            let mut spans: Vec<Vspan> = Vec::with_capacity((cs_xy * cs_xy) as usize);
             for ly in 0..cs_xy {
                 for lx in 0..cs_xy {
                     let wx = chunk_origin_x + lx;
                     let wy = chunk_origin_y + ly;
                     let surface_z = h_at(wx, wy);
-                    // Local slope: max |dh| over the 4-neighbourhood.
-                    // `h_at` clamps at the grid edge so neighbours
-                    // outside the lattice get the edge's height (no
-                    // artificial cliff at the grid boundary).
                     let slope = [
                         (h_at(wx - 1, wy) - surface_z).abs(),
                         (h_at(wx + 1, wy) - surface_z).abs(),
@@ -153,64 +148,41 @@ pub fn build_ground_extent(grid: &mut Grid, chunks_x: i32, chunks_y: i32) {
                     .max()
                     .unwrap_or(0);
                     let top_is_stone = slope >= STONE_SLOPE_THRESHOLD;
-
-                    // Vspan x/y are chunk-local u32 (set_spans skips
-                    // out-of-bounds silently otherwise). Both fit
-                    // u32 trivially since 0..128.
-                    let sx = lx as u32;
-                    let sy = ly as u32;
-
-                    if top_is_stone {
-                        // Single stone span covers surface → above-
-                        // bedrock. Saves 3 spans per column on the
-                        // steep tiles.
-                        stone_spans.push(Vspan {
-                            x: sx,
-                            y: sy,
-                            z0: surface_z as u8,
-                            z1: (z_max - 1) as u8,
-                        });
-                    } else {
-                        // Grass: just the surface voxel.
-                        grass_spans.push(Vspan {
-                            x: sx,
-                            y: sy,
-                            z0: surface_z as u8,
-                            z1: surface_z as u8,
-                        });
-                        // Dirt band, clamped to stay above bedrock.
-                        let dirt_top = surface_z + 1;
-                        let dirt_bot = (surface_z + DIRT_BAND_THICKNESS).min(z_max - 1);
-                        if dirt_bot >= dirt_top {
-                            dirt_spans.push(Vspan {
-                                x: sx,
-                                y: sy,
-                                z0: dirt_top as u8,
-                                z1: dirt_bot as u8,
-                            });
-                        }
-                        // Stone fill from below dirt down to just
-                        // above bedrock.
-                        let stone_top = surface_z + DIRT_BAND_THICKNESS + 1;
-                        if stone_top < z_max {
-                            stone_spans.push(Vspan {
-                                x: sx,
-                                y: sy,
-                                z0: stone_top as u8,
-                                z1: (z_max - 1) as u8,
-                            });
-                        }
-                    }
+                    col_meta.push(ColMeta {
+                        surface_z,
+                        top_is_stone,
+                    });
+                    spans.push(Vspan {
+                        x: lx as u32,
+                        y: ly as u32,
+                        z0: surface_z as u8,
+                        z1: (z_max - 1) as u8,
+                    });
                 }
             }
 
+            // Colfunc picks grass / dirt / stone by relative z from
+            // the column's surface. `x` / `y` are chunk-local voxel
+            // coords (Vspan's u32 fields cast to i32 inside set_spans).
+            let colfunc = move |x: i32, y: i32, z: i32| -> i32 {
+                let lx = x.clamp(0, cs_xy - 1) as usize;
+                let ly = y.clamp(0, cs_xy - 1) as usize;
+                let meta = col_meta[ly * (cs_xy as usize) + lx];
+                let dz = z - meta.surface_z;
+                let colour_u32 = if meta.top_is_stone {
+                    STONE
+                } else if dz == 0 {
+                    GRASS
+                } else if dz <= DIRT_BAND_THICKNESS {
+                    DIRT
+                } else {
+                    STONE
+                };
+                colour_u32 as i32
+            };
+
             let vxl = grid.ensure_chunk(IVec3::new(chx, chy, 0));
-            // One ScumCtx batch per colour band. Empty inputs are a
-            // no-op so we don't bother filtering chunks where every
-            // column happens to be stone-only.
-            set_spans(vxl, &grass_spans, Some(GRASS));
-            set_spans(vxl, &dirt_spans, Some(DIRT));
-            set_spans(vxl, &stone_spans, Some(STONE));
+            set_spans_with_colfunc(vxl, &spans, SpanOp::Insert, colfunc);
         }
     }
 }
