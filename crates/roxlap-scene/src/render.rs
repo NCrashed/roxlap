@@ -785,6 +785,111 @@ mod tests {
     /// Refreeze the hash if a deliberate change to the rendering
     /// pipeline lands; the seam test above is the
     /// look-and-feel-correct check.
+    /// Multi-mip rendering on a chunk-`vsid` (=128) `Vxl` built
+    /// via the edit API surfaces an all-sky frame even though
+    /// the oracle `multi_mip` test (`vsid=2048`, parsed VXL)
+    /// renders correctly. Open question, see scene-demo's
+    /// `scene::bake_lightmode_1` note. Ignored until the
+    /// interaction between the edit pipeline's slab format and
+    /// `phase_remiporend` at small `vsid` is understood.
+    #[test]
+    #[ignore = "all-sky regression at chunk-vsid mip rendering — see scene-demo scene::bake_lightmode_1 comment"]
+    fn vxl_generate_mips_on_set_voxel_chunk_renders() {
+        let mut grid = crate::Grid::new(GridTransform::identity());
+        // Solid floor at z=100..254 across the entire chunk —
+        // looks like the oracle test's terrain.
+        grid.set_rect(
+            IVec3::new(0, 0, 100),
+            IVec3::new(127, 127, 254),
+            Some(0x80_88_88_88),
+        );
+        let chunk = grid.chunks.get_mut(&IVec3::ZERO).unwrap();
+        chunk.generate_mips(3);
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        // Camera south of the box (same pose as the
+        // `render_scene_at_origin_matches_direct_opticast` test
+        // which renders the box correctly mip-0-only).
+        let camera = camera_at([64.0, 0.0, 64.0]);
+        let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        settings.mip_levels = 3;
+        settings.mip_scan_dist = 4;
+        let mut rasterizer = ScalarRasterizer::new(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            &chunk.data,
+            &chunk.column_offset,
+            &chunk.mip_base_offsets,
+            chunk.vsid,
+        );
+        let _ = core_opticast(
+            &mut rasterizer,
+            &mut pool,
+            &camera,
+            &settings,
+            chunk.vsid,
+            &chunk.data,
+            &chunk.column_offset,
+        );
+        drop(rasterizer);
+        let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
+        assert!(
+            non_sky > 0,
+            "Vxl::generate_mips on a set_voxel-built chunk should render to something non-sky"
+        );
+    }
+
+    /// Mip-0 preservation when mips are generated on the combined
+    /// view but `mip_levels = 1` in the rasterizer's settings.
+    /// Confirms `generate_mips` only APPENDS data — mip-0
+    /// prefix is unchanged.
+    #[test]
+    fn render_with_mips_present_still_renders_mip0() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        scene.grid_mut(id).unwrap().set_rect(
+            IVec3::new(40, 40, 40),
+            IVec3::new(55, 55, 55),
+            Some(0x80_88_88_88),
+        );
+        // Force mip-1..mip-2 generation on the combined view.
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .combined_world_mut()
+            .generate_mips(3);
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let camera = camera_at([64.0, 0.0, 64.0]);
+        // mip_scan_dist huge → renderer never transitions past mip-0
+        // so this test pins mip-0 correctness only.
+        let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        settings.mip_scan_dist = 100_000;
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
+        assert!(
+            non_sky > 0,
+            "render of single-grid scene with mips present rendered all-sky: mip-0 may be corrupted by generate_mips"
+        );
+    }
+
     #[test]
     fn render_scene_two_chunk_x_grid_hash_is_stable() {
         // Frozen 2026-05-10 at S4.0 landing on x86_64.

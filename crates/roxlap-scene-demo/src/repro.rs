@@ -283,8 +283,10 @@ fn bench_full_demo_render_fps() {
     let elapsed = t_start.elapsed();
     let avg_ms = elapsed.as_secs_f64() * 1000.0 / N_FRAMES as f64;
     let fps = 1000.0 / avg_ms;
+    let non_sky = fb.iter().filter(|&&p| p != sky).count();
+    let non_sky_pct = 100.0 * non_sky as f64 / pixel_count as f64;
     eprintln!(
-        "bench: {N_FRAMES} frames in {:.2} s — {avg_ms:.1} ms/frame ({fps:.1} FPS, {n_threads} threads, vsid=4096 ground + vsid=768 ship)",
+        "bench: {N_FRAMES} frames in {:.2} s — {avg_ms:.1} ms/frame ({fps:.1} FPS, {n_threads} threads, vsid=4096 ground + vsid=768 ship); non-sky pixels {non_sky}/{pixel_count} ({non_sky_pct:.1}%)",
         elapsed.as_secs_f64()
     );
 }

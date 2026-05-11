@@ -168,5 +168,21 @@ fn bake_lightmode_1(scene: &mut Scene) {
         // back into each chunk's source slab buffer. Keeps the cache
         // invariant valid for any later edit/invalidate cycle.
         grid.sync_combined_to_chunks();
+
+        // **NOTE (2026-05-11):** mip generation was attempted as a
+        // perf fix for the vsid=4096 demo (would let the renderer
+        // sample coarser tables at distance, restoring large
+        // max_scan_dist). The combined-view `generate_mips`
+        // method is in place (and unit-tested for table shape),
+        // but rendering through it produced an all-sky frame even
+        // on minimal test scenes — and the issue reproduces with
+        // `Vxl::generate_mips` called directly on a set_rect-built
+        // chunk, while the oracle multi_mip integration test
+        // passes on a parsed VXL. There's a subtle interaction
+        // between the slab format produced by the edit API and
+        // `phase_remiporend` that needs deeper investigation; that
+        // belongs in the proper S6 mip work, not this session.
+        // For now the demo sticks with the max_scan_dist=512
+        // perf knob (~41 FPS).
     }
 }

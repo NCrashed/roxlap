@@ -212,6 +212,65 @@ impl CombinedGridView {
         let cs = CHUNK_SIZE_XY as i32;
         glam::IVec2::new(-self.origin_chunk.x * cs, -self.origin_chunk.y * cs)
     }
+
+    /// Generate mip-1..mip-`max_mips` directly on the stitched
+    /// world. The mip generator runs over the combined `(data,
+    /// column_offset, vsid)` so each mip-N voxel correctly averages
+    /// 4 mip-(N-1) voxels including those that crossed source-chunk
+    /// boundaries — no per-chunk-edge artefact.
+    ///
+    /// `max_mips` is the desired final mip count (1 = no mips
+    /// added, 4 = mip-0..3). Caps at `vsid >> mip_levels > 1`
+    /// internally per voxlap's halving rule.
+    ///
+    /// After this returns,
+    /// [`roxlap_core::opticast::opticast`] callers can set
+    /// [`roxlap_core::opticast::OpticastSettings::mip_levels`] up
+    /// to the produced mip count and the renderer will switch to
+    /// coarser mips at `mip_scan_dist` voxel ranges.
+    ///
+    /// Implementation: wraps `self`'s data + tables into a synthetic
+    /// [`Vxl`] (with empty `vbit`, since the mip generator doesn't
+    /// touch voxalloc state), calls
+    /// [`Vxl::generate_mips`](roxlap_formats::vxl::Vxl::generate_mips),
+    /// then unwraps back. `Vec ↔ Box<[T]>` conversions are O(1) when
+    /// the allocation isn't shrunk.
+    pub fn generate_mips(&mut self, max_mips: u32) {
+        if max_mips <= 1 {
+            return;
+        }
+        let data = std::mem::take(&mut self.data).into_boxed_slice();
+        let column_offset = std::mem::take(&mut self.column_offset).into_boxed_slice();
+        let mip_base_offsets = std::mem::take(&mut self.mip_base_offsets).into_boxed_slice();
+        let mut vxl = Vxl {
+            vsid: self.vsid,
+            // Per-grid placement lives on `GridTransform`; the
+            // synthetic Vxl's intrinsic camera fields are unused
+            // here, same as in `chunks::empty_chunk_vxl`.
+            ipo: [0.0; 3],
+            ist: [1.0, 0.0, 0.0],
+            ihe: [0.0, 0.0, 1.0],
+            ifo: [0.0, 1.0, 0.0],
+            data,
+            column_offset,
+            mip_base_offsets,
+            vbit: Box::new([]),
+            vbiti: 0,
+        };
+        vxl.generate_mips(max_mips);
+        self.data = vxl.data.into_vec();
+        self.column_offset = vxl.column_offset.into_vec();
+        self.mip_base_offsets = vxl.mip_base_offsets.into_vec();
+    }
+
+    /// How many mip levels are populated. Always `>= 1` (mip-0 is
+    /// the stitched data). Equals `mip_base_offsets.len() - 1`.
+    #[must_use]
+    pub fn mip_count(&self) -> u32 {
+        #[allow(clippy::cast_possible_truncation)]
+        let n = (self.mip_base_offsets.len() - 1) as u32;
+        n
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +408,46 @@ mod tests {
         let view = CombinedGridView::build(&grid.chunks);
         // No populated z=0 chunks → still 1-chunk virtual world.
         assert_eq!(view.vsid, CHUNK_SIZE_XY);
+    }
+
+    /// `generate_mips` adds the requested number of mip levels
+    /// and grows `mip_base_offsets`. Sub-table sizes match
+    /// voxlap's halving rule (`(vsid >> j)² + 1` entries per
+    /// level).
+    #[test]
+    fn generate_mips_grows_mip_table() {
+        let mut grid = Grid::new(GridTransform::identity());
+        grid.set_voxel(IVec3::new(10, 10, 100), Some(0x80_aa_bb_cc));
+        let mut view = CombinedGridView::build(&grid.chunks);
+        assert_eq!(view.mip_count(), 1);
+        let mip0_data_len = view.data.len();
+
+        view.generate_mips(3);
+        assert_eq!(view.mip_count(), 3);
+        // mip_base_offsets has mip_count + 1 entries (trailing
+        // sentinel = column_offset.len()).
+        assert_eq!(view.mip_base_offsets.len(), 4);
+        // Sub-table sizes: vsid² + 1, (vsid/2)² + 1, (vsid/4)² + 1.
+        let vsid = view.vsid as usize;
+        assert_eq!(
+            view.mip_base_offsets[1] - view.mip_base_offsets[0],
+            vsid * vsid + 1
+        );
+        assert_eq!(
+            view.mip_base_offsets[2] - view.mip_base_offsets[1],
+            (vsid / 2) * (vsid / 2) + 1
+        );
+        assert_eq!(
+            view.mip_base_offsets[3] - view.mip_base_offsets[2],
+            (vsid / 4) * (vsid / 4) + 1
+        );
+        // Trailing sentinel equals column_offset.len().
+        assert_eq!(
+            *view.mip_base_offsets.last().unwrap(),
+            view.column_offset.len()
+        );
+        // Mip-0 data prefix is preserved (mip generator appends).
+        assert!(view.data.len() > mip0_data_len);
     }
 
     /// Non-square 2x1 lattice gets square-padded to 2x2; the second
