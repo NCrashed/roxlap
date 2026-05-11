@@ -121,11 +121,11 @@ fn dump_mip_bytes_for_solid_floor_chunk() {
         forward: [0.0, 1.0, 0.0],
     };
     eprintln!("\n>>> ABOUT TO RUN (B) MULTI-MIP <<<");
-    // (B) multi-mip with normal mip_scan_dist=4.
-    {
+    // (B) sweep mip_scan_dist on the SINGLE-SLAB fixture too.
+    for msd in [4i32, 16, 64, 128, 256, 1024] {
         let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         settings.mip_levels = 3;
-        settings.mip_scan_dist = 4;
+        settings.mip_scan_dist = msd;
         fb.fill(sky_color);
         zb.fill(f32::INFINITY);
         let grid_view = GridView::from_single_vxl(chunk);
@@ -133,7 +133,80 @@ fn dump_mip_bytes_for_solid_floor_chunk() {
         let _ = opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
         drop(rasterizer);
         let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
-        eprintln!("(B) multi-mip (mip_scan_dist=4):   {non_sky} non-sky pixels");
+        eprintln!("(B) single-slab mip_scan_dist={msd:5}: {non_sky:6} non-sky pixels");
+    }
+}
+
+/// (C) Same fixture but with an AIR GAP between the surface and
+/// the bedrock so compilerle emits a multi-slab column. If
+/// multi-mip works on this, the bug is specific to single-slab
+/// columns (compilerle's "buried interior" encoding).
+#[test]
+#[ignore = "diagnostic — invoke with --ignored"]
+fn multi_mip_renders_floor_with_air_gap_below() {
+    use roxlap_core::{
+        opticast::{opticast, OpticastSettings},
+        rasterizer::ScratchPool,
+        scalar_rasterizer::ScalarRasterizer,
+        Camera, GridView,
+    };
+
+    let mut grid = Grid::new(GridTransform::identity());
+    // Solid only at z=100..150 — leaves z=151..254 as AIR
+    // (preserved from empty_chunk_vxl's all-air carve), z=255 is
+    // the bedrock placeholder.
+    grid.set_rect(
+        IVec3::new(0, 0, 100),
+        IVec3::new((CHUNK_SIZE_XY - 1) as i32, (CHUNK_SIZE_XY - 1) as i32, 150),
+        Some(0x80_88_88_88),
+    );
+    let chunk = grid.chunks.get_mut(&IVec3::ZERO).unwrap();
+
+    let col0_start = chunk.column_offset_for_mip(0)[0] as usize;
+    let col0_len = slng(&chunk.data[col0_start..]);
+    eprintln!("=== AIR-GAP MIP-0 column (0,0): {col0_len} bytes ===");
+    for i in (0..col0_len).step_by(4) {
+        let b = &chunk.data[col0_start + i..col0_start + i + 4];
+        eprintln!("  [{i:4}] {:3} {:3} {:3} {:3}", b[0], b[1], b[2], b[3]);
+    }
+
+    chunk.generate_mips(3);
+    let col0_m1_start = chunk.column_offset_for_mip(1)[0] as usize;
+    let col0_m1_len = slng(&chunk.data[col0_m1_start..]);
+    eprintln!("\n=== AIR-GAP MIP-1 column (0,0): {col0_m1_len} bytes ===");
+    for i in (0..col0_m1_len).step_by(4) {
+        let b = &chunk.data[col0_m1_start + i..col0_m1_start + i + 4];
+        eprintln!("  [{i:4}] {:3} {:3} {:3} {:3}", b[0], b[1], b[2], b[3]);
+    }
+
+    const XRES: u32 = 320;
+    const YRES: u32 = 200;
+    let mut fb = vec![0u32; (XRES as usize) * (YRES as usize)];
+    let mut zb = vec![0.0f32; fb.len()];
+    let mut pool = ScratchPool::new(XRES, YRES, CHUNK_SIZE_XY);
+    let sky_color: u32 = 0xff_87_ce_eb;
+    pool.set_skycast(i32::from_ne_bytes(sky_color.to_ne_bytes()), 0);
+    fb.fill(sky_color);
+    zb.fill(f32::INFINITY);
+    let camera = Camera {
+        pos: [64.0, 0.0, 80.0],
+        right: [-1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+    };
+    // Sweep mip_scan_dist to find the threshold where rendering starts working.
+    for msd in [4i32, 16, 64, 128, 256, 1024] {
+        let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        settings.mip_levels = 3;
+        settings.mip_scan_dist = msd;
+        fb.fill(sky_color);
+        zb.fill(f32::INFINITY);
+        let grid_view = GridView::from_single_vxl(chunk);
+        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
+        let _ = opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
+        drop(rasterizer);
+        let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
+        eprintln!("(C) air-gap mip_scan_dist={msd:5}: {non_sky:6} non-sky pixels");
     }
 
     // Dump mip-1 column at (0, 0). Should encode the same shape at

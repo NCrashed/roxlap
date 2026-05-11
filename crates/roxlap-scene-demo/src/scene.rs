@@ -178,10 +178,13 @@ fn bake_lightmode_1(scene: &mut Scene) {
             );
         }
 
-        // NOTE (2026-05-11): mip generation attempted as a perf
-        // fix for the vsid=4096 demo. The `compilerle` emit-only-
-        // top-of-column-floor-voxels bug makes mip-1+ slab data
-        // unrenderable. Deferred to S6.
-        // See `project_mip_attempt.md`.
+        // NOTE (S4B.5 2026-05-11): multi-mip wiring was attempted
+        // here but reverted because `phase_remiporend`'s cf-halving
+        // produces all-sky frames at the demo's terrain scale for
+        // any usable `mip_scan_dist`. See
+        // `project_s4b_5_investigation.md` + diagnostic test
+        // `crates/roxlap-scene/tests/mip_repro.rs`. Deferred until
+        // the voxlap-C `genmipremip` audit lands the algorithmic
+        // fix.
     }
 }
