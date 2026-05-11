@@ -530,24 +530,13 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // chunks before hitting the world edge.
         let mut gxmax = cache.prelude.max_scan_dist;
         scratch.skycast.dist = gxmax;
-        let (world_xmin, world_xmax, world_ymin, world_ymax) =
-            if let Some(cg) = self.grid.chunk_grid {
-                #[allow(clippy::cast_possible_wrap)]
-                let chunk_size = self.grid.chunk_size_xy as i32;
-                #[allow(clippy::cast_possible_wrap)]
-                let chunks_x = cg.chunks_x as i32;
-                #[allow(clippy::cast_possible_wrap)]
-                let chunks_y = cg.chunks_y as i32;
-                let xmin = cg.origin_chunk_xy[0] * chunk_size;
-                let xmax = xmin + chunks_x * chunk_size;
-                let ymin = cg.origin_chunk_xy[1] * chunk_size;
-                let ymax = ymin + chunks_y * chunk_size;
-                (xmin, xmax, ymin, ymax)
-            } else {
-                #[allow(clippy::cast_possible_wrap)]
-                let vsid_signed = self.grid.vsid as i32;
-                (0, vsid_signed, 0, vsid_signed)
-            };
+        // S4B.2.d: world-edge clip uses the grid's voxel AABB.
+        // Single-chunk grids get `([0, 0], [vsid, vsid])` — same as
+        // the historical world-edge math. Multi-chunk grids extend
+        // to cover every chunk's voxel extent.
+        let (aabb_min, aabb_max) = self.grid.aabb_xy();
+        let (world_xmin, world_xmax) = (aabb_min[0], aabb_max[0]);
+        let (world_ymin, world_ymax) = (aabb_min[1], aabb_max[1]);
         let j0 = if f.gixy[0] < 0 {
             li_pos_xy[0] - world_xmin
         } else {

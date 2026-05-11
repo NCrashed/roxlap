@@ -195,6 +195,41 @@ impl<'a> GridView<'a> {
         self
     }
 
+    /// S4B.2.d: voxel-space XY axis-aligned bounding box of the
+    /// grid. Returns `([xmin, ymin], [xmax, ymax])` in voxel units;
+    /// the grid contains voxels with coordinates in
+    /// `[xmin, xmax) × [ymin, ymax)`.
+    ///
+    /// - Single-chunk (`chunk_grid: None`): returns
+    ///   `([0, 0], [vsid, vsid])`. Byte-identical to the historical
+    ///   single-chunk world-edge math.
+    /// - Multi-chunk (`chunk_grid: Some(&cg)`): derived from
+    ///   `cg.origin_chunk_xy + cg.chunks_x/y * chunk_size_xy`.
+    ///
+    /// Consumed by [`crate::opticast_prelude::recompute_in_bounds_xy`]
+    /// (camera-inside-grid check) and the rasterizer's gline
+    /// world-edge gxmax clip.
+    #[must_use]
+    pub fn aabb_xy(&self) -> ([i32; 2], [i32; 2]) {
+        if let Some(cg) = self.chunk_grid {
+            #[allow(clippy::cast_possible_wrap)]
+            let cs = self.chunk_size_xy as i32;
+            #[allow(clippy::cast_possible_wrap)]
+            let chunks_x = cg.chunks_x as i32;
+            #[allow(clippy::cast_possible_wrap)]
+            let chunks_y = cg.chunks_y as i32;
+            let xmin = cg.origin_chunk_xy[0] * cs;
+            let ymin = cg.origin_chunk_xy[1] * cs;
+            let xmax = xmin + chunks_x * cs;
+            let ymax = ymin + chunks_y * cs;
+            ([xmin, ymin], [xmax, ymax])
+        } else {
+            #[allow(clippy::cast_possible_wrap)]
+            let v = self.vsid as i32;
+            ([0, 0], [v, v])
+        }
+    }
+
     /// S4B.2.a: chunk lookup for the cross-chunk-XY DDA.
     ///
     /// Returns the [`GridView`] for the chunk at XY index
@@ -410,6 +445,42 @@ mod tests {
         // Single-chunk fields stay populated; tests beyond rely on
         // opticast's prelude refreshing them via the camera lookup.
         let _ = (slab_a, cols_a, mips_a);
+    }
+
+    #[test]
+    fn aabb_xy_single_chunk_returns_0_to_vsid() {
+        let mips = [0usize, 2];
+        let gv = GridView::from_parts(2048, &[], &[], &mips);
+        let (lo, hi) = gv.aabb_xy();
+        assert_eq!(lo, [0, 0]);
+        assert_eq!(hi, [2048, 2048]);
+    }
+
+    #[test]
+    fn aabb_xy_multi_chunk_covers_full_extent() {
+        let (slab_a, _, cols_a, _, mips_a, _) = build_two_chunk_x_stripe();
+        // 2-wide × 3-tall chunk grid starting at origin [-1, 0].
+        // Each chunk is 128² (matches the constructor's chunk_size_xy).
+        let chunks = [
+            Some(GridView::from_parts(128, &slab_a, &cols_a, &mips_a)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [-1, 0],
+            chunks_x: 2,
+            chunks_y: 3,
+        };
+        let gv = GridView::from_chunk_grid(&cg, 128);
+        let (lo, hi) = gv.aabb_xy();
+        // xmin = -1 * 128 = -128; xmax = (-1 + 2) * 128 = 128.
+        // ymin = 0; ymax = 3 * 128 = 384.
+        assert_eq!(lo, [-128, 0]);
+        assert_eq!(hi, [128, 384]);
     }
 
     #[test]

@@ -1000,4 +1000,77 @@ mod tests {
             "Approach B 2-chunk render hash drifted: expected 0x{GOLDEN_B:016x}, got 0x{hash:016x}"
         );
     }
+
+    /// S4B.2.d: multi-chunk camera that sits **past** the first
+    /// chunk's vsid (i.e., inside chunk (1, 0)). Validates that
+    /// `recompute_in_bounds_xy` against the grid AABB recognises
+    /// the camera as in-bounds — and that the seed path looks up
+    /// chunk (1, 0)'s column via `chunk_at_xy(camera_chunk_idx)`
+    /// instead of returning the OOB-XY bedrock placeholder.
+    ///
+    /// Scene shape: a 2-chunk x-stripe with a floor in chunk (1, 0)
+    /// (where the camera sits) and the recognisable box in chunk
+    /// (0, 0). The camera looks `-x` so rays cross from chunk
+    /// (1, 0) back into chunk (0, 0). Tests the OTHER direction of
+    /// cross-chunk DDA + the in-bounds AABB fix together.
+    #[test]
+    fn approach_b_camera_in_chunk_1_0_renders_neighbour() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        // Floor under the camera in chunk (1, 0).
+        g.set_rect(
+            IVec3::new(128, 0, 200),
+            IVec3::new(255, 127, 205),
+            Some(0x80_44_44_aa),
+        );
+        // Box deep in chunk (0, 0) — only visible if the camera in
+        // chunk (1, 0) is recognised as in-bounds AND the
+        // cross-chunk DDA fires westward.
+        g.set_rect(
+            IVec3::new(20, 50, 150),
+            IVec3::new(30, 60, 165),
+            Some(0x80_aa_55_22),
+        );
+        assert_eq!(g.chunk_count(), 2);
+
+        let backing = g.chunk_xy_backing().expect("populated");
+        let cg = roxlap_core::ChunkGrid {
+            chunks: &backing.chunks,
+            origin_chunk_xy: backing.origin_chunk_xy,
+            chunks_x: backing.chunks_x,
+            chunks_y: backing.chunks_y,
+        };
+        let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
+        let (aabb_min, aabb_max) = grid_view.aabb_xy();
+        assert_eq!(aabb_min, [0, 0]);
+        assert_eq!(aabb_max, [256, 128]);
+
+        // Camera deep in chunk (1, 0): world (200, 64, 160). Past
+        // the single-chunk vsid=128 OOB cutoff but inside the
+        // multi-chunk AABB. Look -x toward chunk (0, 0).
+        let camera = Camera {
+            pos: [200.0, 64.0, 160.0],
+            right: [0.0, -1.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [-1.0, 0.0, 0.0],
+        };
+        let (_engine, mut pool, mut fb, mut zb) = render_setup(2 * CHUNK_SIZE_XY);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
+        let outcome = core_opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
+        drop(rasterizer);
+        assert_eq!(outcome, OpticastOutcome::Rendered);
+
+        let floor_count = fb.iter().filter(|&&p| p == 0x80_44_44_aa).count();
+        let box_count = fb.iter().filter(|&&p| p == 0x80_aa_55_22).count();
+        assert!(
+            floor_count > 1000,
+            "floor under camera in chunk (1, 0) not visible — only {floor_count} floor pixels — in_bounds_xy fix may not have taken effect"
+        );
+        assert!(
+            box_count > 50,
+            "box in chunk (0, 0) not visible — only {box_count} box pixels — westward cross-chunk DDA failed"
+        );
+    }
 }

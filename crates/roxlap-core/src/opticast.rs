@@ -208,6 +208,14 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     // chunk callers it splits `li_pos.xy` into
     // `(camera_chunk_idx.xy, camera_local_xyz.xy)`.
     opticast_prelude::recompute_camera_chunk(&mut prelude, grid.chunk_size_xy);
+    // S4B.2.d: re-evaluate `in_bounds_xy` against the grid's full
+    // XY voxel AABB. For single-chunk callers `aabb_xy()` returns
+    // `([0, 0], [vsid, vsid])` so the recomputed `in_bounds_xy`
+    // matches what `derive_prelude` populated. For multi-chunk
+    // callers, the camera is treated as in-bounds when it lies
+    // anywhere inside the grid's chunk-XY footprint.
+    let (aabb_min, aabb_max) = grid.aabb_xy();
+    opticast_prelude::recompute_in_bounds_xy(&mut prelude, aabb_min, aabb_max);
 
     // S4B.1: `column_walk::camera_chunk_air_gap` now owns both
     // branches (in-bounds column lookup + OOB-XY bedrock seed

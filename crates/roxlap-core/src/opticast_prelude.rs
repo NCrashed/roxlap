@@ -241,6 +241,35 @@ pub fn recompute_camera_chunk(prelude: &mut OpticastPrelude, chunk_size_xy: u32)
     ];
 }
 
+/// S4B.2.d: refine [`OpticastPrelude::in_bounds_xy`] against the
+/// grid's full voxel AABB rather than a single chunk's `[0, vsid)²`.
+/// Pair with [`crate::grid_view::GridView::aabb_xy`].
+///
+/// `aabb_min` and `aabb_max` are voxel-space `[xmin, ymin]` and
+/// `[xmax, ymax]`; the camera is in-bounds iff `cx ∈ [xmin, xmax)`
+/// AND `cy ∈ [ymin, ymax)`.
+///
+/// [`derive_prelude`] populates `in_bounds_xy` against the
+/// single-chunk world-edge (`vsid`). For multi-chunk grids
+/// (chunks span the chx/chy plane), a camera in chunk (1, 0) sits
+/// past `chunk_size_xy` on the x axis and would be reported OOB.
+/// This helper re-runs the check against the multi-chunk AABB so
+/// the camera-in-real-chunk case is recognised correctly.
+///
+/// Single-chunk callers (`GridView::aabb_xy` returns
+/// `([0, 0], [vsid, vsid])`) get the same `in_bounds_xy` as
+/// [`derive_prelude`] populated — byte-identical to the goldens.
+pub fn recompute_in_bounds_xy(
+    prelude: &mut OpticastPrelude,
+    aabb_min: [i32; 2],
+    aabb_max: [i32; 2],
+) {
+    prelude.in_bounds_xy = prelude.cx >= aabb_min[0]
+        && prelude.cy >= aabb_min[1]
+        && prelude.cx < aabb_max[0]
+        && prelude.cy < aabb_max[1];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +401,40 @@ mod tests {
     /// left edge). Downstream code gates on `in_bounds_xy`, so
     /// the OOB-XY values don't get dereferenced — but the test
     /// pins the arithmetic.
+    /// S4B.2.d: single-chunk callers' AABB `[0, vsid)²` should
+    /// produce the same `in_bounds_xy` as `derive_prelude`'s
+    /// per-vsid computation — byte-identical with the goldens.
+    #[test]
+    fn recompute_in_bounds_xy_single_chunk_aabb_matches_derive_prelude() {
+        let s = oracle_north_state(); // pos.x = pos.y = 1024
+        let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let before = p.in_bounds_xy;
+        recompute_in_bounds_xy(&mut p, [0, 0], [2048, 2048]);
+        assert_eq!(p.in_bounds_xy, before);
+        assert!(p.in_bounds_xy);
+    }
+
+    /// S4B.2.d: multi-chunk AABB allows camera past the per-chunk
+    /// vsid. Camera at (1200, 100) with per-chunk vsid=128 lands
+    /// OOB under `derive_prelude` (1200 ≥ 128) but in-bounds
+    /// under recompute against `[0, 2048] × [0, 128]`.
+    #[test]
+    fn recompute_in_bounds_xy_multi_chunk_grows_extent() {
+        let cam = crate::Camera {
+            pos: [1200.0, 100.0, 50.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
+        // derive_prelude with single-chunk vsid=128 reports OOB.
+        let mut p = derive_prelude(&s, 128, 1, 4, 1024);
+        assert!(!p.in_bounds_xy);
+        // Multi-chunk grid spans (0, 0) to (2048, 128).
+        recompute_in_bounds_xy(&mut p, [0, 0], [2048, 128]);
+        assert!(p.in_bounds_xy);
+    }
+
     #[test]
     fn recompute_camera_chunk_oob_xy_yields_negative_chunk_idx() {
         let cam = crate::Camera {
