@@ -216,24 +216,32 @@ impl Grid {
     /// Debug builds panic if a column's combined-view byte length
     /// doesn't match its source-chunk byte length — that's the
     /// invariant violation noted above.
+    // chx_local / chy_local are voxlap-canonical paired names.
+    #[allow(clippy::similar_names)]
     pub fn sync_combined_to_chunks(&mut self) {
         let Some(combined) = self.cached_combined.as_ref() else {
             return;
         };
         let cs_xy = CHUNK_SIZE_XY;
         let vsid = combined.vsid;
+        let origin_chunk = combined.origin_chunk;
         for (chunk_idx, vxl) in &mut self.chunks {
             if chunk_idx.z != 0 {
                 // S4.0 scope: only chx/chy chunks at chz=0 are
                 // represented in the combined view. Skip others.
                 continue;
             }
+            // Grid-local chunk index → virtual-coord chunk index.
+            let chx_local = chunk_idx.x - origin_chunk.x;
+            let chy_local = chunk_idx.y - origin_chunk.y;
+            debug_assert!(
+                chx_local >= 0 && chy_local >= 0,
+                "chunk at {chunk_idx:?} is past the combined view's origin {origin_chunk:?}"
+            );
             #[allow(clippy::cast_sign_loss)]
-            let chx = chunk_idx.x as u32;
+            let chunk_origin_x = (chx_local as u32) * cs_xy;
             #[allow(clippy::cast_sign_loss)]
-            let chy = chunk_idx.y as u32;
-            let chunk_origin_x = chx * cs_xy;
-            let chunk_origin_y = chy * cs_xy;
+            let chunk_origin_y = (chy_local as u32) * cs_xy;
             for ly in 0..cs_xy {
                 for lx in 0..cs_xy {
                     let local_idx = (ly * cs_xy + lx) as usize;
@@ -253,7 +261,7 @@ impl Grid {
                     debug_assert_eq!(
                         roxlap_formats::vxl::slng(&vxl.data[chunk_start..]),
                         combined_len,
-                        "combined-view column ({vx}, {vy}) length {combined_len} != chunk ({chx}, {chy}) local ({lx}, {ly}) slng length — sync_combined_to_chunks requires byte-length-preserving mutations"
+                        "combined-view column ({vx}, {vy}) length {combined_len} != chunk {chunk_idx:?} local ({lx}, {ly}) slng length — sync_combined_to_chunks requires byte-length-preserving mutations"
                     );
                     vxl.data[chunk_start..chunk_start + combined_len]
                         .copy_from_slice(&combined.data[combined_start..combined_end]);

@@ -8,7 +8,10 @@
 //! per-chunk spans land in seconds.
 //!
 //! S4.1 ships with the full 32×32 ground (combined `vsid = 4096`,
-//! 16M virtual columns). S4.0's 2×1 micro-bench has been retired.
+//! 16M virtual columns) **centred on the grid origin** — chunks
+//! span grid-local chunk-XY `[-16..16) × [-16..16)`. The world
+//! feels like it surrounds the player rather than extending only
+//! in `+x / +y`. S4.0's 2×1 micro-bench has been retired.
 //!
 //! Material palette:
 //! - `grass` for the topmost voxel of each column when the local
@@ -51,13 +54,18 @@ pub const GROUND_CHUNKS_X: i32 = 32;
 pub const GROUND_CHUNKS_Y: i32 = 32;
 
 /// Build the ground terrain into the `GROUND_CHUNKS_X × GROUND_CHUNKS_Y`
-/// chunk lattice — the demo default. Equivalent to
-/// `build_ground_extent(grid, GROUND_CHUNKS_X, GROUND_CHUNKS_Y)`.
+/// chunk lattice, centred on the grid origin — chunk indices span
+/// `[-GROUND_CHUNKS_X/2..GROUND_CHUNKS_X/2) × [-GROUND_CHUNKS_Y/2..GROUND_CHUNKS_Y/2)`.
+/// Equivalent to `build_ground_extent(grid, GROUND_CHUNKS_X, GROUND_CHUNKS_Y)`.
 pub fn build_ground(grid: &mut Grid) {
     build_ground_extent(grid, GROUND_CHUNKS_X, GROUND_CHUNKS_Y);
 }
 
-/// Build a `chunks_x × chunks_y` ground lattice into `grid`.
+/// Build a `chunks_x × chunks_y` ground lattice into `grid`,
+/// centred on the grid origin: chunk-XY indices span
+/// `[-chunks_x/2..chunks_x/2) × [-chunks_y/2..chunks_y/2)` so the
+/// player at grid-local `(0, 0)` sits in the middle of the world.
+///
 /// Useful for tests that need a smaller terrain than the demo's
 /// 32×32 default — building the full lattice takes ~2-3 seconds
 /// and dominates test wall-time.
@@ -79,30 +87,41 @@ pub fn build_ground(grid: &mut Grid) {
 /// `project_chunk_edge_lighting_seam.md`).
 pub fn build_ground_extent(grid: &mut Grid, chunks_x: i32, chunks_y: i32) {
     let cs_xy = CHUNK_SIZE_XY as i32;
-    let world_x_extent = chunks_x * cs_xy;
-    let world_y_extent = chunks_y * cs_xy;
+    // Half-extents in chunks; world spans
+    // `[-half_chunks_*, half_chunks_*)` along each axis. For an
+    // odd `chunks_x`/`chunks_y` the world slightly favours `+`.
+    let half_chunks_x = chunks_x / 2;
+    let half_chunks_y = chunks_y / 2;
+    let world_x_lo = -half_chunks_x * cs_xy;
+    let world_x_hi = (chunks_x - half_chunks_x) * cs_xy;
+    let world_y_lo = -half_chunks_y * cs_xy;
+    let world_y_hi = (chunks_y - half_chunks_y) * cs_xy;
+    let world_x_extent = world_x_hi - world_x_lo;
+    let world_y_extent = world_y_hi - world_y_lo;
 
     // Pre-compute the heightmap so we can look up neighbour heights
-    // for slope detection without recomputing. Indexed by grid-local
-    // world (x, y).
+    // for slope detection without recomputing. `heights` is indexed
+    // by (wy - world_y_lo) * world_x_extent + (wx - world_x_lo).
     let n_cells = (world_x_extent * world_y_extent) as usize;
     let mut heights = vec![0i32; n_cells];
-    for wy in 0..world_y_extent {
-        for wx in 0..world_x_extent {
-            heights[(wy * world_x_extent + wx) as usize] = terrain_height(wx, wy);
+    for wy in world_y_lo..world_y_hi {
+        for wx in world_x_lo..world_x_hi {
+            let idx = ((wy - world_y_lo) * world_x_extent + (wx - world_x_lo)) as usize;
+            heights[idx] = terrain_height(wx, wy);
         }
     }
     let h_at = |x: i32, y: i32| -> i32 {
-        let xc = x.clamp(0, world_x_extent - 1);
-        let yc = y.clamp(0, world_y_extent - 1);
-        heights[(yc * world_x_extent + xc) as usize]
+        let xc = x.clamp(world_x_lo, world_x_hi - 1);
+        let yc = y.clamp(world_y_lo, world_y_hi - 1);
+        let idx = ((yc - world_y_lo) * world_x_extent + (xc - world_x_lo)) as usize;
+        heights[idx]
     };
 
     let z_max = (CHUNK_SIZE_Z as i32) - 1; // bedrock placeholder z
 
-    // Per-chunk pass.
-    for chy in 0..chunks_y {
-        for chx in 0..chunks_x {
+    // Per-chunk pass over the centred chunk lattice.
+    for chy in -half_chunks_y..(chunks_y - half_chunks_y) {
+        for chx in -half_chunks_x..(chunks_x - half_chunks_x) {
             let chunk_origin_x = chx * cs_xy;
             let chunk_origin_y = chy * cs_xy;
 

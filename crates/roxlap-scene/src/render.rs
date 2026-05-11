@@ -92,17 +92,23 @@ pub fn render_scene(
 
     let mut grids_drawn = 0usize;
     for (_id, grid) in scene.grids_mut() {
+        let grid_origin = grid.transform.origin;
+        let combined = grid.combined_world();
+        let offset = combined.voxel_offset();
+        // World → grid-local → virtual: subtract grid origin, then
+        // add the combined view's voxel offset so negative-index
+        // chunks (origin_chunk.x/y < 0) map to virtual coords in
+        // [0, vsid).
         let local_cam = Camera {
             pos: [
-                camera.pos[0] - grid.transform.origin.x,
-                camera.pos[1] - grid.transform.origin.y,
-                camera.pos[2] - grid.transform.origin.z,
+                camera.pos[0] - grid_origin.x + f64::from(offset.x),
+                camera.pos[1] - grid_origin.y + f64::from(offset.y),
+                camera.pos[2] - grid_origin.z,
             ],
             right: camera.right,
             down: camera.down,
             forward: camera.forward,
         };
-        let combined = grid.combined_world();
         let outcome = {
             let mut rasterizer = ScalarRasterizer::new(
                 fb,
@@ -225,18 +231,23 @@ pub fn render_scene_composed(
         temp_fb.fill(sky_color);
         temp_zb.fill(f32::INFINITY);
 
+        let grid_origin = grid.transform.origin;
+        let combined = grid.combined_world();
+        let offset = combined.voxel_offset();
+        // World → grid-local → virtual: subtract grid origin, then
+        // add the combined view's voxel offset so negative-index
+        // chunks map into the virtual-coord range opticast expects.
         let local_cam = Camera {
             pos: [
-                camera.pos[0] - grid.transform.origin.x,
-                camera.pos[1] - grid.transform.origin.y,
-                camera.pos[2] - grid.transform.origin.z,
+                camera.pos[0] - grid_origin.x + f64::from(offset.x),
+                camera.pos[1] - grid_origin.y + f64::from(offset.y),
+                camera.pos[2] - grid_origin.z,
             ],
             right: camera.right,
             down: camera.down,
             forward: camera.forward,
         };
 
-        let combined = grid.combined_world();
         let outcome = {
             let mut rasterizer = ScalarRasterizer::new(
                 &mut temp_fb,

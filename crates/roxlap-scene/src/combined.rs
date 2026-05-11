@@ -21,7 +21,7 @@
 //! lattice, so chunk **boundaries collapse into ordinary column
 //! steps**. No engine change needed.
 //!
-//! ## S4.0 scope
+//! ## Scope
 //!
 //! Single-z-chunk grids only — chunks at `chz != 0` are silently
 //! ignored. Voxlap's slab format encodes z bounds as `u8`, so
@@ -29,8 +29,16 @@
 //! slab list for 8 stacked chunks) doesn't fit the byte format.
 //! Vertical-stack support comes later in S4.3 via a different path.
 //!
-//! Negative chunk indices are likewise out of S4.0 scope —
-//! `column_index = vy * vsid + vx` requires `vx, vy ≥ 0`.
+//! **Negative chunk indices are supported.** Voxlap's
+//! `column_index = vy * vsid + vx` requires non-negative virtual
+//! coords, so the combined view tracks an [`CombinedGridView::origin_chunk`]
+//! that maps grid-local chunk coords into virtual-coord chunk
+//! coords. Render callers translate the grid-local camera by
+//! `-origin_chunk * CHUNK_SIZE_XY` before passing to opticast.
+//! A grid with chunks spanning grid-local chunk-XY
+//! `[-16..16) × [-16..16)` becomes a 32×32 virtual world at
+//! virtual chunk coords `[0..32) × [0..32)` with
+//! `origin_chunk = (-16, -16, 0)`.
 //!
 //! ## Caching
 //!
@@ -71,6 +79,14 @@ pub struct CombinedGridView {
     /// Single-mip `[0, vsid² + 1]` boundary table — single entry of
     /// state needed by `ScalarRasterizer::new`.
     pub mip_base_offsets: Vec<usize>,
+    /// Grid-local chunk index of the virtual-coord `(0, 0, 0)`
+    /// origin. Grid-local voxel `(gx, gy, gz)` maps to virtual
+    /// `(gx - origin_chunk.x * CHUNK_SIZE_XY, gy - origin_chunk.y *
+    /// CHUNK_SIZE_XY, gz)`; only x / y components are used (z
+    /// stacking is out of S4.x scope). For a grid with chunks at
+    /// non-negative indices this is `(0, 0, 0)` and the translation
+    /// is a no-op.
+    pub origin_chunk: IVec3,
 }
 
 /// All-air column placeholder bytes. Mirrors what
@@ -88,40 +104,55 @@ impl CombinedGridView {
     /// [`crate::Grid::combined_world`]'s lazy cache rather than
     /// invoking this directly per-frame.
     ///
+    /// Chunks may sit at negative XY indices — the view picks the
+    /// minimum chx / chy seen as the [`Self::origin_chunk`] and
+    /// maps grid-local chunk `(chx, chy)` to virtual chunk
+    /// `(chx - origin_chunk.x, chy - origin_chunk.y)`. The
+    /// translation only affects camera input; the slab bytes
+    /// themselves don't move.
+    ///
+    /// Non-zero `chz` chunks (vertical stacking) are skipped
+    /// silently — out of S4.x scope.
+    ///
     /// # Panics
     ///
-    /// Debug builds panic if any chunk has a negative XY index —
-    /// out-of-scope for S4.0. Release builds silently skip such
-    /// chunks. Non-zero `chz` chunks (vertical stacking) are
-    /// skipped silently in both modes.
+    /// Panics if the stitched virtual world's slab bytes exceed
+    /// `u32::MAX` — would require a > 4 GB chunk lattice, far past
+    /// any realistic scene at vsid=4096.
     #[must_use]
-    #[allow(clippy::similar_names)] // max_chx / max_chy are voxlap-canonical pair names
+    #[allow(clippy::similar_names)] // min_chx / max_chx / min_chy / max_chy are voxlap-canonical pair names
     pub fn build(chunks: &HashMap<IVec3, Vxl>) -> Self {
         let cs = CHUNK_SIZE_XY;
 
         // Determine the chunk-XY extent. We only count chunks at
-        // chz=0; others are skipped (S4.0 single-z-chunk scope).
-        let mut max_chx: i32 = 0;
-        let mut max_chy: i32 = 0;
+        // chz=0; others are skipped (S4.x single-z-chunk scope).
+        let mut min_chx: Option<i32> = None;
+        let mut min_chy: Option<i32> = None;
+        let mut max_chx: Option<i32> = None;
+        let mut max_chy: Option<i32> = None;
         for &chunk_idx in chunks.keys() {
             if chunk_idx.z != 0 {
                 continue;
             }
-            debug_assert!(
-                chunk_idx.x >= 0 && chunk_idx.y >= 0,
-                "S4.0 only supports non-negative chunk indices (got {chunk_idx:?})"
-            );
-            if chunk_idx.x < 0 || chunk_idx.y < 0 {
-                continue;
-            }
-            max_chx = max_chx.max(chunk_idx.x);
-            max_chy = max_chy.max(chunk_idx.y);
+            min_chx = Some(min_chx.map_or(chunk_idx.x, |v| v.min(chunk_idx.x)));
+            min_chy = Some(min_chy.map_or(chunk_idx.y, |v| v.min(chunk_idx.y)));
+            max_chx = Some(max_chx.map_or(chunk_idx.x, |v| v.max(chunk_idx.x)));
+            max_chy = Some(max_chy.map_or(chunk_idx.y, |v| v.max(chunk_idx.y)));
         }
-        // Square padding — voxlap's vsid is one number for both
-        // axes. Empty grids still produce a 1-chunk virtual world
-        // so the consumer always has something to render against.
+        // Empty grids (no chz=0 chunks) still produce a 1-chunk
+        // virtual world so the consumer always has something to
+        // render against. Origin defaults to (0, 0, 0).
+        let origin_chunk = IVec3::new(min_chx.unwrap_or(0), min_chy.unwrap_or(0), 0);
+        let span_x = max_chx
+            .unwrap_or(0)
+            .saturating_sub(origin_chunk.x)
+            .saturating_add(1);
+        let span_y = max_chy
+            .unwrap_or(0)
+            .saturating_sub(origin_chunk.y)
+            .saturating_add(1);
         #[allow(clippy::cast_sign_loss)]
-        let n_chunks = ((max_chx.max(max_chy)) as u32) + 1;
+        let n_chunks = (span_x.max(span_y)) as u32;
         let vsid = n_chunks * cs;
         let n_cols = (vsid as usize) * (vsid as usize);
 
@@ -130,11 +161,13 @@ impl CombinedGridView {
 
         for vy in 0..vsid {
             #[allow(clippy::cast_possible_wrap)]
-            let chy = (vy / cs) as i32;
+            let chy_local = (vy / cs) as i32;
+            let chy = origin_chunk.y + chy_local;
             let ly = vy % cs;
             for vx in 0..vsid {
                 #[allow(clippy::cast_possible_wrap)]
-                let chx = (vx / cs) as i32;
+                let chx_local = (vx / cs) as i32;
+                let chx = origin_chunk.x + chx_local;
                 let lx = vx % cs;
                 let off = u32::try_from(data.len()).expect("combined data offset fits in u32");
                 column_offset.push(off);
@@ -163,7 +196,21 @@ impl CombinedGridView {
             data,
             column_offset,
             mip_base_offsets,
+            origin_chunk,
         }
+    }
+
+    /// Voxel-space offset to add to a grid-local camera / coord
+    /// to land in this view's virtual-coord space (matching the
+    /// `column_offset[]` indexing convention voxlap expects).
+    ///
+    /// `virtual = grid_local + voxel_offset()` (XY only; z passes
+    /// through unchanged).
+    #[must_use]
+    pub fn voxel_offset(&self) -> glam::IVec2 {
+        #[allow(clippy::cast_possible_wrap)]
+        let cs = CHUNK_SIZE_XY as i32;
+        glam::IVec2::new(-self.origin_chunk.x * cs, -self.origin_chunk.y * cs)
     }
 }
 
@@ -180,6 +227,8 @@ mod tests {
         let grid = Grid::new(GridTransform::identity());
         let view = CombinedGridView::build(&grid.chunks);
         assert_eq!(view.vsid, CHUNK_SIZE_XY);
+        assert_eq!(view.origin_chunk, IVec3::ZERO);
+        assert_eq!(view.voxel_offset(), glam::IVec2::ZERO);
         let n_cols = (view.vsid as usize) * (view.vsid as usize);
         assert_eq!(view.column_offset.len(), n_cols + 1);
         assert_eq!(view.mip_base_offsets, vec![0, n_cols + 1]);
@@ -189,6 +238,40 @@ mod tests {
             assert_eq!(slng(&view.data[start..]), ALL_AIR_COLUMN.len());
             assert_eq!(&view.data[start..start + 8], &ALL_AIR_COLUMN);
         }
+    }
+
+    /// Negative-min chunk indices: `origin_chunk` picks up the min
+    /// and `voxel_offset` translates grid-local → virtual.
+    #[test]
+    fn negative_chunk_indices_use_origin_chunk_translation() {
+        let mut grid = Grid::new(GridTransform::identity());
+        // Voxel at grid-local (-1, -1, 100) lands in chunk
+        // (-1, -1, 0) at local (CHUNK_SIZE_XY - 1, CHUNK_SIZE_XY - 1).
+        // Voxel at grid-local (5, 0, 100) lands in chunk (0, 0, 0).
+        grid.set_voxel(IVec3::new(-1, -1, 100), Some(0x80_aa_00_00));
+        grid.set_voxel(IVec3::new(5, 0, 100), Some(0x80_00_aa_00));
+        assert_eq!(grid.chunk_count(), 2);
+
+        let view = CombinedGridView::build(&grid.chunks);
+        // Origin at min chunk = (-1, -1, 0); 2-chunk square span.
+        assert_eq!(view.origin_chunk, IVec3::new(-1, -1, 0));
+        assert_eq!(view.vsid, 2 * CHUNK_SIZE_XY);
+        // voxel_offset shifts grid-local +128 in each axis so
+        // virtual coords stay non-negative.
+        #[allow(clippy::cast_possible_wrap)]
+        let cs = CHUNK_SIZE_XY as i32;
+        assert_eq!(view.voxel_offset(), glam::IVec2::new(cs, cs));
+
+        // Grid-local (-1, -1) ↔ virtual (-1 + 128, -1 + 128) = (127, 127),
+        // which is the last column of the negative-min chunk
+        // (chunk (-1, -1, 0)) inside the combined view.
+        let neg_chunk = grid.chunk(IVec3::new(-1, -1, 0)).unwrap();
+        let v_idx_neg = 127_u32 * view.vsid + 127;
+        let off_neg = view.column_offset[v_idx_neg as usize] as usize;
+        let len_neg = slng(&view.data[off_neg..]);
+        let local_idx = ((CHUNK_SIZE_XY - 1) * CHUNK_SIZE_XY + (CHUNK_SIZE_XY - 1)) as usize;
+        let neg_bytes = neg_chunk.column_data(local_idx);
+        assert_eq!(&view.data[off_neg..off_neg + len_neg], neg_bytes);
     }
 
     /// Single populated chunk at (0, 0, 0) → virtual world has

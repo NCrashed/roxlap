@@ -28,16 +28,18 @@ fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
 ///
 /// Layout (world coords, voxlap z-down: smaller z = up):
 /// - **Ground** grid origin at world `(0, 0, 0)` — terrain spans
-///   `GROUND_CHUNKS_X × GROUND_CHUNKS_Y` chunks (S4.1: 32×32) in z ∈
-///   [80..255].
+///   `GROUND_CHUNKS_X × GROUND_CHUNKS_Y` chunks centred on the grid
+///   origin (S4.1: chunk-XY `[-16..16) × [-16..16)`, world XY
+///   `[-2048..2048)`, z ∈ [80..255]).
 /// - **Ship** grid origin at world `(0, 0, -100)` — ship body
 ///   in chunk-local z ∈ [56..72] → world z ∈ [-44..-28].
 ///   The ship sits comfortably in the sky band above the terrain
 ///   (terrain peaks at world z ≈ 80; sky is z < 80).
 ///
-/// Initial camera at world `(128, -120, 50)` (over the lower-left
-/// quadrant of the ground) looking +y, sees the ship dead-ahead
-/// with the terrain visible below the horizon.
+/// Initial camera at world `(0, -120, 50)` (over the south-edge
+/// midline of the centred ground) looking +y, sees the ship
+/// dead-ahead with the terrain stretching to the horizon in
+/// front and the centred world extending behind.
 pub fn build_demo() -> SceneAndCamera {
     let mut scene = Scene::new();
 
@@ -54,7 +56,7 @@ pub fn build_demo() -> SceneAndCamera {
     // hrend / vrend without needing further setup.
     bake_lightmode_1(&mut scene);
 
-    let initial_pos = [128.0, -120.0, 50.0];
+    let initial_pos = [0.0, -120.0, 50.0];
     let initial_yaw = std::f64::consts::FRAC_PI_2; // looks +y
     let initial_pitch = 0.0;
     let camera = camera_for_yaw_pitch(initial_pos, initial_yaw, initial_pitch);
@@ -110,7 +112,8 @@ impl SceneAndCamera {
 /// `EstNormCache` bit table; the per-chunk loop keeps each cache
 /// at ~135 KB (132²×8 bytes) and still gets correct cross-chunk
 /// neighbourhood sampling.
-#[allow(clippy::cast_possible_wrap)]
+// chx_v / chy_v are voxlap-canonical paired names.
+#[allow(clippy::cast_possible_wrap, clippy::similar_names)]
 fn bake_lightmode_1(scene: &mut Scene) {
     const LIGHTMODE: u32 = 1;
     let ids: Vec<GridId> = scene.grids().map(|(id, _)| id).collect();
@@ -129,13 +132,18 @@ fn bake_lightmode_1(scene: &mut Scene) {
         // Per-chunk bake against the combined view's data buffer.
         {
             let combined = grid.combined_world_mut();
+            let origin_chunk = combined.origin_chunk;
             for chunk_idx in &chunk_idxs {
                 if chunk_idx.z != 0 {
                     // S4.0 combined-view scope: chz=0 only.
                     continue;
                 }
-                let x0 = chunk_idx.x * cs_xy;
-                let y0 = chunk_idx.y * cs_xy;
+                // Grid-local chunk index → virtual-coord chunk index
+                // → virtual bake bbox.
+                let chx_v = chunk_idx.x - origin_chunk.x;
+                let chy_v = chunk_idx.y - origin_chunk.y;
+                let x0 = chx_v * cs_xy;
+                let y0 = chy_v * cs_xy;
                 let x1 = x0 + cs_xy;
                 let y1 = y0 + cs_xy;
                 roxlap_core::update_lighting(
