@@ -38,7 +38,8 @@ scene-graph work.
 |------------|----------|-------------------------------------------------------------------------------------------------------------------------|
 | **S3.x**   | landed   | 2 single-chunk axis-aligned grids: 128² hilly ground patch + 128³ ship hull. WASD + mouse-look free-fly camera.         |
 | **S4.0**   | landed   | Ground extends to **2×1×1 chunks** (256×128×256) via the per-grid combined-world stitch (Approach C). Cross-chunk seam validated. |
-| **S4.1**   | next     | Ground extends to **32×32×1 chunks** (4096×4096×256) with continuous heightmap. Ship grows to **4×6×1 chunks** (S4.2).  |
+| **S4.1**   | landed   | Ground extends to **32×32×1 chunks** (4096×4096×256). Terrain builder switched to batched `set_spans` per chunk (~150× fewer edit calls). ~7 s startup. |
+| **S4.2**   | next     | Ship grows to **4×6×1 chunks** with extended hull. Multi-chunk axis-aligned validation for a smaller grid alongside the planet-scale ground. |
 | **S5**     | after S4 | Ship picks up an arbitrary `DQuat` orientation (default 45°/45°/45° pitch/yaw/roll). Camera math handles rotation.      |
 | **S6**     | after S5 | LOD switching: ground renders as billboard at far distance, coarse-mip mid-range, full voxel close. Two ships at LOD-mid. |
 | **S7**     | after S6 | Ground generates on demand from the camera; flying past the loaded radius streams new chunks in / evicts old.          |

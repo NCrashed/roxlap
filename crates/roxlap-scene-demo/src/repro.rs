@@ -18,13 +18,14 @@
 #![cfg(test)]
 #![allow(clippy::cast_precision_loss)]
 
+use glam::DVec3;
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::{Camera, Engine};
 use roxlap_scene::render::render_scene_composed;
-use roxlap_scene::Scene;
+use roxlap_scene::{GridTransform, Scene};
 
-use crate::scene::build_demo;
+use crate::terrain;
 
 /// 800×600 — same as the live demo so PPMs are comparable to
 /// captures from the running binary.
@@ -100,14 +101,18 @@ const BUG_POS: [f64; 3] = [
 const BUG_YAW: f64 = 2.148_296_326_794_884;
 const BUG_PITCH: f64 = 0.544_999_999_999_998_8;
 
+/// Build a minimal 2×1 ground scene for the streaking regression
+/// tests. The full demo (32×32 ground + ship + lighting bake)
+/// takes ~7 s to construct; the streaking bug only depends on
+/// having SOME terrain past which the camera sits OOB-y. 2×1 is
+/// the smallest extent that still exercises the cross-chunk
+/// stitch path (it's the OOB-XY render that triggers, not the
+/// per-chunk gline).
 fn build_ground_only() -> Scene {
-    let mut scene = build_demo().scene;
-    let ids: Vec<_> = scene.grids().map(|(id, _)| id).collect();
-    for id in ids {
-        if id.raw() != 0 {
-            scene.remove_grid(id);
-        }
-    }
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+    let grid = scene.grid_mut(id).expect("ground grid present");
+    terrain::build_ground_extent(grid, 2, 1);
     scene
 }
 
@@ -145,6 +150,57 @@ fn chunk_edge_streaking_bug_is_fixed() {
         diff_frac < 0.05,
         "sky-pixel fraction drift {diff} ({:.2}%) exceeds 5% — chunk-edge streaks may be back",
         100.0 * diff_frac,
+    );
+}
+
+/// Smoke-test the demo's full 32×32×1 ground at startup: build
+/// it via [`build_demo`], render one frame, assert no panic and
+/// non-trivial output. Catches build-time regressions in the
+/// large-vsid path (4096²-column combined view, 64 MB column-
+/// offset table) without running the interactive binary.
+///
+/// Ignored by default because the scene build dominates wall
+/// time (~3 s) and locks up a CI worker. Run with
+/// `cargo test --release -p roxlap-scene-demo --
+/// --ignored` to exercise it.
+#[test]
+#[ignore = "expensive: builds the full 32x32 ground (~3 s on dev hardware)"]
+fn full_demo_scene_renders_without_panic() {
+    let mut scene_and_camera = crate::scene::build_demo();
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    let _ = render_scene_composed(
+        &mut fb,
+        &mut zb,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut scene_and_camera.scene,
+        &scene_and_camera.camera,
+        &settings,
+        sky,
+        None,
+    );
+    let non_sky_count = fb.iter().filter(|&&p| p != sky).count();
+    assert!(
+        non_sky_count > 0,
+        "full demo render at start camera produced no non-sky pixels"
+    );
+    eprintln!(
+        "full demo render: {non_sky_count}/{pixel_count} non-sky pixels ({:.1}%)",
+        100.0 * non_sky_count as f64 / pixel_count as f64
     );
 }
 
