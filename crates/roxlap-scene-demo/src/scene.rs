@@ -7,7 +7,7 @@
 
 use glam::{DVec3, IVec3};
 use roxlap_core::Camera;
-use roxlap_scene::{GridId, GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+use roxlap_scene::{Grid, GridId, GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
 use crate::{ship, terrain};
 
@@ -97,35 +97,28 @@ impl SceneAndCamera {
 /// every chunk of every grid. Mode 1 uses surface normals only —
 /// no `LightSrc` consulted — so we pass an empty `lights` slice.
 ///
-/// **S4.1 fix for the chunk-edge lighting seam** — preserved
-/// through S4B.4.a's combined-view retirement. Per-chunk bakes
-/// at S4.0 produced a visible brightness jump at every chunk
-/// boundary because `estnorm`'s 5×5×5 neighbourhood vote treated
-/// neighbour chunks as all-air. The fix routes the bake through
-/// a freshly-built `CombinedGridView`: each chunk's bake region
-/// is still `(chunk_x0..chunk_x1) × (chunk_y0..chunk_y1)`, but the
-/// `(world_data, column_offsets, vsid)` triple is the combined
-/// view — so `EstNormCache`'s padding reads neighbour-chunk
-/// voxels naturally. After all chunks bake, we
-/// [`CombinedGridView::sync_alpha_to_chunks`] to copy the post-
-/// bake alpha bytes back into source chunks; then drop the
-/// combined view (no caching on `Grid` post-S4B.4.a).
+/// **S4B.4.b chunk-aware bake.** For each populated chunk:
+/// 1. Build an `EstNormCache` (in roxlap-core) with a closure
+///    that resolves chunk-local `(px, py)` queries to whichever
+///    chunk owns that position via `Grid::chunk(IVec3)`. The
+///    closure spans `(-RAD..chunk_size+RAD)` so the 5×5×5
+///    neighbourhood vote pulls from neighbouring chunks seamlessly.
+/// 2. Mutably borrow the target chunk and call
+///    `update_lighting_chunk` to write alpha bytes within the
+///    chunk's footprint only.
 ///
-/// S4B.4.b plan: replace the combined-view materialisation with
-/// a chunk-aware `EstNormCache::build` reader, removing the
-/// last `CombinedGridView` user.
+/// Replaces the S4B.4.a combined-view materialisation. Same
+/// chunk-edge-seam fix as before (cross-chunk estnorm reads); now
+/// without stitching a giant flat buffer for the bake.
 ///
 /// **Per-chunk bake region (not whole-grid).** A whole-grid
-/// `update_lighting` call at vsid=4096 would allocate a 500 MB+
+/// `update_lighting` at vsid=4096 would allocate a 500 MB+
 /// `EstNormCache` bit table; the per-chunk loop keeps each cache
-/// at ~135 KB (132²×8 bytes) and still gets correct cross-chunk
-/// neighbourhood sampling.
+/// at ~135 KB (132²×8 bytes).
 
 // chx_v / chy_v are voxlap-canonical paired names.
 #[allow(clippy::cast_possible_wrap, clippy::similar_names)]
 fn bake_lightmode_1(scene: &mut Scene) {
-    use roxlap_scene::CombinedGridView;
-
     const LIGHTMODE: u32 = 1;
     let ids: Vec<GridId> = scene.grids().map(|(id, _)| id).collect();
     for id in ids {
@@ -137,37 +130,53 @@ fn bake_lightmode_1(scene: &mut Scene) {
         let cs_xy = CHUNK_SIZE_XY as i32;
         let cs_z = CHUNK_SIZE_Z as i32;
 
-        // S4B.4.a: build a local combined view per grid for the
-        // duration of the bake. Drops once the alpha bytes are
-        // propagated back.
-        let mut combined = CombinedGridView::build(&grid.chunks);
-        let origin_chunk = combined.origin_chunk;
         for chunk_idx in &chunk_idxs {
             if chunk_idx.z != 0 {
-                // S4.0 combined-view scope: chz=0 only.
+                // chz=0 only — z-stacking is S4B.3 territory.
                 continue;
             }
-            let chx_v = chunk_idx.x - origin_chunk.x;
-            let chy_v = chunk_idx.y - origin_chunk.y;
-            let x0 = chx_v * cs_xy;
-            let y0 = chy_v * cs_xy;
-            let x1 = x0 + cs_xy;
-            let y1 = y0 + cs_xy;
-            roxlap_core::update_lighting(
-                &mut combined.data,
-                &combined.column_offset,
-                combined.vsid,
-                x0,
-                y0,
+            let target_chx = chunk_idx.x;
+            let target_chy = chunk_idx.y;
+
+            // Cache build (immutable grid borrow). The closure
+            // resolves chunk-local `(px, py)` — which can extend
+            // `±ESTNORMRAD` outside the target chunk — into the
+            // neighbour chunk that owns that voxel-column. Padding
+            // straddling unpopulated chunks returns None (= treat
+            // as full air), matching the historical OOB behaviour.
+            let cache = {
+                let grid_ref: &Grid = &*grid;
+                let reader = |px: i32, py: i32| -> Option<&[u8]> {
+                    let neighbour_chx = target_chx + px.div_euclid(cs_xy);
+                    let neighbour_chy = target_chy + py.div_euclid(cs_xy);
+                    let in_chunk_x = px.rem_euclid(cs_xy);
+                    let in_chunk_y = py.rem_euclid(cs_xy);
+                    let chunk = grid_ref.chunk(IVec3::new(neighbour_chx, neighbour_chy, 0))?;
+                    let col_idx = (in_chunk_y as u32) * CHUNK_SIZE_XY + (in_chunk_x as u32);
+                    let off = chunk.column_offset[col_idx as usize] as usize;
+                    Some(&chunk.data[off..])
+                };
+                roxlap_core::EstNormCache::build_with_reader(reader, 0, 0, cs_xy, cs_xy)
+            };
+            // Immutable grid borrow released.
+
+            // Mutable target-chunk borrow + write phase.
+            let target_chunk = grid.chunks.get_mut(chunk_idx).expect("populated");
+            roxlap_core::apply_lighting_with_cache(
+                &mut target_chunk.data,
+                &target_chunk.column_offset,
+                CHUNK_SIZE_XY,
                 0,
-                x1,
-                y1,
+                0,
+                0,
+                cs_xy,
+                cs_xy,
                 cs_z,
+                &cache,
                 LIGHTMODE,
                 &[],
             );
         }
-        combined.sync_alpha_to_chunks(&mut grid.chunks);
 
         // NOTE (2026-05-11): mip generation attempted as a perf
         // fix for the vsid=4096 demo. The `compilerle` emit-only-

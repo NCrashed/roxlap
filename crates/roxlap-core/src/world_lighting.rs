@@ -188,7 +188,7 @@ pub(crate) fn expandbit256(column: &[u8], bits: &mut [u32; 8]) {
 /// `diag_down_lit` oracle scope, which extends to 452×452 with
 /// padding) needs about 6.4 MB.
 #[allow(dead_code)] // vsid field/method preserved for voxlap-parity inspection
-pub(crate) struct EstNormCache {
+pub struct EstNormCache {
     /// Per-column bit arrays. `bits[(yidx) * width + (xidx)]` is
     /// the slab bit-mask of column `(origin_x + xidx, origin_y +
     /// yidx)`. `xidx ∈ 0..width`, mapping abs-x into
@@ -257,11 +257,51 @@ impl EstNormCache {
     /// `[x0..x1) × [y0..y1)` extended by `ESTNORMRAD` padding on
     /// each side. Calling [`Self::estnorm`] for any `(x, y)` inside
     /// the original `[x0..x1) × [y0..y1)` box is then a pure read.
+    ///
+    /// Wraps [`Self::build_with_reader`] with a flat-table closure.
     #[must_use]
     pub fn build(
         world_data: &[u8],
         column_offsets: &[u32],
         vsid: u32,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+    ) -> Self {
+        let vsid_i = vsid as i32;
+        let reader = |x: i32, y: i32| -> Option<&[u8]> {
+            if (x | y) < 0 || x >= vsid_i || y >= vsid_i {
+                return None;
+            }
+            let col_idx = (y as u32) * vsid + (x as u32);
+            let off_start = column_offsets[col_idx as usize] as usize;
+            // Slice to end-of-buffer; the slab walker self-
+            // terminates via nextptr.
+            Some(&world_data[off_start..])
+        };
+        let mut cache = Self::build_with_reader(reader, x0, y0, x1, y1);
+        cache.vsid = vsid_i;
+        cache
+    }
+
+    /// S4B.4.b: chunk-aware cache build. The closure
+    /// `column_reader(x, y)` returns the slab bytes of the column
+    /// at world-or-grid-local position `(x, y)`, or `None` for an
+    /// implicit-air / out-of-grid column (matching `build`'s OOB
+    /// "treat as full air" semantics).
+    ///
+    /// No vsid bound — the reader owns OOB handling. Per-chunk
+    /// bakes use a closure that resolves `(x, y)` to a neighbour
+    /// chunk via `Grid::chunk(IVec3)` so the 2-voxel padding
+    /// extends seamlessly across chunk boundaries.
+    ///
+    /// The cache's [`Self::vsid`] field is left at `0` for chunk-
+    /// aware builds — the field is dead-code anyway, preserved
+    /// only for voxlap-parity inspection.
+    #[must_use]
+    pub fn build_with_reader<'r>(
+        column_reader: impl Fn(i32, i32) -> Option<&'r [u8]>,
         x0: i32,
         y0: i32,
         x1: i32,
@@ -276,25 +316,15 @@ impl EstNormCache {
         let height = (pad_y1 - pad_y0) as usize;
 
         let mut bits = vec![[0u32; 8]; width * height];
-        let vsid_i = vsid as i32;
         for yi in 0..height {
             let y = pad_y0 + yi as i32;
             for xi in 0..width {
                 let x = pad_x0 + xi as i32;
-                if (x | y) < 0 || x >= vsid_i || y >= vsid_i {
-                    // Out-of-bounds: voxlap's `expandbitstack`
-                    // zeros the bind buffer (= treat as full air).
-                    continue;
+                if let Some(column) = column_reader(x, y) {
+                    expandbit256(column, &mut bits[yi * width + xi]);
                 }
-                let col_idx = (y as u32) * vsid + (x as u32);
-                let off_start = column_offsets[col_idx as usize] as usize;
-                // Slice to end-of-buffer; the slab walker self-
-                // terminates via nextptr. Same fix as world_query +
-                // opticast post-edit-scatter — column_offsets[idx+1]
-                // is the next table entry, NOT the next-byte-offset
-                // after edits.
-                let column = &world_data[off_start..];
-                expandbit256(column, &mut bits[yi * width + xi]);
+                // None → leave the cache slot zeroed (treat as full
+                // air), matching `build`'s OOB behaviour.
             }
         }
 
@@ -305,7 +335,7 @@ impl EstNormCache {
             width,
             height,
             fsqrecip: build_fsqrecip(),
-            vsid: vsid_i,
+            vsid: 0,
         }
     }
 
@@ -554,6 +584,145 @@ pub fn update_lighting(
     };
 
     (y0p..y1p).into_par_iter().for_each(row_body);
+}
+
+/// S4B.4.b: per-chunk variant of [`update_lighting`].
+///
+/// Writes alpha bytes into one chunk's slab buffer; reads
+/// neighbour-chunk voxels through `column_reader` for `estnorm`'s
+/// 5×5×5 padding. The reader takes chunk-local `(x, y)` (which can
+/// extend `±ESTNORMRAD` past the chunk's `[0, target_vsid)` extent)
+/// and returns the column at that position — typically resolved
+/// through `Grid::chunk(IVec3)` so the bake gets seamless
+/// cross-chunk neighbourhood reads without materialising a stitched
+/// combined view (Approach C retirement, S4B.4.b).
+///
+/// `(x0, y0, z0, x1, y1, z1)` is the bake region in chunk-local
+/// coords (typically `(0, 0, 0)..(CHUNK_SIZE_XY, CHUNK_SIZE_XY,
+/// CHUNK_SIZE_Z)`). Writes clip to the target chunk's vsid; reads
+/// extend into neighbour chunks via the closure.
+///
+/// `lightmode`, `lights`, and the per-voxel arithmetic match
+/// [`update_lighting`]; only the cache build + write-region
+/// scoping differ.
+#[allow(clippy::too_many_arguments)]
+pub fn update_lighting_chunk<'r>(
+    target_data: &mut [u8],
+    target_column_offsets: &[u32],
+    target_vsid: u32,
+    x0: i32,
+    y0: i32,
+    z0: i32,
+    x1: i32,
+    y1: i32,
+    z1: i32,
+    column_reader: impl Fn(i32, i32) -> Option<&'r [u8]>,
+    lightmode: u32,
+    lights: &[LightSrc],
+) {
+    if lightmode == 0 {
+        return;
+    }
+    let target_vsid_i = target_vsid as i32;
+
+    // Padded region for the cache (cross-chunk reads via reader).
+    // Z still clamps to [0, MAXZDIM) because no z-stacking yet
+    // (S4B.3) — but x/y intentionally don't clamp, so the reader
+    // can pull from neighbour chunks via its own coord translation.
+    let z0p = (z0 - ESTNORMRAD).max(0);
+    let z1p = (z1 + ESTNORMRAD).min(MAXZDIM);
+    // Write region clipped to the target chunk's footprint.
+    let wx0 = x0.max(0);
+    let wy0 = y0.max(0);
+    let wx1 = x1.min(target_vsid_i);
+    let wy1 = y1.min(target_vsid_i);
+    if wx0 >= wx1 || wy0 >= wy1 || z0p >= z1p {
+        return;
+    }
+
+    let cache = EstNormCache::build_with_reader(column_reader, x0, y0, x1, y1);
+    apply_lighting_with_cache(
+        target_data,
+        target_column_offsets,
+        target_vsid,
+        wx0,
+        wy0,
+        z0p,
+        wx1,
+        wy1,
+        z1p,
+        &cache,
+        lightmode,
+        lights,
+    );
+}
+
+/// S4B.4.b: write half of [`update_lighting_chunk`], split out so
+/// callers can build the [`EstNormCache`] separately (via
+/// [`EstNormCache::build_with_reader`]) and pass it in.
+///
+/// The split matters when the cache build needs an immutable grid
+/// borrow (for cross-chunk reads) and the write phase needs a
+/// mutable target-chunk borrow — the two can't coexist. The
+/// caller builds the cache first while holding the immutable
+/// borrow, drops it, then mutably borrows the target chunk and
+/// invokes this.
+///
+/// The `(x0..x1, y0..y1, z0..z1)` region must already be clipped
+/// to the target chunk's footprint (this helper does no clipping).
+/// `cache` must cover at least `[x0..x1) × [y0..y1)` (a `±ESTNORMRAD`
+/// padding is the caller's responsibility — typically built via
+/// `build_with_reader(.., x0, y0, x1, y1)` which adds the padding
+/// itself).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_lighting_with_cache(
+    target_data: &mut [u8],
+    target_column_offsets: &[u32],
+    target_vsid: u32,
+    x0: i32,
+    y0: i32,
+    z0: i32,
+    x1: i32,
+    y1: i32,
+    z1: i32,
+    cache: &EstNormCache,
+    lightmode: u32,
+    lights: &[LightSrc],
+) {
+    if lightmode == 0 || x0 >= x1 || y0 >= y1 || z0 >= z1 {
+        return;
+    }
+
+    let lightsub: Vec<f32> = lights.iter().map(|l| 1.0 / (l.r2.sqrt() * l.r2)).collect();
+
+    let region_w = (x1 - x0) as usize;
+    let region_h = (y1 - y0) as usize;
+    let mut column_extents: Vec<(usize, usize)> = Vec::with_capacity(region_w * region_h);
+    for yi in 0..region_h {
+        let y = y0 + yi as i32;
+        for xi in 0..region_w {
+            let x = x0 + xi as i32;
+            let col_idx = (y as u32) * target_vsid + (x as u32);
+            let start = target_column_offsets[col_idx as usize] as usize;
+            let end = start + roxlap_formats::vxl::slng(&target_data[start..]);
+            column_extents.push((start, end));
+        }
+    }
+
+    let world_view = WorldDataMutView::new(target_data);
+    let row_body = |y: i32| {
+        let yi = (y - y0) as usize;
+        for x in x0..x1 {
+            let xi = (x - x0) as usize;
+            let (off_start, off_end) = column_extents[yi * region_w + xi];
+            // SAFETY: per-column byte ranges are pairwise disjoint
+            // across distinct `(x, y)` (voxalloc invariant).
+            let column = unsafe { world_view.column_slice(off_start, off_end) };
+            shade_column(column, x, y, z0, z1, lightmode, lights, &lightsub, cache);
+        }
+    };
+
+    (y0..y1).into_par_iter().for_each(row_body);
 }
 
 /// Raw-pointer view of `world_data` so the parallel

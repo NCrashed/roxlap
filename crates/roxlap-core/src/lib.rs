@@ -37,4 +37,6 @@ pub use camera::Camera;
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
 pub use grid_view::{ChunkGrid, GridView};
 pub use opticast::{opticast, OpticastOutcome, OpticastSettings};
-pub use world_lighting::update_lighting;
+pub use world_lighting::{
+    apply_lighting_with_cache, update_lighting, update_lighting_chunk, EstNormCache,
+};

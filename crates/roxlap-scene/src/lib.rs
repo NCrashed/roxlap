@@ -28,7 +28,6 @@
 
 pub mod addr;
 pub mod chunks;
-pub mod combined;
 pub mod edit;
 pub mod render;
 pub mod snapshot;
@@ -40,7 +39,6 @@ use roxlap_formats::vxl::Vxl;
 use serde::{Deserialize, Serialize};
 
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
-pub use combined::CombinedGridView;
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
 /// chunks compact (~2 MB worst-case dense-slab footprint inside
@@ -209,10 +207,8 @@ impl Scene {
         self.grids.iter().map(|(id, g)| (*id, g))
     }
 
-    /// Mutable iterator over all `(id, grid)` pairs. Yield order is
-    /// not guaranteed (HashMap-backed). Used by S4.0+
-    /// [`render::render_scene_composed`] so the per-grid combined
-    /// cache can be populated lazily during the render pass.
+    /// Mutable iterator over all `(id, grid)` pairs. Yield order
+    /// is not guaranteed (HashMap-backed).
     pub fn grids_mut(&mut self) -> impl Iterator<Item = (GridId, &mut Grid)> {
         self.grids.iter_mut().map(|(id, g)| (*id, g))
     }
@@ -280,38 +276,6 @@ mod tests {
             scene.grid(id).unwrap().transform.origin,
             DVec3::new(1.0, 2.0, 3.0)
         );
-    }
-
-    /// S4B.4.a: `CombinedGridView::sync_alpha_to_chunks` propagates
-    /// an alpha-byte-only edit on the combined view back into
-    /// source chunks. Stand-in for the lightmode bake use case at
-    /// much smaller scale. Previously routed through
-    /// `Grid::sync_combined_to_chunks`; that API was removed when
-    /// the combined view stopped being cached on `Grid`.
-    #[test]
-    fn sync_alpha_to_chunks_propagates_alpha_edit() {
-        use roxlap_formats::vxl::slng;
-        let mut grid = Grid::new(GridTransform::identity());
-        grid.set_voxel(IVec3::new(5, 6, 100), Some(0x80_aa_bb_cc));
-        // Build a fresh combined view on demand. No caching on Grid
-        // anymore — the bake call site owns the view's lifetime.
-        let mut combined = CombinedGridView::build(&grid.chunks);
-        let v_idx = (6_u32 * combined.vsid + 5) as usize;
-        let start = combined.column_offset[v_idx] as usize;
-        let len = slng(&combined.data[start..]);
-        // Slab layout: [nextptr, z1, z1c, z0, b, g, r, alpha].
-        // The alpha byte is at the END of the colour record. For a
-        // single solid voxel column the record is the last 4 bytes.
-        let alpha_idx = start + len - 1;
-        combined.data[alpha_idx] = 0xff;
-        combined.sync_alpha_to_chunks(&mut grid.chunks);
-        // Source chunk now carries the modified alpha byte.
-        let chunk = grid.chunk(IVec3::ZERO).unwrap();
-        let local_idx = (6 * CHUNK_SIZE_XY + 5) as usize;
-        let chunk_start = chunk.column_offset[local_idx] as usize;
-        let chunk_len = slng(&chunk.data[chunk_start..]);
-        let chunk_alpha_idx = chunk_start + chunk_len - 1;
-        assert_eq!(chunk.data[chunk_alpha_idx], 0xff);
     }
 
     #[test]
