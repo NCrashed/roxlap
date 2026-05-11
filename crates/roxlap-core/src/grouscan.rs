@@ -275,6 +275,34 @@ pub(crate) struct GrouscanState<'a> {
     /// Voxlap's `gmipnum` — total mip levels available. Constant
     /// per ray; copied from `grouscan_run`'s parameter.
     pub gmipnum: u32,
+
+    // -----------------------------------------------------------------
+    // S4B.2.b — chunk-aware column-step scaffold. For today's
+    // single-chunk callers (chunk_size_xy == vsid) the chunk-swap
+    // branch in `phase_after_delete_kept_presync` is dead code:
+    // the only chunk boundary lies at cx=vsid which the world-edge
+    // OOB check already covers. S4B.2.c introduces multi-chunk
+    // callers where these fields drive cross-chunk dispatch.
+    // -----------------------------------------------------------------
+    /// Per-frame voxel-world borrow. Carries `chunk_at_xy`, the
+    /// lookup the column step uses to swap active per-chunk
+    /// `(slab_buf, column_offsets)` views across chunk boundaries.
+    pub grid_view: crate::grid_view::GridView<'a>,
+    /// Cached `grid_view.chunk_size_xy`. Read once per column step
+    /// to compute `(cx, cy) → chunk_idx` so the inner loop doesn't
+    /// re-touch the GridView struct fields.
+    pub chunk_size_xy: u32,
+    /// XY index of the chunk the ray currently sits in. Initialised
+    /// from `(cx, cy).div_euclid(chunk_size_xy)`; advanced by the
+    /// column step when a step crosses a chunk boundary.
+    pub current_chunk_idx_xy: [i32; 2],
+    /// `false` ⇒ the current chunk is empty (or outside the grid's
+    /// AABB) — the column-refresh branch sets `state.column = &[]`
+    /// instead of dereferencing `column_offsets`. Tracks the result
+    /// of the most recent `chunk_at_xy` call so the
+    /// `(slab_buf, column_offsets)` borrows can stay pointed at the
+    /// last valid chunk without aliasing.
+    pub current_chunk_exists: bool,
 }
 
 impl<'a> GrouscanState<'a> {
@@ -291,6 +319,28 @@ impl<'a> GrouscanState<'a> {
         gmipnum: u32,
     ) -> Self {
         let c = scratch.cf[CF_SEED_INDEX];
+
+        // S4B.2.b: synthesise the GridView from the per-frame
+        // GrouscanInputs fields. For today's single-chunk callers
+        // `chunk_size_xy == vsid` so the chunk-swap branch in
+        // `phase_after_delete_kept_presync` is dead — single-chunk
+        // goldens stay byte-identical. S4B.2.c will plumb a true
+        // multi-chunk GridView through GrouscanInputs.
+        let grid_view = crate::grid_view::GridView::from_parts(
+            inputs.vsid,
+            inputs.slab_buf,
+            inputs.column_offsets,
+            inputs.mip_base_offsets,
+        );
+        let chunk_size_xy = grid_view.chunk_size_xy;
+        #[allow(clippy::cast_possible_wrap)]
+        let chunk_size_signed = chunk_size_xy as i32;
+        let current_chunk_idx_xy = [
+            cx.div_euclid(chunk_size_signed),
+            cy.div_euclid(chunk_size_signed),
+        ];
+        let current_chunk_exists = grid_view.chunk_at_xy(current_chunk_idx_xy).is_some();
+
         Self {
             scratch,
             column: inputs.column,
@@ -328,6 +378,10 @@ impl<'a> GrouscanState<'a> {
             vsid_signed: inputs.vsid as i32,
             gmipcnt: 0,
             gmipnum,
+            grid_view,
+            chunk_size_xy,
+            current_chunk_idx_xy,
+            current_chunk_exists,
         }
     }
 }
@@ -1243,42 +1297,97 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
         state.cy += state.scratch.gixy[1].signum();
     }
 
-    // Refresh state.column from the world buffers, gated on the
-    // signed-coords OOB check. For OOB columns, point `column` at
-    // an empty slice so `column_byte_at` reads return the `0`
-    // sentinel and the slab-walk phases short-circuit without
-    // drawing — i.e., OOB columns render as fully empty / sky.
+    // S4B.2.b: chunk-XY boundary detection + swap. Two code paths
+    // routed by `chunk_size_xy == vsid`:
     //
-    // S1.Z: when in-bounds, RECOMPUTE the linear index from the
-    // signed (cx, cy) instead of trusting `ixy_sptr_col_idx`. The
-    // wrapping_add_signed advance is in `usize`, which is `u64`
-    // on 64-bit hosts; this means the wrap-arithmetic that maps
-    // negative camera positions to small post-wrap u32 indices
-    // (which voxlap C relies on) doesn't trigger when the index
-    // drifts past 2^32. For cy < 0 the initial column_index
-    // u32-wraps to a value near u32::MAX, then advancing +vsid
-    // per y-step on u64 leaves it past 2^32 forever — `.get()`
-    // returns None and the world never refreshes once (cx, cy)
-    // cross into bounds. Recomputing from signed coords sidesteps
-    // the host-pointer-width sensitivity.
-    let in_bounds = state.cx >= 0
-        && state.cy >= 0
-        && state.cx < state.vsid_signed
-        && state.cy < state.vsid_signed;
-    if in_bounds {
-        #[allow(clippy::cast_sign_loss)]
-        let correct_idx = (state.cy as u32)
-            .wrapping_mul(state.vsid)
-            .wrapping_add(state.cx as u32) as usize;
-        state.ixy_sptr_col_idx = correct_idx;
-        if let Some(&col_off) = state.column_offsets.get(correct_idx) {
-            let off = col_off as usize;
-            if off <= state.slab_buf.len() {
-                state.column = &state.slab_buf[off..];
+    // - **Single-chunk fast path** (today's only callers,
+    //   `chunk_size_xy == vsid`). The world-edge OOB check IS the
+    //   chunk boundary, so the chunk-swap is purely additive
+    //   overhead — skip it. Refresh state.column via the pre-S4B.2.b
+    //   flat lookup, byte-identical to the goldens.
+    // - **Multi-chunk path** (S4B.2.c+, `chunk_size_xy < vsid`).
+    //   `cx.div_euclid(chunk_size_xy)` yields the chunk index; on
+    //   boundary crossings `chunk_at_xy` swaps the active per-chunk
+    //   `(slab_buf, column_offsets, mip_base_offsets, vsid)`. Empty
+    //   chunks (`chunk_at_xy → None`) keep borrows pinned at the
+    //   previous chunk and mark `current_chunk_exists = false` so
+    //   the column refresh resolves to `&[]`.
+    //
+    // The branch is on a value that's constant per gline call (the
+    // grid's chunk_size_xy doesn't change mid-ray) so the predictor
+    // memoises it for free.
+    if state.chunk_size_xy == state.vsid {
+        // Single-chunk: pre-S4B.2.b column refresh, unchanged.
+        let in_bounds = state.cx >= 0
+            && state.cy >= 0
+            && state.cx < state.vsid_signed
+            && state.cy < state.vsid_signed;
+        if in_bounds {
+            #[allow(clippy::cast_sign_loss)]
+            let correct_idx = (state.cy as u32)
+                .wrapping_mul(state.vsid)
+                .wrapping_add(state.cx as u32) as usize;
+            state.ixy_sptr_col_idx = correct_idx;
+            if let Some(&col_off) = state.column_offsets.get(correct_idx) {
+                let off = col_off as usize;
+                if off <= state.slab_buf.len() {
+                    state.column = &state.slab_buf[off..];
+                }
             }
+        } else {
+            state.column = &[];
         }
     } else {
-        state.column = &[];
+        // Multi-chunk: detect chunk-XY boundary, swap on transition.
+        #[allow(clippy::cast_possible_wrap)]
+        let chunk_size_signed = state.chunk_size_xy as i32;
+        let new_chunk_xy = [
+            state.cx.div_euclid(chunk_size_signed),
+            state.cy.div_euclid(chunk_size_signed),
+        ];
+        if new_chunk_xy != state.current_chunk_idx_xy {
+            state.current_chunk_idx_xy = new_chunk_xy;
+            if let Some(new_chunk) = state.grid_view.chunk_at_xy(new_chunk_xy) {
+                state.slab_buf = new_chunk.slab_buf;
+                state.column_offsets = new_chunk.column_offsets;
+                state.mip_base_offsets = new_chunk.mip_base_offsets;
+                state.vsid = new_chunk.vsid;
+                #[allow(clippy::cast_possible_wrap)]
+                {
+                    state.vsid_signed = new_chunk.vsid as i32;
+                }
+                state.current_chunk_exists = true;
+            } else {
+                state.current_chunk_exists = false;
+            }
+        }
+
+        // Refresh from active chunk via chunk-LOCAL coords. The S1.Z
+        // recompute-index-from-signed-coords pattern carries over —
+        // wrapping_add_signed in usize can drift past 2^32 on
+        // 64-bit hosts so we always rebuild from `(cx, cy)`.
+        let local_cx = state.cx - new_chunk_xy[0] * chunk_size_signed;
+        let local_cy = state.cy - new_chunk_xy[1] * chunk_size_signed;
+        let chunk_in_bounds = state.current_chunk_exists
+            && local_cx >= 0
+            && local_cy >= 0
+            && local_cx < chunk_size_signed
+            && local_cy < chunk_size_signed;
+        if chunk_in_bounds {
+            #[allow(clippy::cast_sign_loss)]
+            let correct_idx = (local_cy as u32)
+                .wrapping_mul(state.chunk_size_xy)
+                .wrapping_add(local_cx as u32) as usize;
+            state.ixy_sptr_col_idx = correct_idx;
+            if let Some(&col_off) = state.column_offsets.get(correct_idx) {
+                let off = col_off as usize;
+                if off <= state.slab_buf.len() {
+                    state.column = &state.slab_buf[off..];
+                }
+            }
+        } else {
+            state.column = &[];
+        }
     }
     // Voxlap's `v = *ixy_sptr_col` resets v to the new column's
     // base — vptr_offset was relative to the OLD column's slab
