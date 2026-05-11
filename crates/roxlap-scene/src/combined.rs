@@ -271,6 +271,69 @@ impl CombinedGridView {
         let n = (self.mip_base_offsets.len() - 1) as u32;
         n
     }
+
+    /// S4B.4.a: copy per-column slab bytes from this combined view
+    /// back into the source `chunks` map. Each column's byte range
+    /// (per-column `slng` length) must equal between combined view
+    /// and source chunk — only alpha-byte-only mutations on the
+    /// combined view (e.g. lightmode bakes) meet that invariant.
+    ///
+    /// Previously lived as `Grid::sync_combined_to_chunks`; moved
+    /// here as part of S4B.4's CombinedGridView retirement plan.
+    /// The bake site materialises a `CombinedGridView` locally,
+    /// mutates it, calls this to write back, and drops it — no
+    /// long-lived cache on `Grid`.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds panic if a column's combined-view byte length
+    /// doesn't match its source-chunk byte length — that's the
+    /// invariant violation noted above.
+    // chx_local / chy_local are voxlap-canonical paired names.
+    #[allow(clippy::similar_names)]
+    pub fn sync_alpha_to_chunks(&self, chunks: &mut HashMap<IVec3, Vxl>) {
+        let cs_xy = CHUNK_SIZE_XY;
+        let vsid = self.vsid;
+        let origin_chunk = self.origin_chunk;
+        for (chunk_idx, vxl) in chunks {
+            if chunk_idx.z != 0 {
+                // S4.0 combined-view scope: only chx/chy chunks at
+                // chz=0 are represented. Skip others.
+                continue;
+            }
+            let chx_local = chunk_idx.x - origin_chunk.x;
+            let chy_local = chunk_idx.y - origin_chunk.y;
+            debug_assert!(
+                chx_local >= 0 && chy_local >= 0,
+                "chunk at {chunk_idx:?} is past the combined view's origin {origin_chunk:?}"
+            );
+            #[allow(clippy::cast_sign_loss)]
+            let chunk_origin_x = (chx_local as u32) * cs_xy;
+            #[allow(clippy::cast_sign_loss)]
+            let chunk_origin_y = (chy_local as u32) * cs_xy;
+            for ly in 0..cs_xy {
+                for lx in 0..cs_xy {
+                    let local_idx = (ly * cs_xy + lx) as usize;
+                    let vx = chunk_origin_x + lx;
+                    let vy = chunk_origin_y + ly;
+                    let v_idx = (vy * vsid + vx) as usize;
+
+                    let combined_start = self.column_offset[v_idx] as usize;
+                    let combined_end = self.column_offset[v_idx + 1] as usize;
+                    let combined_len = combined_end - combined_start;
+
+                    let chunk_start = vxl.column_offset[local_idx] as usize;
+                    debug_assert_eq!(
+                        roxlap_formats::vxl::slng(&vxl.data[chunk_start..]),
+                        combined_len,
+                        "combined-view column ({vx}, {vy}) length {combined_len} != chunk {chunk_idx:?} local ({lx}, {ly}) slng length — sync_alpha_to_chunks requires byte-length-preserving mutations"
+                    );
+                    vxl.data[chunk_start..chunk_start + combined_len]
+                        .copy_from_slice(&self.data[combined_start..combined_end]);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

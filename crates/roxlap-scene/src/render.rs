@@ -819,12 +819,16 @@ mod tests {
             IVec3::new(55, 55, 55),
             Some(0x80_88_88_88),
         );
-        // Force mip-1..mip-2 generation on the combined view.
-        scene
-            .grid_mut(id)
-            .unwrap()
-            .combined_world_mut()
-            .generate_mips(3);
+        // S4B.4.a: force mip-1..mip-2 generation on the single
+        // chunk directly (the Grid's combined-view cache API was
+        // removed). The chunk's own Vxl::generate_mips builds its
+        // own mip tables and the renderer happens to render through
+        // them via Approach B's chunk_at_xy lookup.
+        {
+            let grid = scene.grid_mut(id).unwrap();
+            let chunk = grid.chunks.get_mut(&IVec3::ZERO).unwrap();
+            chunk.generate_mips(3);
+        }
 
         let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];

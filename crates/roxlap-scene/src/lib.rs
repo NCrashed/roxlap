@@ -138,12 +138,6 @@ pub struct Grid {
     /// Sparse chunk storage keyed by `(chx, chy, chz)` chunk
     /// coordinates. A missing entry means the chunk is fully air.
     pub chunks: HashMap<IVec3, Vxl>,
-    /// Cached "combined" virtual-world view (S4.0 Approach C).
-    /// Built lazily on the first [`Grid::combined_world`] call after
-    /// any chunk edit; the edit API and [`Grid::ensure_chunk`]
-    /// invalidate. External mutators of [`Grid::chunks`] must call
-    /// [`Grid::invalidate_combined`] explicitly when their pass ends.
-    pub(crate) cached_combined: Option<CombinedGridView>,
 }
 
 impl Grid {
@@ -153,132 +147,7 @@ impl Grid {
         Self {
             transform,
             chunks: HashMap::new(),
-            cached_combined: None,
         }
-    }
-
-    /// Get-or-build the cached [`CombinedGridView`]. Rebuild cost
-    /// is `O(virtual_vsid² + total slab bytes)`; subsequent calls
-    /// are `O(1)` until an edit invalidates.
-    ///
-    /// # Panics
-    ///
-    /// Cannot panic in practice — the cache is always populated by
-    /// the time the unwrap runs. Defensive `expect` rather than a
-    /// silent `unwrap_or_default`.
-    pub fn combined_world(&mut self) -> &CombinedGridView {
-        if self.cached_combined.is_none() {
-            self.cached_combined = Some(CombinedGridView::build(&self.chunks));
-        }
-        // Cache populated above; unwrap is infallible here.
-        self.cached_combined
-            .as_ref()
-            .expect("cached_combined populated")
-    }
-
-    /// Mutable counterpart to [`Grid::combined_world`]. Intended for
-    /// **alpha-byte-only mutations** that preserve every column's
-    /// slab byte LENGTH (e.g. lightmode bakes that only rewrite the
-    /// brightness channel of existing colour records). After the
-    /// mutation pass, callers should invoke
-    /// [`Grid::sync_combined_to_chunks`] to propagate the changes
-    /// back into [`Grid::chunks`] so a later cache invalidation
-    /// doesn't drop them.
-    ///
-    /// Mutations that change slab structure (insert/remove slabs,
-    /// change z bounds) must NOT go through this path —
-    /// [`Grid::sync_combined_to_chunks`] assumes per-column byte
-    /// lengths match the source chunks (debug-asserted).
-    ///
-    /// # Panics
-    ///
-    /// Cannot panic in practice — same invariant as
-    /// [`Grid::combined_world`].
-    pub fn combined_world_mut(&mut self) -> &mut CombinedGridView {
-        if self.cached_combined.is_none() {
-            self.cached_combined = Some(CombinedGridView::build(&self.chunks));
-        }
-        self.cached_combined
-            .as_mut()
-            .expect("cached_combined populated")
-    }
-
-    /// Copy per-column slab bytes from the cached combined view
-    /// back into [`Grid::chunks`]. Each column's byte range
-    /// (per-column `slng` length) must equal between combined view
-    /// and source chunk — only alpha-byte-only mutations on the
-    /// combined view (e.g. lightmode bakes) meet that invariant.
-    ///
-    /// No-op if the combined view hasn't been built yet.
-    ///
-    /// # Panics
-    ///
-    /// Debug builds panic if a column's combined-view byte length
-    /// doesn't match its source-chunk byte length — that's the
-    /// invariant violation noted above.
-    // chx_local / chy_local are voxlap-canonical paired names.
-    #[allow(clippy::similar_names)]
-    pub fn sync_combined_to_chunks(&mut self) {
-        let Some(combined) = self.cached_combined.as_ref() else {
-            return;
-        };
-        let cs_xy = CHUNK_SIZE_XY;
-        let vsid = combined.vsid;
-        let origin_chunk = combined.origin_chunk;
-        for (chunk_idx, vxl) in &mut self.chunks {
-            if chunk_idx.z != 0 {
-                // S4.0 scope: only chx/chy chunks at chz=0 are
-                // represented in the combined view. Skip others.
-                continue;
-            }
-            // Grid-local chunk index → virtual-coord chunk index.
-            let chx_local = chunk_idx.x - origin_chunk.x;
-            let chy_local = chunk_idx.y - origin_chunk.y;
-            debug_assert!(
-                chx_local >= 0 && chy_local >= 0,
-                "chunk at {chunk_idx:?} is past the combined view's origin {origin_chunk:?}"
-            );
-            #[allow(clippy::cast_sign_loss)]
-            let chunk_origin_x = (chx_local as u32) * cs_xy;
-            #[allow(clippy::cast_sign_loss)]
-            let chunk_origin_y = (chy_local as u32) * cs_xy;
-            for ly in 0..cs_xy {
-                for lx in 0..cs_xy {
-                    let local_idx = (ly * cs_xy + lx) as usize;
-                    let vx = chunk_origin_x + lx;
-                    let vy = chunk_origin_y + ly;
-                    let v_idx = (vy * vsid + vx) as usize;
-
-                    // Combined view is built contiguously (no
-                    // voxalloc-scatter), so column N's bytes occupy
-                    // exactly `[column_offset[N], column_offset[N+1])`.
-                    // No `slng()` walk needed.
-                    let combined_start = combined.column_offset[v_idx] as usize;
-                    let combined_end = combined.column_offset[v_idx + 1] as usize;
-                    let combined_len = combined_end - combined_start;
-
-                    let chunk_start = vxl.column_offset[local_idx] as usize;
-                    debug_assert_eq!(
-                        roxlap_formats::vxl::slng(&vxl.data[chunk_start..]),
-                        combined_len,
-                        "combined-view column ({vx}, {vy}) length {combined_len} != chunk {chunk_idx:?} local ({lx}, {ly}) slng length — sync_combined_to_chunks requires byte-length-preserving mutations"
-                    );
-                    vxl.data[chunk_start..chunk_start + combined_len]
-                        .copy_from_slice(&combined.data[combined_start..combined_end]);
-                }
-            }
-        }
-    }
-
-    /// Mark the cached combined view stale so the next
-    /// [`Grid::combined_world`] call rebuilds it. Called automatically
-    /// by the edit API and [`Grid::ensure_chunk`]; external code that
-    /// mutates [`Grid::chunks`] (e.g. calling
-    /// [`roxlap_formats::edit`] primitives directly on a borrowed
-    /// `&mut Vxl`, or running a per-chunk lighting bake) must call
-    /// this once their mutation pass finishes.
-    pub fn invalidate_combined(&mut self) {
-        self.cached_combined = None;
     }
 }
 
@@ -413,29 +282,29 @@ mod tests {
         );
     }
 
-    /// `sync_combined_to_chunks` propagates an alpha-byte-only
-    /// edit on the combined view back into source chunks. Stand-in
-    /// for the lightmode bake use case at much smaller scale.
+    /// S4B.4.a: `CombinedGridView::sync_alpha_to_chunks` propagates
+    /// an alpha-byte-only edit on the combined view back into
+    /// source chunks. Stand-in for the lightmode bake use case at
+    /// much smaller scale. Previously routed through
+    /// `Grid::sync_combined_to_chunks`; that API was removed when
+    /// the combined view stopped being cached on `Grid`.
     #[test]
-    fn sync_combined_to_chunks_propagates_alpha_edit() {
+    fn sync_alpha_to_chunks_propagates_alpha_edit() {
         use roxlap_formats::vxl::slng;
         let mut grid = Grid::new(GridTransform::identity());
         grid.set_voxel(IVec3::new(5, 6, 100), Some(0x80_aa_bb_cc));
-        // Materialise + tweak the alpha byte of the surface voxel
-        // through the combined view.
-        {
-            let combined = grid.combined_world_mut();
-            let v_idx = (6_u32 * combined.vsid + 5) as usize;
-            let start = combined.column_offset[v_idx] as usize;
-            let len = slng(&combined.data[start..]);
-            // Slab layout: [nextptr, z1, z1c, z0, b, g, r, alpha].
-            // The alpha byte is at the END of the colour record.
-            // For a single solid voxel column the record is the
-            // last 4 bytes.
-            let alpha_idx = start + len - 1;
-            combined.data[alpha_idx] = 0xff;
-        }
-        grid.sync_combined_to_chunks();
+        // Build a fresh combined view on demand. No caching on Grid
+        // anymore — the bake call site owns the view's lifetime.
+        let mut combined = CombinedGridView::build(&grid.chunks);
+        let v_idx = (6_u32 * combined.vsid + 5) as usize;
+        let start = combined.column_offset[v_idx] as usize;
+        let len = slng(&combined.data[start..]);
+        // Slab layout: [nextptr, z1, z1c, z0, b, g, r, alpha].
+        // The alpha byte is at the END of the colour record. For a
+        // single solid voxel column the record is the last 4 bytes.
+        let alpha_idx = start + len - 1;
+        combined.data[alpha_idx] = 0xff;
+        combined.sync_alpha_to_chunks(&mut grid.chunks);
         // Source chunk now carries the modified alpha byte.
         let chunk = grid.chunk(IVec3::ZERO).unwrap();
         let local_idx = (6 * CHUNK_SIZE_XY + 5) as usize;

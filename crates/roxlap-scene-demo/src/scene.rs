@@ -97,39 +97,39 @@ impl SceneAndCamera {
 /// every chunk of every grid. Mode 1 uses surface normals only —
 /// no `LightSrc` consulted — so we pass an empty `lights` slice.
 ///
-/// **S4.1 fix for the chunk-edge lighting seam.** Per-chunk bakes
+/// **S4.1 fix for the chunk-edge lighting seam** — preserved
+/// through S4B.4.a's combined-view retirement. Per-chunk bakes
 /// at S4.0 produced a visible brightness jump at every chunk
 /// boundary because `estnorm`'s 5×5×5 neighbourhood vote treated
 /// neighbour chunks as all-air. The fix routes the bake through
-/// the combined-world view: each chunk's bake region is still
-/// `(chunk_x0..chunk_x1) × (chunk_y0..chunk_y1)`, but the
-/// `(world_data, column_offsets, vsid)` triple is the grid's
-/// combined view — so `EstNormCache`'s padding reads neighbour-
-/// chunk voxels naturally. After all chunks bake, we
-/// `sync_combined_to_chunks` to copy the post-bake alpha bytes
-/// back into source chunks so the cache invariant holds even
-/// after a later invalidation.
+/// a freshly-built `CombinedGridView`: each chunk's bake region
+/// is still `(chunk_x0..chunk_x1) × (chunk_y0..chunk_y1)`, but the
+/// `(world_data, column_offsets, vsid)` triple is the combined
+/// view — so `EstNormCache`'s padding reads neighbour-chunk
+/// voxels naturally. After all chunks bake, we
+/// [`CombinedGridView::sync_alpha_to_chunks`] to copy the post-
+/// bake alpha bytes back into source chunks; then drop the
+/// combined view (no caching on `Grid` post-S4B.4.a).
+///
+/// S4B.4.b plan: replace the combined-view materialisation with
+/// a chunk-aware `EstNormCache::build` reader, removing the
+/// last `CombinedGridView` user.
 ///
 /// **Per-chunk bake region (not whole-grid).** A whole-grid
 /// `update_lighting` call at vsid=4096 would allocate a 500 MB+
 /// `EstNormCache` bit table; the per-chunk loop keeps each cache
 /// at ~135 KB (132²×8 bytes) and still gets correct cross-chunk
 /// neighbourhood sampling.
-/// Number of mip levels the demo's combined-view bake produces.
-/// 4 mips covers the demo's `MAX_SCAN_DIST` range; rays transition
-/// to coarser mips at every `MIP_SCAN_DIST` distance step.
-const MIP_LEVELS: u32 = 4;
 
 // chx_v / chy_v are voxlap-canonical paired names.
 #[allow(clippy::cast_possible_wrap, clippy::similar_names)]
 fn bake_lightmode_1(scene: &mut Scene) {
+    use roxlap_scene::CombinedGridView;
+
     const LIGHTMODE: u32 = 1;
     let ids: Vec<GridId> = scene.grids().map(|(id, _)| id).collect();
     for id in ids {
         let grid = scene.grid_mut(id).expect("grid present");
-        // Snapshot the chunk indices before borrowing the combined
-        // view mutably; combined_world_mut takes &mut self which
-        // would conflict with iterating &chunks otherwise.
         let chunk_idxs: Vec<IVec3> = grid.chunks.keys().copied().collect();
         if chunk_idxs.is_empty() {
             continue;
@@ -137,52 +137,42 @@ fn bake_lightmode_1(scene: &mut Scene) {
         let cs_xy = CHUNK_SIZE_XY as i32;
         let cs_z = CHUNK_SIZE_Z as i32;
 
-        // Per-chunk bake against the combined view's data buffer.
-        {
-            let combined = grid.combined_world_mut();
-            let origin_chunk = combined.origin_chunk;
-            for chunk_idx in &chunk_idxs {
-                if chunk_idx.z != 0 {
-                    // S4.0 combined-view scope: chz=0 only.
-                    continue;
-                }
-                // Grid-local chunk index → virtual-coord chunk index
-                // → virtual bake bbox.
-                let chx_v = chunk_idx.x - origin_chunk.x;
-                let chy_v = chunk_idx.y - origin_chunk.y;
-                let x0 = chx_v * cs_xy;
-                let y0 = chy_v * cs_xy;
-                let x1 = x0 + cs_xy;
-                let y1 = y0 + cs_xy;
-                roxlap_core::update_lighting(
-                    &mut combined.data,
-                    &combined.column_offset,
-                    combined.vsid,
-                    x0,
-                    y0,
-                    0,
-                    x1,
-                    y1,
-                    cs_z,
-                    LIGHTMODE,
-                    &[],
-                );
+        // S4B.4.a: build a local combined view per grid for the
+        // duration of the bake. Drops once the alpha bytes are
+        // propagated back.
+        let mut combined = CombinedGridView::build(&grid.chunks);
+        let origin_chunk = combined.origin_chunk;
+        for chunk_idx in &chunk_idxs {
+            if chunk_idx.z != 0 {
+                // S4.0 combined-view scope: chz=0 only.
+                continue;
             }
+            let chx_v = chunk_idx.x - origin_chunk.x;
+            let chy_v = chunk_idx.y - origin_chunk.y;
+            let x0 = chx_v * cs_xy;
+            let y0 = chy_v * cs_xy;
+            let x1 = x0 + cs_xy;
+            let y1 = y0 + cs_xy;
+            roxlap_core::update_lighting(
+                &mut combined.data,
+                &combined.column_offset,
+                combined.vsid,
+                x0,
+                y0,
+                0,
+                x1,
+                y1,
+                cs_z,
+                LIGHTMODE,
+                &[],
+            );
         }
-        // Propagate the post-bake alpha bytes from the combined view
-        // back into each chunk's source slab buffer. Keeps the cache
-        // invariant valid for any later edit/invalidate cycle.
-        grid.sync_combined_to_chunks();
+        combined.sync_alpha_to_chunks(&mut grid.chunks);
 
-        // **NOTE (2026-05-11):** mip generation was attempted as a
-        // perf fix for the vsid=4096 demo. The combined-view
-        // `generate_mips` method is in place and unit-tested, but
-        // mip-1+ rendering produces an all-sky frame both at
-        // chunk-vsid (128) and at full grid-vsid (4096). Suspected
-        // root cause: `compilerle` emits only top-of-column floor
-        // voxels for buried-interior columns, so mip-1+ slab data
-        // lacks the depth information `phase_remiporend` needs.
-        // See `project_mip_attempt.md`. Deferred to S6 mip work.
-        let _ = MIP_LEVELS;
+        // NOTE (2026-05-11): mip generation attempted as a perf
+        // fix for the vsid=4096 demo. The `compilerle` emit-only-
+        // top-of-column-floor-voxels bug makes mip-1+ slab data
+        // unrenderable. Deferred to S6.
+        // See `project_mip_attempt.md`.
     }
 }
