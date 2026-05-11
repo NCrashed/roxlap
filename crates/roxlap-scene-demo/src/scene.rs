@@ -31,22 +31,25 @@ fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
 ///   `GROUND_CHUNKS_X × GROUND_CHUNKS_Y` chunks centred on the grid
 ///   origin (S4.1: chunk-XY `[-16..16) × [-16..16)`, world XY
 ///   `[-2048..2048)`, z ∈ [80..255]).
-/// - **Ship** grid origin at world `(0, 0, -100)` — ship body
-///   in chunk-local z ∈ [56..72] → world z ∈ [-44..-28].
-///   The ship sits comfortably in the sky band above the terrain
-///   (terrain peaks at world z ≈ 80; sky is z < 80).
+/// - **Ship** grid origin at world `(0, 500, -100)` — saucer
+///   spanning `SHIP_CHUNKS_X × SHIP_CHUNKS_Y` chunks centred on the
+///   ship grid origin (S4.2: chunk-XY `[-2..2) × [-3..3)`, grid-local
+///   `[-256..256) × [-384..384) × [0..256)`). Body equator at
+///   grid-local z=64 → world z=-36 (same altitude as the S3.x ship).
+///   The +y origin offset puts the saucer visibly ahead of the
+///   spawn camera instead of engulfing it.
 ///
 /// Initial camera at world `(0, -120, 50)` (over the south-edge
-/// midline of the centred ground) looking +y, sees the ship
-/// dead-ahead with the terrain stretching to the horizon in
-/// front and the centred world extending behind.
+/// midline of the centred ground) looking +y, sees the saucer
+/// floating ahead and slightly above the horizon with the centred
+/// terrain stretching to the horizon.
 pub fn build_demo() -> SceneAndCamera {
     let mut scene = Scene::new();
 
     let ground_id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, 0.0)));
     terrain::build_ground(scene.grid_mut(ground_id).expect("ground grid present"));
 
-    let ship_id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, -100.0)));
+    let ship_id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 500.0, -100.0)));
     ship::build_ship(scene.grid_mut(ship_id).expect("ship grid present"));
 
     // Bake lightmode-1 directional shading into every chunk's slab
