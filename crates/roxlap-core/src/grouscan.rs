@@ -304,6 +304,15 @@ pub(crate) struct GrouscanState<'a> {
     /// to compute `(cx, cy) → chunk_idx` so the inner loop doesn't
     /// re-touch the GridView struct fields.
     pub chunk_size_xy: u32,
+    /// `log2(chunk_size_xy)` — used to lower the multi-chunk
+    /// column-step's `div_euclid` to an arithmetic shift. Always
+    /// derivable in debug because `chunk_size_xy` is asserted
+    /// power-of-two; in release we trust the invariant.
+    pub chunk_size_xy_log2: u32,
+    /// `chunk_size_xy - 1` as `i32` — bitwise mask used to derive
+    /// chunk-local coords (`local_cx = cx & mask`) in lieu of
+    /// `cx - chunk_idx * chunk_size`. Same power-of-two invariant.
+    pub chunk_size_xy_mask: i32,
     /// XY index of the chunk the ray currently sits in. Initialised
     /// from `(cx, cy).div_euclid(chunk_size_xy)`; advanced by the
     /// column step when a step crosses a chunk boundary.
@@ -339,12 +348,18 @@ impl<'a> GrouscanState<'a> {
         // fast path stays active and goldens are byte-identical.
         let grid_view = inputs.grid_view;
         let chunk_size_xy = grid_view.chunk_size_xy;
+        // Power-of-two invariant: enables shift / mask lowering of
+        // the column-step's chunk-index split. CHUNK_SIZE_XY is
+        // locked to 128 by `roxlap-scene` and any test-only override
+        // is expected to honour the same shape.
+        debug_assert!(
+            chunk_size_xy.is_power_of_two() && chunk_size_xy > 0,
+            "chunk_size_xy must be a positive power of two (got {chunk_size_xy})"
+        );
+        let chunk_size_xy_log2 = chunk_size_xy.trailing_zeros();
         #[allow(clippy::cast_possible_wrap)]
-        let chunk_size_signed = chunk_size_xy as i32;
-        let current_chunk_idx_xy = [
-            cx.div_euclid(chunk_size_signed),
-            cy.div_euclid(chunk_size_signed),
-        ];
+        let chunk_size_xy_mask = (chunk_size_xy - 1) as i32;
+        let current_chunk_idx_xy = [cx >> chunk_size_xy_log2, cy >> chunk_size_xy_log2];
         let current_chunk_exists = grid_view.chunk_at_xy(current_chunk_idx_xy).is_some();
 
         Self {
@@ -386,6 +401,8 @@ impl<'a> GrouscanState<'a> {
             gmipnum,
             grid_view,
             chunk_size_xy,
+            chunk_size_xy_log2,
+            chunk_size_xy_mask,
             current_chunk_idx_xy,
             current_chunk_exists,
         }
@@ -1351,12 +1368,18 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
         }
     } else {
         // Multi-chunk: detect chunk-XY boundary, swap on transition.
-        #[allow(clippy::cast_possible_wrap)]
-        let chunk_size_signed = state.chunk_size_xy as i32;
-        let new_chunk_xy = [
-            state.cx.div_euclid(chunk_size_signed),
-            state.cy.div_euclid(chunk_size_signed),
-        ];
+        //
+        // Lowering: `chunk_size_xy` is a positive power of two (the
+        // debug_assert in `from_seed` guards this), so the
+        // chunk-index split uses arithmetic shift / bitwise mask
+        // instead of `div_euclid` / `mul-sub`. Arithmetic shift on
+        // a signed `i32` rounds toward negative infinity, matching
+        // `div_euclid`; the `& mask` always lands in
+        // `[0, chunk_size_xy)` regardless of sign, matching
+        // `rem_euclid`.
+        let log2 = state.chunk_size_xy_log2;
+        let mask = state.chunk_size_xy_mask;
+        let new_chunk_xy = [state.cx >> log2, state.cy >> log2];
         if new_chunk_xy != state.current_chunk_idx_xy {
             state.current_chunk_idx_xy = new_chunk_xy;
             if let Some(new_chunk) = state.grid_view.chunk_at_xy(new_chunk_xy) {
@@ -1374,18 +1397,12 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
             }
         }
 
-        // Refresh from active chunk via chunk-LOCAL coords. The S1.Z
-        // recompute-index-from-signed-coords pattern carries over —
-        // wrapping_add_signed in usize can drift past 2^32 on
-        // 64-bit hosts so we always rebuild from `(cx, cy)`.
-        let local_cx = state.cx - new_chunk_xy[0] * chunk_size_signed;
-        let local_cy = state.cy - new_chunk_xy[1] * chunk_size_signed;
-        let chunk_in_bounds = state.current_chunk_exists
-            && local_cx >= 0
-            && local_cy >= 0
-            && local_cx < chunk_size_signed
-            && local_cy < chunk_size_signed;
-        if chunk_in_bounds {
+        // Chunk-local coords via mask. `local_cx` is in
+        // `[0, chunk_size_xy)` for any signed `cx`, so the prior
+        // explicit range checks are redundant.
+        if state.current_chunk_exists {
+            let local_cx = state.cx & mask;
+            let local_cy = state.cy & mask;
             #[allow(clippy::cast_sign_loss)]
             let correct_idx = (local_cy as u32)
                 .wrapping_mul(state.chunk_size_xy)
