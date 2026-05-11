@@ -22,6 +22,7 @@ use rayon::prelude::*;
 use crate::camera_math;
 use crate::camera_math::CameraState;
 use crate::column_walk;
+use crate::grid_view::GridView;
 use crate::opticast_prelude;
 use crate::opticast_prelude::OpticastPrelude;
 use crate::projection;
@@ -122,14 +123,10 @@ pub enum OpticastOutcome {
 /// Drive one frame of opticast. The caller supplies:
 /// - `camera`: pose to render from.
 /// - `settings`: framebuffer + projection + scan-dist constants.
-/// - `vsid`: world dimension (square map).
-/// - `slab_buf` + `column_offsets`: world-level voxel data —
-///   `slab_buf` is the flat byte buffer holding all columns'
-///   slab lists concatenated; `column_offsets[i]` is the byte
-///   offset where column `i`'s slabs start.
-///   `column_offsets.len()` must equal `vsid * vsid + 1` (the
-///   final entry is `slab_buf.len()`, so column slices are
-///   `slab_buf[column_offsets[i]..column_offsets[i + 1]]`).
+/// - `grid`: world voxel data wrapped in a [`GridView`] (vsid +
+///   slab buffer + column offsets + mip-base offsets). Today
+///   always represents a single chunk; the multi-chunk variant
+///   lands in S4B.1+ and reuses this same opticast signature.
 ///
 /// Whatever real or stub [`Rasterizer`] is plugged in receives the
 /// `gline` / `hrend` / `vrend` calls the four-quadrant scan loops
@@ -185,9 +182,7 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     pool: &mut ScratchPool,
     camera: &Camera,
     settings: &OpticastSettings,
-    vsid: u32,
-    slab_buf: &[u8],
-    column_offsets: &[u32],
+    grid: GridView<'_>,
 ) -> OpticastOutcome {
     let cs = camera_math::derive(
         camera,
@@ -200,7 +195,7 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
 
     let prelude = opticast_prelude::derive_prelude(
         &cs,
-        vsid,
+        grid.vsid,
         settings.mip_levels,
         settings.mip_scan_dist,
         settings.max_scan_dist,
@@ -225,7 +220,8 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     // before; the negative-index path is a no-op.
     let treat_z_max_as_air = pool.slot(0).treat_z_max_as_air;
     let (gstartz0, gstartz1, camera_vptr_offset) = if prelude.in_bounds_xy {
-        let camera_column = camera_column_slice(slab_buf, column_offsets, prelude.column_index);
+        let camera_column =
+            camera_column_slice(grid.slab_buf, grid.column_offsets, prelude.column_index);
         let Some(camera_column_data) = camera_column else {
             return OpticastOutcome::SkippedCameraInSolid;
         };
@@ -521,16 +517,10 @@ mod tests {
             LOOKING_DOWN_COL_INDEX,
             2048,
         );
+        let mip_base_offsets = [0usize, column_offsets.len()];
+        let grid = GridView::from_parts(2048, &slab_buf, &column_offsets, &mip_base_offsets);
 
-        let outcome = opticast(
-            &mut counts,
-            &mut pool,
-            &cam,
-            &settings,
-            2048,
-            &slab_buf,
-            &column_offsets,
-        );
+        let outcome = opticast(&mut counts, &mut pool, &cam, &settings, grid);
 
         assert_eq!(outcome, OpticastOutcome::Rendered);
         // Looking-down camera: each quadrant fires. gline counts ≈
@@ -556,16 +546,10 @@ mod tests {
             LOOKING_DOWN_COL_INDEX,
             2048,
         );
+        let mip_base_offsets = [0usize, column_offsets.len()];
+        let grid = GridView::from_parts(2048, &slab_buf, &column_offsets, &mip_base_offsets);
 
-        let outcome = opticast(
-            &mut counts,
-            &mut pool,
-            &cam,
-            &settings,
-            2048,
-            &slab_buf,
-            &column_offsets,
-        );
+        let outcome = opticast(&mut counts, &mut pool, &cam, &settings, grid);
 
         assert_eq!(outcome, OpticastOutcome::SkippedCameraInSolid);
         assert_eq!(counts.gline, 0);

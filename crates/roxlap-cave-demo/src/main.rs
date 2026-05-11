@@ -576,24 +576,10 @@ impl App {
         }
 
         {
-            let mut rasterizer = ScalarRasterizer::new(
-                &mut buffer,
-                &mut self.zbuffer,
-                pitch_pixels,
-                &self.vxl.data,
-                &self.vxl.column_offset,
-                &self.vxl.mip_base_offsets,
-                self.vxl.vsid,
-            );
-            let _ = opticast(
-                &mut rasterizer,
-                &mut self.pool,
-                &cam,
-                &settings,
-                self.vxl.vsid,
-                &self.vxl.data,
-                &self.vxl.column_offset,
-            );
+            let grid = roxlap_core::GridView::from_single_vxl(&self.vxl);
+            let mut rasterizer =
+                ScalarRasterizer::new(&mut buffer, &mut self.zbuffer, pitch_pixels, grid);
+            let _ = opticast(&mut rasterizer, &mut self.pool, &cam, &settings, grid);
         }
 
         // Plasma-bullet billboards on top of the rasterized scene.

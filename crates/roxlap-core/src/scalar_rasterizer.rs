@@ -290,11 +290,11 @@ struct FrameCache {
 /// `opticast` call; SDL hosts allocate these once and reuse across
 /// frames, see `roxlap-host`.
 //
-// `slab_buf` / `column_offsets` / `vsid` are R4.3a-rewire-2
-// scaffolding — the real `gline` (R4.3a-rewire-3) needs them to
-// call `grouscan_run` per ray. The current placeholder gline
-// doesn't read them yet, hence the dead_code allow.
-#[allow(dead_code)]
+// `grid` carries the per-frame voxel-world borrow that gline reads
+// to call `grouscan_run` per ray. S4B.0 collapsed the previous
+// four-field `(slab_buf, column_offsets, mip_base_offsets, vsid)`
+// shape into a single `GridView<'a>`; gline + frame_setup
+// destructure via `self.grid.<field>` reads.
 #[derive(Clone)]
 pub struct ScalarRasterizer<'a> {
     /// Framebuffer + zbuffer raw-pointer view. Stripped from the
@@ -309,26 +309,10 @@ pub struct ScalarRasterizer<'a> {
     /// for tightly-packed buffers; SDL streaming textures may add
     /// trailing padding).
     pitch_pixels: usize,
-    /// World-level flat slab buffer (voxlap's malloc'd column
-    /// data). Re-borrowed from opticast's caller for the lifetime
-    /// of the rasterizer.
-    slab_buf: &'a [u8],
-    /// Per-column byte offsets into [`Self::slab_buf`], concatenated
-    /// across all built mip levels. The mip-0 sub-table prefix
-    /// (`vsid² + 1` entries) is what existing single-mip callers
-    /// pass; multi-mip callers pass the full concatenation and
-    /// declare boundaries via [`Self::mip_base_offsets`].
-    column_offsets: &'a [u32],
-    /// Per-mip column-offset sub-table base indices. Length
-    /// `mip_count + 1`; trailing sentinel equals
-    /// `column_offsets.len()`. Single-mip callers pass
-    /// `&[0, vsid² + 1]`. R4.5d's `phase_remiporend` indexes
-    /// this to land in mip-N+1's sub-table.
-    mip_base_offsets: &'a [usize],
-    /// World dimension. Combined with the prelude's `column_index`
-    /// and the column-step path in grouscan, this is what lets the
-    /// real gline walk the per-ray voxel-column traversal.
-    vsid: u32,
+    /// Per-frame world borrow. `Copy`, so the parallel branches'
+    /// per-thread rasterizer clones share the same backing slab /
+    /// column-offset data without an extra heap allocation.
+    grid: crate::grid_view::GridView<'a>,
     /// Optional sky texture borrow. `None` ⇒ `phase_startsky`
     /// solid-fills with `scratch.skycast`. `Some(_)` ⇒ gline's
     /// per-ray frustum prep updates `scratch.sky_off`, and
@@ -363,10 +347,10 @@ impl<'a> ScalarRasterizer<'a> {
     /// the engine renders into; the `frame_setup` hook does not
     /// validate sizes (it has no height to check against).
     ///
-    /// `slab_buf` / `column_offsets` / `mip_base_offsets` / `vsid`
-    /// describe the world the renderer reads from. Pass the matching
-    /// fields from a [`roxlap_formats::vxl::Vxl`] (or, for tests,
-    /// `&[0, vsid² + 1]` as the single-mip placeholder).
+    /// `grid` describes the world the renderer reads from. Build
+    /// from a [`roxlap_formats::vxl::Vxl`] via
+    /// [`crate::grid_view::GridView::from_single_vxl`], or from raw
+    /// parts via [`crate::grid_view::GridView::from_parts`].
     ///
     /// `ray_step` is initialised to a zero placeholder; the real
     /// values get stamped on the first [`Rasterizer::frame_setup`]
@@ -376,18 +360,12 @@ impl<'a> ScalarRasterizer<'a> {
         framebuffer: &'a mut [u32],
         zbuffer: &'a mut [f32],
         pitch_pixels: usize,
-        slab_buf: &'a [u8],
-        column_offsets: &'a [u32],
-        mip_base_offsets: &'a [usize],
-        vsid: u32,
+        grid: crate::grid_view::GridView<'a>,
     ) -> Self {
         Self {
             target: RasterTarget::new(framebuffer, zbuffer),
             pitch_pixels,
-            slab_buf,
-            column_offsets,
-            mip_base_offsets,
-            vsid,
+            grid,
             sky: None,
             frame: None,
         }
@@ -460,7 +438,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
             &cache.camera_state,
             pos_xfrac,
             pos_yfrac,
-            self.vsid,
+            self.grid.vsid,
             length,
             x0,
             y0,
@@ -544,7 +522,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
         //    `dist`, which the z-buffer ends up carrying.
         let mut gxmax = cache.prelude.max_scan_dist;
         scratch.skycast.dist = gxmax;
-        let vsid_signed = self.vsid as i32;
+        let vsid_signed = self.grid.vsid as i32;
         let j0 = if f.gixy[0] < 0 {
             li_pos_xy[0]
         } else {
@@ -588,7 +566,8 @@ impl Rasterizer for ScalarRasterizer<'_> {
         //    path in grouscan continues to feed empty columns
         //    until (cx, cy) cross into the world.
         let column = if cache.prelude.in_bounds_xy {
-            camera_column_slice(self.slab_buf, self.column_offsets, column_index).unwrap_or(&[])
+            camera_column_slice(self.grid.slab_buf, self.grid.column_offsets, column_index)
+                .unwrap_or(&[])
         } else {
             &[]
         };
@@ -612,10 +591,10 @@ impl Rasterizer for ScalarRasterizer<'_> {
             column,
             gylookup: &cache.prelude.y_lookup,
             gcsub: &gcsub_local,
-            slab_buf: self.slab_buf,
-            column_offsets: self.column_offsets,
-            mip_base_offsets: self.mip_base_offsets,
-            vsid: self.vsid,
+            slab_buf: self.grid.slab_buf,
+            column_offsets: self.grid.column_offsets,
+            mip_base_offsets: self.grid.mip_base_offsets,
+            vsid: self.grid.vsid,
             sky: self.sky.map(crate::grouscan::SkyRef::from_sky),
         };
         // gmipnum = number of built mip levels. R4.5d's
@@ -624,7 +603,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // `gpz > ngxmax` overflow fires; until then a multi-mip
         // world simply renders mip-0 only, byte-stable with the
         // single-mip path.
-        let gmipnum = u32::try_from(self.mip_base_offsets.len().saturating_sub(1))
+        let gmipnum = u32::try_from(self.grid.mip_base_offsets.len().saturating_sub(1))
             .expect("mip count fits in u32");
         let _ = grouscan_run(
             scratch,
@@ -1189,7 +1168,9 @@ mod tests {
     fn frame_setup_caches_ray_step() {
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
+        let mip_base = [0usize, 0];
+        let grid = crate::grid_view::GridView::from_parts(64, &[], &[], &mip_base);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, grid);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -1222,7 +1203,9 @@ mod tests {
         // ionally not bit-checked).
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
+        let mip_base = [0usize, 0];
+        let grid = crate::grid_view::GridView::from_parts(64, &[], &[], &mip_base);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, grid);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -1328,7 +1311,9 @@ mod tests {
         // and verify the framebuffer received the colours.
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
+        let mip_base = [0usize, 0];
+        let grid = crate::grid_view::GridView::from_parts(64, &[], &[], &mip_base);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, grid);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -1418,15 +1403,13 @@ mod tests {
         }
 
         let mip_base_offsets = [0usize, column_offsets.len()];
-        let mut rasterizer = ScalarRasterizer::new(
-            &mut fb,
-            &mut zb,
-            640,
+        let grid = crate::grid_view::GridView::from_parts(
+            2048,
             &column,
             &column_offsets,
             &mip_base_offsets,
-            2048,
         );
+        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, 640, grid);
 
         let cam = crate::Camera {
             pos: [1024.0, 1024.0, 128.0],
@@ -1436,15 +1419,7 @@ mod tests {
         };
         let settings = OpticastSettings::for_oracle_framebuffer(640, 480);
 
-        let outcome = opticast_fn(
-            &mut rasterizer,
-            &mut pool,
-            &cam,
-            &settings,
-            2048,
-            &column,
-            &column_offsets,
-        );
+        let outcome = opticast_fn(&mut rasterizer, &mut pool, &cam, &settings, grid);
         assert_eq!(outcome, crate::OpticastOutcome::Rendered);
 
         // Wiring smoke test — gline → derive_gline_frustum →
@@ -1475,7 +1450,9 @@ mod tests {
         // colour and uurend advanced.
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
+        let mip_base = [0usize, 0];
+        let grid = crate::grid_view::GridView::from_parts(64, &[], &[], &mip_base);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, grid);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,
@@ -1532,7 +1509,9 @@ mod tests {
         // happens once per pixel.
         let mut fb = vec![0u32; 64 * 64];
         let mut zb = vec![0.0f32; 64 * 64];
-        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, &[], &[], &[0usize, 0], 64);
+        let mip_base = [0usize, 0];
+        let grid = crate::grid_view::GridView::from_parts(64, &[], &[], &mip_base);
+        let mut r = ScalarRasterizer::new(&mut fb, &mut zb, 64, grid);
         let (cs, proj, rs, prelude) = dummy_per_frame();
         let ctx = ScanContext {
             proj: &proj,

@@ -34,24 +34,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut zb = vec![0.0f32; fb.len()];
     let mut pool = ScratchPool::new(w, h, world.vsid);
 
-    let mut rast = ScalarRasterizer::new(
-        &mut fb,
-        &mut zb,
-        w as usize,
-        &world.data,
-        &world.column_offset,
-        &world.mip_base_offsets,
-        world.vsid,
-    );
+    let grid = roxlap_core::GridView::from_single_vxl(&world);
+    let mut rast = ScalarRasterizer::new(&mut fb, &mut zb, w as usize, grid);
 
     let _ = opticast(
         &mut rast,
         &mut pool,
         &Camera::default(),
         &OpticastSettings::for_oracle_framebuffer(w, h),
-        world.vsid,
-        &world.data,
-        &world.column_offset,
+        grid,
     );
 
     let mut f = std::fs::File::create("oracle_view.ppm")?;

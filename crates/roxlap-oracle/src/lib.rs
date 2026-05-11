@@ -358,24 +358,9 @@ pub fn render_pose(
     let pitch_pixels = XRES as usize;
 
     {
-        let mut rasterizer = ScalarRasterizer::new(
-            framebuffer,
-            zbuffer,
-            pitch_pixels,
-            &vxl.data,
-            &vxl.column_offset,
-            &vxl.mip_base_offsets,
-            vxl.vsid,
-        );
-        let _ = opticast(
-            &mut rasterizer,
-            pool,
-            &cam,
-            &settings,
-            vxl.vsid,
-            &vxl.data,
-            &vxl.column_offset,
-        );
+        let grid = roxlap_core::GridView::from_single_vxl(vxl);
+        let mut rasterizer = ScalarRasterizer::new(framebuffer, zbuffer, pitch_pixels, grid);
+        let _ = opticast(&mut rasterizer, pool, &cam, &settings, grid);
     }
 
     if let Some(kind) = pose.sprite {

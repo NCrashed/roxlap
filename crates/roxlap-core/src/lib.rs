@@ -15,6 +15,7 @@ mod engine;
 pub(crate) mod equivec;
 pub(crate) mod fixed;
 pub mod gline;
+pub mod grid_view;
 pub(crate) mod grouscan;
 pub mod kfa_draw;
 pub mod meltsphere;
@@ -34,5 +35,6 @@ pub mod world_query;
 
 pub use camera::Camera;
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
+pub use grid_view::GridView;
 pub use opticast::{opticast, OpticastOutcome, OpticastSettings};
 pub use world_lighting::update_lighting;

@@ -188,24 +188,9 @@ fn black_pentagon_under_oob_camera() {
 
     let _cs = camera_math::derive(&cam, XRES, YRES, settings.hx, settings.hy, settings.hz);
 
-    let mut rasterizer = ScalarRasterizer::new(
-        &mut framebuffer,
-        &mut zbuffer,
-        XRES as usize,
-        &vxl.data,
-        &vxl.column_offset,
-        &vxl.mip_base_offsets,
-        vxl.vsid,
-    );
-    let outcome = opticast(
-        &mut rasterizer,
-        &mut pool,
-        &cam,
-        &settings,
-        vxl.vsid,
-        &vxl.data,
-        &vxl.column_offset,
-    );
+    let grid = roxlap_core::GridView::from_single_vxl(&vxl);
+    let mut rasterizer = ScalarRasterizer::new(&mut framebuffer, &mut zbuffer, XRES as usize, grid);
+    let outcome = opticast(&mut rasterizer, &mut pool, &cam, &settings, grid);
     drop(rasterizer);
 
     assert_eq!(outcome, OpticastOutcome::Rendered);
@@ -341,27 +326,12 @@ fn render_to_ppm(cam: Camera, path: &str) -> Vec<u32> {
     pool.set_treat_z_max_as_air(true);
 
     let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-    let mut rasterizer = ScalarRasterizer::new(
-        &mut framebuffer,
-        &mut zbuffer,
-        XRES as usize,
-        &vxl.data,
-        &vxl.column_offset,
-        &vxl.mip_base_offsets,
-        vxl.vsid,
-    );
+    let grid = roxlap_core::GridView::from_single_vxl(&vxl);
+    let mut rasterizer = ScalarRasterizer::new(&mut framebuffer, &mut zbuffer, XRES as usize, grid);
     if let Some(sky_ref) = engine.sky() {
         rasterizer = rasterizer.with_sky(sky_ref);
     }
-    let outcome = opticast(
-        &mut rasterizer,
-        &mut pool,
-        &cam,
-        &settings,
-        vxl.vsid,
-        &vxl.data,
-        &vxl.column_offset,
-    );
+    let outcome = opticast(&mut rasterizer, &mut pool, &cam, &settings, grid);
     drop(rasterizer);
     assert_eq!(outcome, OpticastOutcome::Rendered);
 
@@ -435,27 +405,12 @@ fn below_bedrock_camera_renders_world() {
     pool.set_treat_z_max_as_air(true);
 
     let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-    let mut rasterizer = ScalarRasterizer::new(
-        &mut framebuffer,
-        &mut zbuffer,
-        XRES as usize,
-        &vxl.data,
-        &vxl.column_offset,
-        &vxl.mip_base_offsets,
-        vxl.vsid,
-    );
+    let grid = roxlap_core::GridView::from_single_vxl(&vxl);
+    let mut rasterizer = ScalarRasterizer::new(&mut framebuffer, &mut zbuffer, XRES as usize, grid);
     if let Some(sky_ref) = engine.sky() {
         rasterizer = rasterizer.with_sky(sky_ref);
     }
-    let outcome = opticast(
-        &mut rasterizer,
-        &mut pool,
-        &cam,
-        &settings,
-        vxl.vsid,
-        &vxl.data,
-        &vxl.column_offset,
-    );
+    let outcome = opticast(&mut rasterizer, &mut pool, &cam, &settings, grid);
     drop(rasterizer);
 
     let mut ppm = format!("P6\n{XRES} {YRES}\n255\n").into_bytes();

@@ -110,27 +110,17 @@ pub fn render_scene(
             forward: camera.forward,
         };
         let outcome = {
-            let mut rasterizer = ScalarRasterizer::new(
-                fb,
-                zb,
-                pitch_pixels,
+            let grid = roxlap_core::GridView::from_parts(
+                combined.vsid,
                 &combined.data,
                 &combined.column_offset,
                 &combined.mip_base_offsets,
-                combined.vsid,
             );
+            let mut rasterizer = ScalarRasterizer::new(fb, zb, pitch_pixels, grid);
             if let Some(sky_ref) = sky {
                 rasterizer = rasterizer.with_sky(sky_ref);
             }
-            opticast(
-                &mut rasterizer,
-                pool,
-                &local_cam,
-                settings,
-                combined.vsid,
-                &combined.data,
-                &combined.column_offset,
-            )
+            opticast(&mut rasterizer, pool, &local_cam, settings, grid)
         };
         if outcome == OpticastOutcome::Rendered {
             grids_drawn += 1;
@@ -249,27 +239,18 @@ pub fn render_scene_composed(
         };
 
         let outcome = {
-            let mut rasterizer = ScalarRasterizer::new(
-                &mut temp_fb,
-                &mut temp_zb,
-                pitch_pixels,
+            let grid = roxlap_core::GridView::from_parts(
+                combined.vsid,
                 &combined.data,
                 &combined.column_offset,
                 &combined.mip_base_offsets,
-                combined.vsid,
             );
+            let mut rasterizer =
+                ScalarRasterizer::new(&mut temp_fb, &mut temp_zb, pitch_pixels, grid);
             if let Some(sky_ref) = sky {
                 rasterizer = rasterizer.with_sky(sky_ref);
             }
-            opticast(
-                &mut rasterizer,
-                pool,
-                &local_cam,
-                settings,
-                combined.vsid,
-                &combined.data,
-                &combined.column_offset,
-            )
+            opticast(&mut rasterizer, pool, &local_cam, settings, grid)
         };
         if outcome == OpticastOutcome::Rendered {
             compose_into(fb, zb, &temp_fb, &temp_zb);
@@ -374,23 +355,14 @@ mod tests {
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         let grid = scene.grids().next().unwrap().1;
         let chunk = grid.chunk(IVec3::ZERO).unwrap();
-        let mut rasterizer = ScalarRasterizer::new(
-            &mut fb,
-            &mut zb,
-            XRES as usize,
-            &chunk.data,
-            &chunk.column_offset,
-            &chunk.mip_base_offsets,
-            chunk.vsid,
-        );
+        let grid_view = roxlap_core::GridView::from_single_vxl(chunk);
+        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
         let _ = core_opticast(
             &mut rasterizer,
             &mut pool,
             local_camera,
             &settings,
-            chunk.vsid,
-            &chunk.data,
-            &chunk.column_offset,
+            grid_view,
         );
         drop(rasterizer);
         fb
@@ -815,24 +787,9 @@ mod tests {
         let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         settings.mip_levels = 3;
         settings.mip_scan_dist = 4;
-        let mut rasterizer = ScalarRasterizer::new(
-            &mut fb,
-            &mut zb,
-            XRES as usize,
-            &chunk.data,
-            &chunk.column_offset,
-            &chunk.mip_base_offsets,
-            chunk.vsid,
-        );
-        let _ = core_opticast(
-            &mut rasterizer,
-            &mut pool,
-            &camera,
-            &settings,
-            chunk.vsid,
-            &chunk.data,
-            &chunk.column_offset,
-        );
+        let grid_view = roxlap_core::GridView::from_single_vxl(&chunk);
+        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
+        let _ = core_opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
         drop(rasterizer);
         let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
         assert!(

@@ -81,24 +81,9 @@ fn outside_orbit_matches_golden() {
 
     let _cs = camera_math::derive(&cam, XRES, YRES, settings.hx, settings.hy, settings.hz);
 
-    let mut rasterizer = ScalarRasterizer::new(
-        &mut framebuffer,
-        &mut zbuffer,
-        pitch_pixels,
-        &vxl.data,
-        &vxl.column_offset,
-        &vxl.mip_base_offsets,
-        vxl.vsid,
-    );
-    let outcome = opticast(
-        &mut rasterizer,
-        &mut pool,
-        &cam,
-        &settings,
-        vxl.vsid,
-        &vxl.data,
-        &vxl.column_offset,
-    );
+    let grid = roxlap_core::GridView::from_single_vxl(&vxl);
+    let mut rasterizer = ScalarRasterizer::new(&mut framebuffer, &mut zbuffer, pitch_pixels, grid);
+    let outcome = opticast(&mut rasterizer, &mut pool, &cam, &settings, grid);
     drop(rasterizer);
 
     // S1.Z: outside-XY camera now goes through the standard

@@ -614,15 +614,9 @@ impl App {
         // Scope the rasterizer so its &mut buffer borrow ends before
         // we present the buffer.
         {
-            let rasterizer = ScalarRasterizer::new(
-                &mut buffer,
-                &mut self.zbuffer,
-                pitch_pixels,
-                &self.vxl.data,
-                &self.vxl.column_offset,
-                &self.vxl.mip_base_offsets,
-                self.vxl.vsid,
-            );
+            let grid = roxlap_core::GridView::from_single_vxl(&self.vxl);
+            let rasterizer =
+                ScalarRasterizer::new(&mut buffer, &mut self.zbuffer, pitch_pixels, grid);
             // Bind the sky if the engine has one — opts the
             // rasterizer into the textured-startsky path.
             let mut rasterizer = if let Some(sky) = self.engine.sky() {
@@ -630,15 +624,7 @@ impl App {
             } else {
                 rasterizer
             };
-            let _ = opticast(
-                &mut rasterizer,
-                &mut self.pool,
-                &cam,
-                &settings,
-                self.vxl.vsid,
-                &self.vxl.data,
-                &self.vxl.column_offset,
-            );
+            let _ = opticast(&mut rasterizer, &mut self.pool, &cam, &settings, grid);
         }
 
         // R6.4 sprite render: cull + setup + per-voxel rasterizer

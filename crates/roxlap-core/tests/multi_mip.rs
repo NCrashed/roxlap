@@ -96,24 +96,10 @@ fn render_and_hash(vxl: &vxl::Vxl, mip_levels: u32) -> u64 {
     };
 
     {
-        let mut rasterizer = ScalarRasterizer::new(
-            &mut framebuffer,
-            &mut zbuffer,
-            XRES as usize,
-            &vxl.data,
-            &vxl.column_offset,
-            &vxl.mip_base_offsets,
-            vxl.vsid,
-        );
-        let outcome = opticast(
-            &mut rasterizer,
-            &mut pool,
-            &cam,
-            &settings,
-            vxl.vsid,
-            &vxl.data,
-            &vxl.column_offset,
-        );
+        let grid = roxlap_core::GridView::from_single_vxl(&vxl);
+        let mut rasterizer =
+            ScalarRasterizer::new(&mut framebuffer, &mut zbuffer, XRES as usize, grid);
+        let outcome = opticast(&mut rasterizer, &mut pool, &cam, &settings, grid);
         assert_eq!(outcome, OpticastOutcome::Rendered);
     }
 

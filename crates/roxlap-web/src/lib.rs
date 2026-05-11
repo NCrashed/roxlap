@@ -180,24 +180,9 @@ fn render_frame(state: &mut State) {
 
     let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
     let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-    let mut rasterizer = ScalarRasterizer::new(
-        &mut state.fb,
-        &mut state.zb,
-        XRES as usize,
-        &state.world.data,
-        &state.world.column_offset,
-        &state.world.mip_base_offsets,
-        state.world.vsid,
-    );
-    let _ = opticast(
-        &mut rasterizer,
-        &mut state.pool,
-        &cam,
-        &settings,
-        state.world.vsid,
-        &state.world.data,
-        &state.world.column_offset,
-    );
+    let grid = roxlap_core::GridView::from_single_vxl(&state.world);
+    let mut rasterizer = ScalarRasterizer::new(&mut state.fb, &mut state.zb, XRES as usize, grid);
+    let _ = opticast(&mut rasterizer, &mut state.pool, &cam, &settings, grid);
 }
 
 // ----- WebGL blit -----------------------------------------------------------

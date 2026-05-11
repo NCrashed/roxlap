@@ -463,24 +463,10 @@ fn cmd_bench_sprites(n_sprites: u32, iters: usize, warmup: usize) -> std::io::Re
     framebuffer.fill(sky);
     zbuffer.fill(f32::INFINITY);
     {
-        let mut rasterizer = ScalarRasterizer::new(
-            &mut framebuffer,
-            &mut zbuffer,
-            pitch_pixels,
-            &vxl_world.data,
-            &vxl_world.column_offset,
-            &vxl_world.mip_base_offsets,
-            vxl_world.vsid,
-        );
-        let _ = opticast(
-            &mut rasterizer,
-            &mut pool,
-            &cam,
-            &settings,
-            vxl_world.vsid,
-            &vxl_world.data,
-            &vxl_world.column_offset,
-        );
+        let grid = roxlap_core::GridView::from_single_vxl(&vxl_world);
+        let mut rasterizer =
+            ScalarRasterizer::new(&mut framebuffer, &mut zbuffer, pitch_pixels, grid);
+        let _ = opticast(&mut rasterizer, &mut pool, &cam, &settings, grid);
     }
     // Snapshot the post-world fb / zb so each sprite-bench run
     // starts from the same state.
@@ -978,24 +964,10 @@ fn cmd_find_hairlines(capture_path: &str) -> std::io::Result<()> {
 
     let settings = OpticastSettings::for_oracle_framebuffer(hx, hy);
     {
-        let mut rasterizer = ScalarRasterizer::new(
-            &mut framebuffer,
-            &mut zbuffer,
-            hx as usize,
-            &vxl_world.data,
-            &vxl_world.column_offset,
-            &vxl_world.mip_base_offsets,
-            vxl_world.vsid,
-        );
-        let _ = opticast(
-            &mut rasterizer,
-            &mut pool,
-            &host_cam,
-            &settings,
-            vxl_world.vsid,
-            &vxl_world.data,
-            &vxl_world.column_offset,
-        );
+        let grid = roxlap_core::GridView::from_single_vxl(&vxl_world);
+        let mut rasterizer =
+            ScalarRasterizer::new(&mut framebuffer, &mut zbuffer, hx as usize, grid);
+        let _ = opticast(&mut rasterizer, &mut pool, &host_cam, &settings, grid);
     }
 
     // sky here = the sentinel green we set above; it's what
