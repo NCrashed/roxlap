@@ -12,14 +12,16 @@
 //! S4B.x sub-substages grow this into a multi-chunk view:
 //!
 //! * S4B.1 — carry the camera's chunk index alongside the borrow.
-//! * S4B.2.a (this file) — `chunk_size_xy` field + `chunk_at_xy`
-//!   method. Today's single-chunk callers set `chunk_size_xy =
-//!   vsid` and the lookup only succeeds for `[0, 0]`. The seam
-//!   exists for S4B.2.b's grouscan column-step swap.
+//! * S4B.2.a — `chunk_size_xy` field + `chunk_at_xy` method.
+//!   Today's single-chunk callers set `chunk_size_xy = vsid` and
+//!   the lookup only succeeds for `[0, 0]`.
 //! * S4B.2.b — grouscan column-step calls `chunk_at_xy` and swaps
 //!   active per-chunk `(slab_buf, column_offsets)` when `(cx, cy)`
-//!   crosses a chunk boundary.
-//! * S4B.2.c — new multi-chunk constructor (scene-side) + a 32×32
+//!   crosses a chunk boundary. Single-chunk goldens byte-identical.
+//! * S4B.2.c.1 (this file) — [`ChunkGrid`] backend so `chunk_at_xy`
+//!   can resolve real per-chunk borrows. Pure infrastructure; no
+//!   caller integration yet.
+//! * S4B.2.c.2 — scene-side multi-chunk constructor + 32×32
 //!   ground seam test.
 //! * S4B.3 — chunk-z extent + handoff for cross-chunk-Z rays.
 //!
@@ -65,6 +67,43 @@ pub struct GridView<'a> {
     /// `column_offsets.len()`. Single-mip callers pass
     /// `&[0, vsid² + 1]`.
     pub mip_base_offsets: &'a [usize],
+    /// S4B.2.c.1: chunk-grid backend. `None` for single-chunk views
+    /// (e.g. anything built via [`Self::from_single_vxl`] /
+    /// [`Self::from_parts`]) — [`Self::chunk_at_xy`] falls back to
+    /// the `Some(Self) for [0, 0]` behaviour. `Some(&...)` for
+    /// multi-chunk views built via [`Self::from_chunk_grid`] —
+    /// [`Self::chunk_at_xy`] consults the table.
+    pub chunk_grid: Option<&'a ChunkGrid<'a>>,
+}
+
+/// S4B.2.c.1: chunk-grid metadata for multi-chunk [`GridView`]
+/// lookups.
+///
+/// Stores a 2D table of optional per-chunk [`GridView`] borrows so
+/// [`GridView::chunk_at_xy`] can resolve an XY chunk index to the
+/// matching chunk's `(slab_buf, column_offsets, ...)` view. Empty
+/// table entries (`None`) signal "no chunk at that index" — the
+/// grouscan column-step treats them as fully-air (the chunk renders
+/// as sky / empty until the ray crosses into a populated chunk).
+///
+/// Sized to match the chunk grid's XY footprint:
+/// `chunks.len() == chunks_x * chunks_y`. Chunk at relative position
+/// `(dx, dy)` from `origin_chunk_xy` lives at index
+/// `dy * chunks_x + dx`. The per-chunk [`GridView`] entries should
+/// have `chunk_grid: None` (they describe individual chunks, not
+/// the parent grid).
+#[derive(Clone, Copy)]
+pub struct ChunkGrid<'a> {
+    /// Per-chunk views, row-major. Length `chunks_x * chunks_y`.
+    pub chunks: &'a [Option<GridView<'a>>],
+    /// XY index of the chunk at `chunks[0]`. Subsequent chunks lie
+    /// along `+x` (next in the row) then `+y` (next row).
+    pub origin_chunk_xy: [i32; 2],
+    /// Number of chunks along the X axis. Row stride in
+    /// [`Self::chunks`].
+    pub chunks_x: u32,
+    /// Number of chunks along the Y axis.
+    pub chunks_y: u32,
 }
 
 impl<'a> GridView<'a> {
@@ -88,6 +127,7 @@ impl<'a> GridView<'a> {
             slab_buf,
             column_offsets,
             mip_base_offsets,
+            chunk_grid: None,
         }
     }
 
@@ -103,6 +143,45 @@ impl<'a> GridView<'a> {
             slab_buf: &vxl.data,
             column_offsets: &vxl.column_offset,
             mip_base_offsets: &vxl.mip_base_offsets,
+            chunk_grid: None,
+        }
+    }
+
+    /// S4B.2.c.1: build a multi-chunk view from a [`ChunkGrid`].
+    ///
+    /// The returned [`GridView`]'s flat `(vsid, slab_buf,
+    /// column_offsets, mip_base_offsets)` fields are seeded from
+    /// the first populated chunk in the grid (so opticast's prelude
+    /// has a sensible default before its camera-chunk lookup
+    /// refreshes them). `chunk_size_xy` carries the caller-supplied
+    /// per-chunk dimension; [`Self::chunk_grid`] points at
+    /// `chunk_grid` so [`Self::chunk_at_xy`] resolves every
+    /// in-range index to its actual chunk borrow.
+    ///
+    /// Empty-grid case: if every chunk is `None`, the flat fields
+    /// fall back to empty slices and `vsid = chunk_size_xy`. The
+    /// grouscan column-step swap will see `chunk_at_xy → None` for
+    /// every index and render the whole grid as sky.
+    #[must_use]
+    pub fn from_chunk_grid(chunk_grid: &'a ChunkGrid<'a>, chunk_size_xy: u32) -> Self {
+        let default_chunk = chunk_grid.chunks.iter().find_map(|c| c.as_ref()).copied();
+        match default_chunk {
+            Some(c) => Self {
+                vsid: c.vsid,
+                chunk_size_xy,
+                slab_buf: c.slab_buf,
+                column_offsets: c.column_offsets,
+                mip_base_offsets: c.mip_base_offsets,
+                chunk_grid: Some(chunk_grid),
+            },
+            None => Self {
+                vsid: chunk_size_xy,
+                chunk_size_xy,
+                slab_buf: &[],
+                column_offsets: &[],
+                mip_base_offsets: &[],
+                chunk_grid: Some(chunk_grid),
+            },
         }
     }
 
@@ -119,21 +198,38 @@ impl<'a> GridView<'a> {
     /// S4B.2.a: chunk lookup for the cross-chunk-XY DDA.
     ///
     /// Returns the [`GridView`] for the chunk at XY index
-    /// `chunk_idx` if one exists, `None` otherwise. Today's single-
-    /// chunk callers store one chunk under index `[0, 0]`; any other
-    /// index returns `None` (the grouscan column-step swap will treat
-    /// that as an empty chunk, matching the OOB-XY behaviour the
-    /// existing 2D-DDA already produces for columns past
-    /// `[0, vsid)`).
+    /// `chunk_idx` if one exists, `None` otherwise. Routes by
+    /// [`Self::chunk_grid`]:
     ///
-    /// **Today's degenerate behaviour.** Because every single-chunk
-    /// caller has `chunk_size_xy == vsid`, the column-step swap in
-    /// `grouscan` never fires within `[0, vsid)` — the boundary is
-    /// at `cx = vsid`, which is already OOB. S4B.2.b wires the swap;
-    /// S4B.2.c lands the first caller with `chunk_size_xy < vsid`.
+    /// * `chunk_grid: Some(&cg)` — multi-chunk view. Resolves
+    ///   `chunk_idx` against `cg.origin_chunk_xy` /
+    ///   `cg.chunks_x` / `cg.chunks_y` and returns `cg.chunks[..]`
+    ///   at the matching slot (which may itself be `None` for
+    ///   empty chunks).
+    /// * `chunk_grid: None` — single-chunk view. Returns `Some(Self)`
+    ///   for `[0, 0]`, `None` for any other index. Matches today's
+    ///   single-chunk callers (every `from_single_vxl` /
+    ///   `from_parts` consumer).
+    ///
+    /// The grouscan column-step treats `None` as an empty chunk
+    /// (renders as sky / empty until the ray re-enters a populated
+    /// chunk).
     #[must_use]
     pub fn chunk_at_xy(&self, chunk_idx: [i32; 2]) -> Option<GridView<'a>> {
-        if chunk_idx == [0, 0] {
+        if let Some(cg) = self.chunk_grid {
+            let dx = chunk_idx[0] - cg.origin_chunk_xy[0];
+            let dy = chunk_idx[1] - cg.origin_chunk_xy[1];
+            if dx < 0 || dy < 0 {
+                return None;
+            }
+            #[allow(clippy::cast_sign_loss)]
+            let (dx, dy) = (dx as u32, dy as u32);
+            if dx >= cg.chunks_x || dy >= cg.chunks_y {
+                return None;
+            }
+            let i = dy as usize * cg.chunks_x as usize + dx as usize;
+            cg.chunks.get(i).copied().flatten()
+        } else if chunk_idx == [0, 0] {
             Some(*self)
         } else {
             None
@@ -201,5 +297,137 @@ mod tests {
         let gv = GridView::from_parts(2048, &[], &[], &mips).with_chunk_size_xy(128);
         assert_eq!(gv.vsid, 2048);
         assert_eq!(gv.chunk_size_xy, 128);
+    }
+
+    /// S4B.2.c.1: tiny 2-chunk-x-stripe ChunkGrid scaffolding for
+    /// the multi-chunk lookup tests. Two synthetic 1×1 chunks at
+    /// XY indices [0, 0] and [1, 0]. Their slab/column data is
+    /// distinct so the lookup tests can tell them apart.
+    fn build_two_chunk_x_stripe() -> ([u8; 4], [u8; 4], [u32; 2], [u32; 2], [usize; 2], [usize; 2])
+    {
+        let slab_a = [10u8, 200, 254, 0];
+        let slab_b = [20u8, 200, 254, 0];
+        let cols_a = [0u32, 4];
+        let cols_b = [0u32, 4];
+        let mips_a = [0usize, 2];
+        let mips_b = [0usize, 2];
+        (slab_a, slab_b, cols_a, cols_b, mips_a, mips_b)
+    }
+
+    #[test]
+    fn chunk_at_xy_via_chunk_grid_returns_in_range_chunks() {
+        let (slab_a, slab_b, cols_a, cols_b, mips_a, mips_b) = build_two_chunk_x_stripe();
+        let chunks = [
+            Some(GridView::from_parts(64, &slab_a, &cols_a, &mips_a)),
+            Some(GridView::from_parts(64, &slab_b, &cols_b, &mips_b)),
+        ];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            chunks_x: 2,
+            chunks_y: 1,
+        };
+        let gv = GridView::from_chunk_grid(&cg, 64);
+        // [0, 0] resolves to chunk A.
+        let c0 = gv.chunk_at_xy([0, 0]).expect("chunk [0, 0] present");
+        assert_eq!(c0.slab_buf, &slab_a[..]);
+        // [1, 0] resolves to chunk B.
+        let c1 = gv.chunk_at_xy([1, 0]).expect("chunk [1, 0] present");
+        assert_eq!(c1.slab_buf, &slab_b[..]);
+        // [0, 0] and [1, 0] carry distinct slab buffers.
+        assert_ne!(c0.slab_buf, c1.slab_buf);
+    }
+
+    #[test]
+    fn chunk_at_xy_via_chunk_grid_returns_none_out_of_range() {
+        let (slab_a, _, cols_a, _, mips_a, _) = build_two_chunk_x_stripe();
+        let chunks = [
+            Some(GridView::from_parts(64, &slab_a, &cols_a, &mips_a)),
+            None,
+        ];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            chunks_x: 2,
+            chunks_y: 1,
+        };
+        let gv = GridView::from_chunk_grid(&cg, 64);
+        // [-1, 0] is below origin.
+        assert!(gv.chunk_at_xy([-1, 0]).is_none());
+        // [0, -1] is below origin (y).
+        assert!(gv.chunk_at_xy([0, -1]).is_none());
+        // [2, 0] is past chunks_x.
+        assert!(gv.chunk_at_xy([2, 0]).is_none());
+        // [0, 1] is past chunks_y.
+        assert!(gv.chunk_at_xy([0, 1]).is_none());
+        // [1, 0] is an empty slot inside the grid.
+        assert!(gv.chunk_at_xy([1, 0]).is_none());
+    }
+
+    #[test]
+    fn chunk_at_xy_handles_negative_origin() {
+        let (slab_a, slab_b, cols_a, cols_b, mips_a, mips_b) = build_two_chunk_x_stripe();
+        // Origin at [-1, 0]: chunks live at XY indices [-1, 0] and [0, 0].
+        let chunks = [
+            Some(GridView::from_parts(64, &slab_a, &cols_a, &mips_a)),
+            Some(GridView::from_parts(64, &slab_b, &cols_b, &mips_b)),
+        ];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [-1, 0],
+            chunks_x: 2,
+            chunks_y: 1,
+        };
+        let gv = GridView::from_chunk_grid(&cg, 64);
+        let cm1 = gv.chunk_at_xy([-1, 0]).expect("chunk [-1, 0] present");
+        assert_eq!(cm1.slab_buf, &slab_a[..]);
+        let c0 = gv.chunk_at_xy([0, 0]).expect("chunk [0, 0] present");
+        assert_eq!(c0.slab_buf, &slab_b[..]);
+        // Past the right edge.
+        assert!(gv.chunk_at_xy([1, 0]).is_none());
+        // Past the left edge.
+        assert!(gv.chunk_at_xy([-2, 0]).is_none());
+    }
+
+    #[test]
+    fn from_chunk_grid_seeds_flat_fields_from_first_populated_chunk() {
+        let (slab_a, slab_b, cols_a, cols_b, mips_a, mips_b) = build_two_chunk_x_stripe();
+        // First slot empty, second populated. Flat fields should
+        // seed from chunk B.
+        let chunks = [
+            None,
+            Some(GridView::from_parts(64, &slab_b, &cols_b, &mips_b)),
+        ];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            chunks_x: 2,
+            chunks_y: 1,
+        };
+        let gv = GridView::from_chunk_grid(&cg, 64);
+        assert_eq!(gv.slab_buf, &slab_b[..]);
+        assert_eq!(gv.chunk_size_xy, 64);
+        // Single-chunk fields stay populated; tests beyond rely on
+        // opticast's prelude refreshing them via the camera lookup.
+        let _ = (slab_a, cols_a, mips_a);
+    }
+
+    #[test]
+    fn from_chunk_grid_empty_table_falls_back_to_empty_slices() {
+        let chunks: [Option<GridView<'_>>; 1] = [None];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            chunks_x: 1,
+            chunks_y: 1,
+        };
+        let gv = GridView::from_chunk_grid(&cg, 128);
+        assert!(gv.slab_buf.is_empty());
+        assert!(gv.column_offsets.is_empty());
+        assert!(gv.mip_base_offsets.is_empty());
+        assert_eq!(gv.vsid, 128);
+        assert_eq!(gv.chunk_size_xy, 128);
+        // The chunk_grid backend still gates chunk_at_xy.
+        assert!(gv.chunk_at_xy([0, 0]).is_none());
     }
 }

@@ -35,6 +35,6 @@ pub mod world_query;
 
 pub use camera::Camera;
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
-pub use grid_view::GridView;
+pub use grid_view::{ChunkGrid, GridView};
 pub use opticast::{opticast, OpticastOutcome, OpticastSettings};
 pub use world_lighting::update_lighting;
