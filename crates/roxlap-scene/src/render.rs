@@ -899,4 +899,105 @@ mod tests {
     /// [`render_scene_two_chunk_x_grid_hash_is_stable`]. Replace
     /// `GOLDEN`'s definition with the printed value once captured.
     const SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+
+    /// S4B.2.c.3: render a 2-chunk x-stripe scene via Approach B
+    /// (multi-chunk GridView + direct opticast). Validates the full
+    /// chain — `Grid::chunk_xy_backing` → `ChunkGrid` →
+    /// `GridView::from_chunk_grid` → opticast prelude
+    /// `recompute_camera_chunk` → `camera_chunk_air_gap` lookup →
+    /// gline's chunk-aware seed → grouscan's chunk-swap column-step.
+    ///
+    /// Geometry: a floor in chunk (0, 0) at grid-local
+    /// `(0..127, 0..127, 200..205)` plus a recognisable box in
+    /// chunk (1, 0) at `(160..170, 50..60, 150..165)`. Camera in
+    /// chunk (0, 0) looking +x so rays cross into chunk (1, 0) and
+    /// must trigger the cross-chunk DDA. (Camera in chunk (1, 0) is
+    /// blocked by the in_bounds_xy check that still uses the per-
+    /// chunk vsid; full grid-AABB in_bounds gets revisited later.)
+    ///
+    /// Hash-pinned. Non-sky pixel count is the primary correctness
+    /// signal — if the cross-chunk DDA were broken, only the floor
+    /// in chunk (0, 0) would render.
+    #[test]
+    fn approach_b_renders_two_chunk_x_stripe_via_chunk_grid() {
+        const SENTINEL_B: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+        // Frozen 2026-05-11 on x86_64 — Approach B's first
+        // multi-chunk render (S4B.2.c.3). Refreeze when changing
+        // the rasterizer; the cross-chunk DDA stays validated by
+        // the `floor_count` + `box_count` assertions above.
+        const GOLDEN_B: u64 = 0x5ee1_e81c_66a8_d1f1;
+
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        // Floor across chunk (0, 0) so rays looking +x always have
+        // a hit before they exit the grid AABB.
+        g.set_rect(
+            IVec3::new(0, 0, 200),
+            IVec3::new(127, 127, 205),
+            Some(0x80_44_44_aa),
+        );
+        // Recognisable box deep in chunk (1, 0) — only visible if
+        // the cross-chunk DDA fires.
+        g.set_rect(
+            IVec3::new(160, 50, 150),
+            IVec3::new(170, 60, 165),
+            Some(0x80_aa_55_22),
+        );
+        assert_eq!(g.chunk_count(), 2);
+
+        // Build the multi-chunk GridView.
+        let backing = g.chunk_xy_backing().expect("at least one chunk populated");
+        assert_eq!(backing.chunks_x, 2);
+        assert_eq!(backing.chunks_y, 1);
+        assert_eq!(backing.origin_chunk_xy, [0, 0]);
+        let cg = roxlap_core::ChunkGrid {
+            chunks: &backing.chunks,
+            origin_chunk_xy: backing.origin_chunk_xy,
+            chunks_x: backing.chunks_x,
+            chunks_y: backing.chunks_y,
+        };
+        let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
+
+        // Camera in chunk (0, 0) looking +x toward chunk (1, 0).
+        // Voxlap z-down basis: right × down == forward.
+        let camera = Camera {
+            pos: [10.0, 64.0, 160.0],
+            right: [0.0, 1.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [1.0, 0.0, 0.0],
+        };
+        let (_engine, mut pool, mut fb, mut zb) = render_setup(2 * CHUNK_SIZE_XY);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
+        let outcome = core_opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
+        drop(rasterizer);
+        assert_eq!(outcome, OpticastOutcome::Rendered);
+
+        // Hits BOTH the floor (chunk 0, 0) AND the box (chunk 1, 0).
+        let floor_count = fb.iter().filter(|&&p| p == 0x80_44_44_aa).count();
+        let box_count = fb.iter().filter(|&&p| p == 0x80_aa_55_22).count();
+        assert!(
+            floor_count > 1000,
+            "floor not visible — only {floor_count} floor pixels (single-chunk path?)"
+        );
+        assert!(
+            box_count > 50,
+            "box in chunk (1, 0) not visible — only {box_count} box pixels — cross-chunk DDA may have failed to fire"
+        );
+
+        // Hash-pin the output. Refreeze when changing the rasterizer.
+        let bytes: Vec<u8> = fb.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        let hash = fnv1a64(&bytes);
+        if GOLDEN_B == SENTINEL_B {
+            eprintln!("approach_b_renders_two_chunk_x_stripe_via_chunk_grid: capture hash = 0x{hash:016x}");
+            panic!(
+                "GOLDEN_B is the SENTINEL placeholder — paste 0x{hash:016x} into GOLDEN_B above"
+            );
+        }
+        assert_eq!(
+            hash, GOLDEN_B,
+            "Approach B 2-chunk render hash drifted: expected 0x{GOLDEN_B:016x}, got 0x{hash:016x}"
+        );
+    }
 }

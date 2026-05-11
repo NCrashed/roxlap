@@ -118,6 +118,100 @@ impl Grid {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// S4B.2.c.3: build a per-chunk [`roxlap_core::GridView`] table
+    /// over this grid's XY chunk footprint at `chz = 0`.
+    ///
+    /// Returns `None` if no chz=0 chunk is populated (the entire
+    /// grid would render as implicit air anyway).
+    ///
+    /// Iterates `chunks` once to find the chx/chy bounding box,
+    /// then a second time to fill the row-major
+    /// `Vec<Option<GridView<'_>>>`. Empty XY slots (implicit-air
+    /// chunks inside the box) get `None`.
+    ///
+    /// Pair with [`roxlap_core::ChunkGrid`] + [`roxlap_core::
+    /// GridView::from_chunk_grid`] to drive the Approach B render
+    /// path:
+    ///
+    /// ```ignore
+    /// let backing = grid.chunk_xy_backing().unwrap();
+    /// let cg = roxlap_core::ChunkGrid {
+    ///     chunks: &backing.chunks,
+    ///     origin_chunk_xy: backing.origin_chunk_xy,
+    ///     chunks_x: backing.chunks_x,
+    ///     chunks_y: backing.chunks_y,
+    /// };
+    /// let view = roxlap_core::GridView::from_chunk_grid(
+    ///     &cg, crate::CHUNK_SIZE_XY,
+    /// );
+    /// ```
+    ///
+    /// Only chz=0 chunks contribute (multi-z handoff lands in
+    /// S4B.3); higher-chz chunks in [`Self::chunks`] are ignored
+    /// here.
+    #[must_use]
+    pub fn chunk_xy_backing(&self) -> Option<ChunkXyBacking<'_>> {
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut any = false;
+        for chunk_idx in self.chunks.keys() {
+            if chunk_idx.z != 0 {
+                continue;
+            }
+            min_x = min_x.min(chunk_idx.x);
+            min_y = min_y.min(chunk_idx.y);
+            max_x = max_x.max(chunk_idx.x);
+            max_y = max_y.max(chunk_idx.y);
+            any = true;
+        }
+        if !any {
+            return None;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let chunks_x = (max_x - min_x + 1) as u32;
+        #[allow(clippy::cast_sign_loss)]
+        let chunks_y = (max_y - min_y + 1) as u32;
+        let mut table: Vec<Option<roxlap_core::GridView<'_>>> =
+            vec![None; (chunks_x * chunks_y) as usize];
+        for (chunk_idx, vxl) in &self.chunks {
+            if chunk_idx.z != 0 {
+                continue;
+            }
+            let dx = chunk_idx.x - min_x;
+            let dy = chunk_idx.y - min_y;
+            #[allow(clippy::cast_sign_loss)]
+            let i = (dy as u32 * chunks_x + dx as u32) as usize;
+            table[i] = Some(roxlap_core::GridView::from_single_vxl(vxl));
+        }
+        Some(ChunkXyBacking {
+            chunks: table,
+            origin_chunk_xy: [min_x, min_y],
+            chunks_x,
+            chunks_y,
+        })
+    }
+}
+
+/// S4B.2.c.3: chx/chy chunk table built from a [`Grid`].
+///
+/// Owns the `Vec<Option<GridView>>` so [`roxlap_core::ChunkGrid`]
+/// (which borrows the table) can live alongside the GridView
+/// constructed from it. Used by the Approach B render path —
+/// see [`Grid::chunk_xy_backing`].
+pub struct ChunkXyBacking<'a> {
+    /// Per-chunk views row-major over the chx/chy bounding box.
+    /// Length `chunks_x * chunks_y`; `None` for implicit-air chunks.
+    pub chunks: Vec<Option<roxlap_core::GridView<'a>>>,
+    /// XY index of the chunk at `chunks[0]` — the minimum chx/chy
+    /// among populated chunks at `chz = 0`.
+    pub origin_chunk_xy: [i32; 2],
+    /// Number of chunks along the X axis. Row stride.
+    pub chunks_x: u32,
+    /// Number of chunks along the Y axis.
+    pub chunks_y: u32,
 }
 
 #[cfg(test)]

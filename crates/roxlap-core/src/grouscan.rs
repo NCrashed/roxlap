@@ -1304,14 +1304,16 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     }
 
     // S4B.2.b: chunk-XY boundary detection + swap. Two code paths
-    // routed by `chunk_size_xy == vsid`:
+    // routed by `grid_view.chunk_grid.is_none()`:
     //
-    // - **Single-chunk fast path** (today's only callers,
-    //   `chunk_size_xy == vsid`). The world-edge OOB check IS the
-    //   chunk boundary, so the chunk-swap is purely additive
-    //   overhead — skip it. Refresh state.column via the pre-S4B.2.b
-    //   flat lookup, byte-identical to the goldens.
-    // - **Multi-chunk path** (S4B.2.c+, `chunk_size_xy < vsid`).
+    // - **Single-chunk fast path** (`chunk_grid: None` — every
+    //   `from_single_vxl` / `from_parts` caller). The world-edge
+    //   OOB check IS the chunk boundary, so the chunk-swap is
+    //   purely additive overhead — skip it. Refresh state.column
+    //   via the pre-S4B.2.b flat lookup, byte-identical to the
+    //   goldens.
+    // - **Multi-chunk path** (`chunk_grid: Some(&...)` — Approach B
+    //   callers via `GridView::from_chunk_grid`).
     //   `cx.div_euclid(chunk_size_xy)` yields the chunk index; on
     //   boundary crossings `chunk_at_xy` swaps the active per-chunk
     //   `(slab_buf, column_offsets, mip_base_offsets, vsid)`. Empty
@@ -1319,10 +1321,14 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     //   previous chunk and mark `current_chunk_exists = false` so
     //   the column refresh resolves to `&[]`.
     //
-    // The branch is on a value that's constant per gline call (the
-    // grid's chunk_size_xy doesn't change mid-ray) so the predictor
-    // memoises it for free.
-    if state.chunk_size_xy == state.vsid {
+    // S4B.2.b used `chunk_size_xy == vsid` as the gate; that's
+    // wrong for multi-chunk callers where the per-chunk vsid
+    // equals chunk_size_xy and the gate routes them onto the
+    // single-chunk path. `chunk_grid.is_none()` is unambiguous.
+    //
+    // The branch is on a value constant per gline call (the grid
+    // shape doesn't change mid-ray) so the predictor memoises it.
+    if state.grid_view.chunk_grid.is_none() {
         // Single-chunk: pre-S4B.2.b column refresh, unchanged.
         let in_bounds = state.cx >= 0
             && state.cy >= 0

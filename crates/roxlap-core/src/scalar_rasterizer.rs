@@ -520,13 +520,38 @@ impl Rasterizer for ScalarRasterizer<'_> {
         //    cap → "infinitely far" sky depth). startsky's solid-
         //    fill writes this into every drained radar slot's
         //    `dist`, which the z-buffer ends up carrying.
+        //
+        // S4B.2.c.3: the world-edge clip is per-axis voxel-distance
+        // from `li_pos` to the grid's AABB edge along the ray's
+        // step direction. Single-chunk grids (`chunk_grid: None`)
+        // have AABB = `[0, vsid)²`, byte-identical to today. Multi-
+        // chunk grids derive AABB from `chunk_grid.origin_chunk_xy +
+        // chunks_x/y * chunk_size_xy` so rays can walk across all
+        // chunks before hitting the world edge.
         let mut gxmax = cache.prelude.max_scan_dist;
         scratch.skycast.dist = gxmax;
-        let vsid_signed = self.grid.vsid as i32;
+        let (world_xmin, world_xmax, world_ymin, world_ymax) =
+            if let Some(cg) = self.grid.chunk_grid {
+                #[allow(clippy::cast_possible_wrap)]
+                let chunk_size = self.grid.chunk_size_xy as i32;
+                #[allow(clippy::cast_possible_wrap)]
+                let chunks_x = cg.chunks_x as i32;
+                #[allow(clippy::cast_possible_wrap)]
+                let chunks_y = cg.chunks_y as i32;
+                let xmin = cg.origin_chunk_xy[0] * chunk_size;
+                let xmax = xmin + chunks_x * chunk_size;
+                let ymin = cg.origin_chunk_xy[1] * chunk_size;
+                let ymax = ymin + chunks_y * chunk_size;
+                (xmin, xmax, ymin, ymax)
+            } else {
+                #[allow(clippy::cast_possible_wrap)]
+                let vsid_signed = self.grid.vsid as i32;
+                (0, vsid_signed, 0, vsid_signed)
+            };
         let j0 = if f.gixy[0] < 0 {
-            li_pos_xy[0]
+            li_pos_xy[0] - world_xmin
         } else {
-            vsid_signed - 1 - li_pos_xy[0]
+            world_xmax - 1 - li_pos_xy[0]
         };
         let q0 = (i64::from(f.gdz[0]).wrapping_mul(i64::from(j0)))
             .wrapping_add(i64::from(f.gpz[0] as u32));
@@ -535,9 +560,9 @@ impl Rasterizer for ScalarRasterizer<'_> {
             scratch.skycast.dist = i32::MAX;
         }
         let j1 = if f.gixy[1] < 0 {
-            li_pos_xy[1]
+            li_pos_xy[1] - world_ymin
         } else {
-            vsid_signed - 1 - li_pos_xy[1]
+            world_ymax - 1 - li_pos_xy[1]
         };
         let q1 = (i64::from(f.gdz[1]).wrapping_mul(i64::from(j1)))
             .wrapping_add(i64::from(f.gpz[1] as u32));
