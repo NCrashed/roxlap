@@ -14,20 +14,21 @@
 //!   overwrite grid A's hits). Useful for tests / single-grid
 //!   sanity checks.
 //!
-//! ## S4.0: Approach C combined-world stitch
+//! ## S4B.2.e: Approach B multi-chunk dispatch
 //!
 //! Both APIs route per-grid rendering through
-//! [`crate::Grid::combined_world`] — the per-grid combined virtual
-//! world covers every populated chunk in the grid's XY footprint
-//! and is rendered as a single opticast pass. The 2D-DDA inside
-//! [`roxlap_core::grouscan`] already walks across an arbitrary
-//! `vsid × vsid` lattice, so cross-chunk seams collapse into normal
-//! column steps. Empty chunks contribute all-air placeholder
-//! columns.
+//! [`crate::Grid::chunk_xy_backing`] → [`roxlap_core::ChunkGrid`] →
+//! [`roxlap_core::GridView::from_chunk_grid`] → [`opticast`].
+//! `opticast`'s prelude looks up the camera's chunk via
+//! [`roxlap_core::GridView::chunk_at_xy`]; the grouscan column-step
+//! swaps the active per-chunk `(slab_buf, column_offsets)` when
+//! rays cross a chunk-XY boundary. The combined-world stitch
+//! (Approach C, S4.0..S4.2) is no longer in the render path — the
+//! lighting bake still uses it until S4B.4 lands a per-chunk bake.
 //!
 //! Per-grid rotation (S5) and per-grid LOD (S6) plug in at the
 //! same dispatch point: rotate the world camera into grid-local
-//! before the combined-view lookup, then dispatch coarse / fine /
+//! before the chunk-grid lookup, then dispatch coarse / fine /
 //! billboard based on grid-camera distance.
 
 // `fb` / `zb` (framebuffer / zbuffer) and the `_fb` / `_zb` suffixes
@@ -41,7 +42,7 @@ use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
 
-use crate::Scene;
+use crate::{Scene, CHUNK_SIZE_XY};
 
 /// Outcome of a [`render_scene`] / [`render_scene_composed`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,35 +93,39 @@ pub fn render_scene(
 
     let mut grids_drawn = 0usize;
     for (_id, grid) in scene.grids_mut() {
+        // S4B.2.e: Approach B render path. World → grid-local
+        // camera transform doesn't need a voxel-offset adjustment
+        // anymore — Approach B's chunks live at their signed
+        // (chx, chy) indices and `chunk_at_xy` handles negative-
+        // index lookups natively.
         let grid_origin = grid.transform.origin;
-        let combined = grid.combined_world();
-        let offset = combined.voxel_offset();
-        // World → grid-local → virtual: subtract grid origin, then
-        // add the combined view's voxel offset so negative-index
-        // chunks (origin_chunk.x/y < 0) map to virtual coords in
-        // [0, vsid).
+        let Some(backing) = grid.chunk_xy_backing() else {
+            // Empty grid (no populated chz=0 chunks) — skip.
+            continue;
+        };
         let local_cam = Camera {
             pos: [
-                camera.pos[0] - grid_origin.x + f64::from(offset.x),
-                camera.pos[1] - grid_origin.y + f64::from(offset.y),
+                camera.pos[0] - grid_origin.x,
+                camera.pos[1] - grid_origin.y,
                 camera.pos[2] - grid_origin.z,
             ],
             right: camera.right,
             down: camera.down,
             forward: camera.forward,
         };
+        let cg = roxlap_core::ChunkGrid {
+            chunks: &backing.chunks,
+            origin_chunk_xy: backing.origin_chunk_xy,
+            chunks_x: backing.chunks_x,
+            chunks_y: backing.chunks_y,
+        };
+        let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
         let outcome = {
-            let grid = roxlap_core::GridView::from_parts(
-                combined.vsid,
-                &combined.data,
-                &combined.column_offset,
-                &combined.mip_base_offsets,
-            );
-            let mut rasterizer = ScalarRasterizer::new(fb, zb, pitch_pixels, grid);
+            let mut rasterizer = ScalarRasterizer::new(fb, zb, pitch_pixels, grid_view);
             if let Some(sky_ref) = sky {
                 rasterizer = rasterizer.with_sky(sky_ref);
             }
-            opticast(&mut rasterizer, pool, &local_cam, settings, grid)
+            opticast(&mut rasterizer, pool, &local_cam, settings, grid_view)
         };
         if outcome == OpticastOutcome::Rendered {
             grids_drawn += 1;
@@ -221,36 +226,39 @@ pub fn render_scene_composed(
         temp_fb.fill(sky_color);
         temp_zb.fill(f32::INFINITY);
 
+        // S4B.2.e: Approach B render path. See `render_scene`'s
+        // body for the camera transform + ChunkGrid construction
+        // commentary; the only difference is this writes to
+        // (temp_fb, temp_zb) and composes via `compose_into`.
         let grid_origin = grid.transform.origin;
-        let combined = grid.combined_world();
-        let offset = combined.voxel_offset();
-        // World → grid-local → virtual: subtract grid origin, then
-        // add the combined view's voxel offset so negative-index
-        // chunks map into the virtual-coord range opticast expects.
+        let Some(backing) = grid.chunk_xy_backing() else {
+            continue;
+        };
         let local_cam = Camera {
             pos: [
-                camera.pos[0] - grid_origin.x + f64::from(offset.x),
-                camera.pos[1] - grid_origin.y + f64::from(offset.y),
+                camera.pos[0] - grid_origin.x,
+                camera.pos[1] - grid_origin.y,
                 camera.pos[2] - grid_origin.z,
             ],
             right: camera.right,
             down: camera.down,
             forward: camera.forward,
         };
+        let cg = roxlap_core::ChunkGrid {
+            chunks: &backing.chunks,
+            origin_chunk_xy: backing.origin_chunk_xy,
+            chunks_x: backing.chunks_x,
+            chunks_y: backing.chunks_y,
+        };
+        let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
 
         let outcome = {
-            let grid = roxlap_core::GridView::from_parts(
-                combined.vsid,
-                &combined.data,
-                &combined.column_offset,
-                &combined.mip_base_offsets,
-            );
             let mut rasterizer =
-                ScalarRasterizer::new(&mut temp_fb, &mut temp_zb, pitch_pixels, grid);
+                ScalarRasterizer::new(&mut temp_fb, &mut temp_zb, pitch_pixels, grid_view);
             if let Some(sky_ref) = sky {
                 rasterizer = rasterizer.with_sky(sky_ref);
             }
-            opticast(&mut rasterizer, pool, &local_cam, settings, grid)
+            opticast(&mut rasterizer, pool, &local_cam, settings, grid_view)
         };
         if outcome == OpticastOutcome::Rendered {
             compose_into(fb, zb, &temp_fb, &temp_zb);
