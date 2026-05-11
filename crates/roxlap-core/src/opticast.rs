@@ -201,50 +201,31 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         settings.max_scan_dist,
     );
 
-    // S1.Z: outside-XY camera path. When the camera sits past
-    // [0, vsid)² in X or Y, `prelude.column_index` is wrapped junk
-    // (`li_pos.y * vsid + li_pos.x` with `as u32` cast aliases
-    // negative values to large in-range integers). For the cf-seed
-    // bounds, query the air gap of a REPRESENTATIVE in-bounds
-    // column (nearest to the camera, clamped into [0, vsid)²) at
-    // the camera's z. drawflor dispatches on cf.z1 (= the floor's
-    // top z); a constant `(0, 255)` synthesis would project the
-    // floor at the wrong screen row and the below-floor pixels
-    // would never get sky-filled by Startsky.
+    // S4B.1: `column_walk::camera_chunk_air_gap` now owns both
+    // branches (in-bounds column lookup + OOB-XY bedrock seed
+    // synthesis). Single-chunk grids run the existing column walk
+    // unchanged; S4B.2 grows the wrapper into a real chunk-grid
+    // lookup without touching this call site.
+    //
+    // OOB rationale (kept here for the read-the-call-site reader):
+    // when the camera sits past `[0, vsid)²` in X or Y, the
+    // synthesised air gap from any representative in-bounds column
+    // would create a fake floor at that column's surface_z — the
+    // renderer paints it as a chunk-edge streak when rays graze
+    // the silhouette. The wrapper returns the bedrock placeholder
+    // `(0, 255, 0)` instead; with `treat_z_max_as_air = true` the
+    // renderer treats it as sky-passable so no false-floor pixels
+    // appear (see `project_oob_xy_chunk_edge_streaking.md`).
     //
     // The column-walk DDA still traverses OOB columns as empty
-    // until (cx, cy) cross into the world — handled per-step in
+    // until `(cx, cy)` cross into the world — handled per-step in
     // grouscan.rs's `phase_after_delete_kept_presync`.
-    //
-    // For inside-XY camera, the original gstartv walk runs as
-    // before; the negative-index path is a no-op.
     let treat_z_max_as_air = pool.slot(0).treat_z_max_as_air;
-    let (gstartz0, gstartz1, camera_vptr_offset) = if prelude.in_bounds_xy {
-        let camera_column =
-            camera_column_slice(grid.slab_buf, grid.column_offsets, prelude.column_index);
-        let Some(camera_column_data) = camera_column else {
-            return OpticastOutcome::SkippedCameraInSolid;
-        };
-        match column_walk::camera_column_air_gap(
-            camera_column_data,
-            prelude.li_pos[2],
-            treat_z_max_as_air,
-        ) {
+    let (gstartz0, gstartz1, camera_vptr_offset) =
+        match column_walk::camera_chunk_air_gap(grid, &prelude, treat_z_max_as_air) {
             Some(triple) => triple,
             None => return OpticastOutcome::SkippedCameraInSolid,
-        }
-    } else {
-        // OOB-XY camera is not physically inside any column. The
-        // synthesised air gap from a representative column is
-        // **incorrect** — it creates a fake floor at the
-        // representative column's surface_z, which the renderer
-        // paints as a chunk-edge streak when rays graze the
-        // chunk's silhouette. Always use the bedrock placeholder
-        // (z=MAXZDIM-1) as the synthesized floor; with
-        // `treat_z_max_as_air = true` the renderer treats it as
-        // sky-passable, so no false-floor pixels appear.
-        (0, 255, 0)
-    };
+        };
 
     // Per-frame setup hook needs a `ScanContext` with cy / camera
     // state populated; build a "setup-only" projection over the

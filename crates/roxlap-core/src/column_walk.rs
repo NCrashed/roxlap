@@ -2,6 +2,20 @@
 //! air gap contains the camera. Port of the `gstartv` walk in
 //! `voxlaptest`'s `opticast` (`voxlap5.c:2314..2325`).
 //!
+//! Two entry points, layered:
+//!
+//! - [`camera_column_air_gap`] — operates on a raw column byte slice.
+//!   Bit-stable since R4.3a-rewire-3; covered by the goldens.
+//! - [`camera_chunk_air_gap`] (S4B.1) — chunk-aware wrapper: takes a
+//!   [`crate::grid_view::GridView`] + the [`crate::opticast_prelude::
+//!   OpticastPrelude`] and finds the air gap inside the chunk the
+//!   camera sits in, OR synthesises the OOB-XY bedrock seed when the
+//!   camera is past the grid's AABB. Today's single-chunk grids
+//!   degenerate this to `camera_column_air_gap` over the flat
+//!   `column_offsets` table; the seam exists so S4B.2's
+//!   cross-chunk-XY DDA can grow the chunk lookup without touching
+//!   opticast.
+//!
 //! Voxlap stores each map column as a chain of slab records (see
 //! `roxlap-formats::vxl`):
 //!
@@ -110,6 +124,54 @@ pub fn camera_column_air_gap(
     }
 }
 
+/// Chunk-aware variant of [`camera_column_air_gap`]. Given the
+/// per-frame grid view and the prelude's chunk-local camera info,
+/// find the air gap inside the column the camera sits in (or
+/// synthesise an air seed when the camera is past the grid's AABB).
+///
+/// Returns the same `(gstartz0, gstartz1, camera_vptr_offset)`
+/// triple opticast wants from `camera_column_air_gap`. Returns
+/// `None` only when the camera is inside solid voxel material —
+/// OOB-XY cameras are treated as "in air outside the grid" and
+/// return the bedrock placeholder seed `(0, 255, 0)` (matching
+/// the S1.Z behaviour previously inlined into `opticast`).
+///
+/// Today, the single-chunk grid path goes:
+/// 1. `prelude.in_bounds_xy` is true → look up the column at
+///    `column_index` in the flat `vsid × vsid` table and walk it.
+/// 2. `prelude.in_bounds_xy` is false → return the OOB seed.
+///
+/// S4B.2 will rewire (1) onto `grid.chunk_at_xy(chunk_idx)` and
+/// use `local_xyz` for the in-chunk column lookup; the signature
+/// stays.
+#[must_use]
+pub fn camera_chunk_air_gap(
+    grid: crate::grid_view::GridView<'_>,
+    prelude: &crate::opticast_prelude::OpticastPrelude,
+    treat_z_max_as_air: bool,
+) -> Option<(i32, i32, usize)> {
+    if !prelude.in_bounds_xy {
+        // OOB-XY camera is not physically inside any column of the
+        // grid. Synthesise the bedrock placeholder seed so the
+        // renderer doesn't paint a false floor along the grid's
+        // silhouette (see `project_oob_xy_chunk_edge_streaking.md`).
+        // `treat_z_max_as_air = true` makes the bedrock transparent.
+        return Some((0, 255, 0));
+    }
+
+    // S4B.1 scaffold: today's GridView is a single chunk so
+    // `prelude.column_index` directly indexes the flat
+    // `column_offsets[vsid × vsid + 1]` table. S4B.2 replaces this
+    // with `grid.chunk_at_xy(prelude.camera_chunk_idx).column_at(
+    // prelude.camera_local_xyz)`.
+    let column = crate::opticast::camera_column_slice(
+        grid.slab_buf,
+        grid.column_offsets,
+        prelude.column_index,
+    )?;
+    camera_column_air_gap(column, prelude.li_pos[2], treat_z_max_as_air)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +277,102 @@ mod tests {
         let col = vec![99, 10, 14, 0];
         // cz = 100 forces walk-forward; nextptr advances past EOF.
         assert_eq!(camera_column_air_gap(&col, 100, false), None);
+    }
+
+    /// S4B.1: camera_chunk_air_gap with a single-chunk GridView
+    /// matches camera_column_air_gap on the column the prelude's
+    /// `column_index` points at. Validates the degenerate path —
+    /// today's only path — so the goldens stay byte-identical.
+    #[test]
+    fn camera_chunk_air_gap_inbounds_matches_column_path() {
+        // Single-column world (vsid = 1), column at index 0 is the
+        // two-slab fixture from above. column_index = 0,
+        // mip_base = [0, 2] (2 entries: column 0 start + sentinel).
+        let col = two_slabs_air_at_20_30();
+        let column_offsets = [0u32, col.len() as u32];
+        let mip_base = [0usize, column_offsets.len()];
+        let grid = crate::grid_view::GridView::from_parts(1, &col, &column_offsets, &mip_base);
+        // Hand-built prelude with the fields camera_chunk_air_gap
+        // reads.
+        let prelude = crate::opticast_prelude::OpticastPrelude {
+            forward_z_sign: 1,
+            li_pos: [0, 0, 25], // camera in the [20, 30) air gap
+            column_index: 0,
+            pos_xfrac: [1.0, 0.0],
+            pos_yfrac: [1.0, 0.0],
+            pos_z: 0,
+            y_lookup: Vec::new(),
+            x_mip: 0,
+            max_scan_dist: 0,
+            cx: 0,
+            cy: 0,
+            in_bounds_xy: true,
+            camera_chunk_idx: [0, 0, 0],
+            camera_local_xyz: [0, 0, 25],
+        };
+        let chunk_path = camera_chunk_air_gap(grid, &prelude, false);
+        let column_path = camera_column_air_gap(&col, 25, false);
+        assert_eq!(chunk_path, column_path);
+        assert_eq!(chunk_path, Some((20, 30, 24)));
+    }
+
+    /// S4B.1: camera_chunk_air_gap synthesises the OOB-XY bedrock
+    /// seed when `prelude.in_bounds_xy = false`, independent of the
+    /// grid's column data. The OOB path used to live inline in
+    /// `opticast`; the wrapper owns it now.
+    #[test]
+    fn camera_chunk_air_gap_oob_synthesises_bedrock_seed() {
+        // Empty grid — wrapper must not touch the slab buffer.
+        let mip_base = [0usize, 0];
+        let grid = crate::grid_view::GridView::from_parts(1, &[], &[], &mip_base);
+        let prelude = crate::opticast_prelude::OpticastPrelude {
+            forward_z_sign: 1,
+            li_pos: [-5, 0, 30],
+            column_index: u32::MAX, // junk: as u32 of -5; never read on OOB path
+            pos_xfrac: [1.0, 0.0],
+            pos_yfrac: [1.0, 0.0],
+            pos_z: 0,
+            y_lookup: Vec::new(),
+            x_mip: 0,
+            max_scan_dist: 0,
+            cx: -5,
+            cy: 0,
+            in_bounds_xy: false,
+            camera_chunk_idx: [0, 0, 0],
+            camera_local_xyz: [-5, 0, 30],
+        };
+        assert_eq!(
+            camera_chunk_air_gap(grid, &prelude, true),
+            Some((0, 255, 0))
+        );
+    }
+
+    /// S4B.1: camera-in-solid returns None so opticast can bail.
+    /// Bridges the existing single-slab fixture through the new
+    /// wrapper.
+    #[test]
+    fn camera_chunk_air_gap_inbounds_in_solid_returns_none() {
+        let col = single_slab_5_15();
+        let column_offsets = [0u32, col.len() as u32];
+        let mip_base = [0usize, column_offsets.len()];
+        let grid = crate::grid_view::GridView::from_parts(1, &col, &column_offsets, &mip_base);
+        let prelude = crate::opticast_prelude::OpticastPrelude {
+            forward_z_sign: 1,
+            li_pos: [0, 0, 10], // inside the solid slab z = 5..15
+            column_index: 0,
+            pos_xfrac: [1.0, 0.0],
+            pos_yfrac: [1.0, 0.0],
+            pos_z: 0,
+            y_lookup: Vec::new(),
+            x_mip: 0,
+            max_scan_dist: 0,
+            cx: 0,
+            cy: 0,
+            in_bounds_xy: true,
+            camera_chunk_idx: [0, 0, 0],
+            camera_local_xyz: [0, 0, 10],
+        };
+        assert_eq!(camera_chunk_air_gap(grid, &prelude, false), None);
     }
 
     /// Floor + bedrock placeholder: cz past the bedrock returns None

@@ -65,6 +65,18 @@ pub struct OpticastPrelude {
     /// requires real column data); outside path skips that and
     /// synthesises full-air-gap placeholders.
     pub in_bounds_xy: bool,
+    /// S4B.1: chunk index the camera sits in. For single-chunk grids
+    /// (today's only shape) always `[0, 0, 0]`. S4B.2 grows this to
+    /// `floor_div(cx, chunk_xy)` / `floor_div(cy, chunk_xy)` /
+    /// `floor_div(li_pos.z, chunk_z)` so the XY-cross-chunk DDA can
+    /// hand off when (cx, cy) crosses a chunk boundary.
+    pub camera_chunk_idx: [i32; 3],
+    /// S4B.1: camera coordinates relative to its chunk's origin.
+    /// Single-chunk grid: equal to `li_pos`. Multi-chunk:
+    /// `li_pos[i] - camera_chunk_idx[i] * chunk_size`. Drives the
+    /// chunk-local column-table lookup `chunk.column_offsets[
+    /// camera_local_xyz.y * chunk_vsid + camera_local_xyz.x]`.
+    pub camera_local_xyz: [i32; 3],
 }
 
 /// Derive the per-frame [`OpticastPrelude`].
@@ -165,6 +177,14 @@ pub fn derive_prelude(
     let x_mip = mip_scan_dist.max(4).wrapping_mul(PREC);
     let max_scan_dist_clamped = max_scan_dist.clamp(1, 4095).wrapping_mul(PREC);
 
+    // S4B.1 scaffold: today's GridView is a single chunk, so the
+    // camera is always in chunk (0, 0, 0) and its local position
+    // equals li_pos. S4B.2 grows this into a real chunk-grid lookup;
+    // for now these fields just give downstream code the shape it
+    // will eventually consume.
+    let camera_chunk_idx = [0, 0, 0];
+    let camera_local_xyz = li_pos;
+
     OpticastPrelude {
         forward_z_sign,
         li_pos,
@@ -178,6 +198,8 @@ pub fn derive_prelude(
         cx,
         cy,
         in_bounds_xy,
+        camera_chunk_idx,
+        camera_local_xyz,
     }
 }
 
