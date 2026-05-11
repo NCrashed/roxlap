@@ -506,23 +506,43 @@ pub fn update_lighting(
     // — voxlap walks each column's slab chain via `slng()` to
     // recover length. We pre-compute extents here serially before
     // moving `world_data` into the parallel mutable view; the
-    // slng walk is O(slab_count) per column, typically 1-3 slabs
-    // → tens of microseconds per row at vsid = 1024. Negligible
-    // next to the bake itself.
-    let n_cols = (vsid as usize) * (vsid as usize);
-    let column_extents: Vec<(usize, usize)> = (0..n_cols)
-        .map(|col_idx| {
-            let start = column_offsets[col_idx] as usize;
+    // slng walk is O(slab_count) per column, typically 1-3 slabs.
+    //
+    // **Region-bounded**: only the bake rectangle `[x0p..x1p) ×
+    // [y0p..y1p)` needs extents — the per-row body indexes only
+    // those columns. Sizing the table to `vsid²` is wasteful when
+    // a small chunk-sized region is baked against a large-vsid
+    // world (e.g. S4.1 scene-graph per-chunk bake against a
+    // vsid=4096 combined view — would have been 16M slng walks per
+    // chunk × 1024 chunks = 17B slng walks). The bake-region table
+    // collapses that to `bake_region` walks per call.
+    #[allow(clippy::cast_sign_loss)]
+    let region_w = (x1p - x0p) as usize;
+    #[allow(clippy::cast_sign_loss)]
+    let region_h = (y1p - y0p) as usize;
+    let mut column_extents: Vec<(usize, usize)> = Vec::with_capacity(region_w * region_h);
+    for yi in 0..region_h {
+        #[allow(clippy::cast_possible_wrap)]
+        let y = y0p + yi as i32;
+        for xi in 0..region_w {
+            #[allow(clippy::cast_possible_wrap)]
+            let x = x0p + xi as i32;
+            #[allow(clippy::cast_sign_loss)]
+            let col_idx = (y as u32) * vsid + (x as u32);
+            let start = column_offsets[col_idx as usize] as usize;
             let end = start + roxlap_formats::vxl::slng(&world_data[start..]);
-            (start, end)
-        })
-        .collect();
+            column_extents.push((start, end));
+        }
+    }
 
     let world_view = WorldDataMutView::new(world_data);
     let row_body = |y: i32| {
+        #[allow(clippy::cast_sign_loss)]
+        let yi = (y - y0p) as usize;
         for x in x0p..x1p {
-            let col_idx = (y as u32) * vsid + (x as u32);
-            let (off_start, off_end) = column_extents[col_idx as usize];
+            #[allow(clippy::cast_sign_loss)]
+            let xi = (x - x0p) as usize;
+            let (off_start, off_end) = column_extents[yi * region_w + xi];
             // SAFETY: each (x, y) maps to a unique col_idx; column
             // byte ranges `[off_start, off_end)` are pairwise
             // disjoint across distinct `col_idx` (voxalloc's

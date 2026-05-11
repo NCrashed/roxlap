@@ -5,9 +5,9 @@
 //! Both grid origins are picked so the camera can frame both
 //! without OOB-camera weirdness.
 
-use glam::DVec3;
+use glam::{DVec3, IVec3};
 use roxlap_core::Camera;
-use roxlap_scene::{GridId, GridTransform, Scene, CHUNK_SIZE_Z};
+use roxlap_scene::{GridId, GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
 use crate::{ship, terrain};
 
@@ -28,16 +28,16 @@ fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
 ///
 /// Layout (world coords, voxlap z-down: smaller z = up):
 /// - **Ground** grid origin at world `(0, 0, 0)` — terrain spans
-///   `GROUND_CHUNKS_X × GROUND_CHUNKS_Y` chunks (S4.0: 2×1) in z ∈
+///   `GROUND_CHUNKS_X × GROUND_CHUNKS_Y` chunks (S4.1: 32×32) in z ∈
 ///   [80..255].
 /// - **Ship** grid origin at world `(0, 0, -100)` — ship body
 ///   in chunk-local z ∈ [56..72] → world z ∈ [-44..-28].
 ///   The ship sits comfortably in the sky band above the terrain
 ///   (terrain peaks at world z ≈ 80; sky is z < 80).
 ///
-/// Initial camera at world `(128, -120, 50)` (centred over the
-/// 2-chunk-wide ground) looking +y, sees the ship dead-ahead with
-/// the terrain visible below the horizon.
+/// Initial camera at world `(128, -120, 50)` (over the lower-left
+/// quadrant of the ground) looking +y, sees the ship dead-ahead
+/// with the terrain visible below the horizon.
 pub fn build_demo() -> SceneAndCamera {
     let mut scene = Scene::new();
 
@@ -92,39 +92,70 @@ impl SceneAndCamera {
 /// every chunk of every grid. Mode 1 uses surface normals only —
 /// no `LightSrc` consulted — so we pass an empty `lights` slice.
 ///
-/// Cost: linear in solid-voxel count per chunk; for our 2-chunk
-/// demo (one full of terrain, one mostly air around a saucer)
-/// this completes well under a second.
+/// **S4.1 fix for the chunk-edge lighting seam.** Per-chunk bakes
+/// at S4.0 produced a visible brightness jump at every chunk
+/// boundary because `estnorm`'s 5×5×5 neighbourhood vote treated
+/// neighbour chunks as all-air. The fix routes the bake through
+/// the combined-world view: each chunk's bake region is still
+/// `(chunk_x0..chunk_x1) × (chunk_y0..chunk_y1)`, but the
+/// `(world_data, column_offsets, vsid)` triple is the grid's
+/// combined view — so `EstNormCache`'s padding reads neighbour-
+/// chunk voxels naturally. After all chunks bake, we
+/// `sync_combined_to_chunks` to copy the post-bake alpha bytes
+/// back into source chunks so the cache invariant holds even
+/// after a later invalidation.
+///
+/// **Per-chunk bake region (not whole-grid).** A whole-grid
+/// `update_lighting` call at vsid=4096 would allocate a 500 MB+
+/// `EstNormCache` bit table; the per-chunk loop keeps each cache
+/// at ~135 KB (132²×8 bytes) and still gets correct cross-chunk
+/// neighbourhood sampling.
 #[allow(clippy::cast_possible_wrap)]
 fn bake_lightmode_1(scene: &mut Scene) {
     const LIGHTMODE: u32 = 1;
     let ids: Vec<GridId> = scene.grids().map(|(id, _)| id).collect();
     for id in ids {
         let grid = scene.grid_mut(id).expect("grid present");
-        let cs_xy = grid.chunks.values().next().map_or(0, |c| c.vsid as i32);
-        if cs_xy == 0 {
+        // Snapshot the chunk indices before borrowing the combined
+        // view mutably; combined_world_mut takes &mut self which
+        // would conflict with iterating &chunks otherwise.
+        let chunk_idxs: Vec<IVec3> = grid.chunks.keys().copied().collect();
+        if chunk_idxs.is_empty() {
             continue;
         }
+        let cs_xy = CHUNK_SIZE_XY as i32;
         let cs_z = CHUNK_SIZE_Z as i32;
-        for chunk in grid.chunks.values_mut() {
-            roxlap_core::update_lighting(
-                &mut chunk.data,
-                &chunk.column_offset,
-                chunk.vsid,
-                0,
-                0,
-                0,
-                cs_xy,
-                cs_xy,
-                cs_z,
-                LIGHTMODE,
-                &[],
-            );
+
+        // Per-chunk bake against the combined view's data buffer.
+        {
+            let combined = grid.combined_world_mut();
+            for chunk_idx in &chunk_idxs {
+                if chunk_idx.z != 0 {
+                    // S4.0 combined-view scope: chz=0 only.
+                    continue;
+                }
+                let x0 = chunk_idx.x * cs_xy;
+                let y0 = chunk_idx.y * cs_xy;
+                let x1 = x0 + cs_xy;
+                let y1 = y0 + cs_xy;
+                roxlap_core::update_lighting(
+                    &mut combined.data,
+                    &combined.column_offset,
+                    combined.vsid,
+                    x0,
+                    y0,
+                    0,
+                    x1,
+                    y1,
+                    cs_z,
+                    LIGHTMODE,
+                    &[],
+                );
+            }
         }
-        // Bake mutates each chunk's `data` in place via the slab
-        // bytes, bypassing the edit-API invalidation hooks. Drop
-        // the cached combined view so the next render rebuilds it
-        // against the freshly-lit slab bytes.
-        grid.invalidate_combined();
+        // Propagate the post-bake alpha bytes from the combined view
+        // back into each chunk's source slab buffer. Keeps the cache
+        // invariant valid for any later edit/invalidate cycle.
+        grid.sync_combined_to_chunks();
     }
 }
