@@ -140,6 +140,18 @@ pub struct GrouscanInputs<'a> {
     /// behaviour). `Some(_)` ⇒ `phase_startsky` runs the textured
     /// path when `scratch.sky_off != 0`.
     pub sky: Option<SkyRef<'a>>,
+    /// S4B.2.c.2: parent (whole-grid) [`GridView`]. For multi-chunk
+    /// grids this carries the [`ChunkGrid`] backend the column-step
+    /// swap consults via [`crate::grid_view::GridView::chunk_at_xy`].
+    /// For single-chunk callers it's the same view the rasterizer
+    /// holds (chunk_grid: None — chunk_at_xy degenerates to
+    /// Some(Self) for [0, 0]).
+    ///
+    /// Distinct from the flat `(slab_buf, column_offsets,
+    /// mip_base_offsets, vsid)` fields above: those are the
+    /// **camera chunk's** per-chunk borrows, set by gline's seed
+    /// path so the slab walker starts on the correct chunk.
+    pub grid_view: crate::grid_view::GridView<'a>,
 }
 
 /// All of grouscan's per-ray local state in one struct.
@@ -320,18 +332,12 @@ impl<'a> GrouscanState<'a> {
     ) -> Self {
         let c = scratch.cf[CF_SEED_INDEX];
 
-        // S4B.2.b: synthesise the GridView from the per-frame
-        // GrouscanInputs fields. For today's single-chunk callers
-        // `chunk_size_xy == vsid` so the chunk-swap branch in
-        // `phase_after_delete_kept_presync` is dead — single-chunk
-        // goldens stay byte-identical. S4B.2.c will plumb a true
-        // multi-chunk GridView through GrouscanInputs.
-        let grid_view = crate::grid_view::GridView::from_parts(
-            inputs.vsid,
-            inputs.slab_buf,
-            inputs.column_offsets,
-            inputs.mip_base_offsets,
-        );
+        // S4B.2.c.2: take the parent multi-chunk GridView from
+        // GrouscanInputs (set by the rasterizer's gline seed path).
+        // For single-chunk callers `inputs.grid_view.chunk_grid ==
+        // None` and `chunk_size_xy == vsid`, so the column-step
+        // fast path stays active and goldens are byte-identical.
+        let grid_view = inputs.grid_view;
         let chunk_size_xy = grid_view.chunk_size_xy;
         #[allow(clippy::cast_possible_wrap)]
         let chunk_size_signed = chunk_size_xy as i32;
@@ -2161,6 +2167,12 @@ mod tests {
             mip_base_offsets: &DUMMY_MIP_OFFSETS,
             vsid: 64,
             sky: None,
+            grid_view: crate::grid_view::GridView::from_parts(
+                64,
+                &DUMMY_SLAB_BUF,
+                &DUMMY_COLUMN_OFFSETS,
+                &DUMMY_MIP_OFFSETS,
+            ),
         }
     }
 
@@ -2298,6 +2310,12 @@ mod tests {
             mip_base_offsets: &DUMMY_MIP_OFFSETS,
             vsid: 64,
             sky: None,
+            grid_view: crate::grid_view::GridView::from_parts(
+                64,
+                &DUMMY_SLAB_BUF,
+                &DUMMY_COLUMN_OFFSETS,
+                &DUMMY_MIP_OFFSETS,
+            ),
         };
         GrouscanState::from_seed(scratch, &inputs, 0, 0, 0, 0, 1)
     }
@@ -2318,6 +2336,12 @@ mod tests {
             mip_base_offsets: &DUMMY_MIP_OFFSETS,
             vsid: 64,
             sky: None,
+            grid_view: crate::grid_view::GridView::from_parts(
+                64,
+                &DUMMY_SLAB_BUF,
+                &DUMMY_COLUMN_OFFSETS,
+                &DUMMY_MIP_OFFSETS,
+            ),
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 0, 0, 1)
     }
@@ -2479,6 +2503,12 @@ mod tests {
             mip_base_offsets: &DUMMY_MIP_OFFSETS,
             vsid: 64,
             sky: None,
+            grid_view: crate::grid_view::GridView::from_parts(
+                64,
+                &DUMMY_SLAB_BUF,
+                &DUMMY_COLUMN_OFFSETS,
+                &DUMMY_MIP_OFFSETS,
+            ),
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 0, 0, 1)
     }
@@ -2781,15 +2811,22 @@ mod tests {
         let (slab_buf, column_offsets) = build_4x4_world();
         let gylookup = DUMMY_GYLOOKUP;
         let gcsub = DUMMY_GCSUB;
+        let mip_base = [0usize, column_offsets.len()];
         let inputs = GrouscanInputs {
             column: &slab_buf[20..], // initial column = #5
             gylookup: &gylookup,
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
-            mip_base_offsets: &[0, column_offsets.len()],
+            mip_base_offsets: &mip_base,
             vsid: 4,
             sky: None,
+            grid_view: crate::grid_view::GridView::from_parts(
+                4,
+                &slab_buf,
+                &column_offsets,
+                &mip_base,
+            ),
         };
         let mut s = fresh_scratch();
         s.gixy = [1, 4]; // x-step = 1, y-step = 4
@@ -2821,15 +2858,22 @@ mod tests {
         let (slab_buf, column_offsets) = build_4x4_world();
         let gylookup = DUMMY_GYLOOKUP;
         let gcsub = DUMMY_GCSUB;
+        let mip_base = [0usize, column_offsets.len()];
         let inputs = GrouscanInputs {
             column: &slab_buf[..],
             gylookup: &gylookup,
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
-            mip_base_offsets: &[0, column_offsets.len()],
+            mip_base_offsets: &mip_base,
             vsid: 4,
             sky: None,
+            grid_view: crate::grid_view::GridView::from_parts(
+                4,
+                &slab_buf,
+                &column_offsets,
+                &mip_base,
+            ),
         };
         let mut s = fresh_scratch();
         // BOTH lanes must exceed ngxmax: lane recompute picks the
@@ -2937,15 +2981,22 @@ mod tests {
         let (slab_buf, column_offsets) = build_4x4_world();
         let gylookup = DUMMY_GYLOOKUP;
         let gcsub = DUMMY_GCSUB;
+        let mip_base = [0usize, column_offsets.len()];
         let inputs = GrouscanInputs {
             column: &slab_buf[..],
             gylookup: &gylookup,
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
-            mip_base_offsets: &[0, column_offsets.len()],
+            mip_base_offsets: &mip_base,
             vsid: 4,
             sky: None,
+            grid_view: crate::grid_view::GridView::from_parts(
+                4,
+                &slab_buf,
+                &column_offsets,
+                &mip_base,
+            ),
         };
         let mut s = fresh_scratch();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
@@ -2962,15 +3013,22 @@ mod tests {
         let (slab_buf, column_offsets) = build_4x4_world();
         let gylookup = DUMMY_GYLOOKUP;
         let gcsub = DUMMY_GCSUB;
+        let mip_base = [0usize, column_offsets.len()];
         let inputs = GrouscanInputs {
             column: &slab_buf[..],
             gylookup: &gylookup,
             gcsub: &gcsub,
             slab_buf: &slab_buf,
             column_offsets: &column_offsets,
-            mip_base_offsets: &[0, column_offsets.len()],
+            mip_base_offsets: &mip_base,
             vsid: 4,
             sky: None,
+            grid_view: crate::grid_view::GridView::from_parts(
+                4,
+                &slab_buf,
+                &column_offsets,
+                &mip_base,
+            ),
         };
         let mut s = fresh_scratch();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 32, 0, 0, 0, 1);

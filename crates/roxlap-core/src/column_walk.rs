@@ -159,17 +159,25 @@ pub fn camera_chunk_air_gap(
         return Some((0, 255, 0));
     }
 
-    // S4B.1 scaffold: today's GridView is a single chunk so
-    // `prelude.column_index` directly indexes the flat
-    // `column_offsets[vsid × vsid + 1]` table. S4B.2 replaces this
-    // with `grid.chunk_at_xy(prelude.camera_chunk_idx).column_at(
-    // prelude.camera_local_xyz)`.
+    // S4B.2.c.2: dispatch via `chunk_at_xy` so multi-chunk grids
+    // walk the column at the camera's actual chunk. Single-chunk
+    // grids (`chunk_grid: None`) get `chunk_at_xy([0, 0]) ==
+    // Some(Self)` and the lookup degenerates to today's flat path
+    // — `chunk_size_xy == vsid` and `camera_local_xyz == li_pos`,
+    // so `column_idx_in_chunk == prelude.column_index`. Byte-
+    // identical for the goldens.
+    let camera_chunk =
+        grid.chunk_at_xy([prelude.camera_chunk_idx[0], prelude.camera_chunk_idx[1]])?;
+    #[allow(clippy::cast_sign_loss)]
+    let column_idx_in_chunk = (prelude.camera_local_xyz[1] as u32)
+        .wrapping_mul(camera_chunk.chunk_size_xy)
+        .wrapping_add(prelude.camera_local_xyz[0] as u32);
     let column = crate::opticast::camera_column_slice(
-        grid.slab_buf,
-        grid.column_offsets,
-        prelude.column_index,
+        camera_chunk.slab_buf,
+        camera_chunk.column_offsets,
+        column_idx_in_chunk,
     )?;
-    camera_column_air_gap(column, prelude.li_pos[2], treat_z_max_as_air)
+    camera_column_air_gap(column, prelude.camera_local_xyz[2], treat_z_max_as_air)
 }
 
 #[cfg(test)]

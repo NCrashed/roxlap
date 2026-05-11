@@ -557,19 +557,51 @@ impl Rasterizer for ScalarRasterizer<'_> {
             sky_per_ray_update(scratch, sky, f.vx1, f.vy1);
         }
 
-        // 6. Build inputs and call grouscan_run. The starting
-        //    column is the camera's column. For OOB cameras
-        //    (S1.Z) the linear `column_index` is u32-junk that
-        //    may alias to an unrelated in-range column in the
-        //    offsets table — gate on `in_bounds_xy` so the walk
-        //    starts with an empty column and the per-step OOB
-        //    path in grouscan continues to feed empty columns
-        //    until (cx, cy) cross into the world.
-        let column = if cache.prelude.in_bounds_xy {
-            camera_column_slice(self.grid.slab_buf, self.grid.column_offsets, column_index)
-                .unwrap_or(&[])
+        // 6. Build inputs and call grouscan_run.
+        //
+        // S4B.2.c.2: dispatch the camera-column lookup via
+        // `chunk_at_xy(camera_chunk_idx)` so multi-chunk grids
+        // start the walk inside the camera's actual chunk. Single-
+        // chunk grids (`chunk_grid: None`) get
+        // `chunk_at_xy([0, 0]) == Some(Self)` — the flat-table
+        // lookup with the camera's `column_index`, byte-identical
+        // to the goldens.
+        //
+        // OOB cameras (`in_bounds_xy: false`) start with an empty
+        // column — the grouscan column-step walk picks up real
+        // chunks once `(cx, cy)` cross into the grid.
+        let camera_chunk_opt = if cache.prelude.in_bounds_xy {
+            self.grid.chunk_at_xy([
+                cache.prelude.camera_chunk_idx[0],
+                cache.prelude.camera_chunk_idx[1],
+            ])
         } else {
-            &[]
+            None
+        };
+        let (column, chunk_slab, chunk_cols, chunk_mips, chunk_vsid) = match camera_chunk_opt {
+            Some(chunk) => {
+                #[allow(clippy::cast_sign_loss)]
+                let column_idx_in_chunk = (cache.prelude.camera_local_xyz[1] as u32)
+                    .wrapping_mul(chunk.chunk_size_xy)
+                    .wrapping_add(cache.prelude.camera_local_xyz[0] as u32);
+                let col =
+                    camera_column_slice(chunk.slab_buf, chunk.column_offsets, column_idx_in_chunk)
+                        .unwrap_or(&[]);
+                (
+                    col,
+                    chunk.slab_buf,
+                    chunk.column_offsets,
+                    chunk.mip_base_offsets,
+                    chunk.vsid,
+                )
+            }
+            None => (
+                &[][..],
+                self.grid.slab_buf,
+                self.grid.column_offsets,
+                self.grid.mip_base_offsets,
+                self.grid.vsid,
+            ),
         };
         // Copy gcsub out of scratch so the GrouscanInputs immutable
         // borrow doesn't collide with the `&mut scratch` grouscan_run
@@ -591,11 +623,12 @@ impl Rasterizer for ScalarRasterizer<'_> {
             column,
             gylookup: &cache.prelude.y_lookup,
             gcsub: &gcsub_local,
-            slab_buf: self.grid.slab_buf,
-            column_offsets: self.grid.column_offsets,
-            mip_base_offsets: self.grid.mip_base_offsets,
-            vsid: self.grid.vsid,
+            slab_buf: chunk_slab,
+            column_offsets: chunk_cols,
+            mip_base_offsets: chunk_mips,
+            vsid: chunk_vsid,
             sky: self.sky.map(crate::grouscan::SkyRef::from_sky),
+            grid_view: self.grid,
         };
         // gmipnum = number of built mip levels. R4.5d's
         // `phase_remiporend` body will start incrementing

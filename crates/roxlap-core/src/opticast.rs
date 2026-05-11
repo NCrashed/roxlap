@@ -193,13 +193,21 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         settings.hz,
     );
 
-    let prelude = opticast_prelude::derive_prelude(
+    let mut prelude = opticast_prelude::derive_prelude(
         &cs,
         grid.vsid,
         settings.mip_levels,
         settings.mip_scan_dist,
         settings.max_scan_dist,
     );
+    // S4B.2.c.2: refine the prelude's chunk-aware fields against
+    // the grid's per-chunk dimension. For single-chunk callers
+    // (`chunk_size_xy == vsid`) this is a no-op for the in-bounds
+    // camera — `li_pos.div_euclid(vsid) == 0` and `rem_euclid ==
+    // li_pos` — keeping the goldens byte-identical. For multi-
+    // chunk callers it splits `li_pos.xy` into
+    // `(camera_chunk_idx.xy, camera_local_xyz.xy)`.
+    opticast_prelude::recompute_camera_chunk(&mut prelude, grid.chunk_size_xy);
 
     // S4B.1: `column_walk::camera_chunk_air_gap` now owns both
     // branches (in-bounds column lookup + OOB-XY bedrock seed

@@ -203,6 +203,44 @@ pub fn derive_prelude(
     }
 }
 
+/// S4B.2.c.2: refine [`OpticastPrelude::camera_chunk_idx`] and
+/// [`OpticastPrelude::camera_local_xyz`] using the per-chunk
+/// dimension carried on the [`crate::grid_view::GridView`].
+///
+/// [`derive_prelude`] populates the chunk-aware fields with the
+/// single-chunk placeholder `[0, 0, 0]` / `li_pos`; callers with
+/// access to a `GridView` chain this on so multi-chunk grids see
+/// the right `(chunk_idx, in_chunk_xy)` split. Single-chunk callers
+/// (`chunk_size_xy == vsid`) get the same numerical values as the
+/// placeholder for in-bounds cameras — `li_pos.div_euclid(vsid)`
+/// is `0` for any `li_pos ∈ [0, vsid)`, and
+/// `li_pos.rem_euclid(vsid) == li_pos`.
+///
+/// OOB-XY cameras get non-trivial `camera_chunk_idx` values (the
+/// chunk past the grid edge they're floating over), but
+/// `prelude.in_bounds_xy = false` gates downstream code so the
+/// new field values aren't dereferenced — the OOB-XY bedrock seed
+/// synthesis in [`crate::column_walk::camera_chunk_air_gap`] short-
+/// circuits first.
+//
+// The z axis stays at the single-chunk placeholder until S4B.3
+// adds chunk-z (`li_pos.z.div_euclid(chunk_size_z)`); chunk_z
+// handoff in grouscan is also S4B.3.
+#[allow(clippy::cast_possible_wrap)]
+pub fn recompute_camera_chunk(prelude: &mut OpticastPrelude, chunk_size_xy: u32) {
+    let chunk_size_signed = chunk_size_xy as i32;
+    prelude.camera_chunk_idx = [
+        prelude.li_pos[0].div_euclid(chunk_size_signed),
+        prelude.li_pos[1].div_euclid(chunk_size_signed),
+        0,
+    ];
+    prelude.camera_local_xyz = [
+        prelude.li_pos[0].rem_euclid(chunk_size_signed),
+        prelude.li_pos[1].rem_euclid(chunk_size_signed),
+        prelude.li_pos[2],
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +329,64 @@ mod tests {
         let p = derive_prelude(&s, 2048, 2, 4, 1024);
         // Level 0: (512 >> 0) + 4 = 516. Level 1: (512 >> 1) + 4 = 260.
         assert_eq!(p.y_lookup.len(), 516 + 260);
+    }
+
+    /// S4B.2.c.2: single-chunk-grid recompute is a no-op for the
+    /// in-bounds camera (li_pos < vsid → div_euclid yields 0,
+    /// rem_euclid yields li_pos). Locks in byte-identity for the
+    /// 12-pose oracle goldens after recompute is wired into opticast.
+    #[test]
+    fn recompute_camera_chunk_single_chunk_in_bounds_is_no_op() {
+        let s = oracle_north_state(); // pos.x = pos.y = 1024
+        let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let before_idx = p.camera_chunk_idx;
+        let before_local = p.camera_local_xyz;
+        recompute_camera_chunk(&mut p, 2048);
+        assert_eq!(p.camera_chunk_idx, before_idx);
+        assert_eq!(p.camera_local_xyz, before_local);
+        assert_eq!(p.camera_chunk_idx, [0, 0, 0]);
+        assert_eq!(p.camera_local_xyz, [1024, 1024, 128]);
+    }
+
+    /// S4B.2.c.2: multi-chunk recompute splits li_pos via
+    /// `div_euclid` / `rem_euclid` against `chunk_size_xy`. Camera
+    /// at (1024, 100) with `chunk_size_xy = 128` lands in chunk
+    /// `[8, 0]` with local `(0, 100)`.
+    #[test]
+    fn recompute_camera_chunk_multi_chunk_splits_li_pos() {
+        let cam = crate::Camera {
+            pos: [1024.0, 100.0, 50.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
+        let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
+        recompute_camera_chunk(&mut p, 128);
+        assert_eq!(p.camera_chunk_idx, [8, 0, 0]);
+        assert_eq!(p.camera_local_xyz, [0, 100, 50]);
+    }
+
+    /// S4B.2.c.2: OOB-XY camera's recomputed chunk_idx can be
+    /// non-trivial (negative for camera past `[0, vsid)` on the
+    /// left edge). Downstream code gates on `in_bounds_xy`, so
+    /// the OOB-XY values don't get dereferenced — but the test
+    /// pins the arithmetic.
+    #[test]
+    fn recompute_camera_chunk_oob_xy_yields_negative_chunk_idx() {
+        let cam = crate::Camera {
+            pos: [-5.0, 100.0, 50.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
+        let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
+        recompute_camera_chunk(&mut p, 128);
+        assert!(!p.in_bounds_xy);
+        // -5.div_euclid(128) = -1; -5.rem_euclid(128) = 123 (positive).
+        assert_eq!(p.camera_chunk_idx, [-1, 0, 0]);
+        assert_eq!(p.camera_local_xyz, [123, 100, 50]);
     }
 
     #[test]
