@@ -573,6 +573,90 @@ fn dump_chunk_tearing_capture_pose() {
     );
 }
 
+/// Visual check: render the demo's spawn pose with the live
+/// demo's settings (fog OFF, checkerboard sky ON, multi-mip ON) so
+/// the multi-mip LOD bands are visible against a patterned sky.
+/// Dumps PPM only; no assertion beyond non-empty.
+#[test]
+#[ignore = "expensive: builds full demo; dumps showcase PPM"]
+fn dump_showcase_pose_with_skybox() {
+    use roxlap_core::sky::Sky;
+    use roxlap_scene::CHUNK_SIZE_XY;
+
+    // Checkerboard sky helper — duplicated from main.rs because the
+    // bin's helper isn't reachable from the test crate.
+    fn checker_sky() -> Sky {
+        const W: u32 = 64;
+        const H: u32 = 256;
+        const TILE_X: u32 = 8;
+        const TILE_Y: u32 = 16;
+        let mut pixels = Vec::with_capacity((W * H) as usize);
+        for y in 0..H {
+            for x in 0..W {
+                let (rb, gb, bb): (u32, u32, u32) = match (y * 4) / H {
+                    0 => (0xe0, 0x40, 0x40),
+                    1 => (0x40, 0xe0, 0x40),
+                    2 => (0x40, 0x40, 0xe0),
+                    _ => (0xe0, 0xd0, 0x40),
+                };
+                let dark = ((x / TILE_X) + (y / TILE_Y)) & 1 == 1;
+                let (r, g, b) = if dark {
+                    (rb / 4, gb / 4, bb / 4)
+                } else {
+                    (rb, gb, bb)
+                };
+                let (r, g, b) = if x == 0 {
+                    (0xff, 0xff, 0xff)
+                } else if x == W - 1 {
+                    (0, 0, 0)
+                } else {
+                    (r, g, b)
+                };
+                #[allow(clippy::cast_possible_wrap)]
+                let px = ((0x80u32 << 24) | (r << 16) | (g << 8) | b) as i32;
+                pixels.push(px);
+            }
+        }
+        Sky::from_pixels(pixels, W, H)
+    }
+
+    let mut sc = crate::scene::build_demo();
+    let cam = sc.camera;
+    let engine = Engine::new();
+    let sky_tex = checker_sky();
+    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    // No fog.
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.max_scan_dist = 512;
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb,
+        &mut zb,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        Some(&sky_tex),
+    );
+    let non_sky = fb.iter().filter(|&&p| p != sky).count();
+    eprintln!("showcase pose: non-sky pixels {non_sky}/{pixel_count}");
+    write_ppm("/tmp/scene-demo-showcase.ppm", &fb);
+    assert!(non_sky > 0);
+}
+
 /// User-reported S4B.5 thin-black-ring artifact pose under the
 /// saucer (capture 2026-05-12, third report). The user noted these
 /// only appear under the ship — terrain rendered alone is clean.

@@ -117,7 +117,10 @@ impl SceneAndCamera {
 /// at ~135 KB (132²×8 bytes).
 
 /// Diagnostic re-export for `repro.rs` to bake lighting+mips into a
-/// scene it builds itself (ring-artifact isolation tests).
+/// scene it builds itself (ring-artifact isolation tests). Gated
+/// behind `cfg(test)` so the release binary doesn't carry the
+/// dead-code entry point.
+#[cfg(test)]
 pub fn bake_lightmode_1_pub(scene: &mut Scene) {
     bake_lightmode_1(scene);
 }
@@ -185,15 +188,17 @@ fn bake_lightmode_1(scene: &mut Scene) {
         }
 
         // S4B.5 (2026-05-12): generate per-chunk mips after the
-        // lighting bake. The rasterizer reads mip-0 only when
-        // settings.mip_levels = 1, ignoring the appended mip-1+
-        // sub-tables.
+        // lighting bake. 6 levels covers a 2048-voxel ray-depth
+        // ladder when paired with `mip_scan_dist=64` (64·2⁵ = 2048),
+        // matching the live demo's max scan distance. Build cost
+        // and the chunk's grown mip tables are ~1.25× the mip-0
+        // footprint per chunk — small vs the bake cost.
         for chunk_idx in &chunk_idxs {
             if chunk_idx.z != 0 {
                 continue;
             }
             let chunk = grid.chunks.get_mut(chunk_idx).expect("populated");
-            chunk.generate_mips(4);
+            chunk.generate_mips(6);
         }
     }
 }

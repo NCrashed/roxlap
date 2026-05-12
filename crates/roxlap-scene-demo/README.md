@@ -71,6 +71,7 @@ debug for an interactive frame rate.
 | `LCtrl`               | Hold for 4× speed                                                                 |
 | Mouse                 | Look around (yaw + pitch)                                                         |
 | `F`                   | Capture current frame + camera state to `roxlap-scene-capture.{txt,ppm}` (debug). |
+| `+` / `-`             | Increase / decrease scan distance by 64 voxels (64..2047). Use the larger end to showcase multi-mip rendering; smaller values cap mip-0 work for low-end CPUs. |
 
 The camera collides with solid voxels (per-axis sliding, ±0.3
 voxel skin) so you can't fly through the ground or the ship's

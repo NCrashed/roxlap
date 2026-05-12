@@ -35,14 +35,16 @@ const HEIGHT: u32 = 600;
 /// allocation-free.
 const MAX_GRID_VSID: u32 = 32 * roxlap_scene::CHUNK_SIZE_XY;
 
-/// Max ray-march distance for the per-frame opticast pass.
-/// At vsid=4096 the per-ray DDA walks a flat 64-MB column-offset
-/// table; rays scanning past ~400 voxels overwhelm L3 and drop
-/// frame time below realtime. 512 keeps a healthy view distance
-/// while staying ≥40 FPS on a 4-core CPU. Multi-mip would unblock
-/// larger distances but mip-1+ rendering currently all-skies —
-/// see `project_mip_attempt.md`. Proper fix belongs in S6.
-const MAX_SCAN_DIST: i32 = 512;
+/// Initial max ray-march distance for the per-frame opticast pass.
+/// User can adjust at runtime via `+` / `-` (range
+/// [`SCAN_DIST_MIN`, `SCAN_DIST_MAX`]). Multi-mip absorbs the cost
+/// of larger distances by transitioning distant rays to coarser
+/// chunk LODs — at 1024+ the mip-2/3 voxels dominate the budget
+/// while mip-0 stays sharp near the camera.
+const SCAN_DIST_INITIAL: i32 = 512;
+const SCAN_DIST_MIN: i32 = 64;
+const SCAN_DIST_MAX: i32 = 2047;
+const SCAN_DIST_STEP: i32 = 64;
 
 /// Cap for `rayon`'s strip-parallel pool. Voxlap's per-strip
 /// projection re-derivation adds fixed overhead that amortises
@@ -53,6 +55,54 @@ const MAX_SCAN_DIST: i32 = 512;
 const RENDER_THREADS: usize = 4;
 
 const MOVE_SPEED: f64 = 64.0;
+
+/// Embedded panoramic sky texture for the textured-`startsky`
+/// path. Whatever PNG the user has dropped in `assets/sky.png` is
+/// baked into the binary at build time. Width maps to elevation
+/// (horizon → zenith), height to azimuth (wrap-around). Same asset
+/// the roxlap-host demo ships.
+const SKY_PNG: &[u8] = include_bytes!("../../../assets/sky.png");
+
+/// Decode a PNG byte slice into a `roxlap_core::sky::Sky`.
+///
+/// Voxlap's sky-mapping convention: **texture width = elevation
+/// gradient (horizon → zenith)**, **texture height = azimuth wrap
+/// (360° around the camera)**. Standard equirectangular panoramas
+/// are usually laid out the other way (width=azimuth,
+/// height=elevation), so `Sky::from_pixels` re-interprets the
+/// dimensions accordingly. Mirror of roxlap-host's helper.
+fn load_png_sky(png_bytes: &[u8]) -> Result<roxlap_core::sky::Sky, String> {
+    let decoder = png::Decoder::new(png_bytes);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("png header: {e}"))?;
+    let info = reader.info();
+    let png_w = info.width;
+    let png_h = info.height;
+    let bytes_per_pixel = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        ct => return Err(format!("unsupported colour type {ct:?}; want RGB or RGBA")),
+    };
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "unsupported bit depth {:?}; want 8-bit",
+            info.bit_depth
+        ));
+    }
+    let mut pixel_bytes = vec![0u8; reader.output_buffer_size()];
+    reader
+        .next_frame(&mut pixel_bytes)
+        .map_err(|e| format!("png frame: {e}"))?;
+    let mut pixels = Vec::with_capacity((png_w as usize) * (png_h as usize));
+    for chunk in pixel_bytes.chunks_exact(bytes_per_pixel) {
+        let r = i32::from(chunk[0]);
+        let g = i32::from(chunk[1]);
+        let b = i32::from(chunk[2]);
+        pixels.push((0x80 << 24) | (r << 16) | (g << 8) | b);
+    }
+    Ok(roxlap_core::sky::Sky::from_pixels(pixels, png_w, png_h))
+}
 const FAST_MULT: f64 = 4.0;
 const MOUSE_SENS: f64 = 0.0025;
 /// Pitch clamped just shy of ±90° so the basis stays well-conditioned.
@@ -105,17 +155,22 @@ struct App {
     /// is composited so the captured PPM is the same pixels the
     /// user just saw.
     capture_pending: bool,
+    /// Live-adjustable scan distance (voxels). `+` / `-` bump it
+    /// by `SCAN_DIST_STEP`; clamped to `[SCAN_DIST_MIN, SCAN_DIST_MAX]`.
+    scan_dist: i32,
 }
 
 impl App {
     fn new() -> Self {
         let mut engine = Engine::new();
-        // Match fog distance to the renderer's scan distance so the
-        // visible horizon fades into the sky colour instead of
-        // hard-cutting at the scan-dist limit. The fog colour is
-        // the engine's sky colour so the fade blends with the sky
-        // band above the horizon.
-        engine.set_fog(engine.sky_color(), MAX_SCAN_DIST);
+        // Fog disabled — the embedded `assets/sky.png` panorama
+        // provides a far-distance reference. Falls back to voxlap's
+        // blue gradient if the PNG fails to decode.
+        let sky = load_png_sky(SKY_PNG).unwrap_or_else(|e| {
+            eprintln!("sky: PNG decode failed ({e}); falling back to blue gradient");
+            roxlap_core::sky::Sky::blue_gradient()
+        });
+        engine.set_sky(Some(sky));
 
         let scene = build_demo();
         // One slot per render thread. Strip-parallel rendering
@@ -134,6 +189,7 @@ impl App {
             grabbed: false,
             last_frame: Instant::now(),
             capture_pending: false,
+            scan_dist: SCAN_DIST_INITIAL,
         }
     }
 
@@ -172,12 +228,19 @@ impl App {
         }
 
         let mut settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
-        settings.max_scan_dist = MAX_SCAN_DIST;
+        settings.max_scan_dist = self.scan_dist;
         // S4B.5: per-chunk mips generated in scene::bake_lightmode_1.
-        // mip_scan_dist=64 lets rays transition past mip-0 at depth 64
-        // for ~2× FPS lift (76 FPS vs 38 FPS single-mip baseline — see
-        // `repro::bench_full_demo_render_fps`).
-        settings.mip_levels = 4;
+        // Ladder math: `phase_remiporend` halts the ray when
+        // `gmipcnt + 1 >= gmipnum`, with `ngxmax` doubling each
+        // transition from the initial `mip_scan_dist`. So the
+        // hard render-distance ceiling is
+        // `mip_scan_dist * 2^(mip_levels - 1)`. With `mip_levels = 6`
+        // + `mip_scan_dist = 64` the ladder reaches
+        // `64 * 32 = 2048` voxels, matching `SCAN_DIST_MAX`. Below
+        // this only `mip_scan_dist` voxels render at full mip-0
+        // resolution; past it the increasing `max_scan_dist` does
+        // nothing because the ray would Startsky regardless.
+        settings.mip_levels = 6;
         settings.mip_scan_dist = 64;
 
         // Pool config — sky + fog colour. `treat_z_max_as_air` lets
@@ -222,7 +285,7 @@ impl App {
             &self.scene.camera,
             &settings,
             sky,
-            None,
+            self.engine.sky(),
         );
 
         if self.capture_pending {
@@ -377,6 +440,19 @@ impl ApplicationHandler for App {
                         // composites this frame, so the captured PPM
                         // matches what's on screen.
                         self.capture_pending = true;
+                    }
+                    // `+` / `=` (same key on US layout, with or without Shift)
+                    // and the numpad `+` bump scan distance up by
+                    // SCAN_DIST_STEP. Both keys handled so the
+                    // shift-modifier doesn't trip the binding.
+                    KeyCode::Equal | KeyCode::NumpadAdd if pressed => {
+                        self.scan_dist = (self.scan_dist + SCAN_DIST_STEP).min(SCAN_DIST_MAX);
+                        eprintln!("scan_dist = {}", self.scan_dist);
+                    }
+                    // `-` and numpad `-` bump down.
+                    KeyCode::Minus | KeyCode::NumpadSubtract if pressed => {
+                        self.scan_dist = (self.scan_dist - SCAN_DIST_STEP).max(SCAN_DIST_MIN);
+                        eprintln!("scan_dist = {}", self.scan_dist);
                     }
                     KeyCode::Escape if pressed => {
                         if self.grabbed {
