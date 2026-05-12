@@ -572,3 +572,167 @@ fn dump_chunk_tearing_capture_pose() {
         "spawn-pose multi-mip rendered FEWER pixels ({spawn_mips}) than single-mip ({spawn_base}) — chunk-tearing regression?"
     );
 }
+
+/// User-reported S4B.5 thin-black-ring artifact pose under the
+/// saucer (capture 2026-05-12, third report). The user noted these
+/// only appear under the ship — terrain rendered alone is clean.
+/// Hypothesis: the ship-grid's mip-N data has dark voxels somewhere
+/// (averaged from the saucer edge meeting air?) that win the
+/// z-buffer composition against the ground-grid's terrain pixels.
+///
+/// Renders three frames: (1) ship grid alone at mip-N; (2) ground
+/// grid alone at mip-N; (3) full composed scene. Compares
+/// composed-mips with composed-single-mip exact-black drift.
+const RING_POS: [f64; 3] = [
+    65.350_478_161_762_95,
+    100.183_671_604_502_34,
+    43.180_526_662_698_51,
+];
+const RING_YAW: f64 = 1.715_796_326_794_896_6;
+const RING_PITCH: f64 = 0.879_999_999_999_993_2;
+
+#[test]
+#[ignore = "expensive: builds full demo; dumps PPMs for thin-black-ring inspection"]
+fn dump_ring_artifact_pose() {
+    use roxlap_scene::CHUNK_SIZE_XY;
+
+    let mut sc = crate::scene::build_demo();
+    let cam = camera_for_yaw_pitch(RING_POS, RING_YAW, RING_PITCH);
+
+    let mut engine = Engine::new();
+    engine.set_fog(engine.sky_color(), 512);
+    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.max_scan_dist = 512;
+
+    // (1) Composed scene, single-mip
+    let mut fb_base = vec![sky; pixel_count];
+    let mut zb_base = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 1;
+    settings.mip_scan_dist = 4;
+    let _ = render_scene_composed(
+        &mut fb_base,
+        &mut zb_base,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    let base_non_sky = fb_base.iter().filter(|&&p| p != sky).count();
+    write_ppm("/tmp/scene-demo-ring-baseline.ppm", &fb_base);
+    eprintln!("ring pose single-mip composed: non-sky {base_non_sky}");
+
+    // (2) Composed scene, multi-mip
+    let mut fb_mips = vec![sky; pixel_count];
+    let mut zb_mips = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb_mips,
+        &mut zb_mips,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    let mips_non_sky = fb_mips.iter().filter(|&&p| p != sky).count();
+    write_ppm("/tmp/scene-demo-ring-mips.ppm", &fb_mips);
+    eprintln!("ring pose multi-mip composed: non-sky {mips_non_sky}");
+
+    // Count "very dark" pixels (R+G+B < 60) — the artifact is dark
+    // gray/black rings.
+    let dark_count = |fb: &[u32]| -> usize {
+        fb.iter()
+            .filter(|&&p| {
+                let r = (p >> 16) & 0xff;
+                let g = (p >> 8) & 0xff;
+                let b = p & 0xff;
+                r + g + b < 60
+            })
+            .count()
+    };
+    let base_dark = dark_count(&fb_base);
+    let mips_dark = dark_count(&fb_mips);
+    eprintln!("ring pose dark pixels (r+g+b<60): single-mip={base_dark}, multi-mip={mips_dark}");
+
+    assert!(mips_non_sky > 0);
+
+    // (3+4) Isolate by grid: render ground-only and ship-only scenes
+    // at multi-mip to determine which grid contributes the dark rings.
+    let mut ground_only = Scene::new();
+    let id_g = ground_only.add_grid(GridTransform::at(DVec3::ZERO));
+    terrain::build_ground(ground_only.grid_mut(id_g).expect("ground"));
+    // Apply lighting + mips just like build_demo does:
+    crate::scene::bake_lightmode_1_pub(&mut ground_only);
+
+    let mut ship_only = Scene::new();
+    let id_s = ship_only.add_grid(GridTransform::at(DVec3::new(0.0, 500.0, -100.0)));
+    crate::ship::build_ship(ship_only.grid_mut(id_s).expect("ship"));
+    crate::scene::bake_lightmode_1_pub(&mut ship_only);
+
+    let mut fb_g = vec![sky; pixel_count];
+    let mut zb_g = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb_g,
+        &mut zb_g,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut ground_only,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    let g_non_sky = fb_g.iter().filter(|&&p| p != sky).count();
+    write_ppm("/tmp/scene-demo-ring-ground-only.ppm", &fb_g);
+
+    let mut fb_s = vec![sky; pixel_count];
+    let mut zb_s = vec![f32::INFINITY; pixel_count];
+    let _ = render_scene_composed(
+        &mut fb_s,
+        &mut zb_s,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut ship_only,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    let s_non_sky = fb_s.iter().filter(|&&p| p != sky).count();
+    write_ppm("/tmp/scene-demo-ring-ship-only.ppm", &fb_s);
+    eprintln!("ground-only mips: {g_non_sky} non-sky; ship-only mips: {s_non_sky} non-sky");
+
+    // Regression: multi-mip's dark-pixel count should be close to
+    // single-mip's. Big increase = ring artifact returned.
+    let extra_dark = mips_dark.saturating_sub(base_dark);
+    let extra_pct = 100.0 * extra_dark as f64 / pixel_count as f64;
+    assert!(
+        extra_pct < 1.0,
+        "multi-mip introduces {extra_dark} extra dark pixels ({extra_pct:.2}%) — ring artifact?"
+    );
+}

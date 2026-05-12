@@ -116,6 +116,12 @@ impl SceneAndCamera {
 /// `EstNormCache` bit table; the per-chunk loop keeps each cache
 /// at ~135 KB (132²×8 bytes).
 
+/// Diagnostic re-export for `repro.rs` to bake lighting+mips into a
+/// scene it builds itself (ring-artifact isolation tests).
+pub fn bake_lightmode_1_pub(scene: &mut Scene) {
+    bake_lightmode_1(scene);
+}
+
 // chx_v / chy_v are voxlap-canonical paired names.
 #[allow(clippy::cast_possible_wrap, clippy::similar_names)]
 fn bake_lightmode_1(scene: &mut Scene) {

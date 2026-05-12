@@ -149,6 +149,135 @@ fn dump_mip_bytes_for_solid_floor_chunk() {
     }
 }
 
+/// (E) End-to-end: build a SMALL multi-chunk ship-like grid where
+/// some chunks are all-air-plus-bedrock and some have a single
+/// floor voxel near the top, render through it at mip-N from an
+/// OOB-XY camera, and assert no dark pixels appear. This catches
+/// the user-reported "thin black ring walls" mip-N artifact for
+/// the ship grid's all-air perimeter chunks.
+#[test]
+#[ignore = "diagnostic — invoke with --ignored"]
+fn all_air_chunks_mip_n_no_dark_pixels() {
+    use roxlap_core::{
+        opticast::{opticast, OpticastSettings},
+        rasterizer::ScratchPool,
+        scalar_rasterizer::ScalarRasterizer,
+        Camera, ChunkGrid, GridView,
+    };
+
+    // 2×2 grid of chunks. Chunks (0,0) and (1,1) have a "ship" voxel
+    // at z=50; (0,1) and (1,0) are all-air. Mirrors the saucer-edge
+    // situation where most ship chunks have no ship voxels.
+    let mut grid = Grid::new(GridTransform::identity());
+    grid.set_voxel(IVec3::new(10, 10, 50), Some(0x80_88_88_88));
+    grid.set_voxel(IVec3::new(140, 140, 50), Some(0x80_88_88_88));
+    // Force materialise the other two chunks too as all-air.
+    let _ = grid.ensure_chunk(IVec3::new(0, 1, 0));
+    let _ = grid.ensure_chunk(IVec3::new(1, 0, 0));
+
+    // Mip every chunk.
+    let chunk_idxs: Vec<IVec3> = grid.chunks.keys().copied().collect();
+    for idx in &chunk_idxs {
+        let c = grid.chunks.get_mut(idx).unwrap();
+        c.generate_mips(4);
+    }
+
+    // Build Approach B view. Camera OOB-XY (y < 0), looking +y at
+    // the grid from outside.
+    let backing = grid.chunk_xy_backing().expect("at least one chunk");
+    let cg = ChunkGrid {
+        chunks: &backing.chunks,
+        origin_chunk_xy: backing.origin_chunk_xy,
+        chunks_x: backing.chunks_x,
+        chunks_y: backing.chunks_y,
+    };
+    let view = GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
+
+    const XRES: u32 = 320;
+    const YRES: u32 = 240;
+    let mut fb = vec![0u32; (XRES as usize) * (YRES as usize)];
+    let mut zb = vec![f32::INFINITY; fb.len()];
+    let mut pool = ScratchPool::new(XRES, YRES, 2 * CHUNK_SIZE_XY);
+    let sky_color: u32 = 0xff_87_ce_eb;
+    pool.set_skycast(i32::from_ne_bytes(sky_color.to_ne_bytes()), 0);
+    pool.set_treat_z_max_as_air(true);
+    fb.fill(sky_color);
+    let camera = Camera {
+        pos: [128.0, -50.0, 30.0],
+        right: [-1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+    };
+    let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 16;
+    let mut raster = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, view);
+    let _ = opticast(&mut raster, &mut pool, &camera, &settings, view);
+    drop(raster);
+
+    let dark = fb
+        .iter()
+        .filter(|&&p| {
+            let r = (p >> 16) & 0xff;
+            let g = (p >> 8) & 0xff;
+            let b = p & 0xff;
+            r + g + b < 60
+        })
+        .count();
+    let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
+    eprintln!("all-air mip-N render: non-sky {non_sky}, dark {dark}");
+
+    // Dump for visual inspection.
+    let mut ppm = format!("P6\n{XRES} {YRES}\n255\n").into_bytes();
+    for &px in &fb {
+        ppm.push(((px >> 16) & 0xff) as u8);
+        ppm.push(((px >> 8) & 0xff) as u8);
+        ppm.push((px & 0xff) as u8);
+    }
+    std::fs::write("/tmp/all_air_mip_n.ppm", &ppm).expect("write ppm");
+
+    assert_eq!(
+        dark, 0,
+        "all-air multi-chunk mip-N rendered {dark} dark pixels — bedrock placeholder leaking"
+    );
+}
+
+/// (D) Dump bytes of an ALL-AIR chunk (just the bedrock placeholder).
+/// Used to inspect what `generate_mips` does to the bedrock-only
+/// encoding the ship-grid's around-the-saucer chunks have.
+#[test]
+#[ignore = "diagnostic — invoke with --ignored"]
+fn dump_all_air_chunk_mip_bytes() {
+    let mut grid = Grid::new(GridTransform::identity());
+    grid.set_voxel(IVec3::new(0, 0, 0), Some(0x80_88_88_88)); // any voxel to materialise the chunk
+    grid.set_voxel(IVec3::new(0, 0, 0), None); // then unset → back to all air
+    let chunk = grid.chunks.get_mut(&IVec3::ZERO).unwrap();
+
+    let col0_start = chunk.column_offset_for_mip(0)[0] as usize;
+    let col0_len = slng(&chunk.data[col0_start..]);
+    eprintln!("=== ALL-AIR MIP-0 column (0,0): {col0_len} bytes ===");
+    for i in (0..col0_len).step_by(4) {
+        let b = &chunk.data[col0_start + i..col0_start + i + 4];
+        eprintln!("  [{i:4}] {:3} {:3} {:3} {:3}", b[0], b[1], b[2], b[3]);
+    }
+
+    chunk.generate_mips(4);
+    let mip1_start = chunk.column_offset_for_mip(1)[0] as usize;
+    let mip1_len = slng(&chunk.data[mip1_start..]);
+    eprintln!("\n=== ALL-AIR MIP-1 column (0,0): {mip1_len} bytes ===");
+    for i in (0..mip1_len).step_by(4) {
+        let b = &chunk.data[mip1_start + i..mip1_start + i + 4];
+        eprintln!("  [{i:4}] {:3} {:3} {:3} {:3}", b[0], b[1], b[2], b[3]);
+    }
+    let mip2_start = chunk.column_offset_for_mip(2)[0] as usize;
+    let mip2_len = slng(&chunk.data[mip2_start..]);
+    eprintln!("\n=== ALL-AIR MIP-2 column (0,0): {mip2_len} bytes ===");
+    for i in (0..mip2_len).step_by(4) {
+        let b = &chunk.data[mip2_start + i..mip2_start + i + 4];
+        eprintln!("  [{i:4}] {:3} {:3} {:3} {:3}", b[0], b[1], b[2], b[3]);
+    }
+}
+
 /// (C) Same fixture but with an AIR GAP between the surface and
 /// the bedrock so compilerle emits a multi-slab column. If
 /// multi-mip works on this, the bug is specific to single-slab
