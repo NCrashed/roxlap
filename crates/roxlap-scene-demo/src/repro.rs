@@ -322,6 +322,106 @@ fn dump_bug_pose_ppm_for_inspection() {
     eprintln!("wrote /tmp/scene-demo-bug-pose.ppm");
 }
 
+/// User-reported S4B.5 bedrock-mip-leak pose
+/// (capture 2026-05-12, second report).
+/// Looking +y near horizontal at the saucer floating above terrain.
+/// Multi-mip renders a large BLACK region under the ship where the
+/// terrain should be. Hypothesis: the ship chunk's mip-N bedrock
+/// placeholder voxels (z=255) get colour-averaged into the mip-N
+/// table and rendered as black voxels that `treat_z_max_as_air`
+/// doesn't suppress (since it only checks z==255 of mip-0, not the
+/// halved z=127 / 63 / 31 of mip-N).
+const SHIP_BEDROCK_POS: [f64; 3] = [
+    114.033_161_208_257_45,
+    -39.266_620_412_447_05,
+    51.049_406_147_596_84,
+];
+const SHIP_BEDROCK_YAW: f64 = 1.890_796_326_794_889_7;
+const SHIP_BEDROCK_PITCH: f64 = 0.162_500_000_000_000_1;
+
+#[test]
+#[ignore = "expensive: builds full demo; dumps PPM for visual inspection of bedrock-mip-leak"]
+fn dump_bedrock_mip_leak_pose() {
+    use roxlap_scene::CHUNK_SIZE_XY;
+
+    let mut sc = crate::scene::build_demo();
+    let cam = camera_for_yaw_pitch(SHIP_BEDROCK_POS, SHIP_BEDROCK_YAW, SHIP_BEDROCK_PITCH);
+
+    let mut engine = Engine::new();
+    engine.set_fog(engine.sky_color(), 512);
+    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.max_scan_dist = 512;
+
+    let mut fb_base = vec![sky; pixel_count];
+    let mut zb_base = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 1;
+    settings.mip_scan_dist = 4;
+    let _ = render_scene_composed(
+        &mut fb_base,
+        &mut zb_base,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    let base_non_sky = fb_base.iter().filter(|&&p| p != sky).count();
+    let black: u32 = 0xff_00_00_00;
+    let base_black = fb_base.iter().filter(|&&p| p == black).count();
+    write_ppm("/tmp/scene-demo-ship-pose-baseline.ppm", &fb_base);
+    eprintln!(
+        "single-mip ship pose: non-sky {base_non_sky}, exact-black {base_black} / {pixel_count}"
+    );
+
+    let mut fb_mips = vec![sky; pixel_count];
+    let mut zb_mips = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb_mips,
+        &mut zb_mips,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    let mips_non_sky = fb_mips.iter().filter(|&&p| p != sky).count();
+    let mips_black = fb_mips.iter().filter(|&&p| p == black).count();
+    write_ppm("/tmp/scene-demo-ship-pose-mips.ppm", &fb_mips);
+    eprintln!(
+        "multi-mip ship pose:  non-sky {mips_non_sky}, exact-black {mips_black} / {pixel_count}"
+    );
+
+    assert!(base_non_sky > 0);
+    assert!(mips_non_sky > 0);
+    // Regression: multi-mip mustn't introduce a big black region that
+    // wasn't in the single-mip baseline.
+    let extra_black = mips_black.saturating_sub(base_black);
+    let extra_pct = 100.0 * extra_black as f64 / pixel_count as f64;
+    assert!(
+        extra_pct < 1.0,
+        "multi-mip leaks {extra_black} extra exact-black pixels ({extra_pct:.2}%) vs baseline ({base_black}) — bedrock-mip-leak?"
+    );
+}
+
 /// User-reported S4B.5 multi-chunk + multi-mip artifact pose
 /// (capture 2026-05-12, see `roxlap-scene-capture.txt`).
 /// Pre-fix: phantom green strips at chunk boundaries because the

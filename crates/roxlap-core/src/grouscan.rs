@@ -1154,9 +1154,19 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
     // byte-identical (oracle's canonical scene has its bedrock
     // hidden behind terrain that reaches z=255 inside multi-voxel
     // slabs, where z1c < 255).
+    //
+    // S4B.5 mip-N: `generate_mips` halves the bedrock z each level
+    // (`(255+1)>>1 - 1 = 127` at mip-1, then `63`, `31`, …). The
+    // single-byte mip-N column still has the bedrock as a one-voxel
+    // slab at the world bottom; just compare against the mip-shifted
+    // sentinel so multi-mip rendering treats sparse-chunk bedrock as
+    // air the same way mip-0 does. Without this, the SHIP grid's
+    // all-air chunks would render their mip-N bedrock as a black
+    // floor under the saucer (user-reported 2026-05-12).
+    let bedrock_z_at_mip = 0xff_u8 >> (state.gmipcnt as u32);
     if state.scratch.treat_z_max_as_air
         && state.vptr_offset + 1 < state.column.len()
-        && state.column[state.vptr_offset + 1] == 0xff
+        && state.column[state.vptr_offset + 1] == bedrock_z_at_mip
     {
         return Phase::AfterDelete;
     }
