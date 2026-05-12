@@ -573,6 +573,151 @@ fn dump_chunk_tearing_capture_pose() {
     );
 }
 
+/// User-reported S4B.5 green-beam artifact at deep scan_dist
+/// (capture 2026-05-12). At pose (370.70, 47.60, 138.17) with
+/// scan_dist > 700, four thin green columns rise from terrain into
+/// the sky along the world-X / world-Y axes. Dumps PPMs at three
+/// scan distances so the threshold is visible across them.
+const BEAM_POS: [f64; 3] = [
+    370.703_458_908_366_4,
+    47.604_355_604_949_27,
+    138.166_228_693_474_72,
+];
+const BEAM_YAW: f64 = 2.355_796_326_794_885_6;
+const BEAM_PITCH: f64 = -0.490_000_000_000_002_6;
+
+#[test]
+#[ignore = "expensive: builds full demo; dumps green-beam-artifact PPMs"]
+fn dump_green_beam_pose() {
+    use roxlap_core::sky::Sky;
+    use roxlap_scene::CHUNK_SIZE_XY;
+
+    fn blue_sky() -> Sky {
+        Sky::blue_gradient()
+    }
+
+    let mut sc = crate::scene::build_demo();
+    let cam = camera_for_yaw_pitch(BEAM_POS, BEAM_YAW, BEAM_PITCH);
+    let engine = Engine::new();
+    let sky_tex = blue_sky();
+    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 6;
+    settings.mip_scan_dist = 64;
+
+    settings.max_scan_dist = 2047;
+    settings.mip_levels = 6;
+    settings.mip_scan_dist = 64;
+
+    // (a) ground-only + (b) ship-only at the full config.
+    let mut ground_only = Scene::new();
+    let id_g = ground_only.add_grid(GridTransform::at(DVec3::ZERO));
+    terrain::build_ground(ground_only.grid_mut(id_g).expect("ground"));
+    crate::scene::bake_lightmode_1_pub(&mut ground_only);
+    let mut fb_g = vec![sky; pixel_count];
+    let mut zb_g = vec![f32::INFINITY; pixel_count];
+    let _ = render_scene_composed(
+        &mut fb_g,
+        &mut zb_g,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut ground_only,
+        &cam,
+        &settings,
+        sky,
+        Some(&sky_tex),
+    );
+    let g_grass = fb_g
+        .iter()
+        .filter(|&&p| {
+            let r = ((p >> 16) & 0xff) as i32;
+            let g = ((p >> 8) & 0xff) as i32;
+            let b = (p & 0xff) as i32;
+            g > r + 30 && g > b + 30 && (r + g + b) > 100
+        })
+        .count();
+    write_ppm("/tmp/scene-demo-beam-ground-only.ppm", &fb_g);
+    eprintln!("beam pose ground-only: grass {g_grass}");
+
+    let mut ship_only = Scene::new();
+    let id_s = ship_only.add_grid(GridTransform::at(DVec3::new(0.0, 500.0, -100.0)));
+    crate::ship::build_ship(ship_only.grid_mut(id_s).expect("ship"));
+    crate::scene::bake_lightmode_1_pub(&mut ship_only);
+    let mut fb_s = vec![sky; pixel_count];
+    let mut zb_s = vec![f32::INFINITY; pixel_count];
+    let _ = render_scene_composed(
+        &mut fb_s,
+        &mut zb_s,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut ship_only,
+        &cam,
+        &settings,
+        sky,
+        Some(&sky_tex),
+    );
+    let s_grass = fb_s
+        .iter()
+        .filter(|&&p| {
+            let r = ((p >> 16) & 0xff) as i32;
+            let g = ((p >> 8) & 0xff) as i32;
+            let b = (p & 0xff) as i32;
+            g > r + 30 && g > b + 30 && (r + g + b) > 100
+        })
+        .count();
+    write_ppm("/tmp/scene-demo-beam-ship-only.ppm", &fb_s);
+    eprintln!("beam pose ship-only:   grass {s_grass}");
+
+    settings.mip_levels = 6;
+    settings.mip_scan_dist = 64;
+    for msd in [256_i32, 384, 448, 512, 576, 640, 700, 1024] {
+        // `msd` is the SCAN_DIST sweep here, not mip_scan_dist. Local
+        // rename to keep the inner loop body terse.
+        settings.max_scan_dist = msd;
+        let mut fb = vec![sky; pixel_count];
+        let mut zb = vec![f32::INFINITY; pixel_count];
+        let _ = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            W as usize,
+            W,
+            H,
+            &mut pool,
+            &mut sc.scene,
+            &cam,
+            &settings,
+            sky,
+            Some(&sky_tex),
+        );
+        // Count pixels with the grass-green signature
+        // (R+G+B in [200, 380] AND G > R+30 AND G > B+30) — the
+        // beam pixels are pure-ish grass green so this is a cheap
+        // proxy for "beam visible".
+        let mut grass = 0usize;
+        for &px in &fb {
+            let r = ((px >> 16) & 0xff) as i32;
+            let g = ((px >> 8) & 0xff) as i32;
+            let b = (px & 0xff) as i32;
+            if g > r + 30 && g > b + 30 && (r + g + b) > 100 {
+                grass += 1;
+            }
+        }
+        let path = format!("/tmp/scene-demo-beam-scan{msd}.ppm");
+        write_ppm(&path, &fb);
+        eprintln!("ml=6 scan={msd}: grass {grass} / {pixel_count}, wrote {path}");
+    }
+}
+
 /// Visual check: render the demo's spawn pose with the live
 /// demo's settings (fog OFF, checkerboard sky ON, multi-mip ON) so
 /// the multi-mip LOD bands are visible against a patterned sky.

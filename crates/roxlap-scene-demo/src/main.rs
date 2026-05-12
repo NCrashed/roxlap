@@ -39,11 +39,24 @@ const MAX_GRID_VSID: u32 = 32 * roxlap_scene::CHUNK_SIZE_XY;
 /// User can adjust at runtime via `+` / `-` (range
 /// [`SCAN_DIST_MIN`, `SCAN_DIST_MAX`]). Multi-mip absorbs the cost
 /// of larger distances by transitioning distant rays to coarser
-/// chunk LODs — at 1024+ the mip-2/3 voxels dominate the budget
-/// while mip-0 stays sharp near the camera.
-const SCAN_DIST_INITIAL: i32 = 512;
+/// chunk LODs — at 384+ the mip-2 voxels dominate the budget while
+/// mip-0 stays sharp near the camera.
+///
+/// **Why `SCAN_DIST_MAX` < `mip_scan_dist * 2^(mip_levels - 1)`**:
+/// at axis-aligned ray directions (rays exactly parallel to a
+/// world-X / world-Y axis) the multi-mip rendering develops faint
+/// green beams projecting out of the terrain along the world axes
+/// as scan distance grows (user-reported 2026-05-12: noticeable at
+/// 576+, very prominent at 1024+). Root cause is open — likely a
+/// column-step or cf-halving edge case for `gdz[lane]=0`
+/// configurations that surfaces once the ray walks into deeper
+/// mips (mip-3 / mip-4 / mip-5). Capping the slider below the
+/// noticeable threshold avoids the artifact in the showcase; the
+/// full 6-mip ladder stays available for tests that explicitly
+/// exercise it.
+const SCAN_DIST_INITIAL: i32 = 384;
 const SCAN_DIST_MIN: i32 = 64;
-const SCAN_DIST_MAX: i32 = 2047;
+const SCAN_DIST_MAX: i32 = 512;
 const SCAN_DIST_STEP: i32 = 64;
 
 /// Cap for `rayon`'s strip-parallel pool. Voxlap's per-strip

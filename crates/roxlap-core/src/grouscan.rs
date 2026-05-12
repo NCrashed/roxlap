@@ -801,16 +801,6 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
     // Voxlap5.c:11646-11648. dv1 = v[1] = top of floor-colour list.
     let dv1 = i32::from(state.column[state.vptr_offset + 1]);
 
-    // S4B.5 mip-N bedrock guard. Mirror of the `treat_z_max_as_air`
-    // check in `phase_draw_flor`. The cf-halving rounds `z1` UP
-    // (`(z1+1)>>1` per voxlap5.c:12085), so a mip-1 cf entry seeded
-    // from `z1=255` carries `z1=128` while the mip-1 slab data has
-    // `z1=127` (one voxel off). drawfwall's `dv1 >= z1` check then
-    // fails by 1 at the bedrock slab, the front-wall loop runs, and
-    // paints the bedrock placeholder colour (0,0,0,0) into the
-    // radar. Suppressing the bedrock here keeps the ship-grid's
-    // all-air perimeter chunks invisible at mip-N (user-reported
-    // thin-black-ring artifact, 2026-05-12).
     let bedrock_z_at_mip = 0xff_u8 >> (state.gmipcnt as u32);
     if state.scratch.treat_z_max_as_air && (dv1 as u8) == bedrock_z_at_mip {
         return Phase::DrawCwall;

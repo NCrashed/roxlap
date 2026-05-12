@@ -149,6 +149,59 @@ fn dump_mip_bytes_for_solid_floor_chunk() {
     }
 }
 
+/// (F) Dump mip-5 bytes of a chunk where terrain reaches z=254
+/// (one voxel below the bedrock z=255). At mip-5 both terrain top
+/// and bedrock placeholder end up at the same z (7), which can
+/// trip my bedrock-z-suppression check in `phase_draw_flor`.
+#[test]
+#[ignore = "diagnostic — invoke with --ignored"]
+fn dump_terrain_reaches_z_254_mip5() {
+    let mut grid = Grid::new(GridTransform::identity());
+    // Terrain z=100..254 + bedrock placeholder at z=255.
+    grid.set_rect(
+        IVec3::new(0, 0, 100),
+        IVec3::new((CHUNK_SIZE_XY - 1) as i32, (CHUNK_SIZE_XY - 1) as i32, 254),
+        Some(0x80_88_88_88),
+    );
+    let chunk = grid.chunks.get_mut(&IVec3::ZERO).unwrap();
+    chunk.generate_mips(6);
+
+    for level in 0..6 {
+        let off = chunk.column_offset_for_mip(level)[0] as usize;
+        let len = slng(&chunk.data[off..]);
+        eprintln!("=== MIP-{level} column (0,0): {len} bytes ===");
+        for i in (0..len).step_by(4) {
+            let b = &chunk.data[off + i..off + i + 4];
+            eprintln!("  [{i:4}] {:3} {:3} {:3} {:3}", b[0], b[1], b[2], b[3]);
+        }
+    }
+}
+
+/// (G) Realistic ground-chunk-like fixture: terrain at z=200..254
+/// (surface at z=200, bedrock at z=255, air above). Replicates the
+/// demo's flat-terrain columns to see how mip-N encodes them.
+#[test]
+#[ignore = "diagnostic — invoke with --ignored"]
+fn dump_realistic_ground_column_mips() {
+    let mut grid = Grid::new(GridTransform::identity());
+    grid.set_rect(
+        IVec3::new(0, 0, 200),
+        IVec3::new((CHUNK_SIZE_XY - 1) as i32, (CHUNK_SIZE_XY - 1) as i32, 254),
+        Some(0x80_44_e0_44), // green-ish (matches demo grass)
+    );
+    let chunk = grid.chunks.get_mut(&IVec3::ZERO).unwrap();
+    chunk.generate_mips(6);
+    for level in 0..6 {
+        let off = chunk.column_offset_for_mip(level)[0] as usize;
+        let len = slng(&chunk.data[off..]);
+        eprintln!("=== MIP-{level} column (0,0): {len} bytes ===");
+        for i in (0..len).step_by(4) {
+            let b = &chunk.data[off + i..off + i + 4];
+            eprintln!("  [{i:4}] {:3} {:3} {:3} {:3}", b[0], b[1], b[2], b[3]);
+        }
+    }
+}
+
 /// (E) End-to-end: build a SMALL multi-chunk ship-like grid where
 /// some chunks are all-air-plus-bedrock and some have a single
 /// floor voxel near the top, render through it at mip-N from an
