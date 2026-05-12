@@ -274,6 +274,17 @@ pub(crate) struct GrouscanState<'a> {
     /// `lane` and `sign(gixy[lane])`.
     pub cx: i32,
     pub cy: i32,
+    /// Mip-N voxel coords; identical to `(cx, cy)` until the first
+    /// `phase_remiporend` halves them. `cx_mip`/`cy_mip` advance by
+    /// `±1` per column step in mip-N (one mip-N voxel) while `cx`/`cy`
+    /// keep advancing by `±1` per step (which is geometrically wrong
+    /// in mip-N — they'd represent one mip-N column-step's worth of
+    /// motion, not one mip-N voxel). The column step uses `cx`/`cy`
+    /// at mip-0 (so the OOB check works against `vsid_signed` in
+    /// mip-0 voxel units) and `cx_mip`/`cy_mip` at mip-N (so chunk
+    /// boundary detection and `correct_idx` use mip-N voxel units).
+    pub cx_mip: i32,
+    pub cy_mip: i32,
     /// `vsid as i32`, cached so the OOB check in the column-step
     /// path doesn't re-cast every iteration. Mip transitions rescale
     /// this — see [`phase_remiporend`].
@@ -395,6 +406,8 @@ impl<'a> GrouscanState<'a> {
             ixy_sptr_col_idx,
             cx,
             cy,
+            cx_mip: cx,
+            cy_mip: cy,
             #[allow(clippy::cast_possible_wrap)]
             vsid_signed: inputs.vsid as i32,
             gmipcnt: 0,
@@ -1313,11 +1326,16 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     //
     // gixy[0] = ±1 (one x-column step) when lane=0; gixy[1] = ±vsid
     // (one y-column step) when lane=1. The `signum` recovers the
-    // ±1 cx/cy increment.
+    // ±1 cx/cy increment. In mip-N the mip-0 `cx`/`cy` advance is
+    // geometrically wrong (one column step = one mip-N voxel = 2^N
+    // mip-0 voxels) but the values are unused — the mip-N branch
+    // below uses `cx_mip`/`cy_mip` instead.
     if state.lane == 0 {
         state.cx += state.scratch.gixy[0].signum();
+        state.cx_mip += state.scratch.gixy[0].signum();
     } else {
         state.cy += state.scratch.gixy[1].signum();
+        state.cy_mip += state.scratch.gixy[1].signum();
     }
 
     // S4B.2.b: chunk-XY boundary detection + swap. Two code paths
@@ -1338,33 +1356,65 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     //   previous chunk and mark `current_chunk_exists = false` so
     //   the column refresh resolves to `&[]`.
     //
-    // S4B.2.b used `chunk_size_xy == vsid` as the gate; that's
-    // wrong for multi-chunk callers where the per-chunk vsid
-    // equals chunk_size_xy and the gate routes them onto the
-    // single-chunk path. `chunk_grid.is_none()` is unambiguous.
-    //
-    // The branch is on a value constant per gline call (the grid
-    // shape doesn't change mid-ray) so the predictor memoises it.
+    // S4B.5 multi-mip: in mip-N (gmipcnt > 0) the column-step uses
+    // `cx_mip`/`cy_mip` instead of `cx`/`cy`. `mip_base_offsets[gmipcnt]`
+    // pins the chunk's mip-N sub-table; `vsid_at_mip = chunk_size_xy
+    // >> gmipcnt` is the mip-N stride; chunk crossings are detected
+    // when `cx_mip / chunk_size_at_mip` changes. Voxlap-C tracks the
+    // equivalent state via `gxmipk`/`gymipk` masks on raw `esi`
+    // (LP32-baked); our port re-derives the same indices from
+    // explicit mip-N voxel coords for portability + multi-chunk.
     if state.grid_view.chunk_grid.is_none() {
-        // Single-chunk: pre-S4B.2.b column refresh, unchanged.
-        let in_bounds = state.cx >= 0
-            && state.cy >= 0
-            && state.cx < state.vsid_signed
-            && state.cy < state.vsid_signed;
-        if in_bounds {
-            #[allow(clippy::cast_sign_loss)]
-            let correct_idx = (state.cy as u32)
-                .wrapping_mul(state.vsid)
-                .wrapping_add(state.cx as u32) as usize;
-            state.ixy_sptr_col_idx = correct_idx;
-            if let Some(&col_off) = state.column_offsets.get(correct_idx) {
-                let off = col_off as usize;
-                if off <= state.slab_buf.len() {
-                    state.column = &state.slab_buf[off..];
+        // Single-chunk: pre-S4B.2.b column refresh, with a mip-N
+        // branch that derives the in-chunk mip-N column index from
+        // (cx_mip, cy_mip).
+        if state.gmipcnt > 0 {
+            let gmip = state.gmipcnt as u32;
+            let chunk_size_at_mip = (state.chunk_size_xy >> gmip) as i32;
+            let mip_base = state.mip_base_offsets[state.gmipcnt as usize];
+            let in_bounds = state.cx_mip >= 0
+                && state.cy_mip >= 0
+                && state.cx_mip < chunk_size_at_mip
+                && state.cy_mip < chunk_size_at_mip;
+            if in_bounds {
+                #[allow(clippy::cast_sign_loss)]
+                let correct_idx = mip_base
+                    + ((state.cy_mip as u32) * (chunk_size_at_mip as u32) + (state.cx_mip as u32))
+                        as usize;
+                state.ixy_sptr_col_idx = correct_idx;
+                if let Some(&col_off) = state.column_offsets.get(correct_idx) {
+                    let off = col_off as usize;
+                    if off <= state.slab_buf.len() {
+                        state.column = &state.slab_buf[off..];
+                    } else {
+                        state.column = &[];
+                    }
+                } else {
+                    state.column = &[];
                 }
+            } else {
+                state.column = &[];
             }
         } else {
-            state.column = &[];
+            let in_bounds = state.cx >= 0
+                && state.cy >= 0
+                && state.cx < state.vsid_signed
+                && state.cy < state.vsid_signed;
+            if in_bounds {
+                #[allow(clippy::cast_sign_loss)]
+                let correct_idx = (state.cy as u32)
+                    .wrapping_mul(state.vsid)
+                    .wrapping_add(state.cx as u32) as usize;
+                state.ixy_sptr_col_idx = correct_idx;
+                if let Some(&col_off) = state.column_offsets.get(correct_idx) {
+                    let off = col_off as usize;
+                    if off <= state.slab_buf.len() {
+                        state.column = &state.slab_buf[off..];
+                    }
+                }
+            } else {
+                state.column = &[];
+            }
         }
     } else {
         // Multi-chunk: detect chunk-XY boundary, swap on transition.
@@ -1377,45 +1427,100 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
         // `div_euclid`; the `& mask` always lands in
         // `[0, chunk_size_xy)` regardless of sign, matching
         // `rem_euclid`.
-        let log2 = state.chunk_size_xy_log2;
-        let mask = state.chunk_size_xy_mask;
-        let new_chunk_xy = [state.cx >> log2, state.cy >> log2];
-        if new_chunk_xy != state.current_chunk_idx_xy {
-            state.current_chunk_idx_xy = new_chunk_xy;
-            if let Some(new_chunk) = state.grid_view.chunk_at_xy(new_chunk_xy) {
-                state.slab_buf = new_chunk.slab_buf;
-                state.column_offsets = new_chunk.column_offsets;
-                state.mip_base_offsets = new_chunk.mip_base_offsets;
-                state.vsid = new_chunk.vsid;
-                #[allow(clippy::cast_possible_wrap)]
-                {
-                    state.vsid_signed = new_chunk.vsid as i32;
+        if state.gmipcnt > 0 {
+            // S4B.5 mip-N path. `(cx_mip, cy_mip)` are mip-N voxel
+            // coords; the chunk index is the SAME under mip-0 and
+            // mip-N (chunks live at fixed world positions; mip
+            // levels are just sub-tables inside the chunk).
+            // `cx_mip >> log2(chunk_size_at_mip) = chunk_xy`.
+            let gmip = state.gmipcnt as u32;
+            let chunk_size_at_mip = (state.chunk_size_xy >> gmip) as i32;
+            // chunk_size_xy is power-of-two, so chunk_size_at_mip is too.
+            let chunk_size_at_mip_mask = chunk_size_at_mip - 1;
+            let chunk_size_at_mip_log2 = state.chunk_size_xy_log2 - gmip;
+            let new_chunk_xy = [
+                state.cx_mip >> chunk_size_at_mip_log2,
+                state.cy_mip >> chunk_size_at_mip_log2,
+            ];
+            if new_chunk_xy != state.current_chunk_idx_xy {
+                state.current_chunk_idx_xy = new_chunk_xy;
+                if let Some(new_chunk) = state.grid_view.chunk_at_xy(new_chunk_xy) {
+                    state.slab_buf = new_chunk.slab_buf;
+                    state.column_offsets = new_chunk.column_offsets;
+                    state.mip_base_offsets = new_chunk.mip_base_offsets;
+                    state.vsid = new_chunk.vsid;
+                    #[allow(clippy::cast_possible_wrap)]
+                    {
+                        state.vsid_signed = new_chunk.vsid as i32;
+                    }
+                    state.current_chunk_exists = true;
+                } else {
+                    state.current_chunk_exists = false;
                 }
-                state.current_chunk_exists = true;
-            } else {
-                state.current_chunk_exists = false;
             }
-        }
-
-        // Chunk-local coords via mask. `local_cx` is in
-        // `[0, chunk_size_xy)` for any signed `cx`, so the prior
-        // explicit range checks are redundant.
-        if state.current_chunk_exists {
-            let local_cx = state.cx & mask;
-            let local_cy = state.cy & mask;
-            #[allow(clippy::cast_sign_loss)]
-            let correct_idx = (local_cy as u32)
-                .wrapping_mul(state.chunk_size_xy)
-                .wrapping_add(local_cx as u32) as usize;
-            state.ixy_sptr_col_idx = correct_idx;
-            if let Some(&col_off) = state.column_offsets.get(correct_idx) {
-                let off = col_off as usize;
-                if off <= state.slab_buf.len() {
-                    state.column = &state.slab_buf[off..];
+            if state.current_chunk_exists {
+                let local_cx_mip = state.cx_mip & chunk_size_at_mip_mask;
+                let local_cy_mip = state.cy_mip & chunk_size_at_mip_mask;
+                let mip_base = state.mip_base_offsets[state.gmipcnt as usize];
+                #[allow(clippy::cast_sign_loss)]
+                let correct_idx = mip_base
+                    + ((local_cy_mip as u32) * (chunk_size_at_mip as u32) + (local_cx_mip as u32))
+                        as usize;
+                state.ixy_sptr_col_idx = correct_idx;
+                if let Some(&col_off) = state.column_offsets.get(correct_idx) {
+                    let off = col_off as usize;
+                    if off <= state.slab_buf.len() {
+                        state.column = &state.slab_buf[off..];
+                    } else {
+                        state.column = &[];
+                    }
+                } else {
+                    state.column = &[];
                 }
+            } else {
+                state.column = &[];
             }
         } else {
-            state.column = &[];
+            let log2 = state.chunk_size_xy_log2;
+            let mask = state.chunk_size_xy_mask;
+            let new_chunk_xy = [state.cx >> log2, state.cy >> log2];
+            if new_chunk_xy != state.current_chunk_idx_xy {
+                state.current_chunk_idx_xy = new_chunk_xy;
+                if let Some(new_chunk) = state.grid_view.chunk_at_xy(new_chunk_xy) {
+                    state.slab_buf = new_chunk.slab_buf;
+                    state.column_offsets = new_chunk.column_offsets;
+                    state.mip_base_offsets = new_chunk.mip_base_offsets;
+                    state.vsid = new_chunk.vsid;
+                    #[allow(clippy::cast_possible_wrap)]
+                    {
+                        state.vsid_signed = new_chunk.vsid as i32;
+                    }
+                    state.current_chunk_exists = true;
+                } else {
+                    state.current_chunk_exists = false;
+                }
+            }
+
+            // Chunk-local coords via mask. `local_cx` is in
+            // `[0, chunk_size_xy)` for any signed `cx`, so the prior
+            // explicit range checks are redundant.
+            if state.current_chunk_exists {
+                let local_cx = state.cx & mask;
+                let local_cy = state.cy & mask;
+                #[allow(clippy::cast_sign_loss)]
+                let correct_idx = (local_cy as u32)
+                    .wrapping_mul(state.chunk_size_xy)
+                    .wrapping_add(local_cx as u32) as usize;
+                state.ixy_sptr_col_idx = correct_idx;
+                if let Some(&col_off) = state.column_offsets.get(correct_idx) {
+                    let off = col_off as usize;
+                    if off <= state.slab_buf.len() {
+                        state.column = &state.slab_buf[off..];
+                    }
+                }
+            } else {
+                state.column = &[];
+            }
         }
     }
     // Voxlap's `v = *ixy_sptr_col` resets v to the new column's
@@ -1912,6 +2017,21 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
 
     // Voxlap5.c:12079 — halve gixy[1] (signed arithmetic shift).
     state.scratch.gixy[1] >>= 1;
+
+    // Roxlap multi-chunk + multi-mip: halve `cx_mip`/`cy_mip` so they
+    // track mip-NEW voxel coords. The column-step's mip-N branch
+    // advances them by `±1` per step (one mip-N voxel) and derives
+    // both chunk-XY index and the in-chunk mip-N column offset from
+    // them. Voxlap C doesn't carry this state — it tracks `esi` as a
+    // raw pointer through `gxmipk`/`gymipk` masks (LP32-baked); our
+    // port re-derives the same indices from explicit voxel coords.
+    //
+    // Signed arithmetic shift: `>> 1` rounds toward negative infinity,
+    // mirroring two-voxel-merge geometry for both positive and
+    // negative coords. (OOB-XY camera can reach mip-N with negative
+    // `cx`/`cy`; the multi-mip path handles that.)
+    state.cx_mip >>= 1;
+    state.cy_mip >>= 1;
 
     // Voxlap5.c:12084-12087 — halve every active cf entry's z bounds.
     // z0 uses unsigned shift (rounds down, preserves voxlap's `shr`

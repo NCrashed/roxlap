@@ -178,13 +178,16 @@ fn bake_lightmode_1(scene: &mut Scene) {
             );
         }
 
-        // NOTE (S4B.5 2026-05-11): multi-mip wiring was attempted
-        // here but reverted because `phase_remiporend`'s cf-halving
-        // produces all-sky frames at the demo's terrain scale for
-        // any usable `mip_scan_dist`. See
-        // `project_s4b_5_investigation.md` + diagnostic test
-        // `crates/roxlap-scene/tests/mip_repro.rs`. Deferred until
-        // the voxlap-C `genmipremip` audit lands the algorithmic
-        // fix.
+        // S4B.5 (2026-05-12): generate per-chunk mips after the
+        // lighting bake. The rasterizer reads mip-0 only when
+        // settings.mip_levels = 1, ignoring the appended mip-1+
+        // sub-tables.
+        for chunk_idx in &chunk_idxs {
+            if chunk_idx.z != 0 {
+                continue;
+            }
+            let chunk = grid.chunks.get_mut(chunk_idx).expect("populated");
+            chunk.generate_mips(4);
+        }
     }
 }

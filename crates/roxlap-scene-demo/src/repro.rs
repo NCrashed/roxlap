@@ -254,6 +254,17 @@ fn bench_full_demo_render_fps() {
         .ok()
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(DEMO_MAX_SCAN_DIST);
+    // S4B.5: chunks are mipped (`generate_mips(4)` in scene::bake_lightmode_1).
+    // Sweep mip_scan_dist via BENCH_MIP_SCAN_DIST; set to a value ≥ max_scan_dist
+    // to disable transitions (single-mip baseline).
+    settings.mip_levels = std::env::var("BENCH_MIP_LEVELS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(4);
+    settings.mip_scan_dist = std::env::var("BENCH_MIP_SCAN_DIST")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(64);
 
     // One warmup frame so cache populates + jit-y bits settle.
     let _ = render_scene_composed(
@@ -309,4 +320,155 @@ fn dump_bug_pose_ppm_for_inspection() {
     let fb = render_pose(&mut scene, &cam);
     write_ppm("/tmp/scene-demo-bug-pose.ppm", &fb);
     eprintln!("wrote /tmp/scene-demo-bug-pose.ppm");
+}
+
+/// User-reported S4B.5 multi-chunk + multi-mip artifact pose
+/// (capture 2026-05-12, see `roxlap-scene-capture.txt`).
+/// Pre-fix: phantom green strips at chunk boundaries because the
+/// mip-N column-step pinned to the camera's chunk and wrapped its
+/// data across neighbouring chunks. Post-fix: `cx_mip`/`cy_mip`
+/// track mip-N voxel coords and trigger proper chunk-XY swaps in
+/// the mip-N branch of `phase_after_delete_kept_presync`.
+///
+/// Renders the full 32×32 ground + ship at multi-mip msd=64 and
+/// dumps PPM to /tmp/. Manual visual inspection — assertion is
+/// only "non-zero non-sky pixels", correctness is eyeballed.
+#[test]
+#[ignore = "expensive: builds full 32×32 demo (~3-5 s); use --ignored to dump capture pose"]
+fn dump_chunk_tearing_capture_pose() {
+    use roxlap_scene::CHUNK_SIZE_XY;
+
+    const CAP_POS: [f64; 3] = [
+        -474.287_937_724_851_3,
+        -464.324_076_691_379_5,
+        -57.843_548_692_727_964,
+    ];
+    const CAP_YAW: f64 = -5.694_203_673_205_082;
+    const CAP_PITCH: f64 = 1.282_499_999_999_981_8;
+
+    let mut sc = crate::scene::build_demo();
+    let cam = camera_for_yaw_pitch(CAP_POS, CAP_YAW, CAP_PITCH);
+    eprintln!("capture cam right: {:?}", cam.right);
+    eprintln!("capture cam down: {:?}", cam.down);
+    eprintln!("capture cam forward: {:?}", cam.forward);
+
+    let mut engine = Engine::new();
+    engine.set_fog(engine.sky_color(), 512);
+    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.max_scan_dist = 512;
+    // First render with mips on (the case the user reported broken).
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb,
+        &mut zb,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    let non_sky_mips = fb.iter().filter(|&&p| p != sky).count();
+    write_ppm("/tmp/scene-demo-capture-pose-mips.ppm", &fb);
+    eprintln!(
+        "wrote /tmp/scene-demo-capture-pose-mips.ppm — mips=4 msd=64 non-sky {non_sky_mips}/{pixel_count} ({:.1}%)",
+        100.0 * non_sky_mips as f64 / pixel_count as f64
+    );
+
+    // Second render without mips (baseline / ground truth).
+    let mut fb2 = vec![sky; pixel_count];
+    let mut zb2 = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 1;
+    settings.mip_scan_dist = 4;
+    let _ = render_scene_composed(
+        &mut fb2,
+        &mut zb2,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    let non_sky_base = fb2.iter().filter(|&&p| p != sky).count();
+    write_ppm("/tmp/scene-demo-capture-pose-baseline.ppm", &fb2);
+    eprintln!(
+        "wrote /tmp/scene-demo-capture-pose-baseline.ppm — single-mip non-sky {non_sky_base}/{pixel_count} ({:.1}%)",
+        100.0 * non_sky_base as f64 / pixel_count as f64
+    );
+
+    // Also render at SPAWN pose (single-mip + multi-mip) — a known-
+    // working pose. Compare counts to verify multi-mip doesn't drift
+    // wildly from single-mip there.
+    let mut fb_s_base = vec![sky; pixel_count];
+    let mut zb_s_base = vec![f32::INFINITY; pixel_count];
+    let mut fb_s_mips = vec![sky; pixel_count];
+    let mut zb_s_mips = vec![f32::INFINITY; pixel_count];
+    let spawn_cam = sc.camera;
+    settings.mip_levels = 1;
+    settings.mip_scan_dist = 4;
+    let _ = render_scene_composed(
+        &mut fb_s_base,
+        &mut zb_s_base,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &spawn_cam,
+        &settings,
+        sky,
+        None,
+    );
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb_s_mips,
+        &mut zb_s_mips,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &spawn_cam,
+        &settings,
+        sky,
+        None,
+    );
+    let spawn_base = fb_s_base.iter().filter(|&&p| p != sky).count();
+    let spawn_mips = fb_s_mips.iter().filter(|&&p| p != sky).count();
+    eprintln!("spawn pose: single-mip non-sky {spawn_base}/{pixel_count}");
+    eprintln!("spawn pose: multi-mip non-sky {spawn_mips}/{pixel_count}");
+    write_ppm("/tmp/scene-demo-spawn-pose-baseline.ppm", &fb_s_base);
+    write_ppm("/tmp/scene-demo-spawn-pose-mips.ppm", &fb_s_mips);
+
+    assert!(non_sky_mips > 0, "capture pose rendered all-sky");
+    assert!(spawn_base > 0, "spawn pose single-mip rendered all-sky");
+    assert!(spawn_mips > 0, "spawn pose multi-mip rendered all-sky");
+    // Multi-mip typically renders MORE non-sky pixels than single-mip
+    // because mip-N rays reach farther into terrain without fog cutoff.
+    // We only sanity-check the non-zero pixel count + visually inspect
+    // the PPMs to confirm no chunk-edge tearing returns.
+    assert!(
+        spawn_mips >= spawn_base,
+        "spawn-pose multi-mip rendered FEWER pixels ({spawn_mips}) than single-mip ({spawn_base}) — chunk-tearing regression?"
+    );
 }

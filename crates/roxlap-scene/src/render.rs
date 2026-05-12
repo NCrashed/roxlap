@@ -762,18 +762,20 @@ mod tests {
 
     /// Pin the byte-exact FNV-1a64 of a 2-chunk render. Catches
     /// any drift in the cross-chunk stitch / opticast path.
-    /// Refreeze the hash if a deliberate change to the rendering
-    /// pipeline lands; the seam test above is the
-    /// look-and-feel-correct check.
-    /// Multi-mip rendering on a chunk-`vsid` (=128) `Vxl` built
-    /// via the edit API surfaces an all-sky frame even though
-    /// the oracle `multi_mip` test (`vsid=2048`, parsed VXL)
-    /// renders correctly. Open question, see scene-demo's
-    /// `scene::bake_lightmode_1` note. Ignored until the
-    /// interaction between the edit pipeline's slab format and
-    /// `phase_remiporend` at small `vsid` is understood.
+    /// S4B.5: regression test for the cf-halving + column-step
+    /// interaction at chunk-vsid (=128) under multi-mip rendering.
+    /// Prior to the fix in `grouscan.rs:phase_after_delete_kept_presync`
+    /// the single-chunk column-step recomputed `ixy_sptr_col_idx`
+    /// from `cy * vsid + cx`, mapping the post-remiporend mip-N
+    /// sub-table index back into mip-0's range. The next mip
+    /// transition then underflowed at
+    /// `state.ixy_sptr_col_idx - mip_base_offsets[old_mip]`.
+    ///
+    /// `mip_scan_dist=32` chosen so the 3-mip depth ladder
+    /// (32→64→128 PREC scan budgets) reaches the floor 36 voxels
+    /// away at mip-1 or mip-2 — exercising the post-transition
+    /// rendering path that was broken pre-fix.
     #[test]
-    #[ignore = "all-sky regression at chunk-vsid mip rendering — see scene-demo scene::bake_lightmode_1 comment"]
     fn vxl_generate_mips_on_set_voxel_chunk_renders() {
         let mut grid = crate::Grid::new(GridTransform::identity());
         // Solid floor at z=100..254 across the entire chunk —
@@ -788,13 +790,10 @@ mod tests {
         let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
-        // Camera south of the box (same pose as the
-        // `render_scene_at_origin_matches_direct_opticast` test
-        // which renders the box correctly mip-0-only).
         let camera = camera_at([64.0, 0.0, 64.0]);
         let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         settings.mip_levels = 3;
-        settings.mip_scan_dist = 4;
+        settings.mip_scan_dist = 32;
         let grid_view = roxlap_core::GridView::from_single_vxl(&chunk);
         let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
         let _ = core_opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
@@ -802,7 +801,7 @@ mod tests {
         let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
         assert!(
             non_sky > 0,
-            "Vxl::generate_mips on a set_voxel-built chunk should render to something non-sky"
+            "Vxl::generate_mips on a set_voxel-built chunk should render to something non-sky (got {non_sky})"
         );
     }
 

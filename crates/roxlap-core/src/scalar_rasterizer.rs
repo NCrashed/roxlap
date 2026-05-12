@@ -644,14 +644,17 @@ impl Rasterizer for ScalarRasterizer<'_> {
             sky: self.sky.map(crate::grouscan::SkyRef::from_sky),
             grid_view: self.grid,
         };
-        // gmipnum = number of built mip levels. R4.5d's
-        // `phase_remiporend` body will start incrementing
-        // `state.gmipcnt` once gmipnum > 1 and the column step's
-        // `gpz > ngxmax` overflow fires; until then a multi-mip
-        // world simply renders mip-0 only, byte-stable with the
-        // single-mip path.
-        let gmipnum = u32::try_from(self.grid.mip_base_offsets.len().saturating_sub(1))
+        // gmipnum: min of (built mip levels in chunk) and
+        // (caller-requested cap from settings.mip_levels). Both
+        // matter — the chunk dictates whether mip-N data exists,
+        // while the cap dictates how big y_lookup is. Mismatch
+        // would let `phase_remiporend` advance gylookup past its
+        // tail and read garbage offsets. R4.5d's body still gates
+        // on `state.gmipcnt < gmipnum` so a chunk with no mips
+        // takes the early-out and renders mip-0 only.
+        let chunk_mips = u32::try_from(self.grid.mip_base_offsets.len().saturating_sub(1))
             .expect("mip count fits in u32");
+        let gmipnum = chunk_mips.min(cache.prelude.mip_levels).max(1);
         let _ = grouscan_run(
             scratch,
             &inputs,
@@ -660,7 +663,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
             cache.prelude.cx,
             cache.prelude.cy,
             cache.prelude.x_mip,
-            gmipnum.max(1),
+            gmipnum,
         );
 
         // gscanptr is advanced by the opticast quadrant scan

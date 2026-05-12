@@ -48,6 +48,13 @@ pub struct OpticastPrelude {
     pub pos_yfrac: [f32; 2],
     pub pos_z: i32,
     pub y_lookup: Vec<i32>,
+    /// Caller-requested mip-level cap (voxlap's `gmipnum`). The
+    /// y_lookup table is sized for exactly this many levels, so the
+    /// rasterizer must clamp to it when passing `gmipnum` to grouscan
+    /// — even when the underlying chunk's `mip_base_offsets` carries
+    /// more levels (e.g. a pre-baked chunk read by a single-mip
+    /// renderer would otherwise OOB-read y_lookup at mip transition).
+    pub mip_levels: u32,
     pub x_mip: i32,
     pub max_scan_dist: i32,
     /// S1.Z: signed integer column coordinates of the camera. For
@@ -193,6 +200,7 @@ pub fn derive_prelude(
         pos_yfrac,
         pos_z,
         y_lookup,
+        mip_levels,
         x_mip,
         max_scan_dist: max_scan_dist_clamped,
         cx,

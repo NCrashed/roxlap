@@ -1,7 +1,19 @@
-//! S4B.5: characterise the compilerle / generate_mips interaction
-//! that makes edit-API-built chunks render all-sky when rendered
-//! through mip-1+. Dump the slab bytes pre- / post-generate_mips
-//! for a known-broken fixture so the diagnosis is text-greppable.
+//! S4B.5: diagnostic dump for the multi-mip column-step bug
+//! (fixed 2026-05-12 — see `grouscan.rs::phase_after_delete_kept_presync`).
+//!
+//! Hypothesis pre-fix was that `phase_remiporend`'s cf-halving was
+//! the bug; the actual cause was the single-chunk column-step's
+//! `cy * vsid + cx` index recompute clobbering `ixy_sptr_col_idx`
+//! back into mip-0's sub-table after each step in mip-N. Fix is
+//! to trust the `wrapping_add(step)` result in mip-N (gmipcnt > 0).
+//!
+//! Reading from low to high `mip_scan_dist` shows the expected
+//! shape: at msd small enough that the 3-mip depth ladder
+//! (msd → 2·msd → 4·msd) can't reach the floor, no pixels render
+//! (this is correct; the budget is exhausted before geometry).
+//! At higher msd, mip transitions still fire but the floor is
+//! reachable at mip-1 / mip-2 and the rendered pixel count
+//! climbs to the mip-0 baseline (21775 for the solid-floor fixture).
 
 use glam::IVec3;
 use roxlap_formats::vxl::slng;
@@ -90,7 +102,7 @@ fn dump_mip_bytes_for_solid_floor_chunk() {
         "    grid_view.mip_base_offsets.len() = {}",
         grid_view_check.mip_base_offsets.len()
     );
-    drop(grid_view_check);
+    let _ = grid_view_check;
 
     // Hypothesis: mip-N halves z coords, so a camera at z=64 (above
     // the mip-0 floor z=100..254 → in air) lands at z=64 in the mip-1

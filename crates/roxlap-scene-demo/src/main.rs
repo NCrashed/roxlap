@@ -173,6 +173,12 @@ impl App {
 
         let mut settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
         settings.max_scan_dist = MAX_SCAN_DIST;
+        // S4B.5: per-chunk mips generated in scene::bake_lightmode_1.
+        // mip_scan_dist=64 lets rays transition past mip-0 at depth 64
+        // for ~2× FPS lift (76 FPS vs 38 FPS single-mip baseline — see
+        // `repro::bench_full_demo_render_fps`).
+        settings.mip_levels = 4;
+        settings.mip_scan_dist = 64;
 
         // Pool config — sky + fog colour. `treat_z_max_as_air` lets
         // the ship grid render correctly even though the camera is
