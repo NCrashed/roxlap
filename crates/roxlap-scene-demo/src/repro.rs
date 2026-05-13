@@ -718,6 +718,125 @@ fn dump_green_beam_pose() {
     }
 }
 
+/// Precise beam-pixel finder: render the SAME scene + camera with
+/// `mip_levels=1` (baseline = no transitions) and `mip_levels=6
+/// mip_scan_dist=64` (live config). A pixel that is SKY in the
+/// baseline frame but has terrain colour in the multi-mip frame is
+/// by definition a beam (multi-mip painted terrain where none should
+/// be). Reports a precise count + bounding box + sample coords.
+///
+/// Catches beams in any screen quadrant — the previous "grass"
+/// metric counted both legitimate far-terrain (correct) and beams
+/// (bug) without distinguishing.
+#[test]
+#[ignore = "expensive: builds full demo; reports beam pixel coords"]
+fn dump_green_beam_pose_diff() {
+    use roxlap_scene::CHUNK_SIZE_XY;
+
+    let mut sc = crate::scene::build_demo();
+    let cam = camera_for_yaw_pitch(BEAM_POS, BEAM_YAW, BEAM_PITCH);
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.max_scan_dist = 1024;
+
+    // (Z) baseline: mip_levels=1 — no transitions.
+    let mut fb_z = vec![sky; pixel_count];
+    let mut zb_z = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 1;
+    settings.mip_scan_dist = 4;
+    let _ = render_scene_composed(
+        &mut fb_z,
+        &mut zb_z,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    write_ppm("/tmp/scene-demo-beam-diff-ml1.ppm", &fb_z);
+
+    // (M) multi-mip: live demo config.
+    let mut fb_m = vec![sky; pixel_count];
+    let mut zb_m = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 6;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb_m,
+        &mut zb_m,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    write_ppm("/tmp/scene-demo-beam-diff-ml6.ppm", &fb_m);
+
+    // Diff: pixels SKY in (Z) but grass-green in (M).
+    let is_grass = |p: u32| -> bool {
+        let r = ((p >> 16) & 0xff) as i32;
+        let g = ((p >> 8) & 0xff) as i32;
+        let b = (p & 0xff) as i32;
+        g > r + 30 && g > b + 30 && (r + g + b) > 100
+    };
+
+    let mut beam_pixels = Vec::new();
+    for y in 0..H {
+        for x in 0..W {
+            let i = (y * W + x) as usize;
+            if fb_z[i] == sky && is_grass(fb_m[i]) {
+                beam_pixels.push((x, y));
+            }
+        }
+    }
+    eprintln!(
+        "BEAM PIXELS (sky in ml=1, grass in ml=6): {} / {pixel_count}",
+        beam_pixels.len()
+    );
+    if !beam_pixels.is_empty() {
+        let xmin = beam_pixels.iter().map(|&(x, _)| x).min().unwrap_or(0);
+        let xmax = beam_pixels.iter().map(|&(x, _)| x).max().unwrap_or(0);
+        let ymin = beam_pixels.iter().map(|&(_, y)| y).min().unwrap_or(0);
+        let ymax = beam_pixels.iter().map(|&(_, y)| y).max().unwrap_or(0);
+        eprintln!("  bbox: x=[{xmin}..{xmax}], y=[{ymin}..{ymax}]");
+        // Histogram of x-coordinates (= which screen column the beam
+        // is in). Beams are vertical → cluster around specific x.
+        let mut xhist = vec![0usize; W as usize];
+        for (x, _) in &beam_pixels {
+            xhist[*x as usize] += 1;
+        }
+        // Print x columns with >=5 beam pixels — these are the
+        // columns the beam runs through.
+        let mut beam_cols: Vec<(u32, usize)> = (0..W as usize)
+            .filter(|i| xhist[*i] >= 5)
+            .map(|i| (i as u32, xhist[i]))
+            .collect();
+        beam_cols.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        eprintln!("  top-10 beam columns (x, count):");
+        for (x, c) in beam_cols.iter().take(10) {
+            eprintln!("    x={x} count={c}");
+        }
+        // First 3 beam pixels (sample).
+        for (x, y) in beam_pixels.iter().take(3) {
+            eprintln!("  sample: ({x}, {y})");
+        }
+    }
+}
+
 /// Visual check: render the demo's spawn pose with the live
 /// demo's settings (fog OFF, checkerboard sky ON, multi-mip ON) so
 /// the multi-mip LOD bands are visible against a patterned sky.
