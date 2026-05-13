@@ -2077,10 +2077,23 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     }
     state.z1 = ((state.z1 + 1) as u32 >> 1) as i32;
 
-    // Voxlap5.c:12105-12110 — recompute leading lane and advance gpz.
+    // v5.asm `remiporend:` tail — recompute leading lane and advance
+    // gpz[lane]. Critically, the asm does NOT update `mm6` here: the
+    // packed `(gx, ogx)` pair was already set by the column-step's
+    // `punpckldq mm6, mm7` just before the `ja remiporend` jump, and
+    // remiporend preserves it through the mip transition. Our port
+    // mirrors that — `state.gx` was written by
+    // [`phase_after_delete_kept_presync`] right before this phase was
+    // entered and must not be overwritten here, or the downstream
+    // `predraw{ceil,flor}` / `predeletez` ogx↔gx swaps see the
+    // post-mip lane's potentially trailing-incremented gpz instead of
+    // the pre-mip new_gpz that triggered the transition. Visible as
+    // faint world-axis-aligned green beams under deep mip-N — for
+    // axis-aligned rays (gdz[dead lane] = 0, gpz[dead lane] = MAX) the
+    // live lane's `gpz[live]` is incremented by `gdz_old` inside the
+    // trailing-column branch above, which is what state.gx would have
+    // been miswritten to.
     state.lane = usize::from(state.scratch.gpz[1] < state.scratch.gpz[0]);
-    let new_gpz = state.scratch.gpz[state.lane];
-    state.gx = new_gpz & -0x1_0000_i32;
     state.scratch.gpz[state.lane] =
         state.scratch.gpz[state.lane].wrapping_add(state.scratch.gdz[state.lane]);
 
