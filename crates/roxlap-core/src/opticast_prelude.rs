@@ -230,22 +230,31 @@ pub fn derive_prelude(
 /// new field values aren't dereferenced — the OOB-XY bedrock seed
 /// synthesis in [`crate::column_walk::camera_chunk_air_gap`] short-
 /// circuits first.
-//
-// The z axis stays at the single-chunk placeholder until S4B.3
-// adds chunk-z (`li_pos.z.div_euclid(chunk_size_z)`); chunk_z
-// handoff in grouscan is also S4B.3.
+///
+/// S4B.6.a: `chunk_size_z` parameter populates the z component of
+/// `camera_chunk_idx` + `camera_local_xyz`. Callers that don't yet
+/// stack chunks vertically should pass the per-chunk Z extent (=
+/// `crate::CHUNK_SIZE_Z` / `roxlap_scene::CHUNK_SIZE_Z` = 256) so
+/// the camera-z gets split into `(chz, local_z)` correctly. The
+/// rasterizer's column walker still treats world-z within a single
+/// chunk until S4B.6.c lands.
 #[allow(clippy::cast_possible_wrap)]
-pub fn recompute_camera_chunk(prelude: &mut OpticastPrelude, chunk_size_xy: u32) {
-    let chunk_size_signed = chunk_size_xy as i32;
+pub fn recompute_camera_chunk(
+    prelude: &mut OpticastPrelude,
+    chunk_size_xy: u32,
+    chunk_size_z: u32,
+) {
+    let chunk_size_xy_signed = chunk_size_xy as i32;
+    let chunk_size_z_signed = chunk_size_z as i32;
     prelude.camera_chunk_idx = [
-        prelude.li_pos[0].div_euclid(chunk_size_signed),
-        prelude.li_pos[1].div_euclid(chunk_size_signed),
-        0,
+        prelude.li_pos[0].div_euclid(chunk_size_xy_signed),
+        prelude.li_pos[1].div_euclid(chunk_size_xy_signed),
+        prelude.li_pos[2].div_euclid(chunk_size_z_signed),
     ];
     prelude.camera_local_xyz = [
-        prelude.li_pos[0].rem_euclid(chunk_size_signed),
-        prelude.li_pos[1].rem_euclid(chunk_size_signed),
-        prelude.li_pos[2],
+        prelude.li_pos[0].rem_euclid(chunk_size_xy_signed),
+        prelude.li_pos[1].rem_euclid(chunk_size_xy_signed),
+        prelude.li_pos[2].rem_euclid(chunk_size_z_signed),
     ];
 }
 
@@ -378,7 +387,7 @@ mod tests {
         let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
         let before_idx = p.camera_chunk_idx;
         let before_local = p.camera_local_xyz;
-        recompute_camera_chunk(&mut p, 2048);
+        recompute_camera_chunk(&mut p, 2048, 256);
         assert_eq!(p.camera_chunk_idx, before_idx);
         assert_eq!(p.camera_local_xyz, before_local);
         assert_eq!(p.camera_chunk_idx, [0, 0, 0]);
@@ -399,7 +408,7 @@ mod tests {
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
         let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
-        recompute_camera_chunk(&mut p, 128);
+        recompute_camera_chunk(&mut p, 128, 256);
         assert_eq!(p.camera_chunk_idx, [8, 0, 0]);
         assert_eq!(p.camera_local_xyz, [0, 100, 50]);
     }
@@ -453,7 +462,7 @@ mod tests {
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
         let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
-        recompute_camera_chunk(&mut p, 128);
+        recompute_camera_chunk(&mut p, 128, 256);
         assert!(!p.in_bounds_xy);
         // -5.div_euclid(128) = -1; -5.rem_euclid(128) = 123 (positive).
         assert_eq!(p.camera_chunk_idx, [-1, 0, 0]);

@@ -207,7 +207,7 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     // li_pos` — keeping the goldens byte-identical. For multi-
     // chunk callers it splits `li_pos.xy` into
     // `(camera_chunk_idx.xy, camera_local_xyz.xy)`.
-    opticast_prelude::recompute_camera_chunk(&mut prelude, grid.chunk_size_xy);
+    opticast_prelude::recompute_camera_chunk(&mut prelude, grid.chunk_size_xy, grid.chunk_size_z);
     // S4B.2.d: re-evaluate `in_bounds_xy` against the grid's full
     // XY voxel AABB. For single-chunk callers `aabb_xy()` returns
     // `([0, 0], [vsid, vsid])` so the recomputed `in_bounds_xy`

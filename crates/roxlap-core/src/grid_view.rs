@@ -42,6 +42,12 @@ use roxlap_formats::vxl::Vxl;
 /// internals destructure directly. Keeping the fields exposed
 /// avoids a layer of accessor methods that the borrow checker
 /// would otherwise force at every read.
+/// Z extent of a single chunk's slab table, in voxels. Voxlap's
+/// slab byte format encodes z as `u8`, so each chunk covers exactly
+/// 256 voxels along Z. Tall worlds stack chunks vertically (see
+/// `memory/project_s4b_6_z_stacking_plan.md`).
+pub const CHUNK_SIZE_Z: u32 = 256;
+
 #[derive(Clone, Copy)]
 pub struct GridView<'a> {
     /// Square dimension of the currently-active chunk view (matches
@@ -56,6 +62,15 @@ pub struct GridView<'a> {
     /// per-chunk value — they may diverge in S4B.4 when GridView
     /// stops carrying a "default" chunk's flat fields.
     pub chunk_size_xy: u32,
+    /// S4B.6.a: Z extent of each chunk in voxel units. Locked to
+    /// `MAXZDIM = 256` for every chunk (voxlap's slab byte format
+    /// uses a `u8` z field). Tall worlds stack chunks vertically
+    /// rather than extending this constant — see
+    /// `memory/project_s4b_6_z_stacking_plan.md`. Pre-S4B.6.a
+    /// callers set this to `256` (the only valid value) and the
+    /// rasterizer ignores chunk-z boundaries; S4B.6.c will start
+    /// consuming the field for cross-chunk-z column walks.
+    pub chunk_size_z: u32,
     /// Flat slab byte buffer for every column at every built mip.
     pub slab_buf: &'a [u8],
     /// Per-column byte offsets into [`Self::slab_buf`], concatenated
@@ -86,24 +101,38 @@ pub struct GridView<'a> {
 /// grouscan column-step treats them as fully-air (the chunk renders
 /// as sky / empty until the ray crosses into a populated chunk).
 ///
-/// Sized to match the chunk grid's XY footprint:
-/// `chunks.len() == chunks_x * chunks_y`. Chunk at relative position
-/// `(dx, dy)` from `origin_chunk_xy` lives at index
-/// `dy * chunks_x + dx`. The per-chunk [`GridView`] entries should
-/// have `chunk_grid: None` (they describe individual chunks, not
-/// the parent grid).
+/// Sized to match the chunk grid's full XYZ footprint:
+/// `chunks.len() == chunks_x * chunks_y * chunks_z`. Chunk at
+/// relative position `(dx, dy, dz)` from
+/// `(origin_chunk_xy, origin_chunk_z)` lives at index
+/// `(dz * chunks_y + dy) * chunks_x + dx`. The per-chunk
+/// [`GridView`] entries should have `chunk_grid: None` (they
+/// describe individual chunks, not the parent grid).
+///
+/// S4B.6.a: `chunks_z` + `origin_chunk_z` added for tall worlds.
+/// Pre-S4B.6 callers built `ChunkGrid` with implicit `chunks_z=1
+/// origin_chunk_z=0`; the new layout is backwards-compatible —
+/// `dz=0` substitution gives the same index `dy * chunks_x + dx`,
+/// so a flat `chunks_x * chunks_y` slice indexes identically.
 #[derive(Clone, Copy)]
 pub struct ChunkGrid<'a> {
-    /// Per-chunk views, row-major. Length `chunks_x * chunks_y`.
+    /// Per-chunk views. Length `chunks_x * chunks_y * chunks_z`.
+    /// Index layout: `[(dz * chunks_y + dy) * chunks_x + dx]`.
     pub chunks: &'a [Option<GridView<'a>>],
     /// XY index of the chunk at `chunks[0]`. Subsequent chunks lie
     /// along `+x` (next in the row) then `+y` (next row).
     pub origin_chunk_xy: [i32; 2],
+    /// Z index of the chunk at `chunks[0]`. Subsequent z slabs lie
+    /// at `+chunks_x * chunks_y` strides into [`Self::chunks`].
+    pub origin_chunk_z: i32,
     /// Number of chunks along the X axis. Row stride in
     /// [`Self::chunks`].
     pub chunks_x: u32,
     /// Number of chunks along the Y axis.
     pub chunks_y: u32,
+    /// Number of chunks along the Z axis. `1` for non-stacked
+    /// worlds (matches every pre-S4B.6.a caller).
+    pub chunks_z: u32,
 }
 
 impl<'a> GridView<'a> {
@@ -124,6 +153,7 @@ impl<'a> GridView<'a> {
         Self {
             vsid,
             chunk_size_xy: vsid,
+            chunk_size_z: CHUNK_SIZE_Z,
             slab_buf,
             column_offsets,
             mip_base_offsets,
@@ -140,6 +170,7 @@ impl<'a> GridView<'a> {
         Self {
             vsid: vxl.vsid,
             chunk_size_xy: vxl.vsid,
+            chunk_size_z: CHUNK_SIZE_Z,
             slab_buf: &vxl.data,
             column_offsets: &vxl.column_offset,
             mip_base_offsets: &vxl.mip_base_offsets,
@@ -169,6 +200,7 @@ impl<'a> GridView<'a> {
             Some(c) => Self {
                 vsid: c.vsid,
                 chunk_size_xy,
+                chunk_size_z: CHUNK_SIZE_Z,
                 slab_buf: c.slab_buf,
                 column_offsets: c.column_offsets,
                 mip_base_offsets: c.mip_base_offsets,
@@ -177,6 +209,7 @@ impl<'a> GridView<'a> {
             None => Self {
                 vsid: chunk_size_xy,
                 chunk_size_xy,
+                chunk_size_z: CHUNK_SIZE_Z,
                 slab_buf: &[],
                 column_offsets: &[],
                 mip_base_offsets: &[],
@@ -251,20 +284,44 @@ impl<'a> GridView<'a> {
     /// chunk).
     #[must_use]
     pub fn chunk_at_xy(&self, chunk_idx: [i32; 2]) -> Option<GridView<'a>> {
+        // Defer to chunk_at_xyz at the grid's `origin_chunk_z` (=
+        // 0 for non-stacked worlds, the "current" z layer for
+        // S4B.6+ stacked worlds). Pre-S4B.6.a behaviour is preserved
+        // because `chunks_z=1, origin_chunk_z=0` is the default.
+        let z = self.chunk_grid.map_or(0, |cg| cg.origin_chunk_z);
+        self.chunk_at_xyz([chunk_idx[0], chunk_idx[1], z])
+    }
+
+    /// S4B.6.a: 3D chunk lookup for the future cross-chunk-Z DDA.
+    ///
+    /// Same dispatch contract as [`Self::chunk_at_xy`] but extended
+    /// to a z axis:
+    ///
+    /// * `chunk_grid: Some(&cg)` — multi-chunk view. Resolves
+    ///   `chunk_idx` against `cg.origin_chunk_xy` /
+    ///   `cg.origin_chunk_z` / `cg.chunks_x` / `cg.chunks_y` /
+    ///   `cg.chunks_z` and returns `cg.chunks[..]` at the matching
+    ///   slot (which may itself be `None` for empty chunks).
+    /// * `chunk_grid: None` — single-chunk view. Returns
+    ///   `Some(Self)` for `[0, 0, 0]`, `None` otherwise.
+    #[must_use]
+    pub fn chunk_at_xyz(&self, chunk_idx: [i32; 3]) -> Option<GridView<'a>> {
         if let Some(cg) = self.chunk_grid {
             let dx = chunk_idx[0] - cg.origin_chunk_xy[0];
             let dy = chunk_idx[1] - cg.origin_chunk_xy[1];
-            if dx < 0 || dy < 0 {
+            let dz = chunk_idx[2] - cg.origin_chunk_z;
+            if dx < 0 || dy < 0 || dz < 0 {
                 return None;
             }
             #[allow(clippy::cast_sign_loss)]
-            let (dx, dy) = (dx as u32, dy as u32);
-            if dx >= cg.chunks_x || dy >= cg.chunks_y {
+            let (dx, dy, dz) = (dx as u32, dy as u32, dz as u32);
+            if dx >= cg.chunks_x || dy >= cg.chunks_y || dz >= cg.chunks_z {
                 return None;
             }
-            let i = dy as usize * cg.chunks_x as usize + dx as usize;
+            let i = (dz as usize * cg.chunks_y as usize + dy as usize) * cg.chunks_x as usize
+                + dx as usize;
             cg.chunks.get(i).copied().flatten()
-        } else if chunk_idx == [0, 0] {
+        } else if chunk_idx == [0, 0, 0] {
             Some(*self)
         } else {
             None
@@ -361,6 +418,8 @@ mod tests {
             origin_chunk_xy: [0, 0],
             chunks_x: 2,
             chunks_y: 1,
+            chunks_z: 1,
+            origin_chunk_z: 0,
         };
         let gv = GridView::from_chunk_grid(&cg, 64);
         // [0, 0] resolves to chunk A.
@@ -385,6 +444,8 @@ mod tests {
             origin_chunk_xy: [0, 0],
             chunks_x: 2,
             chunks_y: 1,
+            chunks_z: 1,
+            origin_chunk_z: 0,
         };
         let gv = GridView::from_chunk_grid(&cg, 64);
         // [-1, 0] is below origin.
@@ -412,6 +473,8 @@ mod tests {
             origin_chunk_xy: [-1, 0],
             chunks_x: 2,
             chunks_y: 1,
+            chunks_z: 1,
+            origin_chunk_z: 0,
         };
         let gv = GridView::from_chunk_grid(&cg, 64);
         let cm1 = gv.chunk_at_xy([-1, 0]).expect("chunk [-1, 0] present");
@@ -438,6 +501,8 @@ mod tests {
             origin_chunk_xy: [0, 0],
             chunks_x: 2,
             chunks_y: 1,
+            chunks_z: 1,
+            origin_chunk_z: 0,
         };
         let gv = GridView::from_chunk_grid(&cg, 64);
         assert_eq!(gv.slab_buf, &slab_b[..]);
@@ -474,6 +539,8 @@ mod tests {
             origin_chunk_xy: [-1, 0],
             chunks_x: 2,
             chunks_y: 3,
+            chunks_z: 1,
+            origin_chunk_z: 0,
         };
         let gv = GridView::from_chunk_grid(&cg, 128);
         let (lo, hi) = gv.aabb_xy();
@@ -491,6 +558,8 @@ mod tests {
             origin_chunk_xy: [0, 0],
             chunks_x: 1,
             chunks_y: 1,
+            chunks_z: 1,
+            origin_chunk_z: 0,
         };
         let gv = GridView::from_chunk_grid(&cg, 128);
         assert!(gv.slab_buf.is_empty());
@@ -500,5 +569,64 @@ mod tests {
         assert_eq!(gv.chunk_size_xy, 128);
         // The chunk_grid backend still gates chunk_at_xy.
         assert!(gv.chunk_at_xy([0, 0]).is_none());
+    }
+
+    /// S4B.6.a: `chunk_at_xyz` resolves the z axis correctly on a
+    /// stacked grid. Two chunks at chz=0 and chz=1 each have their
+    /// own slab buffer; xyz lookup must return the matching one.
+    #[test]
+    fn chunk_at_xyz_resolves_stacked_chunks() {
+        let slab0 = [0u8, 100, 100, 0];
+        let slab1 = [0u8, 200, 200, 0];
+        let cols = [0u32, 4];
+        let mips = [0usize, 2];
+        let c0 = GridView::from_parts(1, &slab0, &cols, &mips);
+        let c1 = GridView::from_parts(1, &slab1, &cols, &mips);
+        let chunks = [Some(c0), Some(c1)];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            origin_chunk_z: 0,
+            chunks_x: 1,
+            chunks_y: 1,
+            chunks_z: 2,
+        };
+        let gv = GridView::from_chunk_grid(&cg, 1);
+        let v0 = gv.chunk_at_xyz([0, 0, 0]).expect("chz=0 present");
+        assert_eq!(v0.slab_buf, &slab0[..]);
+        let v1 = gv.chunk_at_xyz([0, 0, 1]).expect("chz=1 present");
+        assert_eq!(v1.slab_buf, &slab1[..]);
+        // OOR z returns None.
+        assert!(gv.chunk_at_xyz([0, 0, 2]).is_none());
+        assert!(gv.chunk_at_xyz([0, 0, -1]).is_none());
+    }
+
+    /// S4B.6.a: `chunk_at_xy` defers to `chunk_at_xyz` at
+    /// `origin_chunk_z`. For a stacked grid centred at chz=-1,
+    /// `chunk_at_xy` returns the chz=-1 layer.
+    #[test]
+    fn chunk_at_xy_returns_origin_z_layer() {
+        let slab_z_neg1 = [0u8, 50, 50, 0];
+        let slab_z_0 = [0u8, 100, 100, 0];
+        let cols = [0u32, 4];
+        let mips = [0usize, 2];
+        let cn = GridView::from_parts(1, &slab_z_neg1, &cols, &mips);
+        let c0 = GridView::from_parts(1, &slab_z_0, &cols, &mips);
+        let chunks = [Some(cn), Some(c0)];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            origin_chunk_z: -1,
+            chunks_x: 1,
+            chunks_y: 1,
+            chunks_z: 2,
+        };
+        let gv = GridView::from_chunk_grid(&cg, 1);
+        // chunk_at_xy returns origin_chunk_z layer = chz=-1.
+        let via_xy = gv.chunk_at_xy([0, 0]).expect("origin layer present");
+        assert_eq!(via_xy.slab_buf, &slab_z_neg1[..]);
+        // chunk_at_xyz with explicit chz=0 returns the upper layer.
+        let v0 = gv.chunk_at_xyz([0, 0, 0]).expect("chz=0 present");
+        assert_eq!(v0.slab_buf, &slab_z_0[..]);
     }
 }

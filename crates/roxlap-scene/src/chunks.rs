@@ -184,8 +184,70 @@ impl Grid {
         Some(ChunkXyBacking {
             chunks: table,
             origin_chunk_xy: [min_x, min_y],
+            origin_chunk_z: 0,
             chunks_x,
             chunks_y,
+            chunks_z: 1,
+        })
+    }
+
+    /// S4B.6.a: 3D-aware version of [`Self::chunk_xy_backing`].
+    /// Enumerates ALL chunks across the chx/chy/chz bounding box
+    /// (not just `chz=0`) so a stacked grid can be rendered once
+    /// S4B.6.c switches the rasterizer to a chunk-z-aware column
+    /// walker.
+    ///
+    /// Iterates `chunks` once for the XYZ bbox, then a second time
+    /// to fill the row-major-per-z `Vec<Option<GridView<'_>>>`.
+    /// Index layout: `[(dz * chunks_y + dy) * chunks_x + dx]` —
+    /// matches [`roxlap_core::ChunkGrid`]'s indexing exactly.
+    ///
+    /// Returns `None` for empty grids.
+    #[must_use]
+    pub fn chunk_xyz_backing(&self) -> Option<ChunkXyBacking<'_>> {
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut min_z = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut max_z = i32::MIN;
+        let mut any = false;
+        for chunk_idx in self.chunks.keys() {
+            min_x = min_x.min(chunk_idx.x);
+            min_y = min_y.min(chunk_idx.y);
+            min_z = min_z.min(chunk_idx.z);
+            max_x = max_x.max(chunk_idx.x);
+            max_y = max_y.max(chunk_idx.y);
+            max_z = max_z.max(chunk_idx.z);
+            any = true;
+        }
+        if !any {
+            return None;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let chunks_x = (max_x - min_x + 1) as u32;
+        #[allow(clippy::cast_sign_loss)]
+        let chunks_y = (max_y - min_y + 1) as u32;
+        #[allow(clippy::cast_sign_loss)]
+        let chunks_z = (max_z - min_z + 1) as u32;
+        let mut table: Vec<Option<roxlap_core::GridView<'_>>> =
+            vec![None; (chunks_x * chunks_y * chunks_z) as usize];
+        for (chunk_idx, vxl) in &self.chunks {
+            let dx = chunk_idx.x - min_x;
+            let dy = chunk_idx.y - min_y;
+            let dz = chunk_idx.z - min_z;
+            #[allow(clippy::cast_sign_loss)]
+            let (dx, dy, dz) = (dx as u32, dy as u32, dz as u32);
+            let i = ((dz * chunks_y + dy) * chunks_x + dx) as usize;
+            table[i] = Some(roxlap_core::GridView::from_single_vxl(vxl));
+        }
+        Some(ChunkXyBacking {
+            chunks: table,
+            origin_chunk_xy: [min_x, min_y],
+            origin_chunk_z: min_z,
+            chunks_x,
+            chunks_y,
+            chunks_z,
         })
     }
 }
@@ -196,17 +258,31 @@ impl Grid {
 /// (which borrows the table) can live alongside the GridView
 /// constructed from it. Used by the Approach B render path —
 /// see [`Grid::chunk_xy_backing`].
+///
+/// S4B.6.a: gained `chunks_z` + `origin_chunk_z` for tall-world
+/// support. Pre-S4B.6.a `chunk_xy_backing` always populates these
+/// as `chunks_z=1 origin_chunk_z=0` (= chz=0 only); S4B.6.c will
+/// switch the render path to `chunk_xyz_backing` once the
+/// rasterizer is stack-aware.
 pub struct ChunkXyBacking<'a> {
-    /// Per-chunk views row-major over the chx/chy bounding box.
-    /// Length `chunks_x * chunks_y`; `None` for implicit-air chunks.
+    /// Per-chunk views over the chx/chy/chz extent.
+    /// Length `chunks_x * chunks_y * chunks_z`; index layout
+    /// `[(dz * chunks_y + dy) * chunks_x + dx]`. `None` for
+    /// implicit-air chunks inside the bbox.
     pub chunks: Vec<Option<roxlap_core::GridView<'a>>>,
     /// XY index of the chunk at `chunks[0]` — the minimum chx/chy
-    /// among populated chunks at `chz = 0`.
+    /// among populated chunks at `chz = origin_chunk_z`.
     pub origin_chunk_xy: [i32; 2],
+    /// Z index of the chunk at `chunks[0]`.
+    pub origin_chunk_z: i32,
     /// Number of chunks along the X axis. Row stride.
     pub chunks_x: u32,
     /// Number of chunks along the Y axis.
     pub chunks_y: u32,
+    /// Number of chunks along the Z axis. `1` from
+    /// [`Grid::chunk_xy_backing`]; `>1` only via the S4B.6.a
+    /// [`Grid::chunk_xyz_backing`].
+    pub chunks_z: u32,
 }
 
 #[cfg(test)]
@@ -334,5 +410,67 @@ pub(crate) mod tests {
     fn chunk_mut_returns_none_for_missing() {
         let mut g = Grid::new(GridTransform::identity());
         assert!(g.chunk_mut(IVec3::ZERO).is_none());
+    }
+
+    /// S4B.6.a: legacy `chunk_xy_backing` ignores chz!=0 chunks and
+    /// always returns `chunks_z=1 origin_chunk_z=0`. Sanity-check
+    /// the new field defaults so pre-S4B.6 render path stays
+    /// byte-identical.
+    #[test]
+    fn chunk_xy_backing_returns_chunks_z_one() {
+        let mut g = Grid::new(GridTransform::identity());
+        g.ensure_chunk(IVec3::new(0, 0, 0));
+        g.ensure_chunk(IVec3::new(1, 0, 0));
+        // Add a chunk at chz=1 — chunk_xy_backing should ignore it.
+        g.ensure_chunk(IVec3::new(0, 0, 1));
+        let backing = g.chunk_xy_backing().expect("two chz=0 chunks present");
+        assert_eq!(backing.chunks_z, 1);
+        assert_eq!(backing.origin_chunk_z, 0);
+        assert_eq!(backing.chunks_x, 2);
+        assert_eq!(backing.chunks_y, 1);
+        assert_eq!(backing.chunks.len(), 2);
+    }
+
+    /// S4B.6.a: new `chunk_xyz_backing` enumerates ALL chunks
+    /// including chz!=0. Indexing layout must match
+    /// `roxlap_core::ChunkGrid`: row-major per z slab.
+    #[test]
+    fn chunk_xyz_backing_with_stacked_chunks_enumerates_all_z() {
+        let mut g = Grid::new(GridTransform::identity());
+        g.ensure_chunk(IVec3::new(0, 0, 0));
+        g.ensure_chunk(IVec3::new(1, 0, 0));
+        g.ensure_chunk(IVec3::new(0, 0, 1));
+        // Leave (1, 0, 1) implicit-air.
+        let backing = g.chunk_xyz_backing().expect("at least one chunk");
+        assert_eq!(backing.chunks_x, 2);
+        assert_eq!(backing.chunks_y, 1);
+        assert_eq!(backing.chunks_z, 2);
+        assert_eq!(backing.origin_chunk_xy, [0, 0]);
+        assert_eq!(backing.origin_chunk_z, 0);
+        assert_eq!(backing.chunks.len(), 2 * 1 * 2);
+        // Index layout: [(dz * chunks_y + dy) * chunks_x + dx]
+        // (0, 0, 0) → dx=0, dy=0, dz=0 → 0
+        // (1, 0, 0) → dx=1, dy=0, dz=0 → 1
+        // (0, 0, 1) → dx=0, dy=0, dz=1 → 2
+        // (1, 0, 1) → dx=1, dy=0, dz=1 → 3 (implicit-air → None)
+        assert!(backing.chunks[0].is_some(), "(0, 0, 0) present");
+        assert!(backing.chunks[1].is_some(), "(1, 0, 0) present");
+        assert!(backing.chunks[2].is_some(), "(0, 0, 1) present");
+        assert!(backing.chunks[3].is_none(), "(1, 0, 1) implicit-air");
+    }
+
+    /// S4B.6.a: chunk_xyz_backing with negative chz origin —
+    /// origin_chunk_z = min_z must reflect the actual minimum chz.
+    #[test]
+    fn chunk_xyz_backing_with_negative_origin_chunk_z() {
+        let mut g = Grid::new(GridTransform::identity());
+        g.ensure_chunk(IVec3::new(0, 0, -2));
+        g.ensure_chunk(IVec3::new(0, 0, 0));
+        let backing = g.chunk_xyz_backing().expect("at least one chunk");
+        assert_eq!(backing.chunks_z, 3); // chz range [-2, 0]
+        assert_eq!(backing.origin_chunk_z, -2);
+        assert!(backing.chunks[0].is_some(), "chz=-2 → dz=0");
+        assert!(backing.chunks[1].is_none(), "chz=-1 → dz=1 implicit-air");
+        assert!(backing.chunks[2].is_some(), "chz=0 → dz=2");
     }
 }

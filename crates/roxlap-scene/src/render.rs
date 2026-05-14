@@ -116,8 +116,10 @@ pub fn render_scene(
         let cg = roxlap_core::ChunkGrid {
             chunks: &backing.chunks,
             origin_chunk_xy: backing.origin_chunk_xy,
+            origin_chunk_z: backing.origin_chunk_z,
             chunks_x: backing.chunks_x,
             chunks_y: backing.chunks_y,
+            chunks_z: backing.chunks_z,
         };
         let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
         let outcome = {
@@ -247,8 +249,10 @@ pub fn render_scene_composed(
         let cg = roxlap_core::ChunkGrid {
             chunks: &backing.chunks,
             origin_chunk_xy: backing.origin_chunk_xy,
+            origin_chunk_z: backing.origin_chunk_z,
             chunks_x: backing.chunks_x,
             chunks_y: backing.chunks_y,
+            chunks_z: backing.chunks_z,
         };
         let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
 
@@ -965,8 +969,10 @@ mod tests {
         let cg = roxlap_core::ChunkGrid {
             chunks: &backing.chunks,
             origin_chunk_xy: backing.origin_chunk_xy,
+            origin_chunk_z: backing.origin_chunk_z,
             chunks_x: backing.chunks_x,
             chunks_y: backing.chunks_y,
+            chunks_z: backing.chunks_z,
         };
         let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
 
@@ -1049,8 +1055,10 @@ mod tests {
         let cg = roxlap_core::ChunkGrid {
             chunks: &backing.chunks,
             origin_chunk_xy: backing.origin_chunk_xy,
+            origin_chunk_z: backing.origin_chunk_z,
             chunks_x: backing.chunks_x,
             chunks_y: backing.chunks_y,
+            chunks_z: backing.chunks_z,
         };
         let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
         let (aabb_min, aabb_max) = grid_view.aabb_xy();

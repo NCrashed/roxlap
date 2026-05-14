@@ -241,8 +241,10 @@ fn all_air_chunks_mip_n_no_dark_pixels() {
     let cg = ChunkGrid {
         chunks: &backing.chunks,
         origin_chunk_xy: backing.origin_chunk_xy,
+        origin_chunk_z: backing.origin_chunk_z,
         chunks_x: backing.chunks_x,
         chunks_y: backing.chunks_y,
+        chunks_z: backing.chunks_z,
     };
     let view = GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
 
