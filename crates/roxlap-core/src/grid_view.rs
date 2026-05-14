@@ -303,7 +303,13 @@ impl<'a> GridView<'a> {
     ///   `cg.chunks_z` and returns `cg.chunks[..]` at the matching
     ///   slot (which may itself be `None` for empty chunks).
     /// * `chunk_grid: None` — single-chunk view. Returns
-    ///   `Some(Self)` for `[0, 0, 0]`, `None` otherwise.
+    ///   `Some(Self)` for `[0, 0, *]`, `None` otherwise. The z
+    ///   index is ignored because single-chunk callers carry an
+    ///   un-stacked world — the camera's chz, even when non-zero
+    ///   (e.g. camera at world z >= 256 below the chunk's bedrock
+    ///   with `treat_z_max_as_air`), still refers to the same one
+    ///   chunk. S4B.6.c will start treating chz as a separator
+    ///   only for multi-chunk grids.
     #[must_use]
     pub fn chunk_at_xyz(&self, chunk_idx: [i32; 3]) -> Option<GridView<'a>> {
         if let Some(cg) = self.chunk_grid {
@@ -321,7 +327,7 @@ impl<'a> GridView<'a> {
             let i = (dz as usize * cg.chunks_y as usize + dy as usize) * cg.chunks_x as usize
                 + dx as usize;
             cg.chunks.get(i).copied().flatten()
-        } else if chunk_idx == [0, 0, 0] {
+        } else if chunk_idx[0] == 0 && chunk_idx[1] == 0 {
             Some(*self)
         } else {
             None

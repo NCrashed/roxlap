@@ -584,11 +584,13 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // OOB cameras (`in_bounds_xy: false`) start with an empty
         // column — the grouscan column-step walk picks up real
         // chunks once `(cx, cy)` cross into the grid.
+        // S4B.6.b: dispatch via `chunk_at_xyz` so stacked grids
+        // start the walk inside the camera's `(chx, chy, chz)`. For
+        // `chunks_z == 1` grids `camera_chunk_idx[2] == 0` and the
+        // shortcut path returns the same chunk as the pre-S4B.6
+        // `chunk_at_xy` lookup — byte-identical for the goldens.
         let camera_chunk_opt = if cache.prelude.in_bounds_xy {
-            self.grid.chunk_at_xy([
-                cache.prelude.camera_chunk_idx[0],
-                cache.prelude.camera_chunk_idx[1],
-            ])
+            self.grid.chunk_at_xyz(cache.prelude.camera_chunk_idx)
         } else {
             None
         };
@@ -643,6 +645,9 @@ impl Rasterizer for ScalarRasterizer<'_> {
             vsid: chunk_vsid,
             sky: self.sky.map(crate::grouscan::SkyRef::from_sky),
             grid_view: self.grid,
+            // S4B.6.b: pin the camera's chz layer for the
+            // column-step's chunk-XY swap.
+            camera_chunk_z: cache.prelude.camera_chunk_idx[2],
         };
         // gmipnum: min of (built mip levels in chunk) and
         // (caller-requested cap from settings.mip_levels). Both

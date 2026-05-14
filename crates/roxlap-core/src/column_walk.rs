@@ -136,14 +136,20 @@ pub fn camera_column_air_gap(
 /// return the bedrock placeholder seed `(0, 255, 0)` (matching
 /// the S1.Z behaviour previously inlined into `opticast`).
 ///
-/// Today, the single-chunk grid path goes:
-/// 1. `prelude.in_bounds_xy` is true → look up the column at
-///    `column_index` in the flat `vsid × vsid` table and walk it.
-/// 2. `prelude.in_bounds_xy` is false → return the OOB seed.
+/// S4B.6.b: queries the chunk at the camera's actual `chz` (=
+/// `prelude.camera_chunk_idx[2]`) via [`GridView::chunk_at_xyz`].
+/// For non-stacked grids (`chunks_z == 1, origin_chunk_z == 0`),
+/// camera_chunk_idx.z is `0` and the lookup degenerates to the
+/// pre-S4B.6 path — byte-identical for the goldens.
 ///
-/// S4B.2 will rewire (1) onto `grid.chunk_at_xy(chunk_idx)` and
-/// use `local_xyz` for the in-chunk column lookup; the signature
-/// stays.
+/// For stacked grids the returned `(z0, z1)` are still chunk-local
+/// (within the camera's chz layer). The cross-chunk air-gap walk
+/// — extending upward into chz-1 when the camera's chunk's top
+/// is fully air, downward into chz+1 when the bottom is fully air
+/// — is S4B.6.c work, where the slab walker grows world-z
+/// awareness. Until then the per-chunk gap is enough because the
+/// rasterizer only consumes data from one chunk's slab table
+/// anyway.
 #[must_use]
 pub fn camera_chunk_air_gap(
     grid: crate::grid_view::GridView<'_>,
@@ -159,15 +165,12 @@ pub fn camera_chunk_air_gap(
         return Some((0, 255, 0));
     }
 
-    // S4B.2.c.2: dispatch via `chunk_at_xy` so multi-chunk grids
-    // walk the column at the camera's actual chunk. Single-chunk
-    // grids (`chunk_grid: None`) get `chunk_at_xy([0, 0]) ==
-    // Some(Self)` and the lookup degenerates to today's flat path
-    // — `chunk_size_xy == vsid` and `camera_local_xyz == li_pos`,
-    // so `column_idx_in_chunk == prelude.column_index`. Byte-
-    // identical for the goldens.
-    let camera_chunk =
-        grid.chunk_at_xy([prelude.camera_chunk_idx[0], prelude.camera_chunk_idx[1]])?;
+    // S4B.6.b: dispatch via `chunk_at_xyz` so stacked grids walk
+    // the column at the camera's actual `(chx, chy, chz)`. For
+    // `chunks_z == 1` callers `camera_chunk_idx[2] == 0` and the
+    // shortcut path returns the same chunk as `chunk_at_xy` —
+    // byte-identical for the goldens.
+    let camera_chunk = grid.chunk_at_xyz(prelude.camera_chunk_idx)?;
     #[allow(clippy::cast_sign_loss)]
     let column_idx_in_chunk = (prelude.camera_local_xyz[1] as u32)
         .wrapping_mul(camera_chunk.chunk_size_xy)
@@ -409,5 +412,94 @@ mod tests {
         // vptr = bedrock's offset = 8 (so drawceil reads
         // column[vptr-4..vptr] = floor's colour).
         assert_eq!(camera_column_air_gap(&col, 261, true), Some((201, 255, 8)));
+    }
+
+    /// S4B.6.b: in a vertically-stacked grid (`chunks_z > 1`),
+    /// `camera_chunk_air_gap` queries the chunk at the camera's
+    /// actual chz. Two chunks at chz=0 and chz=1 each carry their
+    /// own column; the air-gap result reflects the camera's z
+    /// layer.
+    #[test]
+    fn camera_chunk_air_gap_dispatches_by_camera_chz() {
+        use crate::grid_view::{ChunkGrid, GridView};
+
+        // Two chunks (one column each), both with a floor at
+        // local z=50. Distinct colour bytes so we can verify which
+        // chunk's column was walked.
+        let mut col_chz0 = Vec::new();
+        col_chz0.extend_from_slice(&[2, 50, 50, 0]); // floor header
+        col_chz0.extend_from_slice(&[0xaa; 4]); // distinct colour
+        let mut col_chz1 = Vec::new();
+        col_chz1.extend_from_slice(&[2, 50, 50, 0]); // floor header
+        col_chz1.extend_from_slice(&[0xbb; 4]); // distinct colour
+
+        let cols0 = [0u32, col_chz0.len() as u32];
+        let cols1 = [0u32, col_chz1.len() as u32];
+        let mips = [0usize, cols0.len()];
+        let c0 = GridView::from_parts(1, &col_chz0, &cols0, &mips);
+        let c1 = GridView::from_parts(1, &col_chz1, &cols1, &mips);
+        let chunks = [Some(c0), Some(c1)];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            origin_chunk_z: 0,
+            chunks_x: 1,
+            chunks_y: 1,
+            chunks_z: 2,
+        };
+        let parent = GridView::from_chunk_grid(&cg, 1);
+
+        // Camera in chz=0 at local z=20 (= world z=20) — air gap
+        // (0, 50, 0) within chz=0's column.
+        let prelude_chz0 = crate::opticast_prelude::OpticastPrelude {
+            forward_z_sign: 1,
+            li_pos: [0, 0, 20],
+            column_index: 0,
+            pos_xfrac: [1.0, 0.0],
+            pos_yfrac: [1.0, 0.0],
+            pos_z: 0,
+            y_lookup: Vec::new(),
+            mip_levels: 1,
+            x_mip: 0,
+            max_scan_dist: 0,
+            cx: 0,
+            cy: 0,
+            in_bounds_xy: true,
+            camera_chunk_idx: [0, 0, 0],
+            camera_local_xyz: [0, 0, 20],
+        };
+        let gap0 = camera_chunk_air_gap(parent, &prelude_chz0, false);
+        assert_eq!(gap0, Some((0, 50, 0)));
+
+        // Camera in chz=1 at world z=280 (= local z=24 within
+        // chz=1's chunk). camera_chunk_idx=[0, 0, 1].
+        // camera_local_xyz=[0, 0, 24]. Air gap (0, 50, 0) within
+        // chz=1's column.
+        let prelude_chz1 = crate::opticast_prelude::OpticastPrelude {
+            forward_z_sign: 1,
+            li_pos: [0, 0, 280],
+            column_index: 0,
+            pos_xfrac: [1.0, 0.0],
+            pos_yfrac: [1.0, 0.0],
+            pos_z: 0,
+            y_lookup: Vec::new(),
+            mip_levels: 1,
+            x_mip: 0,
+            max_scan_dist: 0,
+            cx: 0,
+            cy: 0,
+            in_bounds_xy: true,
+            camera_chunk_idx: [0, 0, 1],
+            camera_local_xyz: [0, 0, 24],
+        };
+        let gap1 = camera_chunk_air_gap(parent, &prelude_chz1, false);
+        assert_eq!(gap1, Some((0, 50, 0)));
+
+        // Confirm the chunk dispatch is correct by reading slab
+        // bytes via the chunk-z-specific view.
+        let cv0 = parent.chunk_at_xyz([0, 0, 0]).unwrap();
+        let cv1 = parent.chunk_at_xyz([0, 0, 1]).unwrap();
+        assert_eq!(cv0.slab_buf, &col_chz0[..]);
+        assert_eq!(cv1.slab_buf, &col_chz1[..]);
     }
 }

@@ -152,6 +152,12 @@ pub struct GrouscanInputs<'a> {
     /// **camera chunk's** per-chunk borrows, set by gline's seed
     /// path so the slab walker starts on the correct chunk.
     pub grid_view: crate::grid_view::GridView<'a>,
+    /// S4B.6.b: chunk-z layer the camera sits in. Constant per
+    /// ray; the column-step's chunk-XY swap uses this to query
+    /// `chunk_at_xyz([new_chx, new_chy, camera_chunk_z])` instead
+    /// of the legacy 2D `chunk_at_xy`. For `chunks_z == 1` grids
+    /// this is `0` and the dispatch degenerates to today's path.
+    pub camera_chunk_z: i32,
 }
 
 /// All of grouscan's per-ray local state in one struct.
@@ -335,6 +341,13 @@ pub(crate) struct GrouscanState<'a> {
     /// `(slab_buf, column_offsets)` borrows can stay pointed at the
     /// last valid chunk without aliasing.
     pub current_chunk_exists: bool,
+    /// S4B.6.b: camera's chunk-z layer. Pinned for the lifetime of
+    /// this ray — the column-step's chunk-XY swap calls
+    /// `chunk_at_xyz([new_chx, new_chy, camera_chunk_z])` so
+    /// rays in a stacked grid always swap into the camera's z
+    /// layer. Vertical ray traversal (= incrementing chunk_z when
+    /// the ray crosses into chunks above/below) lands in S4B.6.c.
+    pub camera_chunk_z: i32,
 }
 
 impl<'a> GrouscanState<'a> {
@@ -371,7 +384,14 @@ impl<'a> GrouscanState<'a> {
         #[allow(clippy::cast_possible_wrap)]
         let chunk_size_xy_mask = (chunk_size_xy - 1) as i32;
         let current_chunk_idx_xy = [cx >> chunk_size_xy_log2, cy >> chunk_size_xy_log2];
-        let current_chunk_exists = grid_view.chunk_at_xy(current_chunk_idx_xy).is_some();
+        let camera_chunk_z = inputs.camera_chunk_z;
+        let current_chunk_exists = grid_view
+            .chunk_at_xyz([
+                current_chunk_idx_xy[0],
+                current_chunk_idx_xy[1],
+                camera_chunk_z,
+            ])
+            .is_some();
 
         Self {
             scratch,
@@ -418,6 +438,7 @@ impl<'a> GrouscanState<'a> {
             chunk_size_xy_mask,
             current_chunk_idx_xy,
             current_chunk_exists,
+            camera_chunk_z,
         }
     }
 }
@@ -1460,7 +1481,11 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
             ];
             if new_chunk_xy != state.current_chunk_idx_xy {
                 state.current_chunk_idx_xy = new_chunk_xy;
-                if let Some(new_chunk) = state.grid_view.chunk_at_xy(new_chunk_xy) {
+                if let Some(new_chunk) = state.grid_view.chunk_at_xyz([
+                    new_chunk_xy[0],
+                    new_chunk_xy[1],
+                    state.camera_chunk_z,
+                ]) {
                     state.slab_buf = new_chunk.slab_buf;
                     state.column_offsets = new_chunk.column_offsets;
                     state.mip_base_offsets = new_chunk.mip_base_offsets;
@@ -1502,7 +1527,11 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
             let new_chunk_xy = [state.cx >> log2, state.cy >> log2];
             if new_chunk_xy != state.current_chunk_idx_xy {
                 state.current_chunk_idx_xy = new_chunk_xy;
-                if let Some(new_chunk) = state.grid_view.chunk_at_xy(new_chunk_xy) {
+                if let Some(new_chunk) = state.grid_view.chunk_at_xyz([
+                    new_chunk_xy[0],
+                    new_chunk_xy[1],
+                    state.camera_chunk_z,
+                ]) {
                     state.slab_buf = new_chunk.slab_buf;
                     state.column_offsets = new_chunk.column_offsets;
                     state.mip_base_offsets = new_chunk.mip_base_offsets;
@@ -2345,6 +2374,7 @@ mod tests {
                 &DUMMY_COLUMN_OFFSETS,
                 &DUMMY_MIP_OFFSETS,
             ),
+            camera_chunk_z: 0,
         }
     }
 
@@ -2488,6 +2518,7 @@ mod tests {
                 &DUMMY_COLUMN_OFFSETS,
                 &DUMMY_MIP_OFFSETS,
             ),
+            camera_chunk_z: 0,
         };
         GrouscanState::from_seed(scratch, &inputs, 0, 0, 0, 0, 1)
     }
@@ -2514,6 +2545,7 @@ mod tests {
                 &DUMMY_COLUMN_OFFSETS,
                 &DUMMY_MIP_OFFSETS,
             ),
+            camera_chunk_z: 0,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 0, 0, 1)
     }
@@ -2681,6 +2713,7 @@ mod tests {
                 &DUMMY_COLUMN_OFFSETS,
                 &DUMMY_MIP_OFFSETS,
             ),
+            camera_chunk_z: 0,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 0, 0, 1)
     }
@@ -2999,6 +3032,7 @@ mod tests {
                 &column_offsets,
                 &mip_base,
             ),
+            camera_chunk_z: 0,
         };
         let mut s = fresh_scratch();
         s.gixy = [1, 4]; // x-step = 1, y-step = 4
@@ -3046,6 +3080,7 @@ mod tests {
                 &column_offsets,
                 &mip_base,
             ),
+            camera_chunk_z: 0,
         };
         let mut s = fresh_scratch();
         // BOTH lanes must exceed ngxmax: lane recompute picks the
@@ -3169,6 +3204,7 @@ mod tests {
                 &column_offsets,
                 &mip_base,
             ),
+            camera_chunk_z: 0,
         };
         let mut s = fresh_scratch();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
@@ -3201,6 +3237,7 @@ mod tests {
                 &column_offsets,
                 &mip_base,
             ),
+            camera_chunk_z: 0,
         };
         let mut s = fresh_scratch();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 32, 0, 0, 0, 1);
