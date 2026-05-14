@@ -718,6 +718,94 @@ fn dump_green_beam_pose() {
     }
 }
 
+/// Same as `dump_green_beam_pose_diff` but at the demo's SPAWN
+/// pose — used to verify a candidate fix doesn't over-cull
+/// legitimate terrain. Spawn pose looks at lots of close + far
+/// terrain so it stress-tests "is the guard culling real pixels?"
+#[test]
+#[ignore = "expensive: builds full demo; reports beam pixel coords at spawn"]
+fn dump_spawn_pose_diff() {
+    use roxlap_scene::CHUNK_SIZE_XY;
+
+    let mut sc = crate::scene::build_demo();
+    let cam = sc.camera;
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.max_scan_dist = 512;
+
+    let mut fb_z = vec![sky; pixel_count];
+    let mut zb_z = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 1;
+    settings.mip_scan_dist = 4;
+    let _ = render_scene_composed(
+        &mut fb_z,
+        &mut zb_z,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+
+    let mut fb_m = vec![sky; pixel_count];
+    let mut zb_m = vec![f32::INFINITY; pixel_count];
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb_m,
+        &mut zb_m,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+
+    let is_grass = |p: u32| -> bool {
+        let r = ((p >> 16) & 0xff) as i32;
+        let g = ((p >> 8) & 0xff) as i32;
+        let b = (p & 0xff) as i32;
+        g > r + 30 && g > b + 30 && (r + g + b) > 100
+    };
+
+    let mut beam = 0usize;
+    let mut lost_terrain = 0usize;
+    let mut total_non_sky_ml1 = 0usize;
+    let mut total_non_sky_ml4 = 0usize;
+    for i in 0..pixel_count {
+        if fb_z[i] != sky {
+            total_non_sky_ml1 += 1;
+        }
+        if fb_m[i] != sky {
+            total_non_sky_ml4 += 1;
+        }
+        if fb_z[i] == sky && is_grass(fb_m[i]) {
+            beam += 1;
+        }
+        if is_grass(fb_z[i]) && fb_m[i] == sky {
+            lost_terrain += 1;
+        }
+    }
+    eprintln!("SPAWN BEAM PIXELS (sky in ml=1, grass in ml=4): {beam}");
+    eprintln!("SPAWN LOST TERRAIN (grass in ml=1, sky in ml=4): {lost_terrain}");
+    eprintln!("SPAWN non-sky: ml=1 {total_non_sky_ml1}, ml=4 {total_non_sky_ml4}");
+}
+
 /// Precise beam-pixel finder: render the SAME scene + camera with
 /// `mip_levels=1` (baseline = no transitions) and `mip_levels=6
 /// mip_scan_dist=64` (live config). A pixel that is SKY in the
@@ -744,7 +832,15 @@ fn dump_green_beam_pose_diff() {
 
     let pixel_count = (W as usize) * (H as usize);
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
-    settings.max_scan_dist = 1024;
+    let scan = std::env::var("BEAM_SCAN_DIST")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(1024);
+    let msd_env = std::env::var("BEAM_MSD")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(64);
+    settings.max_scan_dist = scan;
 
     // (Z) baseline: mip_levels=1 — no transitions.
     let mut fb_z = vec![sky; pixel_count];
@@ -770,7 +866,7 @@ fn dump_green_beam_pose_diff() {
     let mut fb_m = vec![sky; pixel_count];
     let mut zb_m = vec![f32::INFINITY; pixel_count];
     settings.mip_levels = 6;
-    settings.mip_scan_dist = 64;
+    settings.mip_scan_dist = msd_env;
     let _ = render_scene_composed(
         &mut fb_m,
         &mut zb_m,
@@ -785,6 +881,7 @@ fn dump_green_beam_pose_diff() {
         None,
     );
     write_ppm("/tmp/scene-demo-beam-diff-ml6.ppm", &fb_m);
+    eprintln!("config: scan_dist={scan} mip_scan_dist={msd_env}");
 
     // Diff: pixels SKY in (Z) but grass-green in (M).
     let is_grass = |p: u32| -> bool {
@@ -803,10 +900,35 @@ fn dump_green_beam_pose_diff() {
             }
         }
     }
+    // ALSO count "lost terrain" pixels: pixels that are terrain in
+    // ml=1 but SKY in ml=6 — these would be legitimate terrain
+    // pixels that a too-aggressive guard culled.
+    let mut lost_terrain = 0usize;
+    let is_grass = |p: u32| -> bool {
+        let r = ((p >> 16) & 0xff) as i32;
+        let g = ((p >> 8) & 0xff) as i32;
+        let b = (p & 0xff) as i32;
+        g > r + 30 && g > b + 30 && (r + g + b) > 100
+    };
+    let mut total_grass_ml1 = 0usize;
+    let mut total_grass_ml6 = 0usize;
+    for i in 0..pixel_count {
+        if is_grass(fb_z[i]) {
+            total_grass_ml1 += 1;
+        }
+        if is_grass(fb_m[i]) {
+            total_grass_ml6 += 1;
+        }
+        if is_grass(fb_z[i]) && fb_m[i] == sky {
+            lost_terrain += 1;
+        }
+    }
     eprintln!(
         "BEAM PIXELS (sky in ml=1, grass in ml=6): {} / {pixel_count}",
         beam_pixels.len()
     );
+    eprintln!("LOST TERRAIN (grass in ml=1, sky in ml=6): {lost_terrain} / {pixel_count}");
+    eprintln!("total grass ml=1: {total_grass_ml1}; total grass ml=6: {total_grass_ml6}");
     if !beam_pixels.is_empty() {
         let xmin = beam_pixels.iter().map(|&(x, _)| x).min().unwrap_or(0);
         let xmax = beam_pixels.iter().map(|&(x, _)| x).max().unwrap_or(0);

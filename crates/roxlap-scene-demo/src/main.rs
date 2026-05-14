@@ -56,7 +56,7 @@ const MAX_GRID_VSID: u32 = 32 * roxlap_scene::CHUNK_SIZE_XY;
 /// exercise it.
 const SCAN_DIST_INITIAL: i32 = 384;
 const SCAN_DIST_MIN: i32 = 64;
-const SCAN_DIST_MAX: i32 = 512;
+const SCAN_DIST_MAX: i32 = 1500;
 const SCAN_DIST_STEP: i32 = 64;
 
 /// Cap for `rayon`'s strip-parallel pool. Voxlap's per-strip
@@ -243,18 +243,8 @@ impl App {
         let mut settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
         settings.max_scan_dist = self.scan_dist;
         // S4B.5: per-chunk mips generated in scene::bake_lightmode_1.
-        // Ladder math: `phase_remiporend` halts the ray when
-        // `gmipcnt + 1 >= gmipnum`, with `ngxmax` doubling each
-        // transition from the initial `mip_scan_dist`. So the
-        // hard render-distance ceiling is
-        // `mip_scan_dist * 2^(mip_levels - 1)`. With `mip_levels = 6`
-        // + `mip_scan_dist = 64` the ladder reaches
-        // `64 * 32 = 2048` voxels, matching `SCAN_DIST_MAX`. Below
-        // this only `mip_scan_dist` voxels render at full mip-0
-        // resolution; past it the increasing `max_scan_dist` does
-        // nothing because the ray would Startsky regardless.
-        settings.mip_levels = 6;
-        settings.mip_scan_dist = 64;
+        settings.mip_levels = 4;
+        settings.mip_scan_dist = 128;
 
         // Pool config — sky + fog colour. `treat_z_max_as_air` lets
         // the ship grid render correctly even though the camera is
