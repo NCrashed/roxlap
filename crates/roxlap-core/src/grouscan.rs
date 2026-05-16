@@ -158,6 +158,16 @@ pub struct GrouscanInputs<'a> {
     /// of the legacy 2D `chunk_at_xy`. For `chunks_z == 1` grids
     /// this is `0` and the dispatch degenerates to today's path.
     pub camera_chunk_z: i32,
+    /// S4B.6.c: world-z offset for the slab data the walker starts
+    /// at. `world_z = column_local_z + chunk_world_z_base`. Seeded
+    /// to `camera_chunk_z * chunk_size_z` so the cf seed's z0/z1
+    /// are in world-z from the start. The slab walker bumps this
+    /// when crossing a chunk-z boundary.
+    pub chunk_world_z_base: i32,
+    /// S4B.6.c: Z extent of one chunk in voxel units (= 256). Used
+    /// by the slab walker's chunk-z handoff to compute the next
+    /// chunk's world-z base.
+    pub chunk_size_z: u32,
 }
 
 /// All of grouscan's per-ray local state in one struct.
@@ -348,6 +358,21 @@ pub(crate) struct GrouscanState<'a> {
     /// layer. Vertical ray traversal (= incrementing chunk_z when
     /// the ray crosses into chunks above/below) lands in S4B.6.c.
     pub camera_chunk_z: i32,
+    /// S4B.6.c: world-z offset of the chunk the slab walker is
+    /// currently reading. `world_z = chunk_local_z +
+    /// chunk_world_z_base`. The cf entries' `z0` / `z1` carry
+    /// world-z; per-slab byte reads (`column[vptr+1]` etc.)
+    /// translate via `+ chunk_world_z_base` to compare correctly.
+    /// Updates when the walker crosses a chunk-z boundary.
+    pub chunk_world_z_base: i32,
+    /// S4B.6.c: Z extent of one chunk in voxel units (`= 256`).
+    /// Used by the slab walker's chunk-z handoff to compute the
+    /// next chunk's base.
+    pub chunk_size_z: u32,
+    /// S4B.6.c: chunk-z layer the slab walker is currently in.
+    /// Initialized to `camera_chunk_z` at seed; the slab walker
+    /// increments / decrements as it crosses chunk-z boundaries.
+    pub current_chunk_z: i32,
 }
 
 impl<'a> GrouscanState<'a> {
@@ -439,6 +464,9 @@ impl<'a> GrouscanState<'a> {
             current_chunk_idx_xy,
             current_chunk_exists,
             camera_chunk_z,
+            chunk_world_z_base: inputs.chunk_world_z_base,
+            chunk_size_z: inputs.chunk_size_z,
+            current_chunk_z: camera_chunk_z,
         }
     }
 }
@@ -820,7 +848,7 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
     }
 
     // Voxlap5.c:11646-11648. dv1 = v[1] = top of floor-colour list.
-    let dv1 = i32::from(state.column[state.vptr_offset + 1]);
+    let dv1 = slab_z_at(state, state.vptr_offset, 1);
 
     let bedrock_z_at_mip = 0xff_u8 >> (state.gmipcnt as u32);
     if state.scratch.treat_z_max_as_air && (dv1 as u8) == bedrock_z_at_mip {
@@ -840,7 +868,7 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
 
     'outer: loop {
         // -- loop0 (voxlap5.c:11650): per voxel-row setup. --
-        state.off = state.z1 - i32::from(state.column[state.vptr_offset + 1]);
+        state.off = state.z1 - slab_z_at(state, state.vptr_offset, 1);
         state.z1 -= 1;
         // Read 4-byte voxel colour at byte offset off*4 inside slab.
         // off is non-negative here (loop entry guards `dv1 >= z1`),
@@ -874,7 +902,7 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
             let test = grouscan_cross_sign(state.cx1, state.cy1, state.ogx, state.gy_raw);
             if test <= 0 {
                 // endloop1 (voxlap5.c:11676). Voxel row exhausted.
-                if i32::from(state.column[state.vptr_offset + 1]) != state.z1 {
+                if slab_z_at(state, state.vptr_offset, 1) != state.z1 {
                     continue 'outer;
                 }
                 // c->i1 = ebx, then fall through to drawcwall.
@@ -936,7 +964,7 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
     // Voxlap5.c:11694 — `z1 = v[1]` UNCONDITIONALLY at drawcwall
     // entry (the comment in the C source warns that drawfwall's
     // early-exit path leaves z1 stale otherwise).
-    state.z1 = i32::from(state.column[state.vptr_offset + 1]);
+    state.z1 = slab_z_at(state, state.vptr_offset, 1);
 
     // Column-top: no back wall, jump to drawflor's prep.
     if state.vptr_offset == 0 {
@@ -946,7 +974,7 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
     // Voxlap5.c:11699-11703. v[3] = z0 of this slab (the air-ceiling
     // above it). If it's ≤ the cached z0 there's no back wall above
     // this slab to draw → set z0 = dv3, fall through to drawceil.
-    let dv3 = i32::from(state.column[state.vptr_offset + 3]);
+    let dv3 = slab_z_at(state, state.vptr_offset, 3);
     if dv3 <= state.z0 {
         state.z0 = dv3;
         return Phase::PreDrawCeil;
@@ -964,14 +992,14 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
         // BEFORE the slab header — in the previous slab's tail
         // colour bytes. Use isize math so the negative offset is
         // computed correctly relative to vptr_offset.
-        state.off = state.z0 - i32::from(state.column[state.vptr_offset + 3]);
+        state.off = state.z0 - slab_z_at(state, state.vptr_offset, 3);
         state.z0 += 1;
         let row_offset_signed = state.vptr_offset as isize + (state.off as isize) * 4;
         if row_offset_signed < 0 || (row_offset_signed as usize) + 4 > state.column.len() {
             state.scratch.cf[state.c_idx].i0 = state.ebx;
             state.scratch.cf[state.c_idx].cx0 = state.cx0;
             state.scratch.cf[state.c_idx].cy0 = state.cy0;
-            state.z0 = i32::from(state.column[state.vptr_offset + 3]);
+            state.z0 = slab_z_at(state, state.vptr_offset, 3);
             return Phase::PreDrawCeil;
         }
         let row_offset = row_offset_signed as usize;
@@ -986,7 +1014,7 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
             state.scratch.cf[state.c_idx].i0 = state.ebx;
             state.scratch.cf[state.c_idx].cx0 = state.cx0;
             state.scratch.cf[state.c_idx].cy0 = state.cy0;
-            state.z0 = i32::from(state.column[state.vptr_offset + 3]);
+            state.z0 = slab_z_at(state, state.vptr_offset, 3);
             return Phase::PreDrawCeil;
         }
         state.gy_raw = state.gylookup[z0_idx];
@@ -996,7 +1024,7 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
             let test = grouscan_cross_sign(state.cx0, state.cy0, state.ogx, state.gy_raw);
             if test > 0 {
                 // endloop3 (voxlap5.c:11728). Voxel row exhausted.
-                if i32::from(state.column[state.vptr_offset + 3]) != state.z0 {
+                if slab_z_at(state, state.vptr_offset, 3) != state.z0 {
                     continue 'outer;
                 }
                 // c->i0 = ebx, z0 = v[3], fall through to drawceil.
@@ -1009,7 +1037,7 @@ fn phase_draw_cwall(state: &mut GrouscanState<'_>) -> Phase {
                 state.scratch.cf[state.c_idx].i0 = state.ebx;
                 state.scratch.cf[state.c_idx].cx0 = state.cx0;
                 state.scratch.cf[state.c_idx].cy0 = state.cy0;
-                state.z0 = i32::from(state.column[state.vptr_offset + 3]);
+                state.z0 = slab_z_at(state, state.vptr_offset, 3);
                 return Phase::PreDrawCeil;
             }
             // Advance left-edge ray right.
@@ -1195,6 +1223,14 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
         && state.vptr_offset + 1 < state.column.len()
         && state.column[state.vptr_offset + 1] == bedrock_z_at_mip
     {
+        // S4B.6.c: a chunk-Z handoff hook lives at
+        // `try_handoff_chunk_z_down` for when the cross-chunk
+        // look-down lands. It currently isn't wired into the
+        // bedrock guard because the cf seed's z range is still
+        // capped at the camera-chunk's bedrock (`world_z = 255`
+        // for camera at chz=0). Extending cf z1 across chunks
+        // requires `camera_chunk_air_gap` to walk the chunk-z
+        // stack at seed time — deferred to a follow-up.
         return Phase::AfterDelete;
     }
     // gy_raw = gylookoff[z1].
@@ -1689,7 +1725,8 @@ fn phase_skipixy3(state: &mut GrouscanState<'_>) -> Phase {
     clippy::similar_names
 )]
 fn phase_intoslabloop(state: &mut GrouscanState<'_>) -> Phase {
-    let v2 = i32::from(column_byte_at(state, 2));
+    // S4B.6.c: `v2` is a z-byte (z1c); translate via `slab_z_at`.
+    let v2 = slab_z_at(state, state.vptr_offset, 2);
     let gy_idx = (v2 + 1) as usize;
     if gy_idx >= state.gylookup.len() {
         // Defensive — malformed v2 puts gylookup index out of
@@ -1708,8 +1745,9 @@ fn phase_intoslabloop(state: &mut GrouscanState<'_>) -> Phase {
     // Slab intersects. Test the NEXT slab to decide
     // single-vs-split.
     let v0 = i32::from(column_byte_at(state, 0));
-    let next_v3_offset = (v0 * 4 + 3) as usize;
-    let next_v3 = i32::from(column_byte_at(state, next_v3_offset));
+    // `v0` is nextptr (NOT a z value) — read raw. `next_v3` is
+    // a z-byte of the NEXT slab; translate via slab_z_at.
+    let next_v3 = slab_z_at(state, state.vptr_offset + (v0 as usize) * 4, 3);
     let next_gy_idx = next_v3 as usize;
     if next_gy_idx >= state.gylookup.len() {
         return Phase::DrawFwall;
@@ -1908,6 +1946,104 @@ fn column_byte_at(state: &GrouscanState<'_>, offset: usize) -> u8 {
         .get(state.vptr_offset.saturating_add(offset))
         .copied()
         .unwrap_or(0)
+}
+
+/// S4B.6.c: read a slab z-byte (chunk-local) and translate to
+/// world-z by adding `state.chunk_world_z_base`. Use for any
+/// byte in {1: z1, 2: z1c, 3: z0} where the result is interpreted
+/// as a z coordinate. For nextptr (byte 0) and colour bytes use
+/// raw [`column_byte_at`] / slice indexing. When
+/// `chunk_world_z_base == 0` (= camera in chz=0 of a non-stacked
+/// world) the addition is a no-op, byte-identical with the
+/// pre-S4B.6.c bare-byte reads.
+#[inline]
+fn slab_z_at(state: &GrouscanState<'_>, vptr_offset: usize, byte: usize) -> i32 {
+    i32::from(
+        state
+            .column
+            .get(vptr_offset.saturating_add(byte))
+            .copied()
+            .unwrap_or(0),
+    ) + state.chunk_world_z_base
+}
+
+/// S4B.6.c: try to swap the slab walker into the chunk at
+/// `current_chunk_z + 1` (= one chunk DOWN in voxlap's z-down
+/// convention) at the same XY. Returns `true` on success — caller
+/// re-enters drawflor / drawcwall / etc. so the chain continues
+/// with the new chunk's slab data + world-z base. Returns `false`
+/// when no such chunk exists, leaving state unchanged.
+///
+/// Used by [`phase_draw_flor`]'s bedrock-as-air bypass to extend
+/// across stacked chunks (e.g. camera at chz=0 above an empty
+/// chunk sees terrain in chz=1's chunk).
+///
+/// Mip-0 only — multi-mip + chunk-Z handoff is unaudited; the
+/// caller gates on `state.gmipcnt == 0`.
+fn try_handoff_chunk_z_down(state: &mut GrouscanState<'_>) -> bool {
+    // Only meaningful for multi-chunk grids. Single-chunk grids
+    // (`chunk_grid: None`) carry one un-stacked chunk — the
+    // `chunk_at_xyz` single-chunk shortcut returns Some(self) for
+    // any z, which would cause infinite handoff into the same
+    // chunk. Skip when there's no real chunk-grid backend.
+    let cg = match state.grid_view.chunk_grid {
+        Some(cg) => cg,
+        None => return false,
+    };
+    let next_chz = state.current_chunk_z + 1;
+    // Bail before querying when next_chz is past the grid's z
+    // extent — same effect as `chunk_at_xyz` returning None but
+    // skips a lookup.
+    #[allow(clippy::cast_possible_wrap)]
+    if next_chz >= cg.origin_chunk_z + cg.chunks_z as i32 {
+        return false;
+    }
+    let new_chunk_xyz = [
+        state.current_chunk_idx_xy[0],
+        state.current_chunk_idx_xy[1],
+        next_chz,
+    ];
+    let new_chunk = match state.grid_view.chunk_at_xyz(new_chunk_xyz) {
+        Some(c) => c,
+        None => return false,
+    };
+    state.slab_buf = new_chunk.slab_buf;
+    state.column_offsets = new_chunk.column_offsets;
+    state.mip_base_offsets = new_chunk.mip_base_offsets;
+    state.vsid = new_chunk.vsid;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        state.vsid_signed = new_chunk.vsid as i32;
+    }
+    state.current_chunk_exists = true;
+    state.current_chunk_z = next_chz;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        state.chunk_world_z_base += state.chunk_size_z as i32;
+    }
+    // Recompute column index in the new chunk. Mip-0 path:
+    // `cy_local * chunk_size_xy + cx_local`. `cx` / `cy` are
+    // signed world coords; `& mask` yields chunk-local for
+    // power-of-two `chunk_size_xy`.
+    let local_cx = state.cx & state.chunk_size_xy_mask;
+    let local_cy = state.cy & state.chunk_size_xy_mask;
+    #[allow(clippy::cast_sign_loss)]
+    let correct_idx = (local_cy as u32)
+        .wrapping_mul(state.chunk_size_xy)
+        .wrapping_add(local_cx as u32) as usize;
+    state.ixy_sptr_col_idx = correct_idx;
+    if let Some(&col_off) = state.column_offsets.get(correct_idx) {
+        let off = col_off as usize;
+        if off <= state.slab_buf.len() {
+            state.column = &state.slab_buf[off..];
+        } else {
+            state.column = &[];
+        }
+    } else {
+        state.column = &[];
+    }
+    state.vptr_offset = 0;
+    true
 }
 
 /// `remiporend` — voxlap5.c:11998-12118. Mip-level transition.
@@ -2375,6 +2511,8 @@ mod tests {
                 &DUMMY_MIP_OFFSETS,
             ),
             camera_chunk_z: 0,
+            chunk_world_z_base: 0,
+            chunk_size_z: 256,
         }
     }
 
@@ -2519,6 +2657,8 @@ mod tests {
                 &DUMMY_MIP_OFFSETS,
             ),
             camera_chunk_z: 0,
+            chunk_world_z_base: 0,
+            chunk_size_z: 256,
         };
         GrouscanState::from_seed(scratch, &inputs, 0, 0, 0, 0, 1)
     }
@@ -2546,6 +2686,8 @@ mod tests {
                 &DUMMY_MIP_OFFSETS,
             ),
             camera_chunk_z: 0,
+            chunk_world_z_base: 0,
+            chunk_size_z: 256,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 0, 0, 1)
     }
@@ -2714,6 +2856,8 @@ mod tests {
                 &DUMMY_MIP_OFFSETS,
             ),
             camera_chunk_z: 0,
+            chunk_world_z_base: 0,
+            chunk_size_z: 256,
         };
         GrouscanState::from_seed(scratch, &inputs, vptr_offset, 0, 0, 0, 1)
     }
@@ -3033,6 +3177,8 @@ mod tests {
                 &mip_base,
             ),
             camera_chunk_z: 0,
+            chunk_world_z_base: 0,
+            chunk_size_z: 256,
         };
         let mut s = fresh_scratch();
         s.gixy = [1, 4]; // x-step = 1, y-step = 4
@@ -3081,6 +3227,8 @@ mod tests {
                 &mip_base,
             ),
             camera_chunk_z: 0,
+            chunk_world_z_base: 0,
+            chunk_size_z: 256,
         };
         let mut s = fresh_scratch();
         // BOTH lanes must exceed ngxmax: lane recompute picks the
@@ -3205,6 +3353,8 @@ mod tests {
                 &mip_base,
             ),
             camera_chunk_z: 0,
+            chunk_world_z_base: 0,
+            chunk_size_z: 256,
         };
         let mut s = fresh_scratch();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);
@@ -3238,6 +3388,8 @@ mod tests {
                 &mip_base,
             ),
             camera_chunk_z: 0,
+            chunk_world_z_base: 0,
+            chunk_size_z: 256,
         };
         let mut s = fresh_scratch();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 32, 0, 0, 0, 1);

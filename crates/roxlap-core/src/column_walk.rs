@@ -156,20 +156,27 @@ pub fn camera_chunk_air_gap(
     prelude: &crate::opticast_prelude::OpticastPrelude,
     treat_z_max_as_air: bool,
 ) -> Option<(i32, i32, usize)> {
+    // S4B.6.c: this function returns the cf seed's `(z0, z1, vptr)`
+    // triple in WORLD-Z coordinates. For unstacked grids
+    // (`camera_chunk_idx[2] == 0`) world-z == chunk-local. Stacked
+    // grids translate by `camera_chunk_z * chunk_size_z`.
     if !prelude.in_bounds_xy {
-        // OOB-XY camera is not physically inside any column of the
-        // grid. Synthesise the bedrock placeholder seed so the
-        // renderer doesn't paint a false floor along the grid's
-        // silhouette (see `project_oob_xy_chunk_edge_streaking.md`).
-        // `treat_z_max_as_air = true` makes the bedrock transparent.
-        return Some((0, 255, 0));
+        // OOB-XY camera: synthesise the bedrock placeholder seed
+        // covering the grid's full world-z extent. `vptr=0` is a
+        // placeholder; the cf seed's `i0/i1` range gets drained by
+        // `phase_startsky` so no slab data is read from `column[]`
+        // anyway. For unstacked grids the extent is `0..255` (=
+        // pre-S4B.6 behaviour). For stacked grids the extent is
+        // `0..chunks_z * chunk_size_z - 1`. `treat_z_max_as_air
+        // = true` makes the bedrock transparent.
+        let chunks_z_signed = grid.chunk_grid.map_or(1, |cg| cg.chunks_z) as i32;
+        #[allow(clippy::cast_possible_wrap)]
+        let world_z_max = chunks_z_signed * grid.chunk_size_z as i32 - 1;
+        return Some((0, world_z_max, 0));
     }
 
     // S4B.6.b: dispatch via `chunk_at_xyz` so stacked grids walk
-    // the column at the camera's actual `(chx, chy, chz)`. For
-    // `chunks_z == 1` callers `camera_chunk_idx[2] == 0` and the
-    // shortcut path returns the same chunk as `chunk_at_xy` —
-    // byte-identical for the goldens.
+    // the column at the camera's actual `(chx, chy, chz)`.
     let camera_chunk = grid.chunk_at_xyz(prelude.camera_chunk_idx)?;
     #[allow(clippy::cast_sign_loss)]
     let column_idx_in_chunk = (prelude.camera_local_xyz[1] as u32)
@@ -180,7 +187,16 @@ pub fn camera_chunk_air_gap(
         camera_chunk.column_offsets,
         column_idx_in_chunk,
     )?;
-    camera_column_air_gap(column, prelude.camera_local_xyz[2], treat_z_max_as_air)
+    let (local_z0, local_z1, vptr) =
+        camera_column_air_gap(column, prelude.camera_local_xyz[2], treat_z_max_as_air)?;
+    // Translate chunk-local z to world-z.
+    #[allow(clippy::cast_possible_wrap)]
+    let chunk_world_z_base = prelude.camera_chunk_idx[2] * grid.chunk_size_z as i32;
+    Some((
+        local_z0 + chunk_world_z_base,
+        local_z1 + chunk_world_z_base,
+        vptr,
+    ))
 }
 
 #[cfg(test)]
@@ -469,12 +485,14 @@ mod tests {
             camera_local_xyz: [0, 0, 20],
         };
         let gap0 = camera_chunk_air_gap(parent, &prelude_chz0, false);
+        // S4B.6.c: cf seed returns world-z. For chz=0 (chunk-z
+        // base = 0), world-z == chunk-local.
         assert_eq!(gap0, Some((0, 50, 0)));
 
         // Camera in chz=1 at world z=280 (= local z=24 within
         // chz=1's chunk). camera_chunk_idx=[0, 0, 1].
-        // camera_local_xyz=[0, 0, 24]. Air gap (0, 50, 0) within
-        // chz=1's column.
+        // camera_local_xyz=[0, 0, 24]. Air gap chunk-local
+        // (0, 50, 0) translates to world-z (256, 306, 0).
         let prelude_chz1 = crate::opticast_prelude::OpticastPrelude {
             forward_z_sign: 1,
             li_pos: [0, 0, 280],
@@ -493,7 +511,7 @@ mod tests {
             camera_local_xyz: [0, 0, 24],
         };
         let gap1 = camera_chunk_air_gap(parent, &prelude_chz1, false);
-        assert_eq!(gap1, Some((0, 50, 0)));
+        assert_eq!(gap1, Some((256, 306, 0)));
 
         // Confirm the chunk dispatch is correct by reading slab
         // bytes via the chunk-z-specific view.

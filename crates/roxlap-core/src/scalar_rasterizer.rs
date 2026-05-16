@@ -428,6 +428,12 @@ impl Rasterizer for ScalarRasterizer<'_> {
         let pos_yfrac = cache.prelude.pos_yfrac;
         let li_pos_xy = [cache.prelude.li_pos[0], cache.prelude.li_pos[1]];
         let column_index = cache.prelude.column_index;
+        // S4B.6.c: cf seed `z0` / `z1` are already world-z (the
+        // air-gap lookup translates chunk-local to world by adding
+        // `camera_chunk_z * chunk_size_z`). For unstacked grids
+        // (`chunks_z == 1`, camera_chunk_z == 0) the world-z and
+        // chunk-local values coincide — byte-identical with the
+        // pre-S4B.6.c path.
         let gstartz0 = cache.gstartz0;
         let gstartz1 = cache.gstartz1;
         let vptr_offset = cache.vptr_offset;
@@ -635,6 +641,22 @@ impl Rasterizer for ScalarRasterizer<'_> {
             gcsub_local[0] = gcsub_local[lane0_idx];
             gcsub_local[1] = gcsub_local[lane1_idx];
         }
+        let camera_chunk_z = cache.prelude.camera_chunk_idx[2];
+        #[allow(clippy::cast_possible_wrap)]
+        let chunk_size_z_signed = self.grid.chunk_size_z as i32;
+        // S4B.6.c: world-z base for the chunk the walker is
+        // CURRENTLY reading. For in-bounds cameras the walker
+        // starts on the camera's chunk → `camera_chunk_z *
+        // chunk_size_z`. For OOB-XY cameras the air-gap is
+        // synthesised (no real chunk to read from) → `0` (= the
+        // synthesised bedrock seed lives at world-z 0..chunks_z*
+        // chunk_size_z, so cf seed values stay in the
+        // chunk-local scale of chz=0 implicit).
+        let chunk_world_z_base = if cache.prelude.in_bounds_xy {
+            camera_chunk_z * chunk_size_z_signed
+        } else {
+            0
+        };
         let inputs = GrouscanInputs {
             column,
             gylookup: &cache.prelude.y_lookup,
@@ -647,7 +669,11 @@ impl Rasterizer for ScalarRasterizer<'_> {
             grid_view: self.grid,
             // S4B.6.b: pin the camera's chz layer for the
             // column-step's chunk-XY swap.
-            camera_chunk_z: cache.prelude.camera_chunk_idx[2],
+            camera_chunk_z,
+            // S4B.6.c: cf seed + slab byte reads operate in world-z
+            // by adding `chunk_world_z_base` to chunk-local z reads.
+            chunk_world_z_base,
+            chunk_size_z: self.grid.chunk_size_z,
         };
         // gmipnum: min of (built mip levels in chunk) and
         // (caller-requested cap from settings.mip_levels). Both

@@ -99,7 +99,7 @@ pub fn render_scene(
         // (chx, chy) indices and `chunk_at_xy` handles negative-
         // index lookups natively.
         let grid_origin = grid.transform.origin;
-        let Some(backing) = grid.chunk_xy_backing() else {
+        let Some(backing) = grid.chunk_xyz_backing() else {
             // Empty grid (no populated chz=0 chunks) — skip.
             continue;
         };
@@ -233,7 +233,7 @@ pub fn render_scene_composed(
         // commentary; the only difference is this writes to
         // (temp_fb, temp_zb) and composes via `compose_into`.
         let grid_origin = grid.transform.origin;
-        let Some(backing) = grid.chunk_xy_backing() else {
+        let Some(backing) = grid.chunk_xyz_backing() else {
             continue;
         };
         let local_cam = Camera {
@@ -962,7 +962,7 @@ mod tests {
         assert_eq!(g.chunk_count(), 2);
 
         // Build the multi-chunk GridView.
-        let backing = g.chunk_xy_backing().expect("at least one chunk populated");
+        let backing = g.chunk_xyz_backing().expect("at least one chunk populated");
         assert_eq!(backing.chunks_x, 2);
         assert_eq!(backing.chunks_y, 1);
         assert_eq!(backing.origin_chunk_xy, [0, 0]);
@@ -1051,7 +1051,7 @@ mod tests {
         );
         assert_eq!(g.chunk_count(), 2);
 
-        let backing = g.chunk_xy_backing().expect("populated");
+        let backing = g.chunk_xyz_backing().expect("populated");
         let cg = roxlap_core::ChunkGrid {
             chunks: &backing.chunks,
             origin_chunk_xy: backing.origin_chunk_xy,
@@ -1090,6 +1090,64 @@ mod tests {
         assert!(
             box_count > 50,
             "box in chunk (0, 0) not visible — only {box_count} box pixels — westward cross-chunk DDA failed"
+        );
+    }
+
+    /// S4B.6.c: stacked-grid scaffold — camera in chz=1 (= world
+    /// z=256..511) of a 2-chunk-tall grid should render its own
+    /// chunk's terrain. Verifies cf seed + slab-byte reads + chunk-
+    /// XY swaps all use world-z consistently.
+    ///
+    /// Cross-chunk look-down (= camera in chz=0 sees terrain in
+    /// chz=1) needs cf z range extension at air-gap-lookup time;
+    /// that's a follow-up to S4B.6.c.
+    #[test]
+    fn stacked_two_chunk_z_camera_in_chz1_sees_own_chunk_floor() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).unwrap();
+        // chz=0: all-air (materialised so chunk_xyz_backing enumerates).
+        g.ensure_chunk(IVec3::new(0, 0, 0));
+        // chz=1: floor at local z=50 (= world z=306).
+        g.set_rect(
+            IVec3::new(60, 60, 306),
+            IVec3::new(72, 72, 310),
+            Some(0x80_33_66_99),
+        );
+        assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        pool.set_treat_z_max_as_air(true);
+        // Camera at world (66, 66, 280) — directly above the
+        // floor at world z=306. Look STRAIGHT DOWN (z increases =
+        // down in voxlap z-down).
+        let camera = Camera {
+            pos: [66.0, 66.0, 280.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let floor_count = fb.iter().filter(|&&p| p == 0x80_33_66_99).count();
+        assert!(
+            floor_count > 100,
+            "camera at chz=1 with floor in same chunk should see it — got {floor_count} floor pixels"
         );
     }
 }
