@@ -140,12 +140,9 @@ fn bake_lightmode_1(scene: &mut Scene) {
         let cs_z = CHUNK_SIZE_Z as i32;
 
         for chunk_idx in &chunk_idxs {
-            if chunk_idx.z != 0 {
-                // chz=0 only — z-stacking is S4B.3 territory.
-                continue;
-            }
             let target_chx = chunk_idx.x;
             let target_chy = chunk_idx.y;
+            let target_chz = chunk_idx.z;
 
             // Cache build (immutable grid borrow). The closure
             // resolves chunk-local `(px, py)` — which can extend
@@ -153,6 +150,11 @@ fn bake_lightmode_1(scene: &mut Scene) {
             // neighbour chunk that owns that voxel-column. Padding
             // straddling unpopulated chunks returns None (= treat
             // as full air), matching the historical OOB behaviour.
+            // S4B.6.f: reader queries `target_chz` so stacked grids
+            // bake each chunk-z layer independently. Cross-chz
+            // neighbour reads (ESTNORMRAD padding extending into
+            // chz±1 at top/bottom of a chunk) still clip on the z
+            // boundary — that's a follow-up.
             let cache = {
                 let grid_ref: &Grid = &*grid;
                 let reader = |px: i32, py: i32| -> Option<&[u8]> {
@@ -160,7 +162,8 @@ fn bake_lightmode_1(scene: &mut Scene) {
                     let neighbour_chy = target_chy + py.div_euclid(cs_xy);
                     let in_chunk_x = px.rem_euclid(cs_xy);
                     let in_chunk_y = py.rem_euclid(cs_xy);
-                    let chunk = grid_ref.chunk(IVec3::new(neighbour_chx, neighbour_chy, 0))?;
+                    let chunk =
+                        grid_ref.chunk(IVec3::new(neighbour_chx, neighbour_chy, target_chz))?;
                     let col_idx = (in_chunk_y as u32) * CHUNK_SIZE_XY + (in_chunk_x as u32);
                     let off = chunk.column_offset[col_idx as usize] as usize;
                     Some(&chunk.data[off..])
@@ -194,9 +197,6 @@ fn bake_lightmode_1(scene: &mut Scene) {
         // and the chunk's grown mip tables are ~1.25× the mip-0
         // footprint per chunk — small vs the bake cost.
         for chunk_idx in &chunk_idxs {
-            if chunk_idx.z != 0 {
-                continue;
-            }
             let chunk = grid.chunks.get_mut(chunk_idx).expect("populated");
             chunk.generate_mips(6);
         }

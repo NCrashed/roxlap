@@ -626,9 +626,13 @@ pub fn update_lighting_chunk<'r>(
     let target_vsid_i = target_vsid as i32;
 
     // Padded region for the cache (cross-chunk reads via reader).
-    // Z still clamps to [0, MAXZDIM) because no z-stacking yet
-    // (S4B.3) — but x/y intentionally don't clamp, so the reader
-    // can pull from neighbour chunks via its own coord translation.
+    // Z clamps to [0, MAXZDIM) because each chunk's slab data is
+    // chunk-local in z. For stacked grids (S4B.6) the caller
+    // invokes us once per chunk-z layer; cross-chz padding at the
+    // top/bottom of a chunk gets clipped here (a follow-up could
+    // pass z-aware columns to lift this). X/y intentionally don't
+    // clamp — the reader pulls from neighbour chunks via its own
+    // coord translation.
     let z0p = (z0 - ESTNORMRAD).max(0);
     let z1p = (z1 + ESTNORMRAD).min(MAXZDIM);
     // Write region clipped to the target chunk's footprint.
