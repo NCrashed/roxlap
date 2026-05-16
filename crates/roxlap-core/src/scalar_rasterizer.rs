@@ -281,6 +281,12 @@ struct FrameCache {
     /// camera's column to the slab whose top bounds the air gap
     /// from below. `0` ⇒ column-top.
     vptr_offset: usize,
+    /// S4B.6.e: chunk-z that owns `vptr_offset`. For the in-camera-
+    /// chunk case this equals `prelude.camera_chunk_idx[2]`. For
+    /// cross-chunk look-down it points to the chunk holding the
+    /// real floor — gline_seed routes state.column / slab_buf to
+    /// it so rays start walking that chunk directly.
+    seed_chunk_z: i32,
 }
 
 /// Scalar rasterizer that writes pixels and a z-buffer entry per
@@ -394,6 +400,7 @@ impl Rasterizer for ScalarRasterizer<'_> {
             gstartz0: ctx.camera_gstartz0,
             gstartz1: ctx.camera_gstartz1,
             vptr_offset: ctx.camera_vptr_offset,
+            seed_chunk_z: ctx.camera_seed_chunk_z,
         });
     }
 
@@ -595,8 +602,22 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // `chunks_z == 1` grids `camera_chunk_idx[2] == 0` and the
         // shortcut path returns the same chunk as the pre-S4B.6
         // `chunk_at_xy` lookup — byte-identical for the goldens.
+        //
+        // S4B.6.e: use `cache.seed_chunk_z` for the chz coordinate
+        // (= the chunk that owns the cf-seed's vptr_offset). For
+        // the no-cross-chunk path `seed_chunk_z ==
+        // camera_chunk_idx[2]` and this is unchanged. For
+        // cross-chunk look-down (camera in all-air-bedrock column
+        // with terrain in a deeper chunk) `seed_chunk_z` points to
+        // the deeper chunk so the rasterizer reads its real slab
+        // data instead of the empty camera-chunk column.
+        let seed_chunk_xyz = [
+            cache.prelude.camera_chunk_idx[0],
+            cache.prelude.camera_chunk_idx[1],
+            cache.seed_chunk_z,
+        ];
         let camera_chunk_opt = if cache.prelude.in_bounds_xy {
-            self.grid.chunk_at_xyz(cache.prelude.camera_chunk_idx)
+            self.grid.chunk_at_xyz(seed_chunk_xyz)
         } else {
             None
         };
@@ -641,7 +662,13 @@ impl Rasterizer for ScalarRasterizer<'_> {
             gcsub_local[0] = gcsub_local[lane0_idx];
             gcsub_local[1] = gcsub_local[lane1_idx];
         }
-        let camera_chunk_z = cache.prelude.camera_chunk_idx[2];
+        // S4B.6.e: use `seed_chunk_z` (= the chunk that owns the
+        // cf-seed vptr) instead of `camera_chunk_idx[2]`. They
+        // match for the in-camera-chunk path. For cross-chunk
+        // look-down, `seed_chunk_z` is the deeper chunk holding
+        // the real floor — pinning state's chunk-z to it means
+        // the column-step's chunk-XY DDA queries that chz layer.
+        let camera_chunk_z = cache.seed_chunk_z;
         #[allow(clippy::cast_possible_wrap)]
         let chunk_size_z_signed = self.grid.chunk_size_z as i32;
         // S4B.6.c: world-z base for the chunk the walker is
@@ -1265,6 +1292,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         r.frame_setup(&ctx);
         let cached_rs = r.frame.as_ref().expect("frame populated").ray_step;
@@ -1300,6 +1328,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         r.frame_setup(&ctx);
 
@@ -1408,6 +1437,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         r.frame_setup(&ctx);
 
@@ -1547,6 +1577,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         r.frame_setup(&ctx);
 
@@ -1606,6 +1637,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         r.frame_setup(&ctx);
 

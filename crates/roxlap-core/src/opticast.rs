@@ -242,9 +242,16 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     // until `(cx, cy)` cross into the world — handled per-step in
     // grouscan.rs's `phase_after_delete_kept_presync`.
     let treat_z_max_as_air = pool.slot(0).treat_z_max_as_air;
-    let (gstartz0, gstartz1, camera_vptr_offset) =
+    // S4B.6.e: 4th field `seed_chz` is the chunk-z that owns the
+    // returned `vptr_offset`. For the in-camera-chunk case (=
+    // single-chunk or stacked-but-camera-has-real-floor) it equals
+    // `prelude.camera_chunk_idx[2]`. For the cross-chunk look-down
+    // case (= chz=N all-air-bedrock with chz=N+1 below) it points
+    // to the chunk holding the real floor. gline_seed reads it to
+    // route state.column / slab_buf to the right chunk.
+    let (gstartz0, gstartz1, camera_vptr_offset, seed_chz) =
         match column_walk::camera_chunk_air_gap(grid, &prelude, treat_z_max_as_air) {
-            Some(triple) => triple,
+            Some(tuple) => tuple,
             None => return OpticastOutcome::SkippedCameraInSolid,
         };
 
@@ -276,6 +283,7 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         camera_gstartz0: gstartz0,
         camera_gstartz1: gstartz1,
         camera_vptr_offset,
+        camera_seed_chunk_z: seed_chz,
     };
 
     // Per-frame setup hook — concrete rasterizers (R4.2) cache the
@@ -309,6 +317,7 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
             gstartz0,
             gstartz1,
             camera_vptr_offset,
+            seed_chz,
         );
     }
 
@@ -342,6 +351,7 @@ fn run_strip_parallel<R: Rasterizer + Clone + Send + Sync>(
     gstartz0: i32,
     gstartz1: i32,
     camera_vptr_offset: usize,
+    camera_seed_chunk_z: i32,
 ) {
     let n_strips = pool.n_threads();
     let y_start_total = settings.y_start;
@@ -400,6 +410,7 @@ fn run_strip_parallel<R: Rasterizer + Clone + Send + Sync>(
             camera_gstartz0: gstartz0,
             camera_gstartz1: gstartz1,
             camera_vptr_offset,
+            camera_seed_chunk_z,
         };
 
         let mut strip_rasterizer: R = rasterizer_template.clone();

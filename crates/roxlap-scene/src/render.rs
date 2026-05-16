@@ -1151,6 +1151,65 @@ mod tests {
         );
     }
 
+    /// S4B.6.e: cross-chunk look-down. Camera in chz=0's all-air
+    /// chunk should see chz=1's floor below it. This was deferred
+    /// from S4B.6.c because the cf seed's z range capped at the
+    /// camera-chunk's bedrock (world z=255); S4B.6.e extends the
+    /// air-gap walk in `camera_chunk_air_gap` to step into the
+    /// next chunk down when the camera's column is all-air-bedrock,
+    /// and the rasterizer routes state.column / slab_buf to the
+    /// chunk holding the real floor via `seed_chunk_z`.
+    #[test]
+    fn stacked_two_chunk_z_camera_in_chz0_sees_chz1_floor() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).unwrap();
+        // chz=0: all-air. Materialised so chunk_xyz_backing
+        // enumerates it.
+        g.ensure_chunk(IVec3::new(0, 0, 0));
+        // chz=1: floor at world z=306..310 (= local z=50..54).
+        g.set_rect(
+            IVec3::new(60, 60, 306),
+            IVec3::new(72, 72, 310),
+            Some(0x80_77_aa_44),
+        );
+        assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        pool.set_treat_z_max_as_air(true);
+        // Camera at world (66, 66, 100) — in chz=0's all-air
+        // chunk. Look STRAIGHT DOWN (z+) toward chz=1's floor at
+        // world z=306.
+        let camera = Camera {
+            pos: [66.0, 66.0, 100.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let floor_count = fb.iter().filter(|&&p| p == 0x80_77_aa_44).count();
+        assert!(
+            floor_count > 50,
+            "camera in chz=0 air-gap should see chz=1 floor via cross-chunk look-down — got {floor_count} floor pixels"
+        );
+    }
+
     /// S4B.6.d: 3-chunk-tall stack stresses the widened gylookup
     /// (`(chunks_z * 512) >> mip + 4` per mip). Pre-S4B.6.d, gylookup
     /// was hardcoded at `(512 >> mip) + 4`, which would OOB or alias

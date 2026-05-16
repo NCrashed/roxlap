@@ -129,74 +129,100 @@ pub fn camera_column_air_gap(
 /// find the air gap inside the column the camera sits in (or
 /// synthesise an air seed when the camera is past the grid's AABB).
 ///
-/// Returns the same `(gstartz0, gstartz1, camera_vptr_offset)`
-/// triple opticast wants from `camera_column_air_gap`. Returns
-/// `None` only when the camera is inside solid voxel material —
-/// OOB-XY cameras are treated as "in air outside the grid" and
-/// return the bedrock placeholder seed `(0, 255, 0)` (matching
-/// the S1.Z behaviour previously inlined into `opticast`).
+/// Returns `(gstartz0, gstartz1, camera_vptr_offset, seed_chz)`:
+/// the first three are voxlap's `gstartz0` / `gstartz1` /
+/// `camera_vptr_offset` (now in **world-z** post-S4B.6.c), and
+/// `seed_chz` is the chunk-z of the chunk whose column owns the
+/// `vptr_offset`. For the unstacked path or a camera in a chunk
+/// with real terrain `seed_chz == camera_chunk_idx[2]` (byte-
+/// identical to pre-S4B.6.e). When the camera's column is fully
+/// air-bedrock and `treat_z_max_as_air` is set, this walks the
+/// chunk stack downward (chz+1, chz+2, …) and returns the first
+/// chunk whose column has a real floor — that's `seed_chz`. The
+/// caller then seeds the rasterizer with `seed_chz`'s chunk data
+/// (`state.column` / `state.slab_buf` / etc.) so rays start
+/// walking the real-terrain chunk directly. See
+/// `project_s4b_6_e_landed.md` for the cross-chunk look-down case
+/// this unblocks.
 ///
-/// S4B.6.b: queries the chunk at the camera's actual `chz` (=
-/// `prelude.camera_chunk_idx[2]`) via [`GridView::chunk_at_xyz`].
-/// For non-stacked grids (`chunks_z == 1, origin_chunk_z == 0`),
-/// camera_chunk_idx.z is `0` and the lookup degenerates to the
-/// pre-S4B.6 path — byte-identical for the goldens.
-///
-/// For stacked grids the returned `(z0, z1)` are still chunk-local
-/// (within the camera's chz layer). The cross-chunk air-gap walk
-/// — extending upward into chz-1 when the camera's chunk's top
-/// is fully air, downward into chz+1 when the bottom is fully air
-/// — is S4B.6.c work, where the slab walker grows world-z
-/// awareness. Until then the per-chunk gap is enough because the
-/// rasterizer only consumes data from one chunk's slab table
-/// anyway.
+/// Returns `None` only when the camera is inside solid voxel
+/// material — OOB-XY cameras are treated as "in air outside the
+/// grid" and return the bedrock placeholder seed `(0, world_z_max,
+/// 0, origin_chunk_z)`.
 #[must_use]
 pub fn camera_chunk_air_gap(
     grid: crate::grid_view::GridView<'_>,
     prelude: &crate::opticast_prelude::OpticastPrelude,
     treat_z_max_as_air: bool,
-) -> Option<(i32, i32, usize)> {
-    // S4B.6.c: this function returns the cf seed's `(z0, z1, vptr)`
-    // triple in WORLD-Z coordinates. For unstacked grids
-    // (`camera_chunk_idx[2] == 0`) world-z == chunk-local. Stacked
-    // grids translate by `camera_chunk_z * chunk_size_z`.
+) -> Option<(i32, i32, usize, i32)> {
     if !prelude.in_bounds_xy {
         // OOB-XY camera: synthesise the bedrock placeholder seed
         // covering the grid's full world-z extent. `vptr=0` is a
         // placeholder; the cf seed's `i0/i1` range gets drained by
         // `phase_startsky` so no slab data is read from `column[]`
-        // anyway. For unstacked grids the extent is `0..255` (=
-        // pre-S4B.6 behaviour). For stacked grids the extent is
-        // `0..chunks_z * chunk_size_z - 1`. `treat_z_max_as_air
-        // = true` makes the bedrock transparent.
+        // anyway. `seed_chz = origin_chunk_z` (= top chunk of the
+        // stack) so callers route to that chunk's data — which is
+        // not read anyway for OOB-XY, but keeps the indexing
+        // canonical.
         let chunks_z_signed = grid.chunk_grid.map_or(1, |cg| cg.chunks_z) as i32;
+        let seed_chz = grid.chunk_grid.map_or(0, |cg| cg.origin_chunk_z);
         #[allow(clippy::cast_possible_wrap)]
         let world_z_max = chunks_z_signed * grid.chunk_size_z as i32 - 1;
-        return Some((0, world_z_max, 0));
+        return Some((0, world_z_max, 0, seed_chz));
     }
 
-    // S4B.6.b: dispatch via `chunk_at_xyz` so stacked grids walk
-    // the column at the camera's actual `(chx, chy, chz)`.
-    let camera_chunk = grid.chunk_at_xyz(prelude.camera_chunk_idx)?;
-    #[allow(clippy::cast_sign_loss)]
-    let column_idx_in_chunk = (prelude.camera_local_xyz[1] as u32)
-        .wrapping_mul(camera_chunk.chunk_size_xy)
-        .wrapping_add(prelude.camera_local_xyz[0] as u32);
-    let column = crate::opticast::camera_column_slice(
-        camera_chunk.slab_buf,
-        camera_chunk.column_offsets,
-        column_idx_in_chunk,
-    )?;
-    let (local_z0, local_z1, vptr) =
-        camera_column_air_gap(column, prelude.camera_local_xyz[2], treat_z_max_as_air)?;
-    // Translate chunk-local z to world-z.
+    let chunks_z = grid.chunk_grid.map_or(1, |cg| cg.chunks_z) as i32;
+    let origin_chunk_z = grid.chunk_grid.map_or(0, |cg| cg.origin_chunk_z);
+    let max_chz = origin_chunk_z + chunks_z - 1;
+    let camera_chz = prelude.camera_chunk_idx[2];
     #[allow(clippy::cast_possible_wrap)]
-    let chunk_world_z_base = prelude.camera_chunk_idx[2] * grid.chunk_size_z as i32;
-    Some((
-        local_z0 + chunk_world_z_base,
-        local_z1 + chunk_world_z_base,
-        vptr,
-    ))
+    let chunk_size_z_signed = grid.chunk_size_z as i32;
+
+    // S4B.6.e: walk the chunk stack downward when the camera's
+    // column reports "air all the way to bedrock-as-air" — i.e. the
+    // column-top air gap reaches the chunk's bedrock placeholder
+    // and there's a chunk below it. Each iteration after the first
+    // re-queries the air gap with `cz_local = 0` (camera is "above"
+    // that chunk for the purposes of the air-gap walk).
+    let mut chz = camera_chz;
+    let mut z0_world: Option<i32> = None;
+    loop {
+        let chunk = grid.chunk_at_xyz([
+            prelude.camera_chunk_idx[0],
+            prelude.camera_chunk_idx[1],
+            chz,
+        ])?;
+        #[allow(clippy::cast_sign_loss)]
+        let column_idx_in_chunk = (prelude.camera_local_xyz[1] as u32)
+            .wrapping_mul(chunk.chunk_size_xy)
+            .wrapping_add(prelude.camera_local_xyz[0] as u32);
+        let column = crate::opticast::camera_column_slice(
+            chunk.slab_buf,
+            chunk.column_offsets,
+            column_idx_in_chunk,
+        )?;
+        let cz_local = if chz == camera_chz {
+            prelude.camera_local_xyz[2]
+        } else {
+            0
+        };
+        let (local_z0, local_z1, vptr) =
+            camera_column_air_gap(column, cz_local, treat_z_max_as_air)?;
+        let chunk_world_z_base = chz * chunk_size_z_signed;
+        // Lock z0_world on the first iteration only — subsequent
+        // chunks contribute only their floor (z1) to the gap.
+        let z0w = *z0_world.get_or_insert(local_z0 + chunk_world_z_base);
+        // All-air-bedrock-from-top detection: column-top air gap
+        // (vptr==0) ends at the bedrock placeholder (z1==0xff). With
+        // `treat_z_max_as_air` the gap extends past the chunk; if a
+        // chunk below exists, look at its top to find the real
+        // floor.
+        if local_z1 == 0xff && vptr == 0 && treat_z_max_as_air && chz < max_chz {
+            chz += 1;
+            continue;
+        }
+        return Some((z0w, local_z1 + chunk_world_z_base, vptr, chz));
+    }
 }
 
 #[cfg(test)]
@@ -340,8 +366,10 @@ mod tests {
         };
         let chunk_path = camera_chunk_air_gap(grid, &prelude, false);
         let column_path = camera_column_air_gap(&col, 25, false);
-        assert_eq!(chunk_path, column_path);
-        assert_eq!(chunk_path, Some((20, 30, 24)));
+        // chunk_path adds seed_chz to the tuple; strip it for the
+        // column_path comparison.
+        assert_eq!(chunk_path.map(|(z0, z1, vp, _)| (z0, z1, vp)), column_path);
+        assert_eq!(chunk_path, Some((20, 30, 24, 0)));
     }
 
     /// S4B.1: camera_chunk_air_gap synthesises the OOB-XY bedrock
@@ -372,7 +400,7 @@ mod tests {
         };
         assert_eq!(
             camera_chunk_air_gap(grid, &prelude, true),
-            Some((0, 255, 0))
+            Some((0, 255, 0, 0))
         );
     }
 
@@ -403,6 +431,72 @@ mod tests {
             camera_local_xyz: [0, 0, 10],
         };
         assert_eq!(camera_chunk_air_gap(grid, &prelude, false), None);
+    }
+
+    /// S4B.6.e: cross-chunk look-down. Camera in chz=0 with an
+    /// all-air-bedrock column should walk into chz+1 and seed
+    /// against chz+1's real floor. The returned `seed_chz` lets
+    /// the caller swap the rasterizer's chunk borrow to chz+1.
+    #[test]
+    fn camera_chunk_air_gap_cross_chunk_lookdown_to_chz1_floor() {
+        use crate::grid_view::{ChunkGrid, GridView};
+
+        // chz=0: bedrock-only column (all-air-bedrock).
+        let col_chz0: Vec<u8> = vec![0, 0xff, 0xff, 0];
+        // chz=1: floor at local z=50 (= world z=306).
+        let mut col_chz1 = Vec::new();
+        col_chz1.extend_from_slice(&[2, 50, 50, 0]); // floor header
+        col_chz1.extend_from_slice(&[0xcc; 4]); // floor colour
+        col_chz1.extend_from_slice(&[0, 0xff, 0xff, 51]); // bedrock
+
+        let cols0 = [0u32, col_chz0.len() as u32];
+        let cols1 = [0u32, col_chz1.len() as u32];
+        let mips0 = [0usize, cols0.len()];
+        let mips1 = [0usize, cols1.len()];
+        let c0 = GridView::from_parts(1, &col_chz0, &cols0, &mips0);
+        let c1 = GridView::from_parts(1, &col_chz1, &cols1, &mips1);
+        let chunks = [Some(c0), Some(c1)];
+        let cg = ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            origin_chunk_z: 0,
+            chunks_x: 1,
+            chunks_y: 1,
+            chunks_z: 2,
+        };
+        let parent = GridView::from_chunk_grid(&cg, 1);
+
+        // Camera at world z=100 in chz=0's all-air column.
+        let prelude = crate::opticast_prelude::OpticastPrelude {
+            forward_z_sign: 1,
+            li_pos: [0, 0, 100],
+            column_index: 0,
+            pos_xfrac: [1.0, 0.0],
+            pos_yfrac: [1.0, 0.0],
+            pos_z: 0,
+            y_lookup: Vec::new(),
+            mip_levels: 1,
+            x_mip: 0,
+            max_scan_dist: 0,
+            cx: 0,
+            cy: 0,
+            in_bounds_xy: true,
+            camera_chunk_idx: [0, 0, 0],
+            camera_local_xyz: [0, 0, 100],
+        };
+        // Without treat_z_max_as_air: walk stops in chz=0 with the
+        // bedrock seed unchanged → seed_chz==0.
+        assert_eq!(
+            camera_chunk_air_gap(parent, &prelude, false),
+            Some((0, 0xff, 0, 0))
+        );
+        // With treat_z_max_as_air: walk extends into chz=1, finds
+        // floor at local z=50 (= world z=306), vptr=0 (top of
+        // chz=1's column), seed_chz=1.
+        assert_eq!(
+            camera_chunk_air_gap(parent, &prelude, true),
+            Some((0, 306, 0, 1))
+        );
     }
 
     /// Floor + bedrock placeholder: cz past the bedrock returns None
@@ -486,8 +580,9 @@ mod tests {
         };
         let gap0 = camera_chunk_air_gap(parent, &prelude_chz0, false);
         // S4B.6.c: cf seed returns world-z. For chz=0 (chunk-z
-        // base = 0), world-z == chunk-local.
-        assert_eq!(gap0, Some((0, 50, 0)));
+        // base = 0), world-z == chunk-local. S4B.6.e: seed_chz==0
+        // (camera's column has a real floor in chz=0).
+        assert_eq!(gap0, Some((0, 50, 0, 0)));
 
         // Camera in chz=1 at world z=280 (= local z=24 within
         // chz=1's chunk). camera_chunk_idx=[0, 0, 1].
@@ -511,7 +606,8 @@ mod tests {
             camera_local_xyz: [0, 0, 24],
         };
         let gap1 = camera_chunk_air_gap(parent, &prelude_chz1, false);
-        assert_eq!(gap1, Some((256, 306, 0)));
+        // S4B.6.e: seed_chz==1 (camera in chz=1, real floor there).
+        assert_eq!(gap1, Some((256, 306, 0, 1)));
 
         // Confirm the chunk dispatch is correct by reading slab
         // bytes via the chunk-z-specific view.

@@ -56,6 +56,14 @@ pub struct ScanContext<'a> {
     /// Byte offset within the camera's column to the slab whose top
     /// bounds the air gap from below. `0` means column-top.
     pub camera_vptr_offset: usize,
+    /// S4B.6.e: chunk-z that owns `camera_vptr_offset`. For the
+    /// in-camera-chunk case this equals `prelude.camera_chunk_idx[2]`.
+    /// For cross-chunk look-down (camera in all-air-bedrock column
+    /// with terrain in a deeper chunk) it points to the chunk that
+    /// holds the real floor. `gline_seed` reads it to route
+    /// state.column / slab_buf to the right chunk so rays start
+    /// walking the real-terrain chunk directly.
+    pub camera_seed_chunk_z: i32,
 }
 
 /// Clip a vertical-direction line `(x0, y0) → (x1, y1)` against the
@@ -880,6 +888,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         top_quadrant(&mut rec, &mut scratch, &ctx);
         assert_eq!(rec.gline_calls, 0);
@@ -908,6 +917,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         top_quadrant(&mut rec, &mut scratch, &ctx);
         // We don't pin the exact value (anginc rounding + ±0.01 bias),
@@ -935,6 +945,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         top_quadrant(&mut rec, &mut scratch, &ctx);
         assert!(rec.hrend_calls > 0, "expected ≥ 1 hrend, got 0");
@@ -965,6 +976,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         bottom_quadrant(&mut rec, &mut scratch, &ctx);
         assert_eq!(rec.gline_calls, 0);
@@ -992,6 +1004,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         bottom_quadrant(&mut rec, &mut scratch, &ctx);
         let expected = ((proj.x2 - proj.x3) / 1.0).round_ties_even() as u32;
@@ -1015,6 +1028,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         bottom_quadrant(&mut rec, &mut scratch, &ctx);
         assert!(rec.hrend_calls > 0, "expected ≥ 1 hrend, got 0");
@@ -1044,6 +1058,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         right_quadrant(&mut rec, &mut scratch, &ctx);
         assert_eq!(rec.gline_calls + rec.vrend_calls, 0);
@@ -1069,6 +1084,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         left_quadrant(&mut rec, &mut scratch, &ctx);
         assert_eq!(rec.gline_calls + rec.vrend_calls, 0);
@@ -1092,6 +1108,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         right_quadrant(&mut rec, &mut scratch, &ctx);
         let expected = ((proj.y2 - proj.y1) / 1.0).round_ties_even() as u32;
@@ -1116,6 +1133,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         left_quadrant(&mut rec, &mut scratch, &ctx);
         let expected = ((proj.y3 - proj.y0) / 1.0).round_ties_even() as u32;
@@ -1138,6 +1156,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         let mut rec_right = Recorder::default();
         right_quadrant(&mut rec_right, &mut scratch, &ctx);
@@ -1174,6 +1193,7 @@ mod tests {
             camera_gstartz0: 0,
             camera_gstartz1: 0,
             camera_vptr_offset: 0,
+            camera_seed_chunk_z: 0,
         };
         top_quadrant(&mut rec, &mut scratch, &ctx);
         // Lower bound: gscanptr advanced at least once per ray (every
