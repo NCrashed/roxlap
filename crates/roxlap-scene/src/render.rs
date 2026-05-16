@@ -1210,6 +1210,61 @@ mod tests {
         );
     }
 
+    /// S4B.6.g: cross-chunk look-down under multi-mip. Same scene
+    /// as `stacked_two_chunk_z_camera_in_chz0_sees_chz1_floor` but
+    /// with `mip_levels=2, mip_scan_dist=16` so the rasterizer
+    /// transitions to mip-1 well within the chz=1 terrain. Locks in
+    /// the slab_z_at mip-N offset fix (= `chunk_world_z_base >>
+    /// gmipcnt`). Pre-fix produced a green / brown "wall in a circle
+    /// around the camera" because mip-1 rendered the floor at
+    /// world-z ≈ 178 instead of 306.
+    #[test]
+    fn stacked_two_chunk_z_camera_in_chz0_sees_chz1_floor_multi_mip() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).unwrap();
+        g.ensure_chunk(IVec3::new(0, 0, 0));
+        g.set_rect(
+            IVec3::new(60, 60, 306),
+            IVec3::new(72, 72, 310),
+            Some(0x80_77_aa_44),
+        );
+        assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        pool.set_treat_z_max_as_air(true);
+        let camera = Camera {
+            pos: [66.0, 66.0, 100.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        settings.mip_levels = 2;
+        settings.mip_scan_dist = 16;
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let floor_count = fb.iter().filter(|&&p| p == 0x80_77_aa_44).count();
+        assert!(
+            floor_count > 50,
+            "multi-mip cross-chunk look-down should still see chz=1 floor — got {floor_count} floor pixels"
+        );
+    }
+
     /// S4B.6.d: 3-chunk-tall stack stresses the widened gylookup
     /// (`(chunks_z * 512) >> mip + 4` per mip). Pre-S4B.6.d, gylookup
     /// was hardcoded at `(512 >> mip) + 4`, which would OOB or alias

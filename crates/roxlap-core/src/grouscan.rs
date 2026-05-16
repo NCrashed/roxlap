@@ -1956,15 +1956,29 @@ fn column_byte_at(state: &GrouscanState<'_>, offset: usize) -> u8 {
 /// `chunk_world_z_base == 0` (= camera in chz=0 of a non-stacked
 /// world) the addition is a no-op, byte-identical with the
 /// pre-S4B.6.c bare-byte reads.
+///
+/// S4B.6.g (mip-N stacked fix): the slab byte at mip level N is in
+/// mip-N units (`= chunk_local_z >> N`), while `chunk_world_z_base`
+/// is stored in mip-0 / world-z units. Both cf entries and the
+/// gylookup index for mip-N are in mip-N units (cf is halved at
+/// every `phase_remiporend`), so the offset must shift right by
+/// `gmipcnt` to stay in the same scale as the slab byte. Mip-0
+/// callers see no change because `>> 0` is identity. The bug it
+/// fixes: stacked-grid mip-N rendered the floor at world-z =
+/// `byte * 2^N + chunk_world_z_base` instead of
+/// `byte * 2^N + (chunk_world_z_base >> N) * 2^N` — for chz=1
+/// (base=256) at mip-1 this is a 128-voxel shift toward the camera
+/// = the "green wall in a circle around the camera" artifact.
 #[inline]
 fn slab_z_at(state: &GrouscanState<'_>, vptr_offset: usize, byte: usize) -> i32 {
-    i32::from(
+    let raw = i32::from(
         state
             .column
             .get(vptr_offset.saturating_add(byte))
             .copied()
             .unwrap_or(0),
-    ) + state.chunk_world_z_base
+    );
+    raw + (state.chunk_world_z_base >> (state.gmipcnt as u32))
 }
 
 /// S4B.6.c: try to swap the slab walker into the chunk at
