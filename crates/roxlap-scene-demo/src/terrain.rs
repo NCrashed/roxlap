@@ -97,6 +97,24 @@ pub fn build_ground(grid: &mut Grid) {
 /// bake uses the combined-view path to avoid the brightness-jump
 /// seam (`project_chunk_edge_lighting_seam.md`).
 pub fn build_ground_extent(grid: &mut Grid, chunks_x: i32, chunks_y: i32) {
+    build_ground_extent_at_chz(grid, chunks_x, chunks_y, 0);
+}
+
+/// `chunks_z=2` showcase variant: builds an all-air chz=0 layer + the
+/// `build_ground_extent` terrain in chz=1. The camera sits in chz=0
+/// air-gap and uses S4B.6.e's cross-chunk look-down to see chz=1's
+/// floor below. Materialises chz=0 chunks as empty so
+/// `Grid::chunk_xyz_backing` enumerates the full stack.
+pub fn build_ground_stacked(grid: &mut Grid) {
+    build_ground_extent_at_chz(grid, GROUND_CHUNKS_X, GROUND_CHUNKS_Y, 1);
+}
+
+/// Per-chunk-z variant. `ground_chz=0` matches `build_ground_extent`
+/// byte-for-byte (no extra chunks materialised). `ground_chz>=1`
+/// materialises empty chunks for `0..ground_chz` so the chz=0..N
+/// layers above the terrain are walkable by the camera but contain
+/// no voxels.
+pub fn build_ground_extent_at_chz(grid: &mut Grid, chunks_x: i32, chunks_y: i32, ground_chz: i32) {
     let cs_xy = CHUNK_SIZE_XY as i32;
     let half_chunks_x = chunks_x / 2;
     let half_chunks_y = chunks_y / 2;
@@ -181,7 +199,14 @@ pub fn build_ground_extent(grid: &mut Grid, chunks_x: i32, chunks_y: i32) {
                 colour_u32 as i32
             };
 
-            let vxl = grid.ensure_chunk(IVec3::new(chx, chy, 0));
+            // Materialise empty chunks for the air layers above the
+            // terrain (chz=0..ground_chz). These columns are
+            // bedrock-only — S4B.6.e's cross-chunk look-down walks
+            // through them at seed time.
+            for chz in 0..ground_chz {
+                grid.ensure_chunk(IVec3::new(chx, chy, chz));
+            }
+            let vxl = grid.ensure_chunk(IVec3::new(chx, chy, ground_chz));
             set_spans_with_colfunc(vxl, &spans, SpanOp::Insert, colfunc);
         }
     }

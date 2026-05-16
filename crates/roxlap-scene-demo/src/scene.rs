@@ -47,7 +47,18 @@ pub fn build_demo() -> SceneAndCamera {
     let mut scene = Scene::new();
 
     let ground_id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, 0.0)));
-    terrain::build_ground(scene.grid_mut(ground_id).expect("ground grid present"));
+    // S4B.6.f: `ROXLAP_STACKED_GROUND=1` switches the ground to a
+    // 2-chunk-tall stack (chz=0 all-air, chz=1 hilly terrain). The
+    // camera spawns in chz=0 air-gap and uses S4B.6.e's
+    // cross-chunk look-down (seed-time) to see chz=1 terrain.
+    // Default (`unset`) keeps the unstacked chz=0 ground for the
+    // historical demo + golden tests.
+    let stacked_ground = std::env::var("ROXLAP_STACKED_GROUND").is_ok();
+    if stacked_ground {
+        terrain::build_ground_stacked(scene.grid_mut(ground_id).expect("ground grid present"));
+    } else {
+        terrain::build_ground(scene.grid_mut(ground_id).expect("ground grid present"));
+    }
 
     let ship_id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 500.0, -100.0)));
     ship::build_ship(scene.grid_mut(ship_id).expect("ship grid present"));
@@ -59,9 +70,16 @@ pub fn build_demo() -> SceneAndCamera {
     // hrend / vrend without needing further setup.
     bake_lightmode_1(&mut scene);
 
-    let initial_pos = [0.0, -120.0, 50.0];
+    // For the stacked-ground variant the terrain sits in chz=1
+    // (world z=256..511). Spawn deeper into chz=0's air-gap (z=200,
+    // = 56 voxels above chz=1's top) and pitch down so the
+    // cross-chunk look-down hits the terrain in the default view.
+    let (initial_pos, initial_pitch) = if stacked_ground {
+        ([0.0, -120.0, 200.0], -0.35)
+    } else {
+        ([0.0, -120.0, 50.0], 0.0)
+    };
     let initial_yaw = std::f64::consts::FRAC_PI_2; // looks +y
-    let initial_pitch = 0.0;
     let camera = camera_for_yaw_pitch(initial_pos, initial_yaw, initial_pitch);
 
     SceneAndCamera {

@@ -209,6 +209,59 @@ fn full_demo_scene_renders_without_panic() {
     );
 }
 
+/// S4B.6.f stacked-ground smoke: build the demo with the chunks_z=2
+/// terrain (chz=0 all-air + chz=1 hilly) and the matching spawn
+/// pitch, render the spawn pose, assert non-trivial output. Validates
+/// that S4B.6.e cross-chunk look-down + the chz-aware bake actually
+/// produce visible terrain pixels in the live demo path.
+#[test]
+#[ignore = "expensive: builds the full 32x32 ground (~3 s on dev hardware)"]
+fn stacked_demo_scene_renders_terrain_from_chz0() {
+    std::env::set_var("ROXLAP_STACKED_GROUND", "1");
+    let mut scene_and_camera = crate::scene::build_demo();
+    std::env::remove_var("ROXLAP_STACKED_GROUND");
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb,
+        &mut zb,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut scene_and_camera.scene,
+        &scene_and_camera.camera,
+        &settings,
+        sky,
+        None,
+    );
+    let non_sky_count = fb.iter().filter(|&&p| p != sky).count();
+    eprintln!(
+        "stacked demo render: {non_sky_count}/{pixel_count} non-sky pixels ({:.1}%)",
+        100.0 * non_sky_count as f64 / pixel_count as f64
+    );
+    // Camera at world z=200 pitched -0.35 rad sees ~250+ voxels of
+    // hilly terrain in chz=1 below. Reasonable floor: 5% non-sky.
+    let non_sky_frac = non_sky_count as f64 / pixel_count as f64;
+    assert!(
+        non_sky_frac > 0.05,
+        "stacked demo rendered <5% non-sky pixels — cross-chunk look-down may not be hitting chz=1 terrain"
+    );
+}
+
 /// Quick FPS benchmark: render N frames from the spawn camera at
 /// the full 32×32 ground + 4×6×1 ship, print average frame time.
 /// Ignored by default — only run when investigating perf
