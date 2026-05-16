@@ -1241,7 +1241,7 @@ mod tests {
         let cs = crate::camera_math::derive(&cam, 64, 64, 32.0, 32.0, 32.0);
         let proj = crate::projection::derive_projection(&cs, 64, 64, 32.0, 32.0, 32.0, 1);
         let rs = crate::ray_step::derive_ray_step(&cs, proj.cx, proj.cy, 32.0);
-        let prelude = crate::opticast_prelude::derive_prelude(&cs, 2048, 1, 4, 1024);
+        let prelude = crate::opticast_prelude::derive_prelude(&cs, 2048, 1, 4, 1024, 1);
         (cs, proj, rs, prelude)
     }
 

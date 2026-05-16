@@ -2188,10 +2188,12 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     }
 
     // Voxlap5.c:12076 — slide `gylookup` to mip-NEW's sub-range.
-    // Each mip-N table is `(512 >> N) + 4` int32 entries; advance
-    // by mip-OLD's length to skip past it.
+    // Each mip-N table is `((chunks_z * 512) >> N) + 4` int32 entries
+    // (S4B.6.d widens from 512 to chunks_z*512 for stacked grids);
+    // advance by mip-OLD's length to skip past it.
     {
-        let advance = ((512u32 >> old_mip) as usize) + 4;
+        let chunks_z = state.grid_view.chunk_grid.map_or(1u32, |cg| cg.chunks_z);
+        let advance = (((chunks_z * 512) >> old_mip) as usize) + 4;
         let advance = advance.min(state.gylookup.len());
         state.gylookup = &state.gylookup[advance..];
     }

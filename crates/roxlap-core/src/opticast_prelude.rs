@@ -112,6 +112,7 @@ pub fn derive_prelude(
     mip_levels: u32,
     mip_scan_dist: i32,
     max_scan_dist: i32,
+    chunks_z: u32,
 ) -> OpticastPrelude {
     let forward_z_sign = if camera_state.forward[2] < 0.0 { -1 } else { 1 };
 
@@ -164,11 +165,19 @@ pub fn derive_prelude(
     // wrap-not-saturate `ftol` helper rather than a bare `as i32`.
     let pos_z = ftol(camera_state.pos[2] * PREC as f32 - 0.5);
 
-    // gylookup: per mip level j, fill (512 >> j) + 4 entries computed
-    // from ((pos_z >> j) - i * PREC) >> (16 - j), masked to 16 bits.
+    // gylookup: per mip level j, fill `(chunks_z * 512 >> j) + 4`
+    // entries computed from `((pos_z >> j) - i * PREC) >> (16 - j)`,
+    // masked to 16 bits.
+    //
+    // S4B.6.d: original voxlap uses `(512 >> j) + 4` = `2 * MAXZDIM`
+    // worth of entries per mip — enough for any z within a single
+    // 256-tall chunk plus overflow padding. Stacked grids need
+    // `chunks_z * 512 >> j` to cover world-z up to
+    // `chunks_z * 256`. Non-stacked callers pass `chunks_z = 1` and
+    // get byte-identical sizing.
     let mut y_lookup = Vec::new();
     for j in 0..mip_levels {
-        let count = (512u32 >> j) + 4;
+        let count = ((chunks_z * 512) >> j) + 4;
         let pz_shifted = pos_z >> j;
         let shift = 16i32 - j as i32;
         for i in 0..count {
@@ -312,7 +321,7 @@ mod tests {
     #[test]
     fn integer_position_and_column_index() {
         let s = oracle_north_state();
-        let p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let p = derive_prelude(&s, 2048, 1, 4, 1024, 1);
         assert_eq!(p.li_pos, [1024, 1024, 128]);
         assert_eq!(p.column_index, 1024 * 2048 + 1024);
         assert_eq!(p.forward_z_sign, 1); // forward.z == 0 → non-negative branch
@@ -329,7 +338,7 @@ mod tests {
             forward: [0.0, 1.0, 0.0],
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
-        let p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let p = derive_prelude(&s, 2048, 1, 4, 1024, 1);
         assert_eq!(p.li_pos, [10, 20, 30]);
         // gposxfrac[1] = 10.25 - 10 = 0.25; gposxfrac[0] = 0.75.
         assert_eq!(bits2(p.pos_xfrac), bits2([0.75, 0.25]));
@@ -349,7 +358,7 @@ mod tests {
             forward: [0.0, 0.0, -1.0],
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
-        let p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let p = derive_prelude(&s, 2048, 1, 4, 1024, 1);
         assert_eq!(p.forward_z_sign, -1);
     }
 
@@ -358,7 +367,7 @@ mod tests {
         // pos.z = 128.0 → pos_z = 128 * PREC = 134_217_728. PREC = 2^20,
         // so (pos_z - i*PREC) >> 16 = (128 - i) * 16 for any i.
         let s = oracle_north_state();
-        let p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let p = derive_prelude(&s, 2048, 1, 4, 1024, 1);
         // Single mip level → (512 >> 0) + 4 = 516 entries.
         assert_eq!(p.y_lookup.len(), 516);
         // y_lookup[0] = 128 * 16 = 2048.
@@ -372,7 +381,7 @@ mod tests {
     #[test]
     fn y_lookup_two_mip_levels_have_correct_lengths() {
         let s = oracle_north_state();
-        let p = derive_prelude(&s, 2048, 2, 4, 1024);
+        let p = derive_prelude(&s, 2048, 2, 4, 1024, 1);
         // Level 0: (512 >> 0) + 4 = 516. Level 1: (512 >> 1) + 4 = 260.
         assert_eq!(p.y_lookup.len(), 516 + 260);
     }
@@ -384,7 +393,7 @@ mod tests {
     #[test]
     fn recompute_camera_chunk_single_chunk_in_bounds_is_no_op() {
         let s = oracle_north_state(); // pos.x = pos.y = 1024
-        let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let mut p = derive_prelude(&s, 2048, 1, 4, 1024, 1);
         let before_idx = p.camera_chunk_idx;
         let before_local = p.camera_local_xyz;
         recompute_camera_chunk(&mut p, 2048, 256);
@@ -407,7 +416,7 @@ mod tests {
             forward: [0.0, 1.0, 0.0],
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
-        let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let mut p = derive_prelude(&s, 2048, 1, 4, 1024, 1);
         recompute_camera_chunk(&mut p, 128, 256);
         assert_eq!(p.camera_chunk_idx, [8, 0, 0]);
         assert_eq!(p.camera_local_xyz, [0, 100, 50]);
@@ -424,7 +433,7 @@ mod tests {
     #[test]
     fn recompute_in_bounds_xy_single_chunk_aabb_matches_derive_prelude() {
         let s = oracle_north_state(); // pos.x = pos.y = 1024
-        let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let mut p = derive_prelude(&s, 2048, 1, 4, 1024, 1);
         let before = p.in_bounds_xy;
         recompute_in_bounds_xy(&mut p, [0, 0], [2048, 2048]);
         assert_eq!(p.in_bounds_xy, before);
@@ -445,7 +454,7 @@ mod tests {
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
         // derive_prelude with single-chunk vsid=128 reports OOB.
-        let mut p = derive_prelude(&s, 128, 1, 4, 1024);
+        let mut p = derive_prelude(&s, 128, 1, 4, 1024, 1);
         assert!(!p.in_bounds_xy);
         // Multi-chunk grid spans (0, 0) to (2048, 128).
         recompute_in_bounds_xy(&mut p, [0, 0], [2048, 128]);
@@ -461,7 +470,7 @@ mod tests {
             forward: [0.0, 1.0, 0.0],
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
-        let mut p = derive_prelude(&s, 2048, 1, 4, 1024);
+        let mut p = derive_prelude(&s, 2048, 1, 4, 1024, 1);
         recompute_camera_chunk(&mut p, 128, 256);
         assert!(!p.in_bounds_xy);
         // -5.div_euclid(128) = -1; -5.rem_euclid(128) = 123 (positive).
@@ -473,17 +482,17 @@ mod tests {
     fn xmip_and_maxscandist_clamping() {
         let s = oracle_north_state();
         // mip_scan_dist below the floor of 4 gets clamped up.
-        let p = derive_prelude(&s, 2048, 1, 0, 99999);
+        let p = derive_prelude(&s, 2048, 1, 0, 99999, 1);
         assert_eq!(p.x_mip, 4 * PREC);
         // max_scan_dist clamps to [1, 4095]. Note 4095 × PREC overflows
         // i32 in voxlap C and we mirror the wrap.
         assert_eq!(p.max_scan_dist, 4095_i32.wrapping_mul(PREC));
-        let q = derive_prelude(&s, 2048, 1, 16, 0);
+        let q = derive_prelude(&s, 2048, 1, 16, 0, 1);
         assert_eq!(q.x_mip, 16 * PREC);
         // 0 clamps up to 1, then * PREC.
         assert_eq!(q.max_scan_dist, PREC);
         // Oracle's 1024 is well below the overflow threshold.
-        let r = derive_prelude(&s, 2048, 1, 4, 1024);
+        let r = derive_prelude(&s, 2048, 1, 4, 1024, 1);
         assert_eq!(r.max_scan_dist, 1024 * PREC);
     }
 }

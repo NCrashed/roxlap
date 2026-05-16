@@ -698,7 +698,7 @@ fn cmd_debug_gline(pose_name: &str) -> std::io::Result<()> {
     println!("  corn[2]= {:?}", cs.corn[2]);
     println!("  corn[3]= {:?}", cs.corn[3]);
 
-    let prelude = opticast_prelude::derive_prelude(&cs, 2048, 1, 4, 1024);
+    let prelude = opticast_prelude::derive_prelude(&cs, 2048, 1, 4, 1024, 1);
     println!("\nOpticastPrelude:");
     println!("  forward_z_sign = {}", prelude.forward_z_sign);
     println!("  li_pos         = {:?}", prelude.li_pos);

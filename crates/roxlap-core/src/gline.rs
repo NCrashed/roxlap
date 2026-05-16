@@ -212,7 +212,7 @@ mod tests {
             forward: [0.0, 0.0, 1.0],
         };
         let cs = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
-        let prelude = opticast_prelude::derive_prelude(&cs, 2048, 1, 4, 1024);
+        let prelude = opticast_prelude::derive_prelude(&cs, 2048, 1, 4, 1024, 1);
         (cs, prelude)
     }
 
@@ -311,7 +311,7 @@ mod tests {
             forward: [0.0, 0.0, 1.0],
         };
         let cs2 = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
-        let prelude2 = opticast_prelude::derive_prelude(&cs2, 2048, 1, 4, 1024);
+        let prelude2 = opticast_prelude::derive_prelude(&cs2, 2048, 1, 4, 1024, 1);
         let g2 = derive_gline_frustum(
             &cs2,
             prelude2.pos_xfrac,

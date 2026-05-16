@@ -193,12 +193,17 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
         settings.hz,
     );
 
+    // S4B.6.d: size gylookup for the grid's full chunk-Z extent.
+    // Non-stacked grids (`chunk_grid: None` or `chunks_z == 1`)
+    // pass `1` and get the pre-S4B.6 (512+4)-per-mip table.
+    let chunks_z = grid.chunk_grid.map_or(1, |cg| cg.chunks_z);
     let mut prelude = opticast_prelude::derive_prelude(
         &cs,
         grid.vsid,
         settings.mip_levels,
         settings.mip_scan_dist,
         settings.max_scan_dist,
+        chunks_z,
     );
     // S4B.2.c.2: refine the prelude's chunk-aware fields against
     // the grid's per-chunk dimension. For single-chunk callers

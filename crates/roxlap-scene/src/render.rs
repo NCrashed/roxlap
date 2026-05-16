@@ -1150,4 +1150,63 @@ mod tests {
             "camera at chz=1 with floor in same chunk should see it — got {floor_count} floor pixels"
         );
     }
+
+    /// S4B.6.d: 3-chunk-tall stack stresses the widened gylookup
+    /// (`(chunks_z * 512) >> mip + 4` per mip). Pre-S4B.6.d, gylookup
+    /// was hardcoded at `(512 >> mip) + 4`, which would OOB or alias
+    /// for any z > 511. This test renders a floor at world z=562
+    /// (= chz=2, local z=50) with the camera at world z=540, looking
+    /// straight down. Multi-mip is on so we exercise the mip slide
+    /// path in `phase_remiporend` that scales `advance` by chunks_z.
+    #[test]
+    fn stacked_three_chunk_z_camera_in_chz2_sees_own_chunk_floor_multi_mip() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).unwrap();
+        // Materialise chz=0 + chz=1 so chunk_xyz_backing enumerates
+        // the full stack.
+        g.ensure_chunk(IVec3::new(0, 0, 0));
+        g.ensure_chunk(IVec3::new(0, 0, 1));
+        // chz=2: floor at world z=562..566 (= local z=50..54).
+        g.set_rect(
+            IVec3::new(60, 60, 562),
+            IVec3::new(72, 72, 566),
+            Some(0x80_aa_55_22),
+        );
+        assert!(g.chunk(IVec3::new(0, 0, 2)).is_some());
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        pool.set_treat_z_max_as_air(true);
+        let camera = Camera {
+            pos: [66.0, 66.0, 540.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        // Multi-mip on to exercise the gylookup-slide path.
+        let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        settings.mip_levels = 2;
+        settings.mip_scan_dist = 16;
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let floor_count = fb.iter().filter(|&&p| p == 0x80_aa_55_22).count();
+        assert!(
+            floor_count > 100,
+            "camera at chz=2 with floor in same chunk should see it — got {floor_count} floor pixels"
+        );
+    }
 }
