@@ -1210,6 +1210,102 @@ mod tests {
         );
     }
 
+    /// S4B.6.h: mid-render chunk-Z handoff. Camera column has
+    /// content in chz=0 (= a mountain at the camera's XY) so
+    /// seed-time cross-chunk look-down does NOT fire — seed_chz=0.
+    /// As rays DDA across the scene, they visit XY columns where
+    /// chz=0 is all-air-bedrock. Mid-render handoff should swap
+    /// state to chz=1's column at those XY positions and reveal
+    /// hill content sitting under the camera's chz=0 layer.
+    ///
+    /// This is the "tall mountains breaching chunk-Z boundary"
+    /// case the demo aims for.
+    #[test]
+    fn mid_render_handoff_reveals_chz1_hills_under_mountain_camera() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).unwrap();
+        // chz=0: a small "mountain peak" at the camera's XY.
+        // Mountain at world z=150..200 — solid block.
+        g.set_rect(
+            IVec3::new(60, 60, 150),
+            IVec3::new(72, 72, 200),
+            Some(0x80_88_44_22), // brown mountain
+        );
+        // chz=1: hills at world z=336..360 across the WHOLE chunk
+        // (so DDA rays hit them when chz=0 is air).
+        g.set_rect(
+            IVec3::new(0, 0, 336),
+            IVec3::new(128, 128, 360),
+            Some(0x80_22_88_44), // green hills
+        );
+        // Carve a hole in chz=1's hill at the mountain's footprint
+        // so the mountain doesn't appear to "float" on green.
+        g.set_rect(IVec3::new(60, 60, 336), IVec3::new(72, 72, 360), None);
+        assert!(g.chunk(IVec3::new(0, 0, 0)).is_some());
+        assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        pool.set_treat_z_max_as_air(true);
+        // Camera at world (66, 66, 100) — directly above the
+        // mountain peak (at z=150). Camera column has the
+        // mountain in chz=0. Look straight down.
+        let camera = Camera {
+            pos: [66.0, 66.0, 100.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let mountain_count = fb.iter().filter(|&&p| p == 0x80_88_44_22).count();
+        let hill_count = fb.iter().filter(|&&p| p == 0x80_22_88_44).count();
+        // Verify the hills render at approximately the correct
+        // world-z by sampling the z-buffer at hill pixels. Camera
+        // at z=100 looking straight down; hills at world z=336.
+        // Expected depth = 236 for directly-below pixels. If
+        // state.z1 stays stuck at the mountain peak's z=150 the
+        // hills would render with depth ≈ 50 → orders of magnitude
+        // off.
+        let mut hill_depths: Vec<f32> = fb
+            .iter()
+            .zip(zb.iter())
+            .filter_map(|(&p, &d)| if p == 0x80_22_88_44 { Some(d) } else { None })
+            .collect();
+        hill_depths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_hill_depth = hill_depths[hill_depths.len() / 2];
+        eprintln!(
+            "mid-render handoff: mountain={mountain_count} hill={hill_count} median_hill_depth={median_hill_depth:.1}"
+        );
+        assert!(
+            mountain_count > 50,
+            "should see mountain peak via chz=0 — got {mountain_count} mountain pixels"
+        );
+        assert!(
+            hill_count > 50,
+            "should see chz=1 hills via mid-render handoff — got {hill_count} hill pixels"
+        );
+        assert!(
+            (median_hill_depth - 236.0).abs() < 80.0,
+            "hill median depth should be ≈236 (camera→z=336); got {median_hill_depth:.1} — state.z1 may be stale at the mountain peak's z"
+        );
+    }
+
     /// S4B.6.g: cross-chunk look-down under multi-mip. Same scene
     /// as `stacked_two_chunk_z_camera_in_chz0_sees_chz1_floor` but
     /// with `mip_levels=2, mip_scan_dist=16` so the rasterizer

@@ -249,8 +249,10 @@ fn stacked_demo_scene_renders_terrain_from_chz0() {
         None,
     );
     let non_sky_count = fb.iter().filter(|&&p| p != sky).count();
+    const MOUNTAIN_STONE: u32 = 0x80_8a_82_7a;
+    let mountain_count = fb.iter().filter(|&&p| p == MOUNTAIN_STONE).count();
     eprintln!(
-        "stacked demo render: {non_sky_count}/{pixel_count} non-sky pixels ({:.1}%)",
+        "stacked demo render: {non_sky_count}/{pixel_count} non-sky pixels ({:.1}%), mountain={mountain_count}",
         100.0 * non_sky_count as f64 / pixel_count as f64
     );
     // Camera at world z=200 pitched -0.35 rad sees ~250+ voxels of
@@ -260,6 +262,317 @@ fn stacked_demo_scene_renders_terrain_from_chz0() {
         non_sky_frac > 0.05,
         "stacked demo rendered <5% non-sky pixels — cross-chunk look-down may not be hitting chz=1 terrain"
     );
+}
+
+/// S4B.6.i: render from the user-reported capture pose near a tall
+/// mountain (camera at world (239, 298, 101), close to the
+/// `(220, 320)` mountain) and verify that mountain pixels cover
+/// both halves — the chz=0 portion (= peak side) AND the chz=1
+/// portion (= base side via mid-render handoff). Pre-S4B.6.i the
+/// bedrock placeholder at chz=0's z=255 was overwritten by the
+/// mountain step crossing the chunk boundary; with the placeholder
+/// gone, the handoff sentinel never fires and only the chz=0 top
+/// of the mountain rendered (the bug the user reported: "mountains
+/// floating in mid air, only top layer visible").
+///
+/// S4B.6.j follow-up poses (currently FAILING):
+/// - Pose A `(13.50, 169.45, 193.12)` yaw 3.01 pitch 1.26:
+///   user reports "only bottom layer visible (= chunk z=0 portion)".
+/// - Pose B `(13.71, 171.04, 193.12)` same yaw/pitch: a 1.6-unit
+///   step from A renders ALL SKY. Thin band suggests a chunk-XY
+///   boundary issue.
+/// - Pose C `(21.50, 181.72, 177.21)` yaw 3.19 pitch 0.76: renders
+///   both layers correctly.
+/// These help isolate why some poses lose half the mountain.
+#[test]
+#[ignore = "expensive: builds the full 32x32 stacked ground (~3 s on dev hardware)"]
+fn stacked_demo_renders_full_mountain_at_user_capture_pose() {
+    std::env::set_var("ROXLAP_STACKED_GROUND", "1");
+    let mut scene_and_camera = crate::scene::build_demo();
+    std::env::remove_var("ROXLAP_STACKED_GROUND");
+
+    // The exact pose captured by the F key in the demo.
+    scene_and_camera.cam_pos = [
+        239.015_574_238_198_4,
+        298.289_282_655_482,
+        101.626_834_407_672_85,
+    ];
+    scene_and_camera.yaw = -3.484_203_673_205_028_6;
+    scene_and_camera.pitch = 0.997_500_000_000_006_3;
+    scene_and_camera.refresh_camera();
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    let _ = render_scene_composed(
+        &mut fb,
+        &mut zb,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut scene_and_camera.scene,
+        &scene_and_camera.camera,
+        &settings,
+        sky,
+        None,
+    );
+    const MOUNTAIN_STONE: u32 = 0x80_8a_82_7a;
+    // Camera at z=101 looking down at mountain peak at z=100 (just
+    // 1 voxel above camera). Mountain base at z=336 = depth 235.
+    // Sample depths of mountain pixels: shallow ones (= chz=0 top)
+    // vs deep ones (= chz=1 base via handoff).
+    let mountain_depths: Vec<f32> = fb
+        .iter()
+        .zip(zb.iter())
+        .filter_map(|(&p, &d)| if p == MOUNTAIN_STONE { Some(d) } else { None })
+        .collect();
+    let mountain_count = mountain_depths.len();
+    // For camera at (239,298,101), chz=0 mountain voxels live at
+    // world z=224..254 — distance to closest chz=0 voxel from the
+    // camera is sqrt(19²+22²+(101-254)²) ≈ 156. chz=1 voxels at
+    // z=256..336 — distance >= 158. Picking 200 as a clean
+    // threshold for "definitely chz=1 base of the mountain".
+    let chz1_count = mountain_depths.iter().filter(|&&d| d >= 200.0).count();
+    // Count green hill pixels — chz=1 hills filling the ground
+    // around the mountains via mid-render handoff.
+    let hill_green = fb
+        .iter()
+        .filter(|&&p| {
+            let r = (p >> 16) & 0xff;
+            let g = (p >> 8) & 0xff;
+            let b = p & 0xff;
+            g > r && g > b && g > 60
+        })
+        .count();
+    eprintln!(
+        "user capture pose: mountain_total={mountain_count}, chz1(d>=200)={chz1_count}, hill_green={hill_green}"
+    );
+    // Three S4B.6.i fixes feed this test:
+    //   1. `stamp_mountain_step_preserving_bedrock` keeps the chz=0
+    //      bedrock placeholder intact under mountain steps that
+    //      cross world z=255.
+    //   2. `build_ground_extent_at_chz` caps hill spans at
+    //      `z_max - 2` so insslab can't merge the hill with the
+    //      bedrock placeholder into one "last slab".
+    //   3. Column-step's chunk-XY swap reads `current_chunk_z`
+    //      (= the chunk-z the mid-render handoff is currently
+    //      in) instead of the pinned `camera_chunk_z` — so after
+    //      the first handoff the DDA stays in chz=1 across XY
+    //      crossings and reads the hills there.
+    // Pre-fix: chz1_count = 87 (mountain bases barely visible),
+    // hill_green ≈ 0 (hills entirely black). Post-fix: ~50k+ hill
+    // pixels + the mountain bases continue uninterrupted.
+    assert!(
+        chz1_count > 30,
+        "expected chz=1 base of the mountain (depth>=200) to render via mid-render handoff — got {chz1_count} pixels"
+    );
+    assert!(
+        hill_green > 50_000,
+        "expected ample chz=1 hill green pixels via mid-render handoff — got {hill_green}"
+    );
+}
+
+/// S4B.6.j: render the three follow-up poses the user captured to
+/// isolate the remaining bug.  Saves each framebuffer to /tmp so
+/// the visual can be compared. Asserts nothing — purely diagnostic.
+#[test]
+#[ignore = "expensive diagnostic: ~3s scene build + 3 renders"]
+fn stacked_demo_diagnostic_three_capture_poses() {
+    std::env::set_var("ROXLAP_STACKED_GROUND", "1");
+    let mut scene_and_camera = crate::scene::build_demo();
+    std::env::remove_var("ROXLAP_STACKED_GROUND");
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    const MOUNTAIN_STONE: u32 = 0x80_8a_82_7a;
+    let poses: [(&str, [f64; 3], f64, f64); 4] = [
+        ("poseA_partial", [13.50, 169.45, 193.12], 3.0133, 1.2559),
+        ("poseB_sky_only", [13.71, 171.04, 193.12], 3.0133, 1.2559),
+        ("poseC_works", [21.50, 181.72, 177.21], 3.1908, 0.7559),
+        // S4B.6.k: user reports the "usual render path" is broken
+        // at this pose — far from any mountain, looking steeply
+        // down. Should render hills + distant mountains cleanly.
+        ("poseD_regression", [0.43, -4.61, 225.73], 1.2258, 1.3259),
+    ];
+    for (name, pos, yaw, pitch) in poses {
+        scene_and_camera.cam_pos = pos;
+        scene_and_camera.yaw = yaw;
+        scene_and_camera.pitch = pitch;
+        scene_and_camera.refresh_camera();
+        let mut fb = vec![sky; pixel_count];
+        let mut zb = vec![f32::INFINITY; pixel_count];
+        let _ = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            W as usize,
+            W,
+            H,
+            &mut pool,
+            &mut scene_and_camera.scene,
+            &scene_and_camera.camera,
+            &settings,
+            sky,
+            None,
+        );
+        let mut sky_count = 0usize;
+        let mut hill_green = 0usize;
+        let mut mountain_lit = 0usize;
+        let mut mountain_dark = 0usize;
+        for &p in &fb {
+            let r = (p >> 16) & 0xff;
+            let g = (p >> 8) & 0xff;
+            let b = p & 0xff;
+            if p == sky {
+                sky_count += 1;
+            } else if g > r && g > b && g > 60 {
+                hill_green += 1;
+            } else if r > 60 && (r as i32 - b as i32).abs() < 30 && (r as i32 - g as i32).abs() < 30
+            {
+                if r > 100 {
+                    mountain_lit += 1;
+                } else {
+                    mountain_dark += 1;
+                }
+            }
+        }
+        let mountain_total = fb.iter().filter(|&&p| p == MOUNTAIN_STONE).count();
+        let path = format!("/tmp/stacked-{name}.ppm");
+        write_ppm(&path, &fb);
+        // Bucket mountain (= gray) pixel depths into chz=0 vs
+        // chz=1 ranges. For camera at z≈193 (pose A/B), the
+        // chz boundary at world z=256 is depth ≈ 60-80 from
+        // camera (depending on ray angle). Use 75 as the
+        // cutoff: shallower = chz=0, deeper = chz=1.
+        let mut mountain_chz0 = 0;
+        let mut mountain_chz1 = 0;
+        let cutoff = match name {
+            "poseA_partial" | "poseB_sky_only" => 75.0_f32, // camera at z=193
+            "poseC_works" => 90.0_f32,                      // camera at z=177
+            _ => 100.0_f32,
+        };
+        for (&p, &d) in fb.iter().zip(zb.iter()) {
+            let r = (p >> 16) & 0xff;
+            let g = (p >> 8) & 0xff;
+            let b = p & 0xff;
+            let is_gray =
+                r > 60 && (r as i32 - b as i32).abs() < 30 && (r as i32 - g as i32).abs() < 30;
+            if is_gray && p != sky {
+                if d < cutoff {
+                    mountain_chz0 += 1;
+                } else {
+                    mountain_chz1 += 1;
+                }
+            }
+        }
+        eprintln!(
+            "{name}: sky={sky_count} hill_green={hill_green} mountain_lit={mountain_lit} mountain_dark={mountain_dark} mountain_raw={mountain_total} mountain_chz0={mountain_chz0} mountain_chz1={mountain_chz1} (PPM at {path})"
+        );
+    }
+}
+
+/// S4B.6.k: ablation across mip configs to localise when the
+/// triangular BLACK wedge appears at pose D. Runs the same camera
+/// pose under (mip_levels=1, =2, =3, =4) × (mip_scan_dist=64),
+/// counts exact-RGB-0 pixels in each, and writes PPMs for visual
+/// diff. Useful to isolate whether the bug is in a specific mip
+/// transition.
+#[test]
+#[ignore = "expensive diagnostic: builds full stacked demo + 4 renders (~10 s)"]
+fn poseD_mip_ablation() {
+    std::env::set_var("ROXLAP_STACKED_GROUND", "1");
+    let mut scene_and_cam = crate::scene::build_demo();
+    std::env::remove_var("ROXLAP_STACKED_GROUND");
+    scene_and_cam.cam_pos = [0.43, -4.61, 225.73];
+    scene_and_cam.yaw = 1.2258;
+    scene_and_cam.pitch = 1.3259;
+    scene_and_cam.refresh_camera();
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+
+    for &(mip_levels, mip_scan_dist, tag) in &[
+        (1u32, 1024i32, "m1"),
+        (2u32, 64i32, "m2_64"),
+        (3u32, 64i32, "m3_64"),
+        (4u32, 64i32, "m4_64"),
+        (4u32, 128i32, "m4_128"),
+        (4u32, 256i32, "m4_256"),
+    ] {
+        let mut fb = vec![sky; pixel_count];
+        let mut zb = vec![f32::INFINITY; pixel_count];
+        let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+        settings.mip_levels = mip_levels;
+        settings.mip_scan_dist = mip_scan_dist;
+        let _ = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            W as usize,
+            W,
+            H,
+            &mut pool,
+            &mut scene_and_cam.scene,
+            &scene_and_cam.camera,
+            &settings,
+            sky,
+            None,
+        );
+        // Count exact-RGB-0 pixels (the black wedge) and compute the
+        // bounding box in screen space.
+        let mut n_black = 0usize;
+        let mut x_min = u32::MAX;
+        let mut y_min = u32::MAX;
+        let mut x_max = 0u32;
+        let mut y_max = 0u32;
+        for (i, &p) in fb.iter().enumerate() {
+            let rgb = p & 0x00_ff_ff_ff;
+            if rgb == 0 {
+                n_black += 1;
+                let x = (i as u32) % W;
+                let y = (i as u32) / W;
+                x_min = x_min.min(x);
+                y_min = y_min.min(y);
+                x_max = x_max.max(x);
+                y_max = y_max.max(y);
+            }
+        }
+        let path = format!("/tmp/poseD_ablate_{tag}.ppm");
+        write_ppm(&path, &fb);
+        eprintln!(
+            "{tag} (mip_levels={mip_levels}, mip_scan_dist={mip_scan_dist}): \
+             black_RGB0={n_black} bbox=[x{x_min}..{x_max}, y{y_min}..{y_max}] → {path}"
+        );
+    }
 }
 
 /// Quick FPS benchmark: render N frames from the spawn camera at

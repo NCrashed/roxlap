@@ -101,12 +101,96 @@ pub fn build_ground_extent(grid: &mut Grid, chunks_x: i32, chunks_y: i32) {
 }
 
 /// `chunks_z=2` showcase variant: builds an all-air chz=0 layer + the
-/// `build_ground_extent` terrain in chz=1. The camera sits in chz=0
-/// air-gap and uses S4B.6.e's cross-chunk look-down to see chz=1's
-/// floor below. Materialises chz=0 chunks as empty so
-/// `Grid::chunk_xyz_backing` enumerates the full stack.
+/// `build_ground_extent` terrain in chz=1, then adds a handful of
+/// tall stone mountains that BREACH the chunk boundary (base on the
+/// hills at world z≈336, peak at world z≈100 = ~236 voxels tall,
+/// spanning chz=1's lower half + most of chz=0). The mountains
+/// exercise S4B.6.h mid-render chunk-Z handoff: rays from the chz=0
+/// camera that miss a mountain peak walk into chz=1's hills via
+/// handoff, while rays that hit a peak read its chz=0 voxels
+/// directly.
 pub fn build_ground_stacked(grid: &mut Grid) {
     build_ground_extent_at_chz(grid, GROUND_CHUNKS_X, GROUND_CHUNKS_Y, 1);
+    add_tall_mountains(grid);
+}
+
+/// Stone colour for the tall stacked-demo mountains.
+const MOUNTAIN_STONE: u32 = 0x80_8a_82_7a;
+
+/// Place a handful of stepped-cone mountains spanning chz=0 + chz=1.
+/// Bases at world z=336 (= the top of chz=1's hills), peaks at
+/// world z=100 (= well inside chz=0). Each "step" is a square ring
+/// of voxels stamped via `Grid::set_rect`, which handles the
+/// chunk-XY + chunk-Z multi-chunk decomposition automatically.
+///
+/// **Bedrock-preserving placement.** Each chunk's column needs its
+/// bedrock placeholder at `chunk_local_z = 255` (= the slab-list
+/// terminator with `z1 == 0xff`) intact so the rasterizer's
+/// bedrock-as-air check (= S4B.6.h mid-render handoff trigger)
+/// fires at the chz boundary. If a mountain step's z range
+/// includes world z=255 (chz=0's bedrock) or world z=511 (chz=1's
+/// bedrock), set_rect would overwrite the placeholder, the column
+/// would just end with mountain solid + no sentinel, and handoff
+/// would never fire — the mountain's lower half would render as a
+/// "floating top" with no chz+1 continuation. To prevent that,
+/// stamp each step as up to TWO sub-rects that skip world z=255
+/// and z=511 explicitly.
+fn add_tall_mountains(grid: &mut Grid) {
+    // Hand-placed XY locations — visible from the stacked-demo
+    // spawn pose (looking +y from `(0, -120, 200)`).
+    let centres = [(0i32, 200i32), (-180, 380), (220, 320)];
+    const BASE_Z: i32 = 336; // on top of hills (world z)
+    const PEAK_Z: i32 = 100; // breaches into chz=0
+    const BASE_HALF: i32 = 40; // mountain half-width at the base
+    const STEPS: i32 = 24; // discrete elevation rings
+    let z_thickness = ((BASE_Z - PEAK_Z) / STEPS).max(1);
+
+    for (cx, cy) in centres {
+        for step in 0..STEPS {
+            let frac = step as f32 / (STEPS - 1).max(1) as f32;
+            // Linear interp z_top from BASE_Z down to PEAK_Z. (Voxlap
+            // z-down: smaller z = closer to sky = mountain peak.)
+            let z_top = BASE_Z - ((BASE_Z - PEAK_Z) as f32 * frac).round() as i32;
+            // Radius shrinks linearly from BASE_HALF to 1.
+            let half = (BASE_HALF as f32 * (1.0 - frac) + 1.0).round() as i32;
+            let z_lo = z_top - z_thickness;
+            let z_hi_excl = z_top + 1;
+            stamp_mountain_step_preserving_bedrock(grid, cx, cy, half, z_lo, z_hi_excl);
+        }
+    }
+}
+
+/// Issue a `Grid::set_rect` for one mountain step, splitting at
+/// per-chunk bedrock z values so the chunks' bedrock placeholders
+/// at `chunk_local_z = 255` (= world z `chz*256 + 255`) stay
+/// intact. Callers must pass `z_hi_excl > z_lo`.
+fn stamp_mountain_step_preserving_bedrock(
+    grid: &mut Grid,
+    cx: i32,
+    cy: i32,
+    half: i32,
+    z_lo: i32,
+    z_hi_excl: i32,
+) {
+    let cs_z = CHUNK_SIZE_Z as i32;
+    let mut z = z_lo;
+    while z < z_hi_excl {
+        // Find the next bedrock z >= current z (world z = N*cs_z - 1
+        // for any positive N).
+        let chunk_of_z = z.div_euclid(cs_z);
+        let chunk_bedrock_z = chunk_of_z * cs_z + cs_z - 1;
+        let segment_end = z_hi_excl.min(chunk_bedrock_z);
+        if segment_end > z {
+            grid.set_rect(
+                IVec3::new(cx - half, cy - half, z),
+                IVec3::new(cx + half + 1, cy + half + 1, segment_end),
+                Some(MOUNTAIN_STONE),
+            );
+        }
+        // Skip the bedrock voxel (= the placeholder z) and continue
+        // from the next chunk's first voxel.
+        z = chunk_bedrock_z + 1;
+    }
 }
 
 /// Per-chunk-z variant. `ground_chz=0` matches `build_ground_extent`
@@ -141,6 +225,15 @@ pub fn build_ground_extent_at_chz(grid: &mut Grid, chunks_x: i32, chunks_y: i32,
     };
 
     let z_max = (CHUNK_SIZE_Z as i32) - 1; // bedrock placeholder z
+                                           // S4B.6.k: don't cap the hill 2 short of bedrock — the previous
+                                           // attempt (`z_max - 2`) caused a regression at the usual
+                                           // downward-looking render path where drawcwall on the new
+                                           // bedrock slab rendered a spurious black region at world z=510
+                                           // in chz=1. The merged hill+bedrock slab structure is fine
+                                           // because drawflor / drawfwall's own bedrock-z byte check
+                                           // (`column[vptr+1] == 0xff >> mip`) treats the bedrock implicit
+                                           // at z=255 as air without needing a separate slab.
+    let z_hill_max = z_max - 1;
 
     for chy in -half_chunks_y..(chunks_y - half_chunks_y) {
         for chx in -half_chunks_x..(chunks_x - half_chunks_x) {
@@ -174,7 +267,7 @@ pub fn build_ground_extent_at_chz(grid: &mut Grid, chunks_x: i32, chunks_y: i32,
                         x: lx as u32,
                         y: ly as u32,
                         z0: surface_z as u8,
-                        z1: (z_max - 1) as u8,
+                        z1: z_hill_max as u8,
                     });
                 }
             }

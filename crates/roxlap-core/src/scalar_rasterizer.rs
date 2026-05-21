@@ -662,25 +662,26 @@ impl Rasterizer for ScalarRasterizer<'_> {
             gcsub_local[0] = gcsub_local[lane0_idx];
             gcsub_local[1] = gcsub_local[lane1_idx];
         }
-        // S4B.6.e: use `seed_chunk_z` (= the chunk that owns the
-        // cf-seed vptr) instead of `camera_chunk_idx[2]`. They
-        // match for the in-camera-chunk path. For cross-chunk
-        // look-down, `seed_chunk_z` is the deeper chunk holding
-        // the real floor — pinning state's chunk-z to it means
-        // the column-step's chunk-XY DDA queries that chz layer.
-        let camera_chunk_z = cache.seed_chunk_z;
+        // S4B.6.j: decouple the camera's PHYSICAL chz (= used by
+        // the column-step's chunk-XY DDA at every XY crossing)
+        // from the SEED chunk's chz (= where state.column starts).
+        // They match for the in-camera-chunk path; they differ
+        // when seed-time cross-chunk look-down stepped down to a
+        // deeper chunk's real floor. Without the decoupling, the
+        // pinned `seed_chunk_z` propagates through every chunk-XY
+        // swap and chz=`camera_chunk_z` content at OTHER columns
+        // (e.g. a mountain peak the camera's column doesn't share)
+        // becomes permanently invisible.
+        let camera_chunk_z = cache.prelude.camera_chunk_idx[2];
+        let seed_chunk_z = cache.seed_chunk_z;
         #[allow(clippy::cast_possible_wrap)]
         let chunk_size_z_signed = self.grid.chunk_size_z as i32;
-        // S4B.6.c: world-z base for the chunk the walker is
-        // CURRENTLY reading. For in-bounds cameras the walker
-        // starts on the camera's chunk → `camera_chunk_z *
-        // chunk_size_z`. For OOB-XY cameras the air-gap is
-        // synthesised (no real chunk to read from) → `0` (= the
-        // synthesised bedrock seed lives at world-z 0..chunks_z*
-        // chunk_size_z, so cf seed values stay in the
-        // chunk-local scale of chz=0 implicit).
+        // chunk_world_z_base for the SEED chunk. State reads its
+        // slab data first; per-XY column-step resets this to
+        // `camera_chunk_z * chunk_size_z` for the chunks the DDA
+        // visits. OOB-XY: synthesised seed, no base offset.
         let chunk_world_z_base = if cache.prelude.in_bounds_xy {
-            camera_chunk_z * chunk_size_z_signed
+            seed_chunk_z * chunk_size_z_signed
         } else {
             0
         };

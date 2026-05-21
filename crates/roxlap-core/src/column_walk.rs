@@ -204,7 +204,20 @@ pub fn camera_chunk_air_gap(
         let cz_local = if chz == camera_chz {
             prelude.camera_local_xyz[2]
         } else {
-            0
+            // S4B.6.j: camera is physically ABOVE this chunk
+            // (the chz iter only fires after the previous
+            // iteration found all-air-bedrock). Using `cz = -1`
+            // instead of `0` forces `camera_column_air_gap` to
+            // hit the "air above first slab" branch (`cz <
+            // first_z1`), so columns whose first slab is AT
+            // chunk-local z=0 (= solid right at the chz
+            // boundary) report the air gap as `(0, 0)` instead
+            // of bailing to `None` ("hidden interior between
+            // slabs"). The None bail used to whole-frame-sky a
+            // 1-voxel-thin band of camera positions where step
+            // N's set_rect's XY rectangle straddled the column
+            // — user-reported as pose B.
+            -1
         };
         let (local_z0, local_z1, vptr) =
             camera_column_air_gap(column, cz_local, treat_z_max_as_air)?;

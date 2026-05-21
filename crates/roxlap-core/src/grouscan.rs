@@ -157,6 +157,7 @@ pub struct GrouscanInputs<'a> {
     /// `chunk_at_xyz([new_chx, new_chy, camera_chunk_z])` instead
     /// of the legacy 2D `chunk_at_xy`. For `chunks_z == 1` grids
     /// this is `0` and the dispatch degenerates to today's path.
+    ///
     pub camera_chunk_z: i32,
     /// S4B.6.c: world-z offset for the slab data the walker starts
     /// at. `world_z = column_local_z + chunk_world_z_base`. Seeded
@@ -850,8 +851,21 @@ fn phase_draw_fwall(state: &mut GrouscanState<'_>) -> Phase {
     // Voxlap5.c:11646-11648. dv1 = v[1] = top of floor-colour list.
     let dv1 = slab_z_at(state, state.vptr_offset, 1);
 
+    // S4B.6.k bedrock-z guard. Mirror of `phase_draw_flor`'s check:
+    // compare against the RAW z1 byte (chunk-local), not the
+    // world-z value `slab_z_at` returns. For stacked grids (chz>0)
+    // these diverge: at chz=1, mip=2, the z1 byte is `0xff>>2 = 63`
+    // but `slab_z_at` adds `chunk_world_z_base >> mip = 64`, yielding
+    // world-z 127. The previous `(dv1 as u8) == 0xff>>mip` compared
+    // 127 against 63 and missed the bedrock — drawfwall then drew
+    // the bedrock placeholder's (0,0,0,0) voxel into the radar,
+    // visible as the triangular BLACK wedge in pose D's bottom-left
+    // (user-reported 2026-05-17).
     let bedrock_z_at_mip = 0xff_u8 >> (state.gmipcnt as u32);
-    if state.scratch.treat_z_max_as_air && (dv1 as u8) == bedrock_z_at_mip {
+    if state.scratch.treat_z_max_as_air
+        && state.vptr_offset + 1 < state.column.len()
+        && state.column[state.vptr_offset + 1] == bedrock_z_at_mip
+    {
         return Phase::DrawCwall;
     }
 
@@ -1223,14 +1237,31 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
         && state.vptr_offset + 1 < state.column.len()
         && state.column[state.vptr_offset + 1] == bedrock_z_at_mip
     {
-        // S4B.6.c: a chunk-Z handoff hook lives at
-        // `try_handoff_chunk_z_down` for when the cross-chunk
-        // look-down lands. It currently isn't wired into the
-        // bedrock guard because the cf seed's z range is still
-        // capped at the camera-chunk's bedrock (`world_z = 255`
-        // for camera at chz=0). Extending cf z1 across chunks
-        // requires `camera_chunk_air_gap` to walk the chunk-z
-        // stack at seed time — deferred to a follow-up.
+        // S4B.6.h: mid-render chunk-Z handoff. Before falling
+        // through to AfterDelete (= sky), try to swap state to the
+        // chunk at `current_chunk_z + 1` at the same XY — if it
+        // exists, the new chunk's column might have a real floor
+        // we can draw. After a successful handoff route through
+        // `Phase::Skipixy3` so the rasterizer re-walks the new
+        // column's slab list from vptr=0: this lets drawcwall set
+        // `state.z1` from the new slab's z-byte BEFORE drawflor's
+        // gylookup projection runs (re-entering drawflor directly
+        // leaves `state.z1` stuck at the previous column's slab z
+        // → hill / lower-mountain pixels project to the wrong
+        // screen-y on a non-vertical view).
+        //
+        // `try_handoff_chunk_z_down` bumps `current_chunk_z` by 1
+        // per call and bails when chz exceeds the grid's z extent,
+        // so back-to-back handoffs walking all-air-bedrock chunks
+        // terminate after at most `chunks_z` iterations.
+        //
+        // Mip-0 only — `try_handoff_chunk_z_down`'s column-index
+        // recompute uses the mip-0 stride; multi-mip handoff is
+        // unaudited. Gate explicitly so multi-mip paths fall
+        // through to the historical sky behaviour.
+        if state.gmipcnt == 0 && try_handoff_chunk_z_down(state) {
+            return Phase::Skipixy3;
+        }
         return Phase::AfterDelete;
     }
     // gy_raw = gylookoff[z1].
@@ -1520,7 +1551,7 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(new_chunk) = state.grid_view.chunk_at_xyz([
                     new_chunk_xy[0],
                     new_chunk_xy[1],
-                    state.camera_chunk_z,
+                    state.current_chunk_z,
                 ]) {
                     state.slab_buf = new_chunk.slab_buf;
                     state.column_offsets = new_chunk.column_offsets;
@@ -1566,7 +1597,7 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(new_chunk) = state.grid_view.chunk_at_xyz([
                     new_chunk_xy[0],
                     new_chunk_xy[1],
-                    state.camera_chunk_z,
+                    state.current_chunk_z,
                 ]) {
                     state.slab_buf = new_chunk.slab_buf;
                     state.column_offsets = new_chunk.column_offsets;
