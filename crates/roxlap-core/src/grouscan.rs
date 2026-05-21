@@ -43,6 +43,17 @@ pub struct CfType {
     pub cy0: i32,
     pub cx1: i32,
     pub cy1: i32,
+    /// S4B.6.l: chunk-z layer this cf entry reads voxel data from.
+    /// During multi-chz rendering, each cf entry can map to a
+    /// different chz layer so the rasterizer renders content from
+    /// multiple layers in one pass (= cf-splitting at chz
+    /// boundaries). Initialised to `state.current_chunk_z` at seed
+    /// time and inherited on slab_split. The cf-pop handler
+    /// (`phase_after_delete_kept_presync`) reloads
+    /// `state.{column, slab_buf, column_offsets, mip_base_offsets,
+    /// chunk_world_z_base}` when the new top-of-stack entry's chz
+    /// differs from the popped one.
+    pub chz_layer: i32,
 }
 
 /// Length of the `cf` stack. Voxlap declares `int8_t cfasm[256*32]`
@@ -2523,6 +2534,7 @@ mod tests {
             cy0: 200,
             cx1: 300,
             cy1: 400,
+            chz_layer: 0,
         };
         s
     }
@@ -3640,6 +3652,7 @@ mod tests {
             cy0: 400,
             cx1: 500,
             cy1: 600,
+            chz_layer: 0,
         };
         let inputs = dummy_inputs();
         let mut state = GrouscanState::from_seed(&mut s, &inputs, 0, 0, 0, 0, 1);

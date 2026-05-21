@@ -1210,6 +1210,93 @@ mod tests {
         );
     }
 
+    /// S4B.6.l KNOWN LIMITATION (pre-S4B.6.l fix): camera at chz=0
+    /// with all-air-bedrock at the camera's own XY column
+    /// (seed_chz=1 via cross-chunk look-down). A DIFFERENT XY column
+    /// has chz=0 content (= a distant mountain entirely inside
+    /// chz=0). State.current_chunk_z gets pinned to 1 at seed time
+    /// and the chunk-XY swap reads chz=1 chunks across the DDA, so
+    /// the chz=0 mountain is invisible. This test pins the limitation
+    /// — it currently asserts mountain_count == 0 to fail loudly
+    /// (= the limitation has been fixed) once cf-splitting at chz
+    /// boundaries lands.
+    #[test]
+    #[ignore = "S4B.6.l: known limitation — needs cf-splitting at chz boundaries"]
+    fn stacked_chz0_distant_mountain_visible_from_chz0_camera() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).unwrap();
+        // chz=0 mountain at a column DISTANT from the camera —
+        // entirely in chz=0 (world z=100..200), so chz=1 at the
+        // same XY is all-air-bedrock.
+        g.set_rect(
+            IVec3::new(100, 100, 100),
+            IVec3::new(124, 124, 200),
+            Some(0x80_aa_55_22), // distinct brown
+        );
+        // chz=1 hills filling the floor at world z=336..360 across
+        // the chunk EXCEPT a hole around the mountain XY (so the
+        // mountain doesn't sit on a green tower).
+        g.set_rect(
+            IVec3::new(0, 0, 336),
+            IVec3::new(128, 128, 360),
+            Some(0x80_22_88_44),
+        );
+        g.set_rect(IVec3::new(100, 100, 336), IVec3::new(124, 124, 360), None);
+        // Materialise chz=0 + chz=1 (chz=0 has the mountain; chz=1
+        // has the hills).
+        assert!(g.chunk(IVec3::new(0, 0, 0)).is_some());
+        assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        pool.set_treat_z_max_as_air(true);
+        // Camera at (40, 40, 60) — chz=0 air, FAR from the mountain
+        // XY (100..124, 100..124). Yaw=π/4 (look toward +x+y =
+        // mountain direction), pitch=0.72 rad (≈ 41° down) so the
+        // ray bisecting the screen aims at the chz=0 mountain centre
+        // ≈ (112, 112, 150).
+        let (sy, cy) = (std::f64::consts::FRAC_PI_4).sin_cos();
+        let (sp, cp) = 0.72_f64.sin_cos();
+        let camera = Camera {
+            pos: [40.0, 40.0, 60.0],
+            right: [-sy, cy, 0.0],
+            down: [-cy * sp, -sy * sp, cp],
+            forward: [cy * cp, sy * cp, sp],
+        };
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let mountain_count = fb.iter().filter(|&&p| p == 0x80_aa_55_22).count();
+        let hill_count = fb.iter().filter(|&&p| p == 0x80_22_88_44).count();
+        eprintln!("chz0-distant-mountain: mountain_chz0={mountain_count} hill_chz1={hill_count}");
+        // chz=1 hills are reachable via seed-time cross-chunk
+        // look-down.
+        assert!(
+            hill_count > 50,
+            "expected chz=1 hills via cross-chunk look-down — got {hill_count}"
+        );
+        // The proper-fix assertion: chz=0 distant mountain SHOULD be
+        // visible. Currently fails — pins the limitation.
+        assert!(
+            mountain_count > 50,
+            "expected chz=0 distant mountain visible — got {mountain_count} (S4B.6.l limitation)"
+        );
+    }
+
     /// S4B.6.h: mid-render chunk-Z handoff. Camera column has
     /// content in chz=0 (= a mountain at the camera's XY) so
     /// seed-time cross-chunk look-down does NOT fire — seed_chz=0.

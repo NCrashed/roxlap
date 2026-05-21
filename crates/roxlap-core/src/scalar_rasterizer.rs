@@ -519,6 +519,12 @@ impl Rasterizer for ScalarRasterizer<'_> {
             cy0,
             cx1,
             cy1,
+            // S4B.6.l: chz_layer scaffold. Pre-l.2 (= multi-chz seed
+            // construction) every cf entry maps to the same chz —
+            // `seed_chunk_z`, the chunk-z the rasterizer reads voxel
+            // data from. For non-cross-chunk-look-down poses this
+            // equals `camera_chunk_idx[2]`.
+            chz_layer: cache.seed_chunk_z,
         };
 
         // 5. gxmax = min(gmaxscandist, frustum-edge clip per axis).
