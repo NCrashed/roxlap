@@ -682,13 +682,18 @@ impl Rasterizer for ScalarRasterizer<'_> {
         // Camera ABOVE the grid (camera_chunk_idx[2] < origin_chunk_z,
         // world z<0 in voxlap z-down) clamps to origin_chunk_z so the
         // column-step's `chunk_at_xyz(.., camera_chunk_z)` queries land
-        // in the grid's top chunk. Otherwise every XY column would
-        // return None (no chunk exists outside the z extent) and the
-        // ray walk would render only the sky-cleared frame. Mirrors
-        // the seed-side clamp in `camera_chunk_air_gap`.
+        // in the grid's top chunk. S5.2-followup: also clamp UP for
+        // camera BELOW the grid (raw chz past max_chz), common for
+        // rotated small grids whose inverse-rotation lands the local
+        // camera past the grid's z extent. Without the symmetric
+        // upper clamp every XY column lookup returns None and the
+        // grid renders pure sky. Mirrors the seed-side clamp in
+        // `camera_chunk_air_gap`.
         let raw_camera_chunk_z = cache.prelude.camera_chunk_idx[2];
         let origin_chunk_z = self.grid.chunk_grid.map_or(0, |cg| cg.origin_chunk_z);
-        let camera_chunk_z = raw_camera_chunk_z.max(origin_chunk_z);
+        let chunks_z = self.grid.chunk_grid.map_or(1, |cg| cg.chunks_z) as i32;
+        let max_chz = origin_chunk_z + chunks_z - 1;
+        let camera_chunk_z = raw_camera_chunk_z.clamp(origin_chunk_z, max_chz);
         let seed_chunk_z = cache.seed_chunk_z;
         #[allow(clippy::cast_possible_wrap)]
         let chunk_size_z_signed = self.grid.chunk_size_z as i32;

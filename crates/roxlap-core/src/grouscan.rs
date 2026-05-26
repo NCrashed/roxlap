@@ -1577,15 +1577,28 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                     state.current_chunk_exists = false;
                 }
             }
+            // Recompute `correct_idx` from the active mip-N tables
+            // regardless of `current_chunk_exists`. When the next
+            // chunk doesn't exist, `mip_base_offsets` / `column_offsets`
+            // are still pinned at the previous (existing) chunk's
+            // tables; using THEIR `mip_base + local_y * stride +
+            // local_x` keeps `ixy_sptr_col_idx` inside
+            // `state.mip_base_offsets[gmipcnt]`'s sub-table so a
+            // subsequent [`phase_remiporend`] subtraction can't
+            // underflow. Without this fix, the wrap-add from above
+            // can leave `ixy_sptr_col_idx < mip_base_offsets[gmipcnt]`
+            // (= the S5.2-followup disappearing-ship panic).
+            // `state.column` still drops to `&[]` when the chunk is
+            // absent, so empty-chunk rays correctly draw no voxels.
+            let local_cx_mip = state.cx_mip & chunk_size_at_mip_mask;
+            let local_cy_mip = state.cy_mip & chunk_size_at_mip_mask;
+            let mip_base = state.mip_base_offsets[state.gmipcnt as usize];
+            #[allow(clippy::cast_sign_loss)]
+            let correct_idx = mip_base
+                + ((local_cy_mip as u32) * (chunk_size_at_mip as u32) + (local_cx_mip as u32))
+                    as usize;
+            state.ixy_sptr_col_idx = correct_idx;
             if state.current_chunk_exists {
-                let local_cx_mip = state.cx_mip & chunk_size_at_mip_mask;
-                let local_cy_mip = state.cy_mip & chunk_size_at_mip_mask;
-                let mip_base = state.mip_base_offsets[state.gmipcnt as usize];
-                #[allow(clippy::cast_sign_loss)]
-                let correct_idx = mip_base
-                    + ((local_cy_mip as u32) * (chunk_size_at_mip as u32) + (local_cx_mip as u32))
-                        as usize;
-                state.ixy_sptr_col_idx = correct_idx;
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {

@@ -1885,3 +1885,233 @@ fn dump_ring_artifact_pose() {
         "multi-mip introduces {extra_dark} extra dark pixels ({extra_pct:.2}%) — ring artifact?"
     );
 }
+
+// ---- S5.2-followup: disappearing-ship regression ----
+
+/// User-captured pose where the rotating ship vanishes. Generated
+/// 2026-05-27 via the F hotkey (`roxlap-scene-capture.txt`):
+/// ```text
+/// pos    = (22.77, 109.75, 24.29)
+/// yaw    = 1.6758 rad
+/// pitch  = -0.2850 rad
+/// ship   = [4.508, 4.508, 2.732]  // rad about X, Y, Z
+/// ```
+const SHIP_GONE_CAM_POS: [f64; 3] = [22.77, 109.75, 24.29];
+const SHIP_GONE_YAW: f64 = 1.6758;
+const SHIP_GONE_PITCH: f64 = -0.2850;
+const SHIP_GONE_SHIP_ANGLES: [f64; 3] = [4.508, 4.508, 2.732];
+
+/// Build a ship-only scene matching the live demo's ship grid
+/// (same origin, same lighting bake), with `render_sky = false`
+/// just like the demo enables. Sets the ship grid's rotation to
+/// `angles[0..3]` (`R_z · R_y · R_x` composition).
+fn build_ship_only_at_rotation(angles: [f64; 3]) -> Scene {
+    use glam::DQuat;
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 500.0, -100.0)));
+    {
+        let ship = scene.grid_mut(id).expect("ship grid present");
+        crate::ship::build_ship(ship);
+        ship.render_sky = false;
+    }
+    // Lighting bake operates in grid-local frame, so apply BEFORE
+    // setting the rotation so the bake's slab walk is identical
+    // across rotation values.
+    crate::scene::bake_lightmode_1_pub(&mut scene);
+    let qx = DQuat::from_rotation_x(angles[0]);
+    let qy = DQuat::from_rotation_y(angles[1]);
+    let qz = DQuat::from_rotation_z(angles[2]);
+    scene.grid_mut(id).expect("ship").transform.rotation = qz * qy * qx;
+    scene
+}
+
+/// S5.2-followup regression: pin the rotated-ship-disappears bug
+/// the user captured at `ship_angles = [4.508, 4.508, 2.732]`.
+/// Two engine bugs combined:
+/// 1. `grouscan::phase_after_delete_kept_presync`'s multi-chunk
+///    mip-N branch left `ixy_sptr_col_idx` at the wrap-add value
+///    when the column-step landed in a non-existent chunk; a
+///    later `phase_remiporend` subtracted `mip_base_offsets[gmipcnt]`
+///    from it and underflowed (debug) / wrapped (release).
+/// 2. `column_walk::camera_chunk_air_gap` and
+///    `scalar_rasterizer::gline` didn't handle "camera below the
+///    grid's z extent" (= local camera z > max_chz * chunk_size_z)
+///    — common for small grids like a rotated ship where the
+///    inverse-rotation lands the local camera past the grid's z
+///    range. The path returned None / queried a non-existent
+///    chunk, propagating to `SkippedCameraInSolid` → whole-frame
+///    sky.
+///
+/// Both fixed in this commit. Assertions:
+/// - Identity-rotation render: >100 non-sky pixels (sanity).
+/// - Captured-rotation render: >100 non-sky pixels (= bug fixed).
+///
+/// `#[ignore]` because the ship build + lighting bake costs ~10s
+/// per call (called twice here). Run with `cargo test -p
+/// roxlap-scene-demo -- --ignored ship_disappears_at_captured_rotation`.
+#[test]
+#[ignore = "expensive: ship-only scene build + lighting bake × 2 (~10s)"]
+fn ship_disappears_at_captured_rotation() {
+    let cam = camera_for_yaw_pitch(SHIP_GONE_CAM_POS, SHIP_GONE_YAW, SHIP_GONE_PITCH);
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 4 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    // Live-demo settings — multi-mip is the path the demo runs in.
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 128;
+    settings.max_scan_dist = 1500;
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut render_count = |angles: [f64; 3], dump_path: &str| -> usize {
+        let mut scene = build_ship_only_at_rotation(angles);
+        let mut fb = vec![sky; pixel_count];
+        let mut zb = vec![f32::INFINITY; pixel_count];
+        let _ = render_scene_composed(
+            &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+        );
+        let non_sky = fb.iter().filter(|&&p| p != sky).count();
+        write_ppm(dump_path, &fb);
+        non_sky
+    };
+
+    let identity_count = render_count([0.0; 3], "/tmp/scene-demo-ship-identity.ppm");
+    let captured_count = render_count(
+        SHIP_GONE_SHIP_ANGLES,
+        "/tmp/scene-demo-ship-captured-rotation.ppm",
+    );
+
+    eprintln!(
+        "ship-only @ identity rotation: {identity_count} non-sky pixels\n\
+         ship-only @ captured rotation: {captured_count} non-sky pixels (ratio {:.2}%)",
+        100.0 * captured_count as f64 / identity_count.max(1) as f64,
+    );
+
+    // Sanity: the identity-rotation render must produce a
+    // visible ship. If THIS fails the test is mis-set-up, not
+    // the engine.
+    assert!(
+        identity_count > 100,
+        "identity-rotation ship render produced only {identity_count} non-sky pixels — \
+         camera pose or ship scene may be wrong"
+    );
+
+    // The bug claim: captured-rotation produces ~zero ship
+    // pixels. When the engine is fixed, captured_count should
+    // be similar to identity_count.
+    assert!(
+        captured_count > 100,
+        "captured-rotation ship render produced only {captured_count} non-sky pixels — \
+         ship disappears at rotation {:?}",
+        SHIP_GONE_SHIP_ANGLES,
+    );
+}
+
+/// Second user-captured pose (2026-05-27 follow-up): the
+/// disappearing-ship fix made this case render — but the entire
+/// framebuffer turns grey instead of showing the ship + sky.
+/// ```text
+/// pos    = (26.07, 19.44, 37.99)
+/// yaw    = 1.5658 rad
+/// pitch  = -0.2975 rad
+/// ship   = [4.617, 4.617, 2.951]
+/// ```
+const SHIP_GREY_CAM_POS: [f64; 3] = [26.07, 19.44, 37.99];
+const SHIP_GREY_YAW: f64 = 1.5658;
+const SHIP_GREY_PITCH: f64 = -0.2975;
+const SHIP_GREY_SHIP_ANGLES: [f64; 3] = [4.617, 4.617, 2.951];
+
+/// Pin the "screen suddenly grey" pose. Renders the ship-only
+/// scene at the captured pose + rotation and dumps a PPM. The
+/// assertion is "framebuffer isn't ALL one color" — a working
+/// render produces a mix of sky + ship pixels; a buggy render
+/// fills the screen with a single shade (typically grey, since
+/// the ship's HULL colour `0x80_8a_8a_8a` plus lighting bake
+/// resolves to mid-grey RGB).
+#[test]
+#[ignore = "expensive: ship-only scene build + lighting bake × 2 (~10s); pins user-reported grey-screen pose"]
+fn ship_grey_screen_at_captured_pose() {
+    let cam = camera_for_yaw_pitch(SHIP_GREY_CAM_POS, SHIP_GREY_YAW, SHIP_GREY_PITCH);
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 4 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 128;
+    settings.max_scan_dist = 1500;
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut render = |angles: [f64; 3], dump_path: &str| -> Vec<u32> {
+        let mut scene = build_ship_only_at_rotation(angles);
+        let mut fb = vec![sky; pixel_count];
+        let mut zb = vec![f32::INFINITY; pixel_count];
+        let _ = render_scene_composed(
+            &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+        );
+        write_ppm(dump_path, &fb);
+        fb
+    };
+
+    let fb_identity = render([0.0; 3], "/tmp/scene-demo-ship-grey-identity.ppm");
+    let fb_captured = render(
+        SHIP_GREY_SHIP_ANGLES,
+        "/tmp/scene-demo-ship-grey-captured.ppm",
+    );
+
+    // Color-bucket diagnostic: tally unique pixel values.
+    let unique_count = |fb: &[u32]| -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for &p in fb {
+            seen.insert(p);
+        }
+        seen.len()
+    };
+    let dominant = |fb: &[u32]| -> (u32, usize) {
+        let mut counts = std::collections::HashMap::new();
+        for &p in fb {
+            *counts.entry(p).or_insert(0usize) += 1;
+        }
+        counts.into_iter().max_by_key(|&(_, n)| n).unwrap_or((0, 0))
+    };
+    let (dom_id, dom_id_count) = dominant(&fb_identity);
+    let (dom_cap, dom_cap_count) = dominant(&fb_captured);
+    let non_sky_id = fb_identity.iter().filter(|&&p| p != sky).count();
+    let non_sky_cap = fb_captured.iter().filter(|&&p| p != sky).count();
+    eprintln!(
+        "grey-screen pose:\n\
+         - identity:  {non_sky_id}/{pixel_count} non-sky; dominant {dom_id:#010x} \
+           ({dom_id_count}/{pixel_count}); unique={}\n\
+         - captured:  {non_sky_cap}/{pixel_count} non-sky; dominant {dom_cap:#010x} \
+           ({dom_cap_count}/{pixel_count}); unique={}",
+        unique_count(&fb_identity),
+        unique_count(&fb_captured),
+    );
+
+    // The bug claim: captured-rotation framebuffer is dominated
+    // by ONE colour (all-grey). A working render produces a mix
+    // of sky + ship colours — the dominant single colour should
+    // not exceed ~70% of the framebuffer.
+    let cap_dominance = dom_cap_count as f64 / pixel_count as f64;
+    assert!(
+        cap_dominance < 0.70,
+        "captured-rotation framebuffer is {:.1}% one colour ({:#010x}) — \
+         screen-grey bug repro at rotation {:?}",
+        100.0 * cap_dominance,
+        dom_cap,
+        SHIP_GREY_SHIP_ANGLES,
+    );
+}

@@ -193,7 +193,14 @@ pub fn camera_chunk_air_gap(
     // `grid.chunk_at_xyz` for chz<origin_chunk_z returns None and
     // opticast SKIPS the whole grid — user-reported 2026-05-26 as
     // "green hills disappear when camera flies high enough".
-    let mut chz = camera_chz.max(origin_chunk_z);
+    //
+    // S5.2-followup: also clamp UP to `max_chz` for camera BELOW
+    // the grid (= local z past the bottom chunk's bedrock). Common
+    // for rotated small grids (e.g. spinning ships) where the
+    // inverse-rotation lands the local camera past the grid's z
+    // extent. Without this upper clamp the `chunk_at_xyz` lookup
+    // returns None and opticast paints the whole frame sky.
+    let mut chz = camera_chz.clamp(origin_chunk_z, max_chz);
     let mut z0_world: Option<i32> = None;
     loop {
         let chunk = grid.chunk_at_xyz([
@@ -212,7 +219,7 @@ pub fn camera_chunk_air_gap(
         )?;
         let cz_local = if chz == camera_chz {
             prelude.camera_local_xyz[2]
-        } else {
+        } else if chz > camera_chz {
             // S4B.6.j: camera is physically ABOVE this chunk
             // (the chz iter only fires after the previous
             // iteration found all-air-bedrock). Using `cz = -1`
@@ -227,6 +234,18 @@ pub fn camera_chunk_air_gap(
             // N's set_rect's XY rectangle straddled the column
             // — user-reported as pose B.
             -1
+        } else {
+            // S5.2-followup: camera is physically BELOW this
+            // chunk (camera_chz > max_chz, clamped down to
+            // max_chz so `chz < camera_chz`). Pass
+            // `cz = chunk_size_z` so `camera_column_air_gap`
+            // walks past every slab and takes the
+            // `treat_z_max_as_air + last_z1 == 0xff` branch
+            // (synthesised air gap above the bedrock
+            // placeholder). Equivalent to "camera floats below
+            // the column"; the air gap returned is
+            // `(prev_floor_z1c, 0xff, bedrock_vptr)`.
+            chunk_size_z_signed
         };
         let (local_z0, local_z1, vptr) =
             camera_column_air_gap(column, cz_local, treat_z_max_as_air)?;
