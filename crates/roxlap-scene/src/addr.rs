@@ -393,4 +393,112 @@ mod tests {
             );
         }
     }
+
+    // ---- S5.1: parameterised round-trip over multiple rotations ----
+
+    /// Sweep a grid of rotations × world positions and confirm the
+    /// `world_to_grid_local` ∘ `grid_local_to_world` round-trip
+    /// closes within f32-fract precision (cast from f64 → f32 in
+    /// [`GridLocalPos::fract`] is the lossy step). Per PORTING-SCENE.md
+    /// risk R5, this is the canonical f64↔i32 boundary check.
+    ///
+    /// Tolerance is `1e-5` — empirically matches the worst-case
+    /// f32 precision of a `fract` cast at unit voxel scale (≈ 1.2e-7
+    /// per component, amplified slightly by the round-trip's
+    /// re-rotation).
+    #[test]
+    fn world_local_world_round_trip_rotation_sweep() {
+        // Rotations: identity (sanity), three axis-aligned 90°s, a
+        // shallow tilt, a 45° composite, and a fully arbitrary
+        // axis/angle. Cover identity → near-singular → arbitrary.
+        let rotations = [
+            ("identity", DQuat::IDENTITY),
+            (
+                "90deg-z",
+                DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2),
+            ),
+            (
+                "90deg-y",
+                DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2),
+            ),
+            (
+                "90deg-x",
+                DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2),
+            ),
+            ("180deg-z exact", DQuat::from_xyzw(0.0, 0.0, 1.0, 0.0)),
+            (
+                "45deg-z",
+                DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4),
+            ),
+            (
+                "tilted 0.7rad",
+                DQuat::from_axis_angle(DVec3::new(0.3, 0.8, 0.5).normalize(), 0.7),
+            ),
+            (
+                "yaw+pitch+roll composite",
+                DQuat::from_rotation_y(0.4)
+                    * DQuat::from_rotation_x(0.3)
+                    * DQuat::from_rotation_z(0.2),
+            ),
+        ];
+        // World positions: origin, positive interior, negative
+        // quadrant, near chunk boundaries (positive + negative), and
+        // far-from-origin so the f64 → f32 fract cast loses no
+        // additional precision.
+        let world_positions = [
+            DVec3::ZERO,
+            DVec3::new(1.5, 2.5, 3.5),
+            DVec3::new(-1.5, -2.5, -3.5),
+            DVec3::new(f64::from(CHUNK_SIZE_XY) - 0.01, 0.5, 0.5),
+            DVec3::new(-f64::from(CHUNK_SIZE_XY) - 0.01, 0.5, 0.5),
+            DVec3::new(500.25, -250.75, 100.125),
+        ];
+        // Grid origins: at world origin (canonical case) and a
+        // non-trivial offset to verify the translation interacts
+        // correctly with the rotation.
+        let grid_origins = [DVec3::ZERO, DVec3::new(1000.0, -500.0, 200.0)];
+
+        for (rot_name, rotation) in rotations {
+            for grid_origin in grid_origins {
+                let t = GridTransform {
+                    origin: grid_origin,
+                    rotation,
+                };
+                for world in world_positions {
+                    let p = world_to_grid_local(world, &t);
+                    let back = grid_local_to_world(p.chunk, p.voxel, p.fract, &t);
+                    assert!(
+                        back.abs_diff_eq(world, 1e-5),
+                        "rotation={rot_name} origin={grid_origin:?} world={world:?} back={back:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Spot-check that a non-identity rotation actually places the
+    /// voxel decomposition in a different chunk than the identity
+    /// case would — guards against a regression where rotation is
+    /// silently dropped (e.g., a missed `transform.rotation` field
+    /// read). For 90°-Z about the world origin, world point
+    /// `(0, 5, 0)` lives in grid-local chunk (0, 0, 0) voxel
+    /// `(5, 0, 0)`, NOT the `(0, 5, 0)` it would map to under
+    /// identity.
+    #[test]
+    fn rotated_world_point_lands_in_rotated_voxel() {
+        let t = GridTransform {
+            origin: DVec3::ZERO,
+            rotation: DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2),
+        };
+        let p_rotated = world_to_grid_local(DVec3::new(0.0, 5.5, 0.0), &t);
+        let p_identity = world_to_grid_local(DVec3::new(0.0, 5.5, 0.0), &GridTransform::identity());
+        assert_ne!(
+            p_rotated.voxel, p_identity.voxel,
+            "rotated voxel ({:?}) coincidentally equals identity voxel ({:?}) — rotation may have been dropped",
+            p_rotated.voxel,
+            p_identity.voxel,
+        );
+        assert_eq!(p_rotated.voxel, UVec3::new(5, 0, 0));
+        assert_eq!(p_identity.voxel, UVec3::new(0, 5, 0));
+    }
 }

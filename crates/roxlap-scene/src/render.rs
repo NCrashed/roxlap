@@ -505,6 +505,131 @@ mod tests {
         );
     }
 
+    // ---- S5.1: rotated-grid render correctness ----
+
+    /// Build a single-grid scene at the given transform with a
+    /// marker box near one corner of chunk (0, 0, 0). Returns the
+    /// scene and the marker colour. Picking a single chunk + small
+    /// box keeps the test compact while still exercising the gline
+    /// + grouscan path through the rotated frame.
+    fn build_one_grid_marker_scene(transform: GridTransform) -> (Scene, crate::GridId, u32) {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(transform);
+        let grid = scene.grid_mut(id).unwrap();
+        // Bright marker box at chunk-local (40..56, 40..56, 40..56).
+        grid.set_rect(
+            IVec3::new(40, 40, 40),
+            IVec3::new(55, 55, 55),
+            Some(0x80_55_aa_22), // distinctive green
+        );
+        (scene, id, 0x80_55_aa_22)
+    }
+
+    /// Pin S5.1's central equivalence: rotating both the grid and the
+    /// camera by the SAME rotation around the grid's origin must
+    /// leave the rendered framebuffer unchanged — the grid-local
+    /// camera pose collapses to the same values in both scenarios.
+    ///
+    /// We use `DQuat::from_xyzw(0.0, 0.0, 1.0, 0.0)`, the
+    /// 180°-around-Z unit quaternion. This rotation acts on vectors
+    /// as `(x, y, z) → (-x, -y, z)`, which only multiplies f64
+    /// components by 0 or ±1 — bit-exact under glam's standard quat
+    /// conjugation formula. Other angles (e.g. 90°) would introduce
+    /// sub-1e-15 noise from sin/cos, breaking byte-identity at
+    /// chunk / voxel boundaries.
+    #[test]
+    fn s5_1_180deg_z_rotated_grid_byte_identical_to_axis_aligned() {
+        use glam::DQuat;
+        // Right-handed voxlap basis (right × down == forward).
+        let axis_aligned_camera = Camera {
+            pos: [40.0, -20.0, 50.0],
+            right: [-1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        // R_z(180°): (x, y, z) → (-x, -y, z).
+        let rotated_camera = Camera {
+            pos: [-40.0, 20.0, 50.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, -1.0, 0.0],
+        };
+        // Sanity: prove the exact-arithmetic rotation lands on the
+        // baseline. If glam ever changes its quat*vec formula in a
+        // way that loses exactness here, the next two assertions
+        // catch it before the framebuffer comparison.
+        let q = DQuat::from_xyzw(0.0, 0.0, 1.0, 0.0);
+        let rot_pos = q * DVec3::from_array(axis_aligned_camera.pos);
+        let rot_fwd = q * DVec3::from_array(axis_aligned_camera.forward);
+        assert_eq!(rot_pos.to_array(), rotated_camera.pos);
+        assert_eq!(rot_fwd.to_array(), rotated_camera.forward);
+
+        let (mut scene_a, _, _) = build_one_grid_marker_scene(GridTransform::identity());
+        let fb_a = render_via_scene(&mut scene_a, &axis_aligned_camera);
+
+        let (mut scene_b, _, _) = build_one_grid_marker_scene(GridTransform {
+            origin: DVec3::ZERO,
+            rotation: q,
+        });
+        let fb_b = render_via_scene(&mut scene_b, &rotated_camera);
+
+        assert_eq!(
+            fb_a, fb_b,
+            "rotating both grid and camera by R about the grid origin must leave the framebuffer unchanged"
+        );
+    }
+
+    /// 45° smoke test: rotated grid renders to something non-trivial
+    /// without panicking. No equivalence assertion (45° quat math is
+    /// approximate at f64 level; that path is exercised structurally,
+    /// not bit-exactly). Camera is placed at a fixed world pose where
+    /// — under the rotation — the marker box stays inside the view
+    /// frustum.
+    #[test]
+    fn s5_1_45deg_z_rotated_grid_renders_marker() {
+        use glam::DQuat;
+        let rotation = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_4);
+        let (mut scene, _, marker) = build_one_grid_marker_scene(GridTransform {
+            origin: DVec3::ZERO,
+            rotation,
+        });
+
+        // World position of the marker's centre. Grid-local
+        // (47.5, 47.5, 47.5) → world `rotation * (47.5, 47.5, 47.5)`.
+        // R_z(45°): (47.5, 47.5, 47.5) → (0, 67.18, 47.5) (the x/y
+        // components combine into a single +y vector at √2 * 47.5).
+        let marker_world = rotation * DVec3::new(47.5, 47.5, 47.5);
+        // Camera 80 units south of the marker on the world Y axis,
+        // looking +y at the same z. RH basis.
+        let camera = Camera {
+            pos: [marker_world.x, marker_world.y - 80.0, marker_world.z],
+            right: [-1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+
+        let (_engine, mut pool, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let marker_count = fb.iter().filter(|&&p| p == marker).count();
+        assert!(
+            marker_count > 50,
+            "45°-rotated marker box should be visible — got {marker_count} marker pixels"
+        );
+    }
+
     #[test]
     fn render_scene_at_origin_matches_direct_opticast() {
         // Grid at world origin → grid-local camera == world camera.
