@@ -223,11 +223,14 @@ impl App {
             (size, w_nz, h_nz)
         };
 
-        // Step the camera from the input state.
+        // Step the camera + scene animations from input state.
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f64();
         self.last_frame = now;
         self.tick_camera(dt);
+        // S5.2: advance the ship grid's rotation when the `R`
+        // toggle is on. No-op otherwise.
+        self.scene.tick_ship_spin(dt);
 
         // Resize ScratchPool / zbuffer when the window grew.
         let pixel_count = (size.width as usize) * (size.height as usize);
@@ -443,6 +446,16 @@ impl ApplicationHandler for App {
                         // composites this frame, so the captured PPM
                         // matches what's on screen.
                         self.capture_pending = true;
+                    }
+                    // S5.2: `R` toggles the ship grid's continuous
+                    // Z-axis spin. Pressed-edge only — release is
+                    // ignored so the toggle survives the key going up.
+                    KeyCode::KeyR if pressed => {
+                        self.scene.spin_enabled = !self.scene.spin_enabled;
+                        eprintln!(
+                            "ship spin = {}",
+                            if self.scene.spin_enabled { "ON" } else { "OFF" }
+                        );
                     }
                     // `+` / `=` (same key on US layout, with or without Shift)
                     // and the numpad `+` bump scan distance up by

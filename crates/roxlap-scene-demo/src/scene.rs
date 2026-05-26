@@ -5,9 +5,14 @@
 //! Both grid origins are picked so the camera can frame both
 //! without OOB-camera weirdness.
 
-use glam::{DVec3, IVec3};
+use glam::{DQuat, DVec3, IVec3};
 use roxlap_core::Camera;
 use roxlap_scene::{Grid, GridId, GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+
+/// Angular velocity (rad/s) of the ship grid when `R` toggles spin
+/// on. Picked low enough to read as "slow majestic UFO spin"
+/// rather than disorienting blur — one rotation every ~21 seconds.
+pub const SHIP_SPIN_RATE: f64 = 0.3;
 
 use crate::{ship, terrain};
 
@@ -88,6 +93,9 @@ pub fn build_demo() -> SceneAndCamera {
         cam_pos: initial_pos,
         yaw: initial_yaw,
         pitch: initial_pitch,
+        ship_id,
+        ship_angle: 0.0,
+        spin_enabled: false,
     }
 }
 
@@ -95,12 +103,29 @@ pub fn build_demo() -> SceneAndCamera {
 /// `(pos, yaw, pitch)` plus the materialised `Camera` so the
 /// app can mutate `pos` / `yaw` / `pitch` in response to input
 /// and reconstruct the basis each frame.
+///
+/// S5.2: `ship_id` + `ship_angle` + `spin_enabled` drive the
+/// per-frame ship rotation. Toggling `spin_enabled` (R hotkey)
+/// makes the saucer slowly rotate about its own Z axis via
+/// [`tick_ship_spin`].
 pub struct SceneAndCamera {
     pub scene: Scene,
     pub camera: Camera,
     pub cam_pos: [f64; 3],
     pub yaw: f64,
     pub pitch: f64,
+    /// Grid id of the ship — held so the per-frame spin tick can
+    /// update its [`GridTransform::rotation`] without re-iterating
+    /// the scene.
+    pub ship_id: GridId,
+    /// Current ship rotation angle around grid-local Z (radians).
+    /// Tracked as f64 so the quaternion is rebuilt from absolute
+    /// angle each frame, avoiding the slow drift that an
+    /// incremental quat multiply would accumulate.
+    pub ship_angle: f64,
+    /// `R` toggles this; `false` freezes the ship at its current
+    /// `ship_angle` (lighting bake stays as-is — see S5.3).
+    pub spin_enabled: bool,
 }
 
 impl SceneAndCamera {
@@ -108,6 +133,30 @@ impl SceneAndCamera {
     /// pitch)` state. Call after any input that touches them.
     pub fn refresh_camera(&mut self) {
         self.camera = camera_for_yaw_pitch(self.cam_pos, self.yaw, self.pitch);
+    }
+
+    /// S5.2: advance the ship grid's rotation by `dt` seconds.
+    /// No-op when `spin_enabled` is `false`. Rebuilds the
+    /// quaternion from the absolute angle each frame so f64 angle
+    /// arithmetic stays the source of truth — incremental quat
+    /// multiplication would drift over thousands of frames.
+    pub fn tick_ship_spin(&mut self, dt: f64) {
+        if !self.spin_enabled {
+            return;
+        }
+        self.ship_angle += SHIP_SPIN_RATE * dt;
+        // Wrap into [0, 2π) to keep the f64 angle bounded; visually
+        // identical, but stops it from quietly growing into the
+        // billions over a long session.
+        let two_pi = std::f64::consts::TAU;
+        if self.ship_angle >= two_pi {
+            self.ship_angle -= two_pi;
+        }
+        let ship = self
+            .scene
+            .grid_mut(self.ship_id)
+            .expect("ship grid registered");
+        ship.transform.rotation = DQuat::from_rotation_z(self.ship_angle);
     }
 }
 
