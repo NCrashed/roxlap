@@ -36,13 +36,41 @@
 // apart with longer names just hurts readability.
 #![allow(clippy::similar_names)]
 
+use glam::DVec3;
 use roxlap_core::opticast::{opticast, OpticastOutcome, OpticastSettings};
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
 
-use crate::{Scene, CHUNK_SIZE_XY};
+use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
+
+/// Project a world-space [`Camera`] into a grid's local frame:
+/// translate by `-transform.origin`, then apply
+/// `transform.rotation.inverse()` to the position and the
+/// orthonormal basis (`right` / `down` / `forward`).
+///
+/// Identity rotation collapses to pure translation, byte-identical
+/// to the pre-S5 path (`DQuat::IDENTITY * v == v`). For a rotated
+/// grid the rasterizer still sees an axis-aligned chunk grid —
+/// rotation is invisible below this layer per PORTING-SCENE.md § S5.
+///
+/// The basis is rotated as a free vector (no translation
+/// component); position is rotated about the grid origin.
+fn world_camera_to_grid_local(camera: &Camera, transform: &GridTransform) -> Camera {
+    let inv = transform.rotation.inverse();
+    let world_offset = DVec3::from_array(camera.pos) - transform.origin;
+    let local_pos = inv * world_offset;
+    let local_right = inv * DVec3::from_array(camera.right);
+    let local_down = inv * DVec3::from_array(camera.down);
+    let local_forward = inv * DVec3::from_array(camera.forward);
+    Camera {
+        pos: local_pos.to_array(),
+        right: local_right.to_array(),
+        down: local_down.to_array(),
+        forward: local_forward.to_array(),
+    }
+}
 
 /// Outcome of a [`render_scene`] / [`render_scene_composed`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,21 +126,16 @@ pub fn render_scene(
         // anymore — Approach B's chunks live at their signed
         // (chx, chy) indices and `chunk_at_xy` handles negative-
         // index lookups natively.
-        let grid_origin = grid.transform.origin;
+        //
+        // S5.0: per-grid arbitrary rotation. The local camera is
+        // built by `world_camera_to_grid_local` — translation +
+        // inverse-rotation of the basis. Identity rotation keeps
+        // this byte-identical to the pre-S5 translate-only form.
         let Some(backing) = grid.chunk_xyz_backing() else {
             // Empty grid (no populated chz=0 chunks) — skip.
             continue;
         };
-        let local_cam = Camera {
-            pos: [
-                camera.pos[0] - grid_origin.x,
-                camera.pos[1] - grid_origin.y,
-                camera.pos[2] - grid_origin.z,
-            ],
-            right: camera.right,
-            down: camera.down,
-            forward: camera.forward,
-        };
+        let local_cam = world_camera_to_grid_local(camera, &grid.transform);
         let cg = roxlap_core::ChunkGrid {
             chunks: &backing.chunks,
             origin_chunk_xy: backing.origin_chunk_xy,
@@ -232,20 +255,11 @@ pub fn render_scene_composed(
         // body for the camera transform + ChunkGrid construction
         // commentary; the only difference is this writes to
         // (temp_fb, temp_zb) and composes via `compose_into`.
-        let grid_origin = grid.transform.origin;
+        // S5.0: per-grid rotation flows via the shared helper.
         let Some(backing) = grid.chunk_xyz_backing() else {
             continue;
         };
-        let local_cam = Camera {
-            pos: [
-                camera.pos[0] - grid_origin.x,
-                camera.pos[1] - grid_origin.y,
-                camera.pos[2] - grid_origin.z,
-            ],
-            right: camera.right,
-            down: camera.down,
-            forward: camera.forward,
-        };
+        let local_cam = world_camera_to_grid_local(camera, &grid.transform);
         let cg = roxlap_core::ChunkGrid {
             chunks: &backing.chunks,
             origin_chunk_xy: backing.origin_chunk_xy,
@@ -378,6 +392,117 @@ mod tests {
         );
         drop(rasterizer);
         fb
+    }
+
+    // ---- S5.0: world_camera_to_grid_local helper ----
+
+    /// Identity rotation: pos translates by `-origin`; basis is
+    /// untouched. This is the byte-identical-to-pre-S5 contract.
+    #[test]
+    fn world_camera_to_grid_local_identity_rotation_translates_pos_only() {
+        let camera = Camera {
+            pos: [110.0, 220.0, 330.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let transform = GridTransform::at(DVec3::new(100.0, 200.0, 300.0));
+        let local = super::world_camera_to_grid_local(&camera, &transform);
+        // Basis must be bit-for-bit unchanged for the identity case.
+        assert_eq!(local.right, camera.right);
+        assert_eq!(local.down, camera.down);
+        assert_eq!(local.forward, camera.forward);
+        // Pos translates by `-origin`.
+        for (got, want) in local.pos.iter().zip([10.0, 20.0, 30.0].iter()) {
+            assert!((got - want).abs() < 1e-12, "pos got={got} want={want}");
+        }
+    }
+
+    /// 90° rotation about +Z: grid-local `+x` aligns with world `+y`.
+    /// World camera at `(0, 10, 0)` looking world `+y` lives in
+    /// grid-local at `(10, 0, 0)` looking grid-local `+x`.
+    #[test]
+    fn world_camera_to_grid_local_90deg_z_rotates_basis_and_pos() {
+        use glam::DQuat;
+        let camera = Camera {
+            pos: [0.0, 10.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let transform = GridTransform {
+            origin: DVec3::ZERO,
+            rotation: DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2),
+        };
+        let local = super::world_camera_to_grid_local(&camera, &transform);
+        // World +y == grid-local +x.
+        let approx_eq =
+            |a: [f64; 3], b: [f64; 3]| a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-9);
+        assert!(
+            approx_eq(local.pos, [10.0, 0.0, 0.0]),
+            "pos={:?} expected ~(10, 0, 0)",
+            local.pos
+        );
+        // World +x (right) maps to grid-local -y.
+        assert!(
+            approx_eq(local.right, [0.0, -1.0, 0.0]),
+            "right={:?} expected ~(0, -1, 0)",
+            local.right
+        );
+        // World +z (down) is unchanged — it's the rotation axis.
+        assert!(
+            approx_eq(local.down, [0.0, 0.0, 1.0]),
+            "down={:?} expected ~(0, 0, 1)",
+            local.down
+        );
+        // World +y (forward) maps to grid-local +x.
+        assert!(
+            approx_eq(local.forward, [1.0, 0.0, 0.0]),
+            "forward={:?} expected ~(1, 0, 0)",
+            local.forward
+        );
+    }
+
+    /// Basis orthonormality + handedness both survive the
+    /// inverse-rotation transform. Property: any unit-quaternion
+    /// conjugation preserves the input basis's orthonormality AND
+    /// its handedness (rotations are orientation-preserving).
+    #[test]
+    fn world_camera_to_grid_local_preserves_basis_orthonormality() {
+        use glam::DQuat;
+        // Right-handed voxlap basis (`right × down == forward`):
+        // looking +y, right = -x makes the cross product land on +y.
+        let camera = Camera {
+            pos: [3.0, -5.0, 7.0],
+            right: [-1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let transform = GridTransform {
+            origin: DVec3::new(1.0, 2.0, 3.0),
+            rotation: DQuat::from_axis_angle(glam::DVec3::new(0.3, 0.8, 0.5).normalize(), 0.7),
+        };
+        let local = super::world_camera_to_grid_local(&camera, &transform);
+        let r = DVec3::from_array(local.right);
+        let d = DVec3::from_array(local.down);
+        let f = DVec3::from_array(local.forward);
+        // Norms ≈ 1.
+        for v in [r, d, f] {
+            assert!(
+                (v.length_squared() - 1.0).abs() < 1e-12,
+                "basis vec {v:?} not unit length"
+            );
+        }
+        // Orthogonality.
+        assert!(r.dot(d).abs() < 1e-12, "right·down = {}", r.dot(d));
+        assert!(r.dot(f).abs() < 1e-12, "right·forward = {}", r.dot(f));
+        assert!(d.dot(f).abs() < 1e-12, "down·forward = {}", d.dot(f));
+        // Right-handed: right × down == forward (voxlap convention).
+        let cross = r.cross(d);
+        assert!(
+            (cross - f).length() < 1e-12,
+            "right×down={cross:?} forward={f:?}"
+        );
     }
 
     #[test]
