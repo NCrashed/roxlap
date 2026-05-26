@@ -676,6 +676,231 @@ fn bench_full_demo_render_fps() {
     );
 }
 
+/// User-reported "black wall around ship grid" at this pose.
+/// Mip ablation: m1 = no mip transitions, m4 = full 4-level mips
+/// (= the live demo's setting). If m1 renders clean and m4 shows
+/// the wall, it's a multi-mip regression on the ship grid.
+#[test]
+#[ignore = "diagnostic — builds full demo + dumps PPM at the bug pose"]
+fn dump_ship_black_wall_pose_m1() {
+    dump_ship_black_wall_pose_at_mip(1, 1024, "m1");
+}
+
+#[test]
+#[ignore = "diagnostic — builds full demo + dumps PPM at the bug pose"]
+fn dump_ship_black_wall_pose_m2() {
+    dump_ship_black_wall_pose_at_mip(2, 64, "m2");
+}
+
+#[test]
+#[ignore = "diagnostic — builds full demo + dumps PPM at the bug pose"]
+fn dump_ship_black_wall_pose_m3() {
+    dump_ship_black_wall_pose_at_mip(3, 64, "m3");
+}
+
+#[test]
+#[ignore = "diagnostic — builds full demo + dumps PPM at the bug pose"]
+fn dump_ship_black_wall_pose() {
+    dump_ship_black_wall_pose_at_mip(4, 64, "m4");
+}
+
+fn dump_ship_black_wall_pose_at_mip(mip_levels: u32, mip_scan_dist: i32, tag: &str) {
+    let mut sc = crate::scene::build_demo();
+    let cam = camera_for_yaw_pitch(
+        [
+            340.592_643_528_680_36,
+            536.579_685_026_495_7,
+            54.393_369_117_022_51,
+        ],
+        1.548_296_326_794_943_4,
+        0.282_499_999_999_991_65,
+    );
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = mip_levels;
+    settings.mip_scan_dist = mip_scan_dist;
+    settings.max_scan_dist = 512;
+    let _ = render_scene_composed(
+        &mut fb,
+        &mut zb,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut sc.scene,
+        &cam,
+        &settings,
+        sky,
+        None,
+    );
+    let n_pure_black = fb.iter().filter(|&&p| (p & 0x00_ff_ff_ff) == 0).count();
+    let path = format!("/tmp/ship_black_wall_pose_{tag}.ppm");
+    write_ppm(&path, &fb);
+    eprintln!("ship-black-wall-{tag}: pure-black pixels {n_pure_black}/{pixel_count} → {path}");
+}
+
+/// Variant 1: same pose with only the GROUND grid (no ship).
+/// If the black wall disappears, the bug is in the ship grid.
+#[test]
+#[ignore = "diagnostic — builds ground-only at ship bug pose"]
+fn dump_ship_black_wall_pose_ground_only() {
+    use roxlap_scene::{GridTransform, Scene};
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at(glam::DVec3::ZERO));
+    let grid = scene.grid_mut(id).expect("ground grid present");
+    crate::terrain::build_ground_extent(grid, 32, 32);
+    // No lighting bake — the bug is geometric, not shaded.
+    let cam = camera_for_yaw_pitch(
+        [
+            340.592_643_528_680_36,
+            536.579_685_026_495_7,
+            54.393_369_117_022_51,
+        ],
+        1.548_296_326_794_943_4,
+        0.282_499_999_999_991_65,
+    );
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    settings.max_scan_dist = 512;
+    let _ = render_scene_composed(
+        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+    );
+    let n_pure_black = fb.iter().filter(|&&p| (p & 0x00_ff_ff_ff) == 0).count();
+    write_ppm("/tmp/ship_black_wall_pose_ground_only.ppm", &fb);
+    eprintln!("ground-only: pure-black pixels {n_pure_black}/{pixel_count}");
+}
+
+/// Regression: OOB-XY camera at the ship-only mip-N render path
+/// used to paint a 388k-pixel BLACK WALL around the saucer
+/// (user-reported 2026-05-26). Root cause: `phase_remiporend`
+/// reloaded `state.column` from the seed chunk's column_offsets
+/// without checking `current_chunk_exists`. For OOB-XY cameras
+/// the unbounded `wrapping_add_signed` of `ixy_sptr_col_idx`
+/// across OOB chunks would eventually land in a DEEPER mip's
+/// sub-table (= read 4-byte voxel records past the actual slab,
+/// producing RGB=0 voxel records the bedrock-z guard couldn't
+/// catch because the z byte didn't match `0xff >> gmipcnt`).
+/// Fix: gate the column reload on `current_chunk_exists`.
+#[test]
+#[ignore = "expensive: builds the 4×6 ship + lighting bake + 6 mips (~1 s)"]
+fn dump_ship_black_wall_pose_ship_only_mips() {
+    use roxlap_scene::{GridTransform, Scene};
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at(glam::DVec3::new(0.0, 500.0, -100.0)));
+    let grid = scene.grid_mut(id).expect("ship grid present");
+    crate::ship::build_ship(grid);
+    crate::scene::bake_lightmode_1_pub(&mut scene);
+    let cam = camera_for_yaw_pitch(
+        [
+            340.592_643_528_680_36,
+            536.579_685_026_495_7,
+            54.393_369_117_022_51,
+        ],
+        1.548_296_326_794_943_4,
+        0.282_499_999_999_991_65,
+    );
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    settings.max_scan_dist = 512;
+    let _ = render_scene_composed(
+        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+    );
+    let n_pure_black = fb.iter().filter(|&&p| (p & 0x00_ff_ff_ff) == 0).count();
+    write_ppm("/tmp/ship_black_wall_pose_ship_only_mips.ppm", &fb);
+    eprintln!("ship-only-mips: pure-black pixels {n_pure_black}/{pixel_count}");
+    // Pre-fix: 388_130 pure-black pixels at this pose. The ship hull
+    // is gray, accent orange, bridge blue — no legitimate pure-RGB-0
+    // pixels exist; anything > a handful is a regression.
+    assert!(
+        n_pure_black < 100,
+        "ship-only-mips at OOB-XY camera pose painted {n_pure_black} pure-black pixels — phase_remiporend column-reload regression (was 388k pre-fix)"
+    );
+}
+
+/// Variant 2: same pose with only the SHIP grid (no ground).
+/// Isolates the ship-grid render path.
+#[test]
+#[ignore = "diagnostic — builds ship-only at ship bug pose"]
+fn dump_ship_black_wall_pose_ship_only() {
+    use roxlap_scene::{GridTransform, Scene};
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at(glam::DVec3::new(0.0, 500.0, -100.0)));
+    let grid = scene.grid_mut(id).expect("ship grid present");
+    crate::ship::build_ship(grid);
+    let cam = camera_for_yaw_pitch(
+        [
+            340.592_643_528_680_36,
+            536.579_685_026_495_7,
+            54.393_369_117_022_51,
+        ],
+        1.548_296_326_794_943_4,
+        0.282_499_999_999_991_65,
+    );
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 64;
+    settings.max_scan_dist = 512;
+    let _ = render_scene_composed(
+        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+    );
+    let n_pure_black = fb.iter().filter(|&&p| (p & 0x00_ff_ff_ff) == 0).count();
+    write_ppm("/tmp/ship_black_wall_pose_ship_only.ppm", &fb);
+    eprintln!("ship-only: pure-black pixels {n_pure_black}/{pixel_count}");
+}
+
 /// Convenience: dump the bug-pose's framebuffer to `/tmp/` for
 /// quick visual inspection. Useful if S4 (cross-chunk gline) or
 /// S5 (rotation) regress the OOB-XY render path.

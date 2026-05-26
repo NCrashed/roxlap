@@ -2323,7 +2323,20 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     // Voxlap5.c:12112-12113 — reload `state.column` from the new
     // column. Malformed offsets fall back to an empty slice
     // (matches `camera_column_slice`'s defensive posture).
-    if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
+    //
+    // Multi-chunk: only reload from the active chunk when one
+    // exists. For OOB-XY chunks the column-step path has already
+    // set `state.column = &[]`; without this guard, remiporend
+    // would resurrect the column by indexing into the SEED chunk's
+    // mip sub-table (whose `ixy_sptr_col_idx` is meaningless after
+    // the unbounded `wrapping_add_signed` march through OOB chunks).
+    // The march can land in a DEEPER mip's sub-table — read as
+    // garbage RGB-0 voxels at gmipcnt-1 z values. Manifested as the
+    // 388k-pixel BLACK WALL around the ship at OOB-XY camera
+    // (user-reported 2026-05-26).
+    if !state.current_chunk_exists {
+        state.column = &[];
+    } else if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
         let col_off = col_off as usize;
         state.column = state.slab_buf.get(col_off..).unwrap_or(&[]);
     }
