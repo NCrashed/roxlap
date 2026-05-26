@@ -136,15 +136,29 @@ pub struct Grid {
     /// Sparse chunk storage keyed by `(chx, chy, chz)` chunk
     /// coordinates. A missing entry means the chunk is fully air.
     pub chunks: HashMap<IVec3, Vxl>,
+    /// Whether sky pixels rendered for this grid should be
+    /// composited into the final framebuffer. `true` is the
+    /// historical "grid owns its own sky" behaviour: ray misses
+    /// inside this grid's frustum paint sky_color into the temp
+    /// buffer. Set `false` for grids that are a foreground object
+    /// (e.g. a ship) — the sky is owned by a single "world" grid
+    /// (the ground) and other grids should not contribute sky
+    /// pixels, otherwise their grid-local-frame sky lookup
+    /// rotates with the grid and visibly fights the world's sky
+    /// during compose. See [`crate::render::render_scene_composed`]
+    /// for the masking implementation.
+    pub render_sky: bool,
 }
 
 impl Grid {
-    /// New empty grid at the given transform — no chunks populated.
+    /// New empty grid at the given transform — no chunks populated,
+    /// `render_sky = true`.
     #[must_use]
     pub fn new(transform: GridTransform) -> Self {
         Self {
             transform,
             chunks: HashMap::new(),
+            render_sky: true,
         }
     }
 }

@@ -77,7 +77,20 @@ pub fn build_demo() -> SceneAndCamera {
     }
 
     let ship_id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 500.0, -100.0)));
-    ship::build_ship(scene.grid_mut(ship_id).expect("ship grid present"));
+    {
+        let ship = scene.grid_mut(ship_id).expect("ship grid present");
+        ship::build_ship(ship);
+        // S5.2-followup: with the ship rotating each frame, its
+        // grid-local sky lookup rotates with it. Leaving the ship's
+        // sky on lets per-pixel min-z noise between the ground's
+        // sky-z and the ship's sky-z (which differ because the ray
+        // basis differs once rotation is applied) allow some of the
+        // ship's rotated sky panorama to bleed into the composed
+        // framebuffer. Disabling sky for the ship grid masks those
+        // pixels via [`render::SKY_MASK_SENTINEL`] so only the
+        // ground grid contributes the sky panorama.
+        ship.render_sky = false;
+    }
 
     // Bake lightmode-1 directional shading into every chunk's slab
     // alpha bytes. Pure surface-normal-based gradient — voxlap's

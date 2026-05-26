@@ -306,14 +306,19 @@ impl App {
                 &self.scene.camera,
                 self.scene.yaw,
                 self.scene.pitch,
+                self.scene.ship_angles,
+                self.scene.spin_enabled,
             ) {
                 Ok(()) => eprintln!(
-                    "captured: roxlap-scene-capture.txt + .ppm (pos=({:.2}, {:.2}, {:.2}) yaw={:.4} pitch={:.4})",
+                    "captured: roxlap-scene-capture.txt + .ppm (pos=({:.2}, {:.2}, {:.2}) yaw={:.4} pitch={:.4} ship=[{:.3}, {:.3}, {:.3}])",
                     self.scene.cam_pos[0],
                     self.scene.cam_pos[1],
                     self.scene.cam_pos[2],
                     self.scene.yaw,
                     self.scene.pitch,
+                    self.scene.ship_angles[0],
+                    self.scene.ship_angles[1],
+                    self.scene.ship_angles[2],
                 ),
                 Err(e) => eprintln!("capture failed: {e}"),
             }
@@ -517,6 +522,8 @@ fn write_capture(
     cam: &roxlap_core::Camera,
     yaw: f64,
     pitch: f64,
+    ship_angles: [f64; 3],
+    spin_enabled: bool,
 ) -> std::io::Result<()> {
     use std::io::Write;
     let txt = format!(
@@ -531,7 +538,14 @@ fn write_capture(
          # Camera basis at the time of capture (host yaw/pitch convention):\n\
          right = [{}, {}, {}]\n\
          down = [{}, {}, {}]\n\
-         forward = [{}, {}, {}]\n",
+         forward = [{}, {}, {}]\n\
+         # Ship grid rotation at the time of capture (S5.2). Reproduce by\n\
+         # setting ship_angles[0..3] before render and setting\n\
+         # spin_enabled = false (so the angles don't advance further).\n\
+         ship_angle.x = {}\n\
+         ship_angle.y = {}\n\
+         ship_angle.z = {}\n\
+         ship_spin_enabled = {}\n",
         cam.pos[0],
         cam.pos[1],
         cam.pos[2],
@@ -546,6 +560,10 @@ fn write_capture(
         cam.forward[0],
         cam.forward[1],
         cam.forward[2],
+        ship_angles[0],
+        ship_angles[1],
+        ship_angles[2],
+        spin_enabled,
     );
     std::fs::write("roxlap-scene-capture.txt", txt)?;
 

@@ -45,6 +45,22 @@ use roxlap_core::Camera;
 
 use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
 
+/// Sentinel colour stamped into a `render_sky = false` grid's
+/// temporary framebuffer wherever the rasterizer would have drawn
+/// sky. After opticast, [`render_scene_composed`] walks the temp
+/// buffer and resets `temp_zb` to [`f32::INFINITY`] for any pixel
+/// still carrying this value — those pixels then always lose
+/// [`compose_into`]'s min-z test and the underlying grid's sky
+/// (or another grid's hit) wins.
+///
+/// Alpha byte is `0x00`. Voxlap voxel slabs carry an alpha-encoded
+/// shade in `[0x00, 0x80]`, but a `0x00` alpha **with this exact
+/// RGB pattern** is exceedingly unlikely to occur on a real hit
+/// (the lit-voxel path produces alpha ≥ 0x40 in practice). Bit
+/// pattern is also visually distinct (cyan-ish neon) if anything
+/// ever leaks through to the screen, making the bug obvious.
+const SKY_MASK_SENTINEL: u32 = 0x00_DE_AD_BE;
+
 /// Project a world-space [`Camera`] into a grid's local frame:
 /// translate by `-transform.origin`, then apply
 /// `transform.rotation.inverse()` to the position and the
@@ -245,12 +261,6 @@ pub fn render_scene_composed(
     let mut temp_zb = vec![f32::INFINITY; pixel_count];
 
     for (_id, grid) in scene.grids_mut() {
-        // Reset temp to sky / INFINITY so each grid starts fresh.
-        // The reset cost is O(pixels) per grid; for small grid counts
-        // this is negligible vs the opticast work.
-        temp_fb.fill(sky_color);
-        temp_zb.fill(f32::INFINITY);
-
         // S4B.2.e: Approach B render path. See `render_scene`'s
         // body for the camera transform + ChunkGrid construction
         // commentary; the only difference is this writes to
@@ -259,6 +269,37 @@ pub fn render_scene_composed(
         let Some(backing) = grid.chunk_xyz_backing() else {
             continue;
         };
+        // S5.2-followup: per-grid sky opt-out. Grids with
+        // `render_sky = false` (e.g. a rotating ship) must not
+        // contribute sky pixels — the grid-local sky lookup
+        // rotates with the grid and visibly fights the world's
+        // sky during compose. Implementation: stamp a sentinel
+        // colour into temp_fb everywhere the rasterizer would
+        // paint sky, then walk the buffer post-opticast and
+        // mark sentinel pixels as `INFINITY` in temp_zb so
+        // [`compose_into`]'s min-z test always drops them.
+        let owns_sky = grid.render_sky;
+        let local_sky_color = if owns_sky {
+            sky_color
+        } else {
+            SKY_MASK_SENTINEL
+        };
+        if !owns_sky {
+            // Override the pool's skycast colour just for this
+            // grid so the solid-fill sky path stamps the sentinel.
+            // Restored after the grid's compose. `dist = 0` mirrors
+            // the caller's typical setup; the rasterizer's prelude
+            // overwrites the dist field with `gxmax` or `i32::MAX`
+            // anyway, so the dist arg is cosmetic here.
+            pool.set_skycast(SKY_MASK_SENTINEL as i32, 0);
+        }
+
+        // Reset temp to sky / INFINITY so each grid starts fresh.
+        // The reset cost is O(pixels) per grid; for small grid counts
+        // this is negligible vs the opticast work.
+        temp_fb.fill(local_sky_color);
+        temp_zb.fill(f32::INFINITY);
+
         let local_cam = world_camera_to_grid_local(camera, &grid.transform);
         let cg = roxlap_core::ChunkGrid {
             chunks: &backing.chunks,
@@ -273,11 +314,31 @@ pub fn render_scene_composed(
         let outcome = {
             let mut rasterizer =
                 ScalarRasterizer::new(&mut temp_fb, &mut temp_zb, pitch_pixels, grid_view);
-            if let Some(sky_ref) = sky {
-                rasterizer = rasterizer.with_sky(sky_ref);
+            // Sky texture is suppressed for `!owns_sky` grids so
+            // the textured-sky branch doesn't bypass the sentinel;
+            // only the solid-fill path stamps `skycast.col`.
+            if owns_sky {
+                if let Some(sky_ref) = sky {
+                    rasterizer = rasterizer.with_sky(sky_ref);
+                }
             }
             opticast(&mut rasterizer, pool, &local_cam, settings, grid_view)
         };
+
+        if !owns_sky {
+            // Mask sentinel pixels so compose drops them. One linear
+            // sweep of the temp framebuffer; sentinel pixels become
+            // `INFINITY` in temp_zb (= always lose min-z).
+            for (px, z) in temp_fb.iter().zip(temp_zb.iter_mut()) {
+                if *px == SKY_MASK_SENTINEL {
+                    *z = f32::INFINITY;
+                }
+            }
+            // Restore the pool's sky colour so subsequent grids
+            // (and the next frame) see the caller's value.
+            pool.set_skycast(sky_color as i32, 0);
+        }
+
         if outcome == OpticastOutcome::Rendered {
             compose_into(fb, zb, &temp_fb, &temp_zb);
             grids_drawn += 1;
@@ -627,6 +688,134 @@ mod tests {
         assert!(
             marker_count > 50,
             "45°-rotated marker box should be visible — got {marker_count} marker pixels"
+        );
+    }
+
+    // ---- S5.2-followup: per-grid render_sky opt-out ----
+
+    /// Two-grid scene where grid B sits behind grid A along +y;
+    /// grid A is opaque only in the centre of the framebuffer, so
+    /// the camera's view through grid A is mostly "ray miss". When
+    /// `A.render_sky = false`, the pixels around A's silhouette
+    /// must remain whatever grid B (or the shared pre-fill)
+    /// painted — NOT A's grid-local sky colour. This pins the
+    /// sentinel-mask path: without it, A's sky would write into
+    /// the composed framebuffer wherever its sky-z happened to win
+    /// the min-z race with B's sky-z.
+    #[test]
+    fn render_sky_false_drops_grid_sky_pixels() {
+        use crate::{GridId, GridTransform};
+
+        // Grid B (far, sky owner) — a wide floor of distinct
+        // colour spanning chunk-local x/y so most rays land on it.
+        let mut scene = Scene::new();
+        let _b_id: GridId = scene.add_grid(GridTransform::at(DVec3::new(0.0, 600.0, 0.0)));
+        // Find grid B's id (HashMap iteration; we only just added
+        // one grid, so its id is whichever the iterator yields).
+        let b_id = scene.grids().next().unwrap().0;
+        scene.grid_mut(b_id).unwrap().set_rect(
+            IVec3::new(0, 0, 100),
+            IVec3::new(127, 127, 110),
+            Some(0x80_22_88_22), // green floor
+        );
+
+        // Grid A (near, sky disabled) — a SMALL marker box that
+        // covers only a fraction of the screen. Most pixels of A's
+        // local render are sky.
+        let a_id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 200.0, 0.0)));
+        scene.grid_mut(a_id).unwrap().set_rect(
+            IVec3::new(60, 60, 60),
+            IVec3::new(67, 67, 67),
+            Some(0x80_aa_22_22), // red cube
+        );
+        scene.grid_mut(a_id).unwrap().render_sky = false;
+
+        let unique_sky: u32 = 0xFF_AB_CD_EF;
+        let (_engine, mut pool, _) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![unique_sky; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let camera = camera_at([64.0, 0.0, 100.0]);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            unique_sky,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 2 });
+
+        // The sentinel must never appear in the composed output —
+        // every sentinel pixel must have been masked out before
+        // compose. If any leak through, the test catches it.
+        let leaked = fb
+            .iter()
+            .filter(|&&p| p == super::SKY_MASK_SENTINEL)
+            .count();
+        assert_eq!(
+            leaked, 0,
+            "SKY_MASK_SENTINEL leaked into composed framebuffer ({leaked} pixels)"
+        );
+        // Grid A's hit (red cube) must still render — render_sky=false
+        // only affects sky pixels, not hits.
+        let red_count = fb.iter().filter(|&&p| p == 0x80_aa_22_22).count();
+        assert!(
+            red_count > 0,
+            "red cube from sky-disabled grid A is missing — render_sky=false should only mask sky"
+        );
+        // Grid B's floor must be visible past grid A's silhouette
+        // (the sky-disabled grid doesn't hide B's render).
+        let green_count = fb.iter().filter(|&&p| p == 0x80_22_88_22).count();
+        assert!(
+            green_count > 0,
+            "grid B's floor invisible — grid A's masked sky may have overwritten it"
+        );
+    }
+
+    /// Identity-rotation, single-grid scene with `render_sky = false`
+    /// must produce a sentinel-free framebuffer. Sanity test for the
+    /// trivial 1-grid case (no second grid to compose against).
+    #[test]
+    fn render_sky_false_single_grid_no_sentinel_leak() {
+        let (mut scene, id, _) = build_one_grid_marker_scene(GridTransform::identity());
+        scene.grid_mut(id).unwrap().render_sky = false;
+        let unique_sky: u32 = 0xFF_12_34_56;
+        let (_engine, mut pool, _) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![unique_sky; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let camera = camera_at([64.0, 0.0, 64.0]);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            unique_sky,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let leaked = fb
+            .iter()
+            .filter(|&&p| p == super::SKY_MASK_SENTINEL)
+            .count();
+        assert_eq!(leaked, 0, "SKY_MASK_SENTINEL leaked ({leaked} pixels)");
+        // Pixels that would have been the grid's sky now show
+        // through to the pre-fill (unique_sky).
+        let prefill_count = fb.iter().filter(|&&p| p == unique_sky).count();
+        assert!(
+            prefill_count > 0,
+            "no pre-fill pixels survived — render_sky=false should leave non-hit pixels untouched"
         );
     }
 
