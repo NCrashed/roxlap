@@ -796,6 +796,94 @@ fn dump_ship_black_wall_pose_ground_only() {
     eprintln!("ground-only: pure-black pixels {n_pure_black}/{pixel_count}");
 }
 
+/// Regression: when the camera floats high enough above an unstacked
+/// ground grid that `li_pos[2] / chunk_size_z < 0` (= camera_chunk_idx[2]
+/// goes negative), `camera_chunk_air_gap` returned None and opticast
+/// SKIPPED the whole grid. User-reported 2026-05-26 at camera pose
+/// `(417.85, 101.06, -11.52)` — green hills disappeared once the
+/// camera flew above world z=0.
+///
+/// 2-chunk-XY ground keeps the build fast; the bug repros with any
+/// ground grid since the trigger is just camera z<0.
+#[test]
+fn camera_above_unstacked_ground_renders() {
+    use roxlap_scene::{GridTransform, Scene};
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at(glam::DVec3::ZERO));
+    let grid = scene.grid_mut(id).expect("ground grid present");
+    crate::terrain::build_ground_extent(grid, 2, 2);
+
+    // Camera at world z=-12 (1 voxel above world top, in chunk z=-1
+    // for chunk_size_z=256). 2x2 ground centers chunks at chx,chy ∈
+    // [-1, 1) (world x,y ∈ [-128, 128)), so place the camera at
+    // (0, 0) to keep it IN-bounds-XY. Pitched ~60° down to see
+    // terrain.
+    let cam = camera_for_yaw_pitch([0.0, 0.0, -12.0], 0.0, 1.0);
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 2 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    let _ = render_scene_composed(
+        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+    );
+    let non_sky = fb.iter().filter(|&&p| p != sky).count();
+    eprintln!("camera_above_unstacked_ground: {non_sky}/{pixel_count} non-sky");
+    // Camera looking straight down at terrain — at least 10% of the
+    // frame should be terrain. Pre-fix: entire frame was sky because
+    // camera_chunk_air_gap returned None for chz=-1.
+    assert!(
+        non_sky > pixel_count / 10,
+        "camera above unstacked ground rendered only {non_sky} non-sky pixels (= entire grid was skipped)"
+    );
+}
+
+/// Variant: camera ABOVE multi-chunk ground at a position similar to
+/// the user-reported pose (~chunk (3, 0) for a centered 4×4 ground).
+/// Exercises both the seed-side clamp in `camera_chunk_air_gap` and
+/// the column-step-side clamp in `scalar_rasterizer.rs`.
+#[test]
+fn camera_above_multi_chunk_ground_renders() {
+    use roxlap_scene::{GridTransform, Scene};
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at(glam::DVec3::ZERO));
+    let grid = scene.grid_mut(id).expect("ground grid present");
+    crate::terrain::build_ground_extent(grid, 4, 4);
+
+    // 4x4 ground covers world x,y ∈ [-256, 256). Camera at (200, 50)
+    // sits in chunk (1, 0, ?) — in-bounds-XY and a chunk crossing
+    // away from the center. World z=-12 puts it in chunk-z=-1.
+    let cam = camera_for_yaw_pitch([200.0, 50.0, -12.0], 2.1, 1.05);
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 4 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    pool.set_treat_z_max_as_air(true);
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    let _ = render_scene_composed(
+        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+    );
+    let non_sky = fb.iter().filter(|&&p| p != sky).count();
+    eprintln!("camera_above_multi_chunk_ground: {non_sky}/{pixel_count} non-sky");
+    assert!(
+        non_sky > pixel_count / 10,
+        "camera above multi-chunk ground rendered only {non_sky} non-sky pixels"
+    );
+}
+
 /// Regression: OOB-XY camera at the ship-only mip-N render path
 /// used to paint a 388k-pixel BLACK WALL around the saucer
 /// (user-reported 2026-05-26). Root cause: `phase_remiporend`

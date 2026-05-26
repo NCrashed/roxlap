@@ -184,7 +184,16 @@ pub fn camera_chunk_air_gap(
     // and there's a chunk below it. Each iteration after the first
     // re-queries the air gap with `cz_local = 0` (camera is "above"
     // that chunk for the purposes of the air-gap walk).
-    let mut chz = camera_chz;
+    //
+    // Camera ABOVE the grid (`camera_chz < origin_chunk_z`, world
+    // z<0 in voxlap z-down) clamps to the top chunk. The loop's
+    // `chz != camera_chz` branch then runs `camera_column_air_gap`
+    // with `cz_local = -1` (S4B.6.j trick — "above the column"),
+    // synthesising the right air-gap seed. Without this clamp,
+    // `grid.chunk_at_xyz` for chz<origin_chunk_z returns None and
+    // opticast SKIPS the whole grid — user-reported 2026-05-26 as
+    // "green hills disappear when camera flies high enough".
+    let mut chz = camera_chz.max(origin_chunk_z);
     let mut z0_world: Option<i32> = None;
     loop {
         let chunk = grid.chunk_at_xyz([
