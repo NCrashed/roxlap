@@ -9,10 +9,21 @@ use glam::{DQuat, DVec3, IVec3};
 use roxlap_core::Camera;
 use roxlap_scene::{Grid, GridId, GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
-/// Angular velocity (rad/s) of the ship grid when `R` toggles spin
-/// on. Picked low enough to read as "slow majestic UFO spin"
-/// rather than disorienting blur — one rotation every ~21 seconds.
-pub const SHIP_SPIN_RATE: f64 = 0.3;
+/// Angular velocity (rad/s) of the ship grid's Z-axis spin when
+/// `R` toggles spin on. Z is voxlap's vertical (down) axis — this
+/// is the "UFO spinning on its own axis" yaw. Picked low enough to
+/// read as "slow majestic spin" rather than disorienting blur —
+/// ~21 s per full revolution.
+pub const SHIP_SPIN_RATE_Z: f64 = 0.3;
+
+/// Angular velocity (rad/s) of the X-axis + Y-axis spins. Half the
+/// Z rate so the ship tumbles slowly enough to read each pose
+/// distinctly. The X+Y rotations are the real voxel-raycasting
+/// stress test: non-axis-aligned rays through a chunk grid that's
+/// continuously tilting on its horizontal axes exercise paths
+/// (mip-N column-step, cross-chunk DDA, cf-narrowing at unusual
+/// orientations) that the Z-only spin doesn't touch.
+pub const SHIP_SPIN_RATE_XY: f64 = 0.15;
 
 use crate::{ship, terrain};
 
@@ -94,7 +105,7 @@ pub fn build_demo() -> SceneAndCamera {
         yaw: initial_yaw,
         pitch: initial_pitch,
         ship_id,
-        ship_angle: 0.0,
+        ship_angles: [0.0; 3],
         spin_enabled: false,
     }
 }
@@ -118,13 +129,14 @@ pub struct SceneAndCamera {
     /// update its [`GridTransform::rotation`] without re-iterating
     /// the scene.
     pub ship_id: GridId,
-    /// Current ship rotation angle around grid-local Z (radians).
-    /// Tracked as f64 so the quaternion is rebuilt from absolute
-    /// angle each frame, avoiding the slow drift that an
-    /// incremental quat multiply would accumulate.
-    pub ship_angle: f64,
+    /// Current ship rotation angles around grid-local X / Y / Z
+    /// (radians). Tracked as f64 so the quaternion is rebuilt from
+    /// absolute angles each frame, avoiding the slow drift that
+    /// an incremental quat multiply would accumulate. Order:
+    /// `[x, y, z]`.
+    pub ship_angles: [f64; 3],
     /// `R` toggles this; `false` freezes the ship at its current
-    /// `ship_angle` (lighting bake stays as-is — see S5.3).
+    /// `ship_angles` (lighting bake stays as-is — see S5.3).
     pub spin_enabled: bool,
 }
 
@@ -137,26 +149,46 @@ impl SceneAndCamera {
 
     /// S5.2: advance the ship grid's rotation by `dt` seconds.
     /// No-op when `spin_enabled` is `false`. Rebuilds the
-    /// quaternion from the absolute angle each frame so f64 angle
+    /// quaternion from the absolute angles each frame so f64
     /// arithmetic stays the source of truth — incremental quat
     /// multiplication would drift over thousands of frames.
+    ///
+    /// Three independent axes:
+    /// - X: `SHIP_SPIN_RATE_XY` rad/s — tilts the saucer
+    ///   forward/back.
+    /// - Y: `SHIP_SPIN_RATE_XY` rad/s — rolls the saucer
+    ///   side-to-side.
+    /// - Z: `SHIP_SPIN_RATE_Z` rad/s — the "UFO yaw" (vertical
+    ///   axis, voxlap z-down).
+    ///
+    /// X and Y at half the Z rate gives a slow tumbling motion
+    /// that's the real voxel-raycasting correctness stress: each
+    /// frame the rasterizer sees rays through a chunk grid at a
+    /// non-axis-aligned, continuously-changing orientation.
+    /// Composition order: `R_z · R_y · R_x` (X applied first to
+    /// any grid-local vector, then Y, then Z).
     pub fn tick_ship_spin(&mut self, dt: f64) {
         if !self.spin_enabled {
             return;
         }
-        self.ship_angle += SHIP_SPIN_RATE * dt;
-        // Wrap into [0, 2π) to keep the f64 angle bounded; visually
-        // identical, but stops it from quietly growing into the
-        // billions over a long session.
+        let rates = [SHIP_SPIN_RATE_XY, SHIP_SPIN_RATE_XY, SHIP_SPIN_RATE_Z];
         let two_pi = std::f64::consts::TAU;
-        if self.ship_angle >= two_pi {
-            self.ship_angle -= two_pi;
+        for (angle, rate) in self.ship_angles.iter_mut().zip(rates.iter()) {
+            *angle += rate * dt;
+            // Wrap into [0, 2π) so the f64 stays bounded over a
+            // long session. Visually identical.
+            if *angle >= two_pi {
+                *angle -= two_pi;
+            }
         }
+        let qx = DQuat::from_rotation_x(self.ship_angles[0]);
+        let qy = DQuat::from_rotation_y(self.ship_angles[1]);
+        let qz = DQuat::from_rotation_z(self.ship_angles[2]);
         let ship = self
             .scene
             .grid_mut(self.ship_id)
             .expect("ship grid registered");
-        ship.transform.rotation = DQuat::from_rotation_z(self.ship_angle);
+        ship.transform.rotation = qz * qy * qx;
     }
 }
 
