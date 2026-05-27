@@ -311,6 +311,26 @@ pub fn render_scene_composed(
         };
         let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
 
+        // S5.2-followup: per-grid mip-levels override. Small grids
+        // (e.g. a rotating ship) hit the axis-aligned cf-cancellation
+        // multi-mip artifact (see
+        // `[[project_axis_aligned_mip_beams]]`) when the rotation
+        // creates near-axis-aligned rays through deep mips. Capping
+        // mip_levels=1 for these grids costs negligible perf
+        // (their world footprint is small) and avoids the artifact.
+        let per_grid_settings;
+        let active_settings = match grid.mip_levels_override {
+            Some(cap) => {
+                let clamped = cap.clamp(1, settings.mip_levels);
+                per_grid_settings = OpticastSettings {
+                    mip_levels: clamped,
+                    ..*settings
+                };
+                &per_grid_settings
+            }
+            None => settings,
+        };
+
         let outcome = {
             let mut rasterizer =
                 ScalarRasterizer::new(&mut temp_fb, &mut temp_zb, pitch_pixels, grid_view);
@@ -322,7 +342,13 @@ pub fn render_scene_composed(
                     rasterizer = rasterizer.with_sky(sky_ref);
                 }
             }
-            opticast(&mut rasterizer, pool, &local_cam, settings, grid_view)
+            opticast(
+                &mut rasterizer,
+                pool,
+                &local_cam,
+                active_settings,
+                grid_view,
+            )
         };
 
         if !owns_sky {

@@ -148,6 +148,16 @@ pub struct Grid {
     /// during compose. See [`crate::render::render_scene_composed`]
     /// for the masking implementation.
     pub render_sky: bool,
+    /// Override [`roxlap_core::opticast::OpticastSettings::mip_levels`]
+    /// for this grid. `None` ⇒ use the caller's value. `Some(n)`
+    /// ⇒ cap at `n` (clamped to `[1, settings.mip_levels]`). Use
+    /// to disable multi-mip on a per-grid basis — small grids
+    /// (rotating ships, billboards) don't benefit from deep mips
+    /// and CAN trigger the
+    /// `[[project_axis_aligned_mip_beams]]`-style cf-cancellation
+    /// artifact when near-axis-aligned rays hit the rotated grid.
+    /// `Some(1)` = mip-0 only, byte-stable to single-mip.
+    pub mip_levels_override: Option<u32>,
 }
 
 impl Grid {
@@ -159,6 +169,7 @@ impl Grid {
             transform,
             chunks: HashMap::new(),
             render_sky: true,
+            mip_levels_override: None,
         }
     }
 }

@@ -76,6 +76,12 @@ const MOVE_SPEED: f64 = 64.0;
 /// the roxlap-host demo ships.
 const SKY_PNG: &[u8] = include_bytes!("../../../assets/sky.png");
 
+/// Re-export of [`SKY_PNG`] under a stable name for the
+/// `#[cfg(test)]` `repro` module to load the demo's sky panorama
+/// without duplicating the bytes include.
+#[cfg(test)]
+pub(crate) const SKY_PNG_BYTES: &[u8] = SKY_PNG;
+
 /// Decode a PNG byte slice into a `roxlap_core::sky::Sky`.
 ///
 /// Voxlap's sky-mapping convention: **texture width = elevation
@@ -84,7 +90,7 @@ const SKY_PNG: &[u8] = include_bytes!("../../../assets/sky.png");
 /// are usually laid out the other way (width=azimuth,
 /// height=elevation), so `Sky::from_pixels` re-interprets the
 /// dimensions accordingly. Mirror of roxlap-host's helper.
-fn load_png_sky(png_bytes: &[u8]) -> Result<roxlap_core::sky::Sky, String> {
+pub(crate) fn load_png_sky(png_bytes: &[u8]) -> Result<roxlap_core::sky::Sky, String> {
     let decoder = png::Decoder::new(png_bytes);
     let mut reader = decoder
         .read_info()

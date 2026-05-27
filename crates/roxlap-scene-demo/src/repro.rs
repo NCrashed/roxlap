@@ -2115,3 +2115,233 @@ fn ship_grey_screen_at_captured_pose() {
         SHIP_GREY_SHIP_ANGLES,
     );
 }
+
+/// Third user-captured pose (2026-05-27 follow-up #2): thin
+/// "fake-column" glitch line to the left of the rotating ship.
+/// User confirmed the streak originates from the ship grid (it's
+/// rare and consistent when toggling spin; ground produces them
+/// rarely too).
+/// ```text
+/// pos    = (82.75, 38.60, 38.58)
+/// yaw    = 1.7808 rad
+/// pitch  = -0.2600 rad
+/// ship   = [5.432, 5.432, 4.581]
+/// ```
+const SHIP_GLITCH_CAM_POS: [f64; 3] = [82.75, 38.60, 38.58];
+const SHIP_GLITCH_YAW: f64 = 1.7808;
+const SHIP_GLITCH_PITCH: f64 = -0.2600;
+const SHIP_GLITCH_SHIP_ANGLES: [f64; 3] = [5.432, 5.432, 4.581];
+
+/// Pin the "fake-column glitch line" pose — FULL demo (ground +
+/// ship). The user's capture shows a thin vertical streak of
+/// dark pixels in the sky region near the saucer's upper-left
+/// silhouette. Ship-only at the same pose renders cleanly, so
+/// the artifact requires the ground + ship compose path.
+#[test]
+#[ignore = "diagnostic: dumps PPM for the fake-column artifact pose; full-demo build (~15s)"]
+fn ship_fake_column_glitch_diag() {
+    let cam = camera_for_yaw_pitch(SHIP_GLITCH_CAM_POS, SHIP_GLITCH_YAW, SHIP_GLITCH_PITCH);
+
+    let engine = Engine::new();
+    // Match the live demo: 4-thread strip-parallel pool. R12.3.1's
+    // per-strip rendering produces slightly different pixels at
+    // strip boundaries than single-strip, so the artifact may be
+    // strip-edge specific.
+    let mut pool = ScratchPool::new_parallel(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY, 4);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    // Bisect: single-mip first to test the multi-mip hypothesis.
+    let try_single_mip = false;
+    if try_single_mip {
+        settings.mip_levels = 1;
+        settings.mip_scan_dist = 4;
+    } else {
+        settings.mip_levels = 4;
+        settings.mip_scan_dist = 128;
+    }
+    settings.max_scan_dist = 1500;
+
+    let pixel_count = (W as usize) * (H as usize);
+    // Full demo scene = ground + ship, exactly like the live demo.
+    let mut scene_and_camera = crate::scene::build_demo();
+    // Apply the captured ship rotation. Toggle to IDENTITY to test
+    // whether the streak is rotation-dependent.
+    let ship_id = scene_and_camera.ship_id;
+    let try_identity_rotation = false;
+    let angles = if try_identity_rotation {
+        [0.0; 3]
+    } else {
+        SHIP_GLITCH_SHIP_ANGLES
+    };
+    use glam::DQuat;
+    let qx = DQuat::from_rotation_x(angles[0]);
+    let qy = DQuat::from_rotation_y(angles[1]);
+    let qz = DQuat::from_rotation_z(angles[2]);
+    scene_and_camera
+        .scene
+        .grid_mut(ship_id)
+        .expect("ship grid")
+        .transform
+        .rotation = qz * qy * qx;
+    // Bisect controls (toggle one at a time):
+    // - keep_ship_sky=true: ship's own (rotated) textured sky composites; streak less visible.
+    // - mip_levels=1: single-mip; tests whether multi-mip is the source.
+    // - ship_id rotation set to IDENTITY: tests whether the streak is rotation-dependent.
+    let keep_ship_sky = false; // false = use sentinel mask (default demo behaviour).
+    if keep_ship_sky {
+        scene_and_camera
+            .scene
+            .grid_mut(ship_id)
+            .expect("ship grid")
+            .render_sky = true;
+    }
+
+    // Load the textured-sky panorama from the embedded PNG so this
+    // test renders the same sky path as the live demo (the
+    // artifact only manifests with the textured-sky branch).
+    let mut engine_with_sky = Engine::new();
+    if let Ok(sky_tex) = crate::load_png_sky(crate::SKY_PNG_BYTES) {
+        engine_with_sky.set_sky(Some(sky_tex));
+    }
+    let sky_ref = engine_with_sky.sky();
+
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let _ = render_scene_composed(
+        &mut fb,
+        &mut zb,
+        W as usize,
+        W,
+        H,
+        &mut pool,
+        &mut scene_and_camera.scene,
+        &cam,
+        &settings,
+        sky,
+        sky_ref,
+    );
+    write_ppm("/tmp/scene-demo-full-fake-column.ppm", &fb);
+
+    // Diagnostic: find DARK pixels (very low brightness) that
+    // appear in vertical streaks. The user-reported artifact
+    // shows up as a thin dark vertical line over the bright sky
+    // panorama. A "dark pixel" is RGB-sum < 60; a "streak" is a
+    // vertical run of ≥ 8 dark pixels in one column.
+    let w = W as usize;
+    let h = H as usize;
+    let brightness = |p: u32| -> u32 { ((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff) };
+    // Look for pixels that are LOCALLY ANOMALOUS — much darker
+    // than both their left and right neighbors at the same y.
+    // The fake-column artifact's hallmark: thin vertical line of
+    // pixels surrounded laterally by clearly different (brighter)
+    // pixels.
+    let local_anomaly = |x: usize, y: usize| -> bool {
+        if x == 0 || x + 1 >= w {
+            return false;
+        }
+        let idx = y * w + x;
+        let center = brightness(fb[idx]) as i32;
+        let left = brightness(fb[idx - 1]) as i32;
+        let right = brightness(fb[idx + 1]) as i32;
+        // Center is at least 60 darker than BOTH neighbors.
+        (left - center) > 60 && (right - center) > 60
+    };
+    let mut streak_cols: Vec<(usize, usize, usize)> = Vec::new(); // (x, y_start, length)
+    for x in 0..w {
+        let mut current_run = 0usize;
+        let mut current_start = 0usize;
+        for y in 0..h {
+            if local_anomaly(x, y) {
+                if current_run == 0 {
+                    current_start = y;
+                }
+                current_run += 1;
+            } else {
+                if current_run >= 4 {
+                    streak_cols.push((x, current_start, current_run));
+                }
+                current_run = 0;
+            }
+        }
+        if current_run >= 4 {
+            streak_cols.push((x, current_start, current_run));
+        }
+    }
+    streak_cols.sort_by_key(|&(_, _, len)| std::cmp::Reverse(len));
+    eprintln!(
+        "ship_fake_column_glitch_diag (full demo, textured sky):\n\
+         - non-sky vs prefill: not meaningful (textured sky paints every pixel)\n\
+         - locally-anomalous vertical streaks (center darker than both neighbours by ≥60, length ≥ 4):",
+    );
+    for &(x, y, len) in streak_cols.iter().take(15) {
+        let idx = y * w + x;
+        let p = fb[idx];
+        eprintln!(
+            "    x={x:>4} y={y:>4} length={len:>3} sample_color=0x{p:08x} (R+G+B={})",
+            brightness(p),
+        );
+    }
+}
+
+/// Alternate diagnostic — render only the ship grid (no ground)
+/// at the same pose, to confirm the artifact requires the
+/// compose interaction.
+#[test]
+#[ignore = "diagnostic: ship-only baseline for the fake-column pose (~10s)"]
+fn ship_fake_column_glitch_ship_only() {
+    let cam = camera_for_yaw_pitch(SHIP_GLITCH_CAM_POS, SHIP_GLITCH_YAW, SHIP_GLITCH_PITCH);
+
+    let engine = Engine::new();
+    let mut pool = ScratchPool::new(W, H, 4 * roxlap_scene::CHUNK_SIZE_XY);
+    let sky = engine.sky_color();
+    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
+    pool.set_skycast(sky_col_i, 0);
+    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
+    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
+    pool.set_treat_z_max_as_air(true);
+
+    let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
+    settings.mip_levels = 4;
+    settings.mip_scan_dist = 128;
+    settings.max_scan_dist = 1500;
+
+    let pixel_count = (W as usize) * (H as usize);
+    let mut scene = build_ship_only_at_rotation(SHIP_GLITCH_SHIP_ANGLES);
+    let mut fb = vec![sky; pixel_count];
+    let mut zb = vec![f32::INFINITY; pixel_count];
+    let _ = render_scene_composed(
+        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+    );
+    write_ppm("/tmp/scene-demo-ship-fake-column.ppm", &fb);
+
+    // Diagnostic: count "isolated dark column" pixels — a non-sky
+    // pixel whose left+right neighbours are sky. A glitch streak
+    // produces many such pixels in a vertical line; a real silhouette
+    // produces them only at silhouette edges (small count).
+    let w = W as usize;
+    let mut isolated_dark = 0usize;
+    for y in 0..(H as usize) {
+        for x in 1..(w - 1) {
+            let idx = y * w + x;
+            let p = fb[idx];
+            if p == sky {
+                continue;
+            }
+            if fb[idx - 1] == sky && fb[idx + 1] == sky {
+                isolated_dark += 1;
+            }
+        }
+    }
+    let total_non_sky = fb.iter().filter(|&&p| p != sky).count();
+    eprintln!(
+        "ship_fake_column_glitch_diag:\n\
+         - non-sky: {total_non_sky}\n\
+         - isolated 1-pixel-wide dark (sky-sky-sandwiched): {isolated_dark}",
+    );
+}
