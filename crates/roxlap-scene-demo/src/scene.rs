@@ -241,6 +241,25 @@ impl SceneAndCamera {
 /// `update_lighting` at vsid=4096 would allocate a 500 MB+
 /// `EstNormCache` bit table; the per-chunk loop keeps each cache
 /// at ~135 KB (132²×8 bytes).
+///
+/// **S5.3: lighting is grid-local — sun rotates with the grid.**
+/// `compute_brightness` in `roxlap-core::world_lighting` bakes a
+/// hardcoded sun direction `(0, 0.5, 1)` (see
+/// `(tp[1] * 0.5 + tp[2]) * 64 + 103.5`) into each voxel's alpha
+/// byte. `tp` is the surface normal in the chunk's grid-local
+/// frame, so the "sun" lives in **grid-local space**. When a grid
+/// rotates (the S5 ship demo), the bake doesn't change; rays
+/// project the rotated surface normals back to camera, so the lit
+/// side appears to rotate with the grid — visually "the ship is
+/// lit by a fixed local sun that turns with it".
+///
+/// This was a deliberate v1 decision per `PORTING-SCENE.md` § S5
+/// (see `[[project_s5_3_landed]]`). The alternative — rotate the
+/// world-space sun into grid-local at bake time AND re-bake on
+/// rotation change — is a 0.3.x follow-up. Acceptable trade-off
+/// because: (a) the per-chunk bake is non-trivial cost, (b) the
+/// visual difference is minor for slowly-rotating scenes, and
+/// (c) re-baking each frame would dominate the render budget.
 
 /// Diagnostic re-export for `repro.rs` to bake lighting+mips into a
 /// scene it builds itself (ring-artifact isolation tests). Gated
