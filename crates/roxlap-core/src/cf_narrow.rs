@@ -135,19 +135,29 @@ pub fn cf_narrow_simulate(cf: &mut [CfType], in_: &CfNarrowInputs<'_>) {
     // drawfwall would have read on a finer-mip column.
     let mut virtual_gpz = in_.gpz_at_entry;
 
+    // Diagnostic NOP gate — `ROXLAP_CF_NARROW_NOP=1` forces the
+    // simulator to short-circuit AFTER the env-var/old_mip/empty
+    // checks but BEFORE any narrowing. Confirms whether the
+    // simulator's harness (env-var read per ray, slice mutability,
+    // etc.) is itself perturbing rendering. If beam count under
+    // NOP=1 == baseline 6404, harness is benign and any regression
+    // is purely from the narrowing logic below.
+    if std::env::var_os("ROXLAP_CF_NARROW_NOP").is_some() {
+        return;
+    }
+
     for _step in 0..n_steps {
         let lane = usize::from(virtual_gpz[1] < virtual_gpz[0]);
         let virtual_ogx = virtual_gpz[lane] & -0x1_0000_i32;
 
         for entry in cf.iter_mut() {
-            // Convert z1 to gylookup index. Defensive bounds check
-            // matches drawfwall's per-iter guard.
-            let z1_idx = entry.z1 as usize;
-            if z1_idx >= in_.gylookup.len() {
-                continue;
-            }
-            let gy_raw = in_.gylookup[z1_idx];
-
+            // -- drawfwall-side narrowing (i1 / cx1 / cy1) --
+            //
+            // gy_raw indexed by z1 — drawfwall's outer-iter z1 is
+            // frozen at entry.z1 in the simulator (real drawfwall
+            // decrements z1 per voxel-row; that nuance is unmodelled
+            // in CF.1's minimum-viable shape).
+            //
             // One narrowing step per virtual column — matches the
             // per-virtual-column shape (one drawfwall outer-iter's
             // worth of narrowing per missing finer-mip column). The
@@ -160,11 +170,37 @@ pub fn cf_narrow_simulate(cf: &mut [CfType], in_: &CfNarrowInputs<'_>) {
             // convergence in one virtual step. This variant advances
             // virtual_ogx per step so cross_sign at each step sees a
             // fresh depth (= drawfwall's behaviour across columns).
-            let test = grouscan_cross_sign(entry.cx1, entry.cy1, virtual_ogx, gy_raw);
-            if test > 0 && entry.i1 > entry.i0 {
-                entry.cx1 = entry.cx1.wrapping_sub(in_.gi0);
-                entry.cy1 = entry.cy1.wrapping_sub(in_.gi1);
-                entry.i1 -= 1;
+            let z1_idx = entry.z1 as usize;
+            if z1_idx < in_.gylookup.len() {
+                let gy_raw_fwall = in_.gylookup[z1_idx];
+                let test = grouscan_cross_sign(entry.cx1, entry.cy1, virtual_ogx, gy_raw_fwall);
+                if test > 0 && entry.i1 > entry.i0 {
+                    entry.cx1 = entry.cx1.wrapping_sub(in_.gi0);
+                    entry.cy1 = entry.cy1.wrapping_sub(in_.gi1);
+                    entry.i1 -= 1;
+                }
+            }
+
+            // -- drawcwall-side narrowing (i0 / cx0 / cy0) (CF.3.B) --
+            //
+            // Mirror of drawfwall with sign flips:
+            // - gy_raw indexed by z0 (back wall climbs the slab),
+            // - test exits when `test > 0` (drawfwall exits `<= 0`),
+            // - cx0 += gi0, cy0 += gi1 (drawfwall `-=`),
+            // - i0 += 1 (drawfwall `i1 -= 1`).
+            //
+            // Hypothesis (option B): bug pixels may be drawcwall
+            // paints, not drawfwall — extending the simulator covers
+            // the back-wall side of the same cf-cancellation regime.
+            let z0_idx = entry.z0 as usize;
+            if z0_idx < in_.gylookup.len() {
+                let gy_raw_cwall = in_.gylookup[z0_idx];
+                let test = grouscan_cross_sign(entry.cx0, entry.cy0, virtual_ogx, gy_raw_cwall);
+                if test <= 0 && entry.i0 < entry.i1 {
+                    entry.cx0 = entry.cx0.wrapping_add(in_.gi0);
+                    entry.cy0 = entry.cy0.wrapping_add(in_.gi1);
+                    entry.i0 += 1;
+                }
             }
         }
 
@@ -378,6 +414,48 @@ mod tests {
         cf_narrow_simulate(&mut cf_arr, &inputs);
         assert_eq!(cf_arr[0].i1, 99);
         assert_eq!(cf_arr[0].cx1, 0x0000_C000);
+    }
+
+    /// Test — drawcwall-side narrowing (CF.3.B).
+    /// gy_raw at z0 index is negative. cross_sign(cx0, cy0, ogx,
+    /// gy_raw_cwall) = cx_s16 * gy_s16 = 1 * -1 = -1 ≤ 0 → narrow.
+    /// After: cx0 += gi0 = 0x10000 + 0x10000 = 0x20000, i0 = 1.
+    /// Re-test next step: cx_s16 = 2 → test = 2 * -1 = -2 → narrow again
+    /// if i0 < i1 (yes).
+    /// Old mip=1 → only 1 virtual step, so we narrow once and stop.
+    #[test]
+    fn drawcwall_narrows_when_test_negative() {
+        let mut cf_arr = [CfType {
+            i0: 0,
+            i1: 100,
+            z0: 5,
+            z1: 10,
+            cx0: 0x0001_0000,
+            cy0: 0,
+            cx1: -0x1000_0000, // cf.cx1 forced very negative so
+            // drawfwall side cross_sign trivially
+            // exits (test < 0); we isolate cwall.
+            cy1: 0,
+            chz_layer: 0,
+        }];
+        // gylookup[5] = -1 (cwall side), gylookup[10] = 0 (fwall noop).
+        let mut gylookup = vec![0i32; 16];
+        gylookup[5] = -1;
+        gylookup[10] = 0;
+        let inputs = CfNarrowInputs {
+            gpz_at_entry: [0x0001_0000, i32::MAX],
+            gdz_old: [0x0002_0000, 0],
+            gi0: 0x0001_0000,
+            gi1: 0,
+            gylookup: &gylookup,
+            old_mip: 1,
+        };
+        cf_narrow_simulate(&mut cf_arr, &inputs);
+        assert_eq!(cf_arr[0].i0, 1, "drawcwall-side i0 should have advanced");
+        assert_eq!(
+            cf_arr[0].cx0, 0x0002_0000,
+            "drawcwall-side cx0 should have advanced by +gi0"
+        );
     }
 
     /// Test 8 — ogx-evolution re-triggers narrowing on a near-axis
