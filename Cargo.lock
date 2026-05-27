@@ -1346,7 +1346,10 @@ version = "0.1.1"
 dependencies = [
  "flate2",
  "rayon",
+ "roxlap-cavegen",
  "roxlap-formats",
+ "softbuffer",
+ "winit",
 ]
 
 [[package]]
