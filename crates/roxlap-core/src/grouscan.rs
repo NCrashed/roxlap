@@ -1689,6 +1689,63 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     // c = ce — re-set current to top-of-stack.
     state.c_idx = state.ce_idx;
 
+    // CF.3.C — per-column-step phantom narrowing. Apply drawfwall +
+    // drawcwall-shape narrowing on the active cf entry (cf[ce_idx],
+    // which the next drawfwall/cwall will load via SyncFromPresync)
+    // using `virtual_ogx = state.gx` (the just-computed new column's
+    // depth integer-part).
+    //
+    // Insight from CF.3.B diagnostic: only 0.84 % of cf entries at
+    // remiporend entry trigger drawfwall narrowing. The bug pixels
+    // reach the cancellation regime DURING drawfwall at the new mip,
+    // NOT at remiporend. Per-column narrowing fires at every column
+    // step (instead of once per mip transition), catching narrowings
+    // at the moment they should fire.
+    //
+    // Gated behind `ROXLAP_CF_NARROW_PER_COLUMN=1` so default flow
+    // stays byte-stable. mip-0 (gmipcnt == 0) is excluded — at mip-0
+    // drawfwall does all narrowing natively.
+    if state.gmipcnt > 0 && std::env::var_os("ROXLAP_CF_NARROW_PER_COLUMN").is_some() {
+        // ROXLAP_CF_NARROW_PER_COLUMN_NO_I1=1 — skip the i1 decrement.
+        // Earlier CF.3.B diagnostic showed cx1/cy1 narrowing alone is
+        // observably a no-op (gi0 magnitude is sufficient to flip
+        // cx_s16, but the cf entries the simulator narrows don't
+        // reach the bug pixels' drawfwall fire path). Use this to
+        // confirm: if NO_I1 = baseline, the i1 decrement is the
+        // entire source of regression in per-column too.
+        let skip_i1 = std::env::var_os("ROXLAP_CF_NARROW_PER_COLUMN_NO_I1").is_some();
+        let virtual_ogx = state.gx;
+        let entry = &mut state.scratch.cf[state.ce_idx];
+
+        // drawfwall-side (i1 / cx1 / cy1).
+        let z1_idx = entry.z1 as usize;
+        if z1_idx < state.gylookup.len() {
+            let gy_raw_fwall = state.gylookup[z1_idx];
+            let test = grouscan_cross_sign(entry.cx1, entry.cy1, virtual_ogx, gy_raw_fwall);
+            if test > 0 && entry.i1 > entry.i0 {
+                entry.cx1 = entry.cx1.wrapping_sub(state.scratch.gi0);
+                entry.cy1 = entry.cy1.wrapping_sub(state.scratch.gi1);
+                if !skip_i1 {
+                    entry.i1 -= 1;
+                }
+            }
+        }
+
+        // drawcwall-side (i0 / cx0 / cy0).
+        let z0_idx = entry.z0 as usize;
+        if z0_idx < state.gylookup.len() {
+            let gy_raw_cwall = state.gylookup[z0_idx];
+            let test = grouscan_cross_sign(entry.cx0, entry.cy0, virtual_ogx, gy_raw_cwall);
+            if test <= 0 && entry.i0 < entry.i1 {
+                entry.cx0 = entry.cx0.wrapping_add(state.scratch.gi0);
+                entry.cy0 = entry.cy0.wrapping_add(state.scratch.gi1);
+                if !skip_i1 {
+                    entry.i0 += 1;
+                }
+            }
+        }
+    }
+
     if state.c_presync_idx == state.c_idx {
         Phase::Skipixy3
     } else {
