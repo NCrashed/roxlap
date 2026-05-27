@@ -2174,6 +2174,28 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
         return Phase::Startsky;
     }
 
+    // CF.2 — cf-narrowing simulator. Gated behind `ROXLAP_CF_NARROW=1`
+    // so default behaviour stays byte-stable to commit e484378 until
+    // validated by CF.3. Walks each active cf entry through
+    // `(2^old_mip - 1)` virtual finer-mip column steps' worth of
+    // `phase_draw_fwall`-shape narrowing. Algorithmic fix for the
+    // axis-aligned-mip-beams artifact at deep mip-N + near-axis rays.
+    // See `crate::cf_narrow` + the `cf-narrowing-multi-session-plan`
+    // memo for the full design.
+    if state.gmipcnt > 0 && std::env::var_os("ROXLAP_CF_NARROW").is_some() {
+        let inputs = crate::cf_narrow::CfNarrowInputs {
+            gpz_at_entry: state.scratch.gpz,
+            gdz_old: state.scratch.gdz,
+            gi0: state.scratch.gi0,
+            gi1: state.scratch.gi1,
+            gylookup: state.gylookup,
+            old_mip: state.gmipcnt as u32,
+        };
+        let lo = CF_SEED_INDEX;
+        let hi = state.ce_idx + 1;
+        crate::cf_narrow::cf_narrow_simulate(&mut state.scratch.cf[lo..hi], &inputs);
+    }
+
     // Voxlap5.c:12007 — increment gmipcnt to NEW (= OLD + 1).
     let old_mip = state.gmipcnt as usize;
     state.gmipcnt += 1;
