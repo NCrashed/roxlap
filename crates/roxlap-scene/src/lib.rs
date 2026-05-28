@@ -27,6 +27,7 @@
 //! [`parse`]: roxlap_formats::vxl::parse
 
 pub mod addr;
+pub mod billboard;
 pub mod chunks;
 pub mod edit;
 pub mod lod;
@@ -40,6 +41,7 @@ use roxlap_formats::vxl::Vxl;
 use serde::{Deserialize, Serialize};
 
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
+pub use billboard::{canonical_viewpoints, BillboardCache, BillboardSnapshot};
 pub use lod::{select_lod, Lod, LodThresholds};
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
@@ -167,12 +169,19 @@ pub struct Grid {
     /// the existing multi-mip path; S6.3 plugs `Far` into the
     /// billboard impostor cache. See [`crate::lod`].
     pub lod_thresholds: LodThresholds,
+    /// Lazy [`BillboardCache`] for the `Lod::Far` tier (S6.2).
+    /// `None` until the first time S6.3's render dispatch needs
+    /// it; populated then via [`BillboardCache::build`] and
+    /// cleared by edits ([`Self::set_voxel`] / [`Self::set_rect`]
+    /// / [`Self::set_sphere`]) to force a rebuild on next Far use.
+    /// Callers may also force-invalidate via direct assignment.
+    pub billboards: Option<BillboardCache>,
 }
 
 impl Grid {
     /// New empty grid at the given transform — no chunks populated,
     /// `render_sky = true`, LOD thresholds default to
-    /// [`LodThresholds::always_near`].
+    /// [`LodThresholds::always_near`], no billboard cache.
     #[must_use]
     pub fn new(transform: GridTransform) -> Self {
         Self {
@@ -181,6 +190,7 @@ impl Grid {
             render_sky: true,
             mip_levels_override: None,
             lod_thresholds: LodThresholds::always_near(),
+            billboards: None,
         }
     }
 

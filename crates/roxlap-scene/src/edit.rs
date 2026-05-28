@@ -47,6 +47,9 @@ impl Grid {
     ///
     /// [`Vxl`]: roxlap_formats::vxl::Vxl
     pub fn set_voxel(&mut self, voxel: IVec3, color: Option<u32>) {
+        // S6.2: any edit invalidates the billboard impostor cache;
+        // S6.3 will rebuild on next Far-tier use.
+        self.billboards = None;
         let (chunk_idx, in_chunk) = voxel_split(voxel);
         if color.is_some() {
             let vxl = self.ensure_chunk(chunk_idx);
@@ -82,6 +85,8 @@ impl Grid {
     /// `lo` and `hi` may be in any order on each axis — the
     /// decomposition normalises them.
     pub fn set_rect(&mut self, lo: IVec3, hi: IVec3, color: Option<u32>) {
+        // S6.2: edit invalidates billboard cache (see set_voxel doc).
+        self.billboards = None;
         let lo_n = lo.min(hi);
         let hi_n = lo.max(hi);
         let (lo_c, _) = voxel_split(lo_n);
@@ -117,6 +122,8 @@ impl Grid {
     /// pre-pass that filters chunks against `radius²` could avoid
     /// this; out of scope for v1.
     pub fn set_sphere(&mut self, centre: IVec3, radius: u32, color: Option<u32>) {
+        // S6.2: edit invalidates billboard cache (see set_voxel doc).
+        self.billboards = None;
         #[allow(clippy::cast_possible_wrap)]
         let r_i = radius as i32;
         let lo = centre - IVec3::splat(r_i);
@@ -342,6 +349,57 @@ mod tests {
         assert!(voxel_is_solid(v1, 0, 64, 100));
         // Voxel (130, 64, 100) is 3 voxels from centre, still inside.
         assert!(voxel_is_solid(v1, 2, 64, 100));
+    }
+
+    // ---- S6.2: billboard cache invalidation ----
+
+    /// Helper: stamp a sentinel billboard cache onto a grid so the
+    /// invalidation tests can detect when the edit cleared it. We
+    /// use a 32-resolution `new_empty` cache — populating real
+    /// snapshots would work too but is needlessly expensive when
+    /// the test only cares about Some/None state.
+    fn stamp_sentinel_cache(g: &mut Grid) {
+        g.billboards = Some(crate::BillboardCache::new_empty(32));
+    }
+
+    #[test]
+    fn set_voxel_invalidates_billboard_cache() {
+        let mut g = Grid::new(GridTransform::identity());
+        stamp_sentinel_cache(&mut g);
+        assert!(g.billboards.is_some());
+        g.set_voxel(IVec3::new(5, 5, 5), Some(TEST_COL));
+        assert!(
+            g.billboards.is_none(),
+            "set_voxel should clear the billboard cache"
+        );
+    }
+
+    #[test]
+    fn set_voxel_carve_also_invalidates() {
+        // Even no-op carves invalidate — the cache must be conservative.
+        let mut g = Grid::new(GridTransform::identity());
+        stamp_sentinel_cache(&mut g);
+        g.set_voxel(IVec3::new(5, 5, 5), None); // missing-chunk no-op
+        assert!(
+            g.billboards.is_none(),
+            "carve should clear the cache (conservative)"
+        );
+    }
+
+    #[test]
+    fn set_rect_invalidates_billboard_cache() {
+        let mut g = Grid::new(GridTransform::identity());
+        stamp_sentinel_cache(&mut g);
+        g.set_rect(IVec3::new(0, 0, 0), IVec3::new(3, 3, 3), Some(TEST_COL));
+        assert!(g.billboards.is_none(), "set_rect should clear the cache");
+    }
+
+    #[test]
+    fn set_sphere_invalidates_billboard_cache() {
+        let mut g = Grid::new(GridTransform::identity());
+        stamp_sentinel_cache(&mut g);
+        g.set_sphere(IVec3::new(64, 64, 100), 5, Some(TEST_COL));
+        assert!(g.billboards.is_none(), "set_sphere should clear the cache");
     }
 
     #[test]
