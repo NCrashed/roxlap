@@ -43,6 +43,7 @@ use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
 
+use crate::lod::Lod;
 use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
 
 /// Sentinel colour stamped into a `render_sky = false` grid's
@@ -269,6 +270,19 @@ pub fn render_scene_composed(
         let Some(backing) = grid.chunk_xyz_backing() else {
             continue;
         };
+        // S6.0: per-grid LOD tier dispatch. The picker keys off
+        // the grid's `lod_thresholds` and the world-space camera.
+        // Default thresholds are `always_near` so every grid lands
+        // on `Lod::Near` and the framebuffer stays byte-identical
+        // to the pre-S6 path. S6.1 hooks `Mid` (deeper mip cap via
+        // `mip_levels_override`); S6.3 hooks `Far` (billboard
+        // impostor blit replacing opticast). For now `Mid` and
+        // `Far` fall through to the `Near` arm — the match exists
+        // to make those plug-in points obvious to readers.
+        let lod = grid.select_lod(DVec3::from_array(camera.pos));
+        match lod {
+            Lod::Near | Lod::Mid | Lod::Far => {}
+        }
         // S5.2-followup: per-grid sky opt-out. Grids with
         // `render_sky = false` (e.g. a rotating ship) must not
         // contribute sky pixels — the grid-local sky lookup
@@ -1101,6 +1115,86 @@ mod tests {
         assert_eq!(
             fb, fb2,
             "composition should be order-independent — same scene in different add order should produce identical output"
+        );
+    }
+
+    // ---- S6.0: LOD picker wired but every tier falls through to Near ----
+
+    /// Threshold-invariance: a grid rendered with the S6 derived
+    /// thresholds (`from_radius` of the actual bounding sphere) must
+    /// produce a framebuffer byte-identical to the same grid with
+    /// default `always_near` thresholds, because S6.0 takes the
+    /// `Near` arm of the match for all three tiers. This is the
+    /// regression test for the S6.0 contract.
+    #[test]
+    fn render_scene_composed_lod_threshold_invariance() {
+        // Scene A: default thresholds (always_near).
+        let (mut scene_a, _a_id) = build_one_grid_scene(DVec3::new(0.0, 200.0, 0.0));
+        let cam = camera_at([64.0, 0.0, 100.0]);
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb_a = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb_a = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome_a = render_scene_composed(
+            &mut fb_a,
+            &mut zb_a,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene_a,
+            &cam,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome_a, RenderOutcome::Rendered { grids_drawn: 1 });
+
+        // Scene B: thresholds derived from the grid's bounding
+        // radius. At this camera distance the grid lands on Mid or
+        // Far; if S6.0 ever stops falling through to Near, this test
+        // catches the divergence.
+        let (mut scene_b, b_id) = build_one_grid_scene(DVec3::new(0.0, 200.0, 0.0));
+        let radius = scene_b.grid(b_id).unwrap().bounding_radius();
+        assert!(
+            radius > 0.0,
+            "bounding_radius should be > 0 for a populated grid"
+        );
+        scene_b.grid_mut(b_id).unwrap().lod_thresholds = crate::LodThresholds::from_radius(radius);
+        // Sanity: the camera is far enough that the picker no longer
+        // returns Near (otherwise the invariance test would be vacuous).
+        let lod = scene_b
+            .grid(b_id)
+            .unwrap()
+            .select_lod(DVec3::from_array(cam.pos));
+        assert_ne!(
+            lod,
+            Lod::Near,
+            "camera should land in Mid or Far for derived thresholds — got {lod:?}",
+        );
+
+        let mut fb_b = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb_b = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let outcome_b = render_scene_composed(
+            &mut fb_b,
+            &mut zb_b,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene_b,
+            &cam,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome_b, RenderOutcome::Rendered { grids_drawn: 1 });
+
+        // Byte-identity is the S6.0 contract — Mid/Far still take
+        // the Near arm.
+        assert_eq!(
+            fb_a, fb_b,
+            "S6.0 framebuffer must be byte-identical regardless of LOD thresholds"
         );
     }
 

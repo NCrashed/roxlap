@@ -29,6 +29,7 @@
 pub mod addr;
 pub mod chunks;
 pub mod edit;
+pub mod lod;
 pub mod render;
 pub mod snapshot;
 
@@ -39,6 +40,7 @@ use roxlap_formats::vxl::Vxl;
 use serde::{Deserialize, Serialize};
 
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
+pub use lod::{select_lod, Lod, LodThresholds};
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
 /// chunks compact (~2 MB worst-case dense-slab footprint inside
@@ -158,11 +160,19 @@ pub struct Grid {
     /// artifact when near-axis-aligned rays hit the rotated grid.
     /// `Some(1)` = mip-0 only, byte-stable to single-mip.
     pub mip_levels_override: Option<u32>,
+    /// World-distance thresholds for per-grid LOD tier selection
+    /// (S6.0). Defaults to [`LodThresholds::always_near`], so a
+    /// freshly-constructed grid always renders at full voxel (the
+    /// S5-and-earlier byte-stable behaviour). S6.1 plugs `Mid` into
+    /// the existing multi-mip path; S6.3 plugs `Far` into the
+    /// billboard impostor cache. See [`crate::lod`].
+    pub lod_thresholds: LodThresholds,
 }
 
 impl Grid {
     /// New empty grid at the given transform — no chunks populated,
-    /// `render_sky = true`.
+    /// `render_sky = true`, LOD thresholds default to
+    /// [`LodThresholds::always_near`].
     #[must_use]
     pub fn new(transform: GridTransform) -> Self {
         Self {
@@ -170,7 +180,62 @@ impl Grid {
             chunks: HashMap::new(),
             render_sky: true,
             mip_levels_override: None,
+            lod_thresholds: LodThresholds::always_near(),
         }
+    }
+
+    /// Bounding-sphere radius of the populated chunk set in
+    /// grid-local space.
+    ///
+    /// Walks the sparse chunk map once, computes the chunk-index
+    /// AABB, converts to voxel-space half-extent, returns its
+    /// Euclidean length. Empty grid → `0.0`.
+    ///
+    /// Conservative — bounds the full chunk volume, not just its
+    /// populated voxels (a chunk containing one voxel still
+    /// contributes `CHUNK_SIZE_XY × CHUNK_SIZE_XY × CHUNK_SIZE_Z`
+    /// to the bbox). For LOD picking that's fine: an over-bound
+    /// sphere errs on the side of `Near`.
+    ///
+    /// Cost: `O(chunks.len())`; recomputed on every call. Callers
+    /// who need this every frame should memoize at the
+    /// [`Scene`]-level cache (added when S6.2 needs it).
+    #[must_use]
+    pub fn bounding_radius(&self) -> f64 {
+        if self.chunks.is_empty() {
+            return 0.0;
+        }
+        let mut min = IVec3::splat(i32::MAX);
+        let mut max = IVec3::splat(i32::MIN);
+        for &idx in self.chunks.keys() {
+            min = min.min(idx);
+            max = max.max(idx);
+        }
+        // Chunk-index bbox → voxel-space half-extent. `+1` on max
+        // converts inclusive chunk index to exclusive voxel upper
+        // bound (chunk `idx` covers voxels `[idx*size, (idx+1)*size)`).
+        let sx = f64::from(CHUNK_SIZE_XY);
+        let sz = f64::from(CHUNK_SIZE_Z);
+        let lo = DVec3::new(
+            f64::from(min.x) * sx,
+            f64::from(min.y) * sx,
+            f64::from(min.z) * sz,
+        );
+        let hi = DVec3::new(
+            f64::from(max.x + 1) * sx,
+            f64::from(max.y + 1) * sx,
+            f64::from(max.z + 1) * sz,
+        );
+        let half_extent = (hi - lo) * 0.5;
+        half_extent.length()
+    }
+
+    /// Pick this grid's LOD tier for the given world-space camera
+    /// position. Convenience wrapper around [`crate::select_lod`]
+    /// that pulls [`Self::lod_thresholds`] from the grid.
+    #[must_use]
+    pub fn select_lod(&self, camera_world_pos: DVec3) -> Lod {
+        select_lod(camera_world_pos, &self.transform, self.lod_thresholds)
     }
 }
 
@@ -311,5 +376,84 @@ mod tests {
         // shows up in CI.
         assert_eq!(CHUNK_SIZE_XY, 128);
         assert_eq!(CHUNK_SIZE_Z, 256);
+    }
+
+    // ---- S6.0: bounding_radius + Grid::select_lod ----
+
+    #[test]
+    fn new_grid_defaults_to_always_near_lod() {
+        // Byte-identity contract for the staged S6 rollout: a
+        // grid built through `new` must never trigger the Mid/Far
+        // branches by accident, even when bounding_radius would
+        // imply otherwise.
+        let g = Grid::new(GridTransform::identity());
+        assert_eq!(g.lod_thresholds.r_near, f64::INFINITY);
+        assert_eq!(g.lod_thresholds.r_mid, f64::INFINITY);
+        assert_eq!(g.select_lod(DVec3::new(1e9, 0.0, 0.0)), Lod::Near);
+    }
+
+    #[test]
+    fn bounding_radius_empty_grid_is_zero() {
+        let g = Grid::new(GridTransform::identity());
+        assert_eq!(g.bounding_radius(), 0.0);
+    }
+
+    #[test]
+    fn bounding_radius_single_chunk_at_origin() {
+        // One chunk at (0, 0, 0): bbox is [0, 128) × [0, 128) × [0, 256).
+        // Half-extent = (64, 64, 128); length = sqrt(64² + 64² + 128²)
+        //   = sqrt(4096 + 4096 + 16384) = sqrt(24576) ≈ 156.7747...
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        // Populate chunk (0, 0, 0) via the edit API.
+        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_88_88_88));
+        let r = g.bounding_radius();
+        let expected = ((64.0_f64).powi(2) * 2.0 + (128.0_f64).powi(2)).sqrt();
+        assert!(
+            (r - expected).abs() < 1e-9,
+            "bounding_radius={r} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn bounding_radius_grows_with_chunk_extent() {
+        // Two chunks at (0,0,0) and (3,0,0): x extent is 4 chunks =
+        // 512 voxels; y/z are 1 chunk each. Half-extent = (256, 64, 128);
+        // length = sqrt(256² + 64² + 128²) = sqrt(65536+4096+16384)
+        //        = sqrt(86016) ≈ 293.2848.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        // Stamp one voxel in chunk (0,0,0).
+        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_88_88_88));
+        // Stamp one voxel in chunk (3,0,0): grid-local x = 3*128 = 384.
+        g.set_voxel(IVec3::new(384, 0, 0), Some(0x80_88_88_88));
+        assert_eq!(g.chunks.len(), 2);
+        let r = g.bounding_radius();
+        let expected = (256.0_f64.powi(2) + 64.0_f64.powi(2) + 128.0_f64.powi(2)).sqrt();
+        assert!(
+            (r - expected).abs() < 1e-9,
+            "bounding_radius={r} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn grid_select_lod_respects_lod_thresholds_field() {
+        // Set a non-default threshold and verify the helper picks
+        // the right tier for known distances.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::new(100.0, 0.0, 0.0)));
+        let g = scene.grid_mut(id).unwrap();
+        g.lod_thresholds = LodThresholds {
+            r_near: 50.0,
+            r_mid: 200.0,
+        };
+        // Camera 25 units from grid origin → Near.
+        assert_eq!(g.select_lod(DVec3::new(125.0, 0.0, 0.0)), Lod::Near);
+        // 100 units → Mid.
+        assert_eq!(g.select_lod(DVec3::new(200.0, 0.0, 0.0)), Lod::Mid);
+        // 500 units → Far.
+        assert_eq!(g.select_lod(DVec3::new(600.0, 0.0, 0.0)), Lod::Far);
     }
 }
