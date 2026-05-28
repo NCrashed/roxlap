@@ -28,6 +28,7 @@
 
 pub mod addr;
 pub mod billboard;
+pub mod cavegen;
 pub mod chunks;
 pub mod edit;
 pub mod lod;

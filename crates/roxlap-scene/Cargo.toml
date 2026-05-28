@@ -14,6 +14,7 @@ categories = ["game-development", "graphics"]
 
 [dependencies]
 glam = { workspace = true }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.2" }
 roxlap-core = { path = "../roxlap-core", version = "0.2" }
 roxlap-formats = { path = "../roxlap-formats", version = "0.2" }
 serde = { workspace = true }

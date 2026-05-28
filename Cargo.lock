@@ -1394,6 +1394,7 @@ dependencies = [
  "crossbeam-channel",
  "glam",
  "rayon",
+ "roxlap-cavegen",
  "roxlap-core",
  "roxlap-formats",
  "serde",

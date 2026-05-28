@@ -35,7 +35,7 @@ const CHUNK_EDIT_HEADROOM_PER_COLUMN: usize = 256;
 /// This is the canonical empty-chunk constructor — every code
 /// path that materialises a sparse chunk goes through it (see
 /// [`Grid::ensure_chunk`]).
-fn empty_chunk_vxl() -> Vxl {
+pub(crate) fn empty_chunk_vxl() -> Vxl {
     let vsid = CHUNK_SIZE_XY;
     let n_cols = (vsid as usize) * (vsid as usize);
 
