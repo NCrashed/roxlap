@@ -20,8 +20,8 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core", version = "0.1" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
+roxlap-core = { path = "../roxlap-core", version = "0.2" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.2" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # wasm-bindgen / web-sys versions pinned to the same major+minor as

@@ -14,8 +14,8 @@ categories = ["game-development", "graphics"]
 
 [dependencies]
 glam = { workspace = true }
-roxlap-core = { path = "../roxlap-core", version = "0.1" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.1" }
+roxlap-core = { path = "../roxlap-core", version = "0.2" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.2" }
 serde = { workspace = true }
 
 [dev-dependencies]

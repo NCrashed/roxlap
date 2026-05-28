@@ -5,7 +5,135 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — 2026-05-XX
+## [0.2.0] — 2026-05-27
+
+Scene-graph release: many independent chunked voxel grids, each with
+f64 world position and `Quat` rotation. Substages S1..S5 of
+[`PORTING-SCENE.md`](PORTING-SCENE.md).
+
+### Added
+
+#### `roxlap-scene` (new crate)
+
+- New crate. Scene-graph layer above the per-grid voxel renderer.
+  Many `Grid` objects, each a sparse `IVec3 → Chunk` map; each
+  grid carries a `GridTransform { position: DVec3, rotation:
+  DQuat, scale: f64 }` so worlds can be unbounded in size and
+  rotated to arbitrary orientation.
+- **Address math** (`roxlap_scene::addr`):
+  `world_to_grid_local` / `voxel_split` / `voxel_global` /
+  `grid_local_to_world`. Handles negative / boundary / rotated
+  cases (15 property tests).
+- **Edit API** (`roxlap_scene::edit`): `Scene::set_voxel` /
+  `set_rect` / `set_sphere`. Multi-chunk decomposition delegates
+  per-chunk writes to `roxlap_formats::edit`. Empty chunks keep
+  voxlap's bedrock placeholder at z=255.
+- **Snapshot + serde** (`roxlap_scene::snapshot`):
+  `SceneSnapshot` / `GridSnapshot`, `Scene::to_snapshot` /
+  `from_snapshot`. 100-chunk round-trip via bincode validated.
+  `compact_serialize_chunk` rebuilds in column-index order to work
+  around `vxl::serialize`'s post-edit non-round-trip.
+- **Multi-grid render** (`roxlap_scene::render`):
+  `render_scene` (last-grid-wins single-buffer) +
+  `render_scene_composed` (per-grid temp buffers + min-z merge).
+  Translates the world camera into grid-local space per grid and
+  dispatches to `roxlap_core::opticast`.
+- **Cross-chunk gline** (S4): 3D DDA over chunk index space
+  inside a single grid. New `GridView` / `ChunkGrid` types in
+  `roxlap_core` wrap a multi-chunk sparse map; `opticast` walks
+  chunk-by-chunk with explicit handoff at boundaries (mid-render
+  and at seed-time). Power-of-two chunk_size_xy → arithmetic-shift
+  fast path (+22% FPS vs. the pre-S4 single-chunk view).
+- **Per-grid rotation** (S5): `world_camera_to_grid_local` inverts
+  the grid quat to bring camera basis + position into grid-local
+  space; the rasterizer sees an axis-aligned grid and is unaware
+  of rotation. Identity-rotation is byte-identical to S4 output;
+  180°-Z is bit-exact via exact-arithmetic quat. Per-grid
+  lighting bake stays in grid-local space — a rotating ship is
+  "lit by a sun that turns with it".
+
+#### `roxlap-core`
+
+- **`GridView<'a>`**: new four-field (vsid, slab_buf,
+  column_offsets, mip_base_offsets) borrow-style abstraction
+  threaded through every `opticast` / `ScalarRasterizer::new`
+  callsite. Replaces ad-hoc `&Vxl` + `usize` argument tuples.
+- **`ChunkGrid<'a>`**: sparse multi-chunk view; `GridView`
+  carries an optional pointer to a `ChunkGrid` and dispatches
+  `chunk_at_xy` / `chunk_at_xyz` via the table for multi-chunk,
+  falls back to `Some(Self)`-for-`[0,0,0]` for single-chunk.
+- **Cross-chunk rasterizer state**: `GrouscanState` carries
+  `current_chunk_idx_xy` / `current_chunk_z` / `current_chunk_exists`;
+  column-step routes by `chunk_size_xy == vsid → flat fast path`
+  vs `chunk_size_xy < vsid → chunk-swap via chunk_at_xy`. Single-
+  chunk path byte-identical to 0.1.x.
+- **Z-stacked chunks**: `ChunkGrid` grows `chunks_z` /
+  `origin_chunk_z` / `chunk_size_z`. `gylookup` table widened to
+  `((chunks_z * 512) >> mip) + 4`. Mid-render handoff for
+  look-down across stacked chunks. Slab byte reads operate in
+  world-z (= chunk-local + `camera_chunk_z * 256`).
+- `Grid::mip_levels_override` field: per-grid clamp on mip
+  levels — sidesteps the axis-aligned-mip-N artifact for small
+  rotating grids by forcing mip-0.
+- Engine bug fixes that surfaced during S4/S5 integration:
+  - **OOB-XY chunk-edge streaking** — opticast now seeds OOB-XY
+    columns from the `(0, 255, 0)` bedrock placeholder rather
+    than a synthesised cf entry. (`outside_orbit` golden refrozen.)
+  - **Below-floor sky distortion** — `phase_draw_{cwall,fwall,
+    ceil,flor}` drains now write `cx0/cy0/cx1/cy1` alongside
+    `i0/i1`, fixing the sky lookup offset.
+  - **Below-bedrock all-sky** — camera at z > 255 with
+    `treat_z_max_as_air` now synthesises a bedrock air gap
+    instead of returning `None`.
+  - **Ship-grid mip-N black wall** — `phase_remiporend` reloads
+    `state.column` only when `current_chunk_exists`, avoiding an
+    OOB march into the wrong sub-table.
+  - **Camera above grid skipped** — `chunk_at_xyz` clamps the
+    effective chz to `origin_chunk_z` for unstacked grids so a
+    camera at world z < 0 renders correctly.
+  - **Three rotated-grid camera-placement bugs** — grouscan mip-N
+    column-step underflow, chz clamp for camera-below-grid,
+    cz_local "below the column" branch.
+  - **Mip-N slab_z_at scale fix** — `slab_z_at` shifts the chunk
+    world-z base by `>> gmipcnt` so mip-N reads in stacked
+    chunks land at the correct world-z.
+  - **Pose-D `phase_draw_fwall` bedrock guard** — read
+    `column[vptr+1]` as a raw byte rather than casting via
+    `slab_z_at` (mirrors drawflor's fix).
+- 1 added oracle pose (`outside_orbit`, S1, roxlap-only golden).
+  Existing 12 voxlap-comparable oracle hashes byte-identical to
+  0.1.x.
+
+#### Public-API breakage
+
+- Everything that took `&Vxl` + raw `vsid` / `slab_buf` /
+  `column_offsets` arguments to opticast / grouscan now takes
+  a single `GridView<'a>`. ~18 call sites migrated internally;
+  downstream callers of `opticast` need the same.
+- `roxlap_scene` is new — no migration burden, but pulls in
+  `glam` as a public dep.
+- `Grid::combined_world` and friends (an Approach-C scaffold
+  that briefly existed during S4) — DELETED in S4B.4.b in favour
+  of `Grid::chunk(idx)` reader + per-chunk bake closure. Never
+  shipped in 0.1.x.
+
+#### Not (yet) included
+
+- Per-grid LOD tier selection / billboards / planet sphere proxies
+  (S6 — coming in 0.3.0).
+- Streaming + procedural generation (S7 — coming in 0.3.0).
+- chz multi-rendering: rasterizer state densely coupled to a
+  single column, so rendering content from two stacked chunks
+  through one column is unsupported. Scene-demo poses A/B/C/D
+  unaffected; full investigation log in memory.
+
+[0.2.0]: https://github.com/NCrashed/roxlap/releases/tag/v0.2.0
+
+## [0.1.1] — 2026-05-07
+
+- docs.rs metadata patch. No code changes.
+
+## [0.1.0] — 2026-05-07
 
 Initial public release of the roxlap workspace.
 
@@ -188,4 +316,5 @@ Initial public release of the roxlap workspace.
   (only one `setspans` fixture today; `setcube` / `setsphere` /
   `setrect` rely on round-trip self-consistency tests).
 
+[0.1.1]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.1
 [0.1.0]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.0
