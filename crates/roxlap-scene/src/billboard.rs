@@ -89,6 +89,19 @@ const CAMERA_DISTANCE_FACTOR: f64 = 8.0;
 /// Configurable via [`BillboardCache::with_resolution`].
 pub const DEFAULT_RESOLUTION: u32 = 128;
 
+/// Sentinel colour stamped into a snapshot's framebuffer wherever
+/// opticast would have drawn sky. The S6.3 blit detects sentinel
+/// pixels and skips them so the snapshot's sky shows through to
+/// whatever else is in the shared `(fb, zb)` (sky panorama, ground
+/// from another grid, etc.).
+///
+/// Picked as `0x00_00_00_00` because:
+/// - Alpha byte `0x00` is unused by voxlap's lit-voxel path
+///   (`set_side_shades` produces values in `[0x40, 0x80]`), so a
+///   real hit never accidentally collides with the sentinel.
+/// - All-zero is trivially fast to check and to bulk-fill.
+pub const SKY_SENTINEL: u32 = 0x00_00_00_00;
+
 /// One pre-rendered orthographic-ish view of a grid from a fixed
 /// direction. The depth buffer carries grid-local Euclidean
 /// distance (voxlap's z-buffer convention: smaller = closer); S6.3
@@ -171,10 +184,18 @@ impl BillboardCache {
     ///
     /// An empty grid (no populated chunks) yields 26 all-sky
     /// snapshots. The cache is still populated so the S6.3 blit
-    /// path doesn't keep retrying — a Far-tier empty grid simply
-    /// composes the sky-coloured billboard, which is a no-op.
+    /// path doesn't keep retrying — a Far-tier empty grid's blit
+    /// is then a no-op (every pixel skipped via [`SKY_SENTINEL`]).
+    ///
+    /// **Sky-pixel detection**: the pool's skycast colour is set
+    /// to [`SKY_SENTINEL`] before each snapshot render so opticast
+    /// writes the sentinel (not a real sky colour) into pixels
+    /// rays missed. Post-render, every sentinel pixel's depth is
+    /// reset to [`f32::INFINITY`] (opticast writes a finite "sky
+    /// distance" for these pixels, which would otherwise leak
+    /// through the blit's depth check).
     #[must_use]
-    pub fn build(grid: &Grid, resolution: u32, sky_color: u32) -> Self {
+    pub fn build(grid: &Grid, resolution: u32) -> Self {
         let viewpoints = canonical_viewpoints();
         let mut snapshots = Vec::with_capacity(viewpoints.len());
 
@@ -190,18 +211,18 @@ impl BillboardCache {
 
         // One ScratchPool shared across all 26 renders. Sized so
         // the per-strip uurend stride fits the snapshot width.
-        // pool_vsid: the largest vsid we'd address. For an in-grid
-        // camera we'd use `grid.vsid`; here our camera is outside
-        // the chunk, so use a generous bound.
         let pool_vsid = CHUNK_SIZE_XY.max(resolution).max(64);
         let mut pool = ScratchPool::new(resolution, resolution, pool_vsid);
-        let sky_i = i32::from_ne_bytes(sky_color.to_ne_bytes());
-        pool.set_skycast(sky_i, 0);
+        // Skycast colour = SKY_SENTINEL so opticast stamps the
+        // sentinel into sky pixels (instead of a real colour the
+        // blit can't reliably tell apart from a voxel hit).
+        let sentinel_i = i32::from_ne_bytes(SKY_SENTINEL.to_ne_bytes());
+        pool.set_skycast(sentinel_i, 0);
         pool.set_treat_z_max_as_air(true);
 
         for view_dir in viewpoints {
             let camera = snapshot_camera(view_dir, centre, d);
-            let mut color = vec![sky_color; (resolution as usize) * (resolution as usize)];
+            let mut color = vec![SKY_SENTINEL; (resolution as usize) * (resolution as usize)];
             let mut depth = vec![f32::INFINITY; color.len()];
 
             // Empty grid → render all-sky and move on (no chunks
@@ -221,7 +242,7 @@ impl BillboardCache {
                     ScalarRasterizer::new(&mut color, &mut depth, resolution as usize, grid_view);
                 opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view)
             } else {
-                // Empty grid — leave the buffers at sky / INFINITY.
+                // Empty grid — buffers stay at SKY_SENTINEL / INFINITY.
                 OpticastOutcome::Rendered
             };
             // `Rendered` and `SkippedCameraInSolid` both keep the
@@ -229,6 +250,17 @@ impl BillboardCache {
             // solid material (impossible for our outside-the-grid
             // camera position), in which case we get sky too.
             let _ = outcome;
+
+            // Sentinel post-process: opticast writes a finite
+            // depth (`gxmax` / `max_scan_dist`) for sky pixels via
+            // `phase_startsky`. Reset those to INFINITY so the
+            // blit's `is_infinite()` belt-and-braces check still
+            // works alongside the colour-sentinel check.
+            for (px, z) in color.iter().zip(depth.iter_mut()) {
+                if *px == SKY_SENTINEL {
+                    *z = f32::INFINITY;
+                }
+            }
 
             snapshots.push(BillboardSnapshot {
                 view_dir,
@@ -371,12 +403,25 @@ fn grid_local_centre_and_radius(grid: &Grid) -> (DVec3, f64) {
 fn snapshot_camera(view_dir: DVec3, centre: DVec3, d: f64) -> Camera {
     let pos = centre + view_dir * d;
     let forward = -view_dir;
-    // Pick an "up reference" not parallel to forward. Using world
-    // +Z works for all viewpoints except `view_dir == ±Z`, where
-    // we switch to world +X to keep the cross products well-
-    // conditioned.
+    // Pick an "up reference" not parallel to forward.
+    //
+    // Voxlap is z-down (positive Z = downward in world space), so
+    // the world's "up" direction is **negative** Z. Using
+    // `DVec3::NEG_Z` here gives `down = forward × right` that
+    // points toward voxlap's +Z (= screen down) — i.e. the
+    // snapshot is rendered right-side-up.
+    //
+    // Pre-2026-05-28 bug: this was `DVec3::Z`, producing
+    // `down = (0,0,-1)` for face viewpoints. The rasterizer
+    // rendered each snapshot upside-down; the blit then stamped
+    // the inverted image at the projected grid centre, making
+    // pillars appear at the wrong vertical position (visually:
+    // "billboards are taller than the voxel model").
+    //
+    // Falls back to +X when the viewpoint is near-±Z (forward
+    // nearly parallel to the up reference).
     let up_ref = if forward.z.abs() < 0.99 {
-        DVec3::Z
+        DVec3::NEG_Z
     } else {
         DVec3::X
     };
@@ -546,10 +591,13 @@ pub fn billboard_blit_into(
             }
             let sx = (dx * src_w) / dst_size;
             let src_idx = row_src_base + sx as usize;
-            // Sky pixels: skip. Depth-buffer infinity is the sky
-            // tag (built into BillboardCache::build's all-sky
-            // init).
-            if snapshot.depth[src_idx].is_infinite() {
+            // Sky pixels: skip. Two redundant signals — colour
+            // matches [`SKY_SENTINEL`] (opticast's skycast write)
+            // OR depth is infinite (post-build patch + empty-grid
+            // init). Either alone is sufficient; both are checked
+            // so a future refactor of build's init can drop one
+            // without breaking the blit.
+            if snapshot.color[src_idx] == SKY_SENTINEL || snapshot.depth[src_idx].is_infinite() {
                 continue;
             }
             let dst_idx = row_dst_base + screen_x as usize;
@@ -566,7 +614,9 @@ mod tests {
     use super::*;
     use crate::GridTransform;
 
-    const SKY: u32 = 0xFF_AB_CD_EF;
+    // Sky pixels in built snapshots are tagged with SKY_SENTINEL
+    // (not a caller-supplied colour). The test asserts use this
+    // directly rather than re-exposing a separate constant.
 
     #[test]
     fn canonical_viewpoints_has_26() {
@@ -633,7 +683,7 @@ mod tests {
     #[test]
     fn build_populates_26_snapshots() {
         let grid = build_small_grid();
-        let cache = BillboardCache::build(&grid, 32, SKY);
+        let cache = BillboardCache::build(&grid, 32);
         assert_eq!(cache.resolution, 32);
         assert_eq!(cache.len(), 26);
         for (i, snap) in cache.snapshots.iter().enumerate() {
@@ -659,9 +709,9 @@ mod tests {
         // viewpoint produces at least ONE non-sky pixel — i.e.
         // the snapshot camera correctly framed the grid.
         let grid = build_small_grid();
-        let cache = BillboardCache::build(&grid, 32, SKY);
+        let cache = BillboardCache::build(&grid, 32);
         for (i, snap) in cache.snapshots.iter().enumerate() {
-            let non_sky = snap.color.iter().filter(|&&p| p != SKY).count();
+            let non_sky = snap.color.iter().filter(|&&p| p != SKY_SENTINEL).count();
             assert!(
                 non_sky > 0,
                 "snapshot {i} (view_dir={:?}) rendered all-sky",
@@ -673,12 +723,12 @@ mod tests {
     #[test]
     fn build_empty_grid_yields_26_all_sky_snapshots() {
         let grid = Grid::new(GridTransform::identity());
-        let cache = BillboardCache::build(&grid, 16, SKY);
+        let cache = BillboardCache::build(&grid, 16);
         assert_eq!(cache.len(), 26);
         for (i, snap) in cache.snapshots.iter().enumerate() {
             for &px in &snap.color {
                 assert_eq!(
-                    px, SKY,
+                    px, SKY_SENTINEL,
                     "empty grid snapshot {i} produced non-sky pixel {px:#010x}",
                 );
             }
@@ -691,7 +741,7 @@ mod tests {
     #[test]
     fn pick_nearest_returns_face_viewpoint_for_axis_query() {
         let grid = build_small_grid();
-        let cache = BillboardCache::build(&grid, 16, SKY);
+        let cache = BillboardCache::build(&grid, 16);
         // Query along +x: nearest viewpoint should be +x.
         let snap = cache.pick_nearest(DVec3::X).expect("non-empty cache");
         assert!(
@@ -713,7 +763,7 @@ mod tests {
         // Query along (1, 1, 1) / √3 lands exactly on the (+, +, +)
         // corner viewpoint; pick_nearest must return that.
         let grid = build_small_grid();
-        let cache = BillboardCache::build(&grid, 16, SKY);
+        let cache = BillboardCache::build(&grid, 16);
         let query = DVec3::new(1.0, 1.0, 1.0).normalize();
         let snap = cache.pick_nearest(query).expect("non-empty cache");
         assert!(

@@ -3,6 +3,7 @@
 //! evolution roadmap as the scene-graph substages land.
 
 mod collision;
+mod markers;
 #[cfg(test)]
 mod repro;
 mod scene;
@@ -467,6 +468,16 @@ impl ApplicationHandler for App {
                             "ship spin = {}",
                             if self.scene.spin_enabled { "ON" } else { "OFF" }
                         );
+                    }
+                    // S6.6: `B` toggles the marker pillars'
+                    // LOD configuration between always-Near
+                    // (default — full voxel, pre-S6.6 behaviour)
+                    // and the tuned billboards split (closer
+                    // pillars Near, farther pillars Far via S6.3's
+                    // billboard impostor blit). Pressed-edge only.
+                    KeyCode::KeyB if pressed => {
+                        let on = self.scene.toggle_billboards_lod();
+                        eprintln!("S6 billboards = {}", if on { "ON" } else { "OFF" });
                     }
                     // `+` / `=` (same key on US layout, with or without Shift)
                     // and the numpad `+` bump scan distance up by

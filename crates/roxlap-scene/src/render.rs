@@ -296,7 +296,7 @@ pub fn render_scene_composed(
             // Lazy populate: cleared by edits (see `edit.rs`),
             // rebuilt on first Far entry after each edit cycle.
             if grid.billboards.is_none() {
-                let cache = BillboardCache::build(grid, BILLBOARD_RESOLUTION, sky_color);
+                let cache = BillboardCache::build(grid, BILLBOARD_RESOLUTION);
                 grid.billboards = Some(cache);
             }
             // Grid bounds + world-space centre. Rotation preserves

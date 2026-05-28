@@ -25,7 +25,7 @@ pub const SHIP_SPIN_RATE_Z: f64 = 0.3;
 /// orientations) that the Z-only spin doesn't touch.
 pub const SHIP_SPIN_RATE_XY: f64 = 0.15;
 
-use crate::{ship, terrain};
+use crate::{markers, ship, terrain};
 
 /// Camera basis for "yaw=0, pitch=0 looks +x, voxlap-z down".
 /// Same convention as the existing `roxlap-host` demo.
@@ -111,7 +111,22 @@ pub fn build_demo() -> SceneAndCamera {
     // `(tp.y * 0.5 + tp.z) * 64 + 103.5` formula. Done once at
     // scene-build time; the renderer reads the baked values via
     // hrend / vrend without needing further setup.
+    //
+    // Done BEFORE marker grids are added so the marker chunks
+    // (built via fragmented `set_rect` calls — see
+    // `markers::build_one_marker`) don't pass through
+    // `generate_mips` inside the bake. That call hits the
+    // [[mip_attempt]] index-out-of-bounds for fragmented chunks.
+    // Markers stay unlit (flat colour stripes) which is fine for
+    // a LOD-tier visual validation demo.
     bake_lightmode_1(&mut scene);
+
+    // S6.6: 10 striped marker pillars along world +y. Built AFTER
+    // `bake_lightmode_1` so the markers skip the bake's
+    // generate_mips pass (see above). The `B` hotkey toggles their
+    // `lod_thresholds` between always-Near (default — pre-S6.6
+    // behaviour) and the tuned Near/Far config.
+    let marker_ids = markers::build_markers(&mut scene);
 
     // For the stacked-ground variant the terrain sits in chz=1
     // (world z=256..511). Spawn deeper into chz=0's air-gap (z=200,
@@ -134,6 +149,8 @@ pub fn build_demo() -> SceneAndCamera {
         ship_id,
         ship_angles: [0.0; 3],
         spin_enabled: false,
+        marker_ids,
+        lod_billboards_on: false,
     }
 }
 
@@ -165,6 +182,15 @@ pub struct SceneAndCamera {
     /// `R` toggles this; `false` freezes the ship at its current
     /// `ship_angles` (lighting bake stays as-is — see S5.3).
     pub spin_enabled: bool,
+    /// S6.6: grid ids of the 10 LOD marker pillars (closest first).
+    /// Held so the `B` hotkey can flip their `lod_thresholds`
+    /// without re-iterating the scene.
+    pub marker_ids: Vec<GridId>,
+    /// S6.6: `B` toggles this. `false` ⇒ marker grids render as
+    /// `Lod::Near` (full voxel — pre-S6.6 baseline); `true` ⇒
+    /// distance-keyed Near/Far split via the tuned thresholds in
+    /// [`crate::markers`].
+    pub lod_billboards_on: bool,
 }
 
 impl SceneAndCamera {
@@ -194,6 +220,16 @@ impl SceneAndCamera {
     /// non-axis-aligned, continuously-changing orientation.
     /// Composition order: `R_z · R_y · R_x` (X applied first to
     /// any grid-local vector, then Y, then Z).
+    /// S6.6: flip the marker grids' [`LodThresholds`] between
+    /// the always-Near default and the tuned billboards config.
+    /// Toggles [`Self::lod_billboards_on`] and returns the new
+    /// value so the caller can echo it to the console.
+    pub fn toggle_billboards_lod(&mut self) -> bool {
+        self.lod_billboards_on = !self.lod_billboards_on;
+        markers::set_billboards_lod(&mut self.scene, &self.marker_ids, self.lod_billboards_on);
+        self.lod_billboards_on
+    }
+
     pub fn tick_ship_spin(&mut self, dt: f64) {
         if !self.spin_enabled {
             return;
