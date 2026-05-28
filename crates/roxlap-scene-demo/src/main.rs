@@ -25,7 +25,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use crate::scene::{build_demo, SceneAndCamera};
+use crate::scene::{build_demo, build_streaming_demo, SceneAndCamera};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -192,7 +192,16 @@ impl App {
         });
         engine.set_sky(Some(sky));
 
-        let scene = build_demo();
+        // S7.6: `ROXLAP_STREAM=1` swaps the scene-build for the
+        // streaming-only cave demo (`CaveChunkGenerator` +
+        // `pump_streaming` per frame). Default (unset) keeps the
+        // ground/ship/markers showcase from S6.6.
+        let scene = if std::env::var("ROXLAP_STREAM").is_ok() {
+            eprintln!("ROXLAP_STREAM set — streaming cave demo (T to print stats)");
+            build_streaming_demo()
+        } else {
+            build_demo()
+        };
         // One slot per render thread. Strip-parallel rendering
         // (R12.3.1) splits each frame's y-range across the slots;
         // RENDER_THREADS caps the count below the efficiency knee.
@@ -238,6 +247,18 @@ impl App {
         // S5.2: advance the ship grid's rotation when the `R`
         // toggle is on. No-op otherwise.
         self.scene.tick_ship_spin(dt);
+        // S7.6: streaming pump — runs only when
+        // `ROXLAP_STREAM=1` activated `build_streaming_demo`.
+        // Drains any chunk-results that arrived since the last
+        // frame, evicts chunks past r_evict, dispatches missing
+        // chunks within r_active onto the background pool. Cheap
+        // when the camera is idle (drain pass short-circuits when
+        // the inbox is empty).
+        if self.scene.streaming_enabled {
+            self.scene
+                .scene
+                .pump_streaming(glam::DVec3::from_array(self.scene.cam_pos));
+        }
 
         // Resize ScratchPool / zbuffer when the window grew.
         let pixel_count = (size.width as usize) * (size.height as usize);
@@ -478,6 +499,21 @@ impl ApplicationHandler for App {
                     KeyCode::KeyB if pressed => {
                         let on = self.scene.toggle_billboards_lod();
                         eprintln!("S6 billboards = {}", if on { "ON" } else { "OFF" });
+                    }
+                    // S7.6: `T` (telemetry) prints chunk count +
+                    // pending count for each streaming-enabled
+                    // grid. No-op when not in streaming mode.
+                    KeyCode::KeyT if pressed && self.scene.streaming_enabled => {
+                        for (id, grid) in self.scene.scene.grids() {
+                            eprintln!(
+                                "grid #{id} chunks={chunks} pending={pending} radius={r_active:.0}/{r_evict:.0}",
+                                id = id.raw(),
+                                chunks = grid.chunk_count(),
+                                pending = grid.pending_gen.len(),
+                                r_active = grid.stream_radius.r_active,
+                                r_evict = grid.stream_radius.r_evict,
+                            );
+                        }
                     }
                     // `+` / `=` (same key on US layout, with or without Shift)
                     // and the numpad `+` bump scan distance up by
