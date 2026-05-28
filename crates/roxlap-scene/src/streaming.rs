@@ -23,8 +23,10 @@
 
 use std::fmt;
 
-use glam::IVec3;
+use glam::{DVec3, IVec3};
 use roxlap_formats::vxl::Vxl;
+
+use crate::{CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
 /// Pluggable per-chunk procedural generator.
 ///
@@ -52,11 +54,131 @@ pub trait ChunkGenerator: fmt::Debug + Send + Sync {
     fn generate(&self, chunk_idx: IVec3) -> Vxl;
 }
 
+/// Per-grid streaming activity / eviction radii (S7.1).
+///
+/// Both values are in **grid-local voxel units** — the same scale
+/// as a `GridLocalPos::voxel` coordinate. The math falls out
+/// cleanly from there: chunks span fixed integer voxel extents and
+/// the camera's grid-local position is also expressed in voxels.
+///
+/// Semantics inside [`crate::Scene::pump_streaming_sync`]:
+///
+/// - A chunk whose AABB-to-camera distance is `≤ r_active` MUST be
+///   loaded; if absent + a generator is attached, it gets streamed
+///   in via [`crate::Grid::ensure_chunk_generated`].
+/// - A chunk whose AABB-to-camera distance is `> r_evict` is
+///   dropped from the chunk map.
+/// - Chunks in the hysteresis band `(r_active, r_evict]` are
+///   neither streamed in nor evicted — they're left as-is. The
+///   gap prevents a camera oscillating near a boundary from
+///   thrashing generation + eviction.
+///
+/// The [`Default`] / [`Self::DISABLED`] value is `r_active = 0`,
+/// `r_evict = ∞`: [`crate::Scene::pump_streaming_sync`] is a no-op.
+/// Existing grids keep the pre-S7 "absent stays absent, present
+/// stays present" behaviour until a caller opts in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StreamRadius {
+    /// Chunks closer than this (grid-local voxels, AABB distance)
+    /// are streamed in.
+    pub r_active: f64,
+    /// Chunks farther than this (grid-local voxels, AABB distance)
+    /// are evicted. Must be `≥ r_active`.
+    pub r_evict: f64,
+}
+
+impl StreamRadius {
+    /// `r_active = 0`, `r_evict = ∞` — `pump_streaming_sync`
+    /// never streams a chunk in or evicts one. The default for
+    /// pre-S7.1 grids.
+    pub const DISABLED: Self = Self {
+        r_active: 0.0,
+        r_evict: f64::INFINITY,
+    };
+
+    /// New radius pair. Requires `r_evict >= r_active` so the
+    /// hysteresis band is well-formed (or empty when `==`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `r_evict < r_active`, if `r_active` is `NaN` or
+    /// negative, or if `r_evict` is negative. NaN and negative
+    /// radii are policy bugs — failing loud at construction beats
+    /// silently degenerating chunk-AABB tests later.
+    #[must_use]
+    pub fn new(r_active: f64, r_evict: f64) -> Self {
+        assert!(
+            r_evict >= r_active,
+            "StreamRadius: r_evict ({r_evict}) must be >= r_active ({r_active})"
+        );
+        assert!(
+            r_active.is_finite() && r_active >= 0.0,
+            "StreamRadius: r_active must be finite and >= 0, got {r_active}"
+        );
+        assert!(
+            r_evict >= 0.0,
+            "StreamRadius: r_evict must be >= 0, got {r_evict}"
+        );
+        Self { r_active, r_evict }
+    }
+
+    /// `true` for the [`Self::DISABLED`] sentinel pair. Lets
+    /// `pump_streaming_sync` skip the per-grid pass cheaply when
+    /// streaming is off.
+    #[must_use]
+    pub fn is_disabled(self) -> bool {
+        self.r_active == 0.0 && self.r_evict == f64::INFINITY
+    }
+}
+
+impl Default for StreamRadius {
+    fn default() -> Self {
+        Self::DISABLED
+    }
+}
+
+/// Squared distance from `p_local` (grid-local f64) to the AABB of
+/// the chunk at `chunk_idx`, also in grid-local voxel units.
+///
+/// The chunk at `(chx, chy, chz)` covers voxel-space
+/// `[chx*XY, (chx+1)*XY) × [chy*XY, (chy+1)*XY) × [chz*Z, (chz+1)*Z)`.
+/// Standard "clamp point to AABB then subtract" gives the closest
+/// point on the box; squared length avoids a sqrt per chunk in the
+/// streaming inner loop.
+///
+/// Returns `0.0` if `p_local` is inside the chunk.
+#[must_use]
+pub(crate) fn chunk_aabb_dist_sq(p_local: DVec3, chunk_idx: IVec3) -> f64 {
+    let sxy = f64::from(CHUNK_SIZE_XY);
+    let sz = f64::from(CHUNK_SIZE_Z);
+    let lo = DVec3::new(
+        f64::from(chunk_idx.x) * sxy,
+        f64::from(chunk_idx.y) * sxy,
+        f64::from(chunk_idx.z) * sz,
+    );
+    let hi = DVec3::new(lo.x + sxy, lo.y + sxy, lo.z + sz);
+    let dx = (lo.x - p_local.x).max(0.0).max(p_local.x - hi.x);
+    let dy = (lo.y - p_local.y).max(0.0).max(p_local.y - hi.y);
+    let dz = (lo.z - p_local.z).max(0.0).max(p_local.z - hi.z);
+    dx * dx + dy * dy + dz * dz
+}
+
+/// World-to-grid-local f64 transform — the same inverse-rotation
+/// path as [`crate::addr::world_to_grid_local`], but skipping the
+/// chunk + voxel + fract decomposition. Used by
+/// [`crate::Scene::pump_streaming_sync`] which only needs the
+/// continuous grid-local position to test chunk-AABB distances.
+#[must_use]
+pub(crate) fn world_to_grid_local_pos(world_pos: DVec3, transform: &crate::GridTransform) -> DVec3 {
+    transform.rotation.inverse() * (world_pos - transform.origin)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::chunks::tests::voxel_is_solid;
-    use crate::{Grid, GridTransform, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+    use crate::{Grid, GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+    use glam::DQuat;
     use roxlap_formats::edit::{set_spans, Vspan};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -209,5 +331,286 @@ pub(crate) mod tests {
             !voxel_is_solid(chunk, 0, 0, 0),
             "generator's mark voxel must NOT appear"
         );
+    }
+
+    // ---- S7.1: StreamRadius + Scene::pump_streaming_sync ----
+
+    #[test]
+    fn stream_radius_disabled_is_truly_zero_infty() {
+        let r = StreamRadius::DISABLED;
+        assert_eq!(r.r_active, 0.0);
+        assert!(r.r_evict.is_infinite() && r.r_evict.is_sign_positive());
+        assert!(r.is_disabled());
+        assert!(StreamRadius::default().is_disabled());
+    }
+
+    #[test]
+    fn stream_radius_new_rejects_evict_below_active() {
+        // Guard against accidental "r_evict < r_active" configs that
+        // would evict eagerly + re-stream the same chunk every pump.
+        let result = std::panic::catch_unwind(|| StreamRadius::new(200.0, 100.0));
+        assert!(result.is_err(), "r_evict < r_active must panic");
+    }
+
+    #[test]
+    fn chunk_aabb_dist_sq_inside_chunk_is_zero() {
+        // Camera at (10, 20, 30) — well inside chunk (0, 0, 0)
+        // which covers x,y in [0, 128) and z in [0, 256).
+        let d = chunk_aabb_dist_sq(DVec3::new(10.0, 20.0, 30.0), IVec3::new(0, 0, 0));
+        assert_eq!(d, 0.0);
+    }
+
+    #[test]
+    fn chunk_aabb_dist_sq_axis_aligned() {
+        // Camera at (0, 0, 0). Chunk (1, 0, 0) starts at x=128; nearest
+        // point on its AABB is (128, 0, 0); squared distance 128² = 16384.
+        let d = chunk_aabb_dist_sq(DVec3::ZERO, IVec3::new(1, 0, 0));
+        let expected = 128.0_f64.powi(2);
+        assert!((d - expected).abs() < 1e-9, "got {d}, want {expected}");
+        // Chunk (0, 0, 1) — nearest face at z=256.
+        let d = chunk_aabb_dist_sq(DVec3::ZERO, IVec3::new(0, 0, 1));
+        let expected = 256.0_f64.powi(2);
+        assert!((d - expected).abs() < 1e-9, "got {d}, want {expected}");
+    }
+
+    #[test]
+    fn pump_streaming_sync_with_disabled_radius_is_noop() {
+        // Disabled (default) → never generates, never evicts. This is
+        // the byte-stability guarantee for any pre-S7.1 caller.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let gen = StubGenerator::new();
+        let counter = Arc::clone(&gen.call_count);
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .set_generator(Some(Box::new(gen)));
+        // Stamp a far-away chunk that would be evicted under any
+        // finite r_evict.
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .set_voxel(IVec3::new(10_000, 0, 0), Some(0x80_11_22_33));
+        let baseline_chunks = scene.grid(id).unwrap().chunk_count();
+        scene.pump_streaming_sync(DVec3::ZERO);
+        assert_eq!(scene.grid(id).unwrap().chunk_count(), baseline_chunks);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn pump_streaming_sync_streams_in_chunks_within_r_active() {
+        // r_active = 200 voxels covers chunk (0,0,0) (origin) plus the
+        // ring of XY neighbours whose nearest face lies within 200 of
+        // origin. Chunks at chx ±1 are 128 voxels away (within); chunks
+        // at chx ±2 are 256 voxels away (just outside).
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let gen = StubGenerator::new();
+        let counter = Arc::clone(&gen.call_count);
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Box::new(gen)));
+        g.stream_radius = StreamRadius::new(200.0, 400.0);
+        scene.pump_streaming_sync(DVec3::ZERO);
+
+        // Camera at world origin → grid-local (0, 0, 0). chz coverage:
+        // chunk (0,0,0) Z-AABB is [0, 256); chunk (0,0,-1) Z-AABB is
+        // [-256, 0). Both touch the camera point → both must stream
+        // in. (0,0,1) is at z=256, more than 200 away → must NOT.
+        let g = scene.grid(id).unwrap();
+        let must_have = [
+            IVec3::new(0, 0, 0),
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, -1),
+        ];
+        for idx in must_have {
+            assert!(
+                g.chunks.contains_key(&idx),
+                "chunk {idx:?} missing from streamed set"
+            );
+        }
+        // Diagonals at chunk (1,1,0): AABB nearest = (128,128,0);
+        // dist = sqrt(128² + 128²) ≈ 181.0 < 200 → must be streamed.
+        assert!(g.chunks.contains_key(&IVec3::new(1, 1, 0)));
+        // Chunk (2, 0, 0): nearest face at x=256, dist=256 > 200.
+        assert!(!g.chunks.contains_key(&IVec3::new(2, 0, 0)));
+        // Camera chz coverage: (0,0,1) at z=256 > 200 → out.
+        assert!(!g.chunks.contains_key(&IVec3::new(0, 0, 1)));
+
+        // Counter equals number of streamed chunks.
+        let streamed = g.chunk_count();
+        assert_eq!(counter.load(Ordering::Relaxed), streamed);
+    }
+
+    #[test]
+    fn pump_streaming_sync_idempotent_under_stationary_camera() {
+        // Second pump at the same position must NOT regenerate any
+        // already-loaded chunk — counter stays at the post-first-pump
+        // value.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let gen = StubGenerator::new();
+        let counter = Arc::clone(&gen.call_count);
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Box::new(gen)));
+        g.stream_radius = StreamRadius::new(180.0, 400.0);
+
+        scene.pump_streaming_sync(DVec3::ZERO);
+        let after_first = counter.load(Ordering::Relaxed);
+        scene.pump_streaming_sync(DVec3::ZERO);
+        let after_second = counter.load(Ordering::Relaxed);
+        assert_eq!(after_first, after_second, "second pump regenerated chunks");
+    }
+
+    #[test]
+    fn pump_streaming_sync_evicts_chunks_beyond_r_evict() {
+        // Stream chunks within r_active=200; then move the camera far
+        // away and verify r_evict trims the now-distant set.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let gen = StubGenerator::new();
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Box::new(gen)));
+        g.stream_radius = StreamRadius::new(200.0, 400.0);
+        scene.pump_streaming_sync(DVec3::ZERO);
+        let initial = scene.grid(id).unwrap().chunk_count();
+        assert!(initial > 0, "expected chunks streamed in around origin");
+
+        // Teleport camera ~10_000 voxels along +x; every chunk near
+        // the old origin is now > r_evict (400) away.
+        scene.pump_streaming_sync(DVec3::new(10_000.0, 0.0, 0.0));
+        let g = scene.grid(id).unwrap();
+        for idx in [
+            IVec3::new(0, 0, 0),
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+        ] {
+            assert!(
+                !g.chunks.contains_key(&idx),
+                "chunk {idx:?} survived eviction after far teleport"
+            );
+        }
+        // New chunks around the new camera position must exist.
+        // Camera at x=10_000 → chunk chx = 10_000 / 128 ≈ 78.
+        let cam_chx = 10_000_i32 / i32::try_from(CHUNK_SIZE_XY).unwrap();
+        assert!(g.chunks.contains_key(&IVec3::new(cam_chx, 0, 0)));
+    }
+
+    #[test]
+    fn pump_streaming_sync_hysteresis_band_retains_chunks() {
+        // r_active = 200, r_evict = 600. A chunk that's currently
+        // present and lives in the band (200 < d <= 600) is neither
+        // streamed in (it's already present) nor evicted (within
+        // r_evict). Move just past r_active and check the chunks that
+        // were inside the now-shrunk active set stay loaded.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let gen = StubGenerator::new();
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Box::new(gen)));
+        g.stream_radius = StreamRadius::new(200.0, 600.0);
+        scene.pump_streaming_sync(DVec3::ZERO);
+        let g = scene.grid(id).unwrap();
+        // A chunk at (1, 0, 0) is 128 voxels away — well inside
+        // r_active. After bumping the camera to (300, 0, 0), nearest
+        // face of (1, 0, 0) is x=256 → dist = max(0, 300-256) = 44 <
+        // r_active, still inside r_active so it would stream in again
+        // anyway. We need a chunk we KNOW will fall in the
+        // hysteresis band. (-2, 0, 0): AABB nearest face x=-128;
+        // initial dist at cam (0,0,0) = 128 (inside r_active). After
+        // pump #1, present. After cam → (300, 0, 0): dist = 300 - (-128)
+        // = 428 → in band (200, 600]. Must stay.
+        let band_idx = IVec3::new(-2, 0, 0);
+        // First, confirm (-2, 0, 0) was actually streamed in (its dist
+        // from origin is min(128, 256) = 128 along x → 128 < 200).
+        assert!(
+            g.chunks.contains_key(&band_idx),
+            "(-2, 0, 0) should be streamed at origin"
+        );
+
+        scene.pump_streaming_sync(DVec3::new(300.0, 0.0, 0.0));
+        let g = scene.grid(id).unwrap();
+        assert!(
+            g.chunks.contains_key(&band_idx),
+            "(-2, 0, 0) should remain in the hysteresis band"
+        );
+    }
+
+    #[test]
+    fn pump_streaming_sync_with_no_generator_does_not_panic() {
+        // r_active > 0 but no generator: pump must skip the stream-in
+        // pass cleanly and still run the evict pass. Use a manually-
+        // edited chunk that's far away to verify eviction still works.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        g.stream_radius = StreamRadius::new(200.0, 400.0);
+        // Manual chunk at (50, 0, 0): grid-local x=50*128 = 6400, far
+        // outside r_evict from origin.
+        g.set_voxel(IVec3::new(50 * 128, 0, 0), Some(0x80_aa_bb_cc));
+        assert_eq!(scene.grid(id).unwrap().chunk_count(), 1);
+
+        scene.pump_streaming_sync(DVec3::ZERO);
+        let g = scene.grid(id).unwrap();
+        // Stream-in pass was a no-op (no generator); evict pass
+        // dropped the far chunk.
+        assert_eq!(g.chunk_count(), 0);
+    }
+
+    #[test]
+    fn pump_streaming_sync_respects_grid_rotation() {
+        // Place a grid rotated 180° around Z. World camera at
+        // (+10, 0, 0) maps to grid-local (-10, 0, 0). The streamed
+        // chunk set must reflect that — chunk (-1, 0, 0) must be
+        // present (grid-local x=-10 falls inside (-128, 0]).
+        let transform = GridTransform {
+            origin: DVec3::ZERO,
+            rotation: DQuat::from_axis_angle(DVec3::Z, std::f64::consts::PI),
+        };
+        let mut scene = Scene::new();
+        let id = scene.add_grid(transform);
+        let gen = StubGenerator::new();
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Box::new(gen)));
+        g.stream_radius = StreamRadius::new(50.0, 200.0);
+
+        // World camera at (+10, 0, 0). After inverse 180°-Z, grid-local
+        // is (-10, 0, 0).
+        scene.pump_streaming_sync(DVec3::new(10.0, 0.0, 0.0));
+        let g = scene.grid(id).unwrap();
+        // Camera grid-local x = -10 → camera chunk chx = floor(-10/128) = -1.
+        // Chunk (-1, 0, 0) AABB nearest x lies in [-128, 0); camera in
+        // it → dist 0 → must be streamed.
+        assert!(
+            g.chunks.contains_key(&IVec3::new(-1, 0, 0)),
+            "rotation not applied — camera should map to chunk (-1, 0, 0)"
+        );
+        // Chunk (0, 0, 0) starts at x=0; camera at x=-10 → dist=10 <
+        // r_active → also streamed.
+        assert!(g.chunks.contains_key(&IVec3::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn pump_streaming_sync_eviction_clears_billboard_cache() {
+        // S7.4 will hand off invalidation more carefully; for S7.1
+        // we just pin that eviction nukes the cache so a future Far
+        // render rebuilds it. (Cache stays untouched when nothing
+        // gets evicted.)
+        use crate::BillboardCache;
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        // Seed a single chunk to evict and a placeholder cache.
+        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_aa_bb_cc));
+        g.billboards = Some(BillboardCache::new_empty(64));
+        g.stream_radius = StreamRadius::new(10.0, 50.0);
+
+        // Camera far enough that the chunk's nearest face > r_evict.
+        scene.pump_streaming_sync(DVec3::new(10_000.0, 0.0, 0.0));
+        let g = scene.grid(id).unwrap();
+        assert_eq!(g.chunk_count(), 0, "chunk should have been evicted");
+        assert!(g.billboards.is_none(), "billboard cache should be cleared");
     }
 }

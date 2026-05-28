@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
 pub use billboard::{canonical_viewpoints, BillboardCache, BillboardSnapshot};
 pub use lod::{select_lod, Lod, LodThresholds};
-pub use streaming::ChunkGenerator;
+pub use streaming::{ChunkGenerator, StreamRadius};
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
 /// chunks compact (~2 MB worst-case dense-slab footprint inside
@@ -192,6 +192,11 @@ pub struct Grid {
     /// `None` is the default — a grid without a generator behaves
     /// exactly like the pre-S7 grids: absent chunks stay absent.
     pub generator: Option<Box<dyn ChunkGenerator>>,
+    /// Streaming activity / eviction radii used by
+    /// [`Scene::pump_streaming_sync`] (S7.1). Defaults to
+    /// [`StreamRadius::DISABLED`] so existing grids see no change
+    /// in behaviour until the caller opts in.
+    pub stream_radius: StreamRadius,
 }
 
 impl Grid {
@@ -208,6 +213,7 @@ impl Grid {
             lod_thresholds: LodThresholds::always_near(),
             billboards: None,
             generator: None,
+            stream_radius: StreamRadius::DISABLED,
         }
     }
 
@@ -366,6 +372,98 @@ impl Scene {
     /// is not guaranteed (HashMap-backed).
     pub fn grids_mut(&mut self) -> impl Iterator<Item = (GridId, &mut Grid)> {
         self.grids.iter_mut().map(|(id, g)| (*id, g))
+    }
+
+    /// Synchronous streaming pump (S7.1).
+    ///
+    /// For each grid with a non-[`StreamRadius::DISABLED`] policy:
+    /// 1. Project the world-space camera into grid-local coords
+    ///    (inverse rotation + origin subtract).
+    /// 2. Stream in any chunk whose AABB-to-camera distance is
+    ///    `<= r_active`, calling [`Grid::ensure_chunk_generated`].
+    ///    No-ops gracefully if the grid has no generator attached
+    ///    (so callers can use the eviction half of streaming on a
+    ///    purely-edited grid).
+    /// 3. Evict any chunk whose AABB-to-camera distance exceeds
+    ///    `r_evict` from the grid's chunk map. Eviction also
+    ///    clears the cached [`BillboardCache`] (the bounding sphere
+    ///    may shrink, invalidating impostor projections; the next
+    ///    Far-tier render rebuilds lazily).
+    ///
+    /// Both passes use the f64 grid-local position so rotation
+    /// + non-axis-aligned grids stream and evict correctly. The
+    /// generate path is blocking — S7.3 will move it to a
+    /// background rayon pool with `pump_streaming` (non-blocking).
+    /// Callers that want the async variant in S7.0/S7.1 stages
+    /// should keep `r_active` small.
+    pub fn pump_streaming_sync(&mut self, camera_world_pos: DVec3) {
+        for grid in self.grids.values_mut() {
+            pump_grid_streaming_sync(grid, camera_world_pos);
+        }
+    }
+}
+
+/// S7.1 helper — drives one grid's streaming pass. Pulled out of
+/// [`Scene::pump_streaming_sync`]'s body so the per-grid logic is
+/// testable in isolation and so the inner loops stay legible.
+fn pump_grid_streaming_sync(grid: &mut Grid, camera_world_pos: DVec3) {
+    let radius = grid.stream_radius;
+    if radius.is_disabled() {
+        return;
+    }
+    let cam_local = streaming::world_to_grid_local_pos(camera_world_pos, &grid.transform);
+
+    // --- Pass 1: stream in active chunks ----------------------
+    if radius.r_active > 0.0 && grid.generator.is_some() {
+        let r_sq = radius.r_active * radius.r_active;
+        let sxy = f64::from(CHUNK_SIZE_XY);
+        let sz = f64::from(CHUNK_SIZE_Z);
+        // Half-extent in chunk units; ceil to be conservative so
+        // any chunk whose AABB clips the radius gets considered.
+        // `+1` covers the half-open chunk-AABB upper edge plus the
+        // case where the camera sits exactly on a chunk boundary
+        // and the closest chunk is one index off.
+        #[allow(clippy::cast_possible_truncation)]
+        let r_chunks_xy = (radius.r_active / sxy).ceil() as i32 + 1;
+        #[allow(clippy::cast_possible_truncation)]
+        let r_chunks_z = (radius.r_active / sz).ceil() as i32 + 1;
+        #[allow(clippy::cast_possible_truncation)]
+        let cx_chunk = (cam_local.x / sxy).floor() as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let cy_chunk = (cam_local.y / sxy).floor() as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let cz_chunk = (cam_local.z / sz).floor() as i32;
+        for chz in (cz_chunk - r_chunks_z)..=(cz_chunk + r_chunks_z) {
+            for chy in (cy_chunk - r_chunks_xy)..=(cy_chunk + r_chunks_xy) {
+                for chx in (cx_chunk - r_chunks_xy)..=(cx_chunk + r_chunks_xy) {
+                    let idx = IVec3::new(chx, chy, chz);
+                    if streaming::chunk_aabb_dist_sq(cam_local, idx) <= r_sq {
+                        grid.ensure_chunk_generated(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Pass 2: evict chunks past r_evict --------------------
+    if radius.r_evict.is_finite() {
+        let r_sq = radius.r_evict * radius.r_evict;
+        // Collect first to side-step the iter-while-mutate borrow.
+        let to_evict: Vec<IVec3> = grid
+            .chunks
+            .keys()
+            .filter(|&&idx| streaming::chunk_aabb_dist_sq(cam_local, idx) > r_sq)
+            .copied()
+            .collect();
+        if !to_evict.is_empty() {
+            for idx in &to_evict {
+                grid.chunks.remove(idx);
+            }
+            // Bounding sphere can shrink → impostor projections
+            // would be wrong on next Far render. Clear lazily; the
+            // next Far-tier pass repopulates via BillboardCache::build.
+            grid.billboards = None;
+        }
     }
 }
 
