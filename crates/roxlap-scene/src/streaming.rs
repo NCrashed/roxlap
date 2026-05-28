@@ -592,6 +592,56 @@ pub(crate) mod tests {
         assert!(g.chunks.contains_key(&IVec3::new(0, 0, 0)));
     }
 
+    // ---- S7.2: chunk_version interplay with streaming ----
+
+    #[test]
+    fn ensure_chunk_generated_does_not_bump_version() {
+        // A freshly-generated chunk has no user edits → version 0.
+        let mut g = Grid::new(GridTransform::identity());
+        let gen = StubGenerator::new();
+        g.set_generator(Some(Box::new(gen)));
+        let idx = IVec3::new(2, 3, 0);
+        assert!(g.ensure_chunk_generated(idx));
+        assert_eq!(g.chunk_version(idx), 0);
+        // chunk_versions doesn't grow either.
+        assert!(g.chunk_versions.is_empty());
+    }
+
+    #[test]
+    fn ensure_chunk_generated_then_edit_starts_at_version_one() {
+        // Generator install + a single edit → version 1 (not 2).
+        let mut g = Grid::new(GridTransform::identity());
+        let gen = StubGenerator::new();
+        g.set_generator(Some(Box::new(gen)));
+        let idx = IVec3::ZERO;
+        g.ensure_chunk_generated(idx);
+        g.set_voxel(IVec3::new(10, 10, 10), Some(0x80_aa_bb_cc));
+        assert_eq!(g.chunk_version(idx), 1);
+    }
+
+    #[test]
+    fn pump_streaming_sync_eviction_drops_chunk_version_entry() {
+        // Edit a chunk (version bumps to 1), then evict it via the
+        // streaming pump. The chunk_versions map entry must also be
+        // dropped so the map stays bounded.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_aa_bb_cc));
+        assert_eq!(g.chunk_version(IVec3::ZERO), 1);
+        g.stream_radius = StreamRadius::new(10.0, 50.0);
+
+        scene.pump_streaming_sync(DVec3::new(10_000.0, 0.0, 0.0));
+        let g = scene.grid(id).unwrap();
+        assert_eq!(g.chunk_count(), 0, "chunk should have been evicted");
+        assert_eq!(
+            g.chunk_version(IVec3::ZERO),
+            0,
+            "version entry should be cleared on eviction"
+        );
+        assert!(g.chunk_versions.is_empty(), "map should be empty");
+    }
+
     #[test]
     fn pump_streaming_sync_eviction_clears_billboard_cache() {
         // S7.4 will hand off invalidation more carefully; for S7.1

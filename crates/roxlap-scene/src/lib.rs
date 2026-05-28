@@ -197,6 +197,24 @@ pub struct Grid {
     /// [`StreamRadius::DISABLED`] so existing grids see no change
     /// in behaviour until the caller opts in.
     pub stream_radius: StreamRadius,
+    /// Per-chunk edit version counter (S7.2). Each user edit
+    /// through [`Self::set_voxel`] / [`Self::set_rect`] /
+    /// [`Self::set_sphere`] bumps the counter for every chunk it
+    /// actually wrote to. [`Self::ensure_chunk_generated`] does
+    /// NOT bump — a freshly generated chunk has no edits and
+    /// reads as version 0.
+    ///
+    /// Wired up here so the S7.3 async dispatch can detect "an
+    /// edit happened while a chunk was being generated in the
+    /// background" and discard the now-stale result: each
+    /// background task captures the dispatch-time version and
+    /// only installs its result iff the current version still
+    /// matches.
+    ///
+    /// Missing entries read as `0` via [`Self::chunk_version`].
+    /// Evictions in [`Scene::pump_streaming_sync`] drop the
+    /// corresponding entry so the map stays bounded.
+    pub chunk_versions: HashMap<IVec3, u64>,
 }
 
 impl Grid {
@@ -214,7 +232,38 @@ impl Grid {
             billboards: None,
             generator: None,
             stream_radius: StreamRadius::DISABLED,
+            chunk_versions: HashMap::new(),
         }
+    }
+
+    /// Current per-chunk edit version (S7.2). Returns `0` for any
+    /// chunk that hasn't been edited yet (including absent chunks
+    /// and chunks materialised only via
+    /// [`Self::ensure_chunk_generated`]).
+    ///
+    /// Used by S7.3's async generation dispatch to detect "edit
+    /// happened while we were generating" — the dispatcher
+    /// snapshots this value, the background task carries it, and
+    /// the result is discarded on install if the live counter has
+    /// since moved.
+    #[must_use]
+    pub fn chunk_version(&self, chunk_idx: IVec3) -> u64 {
+        self.chunk_versions.get(&chunk_idx).copied().unwrap_or(0)
+    }
+
+    /// Bump the edit version of `chunk_idx` (S7.2). Saturating add
+    /// at `u64::MAX` — a chunk would need 10^11 edits per second
+    /// for ~5 years to wrap, so saturation is a defensive cap, not
+    /// a realistic concern.
+    ///
+    /// Called by the edit API ([`Self::set_voxel`] /
+    /// [`Self::set_rect`] / [`Self::set_sphere`]) after a chunk
+    /// has actually been written to. Pure no-op edit paths
+    /// (carving from an air chunk that doesn't exist yet) skip
+    /// the bump.
+    pub(crate) fn bump_chunk_version(&mut self, chunk_idx: IVec3) {
+        let entry = self.chunk_versions.entry(chunk_idx).or_insert(0);
+        *entry = entry.saturating_add(1);
     }
 
     /// Attach (or detach) the procedural generator used by
@@ -458,6 +507,14 @@ fn pump_grid_streaming_sync(grid: &mut Grid, camera_world_pos: DVec3) {
         if !to_evict.is_empty() {
             for idx in &to_evict {
                 grid.chunks.remove(idx);
+                // S7.2: keep chunk_versions in sync with chunks so
+                // the map stays bounded. A future re-stream of the
+                // same idx restarts at 0 — that's fine because any
+                // in-flight gen-result tagged with the pre-eviction
+                // version is unreachable (no chunk to install onto)
+                // and gets discarded by the new "version still 0"
+                // check anyway.
+                grid.chunk_versions.remove(idx);
             }
             // Bounding sphere can shrink → impostor projections
             // would be wrong on next Far render. Clear lazily; the

@@ -61,6 +61,8 @@ impl Grid {
                 in_chunk.z as i32,
                 color,
             );
+            // S7.2: bump only on actual write. Insert always writes.
+            self.bump_chunk_version(chunk_idx);
         } else if let Some(vxl) = self.chunks.get_mut(&chunk_idx) {
             #[allow(clippy::cast_possible_wrap)]
             set_cube(
@@ -70,6 +72,9 @@ impl Grid {
                 in_chunk.z as i32,
                 None,
             );
+            // S7.2: carve only writes when the chunk pre-existed
+            // (we're inside the `if let Some` branch).
+            self.bump_chunk_version(chunk_idx);
         }
     }
 
@@ -152,11 +157,19 @@ fn apply_set_rect(
     local_hi: IVec3,
     color: Option<u32>,
 ) {
+    let mut wrote = false;
     if color.is_some() {
         let vxl = grid.ensure_chunk(chunk_idx);
         set_rect(vxl, local_lo.into(), local_hi.into(), color);
+        wrote = true;
     } else if let Some(vxl) = grid.chunks.get_mut(&chunk_idx) {
         set_rect(vxl, local_lo.into(), local_hi.into(), None);
+        wrote = true;
+    }
+    if wrote {
+        // S7.2: only writes bump. Carve on a missing chunk is a
+        // pure no-op (no entry to advance).
+        grid.bump_chunk_version(chunk_idx);
     }
 }
 
@@ -167,11 +180,18 @@ fn apply_set_sphere(
     radius: u32,
     color: Option<u32>,
 ) {
+    let mut wrote = false;
     if color.is_some() {
         let vxl = grid.ensure_chunk(chunk_idx);
         set_sphere(vxl, local_centre.into(), radius, color);
+        wrote = true;
     } else if let Some(vxl) = grid.chunks.get_mut(&chunk_idx) {
         set_sphere(vxl, local_centre.into(), radius, None);
+        wrote = true;
+    }
+    if wrote {
+        // S7.2: see apply_set_rect rationale.
+        grid.bump_chunk_version(chunk_idx);
     }
 }
 
@@ -413,5 +433,74 @@ mod tests {
             .chunk(IVec3::new(1, 2, 1))
             .expect("expected chunk (1, 2, 1)");
         assert!(voxel_is_solid(vxl, 72, 44, 244));
+    }
+
+    // ---- S7.2: chunk version counter bumps ----
+
+    #[test]
+    fn chunk_version_defaults_to_zero_for_missing() {
+        let g = Grid::new(GridTransform::identity());
+        assert_eq!(g.chunk_version(IVec3::ZERO), 0);
+        assert_eq!(g.chunk_version(IVec3::new(7, -3, 12)), 0);
+    }
+
+    #[test]
+    fn set_voxel_insert_bumps_to_one() {
+        let mut g = Grid::new(GridTransform::identity());
+        assert_eq!(g.chunk_version(IVec3::ZERO), 0);
+        g.set_voxel(IVec3::new(5, 5, 5), Some(TEST_COL));
+        assert_eq!(g.chunk_version(IVec3::ZERO), 1);
+    }
+
+    #[test]
+    fn set_voxel_carve_in_existing_chunk_bumps() {
+        // Sequence (insert, carve) → version 2.
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_voxel(IVec3::new(5, 5, 5), Some(TEST_COL));
+        g.set_voxel(IVec3::new(5, 5, 5), None);
+        assert_eq!(g.chunk_version(IVec3::ZERO), 2);
+    }
+
+    #[test]
+    fn set_voxel_carve_in_missing_chunk_does_not_bump() {
+        // No-op edit path — no chunk created, no version bump.
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_voxel(IVec3::new(5, 5, 5), None);
+        assert_eq!(g.chunk_version(IVec3::ZERO), 0);
+        assert!(g.chunk_versions.is_empty());
+    }
+
+    #[test]
+    fn set_rect_multi_chunk_bumps_every_touched_chunk() {
+        // Box crossing the x=128 boundary → two chunks both bumped.
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_rect(IVec3::new(126, 0, 0), IVec3::new(129, 0, 0), Some(TEST_COL));
+        assert_eq!(g.chunk_version(IVec3::ZERO), 1);
+        assert_eq!(g.chunk_version(IVec3::new(1, 0, 0)), 1);
+        // No other chunks touched.
+        assert_eq!(g.chunk_versions.len(), 2);
+    }
+
+    #[test]
+    fn set_rect_carve_bumps_only_existing_chunks() {
+        // Insert into chunk 0; then carve a 2-chunk-wide rect that
+        // overlaps chunk 0 + chunk 1. Chunk 0 (exists) should bump
+        // again; chunk 1 (still implicit-air) should NOT.
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_voxel(IVec3::new(0, 0, 0), Some(TEST_COL));
+        assert_eq!(g.chunk_version(IVec3::ZERO), 1);
+        g.set_rect(IVec3::new(126, 0, 0), IVec3::new(129, 0, 0), None);
+        assert_eq!(g.chunk_version(IVec3::ZERO), 2);
+        assert_eq!(g.chunk_version(IVec3::new(1, 0, 0)), 0);
+    }
+
+    #[test]
+    fn set_sphere_multi_chunk_bumps_every_written_chunk() {
+        // Sphere centred on (127, 64, 100) radius 4 → touches
+        // chunks (0,0,0) and (1,0,0).
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_sphere(IVec3::new(127, 64, 100), 4, Some(TEST_COL));
+        assert_eq!(g.chunk_version(IVec3::ZERO), 1);
+        assert_eq!(g.chunk_version(IVec3::new(1, 0, 0)), 1);
     }
 }

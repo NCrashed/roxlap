@@ -97,6 +97,13 @@ pub struct GridSnapshot {
     /// [`roxlap_formats::vxl::serialize`] output — re-parseable
     /// via [`roxlap_formats::vxl::parse`].
     pub chunks: Vec<(IVec3, Vec<u8>)>,
+    /// S7.2: per-chunk edit version counters, sorted by chunk
+    /// index. Chunks absent from this list restore as version 0 —
+    /// the same as a freshly generated or pre-S7.2 snapshot. The
+    /// `#[serde(default)]` attribute lets a pre-S7.2 snapshot
+    /// deserialise into this newer struct shape cleanly.
+    #[serde(default)]
+    pub chunk_versions: Vec<(IVec3, u64)>,
 }
 
 /// Errors from [`Scene::from_snapshot`]. Wraps the per-chunk
@@ -157,11 +164,27 @@ impl Scene {
                 .into_iter()
                 .map(|addr| (addr, compact_serialize_chunk(&grid.chunks[&addr])))
                 .collect();
+            // S7.2: emit chunk_versions sorted by chunk idx so the
+            // snapshot bytes stay deterministic (HashMap iter order
+            // is not). Zero entries are dropped on the assumption
+            // "missing == 0" — the snapshot stays compact for grids
+            // whose live counters are dense in 1+.
+            let mut version_addrs: Vec<IVec3> = grid
+                .chunk_versions
+                .iter()
+                .filter_map(|(a, v)| if *v != 0 { Some(*a) } else { None })
+                .collect();
+            version_addrs.sort_unstable_by_key(|a| (a.x, a.y, a.z));
+            let chunk_versions = version_addrs
+                .into_iter()
+                .map(|addr| (addr, grid.chunk_versions[&addr]))
+                .collect();
             grids.push((
                 id,
                 GridSnapshot {
                     transform: grid.transform,
                     chunks,
+                    chunk_versions,
                 },
             ));
         }
@@ -196,6 +219,12 @@ impl Scene {
                 let n_cols = (vxl.vsid as usize) * (vxl.vsid as usize);
                 vxl.reserve_edit_capacity(n_cols * RESTORE_EDIT_HEADROOM_PER_COLUMN);
                 grid.chunks.insert(*addr, vxl);
+            }
+            // S7.2: restore per-chunk versions. Pre-S7.2 snapshots
+            // carry an empty Vec (via #[serde(default)]) → no
+            // bumps applied, every chunk reads as version 0.
+            for (addr, ver) in &gsnap.chunk_versions {
+                grid.chunk_versions.insert(*addr, *ver);
             }
             scene.grids.insert(*id, grid);
         }
@@ -358,6 +387,52 @@ mod tests {
             .chunk(IVec3::ZERO)
             .expect("chunk created");
         assert!(voxel_is_solid(chunk, 50, 51, 52));
+    }
+
+    // ---- S7.2: chunk_versions round-trip ----
+
+    #[test]
+    fn snapshot_round_trip_preserves_chunk_versions() {
+        // Build a scene whose chunk_versions are non-trivial (multi-
+        // edit on the same chunk + edits across multiple chunks),
+        // round-trip, and verify every version survives.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        // Three edits on chunk (0,0,0) → version 3.
+        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_aa_bb_cc));
+        g.set_voxel(IVec3::new(1, 1, 1), Some(0x80_dd_ee_ff));
+        g.set_voxel(IVec3::new(2, 2, 2), Some(0x80_11_22_33));
+        // One edit on chunk (1,0,0) → version 1.
+        g.set_voxel(IVec3::new(128, 0, 0), Some(0x80_44_55_66));
+        assert_eq!(g.chunk_version(IVec3::ZERO), 3);
+        assert_eq!(g.chunk_version(IVec3::new(1, 0, 0)), 1);
+
+        let snap = scene.to_snapshot();
+        let bytes = bincode::serialize(&snap).expect("bincode serialize");
+        let snap_back: SceneSnapshot = bincode::deserialize(&bytes).expect("bincode deserialize");
+        let restored = Scene::from_snapshot(&snap_back).expect("restore");
+
+        let g = restored.grid(id).expect("grid present");
+        assert_eq!(g.chunk_version(IVec3::ZERO), 3);
+        assert_eq!(g.chunk_version(IVec3::new(1, 0, 0)), 1);
+        assert_eq!(g.chunk_versions.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_chunk_versions_zero_entries_are_dropped_from_wire() {
+        // Implementation detail worth pinning: we don't waste bytes
+        // on chunks whose live counter is 0 (== absent semantically).
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        // Manually inject a zero entry — we don't have a public API
+        // to do this; reach into chunk_versions to verify the
+        // serialise-side filter behaves.
+        g.chunk_versions.insert(IVec3::ZERO, 0);
+        let snap = scene.to_snapshot();
+        let g_snap = &snap.grids[0].1;
+        assert!(g_snap.chunk_versions.is_empty(), "zero entries dropped");
     }
 
     #[test]
