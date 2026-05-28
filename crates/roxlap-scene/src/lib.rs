@@ -448,6 +448,7 @@ mod tests {
         g.lod_thresholds = LodThresholds {
             r_near: 50.0,
             r_mid: 200.0,
+            ..LodThresholds::always_near()
         };
         // Camera 25 units from grid origin → Near.
         assert_eq!(g.select_lod(DVec3::new(125.0, 0.0, 0.0)), Lod::Near);

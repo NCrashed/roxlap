@@ -270,19 +270,22 @@ pub fn render_scene_composed(
         let Some(backing) = grid.chunk_xyz_backing() else {
             continue;
         };
-        // S6.0: per-grid LOD tier dispatch. The picker keys off
-        // the grid's `lod_thresholds` and the world-space camera.
-        // Default thresholds are `always_near` so every grid lands
-        // on `Lod::Near` and the framebuffer stays byte-identical
-        // to the pre-S6 path. S6.1 hooks `Mid` (deeper mip cap via
-        // `mip_levels_override`); S6.3 hooks `Far` (billboard
-        // impostor blit replacing opticast). For now `Mid` and
-        // `Far` fall through to the `Near` arm — the match exists
-        // to make those plug-in points obvious to readers.
+        // S6.0/S6.1: per-grid LOD tier dispatch. The picker keys
+        // off the grid's `lod_thresholds` and the world-space
+        // camera. Default thresholds are `always_near` so every
+        // grid lands on `Lod::Near` and the framebuffer stays
+        // byte-identical to the pre-S6 path.
+        //
+        // S6.1: `Mid` applies the grid's `mid_mip_levels` /
+        // `mid_mip_scan_dist` overrides (if `Some`) on top of the
+        // base settings, biasing the grid into coarser mips. With
+        // both `None`, Mid renders identically to Near (graceful
+        // degrade — callers opt into the Mid plumbing via
+        // `LodThresholds::from_radius_with_mid_mip`).
+        //
+        // S6.3 will plug `Far` into the billboard impostor blit
+        // path. For now `Far` falls through to the Near render.
         let lod = grid.select_lod(DVec3::from_array(camera.pos));
-        match lod {
-            Lod::Near | Lod::Mid | Lod::Far => {}
-        }
         // S5.2-followup: per-grid sky opt-out. Grids with
         // `render_sky = false` (e.g. a rotating ship) must not
         // contribute sky pixels — the grid-local sky lookup
@@ -325,24 +328,63 @@ pub fn render_scene_composed(
         };
         let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
 
-        // S5.2-followup: per-grid mip-levels override. Small grids
-        // (e.g. a rotating ship) hit the axis-aligned cf-cancellation
-        // multi-mip artifact (see
-        // `[[project_axis_aligned_mip_beams]]`) when the rotation
-        // creates near-axis-aligned rays through deep mips. Capping
-        // mip_levels=1 for these grids costs negligible perf
-        // (their world footprint is small) and avoids the artifact.
+        // Build the per-grid settings by layering three opt-in
+        // overrides on top of the caller's `settings`:
+        //
+        //   1. (S6.1) `lod_thresholds.mid_mip_levels` /
+        //      `mid_mip_scan_dist` — applied iff `lod == Mid`.
+        //      Biases the grid into coarser mips via the existing
+        //      multi-mip path. None ⇒ Mid degrades to Near's
+        //      settings (graceful).
+        //   2. (S5.2-followup) `Grid::mip_levels_override` — global
+        //      per-grid cap applied at ALL tiers. Preserves the
+        //      ship anti-axis-aligned-beam workaround through Mid
+        //      tier (so a rotating ship pinned at mip-0 stays at
+        //      mip-0 even when distant).
+        //
+        // Layer order: Mid overrides first, then global cap. Both
+        // mip_levels overrides are clamped to `[1, base.mip_levels]`
+        // since the base is the maximum the renderer can use
+        // (chunk's `chunk_mips`-min logic inside scalar_rasterizer
+        // applies further per-chunk).
         let per_grid_settings;
-        let active_settings = match grid.mip_levels_override {
-            Some(cap) => {
-                let clamped = cap.clamp(1, settings.mip_levels);
+        let active_settings = {
+            let base_mip_levels = settings.mip_levels;
+            let base_mip_scan = settings.mip_scan_dist;
+            let lod_mip_levels = match lod {
+                Lod::Mid => grid.lod_thresholds.mid_mip_levels,
+                Lod::Near | Lod::Far => None,
+            };
+            let lod_mip_scan = match lod {
+                Lod::Mid => grid.lod_thresholds.mid_mip_scan_dist,
+                Lod::Near | Lod::Far => None,
+            };
+            let global_mip_cap = grid.mip_levels_override;
+            let needs_override =
+                lod_mip_levels.is_some() || lod_mip_scan.is_some() || global_mip_cap.is_some();
+            if needs_override {
+                // Resolve mip_levels: start with base, apply LOD
+                // override (clamped to base), then apply global cap.
+                let mut mip_levels =
+                    lod_mip_levels.map_or(base_mip_levels, |n| n.clamp(1, base_mip_levels));
+                if let Some(cap) = global_mip_cap {
+                    mip_levels = mip_levels.min(cap.clamp(1, base_mip_levels));
+                }
+                // Resolve mip_scan_dist: LOD override clamps to
+                // `min(base, override)` — the override only makes
+                // transitions kick in CLOSER, never farther. The
+                // renderer floors at 4 internally so we don't
+                // bottom-clamp here.
+                let mip_scan_dist = lod_mip_scan.map_or(base_mip_scan, |d| base_mip_scan.min(d));
                 per_grid_settings = OpticastSettings {
-                    mip_levels: clamped,
+                    mip_levels,
+                    mip_scan_dist,
                     ..*settings
                 };
                 &per_grid_settings
+            } else {
+                settings
             }
-            None => settings,
         };
 
         let outcome = {
@@ -1115,6 +1157,210 @@ mod tests {
         assert_eq!(
             fb, fb2,
             "composition should be order-independent — same scene in different add order should produce identical output"
+        );
+    }
+
+    // ---- S6.1: Mid-tier mip overrides ----
+
+    /// Build a multi-mip-friendly grid: solid floor spanning the
+    /// whole chunk at z=100..254 + `generate_mips(3)`. This is the
+    /// same setup `vxl_generate_mips_on_set_voxel_chunk_renders`
+    /// uses and is known to render at `mip_levels = 3,
+    /// mip_scan_dist = 32`.
+    ///
+    /// Returns `(scene, grid_id)`. The Mid test sets the camera
+    /// inside the chunk so chunk-local rays reach the floor at
+    /// short distances; that lets the Mid override use
+    /// `mip_scan_dist = 16` without busting the ray budget
+    /// (`mip_scan_dist * 2^(mip_levels-1) = 16 * 4 = 64` covers the
+    /// distance from camera to floor).
+    fn build_mip_visible_grid(world_origin: DVec3) -> (Scene, crate::GridId) {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(world_origin));
+        let grid = scene.grid_mut(id).unwrap();
+        // Solid floor across the entire chunk at z=100..254.
+        grid.set_rect(
+            IVec3::new(0, 0, 100),
+            IVec3::new(127, 127, 254),
+            Some(0x80_88_88_88),
+        );
+        // Build the per-chunk mip ladder so `gmipnum` can grow past 1.
+        grid.chunk_mut(IVec3::ZERO).unwrap().generate_mips(3);
+        (scene, id)
+    }
+
+    /// FNV-1a 64-bit hash of the framebuffer bytes.
+    fn fb_hash(fb: &[u32]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for px in fb {
+            for b in px.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// Render `scene` via composed path with `mip_levels = 3,
+    /// mip_scan_dist = 32` — same values the working
+    /// `vxl_generate_mips_on_set_voxel_chunk_renders` test uses.
+    /// Returns the framebuffer.
+    fn render_with_multi_mip(scene: &mut Scene, camera: &Camera) -> Vec<u32> {
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        settings.mip_levels = 3;
+        settings.mip_scan_dist = 32;
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            scene,
+            camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        fb
+    }
+
+    /// Mid-tier with explicit mip overrides must produce a different
+    /// framebuffer than Near-tier rendering of the same scene. Loose
+    /// test — checks hash inequality and that the Mid render still
+    /// has some non-sky pixels (sanity that the renderer didn't bail).
+    #[test]
+    fn s6_1_mid_overrides_produce_different_framebuffer_than_near() {
+        // Camera at grid origin + a bit inside the chunk, looking +y.
+        let camera = camera_at([64.0, 0.0, 64.0]);
+
+        // Scene A: default thresholds → Near tier → renderer uses
+        // base settings (mip_levels=3, mip_scan_dist=32).
+        let (mut scene_a, _) = build_mip_visible_grid(DVec3::ZERO);
+        let fb_near = render_with_multi_mip(&mut scene_a, &camera);
+
+        // Scene B: thresholds force Mid tier + mip overrides. We
+        // cap mip_levels at 1 (no multi-mip) to guarantee a visible
+        // pixel difference vs Near's mip-1/2 transitions. This is
+        // the inverse of the typical "Mid = coarser" use case but
+        // is the most reliable way to demonstrate that the override
+        // path actually fires; production callers would more
+        // commonly leave mip_levels at base and lower mip_scan_dist.
+        let (mut scene_b, b_id) = build_mip_visible_grid(DVec3::ZERO);
+        scene_b.grid_mut(b_id).unwrap().lod_thresholds = crate::LodThresholds {
+            // r_near = 0 → any nonzero distance lands in Mid or Far.
+            r_near: 0.0,
+            r_mid: f64::INFINITY,
+            mid_mip_levels: Some(1),
+            mid_mip_scan_dist: None,
+        };
+        // Sanity: confirm the picker actually returns Mid for this pose.
+        let lod = scene_b
+            .grid(b_id)
+            .unwrap()
+            .select_lod(DVec3::from_array(camera.pos));
+        assert_eq!(lod, Lod::Mid, "expected Mid tier for forced thresholds");
+        let fb_mid = render_with_multi_mip(&mut scene_b, &camera);
+
+        // Both renders must contain non-sky pixels (the override
+        // didn't bust the renderer).
+        let (_engine, _, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let non_sky_near = fb_near.iter().filter(|&&p| p != sky_color).count();
+        let non_sky_mid = fb_mid.iter().filter(|&&p| p != sky_color).count();
+        assert!(
+            non_sky_near > 100,
+            "Near render too sparse ({non_sky_near})"
+        );
+        assert!(non_sky_mid > 100, "Mid render too sparse ({non_sky_mid})");
+
+        // Hash must differ — the Mid override changed mip_levels
+        // from 3 to 1, which changes mip transitions and so changes
+        // pixels.
+        let h_near = fb_hash(&fb_near);
+        let h_mid = fb_hash(&fb_mid);
+        assert_ne!(
+            h_near, h_mid,
+            "Mid tier with mid_mip_levels=Some(1) must differ from Near (h_near={h_near:016x})"
+        );
+    }
+
+    /// Mid tier with `mid_mip_levels = None` AND
+    /// `mid_mip_scan_dist = None` must produce a byte-identical
+    /// framebuffer to Near. This is the graceful-degrade contract
+    /// — callers can opt into the Mid plumbing without committing
+    /// to a mip override and stay byte-stable.
+    #[test]
+    fn s6_1_mid_without_overrides_byte_identical_to_near() {
+        let camera = camera_at([64.0, 0.0, 64.0]);
+
+        // Scene A: default thresholds → Near.
+        let (mut scene_a, _) = build_mip_visible_grid(DVec3::ZERO);
+        let fb_near = render_with_multi_mip(&mut scene_a, &camera);
+
+        // Scene B: thresholds force Mid but no mip overrides set.
+        let (mut scene_b, b_id) = build_mip_visible_grid(DVec3::ZERO);
+        scene_b.grid_mut(b_id).unwrap().lod_thresholds = crate::LodThresholds {
+            r_near: 0.0,
+            r_mid: f64::INFINITY,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
+        };
+        let lod = scene_b
+            .grid(b_id)
+            .unwrap()
+            .select_lod(DVec3::from_array(camera.pos));
+        assert_eq!(lod, Lod::Mid);
+        let fb_mid = render_with_multi_mip(&mut scene_b, &camera);
+
+        // Byte-identical: Mid with no overrides degrades cleanly.
+        assert_eq!(
+            fb_near, fb_mid,
+            "Mid with both overrides=None must byte-match Near"
+        );
+    }
+
+    /// `mip_levels_override` (the global per-grid cap) must compose
+    /// with the Mid override: the effective `mip_levels` should be
+    /// `min(mid_override, global_cap)`. Tests that the ship
+    /// anti-axis-aligned-beam workaround survives Mid tier.
+    ///
+    /// We pin this by checking that a grid with `mip_levels_override
+    /// = Some(1)` (mip-0 only — ship workaround) AND Mid-tier
+    /// `mid_mip_levels = Some(4)` renders the same as a grid with
+    /// just `mip_levels_override = Some(1)` at Near tier. Both
+    /// resolve to `mip_levels = 1` (no multi-mip), so both must
+    /// produce the same framebuffer.
+    #[test]
+    fn s6_1_global_mip_cap_survives_mid_tier() {
+        let camera = camera_at([64.0, 0.0, 64.0]);
+
+        // Scene A: Near tier + global cap=1.
+        let (mut scene_a, a_id) = build_mip_visible_grid(DVec3::ZERO);
+        scene_a.grid_mut(a_id).unwrap().mip_levels_override = Some(1);
+        let fb_a = render_with_multi_mip(&mut scene_a, &camera);
+
+        // Scene B: Mid tier + global cap=1 + Mid override=4. Global
+        // cap (1) should win since it's the tighter floor on
+        // `min(global_cap, mid_override)`.
+        let (mut scene_b, b_id) = build_mip_visible_grid(DVec3::ZERO);
+        scene_b.grid_mut(b_id).unwrap().mip_levels_override = Some(1);
+        scene_b.grid_mut(b_id).unwrap().lod_thresholds = crate::LodThresholds {
+            r_near: 0.0,
+            r_mid: f64::INFINITY,
+            mid_mip_levels: Some(4),
+            // mip_scan_dist override left None so we isolate the
+            // mip_levels resolution path.
+            mid_mip_scan_dist: None,
+        };
+        let fb_b = render_with_multi_mip(&mut scene_b, &camera);
+
+        assert_eq!(
+            fb_a, fb_b,
+            "global mip_levels_override should clamp Mid override (ship workaround survives Mid tier)"
         );
     }
 

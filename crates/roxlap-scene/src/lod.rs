@@ -49,14 +49,15 @@ pub enum Lod {
     Far,
 }
 
-/// World-distance thresholds for the per-grid LOD picker.
+/// Per-grid LOD picker configuration: world-distance thresholds
+/// for tier dispatch + optional Mid-tier render overrides.
 ///
-/// Semantics (centre-to-centre distance `d`):
+/// Tier dispatch (centre-to-centre distance `d`):
 /// - `d <= r_near` → [`Lod::Near`]
 /// - `r_near < d <= r_mid` → [`Lod::Mid`]
 /// - `d > r_mid` → [`Lod::Far`]
 ///
-/// Both default to [`f64::INFINITY`] via [`Default`] /
+/// All thresholds default to [`f64::INFINITY`] via [`Default`] /
 /// [`Self::always_near`], so a freshly-constructed [`crate::Grid`]
 /// always lands on [`Lod::Near`] — the S5-and-earlier byte-stable
 /// behaviour. Callers that want real LOD opt in by writing a
@@ -66,6 +67,31 @@ pub enum Lod {
 /// every `d <= NaN` comparison is `false`. No assert — callers
 /// shouldn't be passing `NaN` and we don't want runtime cost in a
 /// per-frame per-grid hot path.
+///
+/// ## S6.1 — Mid-tier mip overrides
+///
+/// When the picker returns [`Lod::Mid`], [`Self::mid_mip_levels`]
+/// and [`Self::mid_mip_scan_dist`] (if `Some`) override the
+/// corresponding [`roxlap_core::opticast::OpticastSettings`] fields
+/// for that grid's render. The intent: force coarser-mip rendering
+/// at Mid distance to recover performance, using the existing R4.5
+/// multi-mip infrastructure with no new rasterizer code.
+///
+/// Semantics:
+/// - `mid_mip_levels = Some(n)` — clamp `OpticastSettings.mip_levels`
+///   to `n` for this grid. `n` is then further clamped to
+///   `[1, settings.mip_levels]` at the call site.
+/// - `mid_mip_scan_dist = Some(d)` — set `OpticastSettings.mip_scan_dist`
+///   to `min(settings.mip_scan_dist, d)`. The renderer floors
+///   `mip_scan_dist` at 4 internally; smaller values transition to
+///   coarser mips closer to the camera, biasing the whole frame
+///   toward higher mips.
+/// - Both `None` ⇒ Mid path renders identically to Near (graceful
+///   degrade — callers can opt into the Mid plumbing without
+///   committing to a mip override).
+/// - [`crate::Grid::mip_levels_override`] continues to apply on
+///   top as a global per-grid cap regardless of tier (the ship
+///   anti-beam workaround is preserved at all LOD tiers).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LodThresholds {
     /// Maximum world-distance at which the grid renders at
@@ -77,28 +103,45 @@ pub struct LodThresholds {
     /// not enforced (an inverted pair just means the [`Lod::Mid`]
     /// band is empty).
     pub r_mid: f64,
+    /// S6.1 — `OpticastSettings.mip_levels` override applied only
+    /// when the picker returns [`Lod::Mid`]. `None` ⇒ Mid uses the
+    /// caller's `settings.mip_levels` unchanged (graceful degrade
+    /// to Near-equivalent behaviour). See struct doc for semantics.
+    pub mid_mip_levels: Option<u32>,
+    /// S6.1 — `OpticastSettings.mip_scan_dist` override applied
+    /// only when the picker returns [`Lod::Mid`]. `None` ⇒ Mid uses
+    /// the caller's value unchanged. Smaller values bias the grid
+    /// toward coarser mips earlier in the ray walk (floor of 4
+    /// inside the renderer).
+    pub mid_mip_scan_dist: Option<i32>,
 }
 
 impl LodThresholds {
-    /// Always-`Near` thresholds. Both fields set to
+    /// Always-`Near` thresholds. Both distance fields set to
     /// [`f64::INFINITY`]; the picker can never enter the Mid/Far
-    /// branches. Use as the byte-identical default during the
-    /// S6.0..S6.3 staged rollout.
+    /// branches. Mid-tier mip overrides set to `None` (irrelevant
+    /// since Mid is never selected). Use as the byte-identical
+    /// default during the S6.0..S6.3 staged rollout.
     #[must_use]
     pub const fn always_near() -> Self {
         Self {
             r_near: f64::INFINITY,
             r_mid: f64::INFINITY,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
         }
     }
 
-    /// Derived defaults from the grid's bounding-sphere radius
-    /// (PORTING-SCENE.md § S6):
+    /// Derived distance thresholds from the grid's bounding-sphere
+    /// radius (PORTING-SCENE.md § S6):
     ///
     /// - `r_near = bounding_radius` — Near while the camera is
     ///   inside the bounding sphere.
     /// - `r_mid = 10 * bounding_radius` — Mid up to ~10× radius,
     ///   Far beyond.
+    /// - `mid_mip_levels` / `mid_mip_scan_dist` ⇒ `None` (Mid
+    ///   degrades to Near; opt in via
+    ///   [`Self::from_radius_with_mid_mip`]).
     ///
     /// A `0.0` (or negative) bounding radius collapses both
     /// thresholds to zero; the picker returns [`Lod::Far`] for any
@@ -109,6 +152,30 @@ impl LodThresholds {
         Self {
             r_near: bounding_radius,
             r_mid: 10.0 * bounding_radius,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
+        }
+    }
+
+    /// [`Self::from_radius`] + an explicit Mid-tier mip override
+    /// pair. Convenience for S6.1 consumers that want Mid LOD wired
+    /// without hand-constructing the struct.
+    ///
+    /// Typical values for a `mip_levels = 4, mip_scan_dist = 128`
+    /// world: `mid_mip_levels = 4, mid_mip_scan_dist = 16`. The
+    /// reduced scan distance biases the Mid grid into coarser mips
+    /// across the whole frame.
+    #[must_use]
+    pub fn from_radius_with_mid_mip(
+        bounding_radius: f64,
+        mid_mip_levels: u32,
+        mid_mip_scan_dist: i32,
+    ) -> Self {
+        Self {
+            r_near: bounding_radius,
+            r_mid: 10.0 * bounding_radius,
+            mid_mip_levels: Some(mid_mip_levels),
+            mid_mip_scan_dist: Some(mid_mip_scan_dist),
         }
     }
 }
@@ -202,6 +269,7 @@ mod tests {
         let t = LodThresholds {
             r_near: 49.0,
             r_mid: 51.0,
+            ..LodThresholds::always_near()
         };
         let xform = GridTransform::at(DVec3::new(100.0, 200.0, 300.0));
         let cam = DVec3::new(100.0, 200.0, 350.0);
