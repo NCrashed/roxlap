@@ -35,7 +35,8 @@ pub mod render;
 pub mod snapshot;
 pub mod streaming;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use glam::{DQuat, DVec3, IVec3, UVec3};
 use roxlap_formats::vxl::Vxl;
@@ -191,7 +192,12 @@ pub struct Grid {
     ///
     /// `None` is the default — a grid without a generator behaves
     /// exactly like the pre-S7 grids: absent chunks stay absent.
-    pub generator: Option<Box<dyn ChunkGenerator>>,
+    ///
+    /// `Arc` (not `Box`) so S7.3's async dispatch can clone the
+    /// generator into background rayon tasks without moving it out
+    /// of the grid. Trait bound `Send + Sync` (required at S7.0)
+    /// already makes `Arc<dyn ChunkGenerator>` `Send + Sync`.
+    pub generator: Option<Arc<dyn ChunkGenerator>>,
     /// Streaming activity / eviction radii used by
     /// [`Scene::pump_streaming_sync`] (S7.1). Defaults to
     /// [`StreamRadius::DISABLED`] so existing grids see no change
@@ -215,6 +221,21 @@ pub struct Grid {
     /// Evictions in [`Scene::pump_streaming_sync`] drop the
     /// corresponding entry so the map stays bounded.
     pub chunk_versions: HashMap<IVec3, u64>,
+    /// In-flight background generation tasks (S7.3).
+    ///
+    /// Populated by [`Scene::pump_streaming`] when it dispatches a
+    /// generator call onto the streaming rayon pool, drained when
+    /// the corresponding [`ChunkResult`] is received and processed
+    /// (either installed or discarded). The set is consulted to
+    /// avoid re-dispatching the same chunk while a previous task
+    /// is still running.
+    ///
+    /// Stays empty when only the synchronous
+    /// [`Scene::pump_streaming_sync`] is used — that path generates
+    /// inline on the calling thread.
+    ///
+    /// [`ChunkResult`]: streaming::ChunkResult
+    pub pending_gen: HashSet<IVec3>,
 }
 
 impl Grid {
@@ -233,6 +254,7 @@ impl Grid {
             generator: None,
             stream_radius: StreamRadius::DISABLED,
             chunk_versions: HashMap::new(),
+            pending_gen: HashSet::new(),
         }
     }
 
@@ -269,11 +291,14 @@ impl Grid {
     /// Attach (or detach) the procedural generator used by
     /// [`Self::ensure_chunk_generated`] (S7.0).
     ///
-    /// Pass `Some(Box::new(generator))` to enable on-demand chunk
+    /// Pass `Some(Arc::new(generator))` to enable on-demand chunk
     /// generation; pass `None` to revert to the "absent stays
     /// absent" behaviour. Replacing an existing generator drops the
-    /// previous one without touching already-materialised chunks.
-    pub fn set_generator(&mut self, generator: Option<Box<dyn ChunkGenerator>>) {
+    /// previous `Arc` clone without touching already-materialised
+    /// chunks. Any background tasks dispatched by a prior
+    /// [`Scene::pump_streaming`] hold their own clones of the old
+    /// generator and finish naturally.
+    pub fn set_generator(&mut self, generator: Option<Arc<dyn ChunkGenerator>>) {
         self.generator = generator;
     }
 
@@ -369,6 +394,13 @@ impl Grid {
 pub struct Scene {
     grids: HashMap<GridId, Grid>,
     next_grid_id: u32,
+    /// S7.3: per-scene streaming pool + result channel. Stored on
+    /// the `Scene` so `pump_streaming` can dispatch background
+    /// tasks and drain results across pump calls. `cfg`-gated out
+    /// on wasm32 where `pump_streaming` short-circuits to
+    /// `pump_streaming_sync` (no rayon pool there).
+    #[cfg(not(target_arch = "wasm32"))]
+    streaming: streaming::StreamingState,
 }
 
 impl Scene {
@@ -423,6 +455,118 @@ impl Scene {
         self.grids.iter_mut().map(|(id, g)| (*id, g))
     }
 
+    /// Configure the number of worker threads in the dedicated
+    /// streaming pool (S7.3).
+    ///
+    /// Lazily applied — the pool itself is constructed on the first
+    /// [`Self::pump_streaming`] call. If the pool was already built
+    /// (i.e. a previous `pump_streaming` already dispatched at
+    /// least one task), it gets dropped and rebuilt. Dropping the
+    /// old pool blocks until all of its in-flight tasks finish
+    /// (rayon's contract); any results those tasks sent are still
+    /// drained by the next `pump_streaming` because the channel
+    /// survives the rebuild.
+    ///
+    /// The streaming pool is separate from rayon's global pool
+    /// (which R12 multicore rendering uses), so chunk generation
+    /// doesn't compete with render threads. Sensible values are 1
+    /// to ~4 — generation work is CPU-bound but should leave most
+    /// of the box for everything else.
+    ///
+    /// On wasm32 this is a no-op (no rayon pool available);
+    /// `pump_streaming` runs synchronously there.
+    ///
+    /// # Panics
+    /// Panics on native if `n == 0` (zero-thread pools are not
+    /// supported; the scene crate's S7.1 helper already disallows
+    /// the equivalent for `StreamRadius::r_active < 0`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_streaming_threads(&mut self, n: usize) {
+        self.streaming.set_thread_count(n);
+    }
+
+    /// wasm32 no-op companion of [`Self::set_streaming_threads`].
+    /// Lets cross-target code call this unconditionally.
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_streaming_threads(&mut self, _n: usize) {
+        // No streaming pool on wasm32 — see `pump_streaming` docs.
+    }
+
+    /// Asynchronous streaming pump (S7.3).
+    ///
+    /// On native, dispatches missing-chunk generations onto a
+    /// dedicated rayon pool, drains any results that arrived since
+    /// the last pump, runs the eviction pass, and tracks in-flight
+    /// tasks in each grid's [`Grid::pending_gen`] set. The drain
+    /// uses the per-chunk version counter from S7.2 to discard
+    /// results whose chunk was edited mid-generation.
+    ///
+    /// On wasm32 this short-circuits to [`Self::pump_streaming_sync`]
+    /// — no thread pool is available there, but the same per-grid
+    /// stream-in / evict semantics apply.
+    ///
+    /// Call once per frame from the render thread. Cheap when
+    /// nothing changed (early-exit on disabled grids, try_recv
+    /// loops empty fast).
+    pub fn pump_streaming(&mut self, camera_world_pos: DVec3) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.pump_streaming_sync(camera_world_pos);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.pump_streaming_native(camera_world_pos);
+        }
+    }
+
+    /// Native implementation of [`Self::pump_streaming`].
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_streaming_native(&mut self, camera_world_pos: DVec3) {
+        // 1. Drain inbox — install fresh results, drop stale.
+        while let Ok(result) = self.streaming.rx.try_recv() {
+            let Some(grid) = self.grids.get_mut(&result.grid_id) else {
+                // Grid was removed while a generation task was
+                // in-flight. Drop silently.
+                continue;
+            };
+            // Clearing pending_gen here both for "result delivered"
+            // and "we shouldn't try to re-dispatch this chunk just
+            // because it's missing".
+            let was_pending = grid.pending_gen.remove(&result.chunk_idx);
+            if !was_pending {
+                // Either the chunk was evicted (pending cleared in
+                // the eviction pass below in some prior call), or a
+                // duplicate result for an already-handled chunk.
+                continue;
+            }
+            if grid.chunks.contains_key(&result.chunk_idx) {
+                // Some other path (e.g. `ensure_chunk_generated`
+                // sync helper, or a manual edit's `ensure_chunk`)
+                // already populated the slot. Don't overwrite.
+                continue;
+            }
+            if grid.chunk_version(result.chunk_idx) != result.version_at_dispatch {
+                // S7.2 stale-result discard: chunk was edited mid-
+                // generation.
+                continue;
+            }
+            grid.chunks.insert(result.chunk_idx, result.vxl);
+        }
+
+        // 2. Per-grid: eviction first, then dispatch. Doing evict
+        //    before dispatch means a chunk that's just left
+        //    r_active doesn't get re-dispatched on the same pump.
+        self.streaming.ensure_pool();
+        // Disjoint sub-field borrows: pool/tx via `&self.streaming.*`,
+        // grids via `&mut self.grids`. Hold both at once.
+        let pool: &rayon::ThreadPool = self.streaming.pool.as_ref().expect("ensure_pool just ran");
+        let tx_template = &self.streaming.tx;
+        for (grid_id, grid) in &mut self.grids {
+            evict_grid_chunks(grid, camera_world_pos);
+            dispatch_grid_async(*grid_id, grid, camera_world_pos, pool, tx_template);
+        }
+    }
+
     /// Synchronous streaming pump (S7.1).
     ///
     /// For each grid with a non-[`StreamRadius::DISABLED`] policy:
@@ -452,9 +596,10 @@ impl Scene {
     }
 }
 
-/// S7.1 helper — drives one grid's streaming pass. Pulled out of
-/// [`Scene::pump_streaming_sync`]'s body so the per-grid logic is
-/// testable in isolation and so the inner loops stay legible.
+/// S7.1 helper — drives one grid's synchronous streaming pass.
+/// Stream-in pass uses [`Grid::ensure_chunk_generated`] (blocking
+/// inline generation); eviction pass shared with the S7.3 async
+/// path through [`evict_grid_chunks`].
 fn pump_grid_streaming_sync(grid: &mut Grid, camera_world_pos: DVec3) {
     let radius = grid.stream_radius;
     if radius.is_disabled() {
@@ -462,66 +607,169 @@ fn pump_grid_streaming_sync(grid: &mut Grid, camera_world_pos: DVec3) {
     }
     let cam_local = streaming::world_to_grid_local_pos(camera_world_pos, &grid.transform);
 
-    // --- Pass 1: stream in active chunks ----------------------
+    // --- Pass 1: stream in active chunks (sync) ---------------
     if radius.r_active > 0.0 && grid.generator.is_some() {
-        let r_sq = radius.r_active * radius.r_active;
-        let sxy = f64::from(CHUNK_SIZE_XY);
-        let sz = f64::from(CHUNK_SIZE_Z);
-        // Half-extent in chunk units; ceil to be conservative so
-        // any chunk whose AABB clips the radius gets considered.
-        // `+1` covers the half-open chunk-AABB upper edge plus the
-        // case where the camera sits exactly on a chunk boundary
-        // and the closest chunk is one index off.
-        #[allow(clippy::cast_possible_truncation)]
-        let r_chunks_xy = (radius.r_active / sxy).ceil() as i32 + 1;
-        #[allow(clippy::cast_possible_truncation)]
-        let r_chunks_z = (radius.r_active / sz).ceil() as i32 + 1;
-        #[allow(clippy::cast_possible_truncation)]
-        let cx_chunk = (cam_local.x / sxy).floor() as i32;
-        #[allow(clippy::cast_possible_truncation)]
-        let cy_chunk = (cam_local.y / sxy).floor() as i32;
-        #[allow(clippy::cast_possible_truncation)]
-        let cz_chunk = (cam_local.z / sz).floor() as i32;
-        for chz in (cz_chunk - r_chunks_z)..=(cz_chunk + r_chunks_z) {
-            for chy in (cy_chunk - r_chunks_xy)..=(cy_chunk + r_chunks_xy) {
-                for chx in (cx_chunk - r_chunks_xy)..=(cx_chunk + r_chunks_xy) {
-                    let idx = IVec3::new(chx, chy, chz);
-                    if streaming::chunk_aabb_dist_sq(cam_local, idx) <= r_sq {
-                        grid.ensure_chunk_generated(idx);
-                    }
+        for_each_chunk_in_radius(cam_local, radius.r_active, |idx| {
+            grid.ensure_chunk_generated(idx);
+        });
+    }
+
+    // --- Pass 2: evict chunks past r_evict --------------------
+    evict_grid_chunks_with_cam(grid, cam_local);
+}
+
+/// Eviction pass shared by [`pump_grid_streaming_sync`] and the
+/// S7.3 async path. Public-ish so the async driver can call it
+/// before dispatching to avoid generating chunks that are about
+/// to be evicted. `cfg`-gated to native: on wasm32 the only
+/// caller (`pump_streaming_native`) doesn't compile, so this
+/// helper would warn as dead code.
+#[cfg(not(target_arch = "wasm32"))]
+fn evict_grid_chunks(grid: &mut Grid, camera_world_pos: DVec3) {
+    let radius = grid.stream_radius;
+    if radius.is_disabled() {
+        return;
+    }
+    let cam_local = streaming::world_to_grid_local_pos(camera_world_pos, &grid.transform);
+    evict_grid_chunks_with_cam(grid, cam_local);
+}
+
+/// Eviction inner — assumes `cam_local` is already computed (the
+/// dispatcher and sync pump both have it on hand).
+fn evict_grid_chunks_with_cam(grid: &mut Grid, cam_local: DVec3) {
+    let radius = grid.stream_radius;
+    if !radius.r_evict.is_finite() {
+        return;
+    }
+    let r_sq = radius.r_evict * radius.r_evict;
+    let to_evict: Vec<IVec3> = grid
+        .chunks
+        .keys()
+        .filter(|&&idx| streaming::chunk_aabb_dist_sq(cam_local, idx) > r_sq)
+        .copied()
+        .collect();
+    // S7.3: also evict pending in-flight tasks past r_evict so the
+    // drain pass doesn't install a chunk that's no longer wanted.
+    // We don't have a way to cancel the rayon task, but we can
+    // drop the pending_gen entry so the result is dropped on
+    // arrival.
+    let to_evict_pending: Vec<IVec3> = grid
+        .pending_gen
+        .iter()
+        .filter(|&&idx| streaming::chunk_aabb_dist_sq(cam_local, idx) > r_sq)
+        .copied()
+        .collect();
+    if to_evict.is_empty() && to_evict_pending.is_empty() {
+        return;
+    }
+    for idx in &to_evict {
+        grid.chunks.remove(idx);
+        // S7.2: keep chunk_versions in sync with chunks so the
+        // map stays bounded. A future re-stream of the same idx
+        // restarts at 0 — that's fine because any in-flight
+        // gen-result tagged with the pre-eviction version is
+        // unreachable (no chunk to install onto) and gets
+        // discarded by the new "version still 0" check anyway.
+        grid.chunk_versions.remove(idx);
+        // S7.3: drop pending entry for the same chunk too. If a
+        // background task is still running, its result will be
+        // dropped on arrival (was_pending = false).
+        grid.pending_gen.remove(idx);
+    }
+    for idx in &to_evict_pending {
+        grid.pending_gen.remove(idx);
+    }
+    if !to_evict.is_empty() {
+        // Bounding sphere can shrink → impostor projections would
+        // be wrong on next Far render. Clear lazily; the next
+        // Far-tier pass repopulates via BillboardCache::build.
+        grid.billboards = None;
+    }
+}
+
+/// Walk every chunk index whose AABB falls within `r_active` of
+/// `cam_local` and invoke `f` on it. Shared between the S7.1 sync
+/// stream-in and the S7.3 async dispatch.
+fn for_each_chunk_in_radius<F>(cam_local: DVec3, r_active: f64, mut f: F)
+where
+    F: FnMut(IVec3),
+{
+    let r_sq = r_active * r_active;
+    let sxy = f64::from(CHUNK_SIZE_XY);
+    let sz = f64::from(CHUNK_SIZE_Z);
+    // Half-extent in chunk units; ceil to be conservative so any
+    // chunk whose AABB clips the radius gets considered. `+1`
+    // covers the half-open chunk-AABB upper edge plus the case
+    // where the camera sits exactly on a chunk boundary and the
+    // closest chunk is one index off.
+    #[allow(clippy::cast_possible_truncation)]
+    let r_chunks_xy = (r_active / sxy).ceil() as i32 + 1;
+    #[allow(clippy::cast_possible_truncation)]
+    let r_chunks_z = (r_active / sz).ceil() as i32 + 1;
+    #[allow(clippy::cast_possible_truncation)]
+    let cx_chunk = (cam_local.x / sxy).floor() as i32;
+    #[allow(clippy::cast_possible_truncation)]
+    let cy_chunk = (cam_local.y / sxy).floor() as i32;
+    #[allow(clippy::cast_possible_truncation)]
+    let cz_chunk = (cam_local.z / sz).floor() as i32;
+    for chz in (cz_chunk - r_chunks_z)..=(cz_chunk + r_chunks_z) {
+        for chy in (cy_chunk - r_chunks_xy)..=(cy_chunk + r_chunks_xy) {
+            for chx in (cx_chunk - r_chunks_xy)..=(cx_chunk + r_chunks_xy) {
+                let idx = IVec3::new(chx, chy, chz);
+                if streaming::chunk_aabb_dist_sq(cam_local, idx) <= r_sq {
+                    f(idx);
                 }
             }
         }
     }
+}
 
-    // --- Pass 2: evict chunks past r_evict --------------------
-    if radius.r_evict.is_finite() {
-        let r_sq = radius.r_evict * radius.r_evict;
-        // Collect first to side-step the iter-while-mutate borrow.
-        let to_evict: Vec<IVec3> = grid
-            .chunks
-            .keys()
-            .filter(|&&idx| streaming::chunk_aabb_dist_sq(cam_local, idx) > r_sq)
-            .copied()
-            .collect();
-        if !to_evict.is_empty() {
-            for idx in &to_evict {
-                grid.chunks.remove(idx);
-                // S7.2: keep chunk_versions in sync with chunks so
-                // the map stays bounded. A future re-stream of the
-                // same idx restarts at 0 — that's fine because any
-                // in-flight gen-result tagged with the pre-eviction
-                // version is unreachable (no chunk to install onto)
-                // and gets discarded by the new "version still 0"
-                // check anyway.
-                grid.chunk_versions.remove(idx);
-            }
-            // Bounding sphere can shrink → impostor projections
-            // would be wrong on next Far render. Clear lazily; the
-            // next Far-tier pass repopulates via BillboardCache::build.
-            grid.billboards = None;
-        }
+/// S7.3 async dispatch — schedule generation for every chunk in
+/// `r_active` that's not already present and not already in
+/// flight. Each dispatch clones the grid's generator `Arc` and a
+/// sender clone, then spawns the closure on the streaming rayon
+/// pool. The closure does the generate + send; the main thread
+/// drains results on the next pump.
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_grid_async(
+    grid_id: GridId,
+    grid: &mut Grid,
+    camera_world_pos: DVec3,
+    pool: &rayon::ThreadPool,
+    tx: &crossbeam_channel::Sender<streaming::ChunkResult>,
+) {
+    let radius = grid.stream_radius;
+    if radius.is_disabled() || radius.r_active <= 0.0 {
+        return;
     }
+    let Some(generator) = grid.generator.as_ref().map(Arc::clone) else {
+        return;
+    };
+    let cam_local = streaming::world_to_grid_local_pos(camera_world_pos, &grid.transform);
+    for_each_chunk_in_radius(cam_local, radius.r_active, |idx| {
+        if grid.chunks.contains_key(&idx) {
+            return; // already present
+        }
+        if grid.pending_gen.contains(&idx) {
+            return; // already in flight
+        }
+        grid.pending_gen.insert(idx);
+        let version_at_dispatch = grid.chunk_version(idx);
+        let tx_clone = tx.clone();
+        let gen_clone = Arc::clone(&generator);
+        pool.spawn(move || {
+            let vxl = gen_clone.generate(idx);
+            // Send is non-blocking on unbounded channel; if the
+            // receiver was dropped (Scene drop), the send fails
+            // silently — that's fine.
+            let _ = tx_clone.send(streaming::ChunkResult {
+                grid_id,
+                chunk_idx: idx,
+                version_at_dispatch,
+                vxl,
+            });
+        });
+    });
 }
 
 #[cfg(test)]

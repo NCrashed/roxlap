@@ -1391,7 +1391,9 @@ name = "roxlap-scene"
 version = "0.2.0"
 dependencies = [
  "bincode",
+ "crossbeam-channel",
  "glam",
+ "rayon",
  "roxlap-core",
  "roxlap-formats",
  "serde",

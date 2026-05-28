@@ -173,6 +173,125 @@ pub(crate) fn world_to_grid_local_pos(world_pos: DVec3, transform: &crate::GridT
     transform.rotation.inverse() * (world_pos - transform.origin)
 }
 
+// ===========================================================
+// S7.3 async dispatch — native only.
+// ===========================================================
+//
+// On wasm32 the streaming pool / channel infrastructure is
+// cfg'd out and `Scene::pump_streaming` short-circuits to
+// `pump_streaming_sync` — there's no rayon `ThreadPool::build`
+// on `wasm32-unknown-unknown` without the wasm-bindgen-rayon
+// adapter, which is a binary-side concern that the scene crate
+// doesn't pull in.
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::{ChunkResult, StreamingState};
+
+#[cfg(not(target_arch = "wasm32"))]
+mod native {
+    use super::*;
+    use crate::GridId;
+
+    /// One generator result carried back over the channel from a
+    /// rayon worker to the main thread (S7.3). Kept `pub(crate)`
+    /// — callers don't construct or inspect these directly.
+    pub(crate) struct ChunkResult {
+        pub grid_id: GridId,
+        pub chunk_idx: IVec3,
+        /// `Grid::chunk_version(chunk_idx)` at dispatch time. The
+        /// main thread compares against the live counter on
+        /// install; mismatch ⇒ an edit happened mid-generation,
+        /// discard the result.
+        pub version_at_dispatch: u64,
+        pub vxl: Vxl,
+    }
+
+    /// Per-scene streaming state: dedicated rayon `ThreadPool` plus
+    /// the `crossbeam_channel` inbox the background tasks send
+    /// results into. One `StreamingState` lives on each
+    /// [`crate::Scene`].
+    ///
+    /// The pool is built lazily on first dispatch — a scene that
+    /// only ever uses [`crate::Scene::pump_streaming_sync`] pays
+    /// no thread-pool overhead.
+    pub(crate) struct StreamingState {
+        pub thread_count: usize,
+        pub pool: Option<rayon::ThreadPool>,
+        pub tx: crossbeam_channel::Sender<ChunkResult>,
+        pub rx: crossbeam_channel::Receiver<ChunkResult>,
+    }
+
+    impl Default for StreamingState {
+        fn default() -> Self {
+            // Unbounded so a slow drain (e.g. a frame stall in
+            // pump_streaming) doesn't block rayon workers on send.
+            // Inbox lifetime is bounded by pending_gen — there
+            // can't be more in-flight messages than there are
+            // chunks in pending_gen sets across all grids.
+            let (tx, rx) = crossbeam_channel::unbounded();
+            Self {
+                thread_count: 2,
+                pool: None,
+                tx,
+                rx,
+            }
+        }
+    }
+
+    impl std::fmt::Debug for StreamingState {
+        // Intentionally elides the channel + pool internals — they
+        // print noisily and add nothing over the summary booleans.
+        #[allow(clippy::missing_fields_in_debug)]
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("StreamingState")
+                .field("thread_count", &self.thread_count)
+                .field("pool_built", &self.pool.is_some())
+                .finish()
+        }
+    }
+
+    impl StreamingState {
+        /// Lazily construct the pool with the current
+        /// `thread_count`. Idempotent — second call is a no-op
+        /// when the pool already exists.
+        ///
+        /// # Panics
+        /// Panics if rayon fails to build the pool (typically OS
+        /// thread-allocation failure).
+        pub fn ensure_pool(&mut self) {
+            if self.pool.is_none() {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(self.thread_count)
+                    .thread_name(|i| format!("roxlap-stream-{i}"))
+                    .build()
+                    .expect("rayon ThreadPoolBuilder");
+                self.pool = Some(pool);
+            }
+        }
+
+        /// Update the desired thread count. If the pool was already
+        /// built, drops the old pool (which blocks until in-flight
+        /// tasks finish — rayon's standard contract) and rebuilds
+        /// with the new count on the next [`Self::ensure_pool`]
+        /// call. The channel survives the rebuild so any results
+        /// the old pool's tasks managed to send before drop are
+        /// still drained by the next pump.
+        ///
+        /// No-op when the new count matches the current one.
+        ///
+        /// # Panics
+        /// Panics if `n == 0`.
+        pub fn set_thread_count(&mut self, n: usize) {
+            assert!(n > 0, "streaming thread count must be >= 1");
+            if self.thread_count == n {
+                return;
+            }
+            self.thread_count = n;
+            self.pool = None;
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -254,7 +373,7 @@ pub(crate) mod tests {
         let mut g = Grid::new(GridTransform::identity());
         let gen = StubGenerator::new();
         let counter = Arc::clone(&gen.call_count);
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
 
         assert_eq!(g.chunk_count(), 0);
         let idx = IVec3::new(3, 0, 0);
@@ -280,7 +399,7 @@ pub(crate) mod tests {
         let mut g = Grid::new(GridTransform::identity());
         let gen = StubGenerator::new();
         let counter = Arc::clone(&gen.call_count);
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
 
         let idx = IVec3::new(5, -2, 0);
         assert!(g.ensure_chunk_generated(idx));
@@ -319,7 +438,7 @@ pub(crate) mod tests {
 
         let gen = StubGenerator::new();
         let counter = Arc::clone(&gen.call_count);
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
 
         let produced = g.ensure_chunk_generated(idx);
         assert!(!produced, "existing chunk not regenerated");
@@ -384,7 +503,7 @@ pub(crate) mod tests {
         scene
             .grid_mut(id)
             .unwrap()
-            .set_generator(Some(Box::new(gen)));
+            .set_generator(Some(Arc::new(gen)));
         // Stamp a far-away chunk that would be evicted under any
         // finite r_evict.
         scene
@@ -408,7 +527,7 @@ pub(crate) mod tests {
         let gen = StubGenerator::new();
         let counter = Arc::clone(&gen.call_count);
         let g = scene.grid_mut(id).unwrap();
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
         g.stream_radius = StreamRadius::new(200.0, 400.0);
         scene.pump_streaming_sync(DVec3::ZERO);
 
@@ -454,7 +573,7 @@ pub(crate) mod tests {
         let gen = StubGenerator::new();
         let counter = Arc::clone(&gen.call_count);
         let g = scene.grid_mut(id).unwrap();
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
         g.stream_radius = StreamRadius::new(180.0, 400.0);
 
         scene.pump_streaming_sync(DVec3::ZERO);
@@ -472,7 +591,7 @@ pub(crate) mod tests {
         let id = scene.add_grid(GridTransform::identity());
         let gen = StubGenerator::new();
         let g = scene.grid_mut(id).unwrap();
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
         g.stream_radius = StreamRadius::new(200.0, 400.0);
         scene.pump_streaming_sync(DVec3::ZERO);
         let initial = scene.grid(id).unwrap().chunk_count();
@@ -509,7 +628,7 @@ pub(crate) mod tests {
         let id = scene.add_grid(GridTransform::identity());
         let gen = StubGenerator::new();
         let g = scene.grid_mut(id).unwrap();
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
         g.stream_radius = StreamRadius::new(200.0, 600.0);
         scene.pump_streaming_sync(DVec3::ZERO);
         let g = scene.grid(id).unwrap();
@@ -573,7 +692,7 @@ pub(crate) mod tests {
         let id = scene.add_grid(transform);
         let gen = StubGenerator::new();
         let g = scene.grid_mut(id).unwrap();
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
         g.stream_radius = StreamRadius::new(50.0, 200.0);
 
         // World camera at (+10, 0, 0). After inverse 180°-Z, grid-local
@@ -599,7 +718,7 @@ pub(crate) mod tests {
         // A freshly-generated chunk has no user edits → version 0.
         let mut g = Grid::new(GridTransform::identity());
         let gen = StubGenerator::new();
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
         let idx = IVec3::new(2, 3, 0);
         assert!(g.ensure_chunk_generated(idx));
         assert_eq!(g.chunk_version(idx), 0);
@@ -612,7 +731,7 @@ pub(crate) mod tests {
         // Generator install + a single edit → version 1 (not 2).
         let mut g = Grid::new(GridTransform::identity());
         let gen = StubGenerator::new();
-        g.set_generator(Some(Box::new(gen)));
+        g.set_generator(Some(Arc::new(gen)));
         let idx = IVec3::ZERO;
         g.ensure_chunk_generated(idx);
         g.set_voxel(IVec3::new(10, 10, 10), Some(0x80_aa_bb_cc));
@@ -640,6 +759,346 @@ pub(crate) mod tests {
             "version entry should be cleared on eviction"
         );
         assert!(g.chunk_versions.is_empty(), "map should be empty");
+    }
+
+    // ---- S7.3: async pump_streaming ----
+
+    /// Test-only generator that pauses inside `generate` until the
+    /// test explicitly releases it. Two-channel design:
+    ///
+    /// - `arrival_tx`: each task signals "I'm running" with its
+    ///   chunk_idx before it blocks. Lets the test wait for the
+    ///   dispatcher to have actually scheduled work without
+    ///   sleeping.
+    /// - `release_rx`: each task blocks on `recv()` here until the
+    ///   test sends a `()` (or drops the matching `release_tx`,
+    ///   which unblocks all pending tasks via `Err` return — the
+    ///   safety net so a panicking test doesn't deadlock on
+    ///   `Scene::drop` waiting for blocked tasks to finish).
+    #[derive(Debug)]
+    #[cfg(not(target_arch = "wasm32"))]
+    struct BlockingGenerator {
+        arrival_tx: crossbeam_channel::Sender<IVec3>,
+        release_rx: crossbeam_channel::Receiver<()>,
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl ChunkGenerator for BlockingGenerator {
+        fn generate(&self, chunk_idx: IVec3) -> Vxl {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let _ = self.arrival_tx.send(chunk_idx);
+            // recv returns Err if the matching Sender was dropped
+            // (e.g. test panicked / ended); still produce a chunk
+            // so the rayon pool's drop doesn't hang.
+            let _ = self.release_rx.recv();
+            StubGenerator::new().generate(chunk_idx)
+        }
+    }
+
+    /// Convenience: pump_streaming in a spin-loop until `grid`'s
+    /// `pending_gen` is empty, releasing all gates as we go.
+    /// Panics on a 5-second timeout — generation tasks shouldn't
+    /// take that long even on the slowest CI.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_until_idle(
+        scene: &mut Scene,
+        cam: DVec3,
+        grid_id: crate::GridId,
+        release_tx: Option<&crossbeam_channel::Sender<()>>,
+    ) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            scene.pump_streaming(cam);
+            let idle = scene
+                .grid(grid_id)
+                .map_or(true, |g| g.pending_gen.is_empty());
+            if idle {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!("pump_until_idle: timeout with pending tasks");
+            }
+            // Release any blocked tasks so they can complete.
+            if let Some(tx) = release_tx {
+                let _ = tx.try_send(());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_streaming_dispatches_and_installs_via_async_path() {
+        // Happy path: set up a fast (non-blocking) generator,
+        // configure r_active, call pump_streaming, spin until
+        // idle, verify chunks installed.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let gen = StubGenerator::new();
+        let counter = Arc::clone(&gen.call_count);
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(gen)));
+        // Camera inside chunk (0,0,0) far from edges so only one
+        // chunk hits the r_active=10 ball.
+        g.stream_radius = StreamRadius::new(10.0, 200.0);
+        let cam = DVec3::new(64.0, 64.0, 128.0);
+
+        pump_until_idle(&mut scene, cam, id, None);
+
+        let g = scene.grid(id).unwrap();
+        assert!(g.chunks.contains_key(&IVec3::ZERO), "chunk installed");
+        assert_eq!(counter.load(Ordering::Relaxed), 1, "generator called once");
+        assert!(g.pending_gen.is_empty(), "no leftover pending");
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_streaming_tracks_in_flight_chunks_in_pending_gen() {
+        // Verify pending_gen reflects in-flight async tasks: after
+        // dispatch, pending_gen contains the chunk; after release
+        // + drain, it's empty.
+        let (arrival_tx, arrival_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let gen = BlockingGenerator {
+            arrival_tx,
+            release_rx,
+            call_count: Arc::clone(&counter),
+        };
+
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(gen)));
+        g.stream_radius = StreamRadius::new(10.0, 200.0);
+        let cam = DVec3::new(64.0, 64.0, 128.0);
+
+        scene.pump_streaming(cam);
+
+        // Wait for the task to actually start.
+        let arrived = arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("task didn't start");
+        assert_eq!(arrived, IVec3::ZERO);
+
+        // Right now the task is blocked inside `generate`.
+        // pending_gen must reflect that.
+        assert!(scene.grid(id).unwrap().pending_gen.contains(&IVec3::ZERO));
+        assert!(scene.grid(id).unwrap().chunks.is_empty());
+
+        // Release and drain.
+        release_tx.send(()).unwrap();
+        pump_until_idle(&mut scene, cam, id, Some(&release_tx));
+
+        let g = scene.grid(id).unwrap();
+        assert!(g.chunks.contains_key(&IVec3::ZERO));
+        assert!(!g.pending_gen.contains(&IVec3::ZERO));
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_streaming_does_not_redispatch_in_flight_chunks() {
+        // While chunk X is in pending_gen, repeated pump calls
+        // must NOT enqueue another generate for X. Verified by
+        // call_count staying at 1 across multiple pumps.
+        let (arrival_tx, arrival_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let gen = BlockingGenerator {
+            arrival_tx,
+            release_rx,
+            call_count: Arc::clone(&counter),
+        };
+
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(gen)));
+        g.stream_radius = StreamRadius::new(10.0, 200.0);
+        let cam = DVec3::new(64.0, 64.0, 128.0);
+
+        scene.pump_streaming(cam);
+        let _ = arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("task didn't start");
+
+        // Pump several more times while task is blocked.
+        for _ in 0..5 {
+            scene.pump_streaming(cam);
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "in-flight chunk re-dispatched"
+        );
+
+        release_tx.send(()).unwrap();
+        pump_until_idle(&mut scene, cam, id, Some(&release_tx));
+        // Final post-drain assertion: still just one generate call.
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_streaming_discards_stale_result_when_chunk_edited_during_gen() {
+        // Race: dispatch a chunk; while task is blocked, edit the
+        // chunk via set_voxel (creates a real chunk + bumps
+        // version to 1). Release. The result arrives with
+        // version_at_dispatch=0 vs current=1 → must discard. The
+        // chunk keeps the user edit; doesn't get overwritten by
+        // generator output.
+        let (arrival_tx, arrival_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let gen = BlockingGenerator {
+            arrival_tx,
+            release_rx,
+            call_count: Arc::clone(&counter),
+        };
+
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(gen)));
+        g.stream_radius = StreamRadius::new(10.0, 200.0);
+        let cam = DVec3::new(64.0, 64.0, 128.0);
+
+        scene.pump_streaming(cam);
+        let _ = arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("task didn't start");
+
+        // Edit while the task is blocked.
+        let g = scene.grid_mut(id).unwrap();
+        // A user voxel at (10, 11, 12) inside chunk (0,0,0).
+        g.set_voxel(IVec3::new(10, 11, 12), Some(0x80_de_ad_be));
+        assert_eq!(g.chunk_version(IVec3::ZERO), 1);
+        let chunk = g.chunk(IVec3::ZERO).unwrap();
+        assert!(voxel_is_solid(chunk, 10, 11, 12));
+        // Stub's signature voxel for chunk_idx.x=0 lives at
+        // (0, 0, 0). After the user edit, before release, that
+        // voxel is NOT solid (manual edit only set (10,11,12)).
+        assert!(!voxel_is_solid(chunk, 0, 0, 0));
+
+        release_tx.send(()).unwrap();
+        pump_until_idle(&mut scene, cam, id, Some(&release_tx));
+
+        // Chunk has the user voxel and NOT the generator signature.
+        let g = scene.grid(id).unwrap();
+        let chunk = g.chunk(IVec3::ZERO).unwrap();
+        assert!(voxel_is_solid(chunk, 10, 11, 12), "user edit survived");
+        assert!(
+            !voxel_is_solid(chunk, 0, 0, 0),
+            "stale generator output must not have overwritten the chunk"
+        );
+        // Generator ran exactly once before we discarded its result.
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_streaming_eviction_drops_pending_gen_entry() {
+        // Dispatch a chunk; while task is blocked, move the camera
+        // far enough that the chunk is past r_evict. After the
+        // next pump, the chunk's pending_gen entry must be gone
+        // (the eviction half of pump removes it). When the task
+        // finally completes, the drain discards the result via
+        // "was_pending = false".
+        let (arrival_tx, arrival_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let gen = BlockingGenerator {
+            arrival_tx,
+            release_rx,
+            call_count: Arc::clone(&counter),
+        };
+
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(gen)));
+        g.stream_radius = StreamRadius::new(10.0, 50.0);
+        let near_cam = DVec3::new(64.0, 64.0, 128.0);
+        scene.pump_streaming(near_cam);
+        let _ = arrival_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("task didn't start");
+        assert!(scene.grid(id).unwrap().pending_gen.contains(&IVec3::ZERO));
+
+        // Teleport the camera 10_000 voxels along +x. Chunk
+        // (0,0,0)'s nearest face at x=128 is now ~9872 away —
+        // well past r_evict.
+        let far_cam = DVec3::new(10_000.0, 64.0, 128.0);
+        scene.pump_streaming(far_cam);
+        assert!(
+            !scene.grid(id).unwrap().pending_gen.contains(&IVec3::ZERO),
+            "eviction should have cleared the pending entry"
+        );
+
+        // Now release the blocked task. Its result arrives with
+        // was_pending = false → silently dropped.
+        release_tx.send(()).unwrap();
+        // Drain at the far camera; chunk (0,0,0) is not in
+        // r_active there, so no re-dispatch.
+        pump_until_idle(&mut scene, far_cam, id, Some(&release_tx));
+        let g = scene.grid(id).unwrap();
+        assert!(
+            !g.chunks.contains_key(&IVec3::ZERO),
+            "evicted chunk must not be re-installed by the stale result"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_streaming_with_disabled_radius_is_noop() {
+        // Like the sync pump's disabled-noop test, but going
+        // through the async path. No dispatch, no drain, no
+        // panic.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let gen = StubGenerator::new();
+        let counter = Arc::clone(&gen.call_count);
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .set_generator(Some(Arc::new(gen)));
+        // stream_radius defaults to DISABLED.
+        scene.pump_streaming(DVec3::ZERO);
+        let g = scene.grid(id).unwrap();
+        assert!(g.chunks.is_empty());
+        assert!(g.pending_gen.is_empty());
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_streaming_threads_zero_panics() {
+        let mut scene = Scene::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scene.set_streaming_threads(0);
+        }));
+        assert!(result.is_err(), "zero threads must panic");
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_streaming_threads_lazily_applied_before_first_pump() {
+        // Set thread count before any pump → pool is built with
+        // the new count on next pump. Verified by a successful
+        // round-trip with thread_count = 1.
+        let mut scene = Scene::new();
+        scene.set_streaming_threads(1);
+        let id = scene.add_grid(GridTransform::identity());
+        let gen = StubGenerator::new();
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(gen)));
+        g.stream_radius = StreamRadius::new(10.0, 200.0);
+        let cam = DVec3::new(64.0, 64.0, 128.0);
+        pump_until_idle(&mut scene, cam, id, None);
+        assert!(scene.grid(id).unwrap().chunks.contains_key(&IVec3::ZERO));
     }
 
     #[test]
