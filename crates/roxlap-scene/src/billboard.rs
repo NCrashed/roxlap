@@ -57,6 +57,26 @@ use roxlap_core::Camera;
 
 use crate::{Grid, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
+/// Per-grid bounding metadata in grid-local space — computed once
+/// per render dispatch by [`grid_local_centre_and_radius`].
+/// Exposed so S6.3's `render_scene_composed` Far arm can share the
+/// centre/radius pair across the cache lookup AND the blit
+/// projection without recomputing.
+#[derive(Debug, Clone, Copy)]
+pub struct GridLocalBounds {
+    pub centre: DVec3,
+    pub radius: f64,
+}
+
+/// See [`super::grid_local_centre_and_radius`] for the internal
+/// version. The pub re-export keeps render.rs out of the
+/// internal-helper namespace.
+#[must_use]
+pub fn grid_bounds(grid: &Grid) -> GridLocalBounds {
+    let (centre, radius) = grid_local_centre_and_radius(grid);
+    GridLocalBounds { centre, radius }
+}
+
 /// Distance multiple of `bounding_radius` at which the snapshot
 /// camera is placed. 8× is "narrow enough FOV to look orthographic
 /// without busting numerical precision". Documented above; not a
@@ -406,6 +426,138 @@ fn snapshot_settings(resolution: u32, d: f64, r: f64, max_scan_dist: i32) -> Opt
         mip_levels: 1,
         mip_scan_dist: 4,
         max_scan_dist,
+    }
+}
+
+/// Blit one [`BillboardSnapshot`] into a `(fb, zb)` pair as a
+/// camera-aligned 2D quad — the S6.3 Far-tier render path.
+///
+/// Projection:
+/// - The grid's world centre projects to a screen pixel via the
+///   runtime camera's basis + `settings.{hx, hy, hz}`. If the
+///   centre is at or behind the camera (`depth <= 0`), this is a
+///   no-op.
+/// - The grid's bounding sphere (`radius` in grid-local voxel
+///   units, identical to world units because rotations preserve
+///   distance) projects to a screen-pixel half-extent
+///   `pixel_radius = radius * hz / depth`. The blit covers the
+///   square `[cx - pixel_radius, cx + pixel_radius]² ×
+///   [cy - pixel_radius, cy + pixel_radius]` around the projected
+///   centre.
+/// - Source-to-destination sampling is nearest-neighbour. The
+///   snapshot's resolution is fixed at build time; under-sampling
+///   when far away (snapshot_pixels >> screen_pixels) is fine for
+///   impostors. Over-sampling when close (screen_pixels >>
+///   snapshot_pixels) causes blocky scaling but Far tier is by
+///   definition past the radius-based threshold so screen_pixels
+///   should stay modest.
+///
+/// Depth: every non-sky destination pixel gets the same `z` value
+/// — the camera-to-grid-centre distance. This treats the impostor
+/// as a flat disk at the grid centre. Adequate for S6.3 minimum-
+/// viable; S6.4 polish can use per-pixel depth from
+/// `snapshot.depth` to recover internal shape.
+///
+/// Sky pixels: detected via `snapshot.depth[..].is_infinite()`.
+/// Skipped entirely (the destination pixel + zbuffer are
+/// untouched), so the underlying sky / other grids show through.
+///
+/// Compose: min-z merge against the existing `zb`. Closer-than-
+/// existing wins. Sky pixels in the snapshot don't even attempt
+/// the merge, so distant grids never wipe out a near grid's
+/// rendered pixel.
+#[allow(clippy::too_many_arguments)]
+pub fn billboard_blit_into(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
+    snapshot: &BillboardSnapshot,
+    grid_world_centre: DVec3,
+    grid_world_radius: f64,
+    camera: &Camera,
+    settings: &OpticastSettings,
+) {
+    // Camera basis in world space.
+    let cam_pos = DVec3::from_array(camera.pos);
+    let forward = DVec3::from_array(camera.forward);
+    let right = DVec3::from_array(camera.right);
+    let down = DVec3::from_array(camera.down);
+    // Vector from camera to grid centre.
+    let to_centre = grid_world_centre - cam_pos;
+    // Depth along the camera forward axis. Negative = behind
+    // camera; skip (the perspective project would invert sign).
+    let depth = to_centre.dot(forward);
+    if depth <= 0.0 || !depth.is_finite() {
+        return;
+    }
+    // Off-axis offsets along right / down.
+    let x_off = to_centre.dot(right);
+    let y_off = to_centre.dot(down);
+    // Perspective scale factor at the grid centre's depth.
+    let scale = f64::from(settings.hz) / depth;
+    let cx = f64::from(settings.hx) + x_off * scale;
+    let cy = f64::from(settings.hy) + y_off * scale;
+    // Half-extent of the impostor quad in destination pixels.
+    let pixel_radius_f = grid_world_radius * scale;
+    if !pixel_radius_f.is_finite() || pixel_radius_f < 1.0 {
+        // Sub-pixel impostor — invisible at this resolution.
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pixel_radius = pixel_radius_f.ceil() as i32;
+    let dst_size = pixel_radius * 2;
+    if dst_size <= 0 {
+        return;
+    }
+    // Source dims.
+    let src_w = snapshot.width as i32;
+    let src_h = snapshot.height as i32;
+    if src_w <= 0 || src_h <= 0 {
+        return;
+    }
+    // Quad's top-left destination corner. Clamped to screen at
+    // sampling time so partially-off-screen quads still render
+    // their visible portion.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let dst_left = (cx - pixel_radius_f) as i32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let dst_top = (cy - pixel_radius_f) as i32;
+    // Z value used for every non-sky billboard pixel.
+    #[allow(clippy::cast_possible_truncation)]
+    let z = depth as f32;
+
+    let w_i = width as i32;
+    let h_i = height as i32;
+    for dy in 0..dst_size {
+        let screen_y = dst_top + dy;
+        if screen_y < 0 || screen_y >= h_i {
+            continue;
+        }
+        // Nearest-neighbour source y.
+        let sy = (dy * src_h) / dst_size;
+        let row_src_base = (sy as usize) * (src_w as usize);
+        let row_dst_base = (screen_y as usize) * pitch_pixels;
+        for dx in 0..dst_size {
+            let screen_x = dst_left + dx;
+            if screen_x < 0 || screen_x >= w_i {
+                continue;
+            }
+            let sx = (dx * src_w) / dst_size;
+            let src_idx = row_src_base + sx as usize;
+            // Sky pixels: skip. Depth-buffer infinity is the sky
+            // tag (built into BillboardCache::build's all-sky
+            // init).
+            if snapshot.depth[src_idx].is_infinite() {
+                continue;
+            }
+            let dst_idx = row_dst_base + screen_x as usize;
+            if z < zb[dst_idx] {
+                fb[dst_idx] = snapshot.color[src_idx];
+                zb[dst_idx] = z;
+            }
+        }
     }
 }
 

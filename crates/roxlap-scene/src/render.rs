@@ -43,6 +43,7 @@ use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
 
+use crate::billboard::{self, BillboardCache, DEFAULT_RESOLUTION as BILLBOARD_RESOLUTION};
 use crate::lod::Lod;
 use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
 
@@ -262,14 +263,6 @@ pub fn render_scene_composed(
     let mut temp_zb = vec![f32::INFINITY; pixel_count];
 
     for (_id, grid) in scene.grids_mut() {
-        // S4B.2.e: Approach B render path. See `render_scene`'s
-        // body for the camera transform + ChunkGrid construction
-        // commentary; the only difference is this writes to
-        // (temp_fb, temp_zb) and composes via `compose_into`.
-        // S5.0: per-grid rotation flows via the shared helper.
-        let Some(backing) = grid.chunk_xyz_backing() else {
-            continue;
-        };
         // S6.0/S6.1: per-grid LOD tier dispatch. The picker keys
         // off the grid's `lod_thresholds` and the world-space
         // camera. Default thresholds are `always_near` so every
@@ -283,9 +276,78 @@ pub fn render_scene_composed(
         // degrade — callers opt into the Mid plumbing via
         // `LodThresholds::from_radius_with_mid_mip`).
         //
-        // S6.3 will plug `Far` into the billboard impostor blit
-        // path. For now `Far` falls through to the Near render.
+        // S6.3: `Far` skips the opticast path entirely — render
+        // dispatches into the billboard impostor blit (below). The
+        // LOD enum is computed before `chunk_xyz_backing` because
+        // the Far branch needs `&mut grid` for the lazy cache
+        // populate, which conflicts with the `&grid` lifetime
+        // backing's tied to.
         let lod = grid.select_lod(DVec3::from_array(camera.pos));
+
+        if lod == Lod::Far {
+            // S6.3: Far-tier billboard blit.
+            //
+            // Empty grids have nothing to impostor; skip without
+            // touching `billboards` so a later edit + Far re-entry
+            // still builds a fresh cache.
+            if grid.chunks.is_empty() {
+                continue;
+            }
+            // Lazy populate: cleared by edits (see `edit.rs`),
+            // rebuilt on first Far entry after each edit cycle.
+            if grid.billboards.is_none() {
+                let cache = BillboardCache::build(grid, BILLBOARD_RESOLUTION, sky_color);
+                grid.billboards = Some(cache);
+            }
+            // Grid bounds + world-space centre. Rotation preserves
+            // length, so `bounds.radius` is the world-space radius.
+            let bounds = billboard::grid_bounds(grid);
+            let centre_world = grid.transform.origin + grid.transform.rotation * bounds.centre;
+            // Query direction = unit vector from grid centre TO
+            // camera, in grid-local space (snapshots' `view_dir`s
+            // live in that frame).
+            let cam_pos = DVec3::from_array(camera.pos);
+            let centre_to_cam_world = cam_pos - centre_world;
+            let ctc_len = centre_to_cam_world.length();
+            if !ctc_len.is_finite() || ctc_len < 1e-9 {
+                // Camera essentially at grid centre — pick_nearest
+                // is ill-defined. Skip; a future frame at a
+                // resolvable pose will render normally.
+                continue;
+            }
+            let query_dir_world = centre_to_cam_world / ctc_len;
+            let query_dir_local = grid.transform.rotation.inverse() * query_dir_world;
+            // Cache is guaranteed Some here (populated above).
+            let cache = grid.billboards.as_ref().unwrap();
+            // pick_nearest only returns None for empty caches;
+            // we just built a 26-snapshot cache so unwrap is safe.
+            let snapshot = cache
+                .pick_nearest(query_dir_local)
+                .expect("billboard cache populated above");
+            billboard::billboard_blit_into(
+                fb,
+                zb,
+                pitch_pixels,
+                width,
+                height,
+                snapshot,
+                centre_world,
+                bounds.radius,
+                camera,
+                settings,
+            );
+            grids_drawn += 1;
+            continue;
+        }
+
+        // S4B.2.e: Approach B render path. See `render_scene`'s
+        // body for the camera transform + ChunkGrid construction
+        // commentary; the only difference is this writes to
+        // (temp_fb, temp_zb) and composes via `compose_into`.
+        // S5.0: per-grid rotation flows via the shared helper.
+        let Some(backing) = grid.chunk_xyz_backing() else {
+            continue;
+        };
         // S5.2-followup: per-grid sky opt-out. Grids with
         // `render_sky = false` (e.g. a rotating ship) must not
         // contribute sky pixels — the grid-local sky lookup
@@ -1362,6 +1424,268 @@ mod tests {
             fb_a, fb_b,
             "global mip_levels_override should clamp Mid override (ship workaround survives Mid tier)"
         );
+    }
+
+    // ---- S6.3: Far-tier billboard blit ----
+
+    /// Force Far tier via `r_near = 0, r_mid = 0`: any non-zero
+    /// camera-to-grid distance lands on `Lod::Far`. Renders a small
+    /// grid at world (0, 200, 0) with default-radius thresholds
+    /// turned all-Far. The composed framebuffer must contain
+    /// non-sky pixels from the impostor blit.
+    #[test]
+    fn s6_3_far_tier_blits_non_sky_pixels() {
+        let (mut scene, id) = build_one_grid_scene(DVec3::new(0.0, 200.0, 0.0));
+        scene.grid_mut(id).unwrap().lod_thresholds = crate::LodThresholds {
+            r_near: 0.0,
+            r_mid: 0.0,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
+        };
+
+        let camera = camera_at([64.0, 0.0, 100.0]);
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+
+        // Sanity: picker actually picked Far.
+        let lod = scene
+            .grid(id)
+            .unwrap()
+            .select_lod(DVec3::from_array(camera.pos));
+        assert_eq!(lod, Lod::Far);
+
+        // Impostor must paint at least some non-sky pixels.
+        let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
+        assert!(
+            non_sky > 0,
+            "Far-tier render produced no non-sky pixels — billboard blit not firing"
+        );
+    }
+
+    /// Lazy populate: cache starts `None`, becomes `Some` after the
+    /// first Far render.
+    #[test]
+    fn s6_3_far_render_lazily_populates_cache() {
+        let (mut scene, id) = build_one_grid_scene(DVec3::new(0.0, 200.0, 0.0));
+        scene.grid_mut(id).unwrap().lod_thresholds = crate::LodThresholds {
+            r_near: 0.0,
+            r_mid: 0.0,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
+        };
+        assert!(scene.grid(id).unwrap().billboards.is_none());
+
+        let camera = camera_at([64.0, 0.0, 100.0]);
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let _ = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        let cache = scene
+            .grid(id)
+            .unwrap()
+            .billboards
+            .as_ref()
+            .expect("Far render should have populated billboards");
+        assert_eq!(cache.len(), 26);
+    }
+
+    /// Edit invalidates the cache; a subsequent Far render rebuilds.
+    #[test]
+    fn s6_3_edit_invalidates_then_far_render_rebuilds() {
+        let (mut scene, id) = build_one_grid_scene(DVec3::new(0.0, 200.0, 0.0));
+        scene.grid_mut(id).unwrap().lod_thresholds = crate::LodThresholds {
+            r_near: 0.0,
+            r_mid: 0.0,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
+        };
+        let camera = camera_at([64.0, 0.0, 100.0]);
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+
+        // First Far render → cache built.
+        let mut fb1 = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb1 = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let _ = render_scene_composed(
+            &mut fb1,
+            &mut zb1,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert!(scene.grid(id).unwrap().billboards.is_some());
+
+        // Edit invalidates.
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .set_voxel(IVec3::new(70, 70, 70), Some(0x80_aa_aa_22));
+        assert!(scene.grid(id).unwrap().billboards.is_none());
+
+        // Second Far render rebuilds.
+        let mut fb2 = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb2 = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let _ = render_scene_composed(
+            &mut fb2,
+            &mut zb2,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert!(scene.grid(id).unwrap().billboards.is_some());
+    }
+
+    /// Hybrid scene: one Near grid + one Far grid. Both must render
+    /// visibly; the Far grid via blit, the Near grid via opticast.
+    /// Sanity check that the two paths cohabit one
+    /// `render_scene_composed` call.
+    #[test]
+    fn s6_3_near_and_far_grids_in_same_scene() {
+        let mut scene = Scene::new();
+        // Grid A: stays Near (default thresholds). Solid box at
+        // world (-30..-20, 190..210, 50..70).
+        let a_id = scene.add_grid(GridTransform::at(DVec3::new(-100.0, 200.0, 0.0)));
+        scene.grid_mut(a_id).unwrap().set_rect(
+            IVec3::new(70, 0, 50),
+            IVec3::new(85, 15, 70),
+            Some(0x80_22_88_22), // green
+        );
+        // Grid B: forced Far. Box at world (~100, 200, 100).
+        let b_id = scene.add_grid(GridTransform::at(DVec3::new(100.0, 200.0, 0.0)));
+        scene.grid_mut(b_id).unwrap().set_rect(
+            IVec3::new(0, 0, 80),
+            IVec3::new(20, 20, 110),
+            Some(0x80_aa_22_22), // red
+        );
+        scene.grid_mut(b_id).unwrap().lod_thresholds = crate::LodThresholds {
+            r_near: 0.0,
+            r_mid: 0.0,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
+        };
+
+        let camera = camera_at([0.0, 0.0, 80.0]);
+        // Confirm A is Near, B is Far for this pose.
+        assert_eq!(
+            scene
+                .grid(a_id)
+                .unwrap()
+                .select_lod(DVec3::from_array(camera.pos)),
+            Lod::Near
+        );
+        assert_eq!(
+            scene
+                .grid(b_id)
+                .unwrap()
+                .select_lod(DVec3::from_array(camera.pos)),
+            Lod::Far
+        );
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 2 });
+
+        // Each grid should contribute visible pixels.
+        let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
+        assert!(
+            non_sky > 20,
+            "hybrid scene produced too few non-sky pixels ({non_sky}); one tier may have failed"
+        );
+    }
+
+    /// Empty grid at Far tier: skipped silently (no panic, no
+    /// allocation), `billboards` stays `None`.
+    #[test]
+    fn s6_3_empty_grid_at_far_is_skipped() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::new(100.0, 200.0, 0.0)));
+        scene.grid_mut(id).unwrap().lod_thresholds = crate::LodThresholds {
+            r_near: 0.0,
+            r_mid: 0.0,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
+        };
+
+        let camera = camera_at([0.0, 0.0, 100.0]);
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        // No grids contributed.
+        assert_eq!(outcome, RenderOutcome::Empty);
+        // Cache must NOT have been built for an empty grid.
+        assert!(scene.grid(id).unwrap().billboards.is_none());
+        // Framebuffer unchanged.
+        assert!(fb.iter().all(|&p| p == sky_color));
     }
 
     // ---- S6.0: LOD picker wired but every tier falls through to Near ----
