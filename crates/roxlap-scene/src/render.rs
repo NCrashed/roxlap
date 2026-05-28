@@ -2635,4 +2635,235 @@ mod tests {
             "camera at chz=2 with floor in same chunk should see it — got {floor_count} floor pixels"
         );
     }
+
+    // ---- S7.4: render integration with streaming ----
+
+    /// Floor-stamping generator for S7.4 render tests. Produces a
+    /// 10-voxel-thick floor at the bottom of every chunk it
+    /// generates (chunk-local `z = 230..239`, all xy). Visible as
+    /// a green stripe along the bottom of the framebuffer when
+    /// the camera looks +y across populated chunks.
+    #[derive(Debug)]
+    struct FloorGenerator;
+
+    impl crate::ChunkGenerator for FloorGenerator {
+        fn generate(&self, _chunk_idx: IVec3) -> roxlap_formats::vxl::Vxl {
+            // Lean on `Grid::ensure_chunk` for the empty-chunk
+            // builder, then carve a floor via `set_rect`. Detach
+            // the chunk from the temporary grid and return it.
+            let mut tmp = crate::Grid::new(GridTransform::identity());
+            tmp.ensure_chunk(IVec3::ZERO);
+            let mut vxl = tmp.chunks.remove(&IVec3::ZERO).unwrap();
+            #[allow(clippy::cast_possible_wrap)]
+            roxlap_formats::edit::set_rect(
+                &mut vxl,
+                glam::IVec3::new(0, 0, 230).into(),
+                glam::IVec3::new((CHUNK_SIZE_XY - 1) as i32, (CHUNK_SIZE_XY - 1) as i32, 239)
+                    .into(),
+                Some(0x80_22_aa_22),
+            );
+            vxl
+        }
+    }
+
+    #[test]
+    fn render_scene_composed_unpumped_streaming_grid_renders_all_sky() {
+        // S7.4(a): a grid with a generator + active stream radius
+        // but no pump_streaming call has zero chunks. The render
+        // walks the grid (chunk_xyz_backing returns None for an
+        // empty chunk map → grid is skipped), framebuffer stays
+        // sky.
+        use std::sync::Arc;
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(FloorGenerator)));
+        g.stream_radius = crate::StreamRadius::new(300.0, 600.0);
+        assert!(g.chunks.is_empty(), "no pump yet → no chunks");
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        // Camera at (64, -100, 200) looking +y so it would see
+        // chunks ahead once they exist.
+        let camera = camera_at([64.0, -100.0, 200.0]);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let _ = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        // Empty grid path skips opticast → framebuffer untouched.
+        assert!(
+            fb.iter().all(|&p| p == sky_color),
+            "unpumped streaming grid must render as all sky"
+        );
+    }
+
+    #[test]
+    fn render_scene_composed_picks_up_streamed_chunks_after_sync_pump() {
+        // S7.4(a): once the streaming pump installs chunks, the
+        // next render shows them. Using pump_streaming_sync for
+        // deterministic timing — pump_streaming (async) lands
+        // the same way modulo a frame of latency.
+        use std::sync::Arc;
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(FloorGenerator)));
+        // Cover chunks ahead of the camera (y=0, y=128, y=256).
+        g.stream_radius = crate::StreamRadius::new(300.0, 600.0);
+
+        // Render BEFORE pump: zero floor pixels.
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let camera = camera_at([64.0, -100.0, 200.0]);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let _ = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        let pre_floor = fb.iter().filter(|&&p| p == 0x80_22_aa_22).count();
+        assert_eq!(pre_floor, 0, "pre-pump frame has no streamed chunks");
+
+        // Pump synchronously — `world_pos` matches the camera so
+        // chunks ahead of it (within r_active = 300) stream in.
+        scene.pump_streaming_sync(DVec3::new(64.0, -100.0, 200.0));
+        let g = scene.grid(id).unwrap();
+        assert!(
+            !g.chunks.is_empty(),
+            "pump should have streamed at least one chunk"
+        );
+
+        // Render AFTER pump: the floor should now be visible. Reset
+        // the framebuffer to sky first.
+        fb.iter_mut().for_each(|p| *p = sky_color);
+        zb.iter_mut().for_each(|z| *z = f32::INFINITY);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let post_floor = fb.iter().filter(|&&p| p == 0x80_22_aa_22).count();
+        assert!(
+            post_floor > 100,
+            "post-pump frame should show the streamed floor — got {post_floor} green pixels"
+        );
+    }
+
+    #[test]
+    fn render_scene_composed_partial_streaming_renders_pending_chunks_as_air() {
+        // S7.4(a): mixed state — some r_active chunks are
+        // materialised, others are still pending (not in
+        // `chunks`). The render must treat pending chunks as
+        // implicit-air. Verified by stamping one chunk via the
+        // generator + skipping the others, then confirming the
+        // framebuffer has fewer floor pixels than the
+        // fully-pumped baseline.
+        use std::sync::Arc;
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(FloorGenerator)));
+        // r_active must be set so the later pump_streaming_sync
+        // sanity-check actually streams more chunks in. Kept at
+        // 300 so the resulting chunks_z stack is ≤ 3 — opticast's
+        // `gylookup` table multiplies `chunks_z * 512 * PREC` and
+        // overflows i32 at chunks_z ≥ 4 (pre-existing limit, not
+        // S7.4 scope to fix).
+        g.stream_radius = crate::StreamRadius::new(300.0, 600.0);
+
+        // Materialise ONLY chunk (0, 0, 0) manually via the
+        // sync helper — leave (0, 1, 0), (0, 2, 0) absent.
+        let installed = g.ensure_chunk_generated(IVec3::ZERO);
+        assert!(installed, "manual install of one chunk");
+        assert_eq!(g.chunks.len(), 1);
+        // Make sure (0, 1, 0), (0, 2, 0) are NOT present.
+        assert!(g.chunk(IVec3::new(0, 1, 0)).is_none());
+        assert!(g.chunk(IVec3::new(0, 2, 0)).is_none());
+
+        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        // Camera inside chunk (0, 0, 0); looking +y means the
+        // floor of (0, 0, 0) gets rendered until the ray walks
+        // off the chunk into implicit-air space at y=128. No
+        // floor pixels past that distance.
+        let camera = camera_at([64.0, 32.0, 200.0]);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let _ = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        let floor_pixels = fb.iter().filter(|&&p| p == 0x80_22_aa_22).count();
+        // Visible floor inside chunk (0,0,0); pending neighbours
+        // contribute nothing. The number isn't pinned exactly —
+        // it just needs to be non-zero (we have content) and
+        // less than what a fully-streamed scene would produce.
+        assert!(
+            floor_pixels > 0,
+            "should see at least some floor from the loaded chunk"
+        );
+        // Sanity: stream the missing chunks; verify the floor
+        // pixel count goes up.
+        scene.pump_streaming_sync(DVec3::new(64.0, 32.0, 200.0));
+        assert!(scene.grid(id).unwrap().chunk_count() >= 2);
+        fb.iter_mut().for_each(|p| *p = sky_color);
+        zb.iter_mut().for_each(|z| *z = f32::INFINITY);
+        let _ = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            &mut pool,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        let floor_pixels_full = fb.iter().filter(|&&p| p == 0x80_22_aa_22).count();
+        assert!(
+            floor_pixels_full > floor_pixels,
+            "fully-streamed scene should show more floor than partial: \
+             partial={floor_pixels} full={floor_pixels_full}"
+        );
+    }
 }

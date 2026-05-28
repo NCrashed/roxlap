@@ -326,6 +326,12 @@ impl Grid {
         };
         let chunk = generator.generate(chunk_idx);
         self.chunks.insert(chunk_idx, chunk);
+        // S7.4: a fresh chunk grows the populated AABB → the
+        // bounding sphere shifts/expands → existing impostor
+        // projections become wrong. Match the eviction (S7.1) +
+        // edit (S6.2) invalidation contract and drop the cache.
+        // Next Far-tier render rebuilds lazily.
+        self.billboards = None;
         true
     }
 
@@ -551,6 +557,13 @@ impl Scene {
                 continue;
             }
             grid.chunks.insert(result.chunk_idx, result.vxl);
+            // S7.4: same invalidation contract as the sync
+            // `ensure_chunk_generated` path — installing a new
+            // chunk can grow the bounding sphere, so the
+            // billboard impostor cache must be rebuilt on next
+            // Far entry. Lazy: only one cache wipe per drain
+            // batch, the Far render rebuilds afterwards.
+            grid.billboards = None;
         }
 
         // 2. Per-grid: eviction first, then dispatch. Doing evict

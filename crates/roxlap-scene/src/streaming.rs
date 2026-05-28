@@ -828,6 +828,103 @@ pub(crate) mod tests {
         }
     }
 
+    // ---- S7.4: stream-in clears billboards cache ----
+
+    #[test]
+    fn ensure_chunk_generated_invalidates_billboard_cache() {
+        // Sync stream-in: a populated cache must be cleared when
+        // a generator installs a new chunk — the bounding sphere
+        // may have grown.
+        let mut g = Grid::new(GridTransform::identity());
+        let gen = StubGenerator::new();
+        g.set_generator(Some(Arc::new(gen)));
+        g.billboards = Some(crate::BillboardCache::new_empty(32));
+
+        let installed = g.ensure_chunk_generated(IVec3::new(2, 0, 0));
+        assert!(installed, "generator should have installed the chunk");
+        assert!(
+            g.billboards.is_none(),
+            "ensure_chunk_generated must clear billboards on install"
+        );
+    }
+
+    #[test]
+    fn ensure_chunk_generated_noop_preserves_billboard_cache() {
+        // No-install paths (no generator, already-present) must
+        // NOT clear the cache — there was no bounding-sphere
+        // change to invalidate.
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_aa_bb_cc));
+        g.billboards = Some(crate::BillboardCache::new_empty(32));
+        // No generator → no install → cache stays.
+        let installed = g.ensure_chunk_generated(IVec3::new(5, 5, 0));
+        assert!(!installed);
+        assert!(
+            g.billboards.is_some(),
+            "no-generator no-op must not clear billboards"
+        );
+        // Already-present chunk → no install → cache stays.
+        let installed = g.ensure_chunk_generated(IVec3::ZERO);
+        assert!(!installed);
+        assert!(
+            g.billboards.is_some(),
+            "already-present chunk must not clear billboards"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_streaming_async_install_invalidates_billboard_cache() {
+        // Async path: pump_streaming installs chunks via the drain;
+        // each install must clear the cache so the next Far render
+        // rebuilds with the new chunk set.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let gen = StubGenerator::new();
+        let g = scene.grid_mut(id).unwrap();
+        g.set_generator(Some(Arc::new(gen)));
+        g.stream_radius = StreamRadius::new(10.0, 200.0);
+        // Stamp a sentinel cache before pumping.
+        g.billboards = Some(crate::BillboardCache::new_empty(32));
+        let cam = DVec3::new(64.0, 64.0, 128.0);
+
+        pump_until_idle(&mut scene, cam, id, None);
+
+        let g = scene.grid(id).unwrap();
+        assert!(g.chunks.contains_key(&IVec3::ZERO), "chunk installed");
+        assert!(
+            g.billboards.is_none(),
+            "async install must clear billboards"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pump_streaming_no_install_preserves_billboard_cache() {
+        // Pump with no missing chunks (all already present) must
+        // NOT clear billboards. Set up: stream chunks in sync,
+        // populate cache, pump again with same camera + same
+        // r_active → drain has nothing → cache survives.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        let gen = StubGenerator::new();
+        g.set_generator(Some(Arc::new(gen)));
+        g.stream_radius = StreamRadius::new(10.0, 200.0);
+        let cam = DVec3::new(64.0, 64.0, 128.0);
+        // First pump: streams in chunk(s).
+        pump_until_idle(&mut scene, cam, id, None);
+        // Stamp cache.
+        scene.grid_mut(id).unwrap().billboards = Some(crate::BillboardCache::new_empty(32));
+        // Second pump at same camera: no new chunks installed.
+        scene.pump_streaming(cam);
+        let g = scene.grid(id).unwrap();
+        assert!(
+            g.billboards.is_some(),
+            "pump with no install should not clear billboards"
+        );
+    }
+
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn pump_streaming_dispatches_and_installs_via_async_path() {
