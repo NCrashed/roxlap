@@ -33,6 +33,7 @@ pub mod edit;
 pub mod lod;
 pub mod render;
 pub mod snapshot;
+pub mod streaming;
 
 use std::collections::HashMap;
 
@@ -43,6 +44,7 @@ use serde::{Deserialize, Serialize};
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
 pub use billboard::{canonical_viewpoints, BillboardCache, BillboardSnapshot};
 pub use lod::{select_lod, Lod, LodThresholds};
+pub use streaming::ChunkGenerator;
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
 /// chunks compact (~2 MB worst-case dense-slab footprint inside
@@ -176,6 +178,20 @@ pub struct Grid {
     /// / [`Self::set_sphere`]) to force a rebuild on next Far use.
     /// Callers may also force-invalidate via direct assignment.
     pub billboards: Option<BillboardCache>,
+    /// Optional procedural generator (S7.0). When set,
+    /// [`Self::ensure_chunk_generated`] uses it to materialise
+    /// chunks that are still absent from [`Self::chunks`].
+    ///
+    /// Streaming layers (S7.1+) walk the active radius around the
+    /// camera and call `ensure_chunk_generated` for missing chunks;
+    /// later stages dispatch this onto a background rayon pool. The
+    /// trait bound is `Send + Sync` (needed for S7.3 async
+    /// dispatch) + `Debug` (needed so [`Grid`] keeps deriving
+    /// `Debug`).
+    ///
+    /// `None` is the default — a grid without a generator behaves
+    /// exactly like the pre-S7 grids: absent chunks stay absent.
+    pub generator: Option<Box<dyn ChunkGenerator>>,
 }
 
 impl Grid {
@@ -191,7 +207,46 @@ impl Grid {
             mip_levels_override: None,
             lod_thresholds: LodThresholds::always_near(),
             billboards: None,
+            generator: None,
         }
+    }
+
+    /// Attach (or detach) the procedural generator used by
+    /// [`Self::ensure_chunk_generated`] (S7.0).
+    ///
+    /// Pass `Some(Box::new(generator))` to enable on-demand chunk
+    /// generation; pass `None` to revert to the "absent stays
+    /// absent" behaviour. Replacing an existing generator drops the
+    /// previous one without touching already-materialised chunks.
+    pub fn set_generator(&mut self, generator: Option<Box<dyn ChunkGenerator>>) {
+        self.generator = generator;
+    }
+
+    /// Materialise the chunk at `chunk_idx` by running [`Self::generator`]
+    /// if (a) the chunk is not already present and (b) a generator
+    /// is attached. Returns `true` iff a chunk was newly generated.
+    ///
+    /// No-ops in all other cases:
+    /// - chunk already present (caller edits / a previous
+    ///   `ensure_chunk_generated` call already populated it),
+    /// - no generator attached (the chunk stays implicit-air per
+    ///   the existing convention — does NOT fall through to
+    ///   [`Self::ensure_chunk`]'s empty-chunk constructor).
+    ///
+    /// This is the synchronous S7.0 path. S7.3 will add an async
+    /// counterpart that dispatches the generator call to a
+    /// dedicated rayon pool and installs the result on the next
+    /// `pump_streaming` call.
+    pub fn ensure_chunk_generated(&mut self, chunk_idx: IVec3) -> bool {
+        if self.chunks.contains_key(&chunk_idx) {
+            return false;
+        }
+        let Some(generator) = self.generator.as_ref() else {
+            return false;
+        };
+        let chunk = generator.generate(chunk_idx);
+        self.chunks.insert(chunk_idx, chunk);
+        true
     }
 
     /// Bounding-sphere radius of the populated chunk set in
