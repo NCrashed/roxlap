@@ -25,7 +25,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use crate::scene::{build_demo, build_streaming_demo, SceneAndCamera};
+use crate::scene::{build_demo, SceneAndCamera};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -192,16 +192,17 @@ impl App {
         });
         engine.set_sky(Some(sky));
 
-        // S7.6: `ROXLAP_STREAM=1` swaps the scene-build for the
-        // streaming-only cave demo (`CaveChunkGenerator` +
-        // `pump_streaming` per frame). Default (unset) keeps the
-        // ground/ship/markers showcase from S6.6.
-        let scene = if std::env::var("ROXLAP_STREAM").is_ok() {
-            eprintln!("ROXLAP_STREAM set — streaming cave demo (T to print stats)");
-            build_streaming_demo()
-        } else {
-            build_demo()
-        };
+        // S7.6: `build_demo` now defaults to the streaming-hills
+        // path — the ground grid is backed by
+        // `HillsChunkGenerator` and pumped each frame. The
+        // historical static 32×32 ground stays available via
+        // `ROXLAP_STATIC=1` for repro / regression tests.
+        let scene = build_demo();
+        if scene.streaming_enabled {
+            eprintln!(
+                "streaming hills active (T prints chunks/pending, ROXLAP_STATIC=1 for static)"
+            );
+        }
         // One slot per render thread. Strip-parallel rendering
         // (R12.3.1) splits each frame's y-range across the slots;
         // RENDER_THREADS caps the count below the efficiency knee.

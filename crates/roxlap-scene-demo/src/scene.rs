@@ -68,13 +68,34 @@ pub fn build_demo() -> SceneAndCamera {
     // 2-chunk-tall stack (chz=0 all-air, chz=1 hilly terrain). The
     // camera spawns in chz=0 air-gap and uses S4B.6.e's
     // cross-chunk look-down (seed-time) to see chz=1 terrain.
-    // Default (`unset`) keeps the unstacked chz=0 ground for the
-    // historical demo + golden tests.
+    // Static path (unset = default for the legacy regression tests
+    // via `ROXLAP_STATIC=1`); S7.6 path replaces it with streaming
+    // hills below.
     let stacked_ground = std::env::var("ROXLAP_STACKED_GROUND").is_ok();
+    // S7.6: streaming hills by default. `ROXLAP_STATIC=1` falls
+    // back to the historical statically-built 32×32 ground
+    // (needed for repro tests + visual A/B against the streaming
+    // variant).
+    let use_static_ground = std::env::var("ROXLAP_STATIC").is_ok() || stacked_ground;
     if stacked_ground {
         terrain::build_ground_stacked(scene.grid_mut(ground_id).expect("ground grid present"));
-    } else {
+    } else if use_static_ground {
         terrain::build_ground(scene.grid_mut(ground_id).expect("ground grid present"));
+    } else {
+        // Streaming variant — attach the generator, set a small
+        // `r_active` so chunks visibly load + unload as the camera
+        // moves. r_active = 256 keeps `chunks_z ≤ 3` at the spawn
+        // camera z = 50 (ducks the
+        // [[s7-4-landed]] opticast gylookup overflow) and gives a
+        // ~2-chunk visible radius around the camera. r_evict =
+        // 384 is the usual 1.5× hysteresis band.
+        let g = scene.grid_mut(ground_id).expect("ground grid present");
+        g.set_generator(Some(Arc::new(terrain::HillsChunkGenerator)));
+        g.stream_radius = roxlap_scene::StreamRadius::new(256.0, 384.0);
+        // No initial pump — let the user see chunks stream in over
+        // the first ~1 second as the rayon pool fills the active
+        // ball. Visually demonstrates the streaming pipeline from
+        // frame 0.
     }
 
     let ship_id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 500.0, -100.0)));
@@ -152,87 +173,9 @@ pub fn build_demo() -> SceneAndCamera {
         spin_enabled: false,
         marker_ids,
         lod_billboards_on: false,
-        streaming_enabled: false,
-    }
-}
-
-/// S7.6: build the streaming-only demo scene.
-///
-/// Activated by `ROXLAP_STREAM=1`. Replaces the ground/ship/markers
-/// scene with one [`Grid`] backed by a
-/// [`roxlap_scene::cavegen::CaveChunkGenerator`] wrapping
-/// [`roxlap_cavegen::BlueCaveGenerator`]. Each frame the demo's
-/// redraw calls [`Scene::pump_streaming`] before render, which
-/// dispatches chunk generation onto the dedicated streaming pool
-/// and drains completed results.
-///
-/// **Why `r_active = 300`**: keeps `chunks_z` ≤ 3 in the
-/// materialised set, ducking the
-/// [[s7-4-landed]] opticast `gylookup` i32 overflow at
-/// `chunks_z ≥ 4` (the camera at world z = 128 sees `chz ∈
-/// [-1, 0, 1]` inside `r_active = 300`). `r_evict = 600` is the
-/// usual `2× r_active` hysteresis.
-///
-/// **Spawn**: `(64, 64, 128)` is the chunk-local centre of the
-/// `chz = 0` slab — the same coordinate that
-/// [`roxlap_cavegen`]'s "central air carve" empties out, so the
-/// camera spawns inside an air pocket rather than embedded in a
-/// wall.
-///
-/// **No lighting bake** in streaming mode: chunks arrive
-/// asynchronously, baking on stream-in would require
-/// `update_lighting_chunk` calls inside the drain. Out of scope
-/// for v1 (would also produce incoherent shading anyway since
-/// each chunk has its own Worley seed pool — see [[s7-5-landed]]'s
-/// "boundary seams" discussion).
-pub fn build_streaming_demo() -> SceneAndCamera {
-    let mut scene = Scene::new();
-
-    let cave_id = scene.add_grid(GridTransform::at(DVec3::ZERO));
-    let adapter = roxlap_scene::cavegen::CaveChunkGenerator::new(
-        roxlap_cavegen::BlueCaveGenerator,
-        roxlap_cavegen::CaveParams {
-            // Reduce seed_count vs. the cave-demo default (128) so
-            // per-chunk generation stays fast. Each chunk is
-            // `CHUNK_SIZE_XY = 128` voxels, smaller than the
-            // cave-demo's `vsid = 2048`; the seed-density / chunk
-            // ratio still gives a recognisable cave texture.
-            seed_count: 24,
-            ..roxlap_cavegen::BlueCaveGenerator::default_params()
-        },
-    );
-    {
-        let g = scene.grid_mut(cave_id).expect("cave grid");
-        g.set_generator(Some(Arc::new(adapter)));
-        g.stream_radius = roxlap_scene::StreamRadius::new(300.0, 600.0);
-    }
-
-    // Prime the world before the camera frames it — without this,
-    // the first frame would render against an empty grid (all sky)
-    // and the chunks only become visible after the first async
-    // dispatch round-trips.
-    let initial_pos = [64.0, 64.0, 128.0];
-    scene.pump_streaming(DVec3::from_array(initial_pos));
-
-    let initial_yaw = std::f64::consts::FRAC_PI_2; // looks +y
-    let initial_pitch = 0.0;
-    let camera = camera_for_yaw_pitch(initial_pos, initial_yaw, initial_pitch);
-
-    SceneAndCamera {
-        scene,
-        camera,
-        cam_pos: initial_pos,
-        yaw: initial_yaw,
-        pitch: initial_pitch,
-        // `ship_id` field repurposed as the cave grid handle so the
-        // existing telemetry hotkey can look it up. The R hotkey's
-        // ship-spin tick is a no-op when `spin_enabled = false`.
-        ship_id: cave_id,
-        ship_angles: [0.0; 3],
-        spin_enabled: false,
-        marker_ids: vec![],
-        lod_billboards_on: false,
-        streaming_enabled: true,
+        // Streaming on whenever the ground grid uses the generator
+        // path; static (`ROXLAP_STATIC=1`) keeps it off.
+        streaming_enabled: !use_static_ground,
     }
 }
 
@@ -273,11 +216,12 @@ pub struct SceneAndCamera {
     /// distance-keyed Near/Far split via the tuned thresholds in
     /// [`crate::markers`].
     pub lod_billboards_on: bool,
-    /// S7.6: streaming mode. `true` when [`build_streaming_demo`]
-    /// produced this scene — drives the per-frame
-    /// [`Scene::pump_streaming`] call + the `T` telemetry hotkey
-    /// in `main.rs`. `false` for the standard [`build_demo`]
-    /// (no per-frame streaming, no telemetry).
+    /// S7.6: streaming mode. `true` when [`build_demo`] used the
+    /// `HillsChunkGenerator` streaming path (the default); `false`
+    /// when the historical static ground was selected via
+    /// `ROXLAP_STATIC=1` or `ROXLAP_STACKED_GROUND=1`. Drives the
+    /// per-frame [`Scene::pump_streaming`] call + the `T`
+    /// telemetry hotkey in `main.rs`.
     pub streaming_enabled: bool,
 }
 
@@ -398,7 +342,21 @@ pub fn bake_lightmode_1_pub(scene: &mut Scene) {
 #[allow(clippy::cast_possible_wrap, clippy::similar_names)]
 fn bake_lightmode_1(scene: &mut Scene) {
     const LIGHTMODE: u32 = 1;
-    let ids: Vec<GridId> = scene.grids().map(|(id, _)| id).collect();
+    // S7.6: skip streaming grids — they bake themselves on
+    // stream-in inside their `ChunkGenerator::generate`. A
+    // scene-wide bake here would only catch the few chunks that
+    // happened to be loaded at the moment of the call, leaving
+    // subsequently-streamed chunks unlit.
+    let ids: Vec<GridId> = scene
+        .grids()
+        .filter_map(|(id, grid)| {
+            if grid.generator.is_some() {
+                None
+            } else {
+                Some(id)
+            }
+        })
+        .collect();
     for id in ids {
         let grid = scene.grid_mut(id).expect("grid present");
         let chunk_idxs: Vec<IVec3> = grid.chunks.keys().copied().collect();
@@ -476,43 +434,41 @@ fn bake_lightmode_1(scene: &mut Scene) {
 mod tests_s7_6 {
     use super::*;
 
-    /// S7.6 entry-point smoke test: `build_streaming_demo` returns
-    /// a populated scene with the streaming flag set, the cave grid
-    /// has a generator + non-disabled stream_radius, and the
-    /// initial pump pre-seeded at least one chunk at the spawn.
+    /// S7.6 entry-point smoke test: `build_demo` (now the streaming
+    /// hills variant by default) returns a scene with the streaming
+    /// flag set, the ground grid has a generator + non-disabled
+    /// stream_radius, and ship + 10 markers are still registered.
     #[test]
-    fn build_streaming_demo_returns_populated_scene() {
-        let s = build_streaming_demo();
-        assert!(s.streaming_enabled);
-        assert_eq!(s.scene.grid_count(), 1, "exactly one cave grid");
-        let grid = s
-            .scene
-            .grid(s.ship_id) // reused as the cave-grid handle
-            .expect("cave grid registered");
-        assert!(grid.generator.is_some(), "generator attached");
+    fn build_demo_streaming_default_has_generator_on_ground_grid() {
+        let s = build_demo();
         assert!(
-            !grid.stream_radius.is_disabled(),
-            "stream_radius must be active in streaming mode"
+            s.streaming_enabled,
+            "streaming is the default for build_demo"
         );
-        // The build_streaming_demo body runs one `pump_streaming`
-        // before returning — sync drain + async dispatch. The
-        // dispatched tasks may not have completed yet on a slow CI,
-        // but `chunk_count + pending_gen.len()` should be > 0.
-        let live = grid.chunk_count() + grid.pending_gen.len();
+        // Ground (raw=0) + ship (raw=1) + `markers::NUM_MARKERS`
+        // pillars.
+        assert_eq!(s.scene.grid_count(), 1 + 1 + crate::markers::NUM_MARKERS);
+        let ground = s
+            .scene
+            .grids()
+            .min_by_key(|(id, _)| id.raw())
+            .map(|(_, g)| g)
+            .expect("at least one grid");
+        assert!(ground.generator.is_some(), "ground grid must be streaming");
         assert!(
-            live > 0,
-            "initial pump should have queued or installed chunks; got 0"
+            !ground.stream_radius.is_disabled(),
+            "stream_radius must be active"
         );
     }
 
     /// S7.6 bounded-memory smoke test: pump many frames with a
-    /// fixed camera; chunk count must NOT grow without bound. The
-    /// stream_radius from `build_streaming_demo` (300 / 600) caps
-    /// the materialised set to chunks in a 600-voxel ball, ~50
-    /// chunks at the demo spawn.
+    /// fixed camera; the streaming grid's chunk count must NOT
+    /// grow without bound. The stream_radius from `build_demo`
+    /// (256 / 384) caps the materialised set to chunks within a
+    /// 384-voxel ball — ~25-50 chunks at the demo spawn.
     #[test]
     fn streaming_demo_chunk_count_stays_bounded_under_repeated_pump() {
-        let mut s = build_streaming_demo();
+        let mut s = build_demo();
         let cam = DVec3::from_array(s.cam_pos);
         // 50 pumps gives the async pool ample time to drain on any
         // reasonable CI host. After this, every chunk inside
@@ -522,7 +478,14 @@ mod tests_s7_6 {
             s.scene.pump_streaming(cam);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let grid = s.scene.grid(s.ship_id).expect("cave grid");
+        // Find the streaming grid (lowest GridId by add order).
+        let ground_id = s
+            .scene
+            .grids()
+            .map(|(id, _)| id)
+            .min_by_key(|id| id.raw())
+            .expect("ground grid registered");
+        let grid = s.scene.grid(ground_id).expect("ground grid");
         // Bound derived from `r_evict = 600`: chunks within
         // 600 voxels of the camera, where each chunk is
         // 128x128x256. Worst case (cube approximation):

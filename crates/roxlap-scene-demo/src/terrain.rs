@@ -33,7 +33,8 @@
 
 use glam::IVec3;
 use roxlap_formats::edit::{set_spans_with_colfunc, SpanOp, Vspan};
-use roxlap_scene::{Grid, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+use roxlap_formats::vxl::Vxl;
+use roxlap_scene::{ChunkGenerator, Grid, GridTransform, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
 /// Per-column metadata the colfunc closure consults: each
 /// column's surface z and whether the top is stone (steep slope)
@@ -303,6 +304,158 @@ pub fn build_ground_extent_at_chz(grid: &mut Grid, chunks_x: i32, chunks_y: i32,
             set_spans_with_colfunc(vxl, &spans, SpanOp::Insert, colfunc);
         }
     }
+}
+
+// =====================================================================
+// S7.6: HillsChunkGenerator — streaming variant of `build_ground`.
+// =====================================================================
+//
+// Wraps the same `terrain_height` heightmap + grass/dirt/stone palette
+// as `build_ground_extent`, but emits one chunk at a time so a Grid
+// can register it via `set_generator` and let `Scene::pump_streaming`
+// stream chunks in / out as the camera moves. The result: visibly
+// infinite green hills. Each `generate` call also runs lightmode-1
+// directional shading + 4-level mips so streamed chunks render
+// identically to the statically-built lattice.
+//
+// `chunk_idx.z != 0` returns a bedrock-only chunk — the terrain layer
+// lives in `chz = 0` only; higher / lower chz layers are implicit air
+// (the renderer's `treat_z_max_as_air` handles the bedrock sentinel).
+
+/// Procedural-generation hook for the demo's green hills. Hand to
+/// `Grid::set_generator` to make the ground stream as the camera
+/// moves.
+#[derive(Debug, Clone, Copy)]
+pub struct HillsChunkGenerator;
+
+impl ChunkGenerator for HillsChunkGenerator {
+    fn generate(&self, chunk_idx: IVec3) -> Vxl {
+        if chunk_idx.z != 0 {
+            return empty_air_chunk();
+        }
+        let mut vxl = empty_air_chunk();
+        stamp_hills_into(&mut vxl, chunk_idx);
+        bake_chunk_lighting(&mut vxl);
+        // 4 mip levels matches `OpticastSettings::mip_levels = 4` in
+        // `main.rs` — past mip-3 the demo doesn't read further mips.
+        vxl.generate_mips(4);
+        vxl
+    }
+}
+
+/// Produce a fresh bedrock-only chunk-sized Vxl by detaching the
+/// chunk that [`Grid::ensure_chunk`] would create. Avoids reaching
+/// into `roxlap-scene`'s private `chunks::empty_chunk_vxl` helper
+/// while still using the canonical empty-chunk shape.
+fn empty_air_chunk() -> Vxl {
+    let mut g = Grid::new(GridTransform::identity());
+    g.ensure_chunk(IVec3::ZERO);
+    g.chunks.remove(&IVec3::ZERO).expect("just inserted")
+}
+
+/// Build the hills surface inside `vxl` for the chunk at
+/// `chunk_idx`. Same `terrain_height` heightmap + grass/dirt/stone
+/// palette as [`build_ground_extent_at_chz`], with the
+/// neighbour-slope sample reaching one voxel into adjacent chunks
+/// via `terrain_height` itself (the heightmap is a pure function
+/// of world coords, so this stays seamless across chunk
+/// boundaries).
+fn stamp_hills_into(vxl: &mut Vxl, chunk_idx: IVec3) {
+    let cs_xy = CHUNK_SIZE_XY as i32;
+    let chunk_origin_x = chunk_idx.x * cs_xy;
+    let chunk_origin_y = chunk_idx.y * cs_xy;
+    let z_max = (CHUNK_SIZE_Z as i32) - 1;
+    let z_hill_max = z_max - 1;
+
+    let mut col_meta: Vec<ColMeta> = Vec::with_capacity((cs_xy * cs_xy) as usize);
+    let mut spans: Vec<Vspan> = Vec::with_capacity((cs_xy * cs_xy) as usize);
+    for ly in 0..cs_xy {
+        for lx in 0..cs_xy {
+            let wx = chunk_origin_x + lx;
+            let wy = chunk_origin_y + ly;
+            let surface_z = terrain_height(wx, wy);
+            let slope = [
+                (terrain_height(wx - 1, wy) - surface_z).abs(),
+                (terrain_height(wx + 1, wy) - surface_z).abs(),
+                (terrain_height(wx, wy - 1) - surface_z).abs(),
+                (terrain_height(wx, wy + 1) - surface_z).abs(),
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+            let top_is_stone = slope >= STONE_SLOPE_THRESHOLD;
+            col_meta.push(ColMeta {
+                surface_z,
+                top_is_stone,
+            });
+            spans.push(Vspan {
+                x: lx as u32,
+                y: ly as u32,
+                z0: surface_z as u8,
+                z1: z_hill_max as u8,
+            });
+        }
+    }
+    let colfunc = move |x: i32, y: i32, z: i32| -> i32 {
+        let lx = x.clamp(0, cs_xy - 1) as usize;
+        let ly = y.clamp(0, cs_xy - 1) as usize;
+        let meta = col_meta[ly * (cs_xy as usize) + lx];
+        let dz = z - meta.surface_z;
+        let colour_u32 = if meta.top_is_stone {
+            STONE
+        } else if dz == 0 {
+            GRASS
+        } else if dz <= DIRT_BAND_THICKNESS {
+            DIRT
+        } else {
+            STONE
+        };
+        colour_u32 as i32
+    };
+    set_spans_with_colfunc(vxl, &spans, SpanOp::Insert, colfunc);
+}
+
+/// Bake lightmode-1 directional shading into the chunk's alpha bytes.
+///
+/// The estnorm padding (`±ESTNORMRAD` voxels past each chunk face)
+/// can't see the neighbour chunks here — they may not be loaded
+/// yet at stream-in time. Reader returns `None` past the chunk's
+/// own column range, which the bake treats as full air. Result:
+/// edge columns get a slight brightness shift compared to the
+/// scene-wide bake in `bake_lightmode_1`. Visible as a faint chunk
+/// outline at low sun angles; acceptable for a v1 streaming demo
+/// (full continuity needs the [[s4b-4-b-landed]] cross-chunk
+/// `Grid::chunk` reader, which requires Grid context the generator
+/// doesn't have).
+fn bake_chunk_lighting(vxl: &mut Vxl) {
+    let cs_xy = CHUNK_SIZE_XY as i32;
+    let cs_z = CHUNK_SIZE_Z as i32;
+    let cache = {
+        let vxl_ref: &Vxl = &*vxl;
+        let reader = |px: i32, py: i32| -> Option<&[u8]> {
+            if px < 0 || px >= cs_xy || py < 0 || py >= cs_xy {
+                return None;
+            }
+            let col_idx = (py as u32) * CHUNK_SIZE_XY + (px as u32);
+            let off = vxl_ref.column_offset[col_idx as usize] as usize;
+            Some(&vxl_ref.data[off..])
+        };
+        roxlap_core::EstNormCache::build_with_reader(reader, 0, 0, cs_xy, cs_xy)
+    };
+    roxlap_core::apply_lighting_with_cache(
+        &mut vxl.data,
+        &vxl.column_offset,
+        CHUNK_SIZE_XY,
+        0,
+        0,
+        0,
+        cs_xy,
+        cs_xy,
+        cs_z,
+        &cache,
+        1, // LIGHTMODE
+        &[],
+    );
 }
 
 /// Heightmap function. Voxlap z-down: a *smaller* `z` is
