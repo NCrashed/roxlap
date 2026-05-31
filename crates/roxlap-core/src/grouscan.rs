@@ -217,6 +217,19 @@ pub(crate) struct GrouscanState<'a> {
     /// from `slab_buf`, which VC.3 will use to inject world-z bytes
     /// without touching the parent borrow.
     pub column: Vec<u8>,
+    /// VC.4: per-byte world-z translation offset paired with
+    /// [`Self::column`] — same length, populated by every install.
+    /// `slab_z_at` reads `column[vptr+byte] + column_z_base[vptr+byte] >> gmipcnt`
+    /// instead of `column[vptr+byte] + chunk_world_z_base >> gmipcnt`.
+    /// Generalises the scalar [`Self::chunk_world_z_base`] so VC.5's
+    /// multi-chz concat can stitch slabs from different chz layers
+    /// with distinct per-slab bases. For VC.4 every install fills
+    /// the table uniformly with the install's world_z_base
+    /// (= byte-identical to pre-VC.4 — see VC.0 baseline hash).
+    /// When `vptr + byte` is OOB the read falls back to
+    /// `chunk_world_z_base`, preserving slab_z_at's
+    /// `.get(...).unwrap_or(...)` OOB-tolerant semantics.
+    pub column_z_base: Vec<i32>,
     /// `gylookoff` window into the per-frame gylookup table.
     pub gylookup: &'a [i32],
     /// Per-side shading table.
@@ -456,6 +469,7 @@ impl<'a> GrouscanState<'a> {
         // to the bulk extend above; the multi-chz scaffolding is in
         // place for VC.4's z widening to unblock chunks_z > 1.
         let mut column_owned: Vec<u8> = Vec::with_capacity(inputs.column.len().min(8192));
+        let mut column_z_base_owned: Vec<i32> = Vec::with_capacity(inputs.column.len().min(8192));
         let use_vc3_multi_chz_seed = grid_view
             .chunk_grid
             .map_or(false, |cg| cg.chunks_z == 1 && cg.origin_chunk_z == 0);
@@ -477,14 +491,23 @@ impl<'a> GrouscanState<'a> {
                 max_chz,
                 chunk_size_z_signed,
             );
+            // VC.4: uniform fill — chunks_z=1 + origin=0 means
+            // every slab in the concat carries world_z_base=0,
+            // which matches the seed's inputs.chunk_world_z_base
+            // already (= seed_chunk_z * chunk_size_z = 0). Pre-VC.5
+            // every slab the iter visits maps to the same scalar
+            // base.
+            column_z_base_owned.resize(column_owned.len(), inputs.chunk_world_z_base);
         } else {
             let seed_chain_len = slab_chain_byte_len(inputs.column);
             column_owned.extend_from_slice(&inputs.column[..seed_chain_len]);
+            column_z_base_owned.resize(column_owned.len(), inputs.chunk_world_z_base);
         }
 
         Self {
             scratch,
             column: column_owned,
+            column_z_base: column_z_base_owned,
             gylookup: inputs.gylookup,
             gcsub: inputs.gcsub,
             slab_buf: inputs.slab_buf,
@@ -1552,15 +1575,24 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        install_owned_column(&mut state.column, state.slab_buf, off);
+                        install_owned_column(
+                            &mut state.column,
+                            &mut state.column_z_base,
+                            state.slab_buf,
+                            off,
+                            state.chunk_world_z_base,
+                        );
                     } else {
                         state.column.clear();
+                        state.column_z_base.clear();
                     }
                 } else {
                     state.column.clear();
+                    state.column_z_base.clear();
                 }
             } else {
                 state.column.clear();
+                state.column_z_base.clear();
             }
         } else {
             let in_bounds = state.cx >= 0
@@ -1576,11 +1608,18 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        install_owned_column(&mut state.column, state.slab_buf, off);
+                        install_owned_column(
+                            &mut state.column,
+                            &mut state.column_z_base,
+                            state.slab_buf,
+                            off,
+                            state.chunk_world_z_base,
+                        );
                     }
                 }
             } else {
                 state.column.clear();
+                state.column_z_base.clear();
             }
         }
     } else {
@@ -1654,15 +1693,24 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        install_owned_column(&mut state.column, state.slab_buf, off);
+                        install_owned_column(
+                            &mut state.column,
+                            &mut state.column_z_base,
+                            state.slab_buf,
+                            off,
+                            state.chunk_world_z_base,
+                        );
                     } else {
                         state.column.clear();
+                        state.column_z_base.clear();
                     }
                 } else {
                     state.column.clear();
+                    state.column_z_base.clear();
                 }
             } else {
                 state.column.clear();
+                state.column_z_base.clear();
             }
         } else {
             let log2 = state.chunk_size_xy_log2;
@@ -1703,11 +1751,18 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        install_owned_column(&mut state.column, state.slab_buf, off);
+                        install_owned_column(
+                            &mut state.column,
+                            &mut state.column_z_base,
+                            state.slab_buf,
+                            off,
+                            state.chunk_world_z_base,
+                        );
                     }
                 }
             } else {
                 state.column.clear();
+                state.column_z_base.clear();
             }
         }
     }
@@ -2159,9 +2214,24 @@ fn slab_chain_byte_len(column: &[u8]) -> usize {
 /// `extend_from_slice` path — VC.3 reuses the per-slab loop to
 /// concatenate chunks at chz boundaries with z bytes translated
 /// to world-z.
-fn install_owned_column(target: &mut Vec<u8>, slab_buf: &[u8], off: usize) {
+fn install_owned_column(
+    target: &mut Vec<u8>,
+    target_z_base: &mut Vec<i32>,
+    slab_buf: &[u8],
+    off: usize,
+    world_z_base: i32,
+) {
     target.clear();
     build_owned_column_from_chain(target, slab_buf, off);
+    // VC.4: parallel per-byte translation table. For single-chz
+    // installs every byte carries the same `world_z_base`, so
+    // `slab_z_at(state, vptr, byte)` reads `column[i] +
+    // column_z_base[i] >> gmipcnt` and produces the same value as
+    // pre-VC.4's `column[i] + chunk_world_z_base >> gmipcnt`. VC.5
+    // multi-chz seed concat varies the per-slab base, at which
+    // point this fill becomes the per-slab loop's responsibility.
+    target_z_base.clear();
+    target_z_base.resize(target.len(), world_z_base);
 }
 
 /// VC.2: walk the slab chain at `slab_buf[off..]` and APPEND each
@@ -2385,14 +2455,22 @@ fn build_owned_column_multi_chz(
 /// = the "green wall in a circle around the camera" artifact.
 #[inline]
 fn slab_z_at(state: &GrouscanState<'_>, vptr_offset: usize, byte: usize) -> i32 {
-    let raw = i32::from(
-        state
-            .column
-            .get(vptr_offset.saturating_add(byte))
-            .copied()
-            .unwrap_or(0),
-    );
-    raw + (state.chunk_world_z_base >> (state.gmipcnt as u32))
+    let idx = vptr_offset.saturating_add(byte);
+    let raw = i32::from(state.column.get(idx).copied().unwrap_or(0));
+    // VC.4: prefer the per-byte translation table. OOB reads
+    // (vptr past the chain's end) fall back to the scalar
+    // `chunk_world_z_base` so the slab walker's defensive
+    // `.get(...).unwrap_or(0)` semantics survive — VC.1's chain-
+    // bounded copy keeps the in-bounds reads identical anyway, but
+    // the fallback preserves byte-identity for the rare past-chain
+    // reads in placeholder columns (= the BugFire chz=-1 case
+    // [[vc-1-landed]] documented).
+    let base = state
+        .column_z_base
+        .get(idx)
+        .copied()
+        .unwrap_or(state.chunk_world_z_base);
+    raw + (base >> (state.gmipcnt as u32))
 }
 
 /// S4B.6.c: try to swap the slab walker into the chunk at
@@ -2463,12 +2541,20 @@ fn try_handoff_chunk_z_down(state: &mut GrouscanState<'_>) -> bool {
     if let Some(&col_off) = state.column_offsets.get(correct_idx) {
         let off = col_off as usize;
         if off <= state.slab_buf.len() {
-            install_owned_column(&mut state.column, state.slab_buf, off);
+            install_owned_column(
+                &mut state.column,
+                &mut state.column_z_base,
+                state.slab_buf,
+                off,
+                state.chunk_world_z_base,
+            );
         } else {
             state.column.clear();
+            state.column_z_base.clear();
         }
     } else {
         state.column.clear();
+        state.column_z_base.clear();
     }
     state.vptr_offset = 0;
     true
@@ -2730,9 +2816,16 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     // (user-reported 2026-05-26).
     if !state.current_chunk_exists {
         state.column.clear();
+        state.column_z_base.clear();
     } else if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
         let col_off = col_off as usize;
-        install_owned_column(&mut state.column, state.slab_buf, col_off);
+        install_owned_column(
+            &mut state.column,
+            &mut state.column_z_base,
+            state.slab_buf,
+            col_off,
+            state.chunk_world_z_base,
+        );
     }
 
     // Voxlap5.c:12116 — reset c to top-of-stack.
@@ -2949,9 +3042,22 @@ mod tests {
         fn assert_match(slab_buf: &[u8], off: usize, label: &str) {
             let mut bulk = Vec::new();
             let mut built = Vec::new();
+            let mut built_z = Vec::new();
             bulk_install(&mut bulk, slab_buf, off);
-            install_owned_column(&mut built, slab_buf, off);
+            install_owned_column(&mut built, &mut built_z, slab_buf, off, 0);
             assert_eq!(bulk, built, "{label}: bulk != builder output");
+            // VC.4: uniform fill — single-chz install populates the
+            // per-byte z-base table with the install's `world_z_base`
+            // (= 0 here) for every byte of the chain.
+            assert_eq!(
+                built_z.len(),
+                built.len(),
+                "{label}: z_base length must mirror column length"
+            );
+            assert!(
+                built_z.iter().all(|&b| b == 0),
+                "{label}: z_base entries must be 0 for world_z_base=0 install"
+            );
         }
 
         // Shape 1 — single-slab bedrock-only column.
@@ -2992,8 +3098,15 @@ mod tests {
         let malformed = vec![1u8, 99, 100, 101];
         let mut bulk_malformed = Vec::new();
         let mut built_malformed = Vec::new();
+        let mut built_z_malformed = Vec::new();
         bulk_install(&mut bulk_malformed, &malformed, 0);
-        install_owned_column(&mut built_malformed, &malformed, 0);
+        install_owned_column(
+            &mut built_malformed,
+            &mut built_z_malformed,
+            &malformed,
+            0,
+            0,
+        );
         // bulk = chain_len walker which bails at advance<4 returning
         // column.len() = 4 → bulk has all 4 bytes.
         assert_eq!(bulk_malformed, malformed);
@@ -3083,6 +3196,39 @@ mod tests {
         let col = vec![0u8, 200, 200, 0];
         let mut out = Vec::new();
         build_owned_column_from_chain_translated(&mut out, &col, 0, 100);
+    }
+
+    /// VC.4: `install_owned_column` populates the parallel
+    /// `column_z_base` table with the install's `world_z_base` for
+    /// every byte of the chain. Length matches `column`'s; values
+    /// are uniform.
+    #[test]
+    fn vc4_install_populates_column_z_base_uniformly() {
+        // Two-slab column: 16 bytes first slab + 16 bytes last slab.
+        let mut col = vec![4u8, 0, 0, 0];
+        col.extend_from_slice(&[0xAA; 12]);
+        col.extend_from_slice(&[0, 10, 12, 0]);
+        col.extend_from_slice(&[0xBB; 12]);
+
+        for &base in &[0_i32, 256, -128, 1024] {
+            let mut column = Vec::new();
+            let mut z_base = Vec::new();
+            install_owned_column(&mut column, &mut z_base, &col, 0, base);
+            assert_eq!(
+                z_base.len(),
+                column.len(),
+                "z_base length must mirror column length (base={base})"
+            );
+            assert!(
+                z_base.iter().all(|&b| b == base),
+                "every z_base entry must equal the install's world_z_base (base={base})"
+            );
+            // Sanity: the chain bytes themselves stayed VC.2-identical
+            // (z_base is parallel, not encoded into column bytes).
+            let mut bulk = Vec::new();
+            build_owned_column_from_chain(&mut bulk, &col, 0);
+            assert_eq!(column, bulk, "column bytes drifted (base={base})");
+        }
     }
 
     fn fresh_scratch() -> ScanScratch {
