@@ -8,6 +8,7 @@
 use glam::{DQuat, DVec3, IVec3};
 use roxlap_core::Camera;
 use roxlap_scene::{Grid, GridId, GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Angular velocity (rad/s) of the ship grid's Z-axis spin when
@@ -430,9 +431,235 @@ fn bake_lightmode_1(scene: &mut Scene) {
     }
 }
 
+/// Per-chunk lighting + mip bake driver for streaming grids.
+///
+/// The post-S7.6-hills patch: removed the in-isolation bake from
+/// [`crate::terrain::HillsChunkGenerator::generate`] because the
+/// generator runs on the streaming rayon pool with no access to
+/// the live [`Grid`] — its estnorm reader had to return `None` for
+/// every voxel past its chunk's own face, producing visible
+/// chunk-edge brightness banding wherever two chunks met.
+///
+/// This tracker runs on the **main thread** right after
+/// [`Scene::pump_streaming`] each frame and bakes lightmode-1
+/// shading + regenerates mips for any chunks that arrived since
+/// the last call. Critically it also re-bakes the four cardinal
+/// neighbours of each newly-installed chunk so the seam between
+/// "I was baked when my neighbour wasn't there" and "I now have a
+/// neighbour" resolves immediately.
+///
+/// Steady state: no streaming → no rebakes. Camera moving slowly
+/// → 1–5 newly-installed chunks per frame → 1–5 + 4 rebakes = ~5–25
+/// per frame, ~7 ms each.
+pub struct StreamingBakeTracker {
+    /// Per-grid set of chunk indices whose alpha bytes have already
+    /// been baked against the current neighbour set. Cleared on
+    /// eviction (the tracker's `process` retains only currently-
+    /// present indices).
+    baked: HashMap<GridId, HashSet<IVec3>>,
+}
+
+impl StreamingBakeTracker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            baked: HashMap::new(),
+        }
+    }
+
+    /// Bake any chunks that streamed in since the last call + the
+    /// loaded cardinal neighbours of each. Skips chunks at
+    /// `chz != 0` — they're bedrock-only placeholders in the
+    /// current demo (caves / hills both live in the chz=0 layer).
+    pub fn process(&mut self, scene: &mut Scene) {
+        let streaming_ids: Vec<GridId> = scene
+            .grids()
+            .filter_map(|(id, g)| {
+                if g.generator.is_some() {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in streaming_ids {
+            self.process_grid(scene, id);
+        }
+    }
+
+    fn process_grid(&mut self, scene: &mut Scene, id: GridId) {
+        // Snapshot the current chz=0 chunk set.
+        let grid = scene.grid(id).expect("grid present");
+        let current: HashSet<IVec3> = grid.chunks.keys().filter(|i| i.z == 0).copied().collect();
+
+        let baked_set = self.baked.entry(id).or_default();
+        // Drop evicted chunks from the tracker so re-streaming
+        // re-bakes from scratch.
+        baked_set.retain(|idx| current.contains(idx));
+
+        let newly_installed: Vec<IVec3> = current
+            .iter()
+            .filter(|idx| !baked_set.contains(*idx))
+            .copied()
+            .collect();
+        if newly_installed.is_empty() {
+            return;
+        }
+
+        // Rebake set: newly installed + their 4 cardinal neighbours
+        // that are also loaded. The neighbour rebake resolves the
+        // pre-existing chunks' "I had no neighbour over there"
+        // estnorm gradient now that a real neighbour is present.
+        // Dedupe via the HashSet.
+        let mut to_bake: HashSet<IVec3> = HashSet::new();
+        for &idx in &newly_installed {
+            to_bake.insert(idx);
+            for delta in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)] {
+                let n = IVec3::new(idx.x + delta.0, idx.y + delta.1, idx.z + delta.2);
+                if current.contains(&n) {
+                    to_bake.insert(n);
+                }
+            }
+        }
+
+        let grid = scene.grid_mut(id).expect("grid present");
+        for &target_idx in &to_bake {
+            bake_single_chunk_neighbour_aware(grid, target_idx);
+            // Regenerate mips since alpha bytes (the brightness
+            // byte) drive the mip lookup tables.
+            let target = grid.chunks.get_mut(&target_idx).expect("populated");
+            remip_post_edit(target, 4);
+            baked_set.insert(target_idx);
+        }
+    }
+}
+
+/// `Vxl::generate_mips` wrapper that handles the stale-sentinel bug
+/// hit when re-mipping an already-edited chunk.
+///
+/// **Bug.** `Vxl::generate_mips` calls `reset_to_single_mip` first,
+/// which slices `self.data[..column_offset[n_cols]]` to drop any
+/// previously-built mip-N. That sentinel `column_offset[n_cols]`
+/// is set at chunk creation to the initial seed-data length
+/// (= `vsid² × 8 = 131072` for our chunks) and is **never bumped**
+/// when `voxalloc` scatters columns into the edit pool past it.
+/// On the second `generate_mips` call against a post-edit chunk,
+/// the slice destroys all real column data → subsequent column
+/// reads OOB-panic.
+///
+/// **Fix.** Recompute "end of mip-0 data" before each rebuild by
+/// walking columns + summing `slng` lengths, then patch the
+/// sentinel. After this, `reset_to_single_mip`'s truncation slices
+/// to a value that preserves all post-edit column data.
+fn remip_post_edit(vxl: &mut roxlap_formats::vxl::Vxl, max_mips: u32) {
+    let n_cols = (vxl.vsid as usize) * (vxl.vsid as usize);
+    let mut max_end: u32 = 0;
+    for i in 0..n_cols {
+        let start = vxl.column_offset[i] as usize;
+        let len_bytes = roxlap_formats::vxl::slng(&vxl.data[start..]);
+        max_end = max_end.max(u32::try_from(start + len_bytes).expect("end fits in u32"));
+    }
+    if vxl.column_offset[n_cols] != max_end {
+        let mut new_offsets = vxl.column_offset.to_vec();
+        new_offsets[n_cols] = max_end;
+        vxl.column_offset = new_offsets.into_boxed_slice();
+    }
+    vxl.generate_mips(max_mips);
+}
+
+impl Default for StreamingBakeTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Run lightmode-1 directional bake on `chunk_idx` of `grid` using a
+/// reader that resolves to neighbour chunks via [`Grid::chunk`].
+///
+/// Same shape as the inner loop body of [`bake_lightmode_1`]; pulled
+/// out so [`StreamingBakeTracker`] can call it per-install. Unlike
+/// the in-generator bake this previously replaced, queries past the
+/// target chunk's own faces resolve to the actual neighbour's data
+/// (when it's loaded), so estnorm at chunk boundaries is consistent
+/// with what the neighbour will compute.
+#[allow(clippy::cast_possible_wrap)]
+fn bake_single_chunk_neighbour_aware(grid: &mut Grid, chunk_idx: IVec3) {
+    const LIGHTMODE: u32 = 1;
+    let cs_xy = CHUNK_SIZE_XY as i32;
+    let cs_z = CHUNK_SIZE_Z as i32;
+    let target_chx = chunk_idx.x;
+    let target_chy = chunk_idx.y;
+    let target_chz = chunk_idx.z;
+
+    let cache = {
+        let grid_ref: &Grid = &*grid;
+        let reader = |px: i32, py: i32| -> Option<&[u8]> {
+            let neighbour_chx = target_chx + px.div_euclid(cs_xy);
+            let neighbour_chy = target_chy + py.div_euclid(cs_xy);
+            let in_chunk_x = px.rem_euclid(cs_xy);
+            let in_chunk_y = py.rem_euclid(cs_xy);
+            let chunk = grid_ref.chunk(IVec3::new(neighbour_chx, neighbour_chy, target_chz))?;
+            let col_idx = (in_chunk_y as u32) * CHUNK_SIZE_XY + (in_chunk_x as u32);
+            let off = chunk.column_offset[col_idx as usize] as usize;
+            Some(&chunk.data[off..])
+        };
+        roxlap_core::EstNormCache::build_with_reader(reader, 0, 0, cs_xy, cs_xy)
+    };
+
+    let target = grid
+        .chunks
+        .get_mut(&chunk_idx)
+        .expect("target chunk populated");
+    roxlap_core::apply_lighting_with_cache(
+        &mut target.data,
+        &target.column_offset,
+        CHUNK_SIZE_XY,
+        0,
+        0,
+        0,
+        cs_xy,
+        cs_xy,
+        cs_z,
+        &cache,
+        LIGHTMODE,
+        &[],
+    );
+}
+
 #[cfg(test)]
 mod tests_s7_6 {
     use super::*;
+    use crate::terrain::HillsChunkGenerator;
+    use roxlap_scene::ChunkGenerator;
+
+    /// Regression test for the `reset_to_single_mip` stale-sentinel
+    /// bug (panic at vxl.rs:599 with index = 131073, len = 131072
+    /// on the second `generate_mips`). Simulates the chunk lifecycle
+    /// the `StreamingBakeTracker` exercises:
+    ///
+    /// 1. Generate one hills chunk (post-edit, no mips).
+    /// 2. First mip build (works — `reset_to_single_mip` early-
+    ///    returns because there's nothing past mip-0 yet).
+    /// 3. Second mip build (would panic without `remip_post_edit`
+    ///    because the stale sentinel would truncate the data
+    ///    buffer back to its pre-edit-pool footprint).
+    ///
+    /// The test passes iff no panic + the chunk has 4 mip levels
+    /// after both rebuilds.
+    #[test]
+    fn remip_post_edit_handles_second_generate_mips_call() {
+        let mut vxl = HillsChunkGenerator.generate(IVec3::ZERO);
+        // First mip build — must succeed.
+        remip_post_edit(&mut vxl, 4);
+        assert_eq!(vxl.mip_count(), 4, "first mip build produced 4 mips");
+        // Second mip build (the path the bug fired on). Must not
+        // panic + must still produce 4 mips.
+        remip_post_edit(&mut vxl, 4);
+        assert_eq!(vxl.mip_count(), 4, "second mip build still produces 4 mips");
+        // Third for good measure — confirms no incremental damage.
+        remip_post_edit(&mut vxl, 4);
+        assert_eq!(vxl.mip_count(), 4, "third mip build OK");
+    }
 
     /// S7.6 entry-point smoke test: `build_demo` (now the streaming
     /// hills variant by default) returns a scene with the streaming

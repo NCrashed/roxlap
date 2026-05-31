@@ -25,7 +25,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use crate::scene::{build_demo, SceneAndCamera};
+use crate::scene::{build_demo, SceneAndCamera, StreamingBakeTracker};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -178,6 +178,12 @@ struct App {
     /// Live-adjustable scan distance (voxels). `+` / `-` bump it
     /// by `SCAN_DIST_STEP`; clamped to `[SCAN_DIST_MIN, SCAN_DIST_MAX]`.
     scan_dist: i32,
+    /// Post-S7.6: lighting + mip bake driver for streaming grids.
+    /// Runs each frame right after `pump_streaming`; bakes any
+    /// newly-installed chunks (and re-bakes their 4 cardinal
+    /// neighbours so chunk-edge brightness banding resolves as
+    /// chunks arrive). Empty + no-op when no streaming grid exists.
+    bake_tracker: StreamingBakeTracker,
 }
 
 impl App {
@@ -220,6 +226,7 @@ impl App {
             last_frame: Instant::now(),
             capture_pending: false,
             scan_dist: SCAN_DIST_INITIAL,
+            bake_tracker: StreamingBakeTracker::new(),
         }
     }
 
@@ -259,6 +266,14 @@ impl App {
             self.scene
                 .scene
                 .pump_streaming(glam::DVec3::from_array(self.scene.cam_pos));
+            // Post-pump bake — see `StreamingBakeTracker` docs.
+            // Resolves chunk-edge brightness banding by running
+            // lightmode-1 + generate_mips on freshly-installed
+            // chunks (and their cardinal neighbours) with a
+            // neighbour-aware estnorm reader. Runs on the main
+            // thread for `&mut Grid` access; bounded work since it
+            // only touches the delta since last frame.
+            self.bake_tracker.process(&mut self.scene.scene);
         }
 
         // Resize ScratchPool / zbuffer when the window grew.

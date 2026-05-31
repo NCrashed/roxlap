@@ -335,10 +335,12 @@ impl ChunkGenerator for HillsChunkGenerator {
         }
         let mut vxl = empty_air_chunk();
         stamp_hills_into(&mut vxl, chunk_idx);
-        bake_chunk_lighting(&mut vxl);
-        // 4 mip levels matches `OpticastSettings::mip_levels = 4` in
-        // `main.rs` — past mip-3 the demo doesn't read further mips.
-        vxl.generate_mips(4);
+        // Bake + mips happen on the main thread post-pump via
+        // `scene::StreamingBakeTracker`. The previous in-isolation
+        // bake here produced visible chunk-edge brightness banding
+        // because the estnorm reader had no access to neighbour
+        // chunks — the post-pump path resolves it by walking the
+        // live `Grid::chunk` map.
         vxl
     }
 }
@@ -413,49 +415,6 @@ fn stamp_hills_into(vxl: &mut Vxl, chunk_idx: IVec3) {
         colour_u32 as i32
     };
     set_spans_with_colfunc(vxl, &spans, SpanOp::Insert, colfunc);
-}
-
-/// Bake lightmode-1 directional shading into the chunk's alpha bytes.
-///
-/// The estnorm padding (`±ESTNORMRAD` voxels past each chunk face)
-/// can't see the neighbour chunks here — they may not be loaded
-/// yet at stream-in time. Reader returns `None` past the chunk's
-/// own column range, which the bake treats as full air. Result:
-/// edge columns get a slight brightness shift compared to the
-/// scene-wide bake in `bake_lightmode_1`. Visible as a faint chunk
-/// outline at low sun angles; acceptable for a v1 streaming demo
-/// (full continuity needs the [[s4b-4-b-landed]] cross-chunk
-/// `Grid::chunk` reader, which requires Grid context the generator
-/// doesn't have).
-fn bake_chunk_lighting(vxl: &mut Vxl) {
-    let cs_xy = CHUNK_SIZE_XY as i32;
-    let cs_z = CHUNK_SIZE_Z as i32;
-    let cache = {
-        let vxl_ref: &Vxl = &*vxl;
-        let reader = |px: i32, py: i32| -> Option<&[u8]> {
-            if px < 0 || px >= cs_xy || py < 0 || py >= cs_xy {
-                return None;
-            }
-            let col_idx = (py as u32) * CHUNK_SIZE_XY + (px as u32);
-            let off = vxl_ref.column_offset[col_idx as usize] as usize;
-            Some(&vxl_ref.data[off..])
-        };
-        roxlap_core::EstNormCache::build_with_reader(reader, 0, 0, cs_xy, cs_xy)
-    };
-    roxlap_core::apply_lighting_with_cache(
-        &mut vxl.data,
-        &vxl.column_offset,
-        CHUNK_SIZE_XY,
-        0,
-        0,
-        0,
-        cs_xy,
-        cs_xy,
-        cs_z,
-        &cache,
-        1, // LIGHTMODE
-        &[],
-    );
 }
 
 /// Heightmap function. Voxlap z-down: a *smaller* `z` is
