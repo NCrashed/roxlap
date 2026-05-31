@@ -2120,14 +2120,77 @@ fn slab_chain_byte_len(column: &[u8]) -> usize {
 /// pre-VC.1 `state.column = &slab_buf[off..]` slice path (the
 /// rasterizer never reads past the chain anyway; the bounded copy
 /// just avoids allocating + memcpying the slab_buf tail).
+///
+/// VC.2: delegates to [`build_owned_column_from_chain`], which
+/// walks the chain slab-by-slab and copies each slab's bytes
+/// individually. Output is byte-identical to the pre-VC.2 bulk
+/// `extend_from_slice` path — VC.3 reuses the per-slab loop to
+/// concatenate chunks at chz boundaries with z bytes translated
+/// to world-z.
 fn install_owned_column(target: &mut Vec<u8>, slab_buf: &[u8], off: usize) {
     target.clear();
+    build_owned_column_from_chain(target, slab_buf, off);
+}
+
+/// VC.2: walk the slab chain at `slab_buf[off..]` and APPEND each
+/// slab's bytes individually to `target`. The caller is responsible
+/// for clearing `target` first ([`install_owned_column`] does this);
+/// keeping the append semantics here lets VC.3's multi-chz path call
+/// the builder N times in sequence to concatenate chains across chz
+/// layers.
+///
+/// Mirrors voxlap's canonical chain walk
+/// (`roxlap_formats::vxl::parse_columns`,
+/// `crates/roxlap-formats/src/vxl.rs:962`):
+///
+/// - Non-last slab (`nextptr != 0`): total bytes = `nextptr * 4`,
+///   advance `pos += nextptr * 4`.
+/// - Last slab (`nextptr == 0`): total bytes =
+///   `4 + max(0, z1c - z1 + 1) * 4`. Emit and stop.
+///
+/// Defensive against malformed columns (truncated tail, `nextptr * 4
+/// < 4`, last-slab body extending past the slab_buf end) — emits the
+/// available bytes and returns. Output is byte-identical to
+/// `target.extend_from_slice(&slab_buf[off..off + slab_chain_byte_len(...)]).`
+fn build_owned_column_from_chain(target: &mut Vec<u8>, slab_buf: &[u8], off: usize) {
     if off >= slab_buf.len() {
         return;
     }
     let tail = &slab_buf[off..];
-    let len = slab_chain_byte_len(tail);
-    target.extend_from_slice(&tail[..len]);
+    let mut pos = 0usize;
+    loop {
+        if pos + 4 > tail.len() {
+            // Truncated header. Emit whatever's left and stop.
+            target.extend_from_slice(&tail[pos..]);
+            return;
+        }
+        let nextptr = tail[pos];
+        if nextptr == 0 {
+            let z1 = i32::from(tail[pos + 1]);
+            let z1c = i32::from(tail[pos + 2]);
+            let n_floor = usize::try_from((z1c - z1 + 1).max(0)).unwrap_or(0);
+            let last_size = 4 + n_floor * 4;
+            let end = (pos + last_size).min(tail.len());
+            target.extend_from_slice(&tail[pos..end]);
+            return;
+        }
+        let advance = usize::from(nextptr) * 4;
+        if advance < 4 {
+            // Malformed: a `nextptr * 4 < 4` advance would loop
+            // forever in voxlap's walker. Treat as terminator;
+            // emit the malformed slab's 4-byte header so reads at
+            // `pos..pos+4` still see the original bytes.
+            let end = (pos + 4).min(tail.len());
+            target.extend_from_slice(&tail[pos..end]);
+            return;
+        }
+        let next_pos = pos.saturating_add(advance).min(tail.len());
+        target.extend_from_slice(&tail[pos..next_pos]);
+        if next_pos >= tail.len() {
+            return;
+        }
+        pos = next_pos;
+    }
 }
 
 /// S4B.6.c: read a slab z-byte (chunk-local) and translate to
@@ -2696,6 +2759,78 @@ fn phase_startsky_textured(state: &mut GrouscanState<'_>) -> Phase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VC.2: builder output equals the chain-bounded bulk slice for
+    /// representative slab-chain shapes — single-slab bedrock, a
+    /// multi-slab column with non-last + last slabs, a chain whose
+    /// last-slab body extends to slab_buf's end, and a truncated tail.
+    #[test]
+    fn vc2_builder_matches_bulk_slice_byte_for_byte() {
+        // Helper: full chain-bounded copy via VC.1's bulk path so we
+        // can diff per-shape against the per-slab builder.
+        fn bulk_install(target: &mut Vec<u8>, slab_buf: &[u8], off: usize) {
+            target.clear();
+            if off >= slab_buf.len() {
+                return;
+            }
+            let tail = &slab_buf[off..];
+            let len = slab_chain_byte_len(tail);
+            target.extend_from_slice(&tail[..len]);
+        }
+        fn assert_match(slab_buf: &[u8], off: usize, label: &str) {
+            let mut bulk = Vec::new();
+            let mut built = Vec::new();
+            bulk_install(&mut bulk, slab_buf, off);
+            install_owned_column(&mut built, slab_buf, off);
+            assert_eq!(bulk, built, "{label}: bulk != builder output");
+        }
+
+        // Shape 1 — single-slab bedrock-only column.
+        // [nextptr=0, z1=255, z1c=255, z0=0] + 1 placeholder colour.
+        let single = vec![0u8, 255, 255, 0, 0xAA, 0xBB, 0xCC, 0xDD];
+        assert_match(&single, 0, "single-slab bedrock");
+
+        // Shape 2 — two-slab column. First slab: nextptr=4 (advance
+        // 16 bytes), z1/z1c/z0 don't matter for the walker advance,
+        // 12 bytes of voxel records. Last slab at offset 16:
+        // [nextptr=0, z1=10, z1c=12, z0=0] + 3 colour records.
+        let mut multi = vec![4u8, 0, 0, 0]; // first slab header
+                                            // 12 voxel-record bytes (= 3 colour records); contents arbitrary.
+        multi.extend_from_slice(&[
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x11, 0x22, 0x33, 0x44,
+        ]);
+        multi.extend_from_slice(&[0, 10, 12, 0]); // last slab header
+        multi.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]); // 3 colour records
+        assert_match(&multi, 0, "two-slab column");
+
+        // Shape 3 — last-slab body extends past slab_buf end. Builder
+        // should clamp to slab_buf.len(). Header says n_floor=3
+        // (12 colour bytes) but only 4 colour bytes are present.
+        let truncated_body = vec![0u8, 10, 12, 0, 1, 2, 3, 4];
+        assert_match(&truncated_body, 0, "last-slab body truncated");
+
+        // Shape 4 — empty slab_buf via off past end. Returns empty
+        // target, no panic.
+        let empty: Vec<u8> = vec![];
+        assert_match(&empty, 0, "empty slab_buf");
+        assert_match(&single, single.len() + 5, "off past end");
+
+        // Shape 5 — malformed nextptr (= 1 → advance 4 bytes back into
+        // own header, which would loop forever). Builder bails on
+        // `advance < 4`; emit the malformed slab's header so the
+        // walker's defensive `column.get(...).unwrap_or(0)` reads
+        // produce the same bytes as the bulk path.
+        let malformed = vec![1u8, 99, 100, 101];
+        let mut bulk_malformed = Vec::new();
+        let mut built_malformed = Vec::new();
+        bulk_install(&mut bulk_malformed, &malformed, 0);
+        install_owned_column(&mut built_malformed, &malformed, 0);
+        // bulk = chain_len walker which bails at advance<4 returning
+        // column.len() = 4 → bulk has all 4 bytes.
+        assert_eq!(bulk_malformed, malformed);
+        // builder: emit the 4 header bytes then return.
+        assert_eq!(built_malformed, malformed);
+    }
 
     fn fresh_scratch() -> ScanScratch {
         let mut s = ScanScratch::new_for_size(64, 64, 64);
