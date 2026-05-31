@@ -165,26 +165,23 @@ const USER_Z_NEG_19_POS: [f64; 3] = [3.78, -159.66, -19.44];
 const USER_Z_NEG_19_YAW: f64 = 1.5033;
 const USER_Z_NEG_19_PITCH: f64 = 1.3575;
 
-/// VC.0 pin: at the user's z = -19.44 pose with chz = -1 placeholder
-/// chunks present, the bug pushes distant-XY hills 256 voxels too
-/// low. Test counts green-dominant pixels at z-buffer depth > 250
-/// (= where hills would land after the +256 shift, given camera at
-/// z = -19.44 and a 77.7° downward pitch).
+/// VC.5 confirmation: at the user's z = -19.44 pose with chz = -1
+/// placeholder chunks present, the multi-chz column-step install
+/// emits the chain stitched across chz layers — distant-XY hills
+/// render at their correct world-z (chunk-local + 0 base for
+/// chz = 0) instead of the pre-VC.5 +256 shifted depth.
 ///
-/// VC.0..VC.4: this fails the `< 30_000` upper bound IFF the
-/// virtual-column rewrite isn't done yet but happens to render the
-/// shifted hills inside the max_scan_dist envelope. On current
-/// master at this pose, the +256 shift puts the distant hills at
-/// world z ≈ 256..306 → ray distance ≈ 250..310 from camera; they
-/// DO render and DO pass the `depth > 250` filter. So this test
-/// currently asserts the bugged distant-hill count > 5000 to LOCK
-/// IN the bug. Once VC.5 fixes the world-z, distant hills move to
-/// world z ≈ 0..50 (depth ≈ 130..150) → fall OUT of the
-/// `depth > 250` bucket → count drops to ~0 → assertion fails →
-/// signals VC.5 is done.
+/// VC.0..VC.4 baseline (= bug active): the +256 shift pushed
+/// distant hills to depth ≈ 300 → far (d > 250) ≈ 154 945,
+/// near (d < 200) ≈ 15 282.
+/// VC.5+ (= bug fixed): hills closer to camera → far (d > 250) ≈
+/// 89 143 (only NATURALLY-distant XY columns at 2+ chunks away),
+/// near (d < 200) ≈ 54 180 (~3.5× growth from pre-VC.5).
 ///
-/// FLIP at VC.5: change `> 5_000` to `< 1_000`. Update the docstring
-/// to describe the post-fix expectation.
+/// Assertion direction flipped at VC.5: now asserts the FIX is in
+/// place via the near-bucket growth. A regression in column-step's
+/// multi-chz install would push hills back to the far bucket and
+/// shrink near below the threshold.
 #[test]
 fn vc5_bug_fires_at_user_z_neg_19_pose() {
     let cam_world_pos = DVec3::new(
@@ -255,13 +252,15 @@ fn vc5_bug_fires_at_user_z_neg_19_pose() {
          of {pixel_count} (PPM at /tmp/vc5_bug_fires_z_neg_19.ppm)"
     );
 
-    // VC.0 pin (BUG ACTIVE): the +256 shift moves distant-XY hills
-    // into the d > 250 bucket; expect ample far-bucket hits.
+    // VC.5+ (FIX ACTIVE): multi-chz column-step install renders
+    // distant-XY hills at their correct world-z. Near-bucket grew
+    // ~3.5× from pre-VC.5 baseline because hills the bug had
+    // shifted to depth ~300 now land at depth ~140.
     assert!(
-        far_hill_pixels > 5_000,
-        "VC.0 pin: expected bug-shifted distant hill pixels (depth > 250) > 5000; got {far_hill_pixels}. \
-         If this is BELOW the bound, the +256 chunk_world_z_base shift may have been fixed — flip the \
-         assertion to `< 1_000` (and document it in project_vc_0_landed.md or the substage memo)."
+        near_hill_pixels > 30_000,
+        "VC.5: expected post-fix near hill pixels (depth < 200) > 30000; got {near_hill_pixels}. \
+         If this DROPS toward pre-VC.5 baseline (~15282), the multi-chz column-step install in \
+         `phase_after_delete_kept_presync` has regressed and the +256 z shift may be back."
     );
 }
 
@@ -295,16 +294,14 @@ fn vc0_baseline_hash_user_z_neg_19_pose_bug_active() {
     );
 }
 
-/// Pinned at the close of VC.1 (2026-05-31). VC.0's value was
-/// `0x0fbe_1121_6bc6_691a`; VC.1's owned-column refactor produced
-/// a 16-pixel sub-percent drift in the BugFire scene because the
-/// chain-bounded install loses past-chain bytes from chz=-1
-/// placeholder columns the mid-render handoff briefly reads
-/// during the bug's misrender. Oracle 10/10 + scene 162 stayed
-/// byte-identical (well-formed columns never read past chain).
-/// VC.2..VC.4 must keep THIS value stable; VC.5 deliberately busts
-/// it once the virtual column eliminates the misrender entirely.
-const VC0_BASELINE_USER_Z_NEG_19_BUG_ACTIVE: u64 = 0xd2cb_b72d_91f4_ba76;
+/// Pinned at the close of VC.5 (2026-05-31). Prior values:
+/// VC.0 baseline `0x0fbe11216bc6691a`, VC.1 re-anchor
+/// `0xd2cbb72d91f4ba76`. VC.5's multi-chz column-step install
+/// fixes the +256 z shift entirely — the bug is GONE and the
+/// hash reflects the corrected render. VC.6+ must keep this
+/// value stable; future changes to the multi-chz path that
+/// alter rendered output break this assertion deliberately.
+const VC0_BASELINE_USER_Z_NEG_19_BUG_ACTIVE: u64 = 0x15e3_21a1_012a_6109;
 
 /// Diagnostic dump for the user's z = -19.44 pose under the
 /// in-binary (mitigated) generator. Renders WITHOUT the

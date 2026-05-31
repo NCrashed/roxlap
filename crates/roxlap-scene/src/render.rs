@@ -2339,20 +2339,17 @@ mod tests {
         );
     }
 
-    /// S4B.6.l KNOWN LIMITATION (pre-S4B.6.l fix): camera at chz=0
-    /// with all-air-bedrock at the camera's own XY column
-    /// (seed_chz=1 via cross-chunk look-down). A DIFFERENT XY column
-    /// has chz=0 content (= a distant mountain entirely inside
-    /// chz=0). State.current_chunk_z gets pinned to 1 at seed time
-    /// and the chunk-XY swap reads chz=1 chunks across the DDA, so
-    /// the chz=0 mountain is invisible. This test pins the limitation
-    /// — it currently asserts mountain_count > 50 to fail loudly
-    /// against current master (= the limitation has been fixed) once
-    /// the virtual-column rewrite lands in VC.5.
+    /// S4B.6.l KNOWN LIMITATION → RESOLVED by VC.5 (2026-05-31).
+    /// Camera at chz=0 with all-air-bedrock at the camera's own
+    /// XY column (seed_chz=1 via cross-chunk look-down). A DIFFERENT
+    /// XY column has chz=0 content (= a distant mountain entirely
+    /// inside chz=0). Pre-VC.5 the chunk-XY swap read chz=1 chunks
+    /// across the DDA, so the chz=0 mountain was invisible. VC.5's
+    /// multi-chz column-step install stitches every chz layer at the
+    /// new XY column; the chz=0 mountain renders correctly.
     ///
-    /// VC.0 pin (2026-05-31): re-enabled (was `#[ignore]`'d) per
-    /// the VC scope brief. Expected to FAIL across VC.0..VC.4 with
-    /// `mountain_count == 0`; VC.5 turns it green.
+    /// VC.0 pin (2026-05-31): re-enabled (was `#[ignore]`'d). VC.5
+    /// flipped it from failing (mountain_chz0 = 0) to passing.
     #[test]
     fn stacked_chz0_distant_mountain_visible_from_chz0_camera() {
         let mut scene = Scene::new();

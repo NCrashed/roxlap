@@ -460,30 +460,32 @@ impl<'a> GrouscanState<'a> {
         // never reads past it, so this stays byte-identical to the
         // pre-VC.1 borrow.
         //
-        // VC.3: when the grid is a multi-chunk backend AND its z
-        // stack fits in u8 (= `chunks_z == 1 && origin_chunk_z == 0`,
-        // the only case where the per-slab z translation is
-        // guaranteed not to overflow), route the seed install
-        // through `build_owned_column_multi_chz` instead. For the
-        // single-iteration N = 1 case the output is byte-identical
-        // to the bulk extend above; the multi-chz scaffolding is in
-        // place for VC.4's z widening to unblock chunks_z > 1.
+        // VC.5: any multi-chunk grid routes the seed install through
+        // `build_owned_column_multi_chz`. Single-chunk grids
+        // (`chunk_grid: None`, oracle's `from_single_vxl`) keep the
+        // bulk-slice path for byte-identity with the goldens — they
+        // have no chz layers to stitch and `inputs.column` already
+        // carries the chain bytes for them.
         let mut column_owned: Vec<u8> = Vec::with_capacity(inputs.column.len().min(8192));
         let mut column_z_base_owned: Vec<i32> = Vec::with_capacity(inputs.column.len().min(8192));
-        let use_vc3_multi_chz_seed = grid_view
-            .chunk_grid
-            .map_or(false, |cg| cg.chunks_z == 1 && cg.origin_chunk_z == 0);
-        if use_vc3_multi_chz_seed {
-            let cg = grid_view.chunk_grid.expect("guarded above");
+        if let Some(cg) = grid_view.chunk_grid {
             #[allow(clippy::cast_possible_wrap)]
-            let starting_chz = cg.origin_chunk_z;
-            #[allow(clippy::cast_possible_wrap)]
-            let max_chz = starting_chz + cg.chunks_z as i32 - 1;
+            let chunks_z_signed = cg.chunks_z as i32;
+            let max_chz = cg.origin_chunk_z + chunks_z_signed - 1;
+            // Start the chz iteration at the camera's clamped chz so
+            // chunks ABOVE the camera (= chz < camera_chunk_z; not
+            // visible in voxlap's z-down convention) are skipped.
+            // For camera ABOVE the grid `camera_chunk_z <
+            // origin_chunk_z` clamps to origin; BELOW the grid
+            // clamps to max_chz. Mirrors the seed clamp in
+            // `column_walk::camera_chunk_air_gap`.
+            let starting_chz = inputs.camera_chunk_z.clamp(cg.origin_chunk_z, max_chz);
             let chunk_local_xy = [cx & chunk_size_xy_mask, cy & chunk_size_xy_mask];
             #[allow(clippy::cast_possible_wrap)]
             let chunk_size_z_signed = inputs.chunk_size_z as i32;
             build_owned_column_multi_chz(
                 &mut column_owned,
+                &mut column_z_base_owned,
                 grid_view,
                 current_chunk_idx_xy,
                 chunk_local_xy,
@@ -491,13 +493,6 @@ impl<'a> GrouscanState<'a> {
                 max_chz,
                 chunk_size_z_signed,
             );
-            // VC.4: uniform fill — chunks_z=1 + origin=0 means
-            // every slab in the concat carries world_z_base=0,
-            // which matches the seed's inputs.chunk_world_z_base
-            // already (= seed_chunk_z * chunk_size_z = 0). Pre-VC.5
-            // every slab the iter visits maps to the same scalar
-            // base.
-            column_z_base_owned.resize(column_owned.len(), inputs.chunk_world_z_base);
         } else {
             let seed_chain_len = slab_chain_byte_len(inputs.column);
             column_owned.extend_from_slice(&inputs.column[..seed_chain_len]);
@@ -1713,6 +1708,13 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 state.column_z_base.clear();
             }
         } else {
+            // VC.5: mip-0 multi-chunk column-step routes through the
+            // multi-chz builder. This is the fix for the S4B.6.j
+            // cross-chunk look-down rendering bug — column-step now
+            // stitches chz layers at the new XY column the same way
+            // the seed install does, so distant XY columns read the
+            // correct world-z slabs instead of falling into the
+            // mid-render handoff's broken `+ chunk_size_z` arithmetic.
             let log2 = state.chunk_size_xy_log2;
             let mask = state.chunk_size_xy_mask;
             let new_chunk_xy = [state.cx >> log2, state.cy >> log2];
@@ -1737,33 +1739,48 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 }
             }
 
-            // Chunk-local coords via mask. `local_cx` is in
-            // `[0, chunk_size_xy)` for any signed `cx`, so the prior
-            // explicit range checks are redundant.
-            if state.current_chunk_exists {
-                let local_cx = state.cx & mask;
-                let local_cy = state.cy & mask;
-                #[allow(clippy::cast_sign_loss)]
-                let correct_idx = (local_cy as u32)
-                    .wrapping_mul(state.chunk_size_xy)
-                    .wrapping_add(local_cx as u32) as usize;
-                state.ixy_sptr_col_idx = correct_idx;
-                if let Some(&col_off) = state.column_offsets.get(correct_idx) {
-                    let off = col_off as usize;
-                    if off <= state.slab_buf.len() {
-                        install_owned_column(
-                            &mut state.column,
-                            &mut state.column_z_base,
-                            state.slab_buf,
-                            off,
-                            state.chunk_world_z_base,
-                        );
-                    }
-                }
-            } else {
-                state.column.clear();
-                state.column_z_base.clear();
-            }
+            // Keep `ixy_sptr_col_idx` in sync (other phases read it,
+            // and `phase_remiporend`'s mip-transition reload uses
+            // it). The multi-chz install reads chunks directly via
+            // `grid_view.chunk_at_xyz`, so this index is purely for
+            // the legacy code paths.
+            let local_cx = state.cx & mask;
+            let local_cy = state.cy & mask;
+            #[allow(clippy::cast_sign_loss)]
+            let correct_idx = (local_cy as u32)
+                .wrapping_mul(state.chunk_size_xy)
+                .wrapping_add(local_cx as u32) as usize;
+            state.ixy_sptr_col_idx = correct_idx;
+
+            // Multi-chz install for the new XY column. Spans every
+            // chz layer of the grid; intermediate bedrock placeholders
+            // are stripped so the walker flows from chz=K's content
+            // into chz=K+1's content without `phase_draw_flor`'s
+            // bedrock-as-air bypass terminating mid-stack.
+            let chunk_local_xy = [local_cx, local_cy];
+            let chunk_grid = state.grid_view.chunk_grid;
+            let starting_chz = state.camera_chunk_z.clamp(
+                chunk_grid.map_or(0, |cg| cg.origin_chunk_z),
+                chunk_grid.map_or(0, |cg| {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let max = cg.origin_chunk_z + cg.chunks_z as i32 - 1;
+                    max
+                }),
+            );
+            #[allow(clippy::cast_possible_wrap)]
+            let max_chz = chunk_grid.map_or(0, |cg| cg.origin_chunk_z + cg.chunks_z as i32 - 1);
+            #[allow(clippy::cast_possible_wrap)]
+            let chunk_size_z_signed = state.chunk_size_z as i32;
+            build_owned_column_multi_chz(
+                &mut state.column,
+                &mut state.column_z_base,
+                state.grid_view,
+                new_chunk_xy,
+                chunk_local_xy,
+                starting_chz,
+                max_chz,
+                chunk_size_z_signed,
+            );
         }
     }
     // Voxlap's `v = *ixy_sptr_col` resets v to the new column's
@@ -2373,30 +2390,133 @@ fn build_owned_column_from_chain_translated(
     }
 }
 
-/// VC.3: build the camera-XY column by concatenating chz layers
-/// from `starting_chz` to `max_chz` (inclusive). Each layer's slab
-/// chain is z-translated by `chz * chunk_size_z` before being
-/// appended. The slab walker still reads bytes positionally — but
-/// for layers with non-zero `world_z_base`, those bytes now
-/// represent world-z directly.
+/// VC.5: append one chunk's chain to `target` + parallel
+/// `target_z_base` with this chunk's `world_z_base`. When
+/// `strip_trailing_bedrock` is set (= this chunk is NOT the last in
+/// the chz iteration), drop the chunk's trailing bedrock placeholder
+/// so the walker doesn't terminate on the intermediate chunk's
+/// `column[vptr+1] == 0xff` bedrock-as-air check. The new-last slab's
+/// nextptr is rewritten to 0 so the chain remains a valid voxlap
+/// chain terminated by the *next* chunk's stitch.
 ///
-/// VC.3 scope: only single-chz stacks (chunks_z = 1) are wired
-/// through to this function via the
-/// [`GrouscanState::from_seed`] dispatch. For N = 1 the loop runs
-/// once, world_z_base = 0, and the output is byte-identical to
-/// VC.2's single-chunk install. The N > 1 iteration logic is
-/// scaffolding for VC.4+ — the
-/// [`build_owned_column_from_chain_translated`] u8-overflow
-/// assertion fires before any incorrect output reaches the
-/// rasterizer.
+/// Returns the offset (in `target`) of the LAST emitted slab's
+/// nextptr byte — caller uses this to stitch chz=K+1's chain by
+/// overwriting that byte with the advance to chz=K+1's first slab.
+/// Returns `None` when nothing was emitted (= empty chunk, or
+/// stripped-down to nothing).
+fn emit_chunk_chain(
+    target: &mut Vec<u8>,
+    target_z_base: &mut Vec<i32>,
+    slab_buf: &[u8],
+    off: usize,
+    world_z_base: i32,
+    strip_trailing_bedrock: bool,
+) -> Option<usize> {
+    if off >= slab_buf.len() {
+        return None;
+    }
+    let tail = &slab_buf[off..];
+
+    // Pass 1: walk the chain, collect each slab's byte range
+    // (relative to `tail`).
+    let mut slabs: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        if pos + 4 > tail.len() {
+            break;
+        }
+        let nextptr = tail[pos];
+        if nextptr == 0 {
+            let z1 = i32::from(tail[pos + 1]);
+            let z1c = i32::from(tail[pos + 2]);
+            let n_floor = usize::try_from((z1c - z1 + 1).max(0)).unwrap_or(0);
+            let last_size = 4 + n_floor * 4;
+            let end = (pos + last_size).min(tail.len());
+            slabs.push((pos, end));
+            break;
+        }
+        let advance = usize::from(nextptr) * 4;
+        if advance < 4 {
+            return None;
+        }
+        let next_pos = pos.saturating_add(advance).min(tail.len());
+        slabs.push((pos, next_pos));
+        if next_pos >= tail.len() {
+            break;
+        }
+        pos = next_pos;
+    }
+    if slabs.is_empty() {
+        return None;
+    }
+
+    // Decide whether to strip the trailing bedrock placeholder.
+    // VC.5: only when the caller is mid-iteration over chz layers
+    // AND the slab actually IS the bedrock sentinel. Voxlap encodes
+    // the placeholder with z1 byte (= `tail[start + 1]`) equal to
+    // 0xff at mip-0. We only call this builder at mip-0 (multi-mip
+    // multi-chz comes later), so the direct 0xff comparison is
+    // sufficient.
+    let strip = strip_trailing_bedrock && {
+        let (last_start, _) = *slabs.last().unwrap();
+        tail.get(last_start + 1).copied() == Some(0xff)
+    };
+    let slabs_to_emit = if strip {
+        if slabs.len() == 1 {
+            // Chunk is bedrock-only — empty air chunk. Emit nothing.
+            return None;
+        }
+        &slabs[..slabs.len() - 1]
+    } else {
+        &slabs[..]
+    };
+
+    // Pass 2: emit each slab. Track the last emitted slab's
+    // nextptr position in `target`.
+    let mut last_slab_target_pos: Option<usize> = None;
+    let n = slabs_to_emit.len();
+    for (i, &(start, end)) in slabs_to_emit.iter().enumerate() {
+        let slab_pos_in_target = target.len();
+        target.extend_from_slice(&tail[start..end]);
+        if i == n - 1 && strip {
+            // After stripping the original last slab, the new last
+            // slab's nextptr byte (= `target[slab_pos_in_target]`)
+            // gets zeroed so this slab terminates the (intra-chunk)
+            // chain. The CALLER then overwrites it to stitch into
+            // chz=K+1's first slab in `target`.
+            target[slab_pos_in_target] = 0;
+        }
+        last_slab_target_pos = Some(slab_pos_in_target);
+    }
+    target_z_base.resize(target.len(), world_z_base);
+    last_slab_target_pos
+}
+
+/// VC.3 / VC.5: build the camera-XY column by concatenating chz
+/// layers from `starting_chz` to `max_chz` (inclusive). Each
+/// chunk's chain is appended raw (chunk-local z bytes), with its
+/// `world_z_base = chz * chunk_size_z` recorded per-byte in
+/// `target_z_base` — `slab_z_at` later reads world-z by combining
+/// the two.
 ///
-/// Note: chains are appended back-to-back; the chz=K last-slab's
-/// `nextptr == 0` sentinel is NOT rewritten to point at chz=K+1's
-/// first slab. That stitching belongs in VC.4 alongside the z
-/// widening — without it, a multi-chz walker would terminate at
-/// the first chz boundary.
+/// VC.5 stitches across chz boundaries: chz=K's intermediate
+/// bedrock placeholder is stripped (`emit_chunk_chain`'s
+/// `strip_trailing_bedrock=true`), and chz=K's new-last slab's
+/// nextptr is rewritten to advance to chz=K+1's first slab in
+/// `target`. The walker then flows from chz=K's content directly
+/// into chz=K+1's content; only the final chunk's bedrock
+/// placeholder remains in the chain (= the world's actual bottom,
+/// where `phase_draw_flor`'s bedrock-as-air bypass correctly
+/// terminates the ray).
+///
+/// Limitation: nextptr is a u8 in voxlap's slab format. If chz=K's
+/// last emitted slab is > 1020 bytes, the stitch's nextptr would
+/// overflow u8; this path leaves the slab's nextptr at 0 (= chain
+/// terminates early). VC.6+ revisits if this matters in practice
+/// (typical chunks have small last slabs).
 fn build_owned_column_multi_chz(
     target: &mut Vec<u8>,
+    target_z_base: &mut Vec<i32>,
     grid_view: crate::grid_view::GridView<'_>,
     chunk_xy: [i32; 2],
     chunk_local_xy: [i32; 2],
@@ -2405,6 +2525,8 @@ fn build_owned_column_multi_chz(
     chunk_size_z: i32,
 ) {
     target.clear();
+    target_z_base.clear();
+    let mut prev_last_slab_pos: Option<usize> = None;
     for chz in starting_chz..=max_chz {
         let Some(chunk) = grid_view.chunk_at_xyz([chunk_xy[0], chunk_xy[1], chz]) else {
             continue;
@@ -2415,7 +2537,6 @@ fn build_owned_column_multi_chz(
         let lx = (chunk_local_xy[0] & chunk_size_xy_mask) as u32;
         #[allow(clippy::cast_sign_loss)]
         let ly = (chunk_local_xy[1] & chunk_size_xy_mask) as u32;
-        // Mip-0 sub-table only — seed-time install never reads mip-N.
         let mip_base = chunk.mip_base_offsets[0];
         let col_idx = ly.wrapping_mul(chunk.chunk_size_xy).wrapping_add(lx);
         let table_idx = mip_base + col_idx as usize;
@@ -2423,12 +2544,36 @@ fn build_owned_column_multi_chz(
             continue;
         };
         let world_z_base = chz * chunk_size_z;
-        build_owned_column_from_chain_translated(
+        let strip_trailing = chz < max_chz;
+        let chz_start = target.len();
+        let Some(last_pos) = emit_chunk_chain(
             target,
+            target_z_base,
             chunk.slab_buf,
             col_off as usize,
             world_z_base,
-        );
+            strip_trailing,
+        ) else {
+            continue;
+        };
+
+        // Stitch the previous chz's last slab to this chz's chain
+        // start. `advance_bytes` is `(chz_start - prev_pos)` because
+        // prev_pos is the nextptr byte of the previous chz's
+        // (rewritten) last slab; advancing past that slab lands at
+        // chz_start where THIS chz's first slab begins.
+        if let Some(prev_pos) = prev_last_slab_pos {
+            let advance_bytes = chz_start - prev_pos;
+            if advance_bytes % 4 == 0 && advance_bytes / 4 <= 255 {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    target[prev_pos] = (advance_bytes / 4) as u8;
+                }
+            }
+            // Else: stitch overflows u8 — leave previous nextptr at
+            // 0 (chain terminates early). Documented limitation.
+        }
+        prev_last_slab_pos = Some(last_pos);
     }
 }
 
