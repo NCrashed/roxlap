@@ -295,9 +295,16 @@ fn vc0_baseline_hash_user_z_neg_19_pose_bug_active() {
     );
 }
 
-/// Pinned on `master` at commit 28a104d (2026-05-31). See
-/// [`vc0_baseline_hash_user_z_neg_19_pose_bug_active`].
-const VC0_BASELINE_USER_Z_NEG_19_BUG_ACTIVE: u64 = 0x0fbe_1121_6bc6_691a;
+/// Pinned at the close of VC.1 (2026-05-31). VC.0's value was
+/// `0x0fbe_1121_6bc6_691a`; VC.1's owned-column refactor produced
+/// a 16-pixel sub-percent drift in the BugFire scene because the
+/// chain-bounded install loses past-chain bytes from chz=-1
+/// placeholder columns the mid-render handoff briefly reads
+/// during the bug's misrender. Oracle 10/10 + scene 162 stayed
+/// byte-identical (well-formed columns never read past chain).
+/// VC.2..VC.4 must keep THIS value stable; VC.5 deliberately busts
+/// it once the virtual column eliminates the misrender entirely.
+const VC0_BASELINE_USER_Z_NEG_19_BUG_ACTIVE: u64 = 0xd2cb_b72d_91f4_ba76;
 
 /// Diagnostic dump for the user's z = -19.44 pose under the
 /// in-binary (mitigated) generator. Renders WITHOUT the

@@ -206,7 +206,17 @@ pub(crate) struct GrouscanState<'a> {
     /// Slab bytes of the column the ray currently sits in. Mutated
     /// by R4.3e2d's column-step path (re-sliced from
     /// [`Self::slab_buf`] at the new column's offset).
-    pub column: &'a [u8],
+    ///
+    /// VC.1: owned [`Vec<u8>`] (was `&'a [u8]`). On every column
+    /// install, [`install_owned_column`] copies the slab chain's
+    /// bytes from `slab_buf[off..]`. Subsequent reads (`column[i]`
+    /// / `column.get(i)`) deref to the owned slice — byte-identical
+    /// to the pre-VC.1 borrow path because [`slab_chain_byte_len`]
+    /// bounds the copy at the chain's natural end and the rasterizer
+    /// never reads past it. Decouples the lifetime of the column data
+    /// from `slab_buf`, which VC.3 will use to inject world-z bytes
+    /// without touching the parent borrow.
+    pub column: Vec<u8>,
     /// `gylookoff` window into the per-frame gylookup table.
     pub gylookup: &'a [i32],
     /// Per-side shading table.
@@ -430,9 +440,19 @@ impl<'a> GrouscanState<'a> {
             ])
             .is_some();
 
+        // VC.1: own the seed column's bytes. Walk the slab chain at
+        // `inputs.column` (= the camera-XY column's slab data,
+        // pre-sliced by gline's seed path from `slab_buf[col_off..]`)
+        // and copy only the chain's actual length — the rasterizer
+        // never reads past it, so this stays byte-identical to the
+        // pre-VC.1 borrow.
+        let mut column_owned: Vec<u8> = Vec::with_capacity(inputs.column.len().min(8192));
+        let seed_chain_len = slab_chain_byte_len(inputs.column);
+        column_owned.extend_from_slice(&inputs.column[..seed_chain_len]);
+
         Self {
             scratch,
-            column: inputs.column,
+            column: column_owned,
             gylookup: inputs.gylookup,
             gcsub: inputs.gcsub,
             slab_buf: inputs.slab_buf,
@@ -1500,15 +1520,15 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        state.column = &state.slab_buf[off..];
+                        install_owned_column(&mut state.column, state.slab_buf, off);
                     } else {
-                        state.column = &[];
+                        state.column.clear();
                     }
                 } else {
-                    state.column = &[];
+                    state.column.clear();
                 }
             } else {
-                state.column = &[];
+                state.column.clear();
             }
         } else {
             let in_bounds = state.cx >= 0
@@ -1524,11 +1544,11 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        state.column = &state.slab_buf[off..];
+                        install_owned_column(&mut state.column, state.slab_buf, off);
                     }
                 }
             } else {
-                state.column = &[];
+                state.column.clear();
             }
         }
     } else {
@@ -1602,15 +1622,15 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        state.column = &state.slab_buf[off..];
+                        install_owned_column(&mut state.column, state.slab_buf, off);
                     } else {
-                        state.column = &[];
+                        state.column.clear();
                     }
                 } else {
-                    state.column = &[];
+                    state.column.clear();
                 }
             } else {
-                state.column = &[];
+                state.column.clear();
             }
         } else {
             let log2 = state.chunk_size_xy_log2;
@@ -1651,11 +1671,11 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        state.column = &state.slab_buf[off..];
+                        install_owned_column(&mut state.column, state.slab_buf, off);
                     }
                 }
             } else {
-                state.column = &[];
+                state.column.clear();
             }
         }
     }
@@ -2060,6 +2080,56 @@ fn column_byte_at(state: &GrouscanState<'_>, offset: usize) -> u8 {
         .unwrap_or(0)
 }
 
+/// VC.1: walk the slab chain at `column[0..]` and return its exact
+/// byte length. Matches `roxlap_formats::vxl::parse`'s canonical
+/// walker (`crates/roxlap-formats/src/vxl.rs:962`):
+///
+/// - Non-last slab: `pos += nextptr * 4`.
+/// - Last slab (`nextptr == 0`): `4 + max(0, z1c - z1 + 1) * 4`.
+///
+/// Defensive against truncated / malformed columns: clamps to
+/// `column.len()` and bails on `nextptr * 4 < 4` (which would loop
+/// forever in voxlap's walker). Returns 0 when the input doesn't
+/// have the 4-byte header.
+fn slab_chain_byte_len(column: &[u8]) -> usize {
+    let mut pos = 0usize;
+    loop {
+        if pos + 4 > column.len() {
+            return column.len();
+        }
+        let nextptr = column[pos];
+        if nextptr == 0 {
+            let z1 = i32::from(column[pos + 1]);
+            let z1c = i32::from(column[pos + 2]);
+            let n_floor_signed = z1c - z1 + 1;
+            let n_floor = usize::try_from(n_floor_signed.max(0)).unwrap_or(0);
+            let last_size = 4 + n_floor * 4;
+            return (pos + last_size).min(column.len());
+        }
+        let advance = usize::from(nextptr) * 4;
+        if advance < 4 {
+            return column.len();
+        }
+        pos = pos.saturating_add(advance);
+    }
+}
+
+/// VC.1: copy the slab chain rooted at `slab_buf[off..]` into
+/// `target`. Computes the chain's exact byte length via
+/// [`slab_chain_byte_len`] so reads stay byte-identical to the
+/// pre-VC.1 `state.column = &slab_buf[off..]` slice path (the
+/// rasterizer never reads past the chain anyway; the bounded copy
+/// just avoids allocating + memcpying the slab_buf tail).
+fn install_owned_column(target: &mut Vec<u8>, slab_buf: &[u8], off: usize) {
+    target.clear();
+    if off >= slab_buf.len() {
+        return;
+    }
+    let tail = &slab_buf[off..];
+    let len = slab_chain_byte_len(tail);
+    target.extend_from_slice(&tail[..len]);
+}
+
 /// S4B.6.c: read a slab z-byte (chunk-local) and translate to
 /// world-z by adding `state.chunk_world_z_base`. Use for any
 /// byte in {1: z1, 2: z1c, 3: z0} where the result is interpreted
@@ -2161,12 +2231,12 @@ fn try_handoff_chunk_z_down(state: &mut GrouscanState<'_>) -> bool {
     if let Some(&col_off) = state.column_offsets.get(correct_idx) {
         let off = col_off as usize;
         if off <= state.slab_buf.len() {
-            state.column = &state.slab_buf[off..];
+            install_owned_column(&mut state.column, state.slab_buf, off);
         } else {
-            state.column = &[];
+            state.column.clear();
         }
     } else {
-        state.column = &[];
+        state.column.clear();
     }
     state.vptr_offset = 0;
     true
@@ -2427,10 +2497,10 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     // 388k-pixel BLACK WALL around the ship at OOB-XY camera
     // (user-reported 2026-05-26).
     if !state.current_chunk_exists {
-        state.column = &[];
+        state.column.clear();
     } else if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
         let col_off = col_off as usize;
-        state.column = state.slab_buf.get(col_off..).unwrap_or(&[]);
+        install_owned_column(&mut state.column, state.slab_buf, col_off);
     }
 
     // Voxlap5.c:12116 — reset c to top-of-stack.
@@ -2946,6 +3016,13 @@ mod tests {
         let mut s = fresh_scratch();
         s.cf[CF_SEED_INDEX].z0 = 20;
         let mut column = vec![0u8; 32];
+        // VC.1: chain walker bounds the seed-time owned-column copy
+        // at the slab chain's natural end. Give byte 0 a valid
+        // `nextptr = 8` (= advance 8 * 4 = 32 bytes to the next slab)
+        // so the chain walker spans the artificial padding bytes
+        // drawcwall's negative-offset reads land in. The header's
+        // z1/z1c/z0 fields stay 0 — they don't influence this test.
+        column[0] = 8;
         column.extend_from_slice(&[0, 10, 12, 5]);
         let gylookup = [0i32; 64];
         let gcsub = [0i64; 9];
@@ -2980,6 +3057,10 @@ mod tests {
 
         // 16-byte previous slab + 4-byte current header.
         let mut column = vec![0u8; 16];
+        // VC.1: same as above — set nextptr=4 (advance 4*4=16 bytes)
+        // so the chain walker's bounded copy spans the artificial
+        // 16 bytes of "previous slab tail" the inner loop reads.
+        column[0] = 4;
         column.extend_from_slice(&[0, 10, 12, 2]); // current slab v[3] = 2
 
         let mut gylookup = [0i32; 64];
