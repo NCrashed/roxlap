@@ -5,6 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-06-01
+
+Virtual-Column-rewrite + perf-recovery release. Closes the S4B.6.j
+cross-chunk look-down rendering limitation properly (no longer
+mitigated; the live demo materialises the full chunk-z stack), and
+restores demo perf to ~3× the pre-VC.5 floor at the spawn pose.
+
+### Fixed
+
+#### `roxlap-core` — Virtual Column rewrite (VC.0..VC.7)
+
+- **S4B.6.j cross-chunk look-down rendering** is fixed at the
+  engine level. The rasterizer's column-step now stitches a
+  multi-chz virtual column at every chunk-XY crossing — distant
+  XY columns see the correct world-z slabs instead of falling
+  into the previous handoff's broken `+ chunk_size_z` arithmetic.
+  `roxlap_scene::render`'s `stacked_chz0_distant_mountain_visible
+  _from_chz0_camera` test (the sanctioned VC.0 fail pin) is now
+  GREEN.
+- New per-slab chain builders + multi-chz install path:
+  `build_owned_column_from_chain`, `build_owned_column_multi_chz`,
+  `emit_chunk_chain`. The seed-time path and the per-column-step
+  install both route through these so distant columns inherit the
+  same multi-chz stitching the camera column gets.
+- New parallel `column_z_base: Vec<i32>` translation table —
+  per-slab world-z lookup decoupled from the chunk-local slab
+  bytes. Lets the rasterizer keep voxlap's u8 slab format while
+  the engine reasons about world-z natively.
+- Camera-above-stacked-grid: `camera_chunk_air_gap` clamped to
+  `origin_chunk_z`; `gline` matches. Cameras above the grid no
+  longer collapse to chz=0.
+
+#### `roxlap-scene-demo` — VC.7 cleanup
+
+- Reverted the `HillsChunkGenerator::should_generate` mitigation
+  from 0.3.0. The live demo now materialises the full chz stack
+  and exercises the engine-level multi-chz path. Repurposed
+  `camera_above_hills_only_streams_chz0_chunks` →
+  `camera_above_hills_streams_full_chz_stack` as a regression test
+  for VC.5's behaviour.
+
+### Performance
+
+- **PR.1 — env-var caching** (`roxlap-core`): the 7
+  `std::env::var{,_os}` reads in `grouscan.rs` + `cf_narrow.rs`
+  (`ROXLAP_TRACE_PHASES`, `ROXLAP_TRACE_STARTSKY`,
+  `ROXLAP_CF_NARROW`, `ROXLAP_CF_NARROW_PER_COLUMN`,
+  `ROXLAP_CF_NARROW_PER_COLUMN_NO_I1`, `ROXLAP_CF_NARROW_NOP`)
+  are now read exactly once per process via module-private
+  `LazyLock<bool>` caches instead of per-call. `run_phases` alone
+  fires per-ray (~480K calls / frame at vsid=4096), so the
+  previous getenv chain accounted for ~29% of render-frame CPU
+  time. Diagnostic flags are not expected to change at runtime,
+  so behaviour is preserved.
+- **PR.2 — per-grid bounding-sphere distance cull**
+  (`roxlap-scene`): `render_scene_composed`'s Near/Mid arm now
+  skips the per-grid opticast pass when the grid's bounding
+  sphere is entirely beyond `OpticastSettings::max_scan_dist`.
+  Each opticast walks ~width\*height rays even when none reach a
+  voxel, so far-away grids (marker pillars, distant pickups)
+  otherwise paid ~9 ms each per frame. Safe: no ray can reach a
+  grid whose closest sphere point is past the scan distance.
+- **PR.3 — single-chunk fast path**
+  (`roxlap-scene::render_scene_composed`): grids that are exactly
+  1 chunk at index `(0, 0, 0)` reuse the
+  `GridView::from_single_vxl` view that `chunk_xyz_backing`
+  already populated. The rasterizer then takes the single-chunk
+  branch in `phase_after_delete_kept_presync` — no per-column-
+  step `chunk_at_xyz` / IVec2 equality / `Option::is_some`.
+  Bench-neutral in the scene-demo's spawn pose (only one
+  qualifying grid is in range; the rest are culled by PR.2),
+  architectural prep for callers adding small single-chunk grids.
+
+Combined bench at the demo's spawn pose (4-thread, vsid=4096
+ground + vsid=768 ship, max_scan_dist=512, mip_levels=4):
+
+| Config                    | 0.3.0 | 0.4.0 | Δ     |
+|---------------------------|-------|-------|-------|
+| Live demo (markers on)    | 11.7  | 35.3  | +202% |
+| Engine only (no markers)  | ~17   | 46.5  | +173% |
+
+### Added
+
+- `ROXLAP_NO_MARKERS=1` env knob in `roxlap-scene-demo` —
+  bench-only switch to skip the 5 marker pillars when measuring
+  the core renderer's cost in isolation. Live demo defaults
+  unchanged.
+
+### Known limits
+
+- **VC.6 — mip-N multi-chz** is deferred. The mip-N column-step
+  still uses single-chz install; demo poses A/B/C/D + the ship
+  don't exercise multi-mip multi-chz, so no active regression.
+- **opticast `gylookup` overflow** at `chunks_z ≥ 4` per grid
+  (surfaced at S7.4, still deferred).
+- Per-strip parallel scheduler tops out at 4 worker threads.
+
 ## [0.3.0] — 2026-05-31
 
 LOD-and-streaming release: per-grid Far-tier billboard impostors,
