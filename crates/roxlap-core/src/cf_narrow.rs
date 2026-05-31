@@ -48,6 +48,13 @@
 
 use crate::grouscan::{grouscan_cross_sign, CfType};
 
+// Diagnostic env-var cache — read once at first access, not per ray.
+// `cf_narrow_simulate` runs inside the per-ray remiporend path, so the
+// previous `std::env::var_os("ROXLAP_CF_NARROW_NOP").is_some()` cost
+// kicked in whenever `ROXLAP_CF_NARROW=1` was set.
+static CF_NARROW_NOP: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("ROXLAP_CF_NARROW_NOP").is_some());
+
 /// Per-call inputs the simulator reads from the live engine state.
 /// All values are taken by value / by borrow — the simulator does not
 /// touch `GrouscanState` directly so it stays pure and unit-testable.
@@ -142,7 +149,7 @@ pub fn cf_narrow_simulate(cf: &mut [CfType], in_: &CfNarrowInputs<'_>) {
     // etc.) is itself perturbing rendering. If beam count under
     // NOP=1 == baseline 6404, harness is benign and any regression
     // is purely from the narrowing logic below.
-    if std::env::var_os("ROXLAP_CF_NARROW_NOP").is_some() {
+    if *CF_NARROW_NOP {
         return;
     }
 

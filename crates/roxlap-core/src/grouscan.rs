@@ -70,6 +70,22 @@ pub const CF_SEED_INDEX: usize = 128;
 use crate::rasterizer::ScanScratch;
 use crate::sky::Sky;
 
+// Diagnostic env-var caches. Each flag is read once at first access
+// via `LazyLock` instead of per-call. Pre-cache, the per-ray
+// `std::env::var(..)` in `run_phases` alone accounted for ~29% of
+// render-frame CPU time (samply, 2026-05-31 vsid=4096 static-ground
+// bench).
+static TRACE_PHASES: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("ROXLAP_TRACE_PHASES").is_ok());
+static TRACE_STARTSKY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("ROXLAP_TRACE_STARTSKY").is_ok());
+static CF_NARROW: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("ROXLAP_CF_NARROW").is_some());
+static CF_NARROW_PER_COLUMN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("ROXLAP_CF_NARROW_PER_COLUMN").is_some());
+static CF_NARROW_PER_COLUMN_NO_I1: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("ROXLAP_CF_NARROW_PER_COLUMN_NO_I1").is_some());
+
 /// Borrowed read-only view of an [`crate::sky::Sky`] resource —
 /// the subset `phase_startsky`'s textured-fill branch reads. Built
 /// from a `&Sky` once per ray (the per-ray sky-row state lives on
@@ -890,7 +906,7 @@ pub enum Phase {
 /// every phase as a stub that returns [`Phase::Done`]; R4.3f+
 /// replaces them with the actual fill loops.
 fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
-    let trace = std::env::var("ROXLAP_TRACE_PHASES").is_ok();
+    let trace = *TRACE_PHASES;
     let mut current = entry;
     let mut step_count = 0u32;
     loop {
@@ -1880,7 +1896,7 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     // Gated behind `ROXLAP_CF_NARROW_PER_COLUMN=1` so default flow
     // stays byte-stable. mip-0 (gmipcnt == 0) is excluded — at mip-0
     // drawfwall does all narrowing natively.
-    if state.gmipcnt > 0 && std::env::var_os("ROXLAP_CF_NARROW_PER_COLUMN").is_some() {
+    if state.gmipcnt > 0 && *CF_NARROW_PER_COLUMN {
         // ROXLAP_CF_NARROW_PER_COLUMN_NO_I1=1 — skip the i1 decrement.
         // Earlier CF.3.B diagnostic showed cx1/cy1 narrowing alone is
         // observably a no-op (gi0 magnitude is sufficient to flip
@@ -1888,7 +1904,7 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
         // reach the bug pixels' drawfwall fire path). Use this to
         // confirm: if NO_I1 = baseline, the i1 decrement is the
         // entire source of regression in per-column too.
-        let skip_i1 = std::env::var_os("ROXLAP_CF_NARROW_PER_COLUMN_NO_I1").is_some();
+        let skip_i1 = *CF_NARROW_PER_COLUMN_NO_I1;
         let virtual_ogx = state.gx;
         let entry = &mut state.scratch.cf[state.ce_idx];
 
@@ -2855,7 +2871,7 @@ fn try_handoff_chunk_z_down(state: &mut GrouscanState<'_>) -> bool {
 // artifact.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
-    if std::env::var("ROXLAP_TRACE_STARTSKY").is_ok() {
+    if *TRACE_STARTSKY {
         eprintln!(
             "remiporend: gmipcnt={} gmipnum={} ce={} c={} gpz=[{}, {}] gxmax={} ngxmax={}",
             state.gmipcnt,
@@ -2880,7 +2896,7 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     // axis-aligned-mip-beams artifact at deep mip-N + near-axis rays.
     // See `crate::cf_narrow` + the `cf-narrowing-multi-session-plan`
     // memo for the full design.
-    if state.gmipcnt > 0 && std::env::var_os("ROXLAP_CF_NARROW").is_some() {
+    if state.gmipcnt > 0 && *CF_NARROW {
         let inputs = crate::cf_narrow::CfNarrowInputs {
             gpz_at_entry: state.scratch.gpz,
             gdz_old: state.scratch.gdz,
@@ -3128,7 +3144,7 @@ fn phase_startsky(state: &mut GrouscanState<'_>) -> Phase {
 /// `state.scratch.skycast` into every remaining radar slot.
 #[allow(clippy::cast_sign_loss)]
 fn phase_startsky_solid(state: &mut GrouscanState<'_>) -> Phase {
-    let trace = std::env::var("ROXLAP_TRACE_STARTSKY").is_ok();
+    let trace = *TRACE_STARTSKY;
 
     let skycast = state.scratch.skycast;
     for c_idx in CF_SEED_INDEX..=state.ce_idx {
