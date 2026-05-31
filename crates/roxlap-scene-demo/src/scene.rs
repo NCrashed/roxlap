@@ -695,28 +695,31 @@ mod tests_s7_6 {
     /// cross-chunk look-down limitation per
     /// [[s4b-6-chz-multi-rendering-research-full-record]].
     ///
-    /// Fix: `HillsChunkGenerator::should_generate` returns `false`
-    /// for `chunk_idx.z != 0`, so the streaming pump never
-    /// materialises placeholder bedrock chunks at chz < 0. The
-    /// streaming grid's chunk set stays at chz=0 only →
-    /// `origin_chunk_z = 0` → the rasterizer's
-    /// `camera_chunk_z.clamp(origin_chunk_z, max_chz)` snaps to 0
-    /// → seed walk runs at chz=0 directly with `chunk_world_z_base
-    /// = 0` everywhere → the column-step + handoff path that
-    /// caused the +256 offset never fires.
+    /// **0.3.0 mitigation (REVERTED at VC.7)**: declined chunk_idx.z
+    /// != 0 in `HillsChunkGenerator::should_generate` so the
+    /// streaming pump never materialised placeholder bedrock chunks
+    /// at chz < 0. With placeholder chunks absent, origin_chunk_z
+    /// stayed at 0 and the buggy column-step handoff path didn't
+    /// fire. Band-aid; left the underlying rasterizer bug latent.
     ///
-    /// Assertion: after pumping at the user's pose, every
-    /// materialised chunk has `chunk_idx.z == 0`.
+    /// **VC.5 fix**: the rasterizer's `phase_after_delete_kept_presync`
+    /// mip-0 multi-chunk column-step path now installs a multi-chz
+    /// virtual column at every chunk-XY crossing, with intermediate
+    /// bedrock placeholders stripped at install. The +256 z shift
+    /// from `try_handoff_chunk_z_down` no longer fires for the
+    /// distant-XY columns the user observed misrendering.
+    ///
+    /// **VC.7 post-revert assertion**: at the user's pose, the
+    /// streaming pump materialises BOTH chz = 0 hill chunks AND
+    /// chz < 0 placeholder bedrock chunks (= the real grid
+    /// topology the rasterizer is meant to handle). The render
+    /// path exercises VC.5's multi-chz column-step install.
     #[test]
-    fn camera_above_hills_only_streams_chz0_chunks() {
+    fn camera_above_hills_streams_full_chz_stack() {
         let mut s = build_demo();
         // The pose from the user's capture.
         let cam = DVec3::new(3.78, -159.66, -19.44);
-        // Use the sync pump for deterministic test timing — the
-        // async pool's tasks may not all complete within a short
-        // test cycle on CI hosts. Sync runs `generate` inline on
-        // the calling thread, guaranteeing installation before
-        // assertion.
+        // Sync pump for deterministic test timing.
         s.scene.pump_streaming_sync(cam);
         let ground_id = s
             .scene
@@ -729,11 +732,28 @@ mod tests_s7_6 {
             grid.chunk_count() > 0,
             "sync pump should have streamed something at this pose"
         );
+        // VC.7 (mitigation reverted): pump materialises placeholder
+        // chunks at chz < 0 (= world z < 0, above the world) AND
+        // hill chunks at chz = 0. Without VC.5's column-step
+        // multi-chz install, mixing these two would re-trigger the
+        // +256 hill shift — but VC.5's fix is in place, so the
+        // pump is free to materialise the full z stack.
+        let mut chz_counts = std::collections::HashMap::<i32, usize>::new();
         for chunk_idx in grid.chunks.keys() {
-            assert_eq!(
-                chunk_idx.z, 0,
-                "HillsChunkGenerator must not materialise chz != 0; got {chunk_idx:?}"
-            );
+            *chz_counts.entry(chunk_idx.z).or_default() += 1;
         }
+        let chz_neg = chz_counts.iter().filter(|(&z, _)| z < 0).count();
+        let chz_zero = chz_counts.get(&0).copied().unwrap_or(0);
+        assert!(
+            chz_neg > 0,
+            "expected chz<0 placeholder chunks (VC.7 reverted the 0.3.0 chz!=0 mitigation); \
+             got chunk_count={} chz_counts={chz_counts:?}",
+            grid.chunk_count()
+        );
+        assert!(
+            chz_zero > 0,
+            "expected chz=0 hill chunks at the user's pose; got chunk_count={} chz_counts={chz_counts:?}",
+            grid.chunk_count()
+        );
     }
 }

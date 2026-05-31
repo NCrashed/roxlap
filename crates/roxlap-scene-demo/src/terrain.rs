@@ -330,12 +330,17 @@ pub struct HillsChunkGenerator;
 
 impl ChunkGenerator for HillsChunkGenerator {
     fn generate(&self, chunk_idx: IVec3) -> Vxl {
-        // The streaming pump filters via `should_generate` first,
-        // so by the time we land here `chunk_idx.z == 0` is
-        // guaranteed. Keep the chz != 0 short-circuit as a
-        // belt-and-braces guard against direct
-        // `Grid::ensure_chunk_generated` callers that might
-        // bypass the pump.
+        // The hill terrain lives in chz = 0 only. For chz != 0 emit
+        // an empty bedrock-only chunk — these are the placeholder
+        // layers around the terrain (`chz < 0` = sky above the
+        // world, `chz > 0` = unused stack below) that
+        // [`Grid::pump_streaming_sync`] materialises inside the
+        // streaming radius. The rasterizer's multi-chz column-step
+        // install (VC.5) stitches across these placeholders +
+        // chz = 0 hills, so the user-reported "camera flies above
+        // the world, hills shift 256 voxels down" bug
+        // ([[s4b-6-chz-multi-rendering-research-full-record]]) no
+        // longer fires.
         if chunk_idx.z != 0 {
             return empty_air_chunk();
         }
@@ -350,26 +355,15 @@ impl ChunkGenerator for HillsChunkGenerator {
         vxl
     }
 
-    /// 2026-05-31: cave layer lives in `chz = 0` only. Declining
-    /// chz != 0 keeps the camera-above-grid scenario clean — see
-    /// [[s4b-6-chz-multi-rendering-research-full-record]]: if
-    /// placeholder bedrock chunks materialise at chz < 0, the
-    /// camera at world z < 0 lands in one of them, the
-    /// scalar_rasterizer's clamp at line ~696 sets
-    /// `camera_chunk_z = -1` (= origin_chunk_z), and seed-time
-    /// cross-chunk look-down resolves chz = 0 hills at the camera
-    /// column but column-step into other XY chunks reads chz = -1
-    /// placeholders with a stale `chunk_world_z_base` of 0 —
-    /// `try_handoff_chunk_z_down` then bumps the base to 256 and
-    /// hills render 256 voxels too low.
-    ///
-    /// By only materialising chz = 0, `origin_chunk_z = 0`, the
-    /// clamp collapses to 0, and the rasterizer's seed reads chz =
-    /// 0 directly with `chunk_world_z_base = 0` everywhere — no
-    /// cross-chunk look-down required.
-    fn should_generate(&self, chunk_idx: IVec3) -> bool {
-        chunk_idx.z == 0
-    }
+    // VC.7 (2026-05-31): the `should_generate` override (=
+    // declining chz != 0) WAS the 0.3.0 mitigation for the
+    // S4B.6.j cross-chunk look-down rendering bug. VC.5's
+    // multi-chz column-step install fixes the bug properly, so
+    // the override is removed and the trait default (return
+    // `true` for every chunk_idx) takes over. Placeholder bedrock
+    // chunks at chz < 0 now materialise alongside chz = 0 hills,
+    // and the rasterizer stitches them into a single virtual
+    // column at every chunk-XY crossing.
 }
 
 /// Produce a fresh bedrock-only chunk-sized Vxl by detaching the
