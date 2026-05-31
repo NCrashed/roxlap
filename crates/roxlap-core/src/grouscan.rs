@@ -446,9 +446,41 @@ impl<'a> GrouscanState<'a> {
         // and copy only the chain's actual length — the rasterizer
         // never reads past it, so this stays byte-identical to the
         // pre-VC.1 borrow.
+        //
+        // VC.3: when the grid is a multi-chunk backend AND its z
+        // stack fits in u8 (= `chunks_z == 1 && origin_chunk_z == 0`,
+        // the only case where the per-slab z translation is
+        // guaranteed not to overflow), route the seed install
+        // through `build_owned_column_multi_chz` instead. For the
+        // single-iteration N = 1 case the output is byte-identical
+        // to the bulk extend above; the multi-chz scaffolding is in
+        // place for VC.4's z widening to unblock chunks_z > 1.
         let mut column_owned: Vec<u8> = Vec::with_capacity(inputs.column.len().min(8192));
-        let seed_chain_len = slab_chain_byte_len(inputs.column);
-        column_owned.extend_from_slice(&inputs.column[..seed_chain_len]);
+        let use_vc3_multi_chz_seed = grid_view
+            .chunk_grid
+            .map_or(false, |cg| cg.chunks_z == 1 && cg.origin_chunk_z == 0);
+        if use_vc3_multi_chz_seed {
+            let cg = grid_view.chunk_grid.expect("guarded above");
+            #[allow(clippy::cast_possible_wrap)]
+            let starting_chz = cg.origin_chunk_z;
+            #[allow(clippy::cast_possible_wrap)]
+            let max_chz = starting_chz + cg.chunks_z as i32 - 1;
+            let chunk_local_xy = [cx & chunk_size_xy_mask, cy & chunk_size_xy_mask];
+            #[allow(clippy::cast_possible_wrap)]
+            let chunk_size_z_signed = inputs.chunk_size_z as i32;
+            build_owned_column_multi_chz(
+                &mut column_owned,
+                grid_view,
+                current_chunk_idx_xy,
+                chunk_local_xy,
+                starting_chz,
+                max_chz,
+                chunk_size_z_signed,
+            );
+        } else {
+            let seed_chain_len = slab_chain_byte_len(inputs.column);
+            column_owned.extend_from_slice(&inputs.column[..seed_chain_len]);
+        }
 
         Self {
             scratch,
@@ -2193,6 +2225,143 @@ fn build_owned_column_from_chain(target: &mut Vec<u8>, slab_buf: &[u8], off: usi
     }
 }
 
+/// VC.3: per-slab chain walker that translates each slab's z bytes
+/// (header bytes 1 = z1, 2 = z1c, 3 = z0) to world-z by adding
+/// `world_z_base`. Other header / voxel-record bytes pass through
+/// untouched. Append semantics (caller clears `target`).
+///
+/// For `world_z_base == 0` produces byte-identical output to
+/// [`build_owned_column_from_chain`]; that's the case the VC.3
+/// dispatch in [`GrouscanState::from_seed`] actually exercises
+/// today. The translation arithmetic is in place so VC.4 can flip
+/// the z bytes to u16 / i32 and unblock `chunks_z > 1`.
+///
+/// VC.3 constraint: panics if any translated z exceeds u8. Guarded
+/// by the dispatch which only fires when `origin_chunk_z == 0` AND
+/// `chunks_z == 1` (= `world_z_base == 0` for every layer the loop
+/// visits).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn build_owned_column_from_chain_translated(
+    target: &mut Vec<u8>,
+    slab_buf: &[u8],
+    off: usize,
+    world_z_base: i32,
+) {
+    if off >= slab_buf.len() {
+        return;
+    }
+    let tail = &slab_buf[off..];
+    let mut pos = 0usize;
+    loop {
+        if pos + 4 > tail.len() {
+            target.extend_from_slice(&tail[pos..]);
+            return;
+        }
+        let nextptr = tail[pos];
+        let z1_raw = i32::from(tail[pos + 1]);
+        let z1c_raw = i32::from(tail[pos + 2]);
+        let z0_raw = i32::from(tail[pos + 3]);
+        let z1_w = z1_raw + world_z_base;
+        let z1c_w = z1c_raw + world_z_base;
+        let z0_w = z0_raw + world_z_base;
+        assert!(
+            (0..256).contains(&z1_w)
+                && (0..256).contains(&z1c_w)
+                && (0..256).contains(&z0_w),
+            "VC.3 z translation overflows u8 (base={world_z_base}, raw z1={z1_raw}, z1c={z1c_raw}, z0={z0_raw})"
+        );
+        // Emit translated header.
+        target.push(nextptr);
+        target.push(z1_w as u8);
+        target.push(z1c_w as u8);
+        target.push(z0_w as u8);
+        if nextptr == 0 {
+            // Last slab body — n_floor based on the CHUNK-LOCAL diff
+            // (= identical to the world-z diff after translation).
+            let n_floor = usize::try_from((z1c_raw - z1_raw + 1).max(0)).unwrap_or(0);
+            let body_bytes = n_floor * 4;
+            let body_end = (pos + 4 + body_bytes).min(tail.len());
+            if pos + 4 < body_end {
+                target.extend_from_slice(&tail[pos + 4..body_end]);
+            }
+            return;
+        }
+        let advance = usize::from(nextptr) * 4;
+        if advance < 4 {
+            return;
+        }
+        let next_pos = pos.saturating_add(advance).min(tail.len());
+        // Emit voxel-record bytes between header and next slab —
+        // colours pass through untouched.
+        if pos + 4 < next_pos {
+            target.extend_from_slice(&tail[pos + 4..next_pos]);
+        }
+        if next_pos >= tail.len() {
+            return;
+        }
+        pos = next_pos;
+    }
+}
+
+/// VC.3: build the camera-XY column by concatenating chz layers
+/// from `starting_chz` to `max_chz` (inclusive). Each layer's slab
+/// chain is z-translated by `chz * chunk_size_z` before being
+/// appended. The slab walker still reads bytes positionally — but
+/// for layers with non-zero `world_z_base`, those bytes now
+/// represent world-z directly.
+///
+/// VC.3 scope: only single-chz stacks (chunks_z = 1) are wired
+/// through to this function via the
+/// [`GrouscanState::from_seed`] dispatch. For N = 1 the loop runs
+/// once, world_z_base = 0, and the output is byte-identical to
+/// VC.2's single-chunk install. The N > 1 iteration logic is
+/// scaffolding for VC.4+ — the
+/// [`build_owned_column_from_chain_translated`] u8-overflow
+/// assertion fires before any incorrect output reaches the
+/// rasterizer.
+///
+/// Note: chains are appended back-to-back; the chz=K last-slab's
+/// `nextptr == 0` sentinel is NOT rewritten to point at chz=K+1's
+/// first slab. That stitching belongs in VC.4 alongside the z
+/// widening — without it, a multi-chz walker would terminate at
+/// the first chz boundary.
+fn build_owned_column_multi_chz(
+    target: &mut Vec<u8>,
+    grid_view: crate::grid_view::GridView<'_>,
+    chunk_xy: [i32; 2],
+    chunk_local_xy: [i32; 2],
+    starting_chz: i32,
+    max_chz: i32,
+    chunk_size_z: i32,
+) {
+    target.clear();
+    for chz in starting_chz..=max_chz {
+        let Some(chunk) = grid_view.chunk_at_xyz([chunk_xy[0], chunk_xy[1], chz]) else {
+            continue;
+        };
+        #[allow(clippy::cast_possible_wrap)]
+        let chunk_size_xy_mask = (chunk.chunk_size_xy as i32) - 1;
+        #[allow(clippy::cast_sign_loss)]
+        let lx = (chunk_local_xy[0] & chunk_size_xy_mask) as u32;
+        #[allow(clippy::cast_sign_loss)]
+        let ly = (chunk_local_xy[1] & chunk_size_xy_mask) as u32;
+        // Mip-0 sub-table only — seed-time install never reads mip-N.
+        let mip_base = chunk.mip_base_offsets[0];
+        let col_idx = ly.wrapping_mul(chunk.chunk_size_xy).wrapping_add(lx);
+        let table_idx = mip_base + col_idx as usize;
+        let Some(&col_off) = chunk.column_offsets.get(table_idx) else {
+            continue;
+        };
+        let world_z_base = chz * chunk_size_z;
+        build_owned_column_from_chain_translated(
+            target,
+            chunk.slab_buf,
+            col_off as usize,
+            world_z_base,
+        );
+    }
+}
+
 /// S4B.6.c: read a slab z-byte (chunk-local) and translate to
 /// world-z by adding `state.chunk_world_z_base`. Use for any
 /// byte in {1: z1, 2: z1c, 3: z0} where the result is interpreted
@@ -2830,6 +2999,90 @@ mod tests {
         assert_eq!(bulk_malformed, malformed);
         // builder: emit the 4 header bytes then return.
         assert_eq!(built_malformed, malformed);
+    }
+
+    /// VC.3: `build_owned_column_from_chain_translated` with
+    /// `world_z_base == 0` produces byte-identical output to VC.2's
+    /// `build_owned_column_from_chain`. Validates the no-op case
+    /// the seed-install dispatch actually hits today.
+    #[test]
+    fn vc3_translation_with_zero_base_is_identity() {
+        // Multi-slab + last-slab columns. Same fixtures as the VC.2
+        // test so any divergence between the two builders pops here
+        // immediately.
+        let single = vec![0u8, 100, 105, 0, 0xAA, 0xBB, 0xCC, 0xDD];
+        let mut multi = vec![4u8, 5, 10, 0]; // first slab: 16 bytes total
+        multi.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]); // 3 colours
+        multi.extend_from_slice(&[0, 50, 60, 40]); // last slab header
+        multi.extend_from_slice(&[
+            0x11, 0x12, 0x13, 0x14, 0x21, 0x22, 0x23, 0x24, 0x31, 0x32, 0x33, 0x34, 0x41, 0x42,
+            0x43, 0x44, 0x51, 0x52, 0x53, 0x54, 0x61, 0x62, 0x63, 0x64, 0x71, 0x72, 0x73, 0x74,
+            0x81, 0x82, 0x83, 0x84, 0x91, 0x92, 0x93, 0x94, 0xA1, 0xA2, 0xA3, 0xA4, 0xB1, 0xB2,
+            0xB3, 0xB4,
+        ]); // 11 colour records (n_floor = 60 - 50 + 1 = 11)
+
+        for (label, slab_buf) in [("single", &single[..]), ("multi", &multi[..])] {
+            let mut untranslated = Vec::new();
+            let mut translated = Vec::new();
+            build_owned_column_from_chain(&mut untranslated, slab_buf, 0);
+            build_owned_column_from_chain_translated(&mut translated, slab_buf, 0, 0);
+            assert_eq!(
+                untranslated, translated,
+                "{label}: world_z_base=0 must produce byte-identical output"
+            );
+        }
+    }
+
+    /// VC.3: positive `world_z_base` shifts every slab header's z1
+    /// / z1c / z0 by that amount; other bytes (nextptr, voxel
+    /// records) pass through. Body lengths (= chain end position)
+    /// stay unchanged.
+    #[test]
+    fn vc3_translation_with_positive_base_shifts_z_bytes() {
+        // Two-slab column. First slab: nextptr=4 (advance 16 bytes),
+        // z1=5, z1c=10, z0=0. Last slab: nextptr=0, z1=20, z1c=22,
+        // z0=18 → n_floor = 3 → 12 colour bytes.
+        let mut col = vec![4u8, 5, 10, 0];
+        col.extend_from_slice(&[
+            0xA1, 0xA2, 0xA3, 0xA4, 0xB1, 0xB2, 0xB3, 0xB4, 0xC1, 0xC2, 0xC3, 0xC4,
+        ]);
+        col.extend_from_slice(&[0, 20, 22, 18]);
+        col.extend_from_slice(&[
+            0xD1, 0xD2, 0xD3, 0xD4, 0xE1, 0xE2, 0xE3, 0xE4, 0xF1, 0xF2, 0xF3, 0xF4,
+        ]);
+
+        let mut out = Vec::new();
+        build_owned_column_from_chain_translated(&mut out, &col, 0, 100);
+
+        // First slab header: nextptr unchanged, z1/z1c/z0 shifted by 100.
+        assert_eq!(out[0], 4);
+        assert_eq!(out[1], 105);
+        assert_eq!(out[2], 110);
+        assert_eq!(out[3], 100);
+        // First slab voxel records pass through.
+        assert_eq!(&out[4..16], &col[4..16]);
+        // Last slab header: shifted z values.
+        assert_eq!(out[16], 0);
+        assert_eq!(out[17], 120);
+        assert_eq!(out[18], 122);
+        assert_eq!(out[19], 118);
+        // Last slab voxel records pass through.
+        assert_eq!(&out[20..32], &col[20..32]);
+        // Total length matches input (= chain end).
+        assert_eq!(out.len(), col.len());
+    }
+
+    /// VC.3: u8 overflow at the translation step panics. Guards
+    /// against silently producing wrap-around z values when callers
+    /// fail to honour the VC.3 dispatch constraint
+    /// (`chunks_z * chunk_size_z <= 256`).
+    #[test]
+    #[should_panic(expected = "VC.3 z translation overflows u8")]
+    fn vc3_translation_overflow_panics() {
+        // z1 = 200 + world_z_base 100 = 300 → overflow.
+        let col = vec![0u8, 200, 200, 0];
+        let mut out = Vec::new();
+        build_owned_column_from_chain_translated(&mut out, &col, 0, 100);
     }
 
     fn fresh_scratch() -> ScanScratch {
