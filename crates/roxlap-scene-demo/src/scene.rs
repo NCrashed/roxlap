@@ -149,7 +149,18 @@ pub fn build_demo() -> SceneAndCamera {
     // generate_mips pass (see above). The `B` hotkey toggles their
     // `lod_thresholds` between always-Near (default — pre-S6.6
     // behaviour) and the tuned Near/Far config.
-    let marker_ids = markers::build_markers(&mut scene);
+    //
+    // `ROXLAP_NO_MARKERS=1` skips marker construction entirely.
+    // Used by the perf bench to isolate the core renderer's cost
+    // from the per-grid overhead of 5 always-Near marker grids
+    // (currently ~9 ms/marker/frame at the bench pose). The live
+    // demo defaults to having them so the LOD-tier visual stays
+    // in place; flip the env var when measuring engine perf.
+    let marker_ids = if std::env::var_os("ROXLAP_NO_MARKERS").is_some() {
+        Vec::new()
+    } else {
+        markers::build_markers(&mut scene)
+    };
 
     // For the stacked-ground variant the terrain sits in chz=1
     // (world z=256..511). Spawn deeper into chz=0's air-gap (z=200,

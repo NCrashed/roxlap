@@ -348,6 +348,26 @@ pub fn render_scene_composed(
         let Some(backing) = grid.chunk_xyz_backing() else {
             continue;
         };
+
+        // Out-of-range early-out: skip the per-grid opticast pass
+        // when the grid's bounding sphere is entirely beyond
+        // `max_scan_dist`. Each opticast call walks ~width*height
+        // rays even when no ray reaches a voxel, so far-away marker
+        // pillars / pickups otherwise cost ~9 ms each at the bench
+        // pose. Safe: if the closest point of the sphere is past
+        // max_scan_dist, no ray can possibly reach the grid, so
+        // dropping the opticast pass is byte-identical.
+        //
+        // `grid_bounds` walks `grid.chunks.keys()`; for the ground's
+        // ~1024 chunks it costs ~10 µs amortised against the ~50 ms
+        // it might save by culling 4-of-5 markers in the live demo.
+        let bounds = billboard::grid_bounds(grid);
+        let centre_world = grid.transform.origin + grid.transform.rotation * bounds.centre;
+        let cam_pos = DVec3::from_array(camera.pos);
+        let dist_to_centre = (centre_world - cam_pos).length();
+        if dist_to_centre - bounds.radius > f64::from(settings.max_scan_dist) {
+            continue;
+        }
         // S5.2-followup: per-grid sky opt-out. Grids with
         // `render_sky = false` (e.g. a rotating ship) must not
         // contribute sky pixels — the grid-local sky lookup
