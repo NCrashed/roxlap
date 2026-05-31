@@ -52,6 +52,26 @@ pub trait ChunkGenerator: fmt::Debug + Send + Sync {
     /// allocate or touch any state outside their own configuration
     /// — running this from a background thread must be safe.
     fn generate(&self, chunk_idx: IVec3) -> Vxl;
+
+    /// Per-chunk filter consulted by [`crate::Scene::pump_streaming`]
+    /// (+ the synchronous [`crate::Grid::ensure_chunk_generated`]
+    /// helper) before dispatching `generate`. Returning `false`
+    /// skips the chunk entirely — it never enters the grid's chunk
+    /// map and `origin_chunk_z` (etc.) reflect only the indices the
+    /// generator actually materialises.
+    ///
+    /// Used to avoid creating placeholder bedrock-only chunks for
+    /// layers the generator has no real content for (e.g. the
+    /// streaming-hills demo's `HillsChunkGenerator` declines
+    /// `chunk_idx.z != 0` so the camera can fly above the world
+    /// without triggering the S4B.6.j cross-chunk look-down
+    /// limitation).
+    ///
+    /// Default returns `true` — pre-fix behaviour, every dispatched
+    /// chunk gets generated.
+    fn should_generate(&self, _chunk_idx: IVec3) -> bool {
+        true
+    }
 }
 
 /// Per-grid streaming activity / eviction radii (S7.1).

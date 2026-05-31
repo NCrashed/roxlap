@@ -685,4 +685,55 @@ mod tests_s7_6 {
             grid.chunk_count()
         );
     }
+
+    /// Regression for the user-reported "camera above the hills"
+    /// z-misalignment bug (2026-05-31). Camera at
+    /// `pos=(3.78, -159.66, -19.44)` (world z < 0 = above the
+    /// world in voxlap z-down) used to render only the camera's
+    /// own XY chunk correctly while every other chunk's hills
+    /// surface appeared 256 voxels too low — the S4B.6.j
+    /// cross-chunk look-down limitation per
+    /// [[s4b-6-chz-multi-rendering-research-full-record]].
+    ///
+    /// Fix: `HillsChunkGenerator::should_generate` returns `false`
+    /// for `chunk_idx.z != 0`, so the streaming pump never
+    /// materialises placeholder bedrock chunks at chz < 0. The
+    /// streaming grid's chunk set stays at chz=0 only →
+    /// `origin_chunk_z = 0` → the rasterizer's
+    /// `camera_chunk_z.clamp(origin_chunk_z, max_chz)` snaps to 0
+    /// → seed walk runs at chz=0 directly with `chunk_world_z_base
+    /// = 0` everywhere → the column-step + handoff path that
+    /// caused the +256 offset never fires.
+    ///
+    /// Assertion: after pumping at the user's pose, every
+    /// materialised chunk has `chunk_idx.z == 0`.
+    #[test]
+    fn camera_above_hills_only_streams_chz0_chunks() {
+        let mut s = build_demo();
+        // The pose from the user's capture.
+        let cam = DVec3::new(3.78, -159.66, -19.44);
+        // Use the sync pump for deterministic test timing — the
+        // async pool's tasks may not all complete within a short
+        // test cycle on CI hosts. Sync runs `generate` inline on
+        // the calling thread, guaranteeing installation before
+        // assertion.
+        s.scene.pump_streaming_sync(cam);
+        let ground_id = s
+            .scene
+            .grids()
+            .map(|(id, _)| id)
+            .min_by_key(|id| id.raw())
+            .expect("ground grid registered");
+        let grid = s.scene.grid(ground_id).expect("ground grid");
+        assert!(
+            grid.chunk_count() > 0,
+            "sync pump should have streamed something at this pose"
+        );
+        for chunk_idx in grid.chunks.keys() {
+            assert_eq!(
+                chunk_idx.z, 0,
+                "HillsChunkGenerator must not materialise chz != 0; got {chunk_idx:?}"
+            );
+        }
+    }
 }

@@ -325,6 +325,13 @@ impl Grid {
         let Some(generator) = self.generator.as_ref() else {
             return false;
         };
+        // S7.6+: generator may decline specific indices (e.g. a
+        // single-z-layer generator skipping placeholder bedrock
+        // chunks at chz != 0). Respect the filter so we don't
+        // materialise an unwanted chunk.
+        if !generator.should_generate(chunk_idx) {
+            return false;
+        }
         let chunk = generator.generate(chunk_idx);
         self.chunks.insert(chunk_idx, chunk);
         // S7.4: a fresh chunk grows the populated AABB → the
@@ -766,6 +773,16 @@ fn dispatch_grid_async(
         }
         if grid.pending_gen.contains(&idx) {
             return; // already in flight
+        }
+        // S7.6+: respect the generator's per-chunk filter — same
+        // contract as `Grid::ensure_chunk_generated` (sync helper).
+        // Lets a generator decline to materialise specific indices
+        // (e.g. `HillsChunkGenerator` skipping placeholder bedrock
+        // chunks at chz != 0 so the camera-above-grid path doesn't
+        // create chz < 0 entries that would shift `origin_chunk_z`
+        // and trigger the S4B.6.j cross-chunk look-down bug).
+        if !generator.should_generate(idx) {
+            return;
         }
         grid.pending_gen.insert(idx);
         let version_at_dispatch = grid.chunk_version(idx);
