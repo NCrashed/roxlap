@@ -17,7 +17,7 @@ categories = ["game-development", "graphics", "rendering::engine"]
 # type lives in the formats crate alongside the parser/serialiser.
 # Path used during local development; version is what cargo publish
 # records for downstream resolution.
-roxlap-formats = { path = "../roxlap-formats", version = "0.2" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.3" }
 
 # R12.2.1: rayon's par_iter for the per-strip / per-row / per-sprite
 # parallel rendering paths. Single-threaded callers
@@ -42,7 +42,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # `examples/hello.rs` — minimum-viable WASD + cube demo for new devs.
 # Pulled in only for the example so the published crate's runtime
 # dependency surface stays unchanged.
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.2" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.3" }
 winit = "0.30"
 softbuffer = "0.4"
 

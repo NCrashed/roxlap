@@ -5,6 +5,147 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-31
+
+LOD-and-streaming release: per-grid Far-tier billboard impostors,
+mid-tier mip overrides, and an end-to-end streaming + procedural
+generation pipeline. Closes the S6 + S7 macro-stages of
+[`PORTING-SCENE.md`](PORTING-SCENE.md).
+
+### Added
+
+#### `roxlap-scene` — S6 (Far-LOD billboards)
+
+- **Per-grid LOD picker** (`roxlap_scene::lod`): new
+  `LodThresholds { r_near, r_mid, mid_mip_levels, mid_mip_scan_dist }`
+  + `Lod::{Near, Mid, Far}` enum + `select_lod(camera_world_pos,
+  transform, thresholds)`. Wired into `Grid::lod_thresholds` and
+  consulted by `render_scene_composed`. Default
+  `LodThresholds::always_near` is byte-identical with the pre-S6
+  path.
+- **Mid-tier mip overrides** (`Grid::lod_thresholds.mid_mip_*`):
+  per-grid Mid-tier override for `OpticastSettings::mip_levels` /
+  `mip_scan_dist`. Falls back to caller's settings when both
+  fields are `None`. Plays nicely with the existing
+  `Grid::mip_levels_override` cap.
+- **Billboard impostor cache** (`roxlap_scene::billboard`): new
+  `BillboardCache` + `BillboardSnapshot` with 26 canonical
+  viewpoints (6 face + 12 edge + 8 corner). Rendered via opticast
+  at `D = 8 × bounding_radius` near-orthographic camera against
+  the runtime sky. Lazy: built on first Far-tier entry per grid,
+  cleared by edits + eviction + stream-in (S7.4).
+- **Far-tier blit** (`roxlap_scene::render::billboard_blit_into`):
+  walks `BillboardCache::pick_nearest`, projects the grid centre
+  via the camera basis, stamps the impostor's RGBA pixels with a
+  constant z. Skips by the sky-sentinel (`0x00_00_00_00`) so
+  background pixels in the impostor don't write to the
+  framebuffer.
+
+#### `roxlap-scene` — S7 (streaming + procedural generation)
+
+- **`ChunkGenerator` trait** (`roxlap_scene::streaming`):
+  `Debug + Send + Sync` pluggable per-chunk generator with
+  `generate(chunk_idx) -> Vxl` and a `should_generate(chunk_idx)
+  -> bool` filter (default `true`). `Grid::generator:
+  Option<Arc<dyn ChunkGenerator>>` carries the generator;
+  `Grid::ensure_chunk_generated` is the synchronous helper.
+- **`StreamRadius { r_active, r_evict }`**: per-grid streaming
+  policy in grid-local voxel units. `DISABLED` sentinel (`r_active
+  = 0`, `r_evict = ∞`) is the default — pre-S7.1 grids keep their
+  "absent stays absent" semantics. `new()` panics on `r_evict <
+  r_active`, NaN, or negative.
+- **Per-chunk version counter**
+  (`Grid::chunk_versions: HashMap<IVec3, u64>`): edits bump;
+  `ensure_chunk_generated` does NOT. Survives the
+  `SceneSnapshot` round-trip via `#[serde(default)]` so pre-S7.2
+  snapshots deserialise cleanly.
+- **`Scene::pump_streaming_sync(camera_world_pos)`** (S7.1) +
+  **`Scene::pump_streaming(camera_world_pos)`** (S7.3, async):
+  per-frame drain + evict + dispatch. Async path uses a dedicated
+  `rayon::ThreadPool` + `crossbeam_channel` inbox so chunk
+  generation doesn't compete with R12's render pool. Race
+  detection: each ChunkResult carries `version_at_dispatch`,
+  installation gated on `chunk_version(idx) ==
+  version_at_dispatch && !chunks.contains_key(idx)`. Eviction
+  also drops `pending_gen` entries so stale results past
+  `r_evict` are discarded. `Scene::set_streaming_threads(n)`
+  reconfigures the pool (drops + rebuilds; channel survives).
+- **Stream-in invalidates billboards** (S7.4): both
+  `ensure_chunk_generated` and the async drain clear
+  `Grid::billboards` after install so the impostor cache rebuilds
+  with the new bounding sphere.
+- **`CaveChunkGenerator<G>`** (`roxlap_scene::cavegen`): generic
+  adapter wrapping any `roxlap_cavegen::Generator<Params =
+  CaveParams>` (works with `BlueCaveGenerator`,
+  `MagCaveGenerator`). `chunk_idx.z != 0` returns a bedrock-only
+  chunk; `chz = 0` derives a per-chunk seed via FNV-1a of `(base_seed,
+  chunk_idx.x, chunk_idx.y)` and calls the inner preset at
+  `vsid = CHUNK_SIZE_XY`. Visible chunk-boundary seams documented
+  as a v1 limitation; continuous-cave deferred.
+
+#### `roxlap-scene-demo` (default mode now streaming)
+
+- **Streaming-hills demo by default**: `build_demo` attaches a
+  `HillsChunkGenerator` to the ground grid with
+  `StreamRadius::new(256.0, 384.0)`. Chunks visibly load + unload
+  as the camera moves. `ROXLAP_STATIC=1` restores the
+  historical 32×32 statically-built ground for regression /
+  visual-A-B work. `T` prints `chunks=N pending=N
+  radius=A/E` per streaming grid.
+- **`StreamingBakeTracker`**: per-frame lighting + mip bake
+  driver. Bakes newly-installed chunks + their four cardinal
+  neighbours via a `Grid::chunk`-resolving `EstNormCache` reader,
+  so chunk-edge brightness banding resolves as chunks settle
+  around the camera. Bake-on-stream-in replaces the previous
+  in-isolation bake inside `HillsChunkGenerator`, which had no
+  neighbour context and produced visible seams.
+
+#### `roxlap-formats`
+
+- `Vxl::reset_to_single_mip` (called from `generate_mips`) now
+  walks columns + `slng` to recompute the actual end of mip-0
+  data instead of trusting the chunk-creation-time sentinel. Fixes
+  an OOB panic on the **second** `generate_mips` call against any
+  chunk that had been edited (= had `voxalloc`-driven column
+  scatter past the original sentinel). Surfaced by S7.6's
+  streaming bake tracker; pre-existing in `roxlap-formats`.
+
+### Public-API breakage
+
+- `roxlap_scene::Grid::generator` field type:
+  `Option<Box<dyn ChunkGenerator>>` → `Option<Arc<dyn ChunkGenerator>>`.
+  Required so S7.3's async dispatch can clone the generator into
+  background rayon tasks. Callers that constructed with
+  `Box::new(...)` should switch to `Arc::new(...)`.
+- `ChunkGenerator` gained `should_generate(&self, _idx: IVec3) ->
+  bool` (default `true`). Existing implementations keep current
+  semantics; opt in by overriding.
+
+### Known limits (still open)
+
+- **S4B.6.j cross-chunk look-down rendering** at non-camera XY
+  columns still hits the `chunk_world_z_base` mismatch on
+  column-step + handoff (rendered surface appears 256 voxels
+  below expected). The fix lives in a "virtual stitched-column"
+  rasterizer rewrite estimated at 2-4 weeks
+  (`memory/project_s4b_6_chz_multi_research.md`); deferred to
+  post-0.3.0. Mitigated in the streaming-hills demo by
+  `HillsChunkGenerator::should_generate` declining `chz != 0`
+  so the camera-above-grid path never materialises the
+  placeholder chunks that trigger the bug.
+- **`opticast_prelude::derive_prelude`'s `gylookup`** multiplies
+  `(chunks_z * 512) * PREC` and overflows `i32` at `chunks_z ≥
+  4`. Streaming demo uses `r_active = 256` to stay at `chunks_z =
+  3`. Proper fix (wrapping_mul or i64 indexing) deferred.
+- **Edits across eviction**: a user edit to a streamed chunk is
+  lost when the chunk is evicted + re-streamed. Persistent
+  dirty-flag handling is deferred to 0.3.x.
+- **CaveChunkGenerator boundary seams**: per-chunk independent
+  Worley seeds. Continuous-cave neighbour-aware pool deferred to
+  0.3.x.
+
+[0.3.0]: https://github.com/NCrashed/roxlap/releases/tag/v0.3.0
+
 ## [0.2.0] — 2026-05-27
 
 Scene-graph release: many independent chunked voxel grids, each with

@@ -16,9 +16,9 @@ name = "roxlap-cave-demo"
 path = "src/main.rs"
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core", version = "0.2" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.2" }
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.2" }
+roxlap-core = { path = "../roxlap-core", version = "0.3" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.3" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.3" }
 winit = "0.30"
 softbuffer = "0.4"
 

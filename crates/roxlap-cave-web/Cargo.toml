@@ -17,9 +17,9 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core", version = "0.2" }
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.2" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.2" }
+roxlap-core = { path = "../roxlap-core", version = "0.3" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.3" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.3" }
 
 # wasm-bindgen / web-sys versions pinned to the same major+minor as
 # `wasm-bindgen-cli` shipped by nixpkgs (see crates/roxlap-oracle/
