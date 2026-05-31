@@ -161,14 +161,33 @@ impl Vxl {
 
     /// Drop any built mip-1+ data, returning the Vxl to its
     /// post-`parse` single-mip shape. Cheap when already single-mip.
+    ///
+    /// **Stale-sentinel handling.** `column_offset[n_cols]` is set
+    /// at chunk creation to the initial seed-data length and is
+    /// **not** bumped when [`Vxl::voxalloc`] scatters columns into
+    /// the edit pool past it. On a second `generate_mips` call
+    /// against a post-edit chunk, trusting the stored sentinel
+    /// would slice `self.data` back to its pre-edit-pool footprint
+    /// and destroy every voxalloc'd column. Recover the real
+    /// end-of-mip-0 by walking columns + summing [`slng`] lengths
+    /// before slicing, and bump the sentinel to the recomputed
+    /// value so downstream reads see a consistent view.
     fn reset_to_single_mip(&mut self) {
         let n_cols = (self.vsid as usize) * (self.vsid as usize);
         if self.mip_base_offsets.len() <= 2 {
             return;
         }
-        let mip0_end_in_data = self.column_offset[n_cols] as usize;
+        let mip0_end_in_data: usize = (0..n_cols)
+            .map(|i| {
+                let start = self.column_offset[i] as usize;
+                start + slng(&self.data[start..])
+            })
+            .max()
+            .unwrap_or(0);
         self.data = self.data[..mip0_end_in_data].to_vec().into_boxed_slice();
-        self.column_offset = self.column_offset[..=n_cols].to_vec().into_boxed_slice();
+        let mut new_offsets = self.column_offset[..=n_cols].to_vec();
+        new_offsets[n_cols] = u32::try_from(mip0_end_in_data).expect("mip-0 end fits in u32");
+        self.column_offset = new_offsets.into_boxed_slice();
         self.mip_base_offsets = Box::new([0, n_cols + 1]);
     }
 
@@ -1223,6 +1242,66 @@ mod tests {
         assert_eq!(a.data, b.data);
         assert_eq!(a.column_offset, b.column_offset);
         assert_eq!(a.mip_base_offsets, b.mip_base_offsets);
+    }
+
+    #[test]
+    fn generate_mips_twice_survives_post_edit_voxalloc_scatter() {
+        // Regression for the `reset_to_single_mip` stale-sentinel bug
+        // surfaced 2026-05-29 by the scene-demo streaming bake tracker.
+        //
+        // Setup: a 2x2 chunk, reserve edit capacity (grows `data`),
+        // then `set_spans` to force `voxalloc` to scatter columns into
+        // the edit pool past the original `column_offset[n_cols]`
+        // sentinel. First `generate_mips` works (early-return in
+        // `reset_to_single_mip` because `mip_base_offsets.len() == 2`),
+        // but the second one used to slice `data[..stale_sentinel]`
+        // and panic when subsequent column reads went OOB.
+        //
+        // After the fix, `reset_to_single_mip` walks columns + `slng`
+        // to recompute the actual mip-0 end, so re-mip is sound.
+        let mut vxl = build_synthetic_2x2([0xaa, 0xbb, 0xcc, 0xdd]);
+        // Grow the data buffer with reserve_edit_capacity so
+        // voxalloc has room to scatter columns.
+        vxl.reserve_edit_capacity(64);
+        // Now carve + re-insert at column (0, 0) so voxalloc moves
+        // it into the edit pool past the original 32-byte mip-0
+        // footprint. Use the edit-module helpers via the formats
+        // crate.
+        crate::edit::set_spans(
+            &mut vxl,
+            &[crate::edit::Vspan {
+                x: 0,
+                y: 0,
+                z0: 5,
+                z1: 15,
+            }],
+            None,
+        );
+        crate::edit::set_spans(
+            &mut vxl,
+            &[crate::edit::Vspan {
+                x: 0,
+                y: 0,
+                z0: 5,
+                z1: 15,
+            }],
+            Some(0x80_42_42_42),
+        );
+
+        // First mip build — must succeed.
+        vxl.generate_mips(2);
+        assert_eq!(vxl.mip_count(), 2, "first generate_mips → 2 mips");
+        // Second build (the path the bug fired on). Must not panic
+        // and still produce 2 mips.
+        vxl.generate_mips(2);
+        assert_eq!(
+            vxl.mip_count(),
+            2,
+            "second generate_mips after post-edit scatter → still 2 mips"
+        );
+        // Third for good measure.
+        vxl.generate_mips(2);
+        assert_eq!(vxl.mip_count(), 2);
     }
 
     #[test]

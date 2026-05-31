@@ -528,43 +528,10 @@ impl StreamingBakeTracker {
             // Regenerate mips since alpha bytes (the brightness
             // byte) drive the mip lookup tables.
             let target = grid.chunks.get_mut(&target_idx).expect("populated");
-            remip_post_edit(target, 4);
+            target.generate_mips(4);
             baked_set.insert(target_idx);
         }
     }
-}
-
-/// `Vxl::generate_mips` wrapper that handles the stale-sentinel bug
-/// hit when re-mipping an already-edited chunk.
-///
-/// **Bug.** `Vxl::generate_mips` calls `reset_to_single_mip` first,
-/// which slices `self.data[..column_offset[n_cols]]` to drop any
-/// previously-built mip-N. That sentinel `column_offset[n_cols]`
-/// is set at chunk creation to the initial seed-data length
-/// (= `vsid² × 8 = 131072` for our chunks) and is **never bumped**
-/// when `voxalloc` scatters columns into the edit pool past it.
-/// On the second `generate_mips` call against a post-edit chunk,
-/// the slice destroys all real column data → subsequent column
-/// reads OOB-panic.
-///
-/// **Fix.** Recompute "end of mip-0 data" before each rebuild by
-/// walking columns + summing `slng` lengths, then patch the
-/// sentinel. After this, `reset_to_single_mip`'s truncation slices
-/// to a value that preserves all post-edit column data.
-fn remip_post_edit(vxl: &mut roxlap_formats::vxl::Vxl, max_mips: u32) {
-    let n_cols = (vxl.vsid as usize) * (vxl.vsid as usize);
-    let mut max_end: u32 = 0;
-    for i in 0..n_cols {
-        let start = vxl.column_offset[i] as usize;
-        let len_bytes = roxlap_formats::vxl::slng(&vxl.data[start..]);
-        max_end = max_end.max(u32::try_from(start + len_bytes).expect("end fits in u32"));
-    }
-    if vxl.column_offset[n_cols] != max_end {
-        let mut new_offsets = vxl.column_offset.to_vec();
-        new_offsets[n_cols] = max_end;
-        vxl.column_offset = new_offsets.into_boxed_slice();
-    }
-    vxl.generate_mips(max_mips);
 }
 
 impl Default for StreamingBakeTracker {
@@ -632,32 +599,25 @@ mod tests_s7_6 {
     use crate::terrain::HillsChunkGenerator;
     use roxlap_scene::ChunkGenerator;
 
-    /// Regression test for the `reset_to_single_mip` stale-sentinel
-    /// bug (panic at vxl.rs:599 with index = 131073, len = 131072
-    /// on the second `generate_mips`). Simulates the chunk lifecycle
-    /// the `StreamingBakeTracker` exercises:
-    ///
-    /// 1. Generate one hills chunk (post-edit, no mips).
-    /// 2. First mip build (works — `reset_to_single_mip` early-
-    ///    returns because there's nothing past mip-0 yet).
-    /// 3. Second mip build (would panic without `remip_post_edit`
-    ///    because the stale sentinel would truncate the data
-    ///    buffer back to its pre-edit-pool footprint).
-    ///
-    /// The test passes iff no panic + the chunk has 4 mip levels
-    /// after both rebuilds.
+    /// Regression test against the `reset_to_single_mip` stale-
+    /// sentinel bug (panic at vxl.rs:599 with `index = 131073`,
+    /// `len = 131072` on the second `generate_mips`). Originally
+    /// covered by a `remip_post_edit` workaround in scene-demo;
+    /// the proper fix shipped in `roxlap-formats` so the test now
+    /// calls `Vxl::generate_mips` directly. Still kept here because
+    /// the demo is the bug's biggest in-the-wild trigger — a
+    /// future regression in formats would surface as a panic on
+    /// demo launch, and this test catches it at build time.
     #[test]
-    fn remip_post_edit_handles_second_generate_mips_call() {
+    fn streaming_chunk_survives_second_generate_mips() {
         let mut vxl = HillsChunkGenerator.generate(IVec3::ZERO);
-        // First mip build — must succeed.
-        remip_post_edit(&mut vxl, 4);
+        vxl.generate_mips(4);
         assert_eq!(vxl.mip_count(), 4, "first mip build produced 4 mips");
-        // Second mip build (the path the bug fired on). Must not
-        // panic + must still produce 4 mips.
-        remip_post_edit(&mut vxl, 4);
+        // Second mip build — the path the bug fired on.
+        vxl.generate_mips(4);
         assert_eq!(vxl.mip_count(), 4, "second mip build still produces 4 mips");
-        // Third for good measure — confirms no incremental damage.
-        remip_post_edit(&mut vxl, 4);
+        // Third for good measure.
+        vxl.generate_mips(4);
         assert_eq!(vxl.mip_count(), 4, "third mip build OK");
     }
 
