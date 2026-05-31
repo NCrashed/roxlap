@@ -2346,11 +2346,14 @@ mod tests {
     /// chz=0). State.current_chunk_z gets pinned to 1 at seed time
     /// and the chunk-XY swap reads chz=1 chunks across the DDA, so
     /// the chz=0 mountain is invisible. This test pins the limitation
-    /// — it currently asserts mountain_count == 0 to fail loudly
-    /// (= the limitation has been fixed) once cf-splitting at chz
-    /// boundaries lands.
+    /// — it currently asserts mountain_count > 50 to fail loudly
+    /// against current master (= the limitation has been fixed) once
+    /// the virtual-column rewrite lands in VC.5.
+    ///
+    /// VC.0 pin (2026-05-31): re-enabled (was `#[ignore]`'d) per
+    /// the VC scope brief. Expected to FAIL across VC.0..VC.4 with
+    /// `mountain_count == 0`; VC.5 turns it green.
     #[test]
-    #[ignore = "S4B.6.l: known limitation — needs cf-splitting at chz boundaries"]
     fn stacked_chz0_distant_mountain_visible_from_chz0_camera() {
         let mut scene = Scene::new();
         let id = scene.add_grid(GridTransform::at(DVec3::ZERO));

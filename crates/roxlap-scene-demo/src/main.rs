@@ -6,6 +6,8 @@ mod collision;
 mod markers;
 #[cfg(test)]
 mod repro;
+#[cfg(test)]
+mod repro_vc;
 mod scene;
 mod ship;
 mod terrain;
