@@ -44,6 +44,7 @@ use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
 
 use crate::billboard::{self, BillboardCache, DEFAULT_RESOLUTION as BILLBOARD_RESOLUTION};
+use crate::chunks;
 use crate::lod::Lod;
 use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
 
@@ -112,6 +113,38 @@ pub enum RenderOutcome {
 /// only correct for single-grid scenes.
 ///
 /// Use this when you have one grid and want the byte-stable
+/// PR.3: pick the cheapest `GridView` constructor that matches the
+/// grid's chunk layout.
+///
+/// Trivial-single-chunk grids (1 chunk at index `(0, 0, 0)`) bypass
+/// the multi-chunk rasterizer path: `GridView::from_single_vxl`
+/// leaves `chunk_grid = None`, so `phase_after_delete_kept_presync`
+/// takes the cheaper single-chunk branch instead of doing
+/// `chunk_at_xyz` + IVec2-equality + `Option::is_some` per
+/// column-step. Markers / pickups / small ships qualify.
+///
+/// Multi-chunk grids (ground, larger ships) fall through to
+/// `from_chunk_grid` with the supplied `ChunkGrid`.
+fn single_chunk_fast_path<'a>(
+    backing: &'a chunks::ChunkXyBacking<'a>,
+    cg: &'a roxlap_core::ChunkGrid<'a>,
+) -> roxlap_core::GridView<'a> {
+    if backing.chunks_x == 1
+        && backing.chunks_y == 1
+        && backing.chunks_z == 1
+        && backing.origin_chunk_xy == [0, 0]
+        && backing.origin_chunk_z == 0
+    {
+        // chunk_xyz_backing populates each `Vec<Option<GridView>>`
+        // slot via `GridView::from_single_vxl`, which leaves
+        // `chunk_grid = None`. Reuse that directly.
+        if let Some(single) = backing.chunks[0] {
+            return single;
+        }
+    }
+    roxlap_core::GridView::from_chunk_grid(cg, CHUNK_SIZE_XY)
+}
+
 /// matches-direct-opticast property — the test suite uses it as a
 /// sanity check that the combined-world stitch + render harness
 /// doesn't drift vs. a raw [`opticast`] call.
@@ -162,7 +195,7 @@ pub fn render_scene(
             chunks_y: backing.chunks_y,
             chunks_z: backing.chunks_z,
         };
-        let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
+        let grid_view = single_chunk_fast_path(&backing, &cg);
         let outcome = {
             let mut rasterizer = ScalarRasterizer::new(fb, zb, pitch_pixels, grid_view);
             if let Some(sky_ref) = sky {
@@ -408,7 +441,7 @@ pub fn render_scene_composed(
             chunks_y: backing.chunks_y,
             chunks_z: backing.chunks_z,
         };
-        let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
+        let grid_view = single_chunk_fast_path(&backing, &cg);
 
         // Build the per-grid settings by layering three opt-in
         // overrides on top of the caller's `settings`:
