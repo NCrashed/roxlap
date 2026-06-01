@@ -175,13 +175,22 @@ pub fn derive_prelude(
     // `chunks_z * 512 >> j` to cover world-z up to
     // `chunks_z * 256`. Non-stacked callers pass `chunks_z = 1` and
     // get byte-identical sizing.
+    //
+    // `(i as i32) * PREC` overflows i32 at `i = 2048` (PREC = 2^20
+    // → product = 2^31), reachable once chunks_z >= 4. Voxlap C
+    // wraps de-facto; Rust's `*` panics in debug. Use `wrapping_mul`
+    // + `wrapping_sub` to match C and the adjacent `x_mip` /
+    // `max_scan_dist_clamped` lines below. The consumer masks the
+    // result through `& 0xFFFF`, which flushes any high-bit
+    // divergence between true-math and wrap-math.
     let mut y_lookup = Vec::new();
     for j in 0..mip_levels {
         let count = ((chunks_z * 512) >> j) + 4;
         let pz_shifted = pos_z >> j;
         let shift = 16i32 - j as i32;
         for i in 0..count {
-            let val = ((pz_shifted - (i as i32) * PREC) >> shift) & 0xFFFF;
+            let sub = pz_shifted.wrapping_sub((i as i32).wrapping_mul(PREC));
+            let val = (sub >> shift) & 0xFFFF;
             y_lookup.push(val);
         }
     }
@@ -476,6 +485,35 @@ mod tests {
         // -5.div_euclid(128) = -1; -5.rem_euclid(128) = 123 (positive).
         assert_eq!(p.camera_chunk_idx, [-1, 0, 0]);
         assert_eq!(p.camera_local_xyz, [123, 100, 50]);
+    }
+
+    /// Deep-stack `chunks_z` values size the j=0 mip table at
+    /// `chunks_z * 512 + 4` entries. At `chunks_z >= 4` the inner
+    /// `i * PREC` multiplication hits `i = 2048` and produces
+    /// `2^31` — must use wrapping arithmetic to avoid debug-mode
+    /// panics and match voxlap C's de-facto wrap. Spot-checks
+    /// against an i64-true-math reference: the `& 0xFFFF` mask in
+    /// the production path flushes any high-bit divergence between
+    /// wrap-math and true-math, so the masked outputs must agree.
+    #[test]
+    fn y_lookup_deep_chunks_z_no_overflow_panic() {
+        let s = oracle_north_state();
+        let chunks_z: u32 = 8;
+        let p = derive_prelude(&s, 2048, 1, 4, 1024, chunks_z);
+        // Single mip → (chunks_z * 512 >> 0) + 4 = 4100 entries.
+        let want_len = (chunks_z as usize * 512) + 4;
+        assert_eq!(p.y_lookup.len(), want_len);
+
+        // Spot-check entries straddling the overflow threshold
+        // against i64-true-math. The shift is 16 for j=0, so the
+        // window `[16, 32)` of the subtraction lands in the low
+        // 16 bits — wrapping-i32 and true-i64 must produce the
+        // same final value after the `& 0xFFFF` mask.
+        let pz_shifted = p.pos_z as i64; // j=0
+        for &i in &[0_usize, 127, 128, 2047, 2048, 2049, 4099] {
+            let want = (((pz_shifted - (i as i64) * PREC as i64) >> 16) & 0xFFFF) as i32;
+            assert_eq!(p.y_lookup[i], want, "y_lookup[{i}] (chunks_z={chunks_z})");
+        }
     }
 
     #[test]

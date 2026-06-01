@@ -2846,12 +2846,8 @@ mod tests {
         let g = scene.grid_mut(id).unwrap();
         g.set_generator(Some(Arc::new(FloorGenerator)));
         // r_active must be set so the later pump_streaming_sync
-        // sanity-check actually streams more chunks in. Kept at
-        // 300 so the resulting chunks_z stack is ≤ 3 — opticast's
-        // `gylookup` table multiplies `chunks_z * 512 * PREC` and
-        // overflows i32 at chunks_z ≥ 4 (pre-existing limit, not
-        // S7.4 scope to fix).
-        g.stream_radius = crate::StreamRadius::new(300.0, 600.0);
+        // sanity-check actually streams more chunks in.
+        g.stream_radius = crate::StreamRadius::new(400.0, 800.0);
 
         // Materialise ONLY chunk (0, 0, 0) manually via the
         // sync helper — leave (0, 1, 0), (0, 2, 0) absent.
