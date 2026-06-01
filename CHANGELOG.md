@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### `roxlap-core` — VC.6 (mip-N multi-chz column-step)
+
+- **Mip-N multi-chz column-step install** (VC.6.0..VC.6.2).
+  Closes the mip-N gap left open by 0.4.0's VC.5 (mip-0 multi-
+  chz). `build_owned_column_multi_chz` and `emit_chunk_chain`
+  both grew a `mip_level: u32` parameter. The mip-N column-step
+  branch at `grouscan.rs::phase_after_delete_kept_presync` now
+  calls the multi-chz builder with `mip_level = state.gmipcnt`,
+  so distant-XY rays at mip-N stitch chz layers the same way
+  mip-0 already did. Intermediate bedrock placeholders are
+  stripped at the scaled sentinel `0xff >> mip_level`.
+
+  Visible improvement (synthetic 4×4×3 grid, chz=0 camera looking
+  down at a chz=2 floor, `mip_levels=4 + mip_scan_dist=64`):
+
+  | Metric         | Pre-VC.6.2 | Post-VC.6.2 | Δ     |
+  |----------------|-----------|-------------|-------|
+  | bottom_half red pixels | 19 087 | 104 511 | 5.5× |
+
+  Render shape: small camera-chunk-only red blob → full
+  trapezoidal floor at perspective. New regression pin:
+  `roxlap_scene_demo::vc6_repro::vc6_2_mip_n_multi_chz_*` at
+  hash `0x577e_6879_b86e_f758`.
+
+  User's `z=-19.44` hills demo byte-stable at VC.5 baseline
+  (`0x15e3_21a1_012a_6109`) — the steep pitch terminates rays
+  inside the camera's own chunk-XY footprint, so the mip-N
+  column-step branch never fires at distant XY for that pose.
+  New scenes with shallower-pitch cameras over stacked content
+  benefit.
+
+### Removed
+
+- **`try_handoff_chunk_z_down`** removed (VC.6.3). The
+  rasterizer's mid-render chunk-Z handoff was the
+  pre-VC.5 mechanism for stacked-grid rendering; VC.5's mip-0 +
+  VC.6.2's mip-N multi-chz install supersede it (every chz is
+  pre-stitched into one virtual column at install time, with
+  intermediate bedrocks stripped). Audit confirmed the helper
+  was dead in all three reachable configurations (mip-0 multi-
+  chunk, single-chunk, mip-N gated out). `phase_draw_flor`'s
+  bedrock-as-air bypass now falls through to `Phase::AfterDelete`
+  unconditionally when the sentinel is hit. Byte-stable: every
+  existing render hash unchanged (VC.5 baseline + VC.6.2 fix
+  hash both verified post-removal).
+
+### Known limits
+
+- **`phase_remiporend` single-chz reload** at mip transition
+  mid-render. The VC.6.0 fixture pose doesn't expose this
+  because the chz=2 floor is hit after rays have already
+  crossed chunk-XY (column-step's multi-chz path took over).
+  Other topologies — content at `chz != seed_chz` visible at
+  the camera's own chunk-XY past a mip transition — could
+  surface it. Deferred until a real scene demonstrates the
+  gap.
+- **Edge tearing at deep mip-N** at the back of the VC.6.0
+  fixture render. Same area-of-code as the open
+  `axis-aligned-mip-beams` artifact (cf-narrowing at remiporend).
+- `opticast` `gylookup` overflow at `chunks_z ≥ 4` per grid —
+  unchanged from 0.4.0.
+
 ## [0.4.0] — 2026-06-01
 
 Virtual-Column-rewrite + perf-recovery release. Closes the S4B.6.j

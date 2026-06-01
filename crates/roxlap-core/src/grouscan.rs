@@ -1366,31 +1366,18 @@ fn phase_draw_flor(state: &mut GrouscanState<'_>) -> Phase {
         && state.vptr_offset + 1 < state.column.len()
         && state.column[state.vptr_offset + 1] == bedrock_z_at_mip
     {
-        // S4B.6.h: mid-render chunk-Z handoff. Before falling
-        // through to AfterDelete (= sky), try to swap state to the
-        // chunk at `current_chunk_z + 1` at the same XY — if it
-        // exists, the new chunk's column might have a real floor
-        // we can draw. After a successful handoff route through
-        // `Phase::Skipixy3` so the rasterizer re-walks the new
-        // column's slab list from vptr=0: this lets drawcwall set
-        // `state.z1` from the new slab's z-byte BEFORE drawflor's
-        // gylookup projection runs (re-entering drawflor directly
-        // leaves `state.z1` stuck at the previous column's slab z
-        // → hill / lower-mountain pixels project to the wrong
-        // screen-y on a non-vertical view).
+        // Walker hit the bedrock placeholder. Pre-VC.6.3 this
+        // tried `try_handoff_chunk_z_down` at mip-0 to swap into
+        // the chunk at `chz + 1`; VC.5's multi-chz install +
+        // VC.6.2's mip-N multi-chz install now stitch every chz
+        // into one virtual column at install time, with
+        // intermediate bedrocks stripped. The bedrock sentinel
+        // here can only be the *world's* bottom (chz=max_chz's
+        // placeholder), which has no chunk below to hand off to
+        // anyway. Fall through to AfterDelete = sky.
         //
-        // `try_handoff_chunk_z_down` bumps `current_chunk_z` by 1
-        // per call and bails when chz exceeds the grid's z extent,
-        // so back-to-back handoffs walking all-air-bedrock chunks
-        // terminate after at most `chunks_z` iterations.
-        //
-        // Mip-0 only — `try_handoff_chunk_z_down`'s column-index
-        // recompute uses the mip-0 stride; multi-mip handoff is
-        // unaudited. Gate explicitly so multi-mip paths fall
-        // through to the historical sky behaviour.
-        if state.gmipcnt == 0 && try_handoff_chunk_z_down(state) {
-            return Phase::Skipixy3;
-        }
+        // See `memory/project_vc_6_3_landed.md` for the dead-code
+        // audit + removal rationale.
         return Phase::AfterDelete;
     }
     // gy_raw = gylookoff[z1].
@@ -2791,93 +2778,6 @@ fn slab_z_at(state: &GrouscanState<'_>, vptr_offset: usize, byte: usize) -> i32 
             .unwrap_or(state.chunk_world_z_base)
     };
     raw + (base >> (state.gmipcnt as u32))
-}
-
-/// S4B.6.c: try to swap the slab walker into the chunk at
-/// `current_chunk_z + 1` (= one chunk DOWN in voxlap's z-down
-/// convention) at the same XY. Returns `true` on success — caller
-/// re-enters drawflor / drawcwall / etc. so the chain continues
-/// with the new chunk's slab data + world-z base. Returns `false`
-/// when no such chunk exists, leaving state unchanged.
-///
-/// Used by [`phase_draw_flor`]'s bedrock-as-air bypass to extend
-/// across stacked chunks (e.g. camera at chz=0 above an empty
-/// chunk sees terrain in chz=1's chunk).
-///
-/// Mip-0 only — multi-mip + chunk-Z handoff is unaudited; the
-/// caller gates on `state.gmipcnt == 0`.
-fn try_handoff_chunk_z_down(state: &mut GrouscanState<'_>) -> bool {
-    // Only meaningful for multi-chunk grids. Single-chunk grids
-    // (`chunk_grid: None`) carry one un-stacked chunk — the
-    // `chunk_at_xyz` single-chunk shortcut returns Some(self) for
-    // any z, which would cause infinite handoff into the same
-    // chunk. Skip when there's no real chunk-grid backend.
-    let cg = match state.grid_view.chunk_grid {
-        Some(cg) => cg,
-        None => return false,
-    };
-    let next_chz = state.current_chunk_z + 1;
-    // Bail before querying when next_chz is past the grid's z
-    // extent — same effect as `chunk_at_xyz` returning None but
-    // skips a lookup.
-    #[allow(clippy::cast_possible_wrap)]
-    if next_chz >= cg.origin_chunk_z + cg.chunks_z as i32 {
-        return false;
-    }
-    let new_chunk_xyz = [
-        state.current_chunk_idx_xy[0],
-        state.current_chunk_idx_xy[1],
-        next_chz,
-    ];
-    let new_chunk = match state.grid_view.chunk_at_xyz(new_chunk_xyz) {
-        Some(c) => c,
-        None => return false,
-    };
-    state.slab_buf = new_chunk.slab_buf;
-    state.column_offsets = new_chunk.column_offsets;
-    state.mip_base_offsets = new_chunk.mip_base_offsets;
-    state.vsid = new_chunk.vsid;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        state.vsid_signed = new_chunk.vsid as i32;
-    }
-    state.current_chunk_exists = true;
-    state.current_chunk_z = next_chz;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        state.chunk_world_z_base += state.chunk_size_z as i32;
-    }
-    // Recompute column index in the new chunk. Mip-0 path:
-    // `cy_local * chunk_size_xy + cx_local`. `cx` / `cy` are
-    // signed world coords; `& mask` yields chunk-local for
-    // power-of-two `chunk_size_xy`.
-    let local_cx = state.cx & state.chunk_size_xy_mask;
-    let local_cy = state.cy & state.chunk_size_xy_mask;
-    #[allow(clippy::cast_sign_loss)]
-    let correct_idx = (local_cy as u32)
-        .wrapping_mul(state.chunk_size_xy)
-        .wrapping_add(local_cx as u32) as usize;
-    state.ixy_sptr_col_idx = correct_idx;
-    if let Some(&col_off) = state.column_offsets.get(correct_idx) {
-        let off = col_off as usize;
-        if off <= state.slab_buf.len() {
-            install_owned_column(
-                &mut state.column,
-                &mut state.column_z_base,
-                state.slab_buf,
-                off,
-                state.chunk_world_z_base,
-            );
-        } else {
-            state.column.clear();
-            state.column_z_base.clear();
-        }
-    } else {
-        state.column.clear();
-        state.column_z_base.clear();
-    }
-    state.vptr_offset = 0;
-    true
 }
 
 /// `remiporend` — voxlap5.c:11998-12118. Mip-level transition.
