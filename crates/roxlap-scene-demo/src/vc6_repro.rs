@@ -1,17 +1,13 @@
-//! VC.6.0 — Pre-flight repro for the mip-N multi-chz column-step
-//! bug.
+//! VC.6 — mip-N multi-chz column-step regression pin.
 //!
 //! VC.5 (`memory/project_vc_5_landed.md`) fixed the mip-0
 //! multi-chunk column-step at `grouscan.rs::phase_after_delete_kept_presync`
 //! by routing the install through `build_owned_column_multi_chz`.
-//! The corresponding **mip-N** column-step branch
-//! (`grouscan.rs:1673..1751`) still uses single-chz
-//! `install_owned_column` — same shape as pre-VC.5 mip-0. The
-//! brief (`memory/project_vc_6_scope.md`) calls VC.6.0 the
-//! critical-path investigation: build a multi-chz grid with real
-//! content at every chz, find a pose that exposes the gap, and
-//! land a regression test. If no reachable pose fires the bug,
-//! VC.6 closes as dead-code and no engine fix ships.
+//! VC.6.2 (`memory/project_vc_6_2_landed.md`) lands the matching
+//! fix on the **mip-N** column-step branch (`grouscan.rs:1673..1751`):
+//! the helper grew a `mip_level: u32` parameter (VC.6.1) and the
+//! mip-N column-step now calls it with `state.gmipcnt` so distant-XY
+//! rays at mip-N stitch chz layers the same way mip-0 already does.
 //!
 //! ## Fixture
 //!
@@ -33,28 +29,23 @@
 //!
 //! Render settings: `mip_levels = 4`, `mip_scan_dist = 64`,
 //! `max_scan_dist = 1024`. The mip-N column-step branch fires
-//! past the first transition; rays that have crossed at least
-//! one chunk-XY boundary at mip ≥ 1 read the new chunk's mip-N
-//! sub-table via `install_owned_column`.
+//! past the first chunk-XY crossing.
 //!
-//! ## Expected pre-fix behaviour
+//! ## Pre-VC.6.2 behaviour (= the bug)
 //!
-//! With the bug active, the mip-N column-step at distant XY
-//! reads `chunk_at_xyz([new_xy, current_chunk_z = seed_chz = 0])`
-//! → chz=0's mip-N sub-table → placeholder bedrock → distant rays
-//! draw sky. Red floor visible only inside the camera's own
-//! chunk-XY footprint (where the seed install's multi-chz stitch
-//! covers all chz) and at near range before mip transitions fire.
-//! Far-bucket red pixel count is **low** relative to the near
-//! bucket.
+//! `install_owned_column` reads `chunk_at_xyz([new_xy,
+//! current_chunk_z = seed_chz = 0])` → chz=0's mip-N sub-table
+//! → placeholder bedrock → distant rays draw sky. Red floor
+//! visible only inside the camera's own chunk-XY footprint
+//! (~19k pixels at this pose) where the seed install's multi-
+//! chz stitch covers all chz.
 //!
-//! ## Post-fix behaviour (VC.6.2 target)
+//! ## Post-VC.6.2 behaviour (= fix in place)
 //!
-//! Routing the mip-N column-step through a multi-chz builder
-//! (analogous to `build_owned_column_multi_chz` but stepping
-//! `mip_base_offsets[gmipcnt]` per chunk) lets distant rays at
-//! distant XY see chz=2's mip-N floor. Far-bucket red count grows
-//! substantially.
+//! `build_owned_column_multi_chz(.., mip_level = state.gmipcnt)`
+//! stitches every chz at the chunk's mip-N sub-table per
+//! column-step. The bottom half of the framebuffer fills with
+//! red (~104k pixels) — chz=2's floor visible at distant XY.
 
 #![cfg(test)]
 #![allow(clippy::cast_precision_loss)]
@@ -221,23 +212,19 @@ fn count_red_buckets(fb: &[u32]) -> (usize, usize, usize) {
     (total, top_half, bottom_half)
 }
 
-/// VC.6.0 primary deliverable. Verifies the mip-N multi-chz bug
-/// fires reproducibly at a chosen pose by asserting that distant
-/// red-floor pixels are RARE relative to near red-floor pixels
-/// today.
+/// VC.6.2 primary regression pin. The mip-N column-step now
+/// routes through `build_owned_column_multi_chz` with `mip_level =
+/// state.gmipcnt`, so distant-XY rays at mip-N read the stitched
+/// chz=0..max_chz column at the chunk's mip-N sub-table. The
+/// bottom half of the framebuffer fills with red (~104k pixels) —
+/// a 5.5× jump from the bug-active baseline of ~19k.
 ///
-/// Today (HEAD post-GY-overflow, 2026-06-01): the mip-N
-/// column-step at distant XY reads chz=0's placeholder bedrock
-/// → far-bucket red count is low. This assertion passes.
-///
-/// VC.6.2 lands the multi-chz mip-N install. Far-bucket red
-/// count grows → this assertion fails. At that point flip the
-/// direction (e.g. `far_red > 5_000`) to assert the FIX is in
-/// place. The flip lives alongside the same code change that
-/// land VC.6.2 — mirrors the [[vc-5-landed]] `vc5_bug_fires`
-/// pattern.
+/// Direction flipped at VC.6.2 land. Pre-VC.6.2 form asserted
+/// `bottom_red < 30_000` (= bug active); the inverse was an
+/// `#[ignore]`'d companion. They merged into this single test
+/// once the fix landed. Mirrors [[vc-5-landed]]'s pattern.
 #[test]
-fn vc6_0_mip_n_multi_chz_bug_fires_at_chz0_camera_looking_down_at_chz2_floor() {
+fn vc6_2_mip_n_multi_chz_distant_chz2_floor_visible_at_chz0_camera() {
     let mut scene = build_3chz_grid_with_floor_at_chz2();
 
     let cam = camera_for_yaw_pitch(
@@ -249,95 +236,41 @@ fn vc6_0_mip_n_multi_chz_bug_fires_at_chz0_camera_looking_down_at_chz2_floor() {
 
     let (total_red, top_red, bottom_red) = count_red_buckets(&fb);
     let hash = fnv1a64_fb(&fb);
-    write_ppm("/tmp/vc6_0_mip_n_multi_chz_repro.ppm", &fb);
-    eprintln!(
-        "vc6.0 mip-N multi-chz repro: total_red={total_red} top_half={top_red} \
-         bottom_half={bottom_red} hash={hash:#018x} (PPM at \
-         /tmp/vc6_0_mip_n_multi_chz_repro.ppm)"
-    );
-
-    // Sanity: the camera-XY column has chz=2 stitched via the
-    // multi-chz seed install (see `from_seed` at
-    // `crates/roxlap-core/src/grouscan.rs:510`). Some red is
-    // expected; if `total_red == 0` either the fixture didn't
-    // build the floor or the rasterizer regressed on the seed
-    // install.
-    assert!(
-        total_red > 5_000,
-        "VC.6.0 sanity: expected total_red > 5000 (camera-XY column should \
-         stitch chz=2 floor via multi-chz seed install in the camera's chunk); \
-         got total_red={total_red}. Either the fixture broke or the multi-chz \
-         seed install regressed."
-    );
-
-    // PRIMARY ASSERTION — current HEAD (= bug active). Bottom-half
-    // red count is BOUNDED by the small camera-chunk footprint
-    // (~19 k pixels at this pose). If the mip-N multi-chz fix
-    // landed, distant rays would see chz=2's floor across the
-    // full bottom half (~240 k pixels) — the count would jump 5-
-    // 10×. VC.6.2 will flip this assertion's direction.
-    assert!(
-        bottom_red < 30_000,
-        "VC.6.0: expected the mip-N multi-chz bug to fire (bottom_red < 30000, \
-         i.e. distant XY rays draw sky instead of chz=2 floor). Got \
-         bottom_red={bottom_red}, total_red={total_red}. If bottom_red is much \
-         larger, the bug may NOT fire at this pose: (a) the multi-chz mip-N \
-         path may already do the right thing in this topology, or (b) the \
-         camera/scene needs adjusting. Per the VC.6.0 brief, if no reachable \
-         pose triggers the bug, close VC.6 as dead-code."
-    );
-
-    // HASH PIN — diagnostic, not load-bearing. Re-anchor as VC.6.2
-    // flips the bug. A mid-stage refactor that changes this hash
-    // without obvious cause warrants investigation.
-    assert_eq!(
-        hash, VC6_0_BUG_ACTIVE_HASH,
-        "VC.6.0 hash drift — bug-active render changed. If intentional (refactor \
-         that preserves the bug behaviour), update the pin; if unintentional, \
-         audit the mip-N column-step path."
-    );
-}
-
-/// Pinned at VC.6.0 (2026-06-01). Render under the mip-N multi-chz
-/// bug = chz=2 floor visible only inside the camera chunk's XY
-/// footprint. VC.6.2 deliberately busts this when the fix lands.
-const VC6_0_BUG_ACTIVE_HASH: u64 = 0x74b1_9785_9c26_911c;
-
-/// VC.6.2 target — un-ignore when the multi-chz mip-N install
-/// lands. Asserts the FIX is in place: distant-XY rays see chz=2's
-/// floor across the bottom half of the screen, so `bottom_red`
-/// jumps from ~19 k to ~100 k+ (the entire visible-ground area
-/// fills with red). Same fixture + pose as
-/// [`vc6_0_mip_n_multi_chz_bug_fires_at_chz0_camera_looking_down_at_chz2_floor`].
-///
-/// Mirrors [[vc-5-landed]]'s pattern: VC.0 introduced
-/// `stacked_chz0_distant_mountain_visible_from_chz0_camera` as
-/// `#[ignore]`, VC.5 un-ignored it once the fix flipped its
-/// outcome.
-#[test]
-#[ignore = "VC.6.2 fix target — un-ignore when the multi-chz mip-N install \
-            lands and bottom_red grows past the camera-chunk-only blob"]
-fn vc6_2_fix_landed_distant_chz2_floor_visible_under_mip_n() {
-    let mut scene = build_3chz_grid_with_floor_at_chz2();
-    let cam = camera_for_yaw_pitch(
-        [0.0, 0.0, 50.0],
-        std::f64::consts::FRAC_PI_2,
-        std::f64::consts::FRAC_PI_3,
-    );
-    let (fb, _zb) = render_repro(&mut scene, &cam);
-    let (total_red, top_red, bottom_red) = count_red_buckets(&fb);
-    let hash = fnv1a64_fb(&fb);
+    write_ppm("/tmp/vc6_2_mip_n_multi_chz_fix.ppm", &fb);
     eprintln!(
         "vc6.2 mip-N multi-chz FIX: total_red={total_red} top_half={top_red} \
-         bottom_half={bottom_red} hash={hash:#018x}"
+         bottom_half={bottom_red} hash={hash:#018x} (PPM at \
+         /tmp/vc6_2_mip_n_multi_chz_fix.ppm)"
     );
-    // With the fix in place, distant-XY rays read chz=2's floor
-    // through the multi-chz install. Bottom half is mostly red.
+
+    // FIX assertion — distant-XY rays at mip-N now read the
+    // multi-chz column. `bottom_red` jumped from ~19k (bug
+    // active) to ~104k (fix landed). A regression that re-
+    // introduces single-chz mip-N install would shrink this
+    // count back below the ~30k threshold.
     assert!(
         bottom_red > 100_000,
         "VC.6.2: expected bottom_red > 100000 with the multi-chz mip-N fix \
-         in place; got bottom_red={bottom_red} (still close to the bug-active \
-         baseline of ~19000). The fix at `grouscan.rs:1729-1751` may not be \
-         routing through the multi-chz path."
+         in place; got bottom_red={bottom_red}, total_red={total_red}. If \
+         bottom_red ≲ 19000 the mip-N column-step has regressed to single-chz \
+         install. Audit `grouscan.rs:1729-1751`."
+    );
+
+    // HASH PIN — locks the post-fix render. Future engine
+    // changes that touch the mip-N column-step or
+    // `build_owned_column_multi_chz` must update this pin
+    // deliberately.
+    assert_eq!(
+        hash, VC6_2_FIX_LANDED_HASH,
+        "VC.6.2 hash drift — fix-landed render changed. If intentional \
+         (e.g. a follow-up mip-N path refinement), update the pin; if \
+         unintentional, audit the mip-N column-step or multi-chz install."
     );
 }
+
+/// Pinned at VC.6.2 (2026-06-01). Post-fix render of the 4×4×3
+/// chunk fixture at the chz=0-camera-looking-down pose.
+/// Previously `0x74b1_9785_9c26_911c` (bug-active = camera-chunk-
+/// only blob); VC.6.2's multi-chz mip-N install reveals the full
+/// chz=2 floor at distant XY → new hash.
+const VC6_2_FIX_LANDED_HASH: u64 = 0x577e_6879_b86e_f758;

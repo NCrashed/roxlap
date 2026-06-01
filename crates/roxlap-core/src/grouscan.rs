@@ -507,6 +507,11 @@ impl<'a> GrouscanState<'a> {
             let chunk_local_xy = [cx & chunk_size_xy_mask, cy & chunk_size_xy_mask];
             #[allow(clippy::cast_possible_wrap)]
             let chunk_size_z_signed = inputs.chunk_size_z as i32;
+            // VC.6.2: seed install is mip-0 (the rasterizer enters
+            // the scan at mip-0; `phase_remiporend` rebases into
+            // mip-N later via [`install_owned_column`] or — once
+            // the column-step swaps to multi-chz at mip-N below —
+            // through this same builder with `mip_level = gmipcnt`).
             build_owned_column_multi_chz(
                 &mut column_owned,
                 &mut column_z_base_owned,
@@ -516,6 +521,7 @@ impl<'a> GrouscanState<'a> {
                 starting_chz,
                 max_chz,
                 chunk_size_z_signed,
+                0,
             );
         } else {
             let seed_chain_len = slab_chain_byte_len(inputs.column);
@@ -1726,29 +1732,35 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 + ((local_cy_mip as u32) * (chunk_size_at_mip as u32) + (local_cx_mip as u32))
                     as usize;
             state.ixy_sptr_col_idx = correct_idx;
-            if state.current_chunk_exists {
-                if let Some(&col_off) = state.column_offsets.get(correct_idx) {
-                    let off = col_off as usize;
-                    if off <= state.slab_buf.len() {
-                        install_owned_column(
-                            &mut state.column,
-                            &mut state.column_z_base,
-                            state.slab_buf,
-                            off,
-                            state.chunk_world_z_base,
-                        );
-                    } else {
-                        state.column.clear();
-                        state.column_z_base.clear();
-                    }
-                } else {
-                    state.column.clear();
-                    state.column_z_base.clear();
-                }
-            } else {
-                state.column.clear();
-                state.column_z_base.clear();
-            }
+            // VC.6.2: mip-N multi-chz column-step install. Mirrors
+            // VC.5's mip-0 multi-chz install at the matching column-
+            // step branch below. Distant XY rays now read the
+            // stitched chz=0..max_chz column at the chunk's mip-N
+            // sub-table — content at chz != seed_chz becomes visible
+            // at distance, fixing the `vc6_repro` regression pin.
+            //
+            // Same dispatch shape as the mip-0 branch: chunk_at_xyz
+            // lookup above pinned `state.slab_buf` / `column_offsets`
+            // / `mip_base_offsets` to the new chunk-XY at seed_chz,
+            // which keeps downstream consumers (other phases,
+            // phase_remiporend's reload) consistent with the
+            // pre-VC.6.2 single-chz convention. The actual multi-
+            // chz install writes into `state.column` directly via
+            // the builder.
+            #[allow(clippy::cast_possible_wrap)]
+            let chunk_size_z_signed = state.chunk_size_z as i32;
+            let chunk_local_xy_mip = [local_cx_mip, local_cy_mip];
+            build_owned_column_multi_chz(
+                &mut state.column,
+                &mut state.column_z_base,
+                state.grid_view,
+                new_chunk_xy,
+                chunk_local_xy_mip,
+                state.starting_chz,
+                state.max_chz,
+                chunk_size_z_signed,
+                state.gmipcnt as u32,
+            );
         } else {
             // VC.5: mip-0 multi-chunk column-step routes through the
             // multi-chz builder. This is the fix for the S4B.6.j
@@ -1846,6 +1858,7 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                     starting_chz,
                     max_chz,
                     chunk_size_z_signed,
+                    0,
                 );
             }
         }
@@ -2605,6 +2618,19 @@ fn emit_chunk_chain(
 /// overflow u8; this path leaves the slab's nextptr at 0 (= chain
 /// terminates early). VC.6+ revisits if this matters in practice
 /// (typical chunks have small last slabs).
+///
+/// VC.6.2: `mip_level` selects which mip sub-table to walk in each
+/// chunk's column-offsets array. At mip-0 callers pass
+/// `chunk_local_xy` in mip-0 voxel units and `mip_level = 0` (=
+/// byte-identical to pre-VC.6.2). At mip-N callers pass
+/// `chunk_local_xy` in **mip-N** voxel units (matching
+/// `state.cx_mip` / `cy_mip` in the rasterizer's mip-N column-
+/// step branch) and `mip_level = N`. Each chunk's chain is then
+/// indexed at
+/// `column_offsets[mip_base_offsets[N] + ly * (chunk_size_xy >> N)
+/// + lx]`. The bedrock-strip check uses `0xff >> mip_level` via
+/// [`emit_chunk_chain`] so intermediate chunks' mip-N bedrock
+/// placeholders are stripped at the right scale.
 fn build_owned_column_multi_chz(
     target: &mut Vec<u8>,
     target_z_base: &mut Vec<i32>,
@@ -2614,6 +2640,7 @@ fn build_owned_column_multi_chz(
     starting_chz: i32,
     max_chz: i32,
     chunk_size_z: i32,
+    mip_level: u32,
 ) {
     target.clear();
     target_z_base.clear();
@@ -2636,14 +2663,15 @@ fn build_owned_column_multi_chz(
     // max_chz` = false).
     if starting_chz == max_chz {
         if let Some(chunk) = grid_view.chunk_at_xyz([chunk_xy[0], chunk_xy[1], starting_chz]) {
+            let chunk_size_at_mip = chunk.chunk_size_xy >> mip_level;
             #[allow(clippy::cast_possible_wrap)]
-            let chunk_size_xy_mask = (chunk.chunk_size_xy as i32) - 1;
+            let chunk_size_at_mip_mask = (chunk_size_at_mip as i32) - 1;
             #[allow(clippy::cast_sign_loss)]
-            let lx = (chunk_local_xy[0] & chunk_size_xy_mask) as u32;
+            let lx = (chunk_local_xy[0] & chunk_size_at_mip_mask) as u32;
             #[allow(clippy::cast_sign_loss)]
-            let ly = (chunk_local_xy[1] & chunk_size_xy_mask) as u32;
-            let mip_base = chunk.mip_base_offsets[0];
-            let col_idx = ly.wrapping_mul(chunk.chunk_size_xy).wrapping_add(lx);
+            let ly = (chunk_local_xy[1] & chunk_size_at_mip_mask) as u32;
+            let mip_base = chunk.mip_base_offsets[mip_level as usize];
+            let col_idx = ly.wrapping_mul(chunk_size_at_mip).wrapping_add(lx);
             let table_idx = mip_base + col_idx as usize;
             if let Some(&col_off) = chunk.column_offsets.get(table_idx) {
                 let off = col_off as usize;
@@ -2669,14 +2697,15 @@ fn build_owned_column_multi_chz(
         let Some(chunk) = grid_view.chunk_at_xyz([chunk_xy[0], chunk_xy[1], chz]) else {
             continue;
         };
+        let chunk_size_at_mip = chunk.chunk_size_xy >> mip_level;
         #[allow(clippy::cast_possible_wrap)]
-        let chunk_size_xy_mask = (chunk.chunk_size_xy as i32) - 1;
+        let chunk_size_at_mip_mask = (chunk_size_at_mip as i32) - 1;
         #[allow(clippy::cast_sign_loss)]
-        let lx = (chunk_local_xy[0] & chunk_size_xy_mask) as u32;
+        let lx = (chunk_local_xy[0] & chunk_size_at_mip_mask) as u32;
         #[allow(clippy::cast_sign_loss)]
-        let ly = (chunk_local_xy[1] & chunk_size_xy_mask) as u32;
-        let mip_base = chunk.mip_base_offsets[0];
-        let col_idx = ly.wrapping_mul(chunk.chunk_size_xy).wrapping_add(lx);
+        let ly = (chunk_local_xy[1] & chunk_size_at_mip_mask) as u32;
+        let mip_base = chunk.mip_base_offsets[mip_level as usize];
+        let col_idx = ly.wrapping_mul(chunk_size_at_mip).wrapping_add(lx);
         let table_idx = mip_base + col_idx as usize;
         let Some(&col_off) = chunk.column_offsets.get(table_idx) else {
             continue;
@@ -2684,11 +2713,10 @@ fn build_owned_column_multi_chz(
         let world_z_base = chz * chunk_size_z;
         let strip_trailing = chz < max_chz;
         let chz_start = target.len();
-        // VC.6.1: mip_level = 0 — the multi-chz mip-0 builder walks
-        // each chunk's mip-0 sub-table. VC.6.2 grows
-        // `build_owned_column_multi_chz` to also have a mip_level
-        // parameter; this call site stays at 0 because the mip-0
-        // builder's contract is mip-0-only.
+        // VC.6.2: forward `mip_level` so `emit_chunk_chain`'s
+        // strip-bedrock check matches `0xff >> mip_level` (the
+        // mip-N halved bedrock sentinel). Mip-0 callers stay
+        // byte-identical because `0xff >> 0 = 0xff`.
         let Some(last_pos) = emit_chunk_chain(
             target,
             target_z_base,
@@ -2696,7 +2724,7 @@ fn build_owned_column_multi_chz(
             col_off as usize,
             world_z_base,
             strip_trailing,
-            0,
+            mip_level,
         ) else {
             continue;
         };
