@@ -2469,6 +2469,14 @@ fn build_owned_column_from_chain_translated(
 /// nextptr is rewritten to 0 so the chain remains a valid voxlap
 /// chain terminated by the *next* chunk's stitch.
 ///
+/// VC.6.1: `mip_level` selects the bedrock-sentinel scale. At mip-N
+/// the bedrock placeholder's chunk-local z byte is `0xff >> mip_level`
+/// (each mip level halves the z resolution; see [[s4b-5-landed]]'s
+/// `phase_draw_flor` fix that compares `column[vptr+1] == 0xff >>
+/// gmipcnt`). Callers walking a chunk's mip-0 table pass `mip_level
+/// = 0`, which gives `0xff >> 0 = 0xff` and is byte-identical with
+/// pre-VC.6.1 behaviour.
+///
 /// Returns the offset (in `target`) of the LAST emitted slab's
 /// nextptr byte — caller uses this to stitch chz=K+1's chain by
 /// overwriting that byte with the advance to chz=K+1's first slab.
@@ -2481,6 +2489,7 @@ fn emit_chunk_chain(
     off: usize,
     world_z_base: i32,
     strip_trailing_bedrock: bool,
+    mip_level: u32,
 ) -> Option<usize> {
     if off >= slab_buf.len() {
         return None;
@@ -2508,12 +2517,20 @@ fn emit_chunk_chain(
 
         if nextptr == 0 {
             // Last slab. VC.5 strip-bedrock: drop the placeholder
-            // when (a) caller asked and (b) z1 byte is 0xff (=
-            // chunk-local bedrock sentinel). Roll back to the
-            // previous slab and zero its nextptr so the chain ends
-            // there (caller stitches into chz=K+1).
+            // when (a) caller asked and (b) z1 byte equals the
+            // mip-N bedrock sentinel `0xff >> mip_level` (chunk-
+            // local). Roll back to the previous slab and zero its
+            // nextptr so the chain ends there (caller stitches
+            // into chz=K+1).
+            //
+            // VC.6.1: `mip_level = 0` keeps the literal 0xff
+            // sentinel = byte-identical with pre-VC.6.1. mip > 0
+            // matches `phase_draw_flor`'s halved sentinel and lets
+            // the multi-chz path stitch chains drawn from a
+            // chunk's mip-N sub-table.
             let z1 = tail[pos + 1];
-            if strip_trailing_bedrock && z1 == 0xff {
+            let bedrock_sentinel = 0xff_u8.wrapping_shr(mip_level);
+            if strip_trailing_bedrock && z1 == bedrock_sentinel {
                 if let Some(prev) = prev_slab_target_pos {
                     target[prev] = 0;
                     last_slab_target_pos = Some(prev);
@@ -2667,6 +2684,11 @@ fn build_owned_column_multi_chz(
         let world_z_base = chz * chunk_size_z;
         let strip_trailing = chz < max_chz;
         let chz_start = target.len();
+        // VC.6.1: mip_level = 0 — the multi-chz mip-0 builder walks
+        // each chunk's mip-0 sub-table. VC.6.2 grows
+        // `build_owned_column_multi_chz` to also have a mip_level
+        // parameter; this call site stays at 0 because the mip-0
+        // builder's contract is mip-0-only.
         let Some(last_pos) = emit_chunk_chain(
             target,
             target_z_base,
@@ -2674,6 +2696,7 @@ fn build_owned_column_multi_chz(
             col_off as usize,
             world_z_base,
             strip_trailing,
+            0,
         ) else {
             continue;
         };
@@ -3490,6 +3513,108 @@ mod tests {
             let mut bulk = Vec::new();
             build_owned_column_from_chain(&mut bulk, &col, 0);
             assert_eq!(column, bulk, "column bytes drifted (base={base})");
+        }
+    }
+
+    /// VC.6.1: `emit_chunk_chain` accepts a `mip_level` parameter.
+    /// At `mip_level = 0` the bedrock-strip check compares against
+    /// 0xff and behaves byte-identically to pre-VC.6.1. The lone
+    /// caller in `build_owned_column_multi_chz` keeps passing 0
+    /// (= the mip-0 builder), so this test plus the unchanged
+    /// `repro_vc` baseline hash together pin the byte-stability.
+    #[test]
+    fn vc6_1_emit_chunk_chain_mip0_preserves_behaviour() {
+        // Two-slab chain where the LAST slab is the chunk-local
+        // bedrock placeholder (z1 = 0xff). `strip_trailing_bedrock
+        // = true` + `mip_level = 0` must roll back to the previous
+        // slab and zero its nextptr.
+        let mut col = vec![4u8, 0, 0, 0];
+        col.extend_from_slice(&[0xAA; 12]); // 12 voxel bytes
+        col.extend_from_slice(&[0, 0xff, 0xff, 0]); // bedrock last slab
+
+        let mut target = Vec::new();
+        let mut z_base = Vec::new();
+        let last_pos = emit_chunk_chain(&mut target, &mut z_base, &col, 0, 0, true, 0)
+            .expect("non-empty chain");
+        assert_eq!(target.len(), 16, "bedrock-stripped chain = first slab only");
+        assert_eq!(
+            target[0], 0,
+            "previous slab's nextptr rewritten to 0 (becomes new last)"
+        );
+        assert_eq!(
+            last_pos, 0,
+            "last_pos points at the new-last slab's nextptr"
+        );
+        // z_base parallel-fill matches target length with the
+        // provided world_z_base (= 0 here).
+        assert_eq!(z_base.len(), target.len());
+        assert!(z_base.iter().all(|&v| v == 0));
+    }
+
+    /// VC.6.1: at `mip_level = N` the bedrock sentinel is `0xff >>
+    /// N`. A chain whose last slab carries the mip-N sentinel must
+    /// be stripped; the literal-0xff legacy sentinel must NOT
+    /// (mip-N scale's z bytes ARE half-resolution → 0xff at mip-N
+    /// would mean world-z ≥ 256·2^N, far beyond the chunk).
+    #[test]
+    fn vc6_1_emit_chunk_chain_mip_n_strips_halved_bedrock_sentinel() {
+        // mip-2 sentinel: 0xff >> 2 = 63.
+        // Chain: [first-slab nextptr=4, ...padding..., last-slab
+        // nextptr=0, z1=63, z1c=63, z0=0] = bedrock at mip-2.
+        let mut col = vec![4u8, 0, 0, 0];
+        col.extend_from_slice(&[0x11; 12]);
+        col.extend_from_slice(&[0, 63, 63, 0]);
+
+        // mip_level = 2 strips the bedrock placeholder.
+        {
+            let mut target = Vec::new();
+            let mut z_base = Vec::new();
+            let last_pos = emit_chunk_chain(&mut target, &mut z_base, &col, 0, 0, true, 2)
+                .expect("non-empty chain");
+            assert_eq!(target.len(), 16, "mip-2 bedrock stripped");
+            assert_eq!(target[0], 0);
+            assert_eq!(last_pos, 0);
+        }
+
+        // mip_level = 0 does NOT strip — the byte 63 isn't 0xff,
+        // so the sentinel check stays false and the chain emits in
+        // full (= byte-identical to pre-VC.6.1 behaviour on mip-0
+        // data with non-bedrock last slabs).
+        {
+            let mut target = Vec::new();
+            let mut z_base = Vec::new();
+            emit_chunk_chain(&mut target, &mut z_base, &col, 0, 0, true, 0)
+                .expect("non-empty chain");
+            assert_eq!(
+                target.len(),
+                col.len(),
+                "mip-0 strip-check ignores the mip-N sentinel; chain emits in full"
+            );
+        }
+    }
+
+    /// VC.6.1: `mip_level` controls ONLY the bedrock sentinel
+    /// match; it does not change the chain walker's byte semantics
+    /// (nextptr advances, voxel-record byte-passthrough, etc.).
+    /// A chain whose last slab is NOT bedrock at any mip level
+    /// emits identically across mip_level values.
+    #[test]
+    fn vc6_1_non_bedrock_last_slab_emit_is_mip_invariant() {
+        let mut col = vec![4u8, 0, 0, 0];
+        col.extend_from_slice(&[0x55; 12]);
+        col.extend_from_slice(&[0, 10, 12, 0]); // non-bedrock last
+        col.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+        let mut prev: Option<Vec<u8>> = None;
+        for &mip in &[0u32, 1, 2, 3, 4] {
+            let mut target = Vec::new();
+            let mut z_base = Vec::new();
+            emit_chunk_chain(&mut target, &mut z_base, &col, 0, 0, true, mip)
+                .expect("non-empty chain");
+            if let Some(p) = prev.as_ref() {
+                assert_eq!(&target, p, "mip={mip} emit drifted vs mip=0/1/...");
+            }
+            prev = Some(target);
         }
     }
 
