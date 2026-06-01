@@ -11,6 +11,8 @@ mod repro_vc;
 mod scene;
 mod ship;
 mod terrain;
+#[cfg(test)]
+mod vc6_repro;
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
