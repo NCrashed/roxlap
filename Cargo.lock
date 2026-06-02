@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-cave-demo"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "roxlap-cavegen",
  "roxlap-core",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-cave-web"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -1335,14 +1335,14 @@ dependencies = [
 
 [[package]]
 name = "roxlap-cavegen"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "roxlap-formats",
 ]
 
 [[package]]
 name = "roxlap-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "flate2",
  "rayon",
@@ -1354,14 +1354,14 @@ dependencies = [
 
 [[package]]
 name = "roxlap-formats"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "flate2",
 ]
 
 [[package]]
 name = "roxlap-host"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "flate2",
  "png",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-oracle"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "console_error_panic_hook",
  "flate2",
@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-scene"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bincode",
  "crossbeam-channel",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-scene-demo"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "glam",
  "png",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-web"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "console_error_panic_hook",
  "flate2",

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-06-01
+
+Mip-N multi-chz column-step fix + column-borrow perf cleanup.
+Closes the engine-level mip-N gap that 0.4.0's VC.5 left open
+(distant-XY rays at mip-N now stitch chz layers the same way
+mip-0 already did), and reverts the structural per-column-step
+memcpy cost the VC arc accidentally introduced at 0.2.0. No
+public-API breakage vs 0.4.0.
+
 ### Performance
 
 #### `roxlap-core` — CB (column borrow)
