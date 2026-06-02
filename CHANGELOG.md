@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-06-03
+
+Axis-aligned-mip-beams resolution + `phase_remiporend`
+multi-chz reload. The beam bug that motivated the 0.4.x
+mitigation cascade is gone (incidentally fixed by the VC.5 /
+VC.6.2 / PRR multi-chz install path); demo mitigations
+reverted to the original aggressive config. `phase_remiporend`
+closes the last VC.6 follow-up from 0.4.1's Known limits.
+No public-API breakage vs 0.4.1.
+
 ### Fixed
 
 #### `roxlap-core` + `roxlap-scene-demo` — AAMB (axis-aligned-mip-beams resolution)
