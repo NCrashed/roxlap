@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### `roxlap-core` + `roxlap-scene-demo` — AAMB (axis-aligned-mip-beams resolution)
+
+- **The axis-aligned-mip-beams artifact is RESOLVED.** Originally
+  reported 2026-05-12: faint world-axis green columns at deep
+  mip-N + near-axis-aligned rays. Multi-session investigation
+  CF.0..CF.3.C in `project_cf_narrowing_multi_session_plan.md`
+  concluded that cf-narrowing could not fix it. Re-audit at
+  2026-06-03 finds the bug GONE — every multi-chunk beam test
+  reports **0 beam pixels** at `ml=6` across `msd=8/64/256/1024`.
+  Likely fixed incidentally by the VC.5 / VC.6.2 / PRR multi-chz
+  install cascade (`phase_after_delete_kept_presync`'s column-step
+  and `phase_remiporend`'s reload both now route through
+  `build_owned_column_multi_chz`, which appears to have closed
+  the corner case the beam relied on). Confirmed:
+  `dump_green_beam_pose_diff` (scan=1024, msd=64, ml=6 vs ml=1)
+  reports 0 beam pixels (was 6404 at S5.3); `dump_spawn_pose_diff`
+  reports 0 (was 5379).
+- **Demo mitigations reverted**. `roxlap-scene-demo`:
+  - `SCAN_DIST_MAX` 1500 → 1024.
+  - `settings.mip_levels` 4 → 6, `settings.mip_scan_dist` 128 →
+    64 (the live demo now exercises the full 6-mip ladder at
+    msd=64).
+  - Ship grid's `mip_levels_override = Some(1)` retired — ship
+    now renders with the full mip ladder. Bench engine-only
+    moves from 43 FPS (mitigated, NSP 68.9 %) to 75 FPS (revert,
+    NSP 34.4 %) — coarser mips render less terrain faster at
+    the bench camera.
+- **`crates/roxlap-core/src/cf_narrow.rs` deleted** (~523 LOC) —
+  the rejected experiment + 9 unit tests retired. The three env-
+  var gates (`ROXLAP_CF_NARROW`, `ROXLAP_CF_NARROW_PER_COLUMN`,
+  `ROXLAP_CF_NARROW_PER_COLUMN_NO_I1`) and their LazyLock caches
+  also gone from `grouscan.rs`.
+- **AAMB.1 single-chunk multi-mip crash fixed**. The audit
+  surfaced a pre-existing arithmetic underflow at
+  `grouscan.rs::phase_remiporend` where
+  `state.ixy_sptr_col_idx - state.mip_base_offsets[old_mip]`
+  panicked for axis-aligned poses on single-chunk grids at
+  `msd ≥ 64, ml = 6` (negative `cy_mip` masking into a column
+  index that landed just below the mip-OLD sub-table boundary).
+  Fix: defensive bail to `Phase::Startsky` when the index slips
+  below `mip_old_base`. `axis_aligned_single_chunk_multi_mip_*`
+  and `axis_aligned_single_chunk_pitched_up` flip from PANIC to
+  PASS; multi-chunk beam tests stay green.
+
 #### `roxlap-core` — PRR (phase_remiporend multi-chz reload)
 
 - **`phase_remiporend`'s post-mip-transition column reload**

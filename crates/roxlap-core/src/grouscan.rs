@@ -198,13 +198,6 @@ static TRACE_PHASES: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("ROXLAP_TRACE_PHASES").is_ok());
 static TRACE_STARTSKY: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("ROXLAP_TRACE_STARTSKY").is_ok());
-static CF_NARROW: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("ROXLAP_CF_NARROW").is_some());
-static CF_NARROW_PER_COLUMN: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("ROXLAP_CF_NARROW_PER_COLUMN").is_some());
-static CF_NARROW_PER_COLUMN_NO_I1: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("ROXLAP_CF_NARROW_PER_COLUMN_NO_I1").is_some());
-
 /// Borrowed read-only view of an [`crate::sky::Sky`] resource —
 /// the subset `phase_startsky`'s textured-fill branch reads. Built
 /// from a `&Sky` once per ray (the per-ray sky-row state lives on
@@ -2026,56 +2019,12 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
     // using `virtual_ogx = state.gx` (the just-computed new column's
     // depth integer-part).
     //
-    // Insight from CF.3.B diagnostic: only 0.84 % of cf entries at
-    // remiporend entry trigger drawfwall narrowing. The bug pixels
-    // reach the cancellation regime DURING drawfwall at the new mip,
-    // NOT at remiporend. Per-column narrowing fires at every column
-    // step (instead of once per mip transition), catching narrowings
-    // at the moment they should fire.
-    //
-    // Gated behind `ROXLAP_CF_NARROW_PER_COLUMN=1` so default flow
-    // stays byte-stable. mip-0 (gmipcnt == 0) is excluded — at mip-0
-    // drawfwall does all narrowing natively.
-    if state.gmipcnt > 0 && *CF_NARROW_PER_COLUMN {
-        // ROXLAP_CF_NARROW_PER_COLUMN_NO_I1=1 — skip the i1 decrement.
-        // Earlier CF.3.B diagnostic showed cx1/cy1 narrowing alone is
-        // observably a no-op (gi0 magnitude is sufficient to flip
-        // cx_s16, but the cf entries the simulator narrows don't
-        // reach the bug pixels' drawfwall fire path). Use this to
-        // confirm: if NO_I1 = baseline, the i1 decrement is the
-        // entire source of regression in per-column too.
-        let skip_i1 = *CF_NARROW_PER_COLUMN_NO_I1;
-        let virtual_ogx = state.gx;
-        let entry = &mut state.scratch.cf[state.ce_idx];
-
-        // drawfwall-side (i1 / cx1 / cy1).
-        let z1_idx = entry.z1 as usize;
-        if z1_idx < state.gylookup.len() {
-            let gy_raw_fwall = state.gylookup[z1_idx];
-            let test = grouscan_cross_sign(entry.cx1, entry.cy1, virtual_ogx, gy_raw_fwall);
-            if test > 0 && entry.i1 > entry.i0 {
-                entry.cx1 = entry.cx1.wrapping_sub(state.scratch.gi0);
-                entry.cy1 = entry.cy1.wrapping_sub(state.scratch.gi1);
-                if !skip_i1 {
-                    entry.i1 -= 1;
-                }
-            }
-        }
-
-        // drawcwall-side (i0 / cx0 / cy0).
-        let z0_idx = entry.z0 as usize;
-        if z0_idx < state.gylookup.len() {
-            let gy_raw_cwall = state.gylookup[z0_idx];
-            let test = grouscan_cross_sign(entry.cx0, entry.cy0, virtual_ogx, gy_raw_cwall);
-            if test <= 0 && entry.i0 < entry.i1 {
-                entry.cx0 = entry.cx0.wrapping_add(state.scratch.gi0);
-                entry.cy0 = entry.cy0.wrapping_add(state.scratch.gi1);
-                if !skip_i1 {
-                    entry.i0 += 1;
-                }
-            }
-        }
-    }
+    // AAMB: the per-column cf-narrowing experiment (CF.3.C) and the
+    // remiporend-time cf-narrowing experiment (CF.0..CF.3.B) both
+    // regressed the beam metrics they were trying to improve. The
+    // env-flag gated paths are retired; the axis-aligned-mip-beams
+    // bug they were trying to address turned out to be resolved by
+    // the VC/CB/PRR multi-chz install cascade.
 
     if state.c_presync_idx == state.c_idx {
         Phase::Skipixy3
@@ -2983,28 +2932,6 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
         return Phase::Startsky;
     }
 
-    // CF.2 — cf-narrowing simulator. Gated behind `ROXLAP_CF_NARROW=1`
-    // so default behaviour stays byte-stable to commit e484378 until
-    // validated by CF.3. Walks each active cf entry through
-    // `(2^old_mip - 1)` virtual finer-mip column steps' worth of
-    // `phase_draw_fwall`-shape narrowing. Algorithmic fix for the
-    // axis-aligned-mip-beams artifact at deep mip-N + near-axis rays.
-    // See `crate::cf_narrow` + the `cf-narrowing-multi-session-plan`
-    // memo for the full design.
-    if state.gmipcnt > 0 && *CF_NARROW {
-        let inputs = crate::cf_narrow::CfNarrowInputs {
-            gpz_at_entry: state.scratch.gpz,
-            gdz_old: state.scratch.gdz,
-            gi0: state.scratch.gi0,
-            gi1: state.scratch.gi1,
-            gylookup: state.gylookup,
-            old_mip: state.gmipcnt as u32,
-        };
-        let lo = CF_SEED_INDEX;
-        let hi = state.ce_idx + 1;
-        crate::cf_narrow::cf_narrow_simulate(&mut state.scratch.cf[lo..hi], &inputs);
-    }
-
     // Voxlap5.c:12007 — increment gmipcnt to NEW (= OLD + 1).
     let old_mip = state.gmipcnt as usize;
     state.gmipcnt += 1;
@@ -3018,6 +2945,22 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     // LP32-baked `<<29` / `<<(gmipcnt+17)` shift trick.
     let mip_old_base = state.mip_base_offsets[old_mip];
     let mip_new_base = state.mip_base_offsets[new_mip];
+    // AAMB.1: defensive bail when `ixy_sptr_col_idx` has slipped
+    // out of the mip-OLD sub-table. The column-step path is
+    // supposed to keep the index in range via the
+    // `cx_mip & chunk_size_at_mip_mask` masking, but axis-aligned
+    // poses on single-chunk grids at deep mip-N can produce
+    // negative `cy_mip` values whose masked column index lands
+    // just below the boundary (observed: idx=344059 vs
+    // mip_old_base=344067 for vsid=512 + mip_levels=6 + pitch=
+    // -0.49 + msd=64). Without this guard, `phase_remiporend`'s
+    // subtraction underflows + panics. Treat the case as "column
+    // fell out of bounds" and bail straight to Startsky — same
+    // semantics as the OOB-XY column-step path (`state.column =
+    // &[]`) that subsequent phases handle gracefully.
+    if state.ixy_sptr_col_idx < mip_old_base {
+        return Phase::Startsky;
+    }
     let col_within_old = state.ixy_sptr_col_idx - mip_old_base;
     let vsid_old = (state.vsid >> old_mip) as usize;
     debug_assert!(vsid_old.is_power_of_two() && vsid_old > 0);

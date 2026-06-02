@@ -47,21 +47,16 @@ const MAX_GRID_VSID: u32 = 32 * roxlap_scene::CHUNK_SIZE_XY;
 /// chunk LODs — at 384+ the mip-2 voxels dominate the budget while
 /// mip-0 stays sharp near the camera.
 ///
-/// **Why `SCAN_DIST_MAX` < `mip_scan_dist * 2^(mip_levels - 1)`**:
-/// at axis-aligned ray directions (rays exactly parallel to a
-/// world-X / world-Y axis) the multi-mip rendering develops faint
-/// green beams projecting out of the terrain along the world axes
-/// as scan distance grows (user-reported 2026-05-12: noticeable at
-/// 576+, very prominent at 1024+). Root cause is open — likely a
-/// column-step or cf-halving edge case for `gdz[lane]=0`
-/// configurations that surfaces once the ray walks into deeper
-/// mips (mip-3 / mip-4 / mip-5). Capping the slider below the
-/// noticeable threshold avoids the artifact in the showcase; the
-/// full 6-mip ladder stays available for tests that explicitly
-/// exercise it.
+/// AAMB (axis-aligned-mip-beams) was the cap rationale — kept
+/// SCAN_DIST_MAX at 1500 to push the slider below the beam
+/// threshold. The VC/CB/PRR cascade incidentally resolved the
+/// beam bug (multi-chunk beam tests report 0 pixels across every
+/// msd config at ml=6). Cap reverted to 1024 here as part of the
+/// AAMB cleanup; the full 6-mip ladder is now safe at the
+/// original config.
 const SCAN_DIST_INITIAL: i32 = 384;
 const SCAN_DIST_MIN: i32 = 64;
-const SCAN_DIST_MAX: i32 = 1500;
+const SCAN_DIST_MAX: i32 = 1024;
 const SCAN_DIST_STEP: i32 = 64;
 
 /// Cap for `rayon`'s strip-parallel pool. Voxlap's per-strip
@@ -294,8 +289,10 @@ impl App {
         let mut settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
         settings.max_scan_dist = self.scan_dist;
         // S4B.5: per-chunk mips generated in scene::bake_lightmode_1.
-        settings.mip_levels = 4;
-        settings.mip_scan_dist = 128;
+        // AAMB: reverted from (4, 128) — the VC/CB/PRR cascade fixed
+        // the beam bug; full 6-mip ladder at msd=64 now safe.
+        settings.mip_levels = 6;
+        settings.mip_scan_dist = 64;
 
         // Pool config — sky + fog colour. `treat_z_max_as_air` lets
         // the ship grid render correctly even though the camera is

@@ -9,7 +9,6 @@
 
 mod camera;
 pub mod camera_math;
-pub(crate) mod cf_narrow;
 pub(crate) mod column_walk;
 pub mod drawtile;
 mod engine;

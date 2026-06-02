@@ -113,20 +113,12 @@ pub fn build_demo() -> SceneAndCamera {
         // pixels via [`render::SKY_MASK_SENTINEL`] so only the
         // ground grid contributes the sky panorama.
         ship.render_sky = false;
-        // S5.2-followup #2 (fake-column artifact). The
-        // axis-aligned-mip-beams artifact (multi-mip + near-axis-
-        // aligned ray + cf-cancellation, see
-        // `project_axis_aligned_mip_beams.md`) is dramatically
-        // worse for the rotating ship grid: each rotation
-        // orientation creates new ray-vs-axis configurations that
-        // can trigger the cf-cancellation. The proper fix is
-        // cf-narrowing at remiporend (deferred engine work). For
-        // the ship — which is small enough (~500-voxel diameter)
-        // that multi-mip provides no perceptible LOD benefit at
-        // the demo's camera distances — cap at mip-0 to side-step
-        // the bug. Identity-rotation render stays clean; verified
-        // by `ship_fake_column_glitch_diag::try_single_mip=true`.
-        ship.mip_levels_override = Some(1);
+        // AAMB: the rotating-ship beam workaround (mip-0 cap) is
+        // retired here. The VC/CB/PRR cascade incidentally fixed
+        // the axis-aligned-mip-beams bug — every multi-chunk beam
+        // test now reports 0 beam pixels at ml=6 across msd=8..1024.
+        // The ship now renders with the full mip ladder; identity
+        // and rotated orientations are visually clean.
     }
 
     // Bake lightmode-1 directional shading into every chunk's slab
