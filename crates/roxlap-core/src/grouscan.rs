@@ -3181,21 +3181,33 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
     if !state.current_chunk_exists {
         state.column.clear();
         state.column_z_base.clear();
-    } else if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
-        let col_off = col_off as usize;
-        // CB.4: phase_remiporend reload is always single-chz (it
-        // re-projects the same column into mip-NEW's sub-table at
-        // the active chunk only — multi-chz stitching never happens
-        // here, even in stacked grids). Borrow the chain bytes
-        // directly out of `state.slab_buf` to skip the per-mip-
-        // transition memcpy.
-        if col_off <= state.slab_buf.len() {
-            let chain_len = slab_chain_byte_len(&state.slab_buf[col_off..]);
-            state
-                .column
-                .set_borrowed(state.slab_buf, col_off, chain_len);
-            state.column_z_base.clear();
-        }
+    } else {
+        // PRR.1: post-mip-transition reload now uses the multi-chz
+        // install for the same reason VC.6.2 swapped the column-
+        // step: at the camera's own chunk-XY past a mip transition,
+        // multi-chz scenes (`chunks_z > 1` + content at `chz !=
+        // seed_chz`) need the stitched virtual column or the
+        // intermediate drawing phases (drawfwall/cwall/flor) read
+        // the camera-chunk's placeholder bedrock and bypass to sky.
+        // Mip-0 callers (`chunks_z = 1` or N=1 fast path) borrow
+        // back into `slab_buf` and stay byte-stable.
+        #[allow(clippy::cast_possible_wrap)]
+        let chunk_size_z_signed = state.chunk_size_z as i32;
+        let gmip = state.gmipcnt as u32;
+        let chunk_size_at_mip_mask = ((state.chunk_size_xy >> gmip) as i32) - 1;
+        let local_cx = state.cx_mip & chunk_size_at_mip_mask;
+        let local_cy = state.cy_mip & chunk_size_at_mip_mask;
+        build_owned_column_multi_chz(
+            &mut state.column,
+            &mut state.column_z_base,
+            state.grid_view,
+            state.current_chunk_idx_xy,
+            [local_cx, local_cy],
+            state.starting_chz,
+            state.max_chz,
+            chunk_size_z_signed,
+            gmip,
+        );
     }
 
     // Voxlap5.c:12116 — reset c to top-of-stack.

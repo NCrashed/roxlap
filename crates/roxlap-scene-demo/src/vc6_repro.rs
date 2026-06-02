@@ -268,9 +268,20 @@ fn vc6_2_mip_n_multi_chz_distant_chz2_floor_visible_at_chz0_camera() {
     );
 }
 
-/// Pinned at VC.6.2 (2026-06-01). Post-fix render of the 4×4×3
+/// Pinned at PRR.1 (2026-06-03). Post-fix render of the 4×4×3
 /// chunk fixture at the chz=0-camera-looking-down pose.
-/// Previously `0x74b1_9785_9c26_911c` (bug-active = camera-chunk-
-/// only blob); VC.6.2's multi-chz mip-N install reveals the full
-/// chz=2 floor at distant XY → new hash.
-const VC6_2_FIX_LANDED_HASH: u64 = 0x577e_6879_b86e_f758;
+///
+/// History:
+/// * `0x74b1_9785_9c26_911c` — VC.6.0 bug-active (camera-chunk-
+///   only blob, ~19 k red pixels).
+/// * `0x577e_6879_b86e_f758` — VC.6.2 fix landed; multi-chz
+///   mip-N install at the column-step revealed the full chz=2
+///   floor at distant XY (~104 k red pixels).
+/// * `0xd8eb_5565_84f2_f30d` — PRR.1: also routes
+///   `phase_remiporend`'s post-mip-transition reload through
+///   the multi-chz install. Adds ~931 voxel-fills at the
+///   camera's own chunk-XY that the single-chz reload had been
+///   bypassing to sky between mip-transitions and the next
+///   column-step. Subtle in-fill; the trapezoidal shape is
+///   visually unchanged.
+const VC6_2_FIX_LANDED_HASH: u64 = 0xd8eb_5565_84f2_f30d;

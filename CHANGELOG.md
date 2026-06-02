@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### `roxlap-core` — PRR (phase_remiporend multi-chz reload)
+
+- **`phase_remiporend`'s post-mip-transition column reload**
+  switched from single-chz install to the same multi-chz
+  builder VC.6.2 already routes the column-step through.
+  Closes the last VC.6 follow-up from 0.4.1's
+  Known-limits list. At the camera's own chunk-XY past a mip
+  transition, multi-chz scenes (`chunks_z > 1` + content at
+  `chz != seed_chz`) need the stitched virtual column or the
+  intermediate drawing phases (drawfwall / drawcwall / drawflor)
+  read the camera-chunk's placeholder bedrock and bypass to
+  sky before the next column-step's multi-chz install fires.
+- VC.6.0 fixture (4×4×3 chunk grid, chz=0 camera looking
+  down at chz=2 floor) reveals the effect: `total_red`
+  104 511 → 105 442 (+931 voxel in-fills, +0.9 %). Visual
+  shape unchanged (the trapezoidal floor projection); the
+  fix in-fills voxels that were previously sky-bypassed.
+- VC.6.2 regression pin re-anchored to
+  `0xd8eb_5565_84f2_f30d` (was `0x577e_6879_b86e_f758`).
+- User's `z=-19.44` hills demo still byte-stable at VC.5
+  baseline `0x15e3_21a1_012a_6109` — the steep pitch
+  terminates rays in the camera-chunk; mip transitions
+  don't fire there.
+
 ## [0.4.1] — 2026-06-01
 
 Mip-N multi-chz column-step fix + column-borrow perf cleanup.
