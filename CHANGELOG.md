@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+#### `roxlap-core` — CB (column borrow)
+
+- **`state.column` switched to `ColumnSource<'a>` enum** —
+  `Borrowed(&'a [u8])` for single-chz / N=1 installs (zero
+  allocation, zero memcpy per column-step) and
+  `Owned(Vec<u8>)` for multi-chz stitched chains. `Deref<Target
+  = [u8]>` keeps every `state.column[i]` / `.len()` / `.get(i)`
+  call site working unchanged.
+- Reverts the structural perf cost the VC arc accidentally
+  introduced at 0.2.0 (when `state.column` flipped from `&'a
+  [u8]` to `Vec<u8>` to support multi-chz stitching). For
+  chunks_z = 1 grids — including the demo's ground (vsid =
+  4096) and ship (vsid = 768) — every column-step install now
+  borrows back into the chunk's `slab_buf` instead of copying
+  the chain bytes into an owned Vec.
+- Install sites updated: seed install (`from_seed`), mip-0
+  multi-chunk column-step's N=1 fast path, mip-N multi-chunk
+  column-step (VC.6.2's swap), single-chunk single-chz column-
+  step (both mip-0 and mip-N), and `phase_remiporend`'s
+  mid-ray mip-transition reload. Multi-chz stitched installs
+  stay on the `Owned` Vec path unchanged.
+- Bench gain (4-thread, ROXLAP_STATIC=1, vsid=4096 ground +
+  vsid=768 ship, max_scan_dist=512, mip_levels=4): engine-only
+  best 52.1 FPS, mean ~46 FPS (vs 0.4.0 baseline 42.9 FPS = ~
+  +10-20%; bench has ±5 FPS run-to-run noise). Lower than the
+  ~25% structural-gap estimate in [[perf-recovery-landed]] —
+  the Deref-through-enum match adds per-read overhead that
+  partly offsets the install-time savings. Architectural
+  cleanup stands regardless: `install_owned_column` is no
+  longer called in production (kept as a chain-walker reference
+  for tests).
+- Byte-stable across the entire test corpus: VC.5 baseline
+  hash `0x15e3_21a1_012a_6109`, VC.6.2 fix hash
+  `0x577e_6879_b86e_f758`, oracle 10 MATCH + 2 pre-existing
+  CPU divergence all unchanged.
+
 ### Fixed
 
 #### `roxlap-core` — VC.6 (mip-N multi-chz column-step)

@@ -67,8 +67,127 @@ pub const CF_LEN: usize = 256;
 /// `grouscan_run`. Voxlap calls this `cf[128]`.
 pub const CF_SEED_INDEX: usize = 128;
 
+use std::ops::Deref;
+
 use crate::rasterizer::ScanScratch;
 use crate::sky::Sky;
+
+/// CB.1: column-data carrier. Either a borrow back into the
+/// active chunk's `slab_buf` (the chunks_z=1 / N=1-fast-path
+/// install — zero allocation per column-step) or an owned
+/// stitched `Vec<u8>` built by [`build_owned_column_multi_chz`]
+/// when the install needs to concatenate multiple chz layers.
+///
+/// `Deref<Target = [u8]>` lets every existing call site
+/// (`state.column[i]`, `state.column.len()`,
+/// `state.column.get(i)`) keep working unchanged. The
+/// per-column-step copy from `slab_buf[off..]` into a Vec —
+/// the structural perf cost the VC arc accidentally
+/// introduced at 0.2.0 — disappears for chunks_z=1 grids
+/// once the install dispatch starts using
+/// [`Self::set_borrowed`].
+///
+/// CB.2 (fast-path tuning): the [`Borrowed`] variant stores
+/// the slice pre-computed (pointer + length) instead of
+/// `(slab_buf, off, len)` so the [`Deref`] hot path is just
+/// `&[u8]` — single load, no recomputed range. `slab_z_at`
+/// fires ~30M times / frame at vsid=4096 so this matters.
+#[derive(Debug)]
+pub enum ColumnSource<'a> {
+    /// Borrowed slice into a chunk's `slab_buf`. The
+    /// install path computes [`slab_chain_byte_len`] once
+    /// and stores the bounded slice here; subsequent reads
+    /// (`column[i]`, `column.len()`, `column.get(i)`) deref
+    /// to this slice with no per-call arithmetic.
+    Borrowed(&'a [u8]),
+    /// Owned `Vec<u8>` carrying a stitched multi-chz column,
+    /// or an intermediate buffer that mip-N reload / the
+    /// historical install path filled. Capacity persists
+    /// across `clear()` for buffer reuse within an [`Owned`]
+    /// install sequence.
+    Owned(Vec<u8>),
+}
+
+impl<'a> ColumnSource<'a> {
+    /// Empty owned variant. New [`GrouscanState`]s start here
+    /// so the install dispatch can later swap in either
+    /// variant without reallocating against a sentinel borrow.
+    #[must_use]
+    pub fn new_owned() -> Self {
+        Self::Owned(Vec::new())
+    }
+
+    /// Empty owned variant with a hinted Vec capacity —
+    /// `from_seed` uses this so the first install fits in
+    /// the initial allocation.
+    #[must_use]
+    pub fn with_owned_capacity(cap: usize) -> Self {
+        Self::Owned(Vec::with_capacity(cap))
+    }
+
+    /// Reset to empty. For [`Borrowed`] this swaps in an
+    /// empty static slice; for [`Owned`] the Vec keeps its
+    /// capacity (matches pre-CB `Vec::clear` semantics).
+    #[inline]
+    pub fn clear(&mut self) {
+        match self {
+            Self::Borrowed(b) => *b = &[],
+            Self::Owned(v) => v.clear(),
+        }
+    }
+
+    /// Switch to [`Borrowed`] mode with the chain bytes at
+    /// `slab_buf[off..off + len]`. Drops the current Vec
+    /// capacity if any. Callers should prefer this for
+    /// chunks_z = 1 / N = 1 installs.
+    #[inline]
+    pub fn set_borrowed(&mut self, slab_buf: &'a [u8], off: usize, len: usize) {
+        let end = off.saturating_add(len).min(slab_buf.len());
+        *self = Self::Borrowed(&slab_buf[off..end]);
+    }
+
+    /// Switch to [`Borrowed`] mode with a pre-sliced view.
+    /// Used by seed-time installs where the caller already
+    /// holds the chain slice.
+    #[inline]
+    pub fn set_borrowed_slice(&mut self, bytes: &'a [u8]) {
+        *self = Self::Borrowed(bytes);
+    }
+
+    /// Obtain a `&mut Vec<u8>` for the Owned variant,
+    /// initialising it (capacity-empty) if currently
+    /// [`Borrowed`]. Used by install paths that build a
+    /// stitched column inside an existing
+    /// `build_owned_column_*` helper.
+    #[inline]
+    pub fn as_owned_mut(&mut self) -> &mut Vec<u8> {
+        if !matches!(self, Self::Owned(_)) {
+            *self = Self::Owned(Vec::new());
+        }
+        match self {
+            Self::Owned(v) => v,
+            Self::Borrowed(_) => unreachable!("just installed Owned variant"),
+        }
+    }
+}
+
+impl<'a> Deref for ColumnSource<'a> {
+    type Target = [u8];
+
+    #[inline(always)]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(b) => b,
+            Self::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+impl Default for ColumnSource<'_> {
+    fn default() -> Self {
+        Self::new_owned()
+    }
+}
 
 // Diagnostic env-var caches. Each flag is read once at first access
 // via `LazyLock` instead of per-call. Pre-cache, the per-ray
@@ -232,7 +351,14 @@ pub(crate) struct GrouscanState<'a> {
     /// never reads past it. Decouples the lifetime of the column data
     /// from `slab_buf`, which VC.3 will use to inject world-z bytes
     /// without touching the parent borrow.
-    pub column: Vec<u8>,
+    ///
+    /// CB (post-VC.6): [`ColumnSource`] now wraps either the
+    /// borrowed slice or the owned Vec. Single-chz / N=1 installs
+    /// take the borrowed path → zero allocation, zero memcpy per
+    /// column-step. Multi-chz stitched installs stay Owned.
+    /// `Deref<Target = [u8]>` keeps every existing call site
+    /// indexing / iterating / `len()`-ing this field unchanged.
+    pub column: ColumnSource<'a>,
     /// VC.4: per-byte world-z translation offset paired with
     /// [`Self::column`] — same length, populated by every install.
     /// `slab_z_at` reads `column[vptr+byte] + column_z_base[vptr+byte] >> gmipcnt`
@@ -490,7 +616,13 @@ impl<'a> GrouscanState<'a> {
         // bulk-slice path for byte-identity with the goldens — they
         // have no chz layers to stitch and `inputs.column` already
         // carries the chain bytes for them.
-        let mut column_owned: Vec<u8> = Vec::with_capacity(inputs.column.len().min(8192));
+        // CB.2: build the seed install directly into a
+        // `ColumnSource<'a>`. The multi-chz path inside the
+        // builder uses `as_owned_mut()` to grab a fresh Vec; the
+        // N=1 fast path installs `Borrowed { slab_buf, off, len }`
+        // for zero-allocation seed for chunks_z=1 grids.
+        let mut column: ColumnSource<'a> =
+            ColumnSource::with_owned_capacity(inputs.column.len().min(8192));
         let mut column_z_base_owned: Vec<i32> = Vec::with_capacity(inputs.column.len().min(8192));
         if let Some(cg) = grid_view.chunk_grid {
             #[allow(clippy::cast_possible_wrap)]
@@ -513,7 +645,7 @@ impl<'a> GrouscanState<'a> {
             // the column-step swaps to multi-chz at mip-N below —
             // through this same builder with `mip_level = gmipcnt`).
             build_owned_column_multi_chz(
-                &mut column_owned,
+                &mut column,
                 &mut column_z_base_owned,
                 grid_view,
                 current_chunk_idx_xy,
@@ -524,16 +656,19 @@ impl<'a> GrouscanState<'a> {
                 0,
             );
         } else {
+            // CB.2: single-chunk seed install can also borrow —
+            // `inputs.column` is already pre-sliced to the column
+            // bytes (see `gline`'s seed path) so we install a
+            // Borrowed view at `(inputs.column, 0, chain_len)`.
+            // Lifetime: `inputs.column: &'a [u8]` lives at least as
+            // long as the rasterizer's borrow of `inputs.slab_buf`.
             let seed_chain_len = slab_chain_byte_len(inputs.column);
-            column_owned.extend_from_slice(&inputs.column[..seed_chain_len]);
-            // VC.X.PERF: single-chunk seed install leaves column_z_base
-            // empty — `slab_z_at` falls back to the scalar
-            // `state.chunk_world_z_base` (= inputs.chunk_world_z_base).
+            column.set_borrowed(inputs.column, 0, seed_chain_len);
         }
 
         Self {
             scratch,
-            column: column_owned,
+            column,
             column_z_base: column_z_base_owned,
             gylookup: inputs.gylookup,
             gcsub: inputs.gcsub,
@@ -1605,13 +1740,12 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        install_owned_column(
-                            &mut state.column,
-                            &mut state.column_z_base,
-                            state.slab_buf,
-                            off,
-                            state.chunk_world_z_base,
-                        );
+                        // CB.4: single-chunk + mip-N column-step.
+                        // Single-chz, so we can borrow back into
+                        // slab_buf without copying.
+                        let chain_len = slab_chain_byte_len(&state.slab_buf[off..]);
+                        state.column.set_borrowed(state.slab_buf, off, chain_len);
+                        state.column_z_base.clear();
                     } else {
                         state.column.clear();
                         state.column_z_base.clear();
@@ -1638,13 +1772,11 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                 if let Some(&col_off) = state.column_offsets.get(correct_idx) {
                     let off = col_off as usize;
                     if off <= state.slab_buf.len() {
-                        install_owned_column(
-                            &mut state.column,
-                            &mut state.column_z_base,
-                            state.slab_buf,
-                            off,
-                            state.chunk_world_z_base,
-                        );
+                        // CB.4: single-chunk + mip-0 column-step.
+                        // Borrow into slab_buf — single-chz install.
+                        let chain_len = slab_chain_byte_len(&state.slab_buf[off..]);
+                        state.column.set_borrowed(state.slab_buf, off, chain_len);
+                        state.column_z_base.clear();
                     }
                 }
             } else {
@@ -1818,9 +1950,17 @@ fn phase_after_delete_kept_presync(state: &mut GrouscanState<'_>) -> Phase {
                             // processed (~30M calls / frame at vsid=
                             // 4096), so this is the largest single
                             // hot-path win in the VC.X.PERF pass.
+                            //
+                            // CB.2: borrow the chain bytes directly
+                            // out of `state.slab_buf` rather than
+                            // copy them into an owned Vec —
+                            // chunks_z=1 grids (the bench's ground +
+                            // ship) install the column in this branch
+                            // every column-step, so eliminating the
+                            // copy is the primary CB.2 win.
                             state.chunk_world_z_base = world_z_base;
-                            state.column.clear();
-                            build_owned_column_from_chain(&mut state.column, state.slab_buf, off);
+                            let chain_len = slab_chain_byte_len(&state.slab_buf[off..]);
+                            state.column.set_borrowed(state.slab_buf, off, chain_len);
                             state.column_z_base.clear();
                         }
                     }
@@ -2618,10 +2758,18 @@ fn emit_chunk_chain(
 /// + lx]`. The bedrock-strip check uses `0xff >> mip_level` via
 /// [`emit_chunk_chain`] so intermediate chunks' mip-N bedrock
 /// placeholders are stripped at the right scale.
-fn build_owned_column_multi_chz(
-    target: &mut Vec<u8>,
+///
+/// CB.2: `target` is now [`ColumnSource<'a>`]. The N=1 fast path
+/// installs `Borrowed { slab_buf, off, len }` directly — zero
+/// allocation, zero memcpy — so chunks_z=1 grids (the bench's
+/// ground + ship) no longer pay the VC-architecture per-column-
+/// step Vec extend. Multi-chz path stays Owned via
+/// `as_owned_mut()` and reuses the existing builder's
+/// `extend_from_slice` loop.
+fn build_owned_column_multi_chz<'a>(
+    target: &mut ColumnSource<'a>,
     target_z_base: &mut Vec<i32>,
-    grid_view: crate::grid_view::GridView<'_>,
+    grid_view: crate::grid_view::GridView<'a>,
     chunk_xy: [i32; 2],
     chunk_local_xy: [i32; 2],
     starting_chz: i32,
@@ -2632,22 +2780,22 @@ fn build_owned_column_multi_chz(
     target.clear();
     target_z_base.clear();
 
-    // VC.X.PERF: N=1 fast path. When the iteration would yield a
-    // single chz emission (= `starting_chz == max_chz`, which fires
-    // for the common case of a camera INSIDE the grid's chz extent
-    // with `chunks_z = 1`, or chunks_z > 1 but the camera's clamped
-    // chz already at the max — e.g. the demo's spawn pose where
-    // `starting_chz = 0 = max_chz` even though the grid has chz=-1
-    // placeholders), bypass the multi-chz builder and use the
-    // single-chunk install path. Saves per-column-step overhead at
-    // a multi-chunk grid scale: emit_chunk_chain's strip logic +
-    // stitch arithmetic + Vec capacity bookkeeping all collapse to
-    // a single bulk extend_from_slice + uniform z_base resize.
+    // VC.X.PERF + CB.2: N=1 fast path. When the iteration would
+    // yield a single chz emission (= `starting_chz == max_chz`,
+    // which fires for the common case of a camera INSIDE the
+    // grid's chz extent with `chunks_z = 1`, or chunks_z > 1 but
+    // the camera's clamped chz already at the max — e.g. the
+    // demo's spawn pose where `starting_chz = 0 = max_chz` even
+    // though the grid has chz=-1 placeholders), bypass the multi-
+    // chz builder and **borrow** the chain bytes directly out of
+    // `slab_buf`. Byte-identical to the pre-CB.2 owned-copy path
+    // because [`slab_chain_byte_len`] bounds the slice at the
+    // chain's natural end and the rasterizer never reads past it.
     //
-    // Byte-identical to the multi-chz path at N=1 because no
-    // stitching across chunks happens and the chunk's trailing
-    // bedrock is kept (strip_trailing_bedrock would be `chz <
-    // max_chz` = false).
+    // `target_z_base` stays empty so `slab_z_at` falls back to the
+    // scalar `state.chunk_world_z_base = starting_chz *
+    // chunk_size_z` (set by the caller before invoking this
+    // builder).
     if starting_chz == max_chz {
         if let Some(chunk) = grid_view.chunk_at_xyz([chunk_xy[0], chunk_xy[1], starting_chz]) {
             let chunk_size_at_mip = chunk.chunk_size_xy >> mip_level;
@@ -2663,21 +2811,17 @@ fn build_owned_column_multi_chz(
             if let Some(&col_off) = chunk.column_offsets.get(table_idx) {
                 let off = col_off as usize;
                 if off <= chunk.slab_buf.len() {
-                    build_owned_column_from_chain(target, chunk.slab_buf, off);
-                    // VC.X.PERF: leave `target_z_base` empty
-                    // (`target.clear()` at top already cleared it) —
-                    // slab_z_at falls back to the seed-time scalar
-                    // `state.chunk_world_z_base = starting_chz *
-                    // chunk_size_z` for this single uniform layer.
-                    // The N=1 fast path therefore matches the
-                    // column-step's scalar-mode install in cost +
-                    // semantics.
+                    let chain_len = slab_chain_byte_len(&chunk.slab_buf[off..]);
+                    target.set_borrowed(chunk.slab_buf, off, chain_len);
                 }
             }
         }
         let _ = chunk_size_z;
         return;
     }
+
+    // Multi-chz path: take the owned Vec, emit + stitch into it.
+    let target_vec = target.as_owned_mut();
 
     let mut prev_last_slab_pos: Option<usize> = None;
     for chz in starting_chz..=max_chz {
@@ -2699,13 +2843,13 @@ fn build_owned_column_multi_chz(
         };
         let world_z_base = chz * chunk_size_z;
         let strip_trailing = chz < max_chz;
-        let chz_start = target.len();
+        let chz_start = target_vec.len();
         // VC.6.2: forward `mip_level` so `emit_chunk_chain`'s
         // strip-bedrock check matches `0xff >> mip_level` (the
         // mip-N halved bedrock sentinel). Mip-0 callers stay
         // byte-identical because `0xff >> 0 = 0xff`.
         let Some(last_pos) = emit_chunk_chain(
-            target,
+            target_vec,
             target_z_base,
             chunk.slab_buf,
             col_off as usize,
@@ -2726,7 +2870,7 @@ fn build_owned_column_multi_chz(
             if advance_bytes % 4 == 0 && advance_bytes / 4 <= 255 {
                 #[allow(clippy::cast_possible_truncation)]
                 {
-                    target[prev_pos] = (advance_bytes / 4) as u8;
+                    target_vec[prev_pos] = (advance_bytes / 4) as u8;
                 }
             }
             // Else: stitch overflows u8 — leave previous nextptr at
@@ -3039,13 +3183,19 @@ fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
         state.column_z_base.clear();
     } else if let Some(&col_off) = state.column_offsets.get(state.ixy_sptr_col_idx) {
         let col_off = col_off as usize;
-        install_owned_column(
-            &mut state.column,
-            &mut state.column_z_base,
-            state.slab_buf,
-            col_off,
-            state.chunk_world_z_base,
-        );
+        // CB.4: phase_remiporend reload is always single-chz (it
+        // re-projects the same column into mip-NEW's sub-table at
+        // the active chunk only — multi-chz stitching never happens
+        // here, even in stacked grids). Borrow the chain bytes
+        // directly out of `state.slab_buf` to skip the per-mip-
+        // transition memcpy.
+        if col_off <= state.slab_buf.len() {
+            let chain_len = slab_chain_byte_len(&state.slab_buf[col_off..]);
+            state
+                .column
+                .set_borrowed(state.slab_buf, col_off, chain_len);
+            state.column_z_base.clear();
+        }
     }
 
     // Voxlap5.c:12116 — reset c to top-of-stack.
