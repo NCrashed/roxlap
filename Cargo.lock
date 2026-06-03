@@ -1800,6 +1800,7 @@ dependencies = [
  "rayon",
  "roxlap-core",
  "roxlap-formats",
+ "roxlap-gpu",
  "roxlap-scene",
  "softbuffer",
  "winit",

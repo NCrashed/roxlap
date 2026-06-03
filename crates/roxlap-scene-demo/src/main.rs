@@ -15,12 +15,13 @@ mod terrain;
 mod vc6_repro;
 
 use std::num::NonZeroU32;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::Engine;
+use roxlap_gpu::{GpuRenderer, GpuRendererSettings};
 use roxlap_scene::render::render_scene_composed;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -161,8 +162,14 @@ impl InputState {
 
 #[allow(clippy::struct_excessive_bools)]
 struct App {
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    window: Option<Arc<Window>>,
+    /// CPU compositor — populated unless the GPU path won the
+    /// startup race (`ROXLAP_GPU=1` + a working WGPU adapter).
+    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// GPU.1 renderer — `Some` iff the demo started with
+    /// `ROXLAP_GPU=1` and WGPU init succeeded. Mutually exclusive
+    /// with `surface`.
+    gpu: Option<GpuRenderer>,
     engine: Engine,
     scene: SceneAndCamera,
     zbuffer: Vec<f32>,
@@ -216,6 +223,7 @@ impl App {
         Self {
             window: None,
             surface: None,
+            gpu: None,
             engine,
             scene,
             zbuffer: vec![f32::INFINITY; (WIDTH * HEIGHT) as usize],
@@ -273,6 +281,12 @@ impl App {
             // thread for `&mut Grid` access; bounded work since it
             // only touches the delta since last frame.
             self.bake_tracker.process(&mut self.scene.scene);
+        }
+
+        // GPU.1 short-circuit — see `redraw_gpu`.
+        if self.gpu.is_some() {
+            self.redraw_gpu();
+            return;
         }
 
         // Resize ScratchPool / zbuffer when the window grew.
@@ -375,6 +389,19 @@ impl App {
         }
     }
 
+    /// GPU.1 substitute for the softbuffer path: ask the GPU
+    /// renderer to clear-and-present, then re-arm the redraw loop.
+    /// The scene / camera / capture flow doesn't run yet — the GPU
+    /// renderer ignores them.
+    fn redraw_gpu(&mut self) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.render();
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
     /// Update camera position from the active input bits.
     fn tick_camera(&mut self, dt: f64) {
         let fast = if self.input.fast { FAST_MULT } else { 1.0 };
@@ -452,21 +479,51 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes()
             .with_title("roxlap-scene-demo")
             .with_inner_size(LogicalSize::new(WIDTH, HEIGHT));
-        let window = Rc::new(
+        let window = Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("winit: create_window"),
         );
-        let context = softbuffer::Context::new(window.clone()).expect("softbuffer: Context::new");
-        let surface =
-            softbuffer::Surface::new(&context, window.clone()).expect("softbuffer: Surface::new");
+
+        // GPU.1: opt-in via `ROXLAP_GPU=1`. Falls back to the CPU
+        // softbuffer path on any WGPU init failure so a missing
+        // driver doesn't bring the demo down.
+        let want_gpu = std::env::var_os("ROXLAP_GPU").is_some_and(|v| v != "0" && !v.is_empty());
+        if want_gpu {
+            match GpuRenderer::new_blocking(window.clone(), GpuRendererSettings::default()) {
+                Ok(gpu) => {
+                    eprintln!("roxlap-gpu: {}", gpu.adapter_info());
+                    window.set_title(&format!("roxlap-scene-demo (GPU: {})", gpu.adapter_info(),));
+                    self.gpu = Some(gpu);
+                }
+                Err(e) => {
+                    eprintln!("roxlap-gpu init failed ({e}); falling back to softbuffer");
+                }
+            }
+        }
+
+        if self.gpu.is_none() {
+            let context =
+                softbuffer::Context::new(window.clone()).expect("softbuffer: Context::new");
+            let surface = softbuffer::Surface::new(&context, window.clone())
+                .expect("softbuffer: Surface::new");
+            self.surface = Some(surface);
+        }
+
         self.window = Some(window);
-        self.surface = Some(surface);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(new_size) => {
+                // GPU.1: the swapchain must follow physical resizes;
+                // softbuffer resizes lazily inside `redraw`, so the
+                // CPU branch needs nothing here.
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.resize(new_size.width, new_size.height);
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
