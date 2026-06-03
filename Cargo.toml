@@ -5,6 +5,7 @@ members = [
     "crates/roxlap-cavegen",
     "crates/roxlap-core",
     "crates/roxlap-formats",
+    "crates/roxlap-gpu",
     "crates/roxlap-host",
     "crates/roxlap-oracle",
     "crates/roxlap-scene",

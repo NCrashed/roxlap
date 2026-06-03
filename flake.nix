@@ -40,6 +40,12 @@
             libxi
             libxrandr
             libxcb
+            # GPU.0: wgpu dlopens libvulkan.so.1 at runtime to reach
+            # the Mesa/Nvidia ICDs. NixOS desktops carry the ICDs
+            # themselves via hardware.graphics; the loader has to be
+            # findable on LD_LIBRARY_PATH for non-NixOS-managed
+            # binaries (i.e. ours).
+            vulkan-loader
           ];
 
           # R10.X.2: pin a specific nightly via rust-toolchain.toml.
