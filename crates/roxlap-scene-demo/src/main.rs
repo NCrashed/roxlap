@@ -201,6 +201,13 @@ struct App {
     /// neighbours so chunk-edge brightness banding resolves as
     /// chunks arrive). Empty + no-op when no streaming grid exists.
     bake_tracker: StreamingBakeTracker,
+    /// Title bar prefix (e.g. `"roxlap-scene-demo (GPU: …)"`).
+    /// `tick_fps` composes `"<base> — NNN FPS"` on top of this
+    /// every ~500ms so the user can read the live frame rate
+    /// without a HUD overlay.
+    title_base: String,
+    fps_frames: u32,
+    fps_last: Instant,
 }
 
 impl App {
@@ -247,7 +254,28 @@ impl App {
             capture_pending: false,
             scan_dist: SCAN_DIST_INITIAL,
             bake_tracker: StreamingBakeTracker::new(),
+            title_base: "roxlap-scene-demo".to_string(),
+            fps_frames: 0,
+            fps_last: Instant::now(),
         }
+    }
+
+    /// Bump the rolling frame counter and refresh the title bar
+    /// every ~500ms. Both `redraw` (CPU path) and `redraw_gpu` (GPU
+    /// path) call this at the end of a successful frame.
+    fn tick_fps(&mut self) {
+        self.fps_frames += 1;
+        let now = Instant::now();
+        let dt = (now - self.fps_last).as_secs_f32();
+        if dt < 0.5 {
+            return;
+        }
+        let fps = f64::from(self.fps_frames) / f64::from(dt);
+        if let Some(window) = self.window.as_ref() {
+            window.set_title(&format!("{} — {:.1} FPS", self.title_base, fps));
+        }
+        self.fps_frames = 0;
+        self.fps_last = now;
     }
 
     fn redraw(&mut self) {
@@ -400,6 +428,7 @@ impl App {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+        self.tick_fps();
     }
 
     /// GPU.3 substitute for the softbuffer path: marches the
@@ -440,6 +469,7 @@ impl App {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+        self.tick_fps();
     }
 
     /// At GPU startup, find a materialised chunk to upload. Under
@@ -578,7 +608,8 @@ impl ApplicationHandler for App {
             match GpuRenderer::new_blocking(window.clone(), GpuRendererSettings::default()) {
                 Ok(gpu) => {
                     eprintln!("roxlap-gpu: {}", gpu.adapter_info());
-                    window.set_title(&format!("roxlap-scene-demo (GPU: {})", gpu.adapter_info(),));
+                    self.title_base = format!("roxlap-scene-demo (GPU: {})", gpu.adapter_info());
+                    window.set_title(&self.title_base);
                     self.upload_first_chunk(&gpu);
                     self.gpu = Some(gpu);
                 }
