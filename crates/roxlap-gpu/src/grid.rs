@@ -51,9 +51,21 @@ pub struct GridUpload {
     pub origin_chunk: [i32; 3],
     /// Chunk-count along each axis = `max - min + 1`.
     pub chunks_dims: [u32; 3],
-    /// `(chunk_idx, decompressed)` pairs. Chunk indices outside
-    /// `[origin_chunk, origin_chunk + chunks_dims)` are silently
-    /// skipped.
+    /// GPU.7 slot-pool dimensions for modular chunk indexing.
+    /// Every component MUST be a power of 2. A chunk at index
+    /// `(chx, chy, chz)` maps to slot
+    /// `(chx & (pool_dims.x - 1), chy & (pool_dims.y - 1),
+    /// chz & (pool_dims.z - 1))`. As long as
+    /// `pool_dims_axis ≥ active_range_along_axis`, no two
+    /// simultaneously-resident chunks collide. Set this larger than
+    /// `chunks_dims` only when streaming may install chunks at
+    /// indices outside the initial bbox.
+    pub pool_dims: [u32; 3],
+    /// `(chunk_idx, decompressed)` pairs. Chunks outside the
+    /// pool's collision-free active range are still accepted —
+    /// modular indexing will assign them slots; the caller is
+    /// responsible for avoiding collisions with other resident
+    /// chunks.
     pub chunks: Vec<([i32; 3], ChunkUpload)>,
 }
 
@@ -61,6 +73,21 @@ impl GridUpload {
     #[must_use]
     pub fn total_chunks(&self) -> u32 {
         self.chunks_dims[0] * self.chunks_dims[1] * self.chunks_dims[2]
+    }
+
+    /// Default GPU.7 [`Self::pool_dims`] derived from
+    /// `chunks_dims` — each axis rounded up to the next power of 2.
+    /// Use this when the grid is static + slots map 1:1 to bbox
+    /// positions; for streaming grids, callers should pick a
+    /// larger pool that covers `2 × r_active_chunks + 1` along
+    /// each axis.
+    #[must_use]
+    pub fn default_pool_dims(chunks_dims: [u32; 3]) -> [u32; 3] {
+        [
+            ceil_pow2(chunks_dims[0]),
+            ceil_pow2(chunks_dims[1]),
+            ceil_pow2(chunks_dims[2]),
+        ]
     }
 
     /// Linear chunk index `(meta_idx)` for `(chx, chy, chz)` in the
@@ -229,6 +256,17 @@ fn create_storage(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu::Buf
         contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::STORAGE,
     })
+}
+
+/// Round `n` up to the nearest power of 2. `0` and `1` both return
+/// `1`. Used to derive a GPU.7 [`GridUpload::pool_dims`] from a
+/// non-pow2 `chunks_dims`.
+#[must_use]
+pub fn ceil_pow2(n: u32) -> u32 {
+    if n <= 1 {
+        return 1;
+    }
+    1u32 << (32 - (n - 1).leading_zeros())
 }
 
 /// Compute the smallest bounding box that contains every

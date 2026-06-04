@@ -1190,6 +1190,10 @@ impl GpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
+                    resource: scene.all_slot_chunk_idx.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
                     resource: wgpu::BindingResource::TextureView(&dda.storage_view),
                 },
             ],
@@ -1280,8 +1284,9 @@ impl GpuRenderer {
                     bgl_storage_entry(4, true),
                     bgl_storage_entry(5, true),
                     bgl_storage_entry(6, true),
+                    bgl_storage_entry(7, true),
                     wgpu::BindGroupLayoutEntry {
-                        binding: 7,
+                        binding: 8,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,

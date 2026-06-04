@@ -40,13 +40,11 @@ struct GridStaticMeta {
     colors_offset: u32,
     chunk_colors_base_offset: u32,
     chunk_occupancy_offset: u32,
+    slot_chunk_idx_offset: u32,
     vsid: u32,
-    total_chunks: u32,
+    total_slots: u32,
+    pool_dims: vec3<u32>,
     _pad0: u32,
-    chunks_dims: vec3<u32>,
-    _pad1: u32,
-    origin_chunk: vec3<i32>,
-    _pad2: u32,
 };
 
 struct Uniforms {
@@ -66,7 +64,9 @@ struct Uniforms {
 @group(0) @binding(4) var<storage, read> all_chunk_colors_base: array<u32>;
 @group(0) @binding(5) var<storage, read> all_chunk_occupancy: array<u32>;
 @group(0) @binding(6) var<storage, read> grid_static_meta: array<GridStaticMeta>;
-@group(0) @binding(7) var output: texture_storage_2d<rgba8unorm, write>;
+// GPU.7: per-slot chunk_idx, vec3<i32> with std430 16-byte stride.
+@group(0) @binding(7) var<storage, read> all_slot_chunk_idx: array<vec3<i32>>;
+@group(0) @binding(8) var output: texture_storage_2d<rgba8unorm, write>;
 
 fn voxel_solid_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> bool {
     let m = grid_static_meta[g];
@@ -111,27 +111,33 @@ fn voxel_color_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> vec3<f32> {
     return vec3<f32>(r, g_chan, b) * (brightness / 255.0);
 }
 
-fn meta_idx_of(g: u32, chunk_idx: vec3<i32>) -> i32 {
+// GPU.7 modular slot lookup. `pool_dims` are powers of 2 (asserted
+// on the host), so `chunk_idx & (pool_dims - 1)` is the slot index
+// per axis. Slot identity must be verified against
+// `all_slot_chunk_idx` — multiple chunk_idx values can map to the
+// same slot under the pool's collision invariant.
+fn slot_idx_of(g: u32, chunk_idx: vec3<i32>) -> u32 {
     let m = grid_static_meta[g];
-    let rel = chunk_idx - m.origin_chunk;
-    if (rel.x < 0 || rel.y < 0 || rel.z < 0 ||
-        u32(rel.x) >= m.chunks_dims.x ||
-        u32(rel.y) >= m.chunks_dims.y ||
-        u32(rel.z) >= m.chunks_dims.z) {
-        return -1;
-    }
-    return rel.x
-        + rel.y * i32(m.chunks_dims.x)
-        + rel.z * i32(m.chunks_dims.x * m.chunks_dims.y);
+    let mask = vec3<i32>(m.pool_dims) - vec3<i32>(1, 1, 1);
+    let s = chunk_idx & mask;
+    return u32(s.x)
+        + u32(s.y) * m.pool_dims.x
+        + u32(s.z) * m.pool_dims.x * m.pool_dims.y;
 }
 
-fn chunk_has_content(g: u32, meta_id: i32) -> bool {
-    if (meta_id < 0) {
+fn chunk_has_content(g: u32, slot_idx: u32, chunk_idx: vec3<i32>) -> bool {
+    let m = grid_static_meta[g];
+    // Identity check: does this slot actually hold the chunk the
+    // outer DDA is visiting? An empty slot's sentinel
+    // (i32::MIN, i32::MIN, i32::MIN) fails this check.
+    // vec3<i32> entries are at `slot_chunk_idx_offset/4 + slot_idx`
+    // since WGSL `array<vec3<i32>>` uses 16-byte stride.
+    let stored = all_slot_chunk_idx[m.slot_chunk_idx_offset / 4u + slot_idx];
+    if (stored.x != chunk_idx.x || stored.y != chunk_idx.y || stored.z != chunk_idx.z) {
         return false;
     }
-    let m = grid_static_meta[g];
-    let mi = u32(meta_id);
-    return (all_chunk_occupancy[m.chunk_occupancy_offset + (mi >> 5u)] & (1u << (mi & 31u))) != 0u;
+    return (all_chunk_occupancy[m.chunk_occupancy_offset + (slot_idx >> 5u)]
+        & (1u << (slot_idx & 31u))) != 0u;
 }
 
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
@@ -190,8 +196,8 @@ fn march_grid(
         if (t_enter > best_t) {
             return out; // no closer hit possible in this grid
         }
-        let meta_id = meta_idx_of(g, p_chunk);
-        if (chunk_has_content(g, meta_id)) {
+        let slot_id = slot_idx_of(g, p_chunk);
+        if (chunk_has_content(g, slot_id, p_chunk)) {
             let t_chunk_exit = min(t_max_chunk.x, min(t_max_chunk.y, t_max_chunk.z));
             let entry_world = ray_origin + t_enter * ray_dir;
             let chunk_origin_world = vec3<f32>(p_chunk) * chunk_dim;
@@ -219,11 +225,11 @@ fn march_grid(
             var t_hit: f32 = t_enter;
 
             for (var iv: u32 = 0u; iv < MAX_INNER_STEPS; iv = iv + 1u) {
-                if (voxel_solid_in(g, u32(meta_id), p_voxel)) {
+                if (voxel_solid_in(g, slot_id, p_voxel)) {
                     if (t_hit < best_t) {
                         out.hit = true;
                         out.t = t_hit;
-                        out.color = voxel_color_in(g, u32(meta_id), p_voxel);
+                        out.color = voxel_color_in(g, slot_id, p_voxel);
                         return out;
                     } else {
                         return out;

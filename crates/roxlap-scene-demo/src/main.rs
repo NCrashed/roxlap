@@ -551,10 +551,22 @@ impl App {
                 .map(|(idx, vxl)| ([idx.x, idx.y, idx.z], roxlap_gpu::decompress_chunk(vxl)))
                 .collect();
             total_chunks_uploaded += chunks.len();
+            // GPU.7 pool dims: streaming grids get a generous pool
+            // (8×8×4 = 256 slots) so chunks streamed in at new
+            // indices anywhere in the world fit without collision
+            // (r_active = 2 chunks = active range 5 ≤ pool_dim 8).
+            // Static grids use ceil_pow2(chunks_dims) — fits exactly
+            // and chunks never move.
+            let pool_dims = if grid.generator.is_some() {
+                [8, 8, 4]
+            } else {
+                roxlap_gpu::GridUpload::default_pool_dims(chunks_dims)
+            };
             scene_grids.push(roxlap_gpu::GridUpload {
                 vsid: roxlap_scene::CHUNK_SIZE_XY,
                 origin_chunk,
                 chunks_dims,
+                pool_dims,
                 chunks,
             });
             scene_grid_ids.push(gid);
@@ -600,8 +612,11 @@ impl App {
     /// GPU.6 dirty pass — runs each frame before `render_scene`.
     /// Re-uploads any chunk whose `chunk_version` bumped since the
     /// last frame. For now this only fires for chunks that already
-    /// have a GPU slot (within the upload-time bbox); chunks newly
-    /// streamed in at new indices are GPU.7 territory.
+    /// have a GPU slot. GPU.7 modular pool makes "have a GPU slot"
+    /// universally true (modular indexing always finds one), so
+    /// this also handles chunks newly streamed in at new indices.
+    /// Evictions: chunks present in the tracker but missing from
+    /// `grid.chunks` get their slot cleared.
     fn refresh_dirty_chunks(&mut self) {
         let Some(resident) = self.gpu_scene.as_mut() else {
             return;
@@ -610,18 +625,20 @@ impl App {
             return;
         };
         let mut decompressed = 0u32;
+        let mut evicted = 0u32;
         for (scene_idx, gid) in self.gpu_scene_grid_ids.iter().enumerate() {
             let Some(grid) = self.scene.scene.grid(*gid) else {
                 continue;
             };
             let tracker = &mut self.gpu_chunk_versions[scene_idx];
+
+            // Pass 1: install / refresh current chunks.
             for (chunk_ivec3, vxl) in &grid.chunks {
                 let cur_version = grid.chunk_version(*chunk_ivec3);
                 let prev_version = tracker.get(chunk_ivec3).copied();
                 if prev_version == Some(cur_version) {
                     continue;
                 }
-                // Re-decompress + refresh in place.
                 let chunk_upload = roxlap_gpu::decompress_chunk(vxl);
                 let outcome = resident.refresh_chunk(
                     gpu.queue(),
@@ -634,15 +651,27 @@ impl App {
                     decompressed += 1;
                 }
             }
-            // TODO(GPU.7): detect evicted chunks (in tracker but
-            // missing from `grid.chunks`) and clear their
-            // chunk_occupancy bit via a one-empty refresh.
+
+            // Pass 2: evict chunks that the streamer dropped since
+            // last frame. Drain them from the tracker + clear the
+            // slot on the GPU.
+            let stale: Vec<IVec3> = tracker
+                .keys()
+                .filter(|i| !grid.chunks.contains_key(*i))
+                .copied()
+                .collect();
+            for chunk_ivec3 in stale {
+                resident.evict_chunk(
+                    gpu.queue(),
+                    scene_idx,
+                    [chunk_ivec3.x, chunk_ivec3.y, chunk_ivec3.z],
+                );
+                tracker.remove(&chunk_ivec3);
+                evicted += 1;
+            }
         }
-        if decompressed > 8 {
-            // Spammy in normal play; only print when something
-            // meaningful happened (e.g. streaming-pump arrival burst
-            // or first-frame catch-up).
-            eprintln!("GPU.6: refreshed {decompressed} dirty chunks");
+        if decompressed > 8 || evicted > 0 {
+            eprintln!("GPU.7: refreshed {decompressed} chunks, evicted {evicted}");
         }
     }
 
