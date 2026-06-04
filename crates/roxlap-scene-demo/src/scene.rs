@@ -121,6 +121,15 @@ pub fn build_demo() -> SceneAndCamera {
         // and rotated orientations are visually clean.
     }
 
+    // GPU.9 KV6 sprite — load `coco.kv6` and drop it into a tiny
+    // grid right in front of the camera spawn pose so the user
+    // can immediately verify the sprite path. Skipped silently if
+    // the embedded asset fails to parse (shouldn't happen with
+    // the bundled file).
+    if let Ok(kv6) = roxlap_formats::kv6::parse(crate::kv6_sprite::COCO_KV6_BYTES) {
+        crate::kv6_sprite::add_kv6_grid(&mut scene, &kv6, DVec3::new(-5.0, -90.0, 30.0));
+    }
+
     // Bake lightmode-1 directional shading into every chunk's slab
     // alpha bytes. Pure surface-normal-based gradient — voxlap's
     // `(tp.y * 0.5 + tp.z) * 64 + 103.5` formula. Done once at
@@ -641,9 +650,12 @@ mod tests_s7_6 {
             s.streaming_enabled,
             "streaming is the default for build_demo"
         );
-        // Ground (raw=0) + ship (raw=1) + `markers::NUM_MARKERS`
-        // pillars.
-        assert_eq!(s.scene.grid_count(), 1 + 1 + crate::markers::NUM_MARKERS);
+        // Ground (raw=0) + ship (raw=1) + 1 KV6 sprite (raw=2,
+        // GPU.9) + `markers::NUM_MARKERS` pillars.
+        assert_eq!(
+            s.scene.grid_count(),
+            1 + 1 + 1 + crate::markers::NUM_MARKERS,
+        );
         let ground = s
             .scene
             .grids()

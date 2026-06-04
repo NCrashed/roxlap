@@ -3,6 +3,7 @@
 //! evolution roadmap as the scene-graph substages land.
 
 mod collision;
+mod kv6_sprite;
 mod markers;
 #[cfg(test)]
 mod repro;
