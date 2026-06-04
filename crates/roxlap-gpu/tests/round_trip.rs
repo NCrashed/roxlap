@@ -10,8 +10,7 @@ use std::time::Instant;
 
 use roxlap_formats::vxl::Vxl;
 use roxlap_gpu::{
-    decompress_chunk, GpuChunkResident, GpuInitError, GpuRendererSettings, HeadlessGpu,
-    BEDROCK_RGB, CHUNK_Z,
+    decompress_chunk, GpuChunkResident, GpuInitError, GpuRendererSettings, HeadlessGpu, CHUNK_Z,
 };
 
 /// Build a `vsid × vsid` Vxl where every column has one textured
@@ -107,7 +106,9 @@ fn round_trip_air_above_returns_none() {
 }
 
 #[test]
-fn round_trip_bedrock_below_returns_sentinel() {
+fn round_trip_bedrock_below_now_returns_air() {
+    // Bedrock-as-air refactor (GPU.4 prereq) — z > z1c is no
+    // longer reported as solid by the GPU decompressor or shader.
     let Some(gpu) = try_init() else { return };
     let vxl = fixture_one_voxel_per_column(4);
     let chunk = decompress_chunk(&vxl);
@@ -115,10 +116,9 @@ fn round_trip_bedrock_below_returns_sentinel() {
 
     for &z in &[101u32, 150, CHUNK_Z - 1] {
         let v = resident.read_voxel_blocking(&gpu.device, &gpu.queue, 1, 2, z);
-        assert_eq!(
-            v,
-            Some(BEDROCK_RGB),
-            "bedrock at (1, 2, {z}) should be sentinel"
+        assert!(
+            v.is_none(),
+            "bedrock at (1, 2, {z}) should be empty — got {v:?}"
         );
         assert_eq!(chunk.voxel_at(1, 2, z), v);
     }

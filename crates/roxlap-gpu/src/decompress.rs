@@ -17,11 +17,18 @@
 //! The voxlap slab format interleaves floor and ceiling colour
 //! ranges across slab boundaries, with implicit "bedrock" voxels
 //! filling the gap between a slab's textured floor and the next
-//! slab's air-gap top. We faithfully expand both: textured runs
-//! get their per-voxel colour from the slab data; bedrock voxels
-//! get a sentinel grey colour so rays from below still terminate.
+//! slab's air-gap top. Bedrock has no per-voxel colour in the slab
+//! data — voxlap stores only textured surfaces.
 //!
-//! This is `O(occupied voxels)` work; not on the render hot path.
+//! **Bedrock-as-air** (GPU.4 prerequisite): the GPU decompressor
+//! treats bedrock voxels as empty. Rays heading into bedrock fall
+//! through to the far surface (or sky); for the typical demo view
+//! (camera above terrain, looking out) this is visually
+//! indistinguishable from voxlap-CPU. Storing bedrock explicitly
+//! would balloon a vsid=128 chunk's colour array from ~80 KiB to
+//! ~10 MiB, blocking GPU.4's 32×32-chunk grid upload.
+//!
+//! This is `O(textured voxels)` work; not on the render hot path.
 
 #![allow(
     clippy::cast_sign_loss,
@@ -37,11 +44,10 @@ use roxlap_formats::vxl::Vxl;
 /// module stays a pure consumer of the public `Vxl` surface.
 pub const CHUNK_Z: u32 = 256;
 
-/// Sentinel BGRA the decompressor stamps onto bedrock voxels — the
-/// implicit-solid region below a slab's textured floor. Dark grey
-/// in voxlap's 0xAARRGGBB convention. Chosen to be visually
-/// distinct from typical terrain so a stray bedrock hit shows up
-/// in screenshots rather than passing for terrain.
+/// Historic sentinel BGRA for bedrock voxels — kept exported so
+/// callers that want voxlap-CPU bedrock parity can render their own
+/// pass. **Not used by the default GPU decompressor**: the
+/// "bedrock-as-air" refactor (GPU.4 prereq) skips bedrock entirely.
 pub const BEDROCK_RGB: u32 = 0x0040_4040;
 
 /// CPU-decompressed chunk ready to upload to the GPU. Each field
@@ -140,10 +146,10 @@ pub fn decompress_chunk(vxl: &Vxl) -> ChunkUpload {
     }
 }
 
-/// Walk one column's slab chain. For each solid voxel sets the
-/// occupancy bit and pushes its packed BGRA u32 into `colors`.
+/// Walk one column's slab chain. For each **textured** voxel sets
+/// the occupancy bit and pushes its packed BGRA u32 into `colors`.
 /// Bedrock voxels (implicit solid below a slab's textured floor)
-/// get `BEDROCK_RGB`.
+/// are skipped — treated as air for the GPU marcher.
 fn decompress_column(
     slab: &[u8],
     x: u32,
@@ -162,13 +168,13 @@ fn decompress_column(
             while range_cursor < ranges.len() && z >= ranges[range_cursor].z_end {
                 range_cursor += 1;
             }
-            let rgb = if range_cursor < ranges.len() && z >= ranges[range_cursor].z_start {
-                let off = ((z - ranges[range_cursor].z_start) as usize) * 4;
-                let bytes = &ranges[range_cursor].colours[off..off + 4];
-                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-            } else {
-                BEDROCK_RGB
-            };
+            // Skip bedrock z values — outside every colour range.
+            if range_cursor >= ranges.len() || z < ranges[range_cursor].z_start {
+                continue;
+            }
+            let off = ((z - ranges[range_cursor].z_start) as usize) * 4;
+            let bytes = &ranges[range_cursor].colours[off..off + 4];
+            let rgb = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
             // z-innermost packing: each column owns 8 contiguous u32
             // words covering z=0..256.
@@ -318,25 +324,27 @@ mod tests {
     }
 
     #[test]
-    fn fixture_below_textured_is_bedrock() {
+    fn fixture_below_textured_is_air_after_bedrock_strip() {
+        // Bedrock-as-air refactor (GPU.4 prereq): z>z1c is no
+        // longer reported as solid by the GPU decompressor.
         let vxl = fixture_one_voxel_per_column();
         let chunk = decompress_chunk(&vxl);
         for z in 101..CHUNK_Z {
             assert_eq!(
                 chunk.voxel_at(1, 2, z),
-                Some(BEDROCK_RGB),
-                "z={z} expected bedrock"
+                None,
+                "z={z} expected air (bedrock stripped)"
             );
         }
     }
 
     #[test]
-    fn fixture_solid_run_length_matches_expandrle() {
+    fn only_textured_voxels_are_marked_solid() {
         let vxl = fixture_one_voxel_per_column();
         let chunk = decompress_chunk(&vxl);
-        // 156 solid voxels per column: textured 1 + bedrock 155.
+        // 1 textured voxel per column.
         let solid: u32 = chunk.occupancy.iter().map(|w| w.count_ones()).sum();
-        let expected = (chunk.vsid * chunk.vsid) * (CHUNK_Z - 100);
+        let expected = chunk.vsid * chunk.vsid;
         assert_eq!(solid, expected);
     }
 
@@ -347,8 +355,9 @@ mod tests {
         let n_cols = (chunk.vsid * chunk.vsid) as usize;
         assert_eq!(chunk.color_offsets.len(), n_cols + 1);
         assert_eq!(chunk.color_offsets[0], 0);
-        // First column has CHUNK_Z - 100 colours (1 textured + bedrock).
-        let per_col = CHUNK_Z - 100;
+        // Bedrock is stripped — only the 1 textured voxel/column
+        // ends up in colours.
+        let per_col = 1;
         for i in 0..=n_cols {
             assert_eq!(
                 chunk.color_offsets[i],
