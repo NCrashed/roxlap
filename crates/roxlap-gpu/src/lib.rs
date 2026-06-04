@@ -29,18 +29,21 @@
 //! # }
 //! ```
 
-#![allow(clippy::must_use_candidate)]
+#![allow(clippy::must_use_candidate, clippy::too_many_lines)]
 
+pub mod camera;
 pub mod decompress;
 pub mod headless;
 pub mod resident;
 
+pub use camera::Camera;
 pub use decompress::{decompress_chunk, ChunkUpload, BEDROCK_RGB, CHUNK_Z};
 pub use headless::HeadlessGpu;
 pub use resident::GpuChunkResident;
 
 use std::sync::Arc;
 
+use bytemuck::{Pod, Zeroable};
 use winit::window::Window;
 
 /// Caller-controllable knobs for [`GpuRenderer::new`]. Defaults
@@ -118,9 +121,10 @@ impl From<wgpu::RequestDeviceError> for GpuInitError {
     }
 }
 
-/// GPU.1 scaffold renderer. Owns a wgpu device, queue, and surface
-/// bound to the host's winit window. `render` presents a single
-/// clear-to-colour frame each call.
+/// WGPU-backed renderer. Owns the device, queue, and surface
+/// bound to the host's winit window. [`Self::render`] is the GPU.1
+/// clear-to-colour path; [`Self::render_chunk`] is GPU.3's
+/// single-chunk DDA marcher.
 pub struct GpuRenderer {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -130,6 +134,41 @@ pub struct GpuRenderer {
     adapter_info: String,
     clear_colour: [f64; 3],
     frame_count: u32,
+    /// Lazy-built on first [`Self::render_chunk`] call; rebuilt when
+    /// the swapchain resizes (storage texture must match).
+    chunk_dda: Option<ChunkDdaResources>,
+}
+
+/// Per-renderer chunk-DDA pipeline state. The compute shader writes
+/// into the storage texture; a fullscreen-triangle render pass
+/// nearest-neighbour blits it to the swapchain.
+struct ChunkDdaResources {
+    storage_size: (u32, u32),
+    storage_view: wgpu::TextureView,
+    uniform_buf: wgpu::Buffer,
+    bgl_dda: wgpu::BindGroupLayout,
+    pipeline_dda: wgpu::ComputePipeline,
+    blit_bg: wgpu::BindGroup,
+    pipeline_blit: wgpu::RenderPipeline,
+    // wgpu BindGroups internally Arc their resources, but we keep
+    // the handle so the sampler shows up in profiler dumps.
+    _sampler: wgpu::Sampler,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ChunkDdaUniform {
+    camera_pos: [f32; 3],
+    _pad0: f32,
+    camera_right: [f32; 3],
+    _pad1: f32,
+    camera_down: [f32; 3],
+    _pad2: f32,
+    camera_forward: [f32; 3],
+    fov_y_rad: f32,
+    screen_size: [u32; 2],
+    vsid: u32,
+    max_scan_dist: u32,
 }
 
 impl GpuRenderer {
@@ -213,6 +252,7 @@ impl GpuRenderer {
             adapter_info,
             clear_colour: settings.clear_colour,
             frame_count: 0,
+            chunk_dda: None,
         })
     }
 
@@ -238,8 +278,21 @@ impl GpuRenderer {
         &self.window
     }
 
+    /// Borrow the underlying wgpu device — hosts use this to build
+    /// chunk uploads (`GpuChunkResident::upload(gpu.device(), …)`).
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Borrow the wgpu queue — hosts use this for read-back paths
+    /// (`GpuChunkResident::read_voxel_blocking(gpu.device(), gpu.queue(), …)`).
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
     /// Re-configure the swapchain to a new physical size. Call from
-    /// `WindowEvent::Resized`.
+    /// `WindowEvent::Resized`. Drops the chunk-DDA storage texture
+    /// so [`Self::render_chunk`] rebuilds it at the new size.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -247,6 +300,7 @@ impl GpuRenderer {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
+        self.chunk_dda = None;
     }
 
     /// GPU.1 render: single render pass clearing the swapchain to a
@@ -305,6 +359,340 @@ impl GpuRenderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         surf_tex.present();
         self.frame_count = self.frame_count.wrapping_add(1);
+    }
+
+    /// GPU.3 single-chunk render. Dispatches `chunk_dda.wgsl`
+    /// against `resident`'s storage buffers, then blits the
+    /// low-res storage texture to the swapchain. `camera.position`
+    /// is in **chunk-local** voxel units (host translates from
+    /// world coords). `max_scan_dist` caps the per-pixel DDA loop —
+    /// scene-demo wires `+` / `-` through this each frame.
+    ///
+    /// # Panics
+    /// Internally `expect`s the chunk-DDA resources to be built —
+    /// they are constructed at the top of this function if missing.
+    /// Cannot fire in normal control flow.
+    pub fn render_chunk(
+        &mut self,
+        resident: &GpuChunkResident,
+        camera: &Camera,
+        max_scan_dist: u32,
+    ) {
+        let surf_tex = match self.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return;
+            }
+            Err(e) => {
+                eprintln!("roxlap-gpu surface error: {e:?}");
+                return;
+            }
+        };
+        let surf_view = surf_tex
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let surface_w = self.surface_config.width;
+        let surface_h = self.surface_config.height;
+        let surface_format = self.surface_config.format;
+
+        // Lazy-build chunk-DDA resources; rebuild when the swapchain
+        // grew or shrank.
+        let needs_build = match &self.chunk_dda {
+            Some(r) => r.storage_size != (surface_w, surface_h),
+            None => true,
+        };
+        if needs_build {
+            self.chunk_dda = Some(self.build_chunk_dda(surface_w, surface_h, surface_format));
+        }
+        let dda = self.chunk_dda.as_ref().expect("just built");
+
+        // Update uniforms.
+        let uniform = ChunkDdaUniform {
+            camera_pos: camera.position,
+            _pad0: 0.0,
+            camera_right: camera.right,
+            _pad1: 0.0,
+            camera_down: camera.down,
+            _pad2: 0.0,
+            camera_forward: camera.forward,
+            fov_y_rad: camera.fov_y_rad,
+            screen_size: [surface_w, surface_h],
+            vsid: resident.vsid,
+            max_scan_dist,
+        };
+        self.queue
+            .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
+
+        // Per-frame DDA bind group — references the chunk's buffers
+        // so we rebuild every frame (the resident can change between
+        // calls).
+        let dda_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("roxlap-gpu chunk_dda.bg"),
+            layout: &dda.bgl_dda,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: dda.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: resident.occupancy.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: resident.color_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: resident.colors.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&dda.storage_view),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("roxlap-gpu chunk encoder"),
+            });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("roxlap-gpu chunk_dda compute"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&dda.pipeline_dda);
+            cpass.set_bind_group(0, &dda_bg, &[]);
+            cpass.dispatch_workgroups(surface_w.div_ceil(8), surface_h.div_ceil(8), 1);
+        }
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("roxlap-gpu chunk_dda blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surf_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rpass.set_pipeline(&dda.pipeline_blit);
+            rpass.set_bind_group(0, &dda.blit_bg, &[]);
+            rpass.draw(0..3, 0..1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        surf_tex.present();
+        self.frame_count = self.frame_count.wrapping_add(1);
+    }
+
+    fn build_chunk_dda(
+        &self,
+        width: u32,
+        height: u32,
+        surface_format: wgpu::TextureFormat,
+    ) -> ChunkDdaResources {
+        let storage_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("roxlap-gpu chunk_dda.storage"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let storage_view = storage_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu chunk_dda.uniform"),
+            size: std::mem::size_of::<ChunkDdaUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let dda_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("chunk_dda.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/chunk_dda.wgsl").into()),
+            });
+        let bgl_dda = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("roxlap-gpu chunk_dda.bgl"),
+                entries: &[
+                    bgl_uniform_entry(0),
+                    bgl_storage_entry(1, true),
+                    bgl_storage_entry(2, true),
+                    bgl_storage_entry(3, true),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let dda_pl = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("roxlap-gpu chunk_dda.layout"),
+                bind_group_layouts: &[&bgl_dda],
+                push_constant_ranges: &[],
+            });
+        let pipeline_dda = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("roxlap-gpu chunk_dda.pipeline"),
+                layout: Some(&dda_pl),
+                module: &dda_shader,
+                entry_point: "render_chunk",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        // Fullscreen-triangle blit upscales the storage texture into
+        // the swapchain. Nearest filter keeps the retro pixel look.
+        let blit_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("blit.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
+            });
+        let bgl_blit = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("roxlap-gpu chunk_dda.blit_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                        count: None,
+                    },
+                ],
+            });
+        let blit_pl = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("roxlap-gpu chunk_dda.blit_layout"),
+                bind_group_layouts: &[&bgl_blit],
+                push_constant_ranges: &[],
+            });
+        let pipeline_blit = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("roxlap-gpu chunk_dda.blit_pipeline"),
+                layout: Some(&blit_pl),
+                vertex: wgpu::VertexState {
+                    module: &blit_shader,
+                    entry_point: "vs_main",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &blit_shader,
+                    entry_point: "fs_main",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("roxlap-gpu chunk_dda.blit_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("roxlap-gpu chunk_dda.blit_bg"),
+            layout: &bgl_blit,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&storage_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        ChunkDdaResources {
+            storage_size: (width, height),
+            storage_view,
+            uniform_buf,
+            bgl_dda,
+            pipeline_dda,
+            blit_bg,
+            pipeline_blit,
+            _sampler: sampler,
+        }
+    }
+}
+
+fn bgl_uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn bgl_storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
     }
 }
 

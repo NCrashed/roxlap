@@ -18,6 +18,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 
+use glam::IVec3;
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::Engine;
@@ -170,6 +171,16 @@ struct App {
     /// `ROXLAP_GPU=1` and WGPU init succeeded. Mutually exclusive
     /// with `surface`.
     gpu: Option<GpuRenderer>,
+    /// GPU.3 chunk resident — uploaded once at startup from chunk
+    /// `(0, 0, 0)` of the first grid that has one. `None` means
+    /// either the GPU path isn't active or no chunk was
+    /// materialised in time (streaming hills startup race) — the
+    /// GPU branch falls back to clear-to-colour.
+    gpu_chunk: Option<roxlap_gpu::GpuChunkResident>,
+    /// Grid-local world voxel origin of the uploaded chunk (= chunk
+    /// index × chunk size). Frame-time camera position is translated
+    /// by this before being passed to `render_chunk`.
+    gpu_chunk_origin_world: [f64; 3],
     engine: Engine,
     scene: SceneAndCamera,
     zbuffer: Vec<f32>,
@@ -224,6 +235,8 @@ impl App {
             window: None,
             surface: None,
             gpu: None,
+            gpu_chunk: None,
+            gpu_chunk_origin_world: [0.0, 0.0, 0.0],
             engine,
             scene,
             zbuffer: vec![f32::INFINITY; (WIDTH * HEIGHT) as usize],
@@ -389,17 +402,87 @@ impl App {
         }
     }
 
-    /// GPU.1 substitute for the softbuffer path: ask the GPU
-    /// renderer to clear-and-present, then re-arm the redraw loop.
-    /// The scene / camera / capture flow doesn't run yet — the GPU
-    /// renderer ignores them.
+    /// GPU.3 substitute for the softbuffer path: marches the
+    /// uploaded chunk via the GPU renderer when one is resident,
+    /// else falls back to GPU.1's clear-to-colour so the user still
+    /// sees a window. Re-arms the redraw loop.
     fn redraw_gpu(&mut self) {
-        if let Some(gpu) = self.gpu.as_mut() {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        if let Some(resident) = &self.gpu_chunk {
+            let cam = &self.scene.camera;
+            let cam_local = [
+                (self.scene.cam_pos[0] - self.gpu_chunk_origin_world[0]) as f32,
+                (self.scene.cam_pos[1] - self.gpu_chunk_origin_world[1]) as f32,
+                (self.scene.cam_pos[2] - self.gpu_chunk_origin_world[2]) as f32,
+            ];
+            let camera = roxlap_gpu::Camera {
+                position: cam_local,
+                right: [
+                    cam.right[0] as f32,
+                    cam.right[1] as f32,
+                    cam.right[2] as f32,
+                ],
+                down: [cam.down[0] as f32, cam.down[1] as f32, cam.down[2] as f32],
+                forward: [
+                    cam.forward[0] as f32,
+                    cam.forward[1] as f32,
+                    cam.forward[2] as f32,
+                ],
+                fov_y_rad: 60_f32.to_radians(),
+            };
+            let max_scan = u32::try_from(self.scan_dist.max(1)).unwrap_or(u32::MAX);
+            gpu.render_chunk(resident, &camera, max_scan);
+        } else {
             gpu.render();
         }
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+    }
+
+    /// At GPU startup, find a materialised chunk to upload. Under
+    /// streaming hills the ground (grid 0) starts empty, so we
+    /// pump the streamer once around the camera spawn pose to
+    /// force-load chunk (0, 0, 0). Falls through any grid in order
+    /// if (0, 0, 0) still isn't there. With `ROXLAP_STATIC=1` the
+    /// pump is a no-op (chunks already built).
+    fn upload_first_chunk(&mut self, gpu: &GpuRenderer) {
+        // Force-pump streaming once so the ground has chunk (0,0,0).
+        // Block on the sync variant since we want the chunk in hand
+        // *now*, not asynchronously a few frames later.
+        if self.scene.streaming_enabled {
+            self.scene
+                .scene
+                .pump_streaming_sync(glam::DVec3::from_array(self.scene.cam_pos));
+        }
+
+        // Walk grids in id order — `scene.grids()` iterates a
+        // HashMap so its order is unspecified. The ground is grid
+        // 0 by construction; we want it whenever it's present.
+        let mut grids_by_id: Vec<_> = self.scene.scene.grids().collect();
+        grids_by_id.sort_by_key(|(gid, _)| gid.raw());
+        for (gid, grid) in grids_by_id {
+            if let Some(vxl) = grid.chunk(IVec3::ZERO) {
+                let upload = roxlap_gpu::decompress_chunk(vxl);
+                let resident = roxlap_gpu::GpuChunkResident::upload(gpu.device(), &upload);
+                // For now: grid-origin-only support. GPU.5 will
+                // factor in `GridTransform`. The chunk occupies
+                // grid-local voxel-coords [0, 128) × [0, 128) ×
+                // [0, 256); under the identity transform that's
+                // also its world placement.
+                self.gpu_chunk_origin_world = [0.0; 3];
+                eprintln!(
+                    "GPU.3: uploaded chunk (0, 0, 0) of grid {} — {} KiB resident",
+                    gid.raw(),
+                    resident.resident_bytes() / 1024,
+                );
+                self.gpu_chunk = Some(resident);
+                return;
+            }
+        }
+        eprintln!("GPU.3: no chunk at (0, 0, 0) in any grid — falling back to clear-to-colour.");
     }
 
     /// Update camera position from the active input bits.
@@ -494,6 +577,7 @@ impl ApplicationHandler for App {
                 Ok(gpu) => {
                     eprintln!("roxlap-gpu: {}", gpu.adapter_info());
                     window.set_title(&format!("roxlap-scene-demo (GPU: {})", gpu.adapter_info(),));
+                    self.upload_first_chunk(&gpu);
                     self.gpu = Some(gpu);
                 }
                 Err(e) => {

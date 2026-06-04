@@ -3,16 +3,21 @@
 // storage buffers and writes its colour to `out[0]`. Output is 0
 // for empty voxels.
 //
-// Mirrors the CPU `ChunkUpload::voxel_at` logic. Used to prove the
-// upload round-trips without bit corruption.
+// Occupancy layout (z-innermost, post-GPU.3 layout swap):
+//   column (x, y) owns 8 contiguous u32 words at
+//   `col_word_base = (x + y*vsid)*8`. Bit `z & 31` in word
+//   `col_word_base + z/32` is voxel (x, y, z)'s occupancy.
+//
+// Rank-count of solid voxels at z' < z = sum of `countOneBits` over
+// the `z/32` full words plus a masked partial. Mirrors
+// `ChunkUpload::voxel_at` field-for-field.
+
+const OCC_WORDS_PER_COLUMN: u32 = 8u; // CHUNK_Z (256) / 32
 
 struct Probe {
     coord: vec3<u32>,
     vsid: u32,
     chunk_z: u32,
-    // Padding to align the storage buffer to 16 bytes. WGSL doesn't
-    // need it but it keeps the bytemuck Pod struct on the Rust side
-    // straightforward.
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
@@ -24,32 +29,32 @@ struct Probe {
 @group(0) @binding(3) var<storage, read> colors: array<u32>;
 @group(0) @binding(4) var<storage, read_write> out: array<u32, 1>;
 
-fn voxel_solid(p: vec3<u32>) -> bool {
-    if (p.x >= probe.vsid || p.y >= probe.vsid || p.z >= probe.chunk_z) {
-        return false;
-    }
-    let i = p.x + p.y * probe.vsid + p.z * probe.vsid * probe.vsid;
-    let word = occupancy[i >> 5u];
-    return (word & (1u << (i & 31u))) != 0u;
-}
-
 @compute @workgroup_size(1)
 fn debug_read() {
     let p = probe.coord;
-    if (!voxel_solid(p)) {
+    if (p.x >= probe.vsid || p.y >= probe.vsid || p.z >= probe.chunk_z) {
         out[0] = 0u;
         return;
     }
-    // Count solid voxels at z < probe.z in column (x, y) → that's
-    // the rank within color_offsets.
-    var rank: u32 = 0u;
-    let col_base = p.x + p.y * probe.vsid;
-    for (var z: u32 = 0u; z < p.z; z = z + 1u) {
-        let i = p.x + p.y * probe.vsid + z * probe.vsid * probe.vsid;
-        let word = occupancy[i >> 5u];
-        let bit = (word >> (i & 31u)) & 1u;
-        rank = rank + bit;
+    let col_idx = p.x + p.y * probe.vsid;
+    let col_word_base = col_idx * OCC_WORDS_PER_COLUMN;
+    let z_word = p.z >> 5u;
+    let z_bit = p.z & 31u;
+    let solid = (occupancy[col_word_base + z_word] >> z_bit) & 1u;
+    if (solid == 0u) {
+        out[0] = 0u;
+        return;
     }
-    let base = color_offsets[col_base];
-    out[0] = colors[base + rank];
+    // Rank: popcount the full words below z, plus mask the partial.
+    var rank: u32 = 0u;
+    for (var w: u32 = 0u; w < z_word; w = w + 1u) {
+        rank = rank + countOneBits(occupancy[col_word_base + w]);
+    }
+    var mask: u32 = 0u;
+    if (z_bit > 0u) {
+        mask = (1u << z_bit) - 1u;
+    }
+    rank = rank + countOneBits(occupancy[col_word_base + z_word] & mask);
+
+    out[0] = colors[color_offsets[col_idx] + rank];
 }

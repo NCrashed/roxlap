@@ -1,14 +1,18 @@
 //! GPU.2 — Vxl → (occupancy bitmap, colour offsets, packed colour
-//! array). Pure CPU; no wgpu deps in this module. The shape mirrors
-//! `PORTING-GPU.md` §"Data representation":
+//! array). Pure CPU; no wgpu deps in this module. Shape:
 //!
-//! * `occupancy[chx, chy, chz][x, y, z]` — 1 bit per voxel, packed
-//!   into u32s. ⌈XY·XY·Z/32⌉ words for a single chunk.
-//! * `color_offsets[chx, chy, chz][x, y]` — u32 per column = base
-//!   index into `colors` for that column's voxels in ascending z.
-//! * `colors[grid_id][...]` — packed u32 per occupied voxel. The
-//!   columns are stored back-to-back; column `(x, y)` runs from
-//!   `offsets[x + y*XY] .. offsets[x + y*XY + 1]`.
+//! * `occupancy[x, y]` is 8 contiguous u32 words covering z=0..256,
+//!   one bit per voxel with z-innermost ordering. Bit position of
+//!   voxel `(x, y, z)` is `z + (x + y*vsid)*CHUNK_Z`; the word
+//!   index is `(x + y*vsid)*8 + z/32` and the bit-in-word is `z & 31`.
+//!   This packs each column's 256 z-bits into 8 contiguous u32s so
+//!   the GPU shader can rank-count solid voxels in O(8 popcount)
+//!   instead of O(z) sequential bit fetches.
+//! * `color_offsets[x + y*vsid]` — u32 = base index into `colors`
+//!   for that column's voxels in ascending z. `vsid*vsid + 1`
+//!   entries; trailing sentinel = `colors.len()`.
+//! * `colors[..]` — packed u32 per occupied voxel, ordered first by
+//!   column index then by ascending z within the column.
 //!
 //! The voxlap slab format interleaves floor and ceiling colour
 //! ranges across slab boundaries, with implicit "bedrock" voxels
@@ -60,6 +64,12 @@ pub struct ChunkUpload {
     pub colors: Vec<u32>,
 }
 
+/// Number of u32 words per column in the occupancy bitmap
+/// (`CHUNK_Z` bits packed 32-per-word). With `CHUNK_Z = 256` this is
+/// exactly 8 — the rank-count loop in the GPU shader runs in 8
+/// iterations max.
+pub const OCC_WORDS_PER_COLUMN: u32 = CHUNK_Z / 32;
+
 impl ChunkUpload {
     /// Helper for tests / debug — looks up the colour at `(x, y, z)`
     /// if solid, else `None`. CPU-side mirror of what the GPU shader
@@ -69,20 +79,27 @@ impl ChunkUpload {
         if x >= self.vsid || y >= self.vsid || z >= CHUNK_Z {
             return None;
         }
-        let vsid = self.vsid as usize;
-        let i = (x as usize) + (y as usize) * vsid + (z as usize) * vsid * vsid;
-        let bit = (self.occupancy[i >> 5] >> (i & 31)) & 1;
+        let col_idx = (x + y * self.vsid) as usize;
+        let col_word_base = col_idx * OCC_WORDS_PER_COLUMN as usize;
+        let z_word = (z / 32) as usize;
+        let z_bit = z & 31;
+        let bit = (self.occupancy[col_word_base + z_word] >> z_bit) & 1;
         if bit == 0 {
             return None;
         }
-        // Find which colour goes here by counting solid voxels
-        // above us in the same column.
-        let col_idx = (x as usize) + (y as usize) * vsid;
+        // Rank-count solid voxels at z' < z in the same column —
+        // popcount of `z_word` full words + masked partial.
         let mut rank = 0u32;
-        for zi in 0..z {
-            let j = (x as usize) + (y as usize) * vsid + (zi as usize) * vsid * vsid;
-            rank += (self.occupancy[j >> 5] >> (j & 31)) & 1;
+        for w in 0..z_word {
+            rank += self.occupancy[col_word_base + w].count_ones();
         }
+        let mask = if z_bit == 0 {
+            0u32
+        } else {
+            (1u32 << z_bit) - 1
+        };
+        rank += (self.occupancy[col_word_base + z_word] & mask).count_ones();
+
         let base = self.color_offsets[col_idx];
         Some(self.colors[(base + rank) as usize])
     }
@@ -96,9 +113,9 @@ pub fn decompress_chunk(vxl: &Vxl) -> ChunkUpload {
     let vsid = vxl.vsid;
     let vsid_usize = vsid as usize;
     let n_cols = vsid_usize * vsid_usize;
-    let n_voxels = n_cols * (CHUNK_Z as usize);
+    let n_occ_words = n_cols * (OCC_WORDS_PER_COLUMN as usize);
 
-    let mut occupancy = vec![0u32; n_voxels.div_ceil(32)];
+    let mut occupancy = vec![0u32; n_occ_words];
     let mut color_offsets = vec![0u32; n_cols + 1];
     // Heuristic: each column ends up ~CHUNK_Z bedrock + ~10 textured
     // on average for a typical scene-demo terrain chunk.
@@ -153,9 +170,13 @@ fn decompress_column(
                 BEDROCK_RGB
             };
 
-            let voxel_idx =
-                (x as usize) + (y as usize) * vsid_usize + (z as usize) * vsid_usize * vsid_usize;
-            occupancy[voxel_idx >> 5] |= 1u32 << (voxel_idx & 31);
+            // z-innermost packing: each column owns 8 contiguous u32
+            // words covering z=0..256.
+            let col_idx = (x as usize) + (y as usize) * vsid_usize;
+            let col_word_base = col_idx * (OCC_WORDS_PER_COLUMN as usize);
+            let z_word = (z as usize) / 32;
+            let z_bit = (z as u32) & 31;
+            occupancy[col_word_base + z_word] |= 1u32 << z_bit;
             colors.push(rgb);
         }
     }
