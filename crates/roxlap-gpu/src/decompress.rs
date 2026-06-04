@@ -175,6 +175,15 @@ fn decompress_column(
             let off = ((z - ranges[range_cursor].z_start) as usize) * 4;
             let bytes = &ranges[range_cursor].colours[off..off + 4];
             let rgb = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            // Alpha = 0 means either an `empty_chunk_vxl` placeholder
+            // (chz != 0 streaming-hills layers) or a truly invisible
+            // voxel. CPU brightness multiplier would render it as
+            // pure black; treat it as air for the GPU marcher so
+            // rays through these "ceiling" placeholders fall to sky
+            // instead of hitting a black wall above the camera.
+            if (rgb >> 24) == 0 {
+                continue;
+            }
 
             // z-innermost packing: each column owns 8 contiguous u32
             // words covering z=0..256.
@@ -276,16 +285,18 @@ mod tests {
 
     /// Build a tiny `Vxl` (4×4 columns) where every column is a
     /// single-slab "one floor voxel at z=100" with colour
-    /// `0xAARRGGBB = 0x00ff_8000` (red-orange). Used as the
+    /// `0xAARRGGBB = 0x80ff_8000` (red-orange). Used as the
     /// canonical fixture for both CPU and GPU round-trip tests.
     pub(crate) fn fixture_one_voxel_per_column() -> Vxl {
         let vsid: u32 = 4;
         let n_cols = (vsid as usize) * (vsid as usize);
         let mut data = Vec::with_capacity(n_cols * 8);
         let mut column_offset = Vec::with_capacity(n_cols + 1);
-        // 0x00ff_8000 little-endian bytes = [0x00, 0x80, 0xff, 0x00]
-        // = [B=0x00, G=0x80, R=0xff, A=0x00].
-        let bgra = [0x00, 0x80, 0xff, 0x00];
+        // 0x80ff_8000 little-endian bytes = [0x00, 0x80, 0xff, 0x80]
+        // = [B=0x00, G=0x80, R=0xff, A=0x80 (neutral brightness)].
+        // Alpha=0x80 keeps the fixture non-empty under the
+        // alpha-zero placeholder filter in `decompress_column`.
+        let bgra = [0x00, 0x80, 0xff, 0x80];
         for _ in 0..n_cols {
             column_offset.push(u32::try_from(data.len()).expect("offset fits"));
             data.extend_from_slice(&[0, 100, 100, 0]); // nextptr=0, z1=100, z1c=100, z0=0
@@ -311,7 +322,7 @@ mod tests {
     fn fixture_textured_voxel_carries_slab_colour() {
         let vxl = fixture_one_voxel_per_column();
         let chunk = decompress_chunk(&vxl);
-        assert_eq!(chunk.voxel_at(1, 2, 100), Some(0x00ff_8000));
+        assert_eq!(chunk.voxel_at(1, 2, 100), Some(0x80ff_8000));
     }
 
     #[test]

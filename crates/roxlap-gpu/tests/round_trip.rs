@@ -14,14 +14,15 @@ use roxlap_gpu::{
 };
 
 /// Build a `vsid × vsid` Vxl where every column has one textured
-/// floor voxel at z=100 with colour `0x00ff_8000` (red-orange).
+/// floor voxel at z=100 with colour `0x80ff_8000` (red-orange).
 /// Identical in shape to `decompress::tests::fixture_one_voxel_per_column`.
 fn fixture_one_voxel_per_column(vsid: u32) -> Vxl {
     let n_cols = (vsid as usize) * (vsid as usize);
     let mut data: Vec<u8> = Vec::with_capacity(n_cols * 8);
     let mut column_offset: Vec<u32> = Vec::with_capacity(n_cols + 1);
-    // BGRA little-endian bytes of 0x00ff_8000.
-    let bgra = [0x00u8, 0x80, 0xff, 0x00];
+    // BGRA little-endian bytes of 0x80ff_8000 — alpha 0x80 keeps
+    // the fixture visible under the alpha-zero placeholder filter.
+    let bgra = [0x00u8, 0x80, 0xff, 0x80];
     for _ in 0..n_cols {
         column_offset.push(u32::try_from(data.len()).expect("offset fits"));
         data.extend_from_slice(&[0, 100, 100, 0]); // nextptr=0, z1=100, z1c=100, z0=0
@@ -69,14 +70,14 @@ fn round_trip_textured_voxel_matches_cpu() {
     let resident = GpuChunkResident::upload(&gpu.device, &chunk);
     eprintln!("resident bytes: {}", resident.resident_bytes());
 
-    // Textured voxels — every (x, y, 100) should read 0x00ff_8000.
+    // Textured voxels — every (x, y, 100) should read 0x80ff_8000.
     for y in 0..vxl.vsid {
         for x in 0..vxl.vsid {
             let v = resident.read_voxel_blocking(&gpu.device, &gpu.queue, x, y, 100);
             assert_eq!(
                 v,
-                Some(0x00ff_8000),
-                "GPU voxel at ({x}, {y}, 100) should be 0x00ff_8000"
+                Some(0x80ff_8000),
+                "GPU voxel at ({x}, {y}, 100) should be 0x80ff_8000"
             );
             // CPU mirror.
             assert_eq!(
@@ -153,5 +154,5 @@ fn bench_single_chunk_upload() {
 
     // Sanity check — the GPU resident sees the same first voxel.
     let v = resident.read_voxel_blocking(&gpu.device, &gpu.queue, 7, 13, 100);
-    assert_eq!(v, Some(0x00ff_8000));
+    assert_eq!(v, Some(0x80ff_8000));
 }
