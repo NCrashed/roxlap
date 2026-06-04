@@ -24,6 +24,8 @@ wgpu = "22.1"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { workspace = true }
+# GPU.2: source of `Vxl` chunks for the CPU-side decompressor.
+roxlap-formats = { path = "../roxlap-formats", version = "0.4" }
 # Shared window/event loop with the rest of the workspace. Pinned to
 # 0.30 to match `roxlap-scene-demo`'s host stack so a future
 # host-side `--gpu` integration plugs into the same App pattern.

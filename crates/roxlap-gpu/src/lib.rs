@@ -31,6 +31,14 @@
 
 #![allow(clippy::must_use_candidate)]
 
+pub mod decompress;
+pub mod headless;
+pub mod resident;
+
+pub use decompress::{decompress_chunk, ChunkUpload, BEDROCK_RGB, CHUNK_Z};
+pub use headless::HeadlessGpu;
+pub use resident::GpuChunkResident;
+
 use std::sync::Arc;
 
 use winit::window::Window;
