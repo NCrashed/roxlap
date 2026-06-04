@@ -445,17 +445,19 @@ impl App {
     /// At GPU startup, find a materialised chunk to upload. Under
     /// streaming hills the ground (grid 0) starts empty, so we
     /// pump the streamer once around the camera spawn pose to
-    /// force-load chunk (0, 0, 0). Falls through any grid in order
-    /// if (0, 0, 0) still isn't there. With `ROXLAP_STATIC=1` the
-    /// pump is a no-op (chunks already built).
+    /// force-load chunk (0, 0, 0). Then drive the per-frame bake
+    /// tracker so the chunk's lightmode-1 alphas are written
+    /// *before* we read its slab — otherwise the GPU sees the
+    /// generator's flat alphas and the render is uniformly bright.
+    /// Falls through any grid in order if (0, 0, 0) still isn't
+    /// there. With `ROXLAP_STATIC=1` `build_demo` already baked
+    /// every chunk; the pump + tracker are no-ops.
     fn upload_first_chunk(&mut self, gpu: &GpuRenderer) {
-        // Force-pump streaming once so the ground has chunk (0,0,0).
-        // Block on the sync variant since we want the chunk in hand
-        // *now*, not asynchronously a few frames later.
         if self.scene.streaming_enabled {
             self.scene
                 .scene
                 .pump_streaming_sync(glam::DVec3::from_array(self.scene.cam_pos));
+            self.bake_tracker.process(&mut self.scene.scene);
         }
 
         // Walk grids in id order — `scene.grids()` iterates a
