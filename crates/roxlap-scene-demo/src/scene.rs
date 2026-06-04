@@ -533,6 +533,12 @@ impl StreamingBakeTracker {
             let target = grid.chunks.get_mut(&target_idx).expect("populated");
             target.generate_mips(4);
             baked_set.insert(target_idx);
+            // GPU.6/7: bump chunk_version so the GPU's dirty pass
+            // re-uploads the re-baked chunk. Without this, neighbour
+            // chunks get their alphas refreshed on the CPU side but
+            // the GPU keeps the pre-bake values, producing a visible
+            // lighting seam at chunk edges when streaming.
+            grid.bump_chunk_version(target_idx);
         }
     }
 }

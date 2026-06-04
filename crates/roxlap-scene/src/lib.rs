@@ -284,7 +284,14 @@ impl Grid {
     /// has actually been written to. Pure no-op edit paths
     /// (carving from an air chunk that doesn't exist yet) skip
     /// the bump.
-    pub(crate) fn bump_chunk_version(&mut self, chunk_idx: IVec3) {
+    ///
+    /// Exposed as `pub` (vs the historical `pub(crate)`) so hosts
+    /// that mutate `grid.chunks` directly — e.g.
+    /// `roxlap-scene-demo`'s `StreamingBakeTracker` writing
+    /// lightmode-1 alphas via `apply_lighting_with_cache` — can
+    /// signal "this chunk's slab changed" to downstream consumers
+    /// like the GPU dirty-chunk poller.
+    pub fn bump_chunk_version(&mut self, chunk_idx: IVec3) {
         let entry = self.chunk_versions.entry(chunk_idx).or_insert(0);
         *entry = entry.saturating_add(1);
     }
