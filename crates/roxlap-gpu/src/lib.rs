@@ -44,7 +44,8 @@ pub use grid::{bounding_box_of, GpuGridResident, GridUpload};
 pub use headless::HeadlessGpu;
 pub use resident::GpuChunkResident;
 pub use scene::{
-    GpuSceneResident, GridRuntimeTransform, GridStaticMeta, SceneUpload, MAX_SCENE_GRIDS,
+    GpuSceneResident, GridRuntimeTransform, GridStaticMeta, RefreshOutcome, SceneUpload,
+    MAX_SCENE_GRIDS,
 };
 
 use std::sync::Arc;

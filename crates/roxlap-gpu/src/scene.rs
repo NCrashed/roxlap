@@ -23,7 +23,7 @@
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
 
-use crate::decompress::OCC_WORDS_PER_COLUMN;
+use crate::decompress::{ChunkUpload, OCC_WORDS_PER_COLUMN};
 use crate::grid::GridUpload;
 
 /// Maximum number of grids the shader's per-grid camera uniform
@@ -103,6 +103,20 @@ pub struct GpuSceneResident {
     /// Cached static metadata for the host's frame-loop
     /// `world_camera_for_grid(idx)` computations.
     pub static_meta: Vec<GridStaticMeta>,
+    /// CPU shadow of per-chunk colour-slot base offsets (in u32
+    /// words, relative to that grid's `colors_offset`). Indexed
+    /// `[scene_idx][meta_idx]`. GPU.6 `refresh_chunk` uses this
+    /// to write new colour bytes into the existing slot.
+    pub(crate) chunk_colors_base: Vec<Vec<u32>>,
+    /// Allocated colour-slot capacity per chunk (in u32 words).
+    /// `[scene_idx][meta_idx]`. `refresh_chunk` truncates a chunk's
+    /// new colour data to this length and warns on overflow.
+    pub(crate) chunk_colors_capacity: Vec<Vec<u32>>,
+    /// CPU shadow of the per-grid chunk-occupancy bitmap. Each entry
+    /// is the u32 word at `chunk_occupancy_offset + (mi >> 5)`.
+    /// `refresh_chunk` flips the right bit in this shadow + writes
+    /// the affected word back to the GPU.
+    pub(crate) chunk_occupancy_shadow: Vec<Vec<u32>>,
 }
 
 impl GpuSceneResident {
@@ -125,6 +139,9 @@ impl GpuSceneResident {
         let mut all_chunk_colors_base: Vec<u32> = Vec::new();
         let mut all_chunk_occupancy: Vec<u32> = Vec::new();
         let mut static_meta: Vec<GridStaticMeta> = Vec::with_capacity(info.grids.len());
+        let mut chunk_colors_base: Vec<Vec<u32>> = Vec::with_capacity(info.grids.len());
+        let mut chunk_colors_capacity: Vec<Vec<u32>> = Vec::with_capacity(info.grids.len());
+        let mut chunk_occupancy_shadow: Vec<Vec<u32>> = Vec::with_capacity(info.grids.len());
 
         for grid in &info.grids {
             let vsid = grid.vsid;
@@ -177,6 +194,24 @@ impl GpuSceneResident {
                 origin_chunk: grid.origin_chunk,
                 _pad2: 0,
             };
+            // Compute per-chunk slot capacities (= next-base
+            // minus this-base; last slot gets trailing bytes up to
+            // grid_colors.len()). Stored as cheap CPU shadow for
+            // GPU.6 in-place re-uploads.
+            let grid_colors_len = u32::try_from(grid_colors.len()).expect("fits");
+            let mut grid_chunk_capacity = vec![0u32; total_chunks_us];
+            for i in 0..total_chunks_us {
+                let next_base = if i + 1 < total_chunks_us {
+                    grid_chunk_colors_base[i + 1]
+                } else {
+                    grid_colors_len
+                };
+                grid_chunk_capacity[i] = next_base.saturating_sub(grid_chunk_colors_base[i]);
+            }
+            chunk_colors_base.push(grid_chunk_colors_base.clone());
+            chunk_colors_capacity.push(grid_chunk_capacity);
+            chunk_occupancy_shadow.push(grid_chunk_occupancy.clone());
+
             all_occupancy.extend_from_slice(&grid_occupancy);
             all_color_offsets.extend_from_slice(&grid_color_offsets);
             all_colors.extend_from_slice(&grid_colors);
@@ -249,18 +284,163 @@ impl GpuSceneResident {
             grid_static_meta,
             total_bytes,
             static_meta,
+            chunk_colors_base,
+            chunk_colors_capacity,
+            chunk_occupancy_shadow,
         }
     }
 
     pub fn resident_bytes(&self) -> u64 {
         self.total_bytes
     }
+
+    /// GPU.6 — refresh one chunk's data in-place. Used by the host
+    /// each frame when [`roxlap_scene::Grid::chunk_version`] reports
+    /// a bump (e.g. the streaming-hills bake tracker re-baking a
+    /// newly-installed chunk's neighbours).
+    ///
+    /// The chunk's slot in the concatenated buffers is identified
+    /// by `(scene_idx, chunk_idx)`. Occupancy + `color_offsets` are
+    /// fixed-size and always written; the colour data is written up
+    /// to the slot's allocated capacity and truncated with a stderr
+    /// warn beyond that (chunks growing past their initial colour
+    /// count is a GPU.7 follow-up — sliding-window streaming).
+    pub fn refresh_chunk(
+        &mut self,
+        queue: &wgpu::Queue,
+        scene_idx: usize,
+        chunk_idx: [i32; 3],
+        chunk: &ChunkUpload,
+    ) -> RefreshOutcome {
+        let Some(meta) = self.static_meta.get(scene_idx) else {
+            return RefreshOutcome::SceneIdxOob;
+        };
+        let dx = chunk_idx[0] - meta.origin_chunk[0];
+        let dy = chunk_idx[1] - meta.origin_chunk[1];
+        let dz = chunk_idx[2] - meta.origin_chunk[2];
+        if dx < 0
+            || dy < 0
+            || dz < 0
+            || (dx as u32) >= meta.chunks_dims[0]
+            || (dy as u32) >= meta.chunks_dims[1]
+            || (dz as u32) >= meta.chunks_dims[2]
+        {
+            return RefreshOutcome::ChunkOutOfBbox;
+        }
+        let meta_idx = ((dx as u32)
+            + (dy as u32) * meta.chunks_dims[0]
+            + (dz as u32) * meta.chunks_dims[0] * meta.chunks_dims[1])
+            as usize;
+
+        let vsid = meta.vsid as usize;
+        let cols_per_chunk = vsid * vsid;
+        let occ_words_per_chunk = cols_per_chunk * (OCC_WORDS_PER_COLUMN as usize);
+        let offsets_words_per_chunk = cols_per_chunk + 1;
+
+        assert_eq!(
+            chunk.occupancy.len(),
+            occ_words_per_chunk,
+            "refresh_chunk: occupancy length mismatch",
+        );
+        assert_eq!(
+            chunk.color_offsets.len(),
+            offsets_words_per_chunk,
+            "refresh_chunk: color_offsets length mismatch",
+        );
+
+        // ---- occupancy ----
+        let occ_word_offset = meta.occupancy_offset as usize + meta_idx * occ_words_per_chunk;
+        let occ_byte_offset = (occ_word_offset * 4) as u64;
+        queue.write_buffer(
+            &self.all_occupancy,
+            occ_byte_offset,
+            bytemuck::cast_slice(&chunk.occupancy),
+        );
+
+        // ---- color_offsets ----
+        let off_word_offset =
+            meta.color_offsets_offset as usize + meta_idx * offsets_words_per_chunk;
+        let off_byte_offset = (off_word_offset * 4) as u64;
+        queue.write_buffer(
+            &self.all_color_offsets,
+            off_byte_offset,
+            bytemuck::cast_slice(&chunk.color_offsets),
+        );
+
+        // ---- colours (truncate to slot capacity) ----
+        let slot_base = self.chunk_colors_base[scene_idx][meta_idx] as usize;
+        let slot_capacity = self.chunk_colors_capacity[scene_idx][meta_idx] as usize;
+        let new_len = chunk.colors.len();
+        let outcome = if new_len > slot_capacity {
+            eprintln!(
+                "roxlap-gpu refresh_chunk: scene_idx={scene_idx} chunk_idx={chunk_idx:?} colours \
+                 {new_len} > slot capacity {slot_capacity}; truncating (GPU.7 sliding pool fixes this)",
+            );
+            RefreshOutcome::ColorsTruncated
+        } else {
+            RefreshOutcome::Ok
+        };
+        let write_len = new_len.min(slot_capacity);
+        if write_len > 0 {
+            let colors_word_offset = meta.colors_offset as usize + slot_base;
+            let colors_byte_offset = (colors_word_offset * 4) as u64;
+            queue.write_buffer(
+                &self.all_colors,
+                colors_byte_offset,
+                bytemuck::cast_slice(&chunk.colors[..write_len]),
+            );
+        }
+
+        // ---- chunk_occupancy bit (read-modify-write the word) ----
+        let chunk_bit_word_idx = meta_idx >> 5;
+        let chunk_bit = meta_idx & 31;
+        let shadow = &mut self.chunk_occupancy_shadow[scene_idx][chunk_bit_word_idx];
+        let new_bit = !chunk.colors.is_empty();
+        let was_bit = (*shadow >> chunk_bit) & 1 == 1;
+        if new_bit != was_bit {
+            if new_bit {
+                *shadow |= 1u32 << chunk_bit;
+            } else {
+                *shadow &= !(1u32 << chunk_bit);
+            }
+            let global_word_idx = meta.chunk_occupancy_offset as usize + chunk_bit_word_idx;
+            queue.write_buffer(
+                &self.all_chunk_occupancy,
+                (global_word_idx * 4) as u64,
+                bytemuck::bytes_of(shadow),
+            );
+        }
+
+        outcome
+    }
+}
+
+/// Outcome of `GpuSceneResident::refresh_chunk`. Most callers
+/// can ignore the result; `ColorsTruncated` indicates the chunk
+/// grew past its slot capacity and GPU.7 sliding-window streaming
+/// is the proper fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    Ok,
+    /// The chunk's new colour count exceeded its pre-allocated
+    /// slot capacity. The chunk was truncated; GPU will render
+    /// the first `slot_capacity` colours.
+    ColorsTruncated,
+    /// `chunk_idx` is outside the scene's `(origin_chunk,
+    /// chunks_dims)` bbox for `scene_idx`. The chunk wasn't
+    /// refreshed; GPU.7 will install new chunks via the sliding
+    /// window.
+    ChunkOutOfBbox,
+    /// `scene_idx` is past `grid_count`. Programming error.
+    SceneIdxOob,
 }
 
 fn create_storage(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu::Buffer {
+    // GPU.6: include COPY_DST so `refresh_chunk` can `queue.write_buffer`
+    // into existing slots without rebuilding the resident.
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
         contents: bytemuck::cast_slice(data),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     })
 }
