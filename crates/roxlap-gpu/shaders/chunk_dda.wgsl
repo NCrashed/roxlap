@@ -67,12 +67,16 @@ fn voxel_color(p: vec3<i32>) -> vec3<f32> {
     rank = rank + countOneBits(occupancy[col_word_base + z_word] & mask);
     let packed = colors[color_offsets[col_idx] + rank];
     // Voxlap colour layout = 0xAARRGGBB (little-endian u32 from BGRA
-    // bytes). After unpack, R is at >>16, G at >>8, B at >>0.
-    return vec3<f32>(
-        f32((packed >> 16u) & 0xffu) / 255.0,
-        f32((packed >> 8u) & 0xffu) / 255.0,
-        f32(packed & 0xffu) / 255.0,
-    );
+    // bytes). The A byte is voxlap's "brightness" multiplier baked
+    // by lightmode-1: 0x80 (=128) is neutral; CPU rasterizer mirrors
+    // `(rgb * A) >> 7` per channel. Apply it here so GPU-rendered
+    // chunks match the CPU's baked shading.
+    let a = f32((packed >> 24u) & 0xffu);
+    let r = f32((packed >> 16u) & 0xffu);
+    let g = f32((packed >> 8u) & 0xffu);
+    let b = f32(packed & 0xffu);
+    let brightness = a * (1.0 / 128.0);
+    return vec3<f32>(r, g, b) * (brightness / 255.0);
 }
 
 // Voxlap-style two-band sky: blue zenith, lighter horizon. dir.z is
@@ -119,28 +123,26 @@ fn render_chunk(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (dir.z == 0.0) { t_max.z = 1.0e30; }
 
     var hit_color = sky_color(dir);
-    var face_shade: f32 = 1.0;
 
+    // Voxlap's lightmode-1 bake already encodes face direction +
+    // sun angle into each voxel's alpha byte (consumed in
+    // `voxel_color`), so the marcher doesn't apply additional
+    // per-face shading — that would double-darken and produce the
+    // "flat / pastel" mismatch the user flagged.
     for (var i = 0u; i < u.max_scan_dist; i = i + 1u) {
         if (voxel_solid(p)) {
-            hit_color = voxel_color(p) * face_shade;
+            hit_color = voxel_color(p);
             break;
         }
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
             p.x = p.x + step.x;
             t_max.x = t_max.x + t_delta.x;
-            face_shade = 0.78;
         } else if (t_max.y < t_max.z) {
             p.y = p.y + step.y;
             t_max.y = t_max.y + t_delta.y;
-            face_shade = 0.88;
         } else {
             p.z = p.z + step.z;
             t_max.z = t_max.z + t_delta.z;
-            // Voxlap: step.z > 0 means we stepped down (camera
-            // looking down), so we entered the voxel through its
-            // top face. Sky lights the top → bright.
-            face_shade = select(0.6, 1.0, step.z > 0);
         }
     }
 

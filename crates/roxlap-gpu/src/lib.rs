@@ -219,11 +219,19 @@ impl GpuRenderer {
             .await?;
 
         let caps = surface.get_capabilities(&adapter);
+        // Pick a NON-sRGB swapchain format. Voxlap colours are
+        // already sRGB-encoded (the slab bytes are display-ready,
+        // matching what the CPU softbuffer path writes straight to
+        // the framebuffer with no conversion). An sRGB swapchain
+        // would re-apply the gamma curve on top, producing a
+        // washed-out / pastel look that diverges from the CPU
+        // renderer. Falls back to `caps.formats[0]` only if every
+        // offered format is sRGB.
         let surface_format = caps
             .formats
             .iter()
             .copied()
-            .find(wgpu::TextureFormat::is_srgb)
+            .find(|f| !f.is_srgb())
             .unwrap_or(caps.formats[0]);
         let present_mode = if settings.uncapped_present {
             pick_present_mode(&caps.present_modes)
