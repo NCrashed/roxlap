@@ -94,6 +94,44 @@ pub(crate) const SKY_PNG_BYTES: &[u8] = SKY_PNG;
 /// are usually laid out the other way (width=azimuth,
 /// height=elevation), so `Sky::from_pixels` re-interprets the
 /// dimensions accordingly. Mirror of roxlap-host's helper.
+/// GPU.8 helper — decode `SKY_PNG` to a raw RGBA byte buffer
+/// (`width * height * 4`). The GPU sky binding wants pixels in
+/// equirectangular layout, which is exactly what the PNG already
+/// is; the host of `load_png_sky` re-interprets the CPU side but
+/// the GPU samples the original bytes directly.
+pub(crate) fn load_png_sky_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    let decoder = png::Decoder::new(png_bytes);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("png header: {e}"))?;
+    let info = reader.info();
+    let width = info.width;
+    let height = info.height;
+    let (bytes_per_pixel, has_alpha) = match info.color_type {
+        png::ColorType::Rgb => (3, false),
+        png::ColorType::Rgba => (4, true),
+        ct => return Err(format!("unsupported colour type {ct:?}; want RGB or RGBA")),
+    };
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "unsupported bit depth {:?}; want 8-bit",
+            info.bit_depth
+        ));
+    }
+    let mut src = vec![0u8; reader.output_buffer_size()];
+    reader
+        .next_frame(&mut src)
+        .map_err(|e| format!("png frame: {e}"))?;
+    let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for chunk in src.chunks_exact(bytes_per_pixel) {
+        rgba.push(chunk[0]);
+        rgba.push(chunk[1]);
+        rgba.push(chunk[2]);
+        rgba.push(if has_alpha { chunk[3] } else { 0xff });
+    }
+    Ok((rgba, width, height))
+}
+
 pub(crate) fn load_png_sky(png_bytes: &[u8]) -> Result<roxlap_core::sky::Sky, String> {
     let decoder = png::Decoder::new(png_bytes);
     let mut reader = decoder
@@ -764,10 +802,20 @@ impl ApplicationHandler for App {
         let want_gpu = std::env::var_os("ROXLAP_GPU").is_some_and(|v| v != "0" && !v.is_empty());
         if want_gpu {
             match GpuRenderer::new_blocking(window.clone(), GpuRendererSettings::default()) {
-                Ok(gpu) => {
+                Ok(mut gpu) => {
                     eprintln!("roxlap-gpu: {}", gpu.adapter_info());
                     self.title_base = format!("roxlap-scene-demo (GPU: {})", gpu.adapter_info());
                     window.set_title(&self.title_base);
+                    // GPU.8: upload the same panorama the CPU
+                    // softbuffer path samples, so the two renderers
+                    // visually agree at the horizon.
+                    match load_png_sky_rgba(SKY_PNG) {
+                        Ok((rgba, w, h)) => {
+                            gpu.set_sky_panorama(&rgba, w, h);
+                            eprintln!("roxlap-gpu: sky panorama uploaded ({w}×{h})");
+                        }
+                        Err(e) => eprintln!("roxlap-gpu: sky decode failed ({e})"),
+                    }
                     self.upload_first_scene(&gpu);
                     self.gpu = Some(gpu);
                 }

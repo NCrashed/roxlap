@@ -151,6 +151,21 @@ pub struct GpuRenderer {
     /// Lazy-built on first [`Self::render_scene`] call. Holds the
     /// multi-grid pipeline + per-grid camera uniforms.
     scene_dda: Option<SceneDdaResources>,
+    /// GPU.8 — panoramic sky texture + sampler. Created at
+    /// `new` as a 1×1 mid-grey default; [`Self::set_sky_panorama`]
+    /// replaces it. The scene-DDA bind group references this each
+    /// frame.
+    sky_texture: wgpu::Texture,
+    sky_view: wgpu::TextureView,
+    sky_sampler: wgpu::Sampler,
+    /// GPU.8 fog state. `color` is BGRA-style premultiplied (each
+    /// channel in [0, 1]); `near` is the world-t distance at which
+    /// fog starts kicking in; `far` is the distance at which it's
+    /// fully opaque. The shader does
+    /// `mix(hit, fog, smoothstep(near, far, t))`.
+    fog_color: [f32; 3],
+    fog_near: f32,
+    fog_far: f32,
 }
 
 /// Per-renderer chunk-DDA pipeline state. The compute shader writes
@@ -216,6 +231,13 @@ struct SceneDdaUniform {
     screen_size: [u32; 2],
     _pad1: [u32; 2],
     cameras: [SceneDdaPerGridCamera; SCENE_MAX_GRIDS],
+    /// GPU.8 — `[r, g, b, fog_near]`. The `near` distance is packed
+    /// into the colour's alpha channel to keep std140 alignment
+    /// tidy (a bare `f32` after the `vec4` would force extra pads).
+    fog_color: [f32; 4],
+    fog_far: f32,
+    _pad2: f32,
+    _pad3: [f32; 2],
 }
 
 #[repr(C)]
@@ -334,6 +356,45 @@ impl GpuRenderer {
         };
         surface.configure(&device, &surface_config);
 
+        // GPU.8 default sky: a 1×1 mid-grey texture. Hosts replace
+        // it via `set_sky_panorama` with a real equirectangular
+        // panorama; the default stops the shader sampling
+        // uninitialised memory before that happens.
+        let default_sky_pixel = [0x80u8, 0x80, 0x80, 0xff];
+        let (sky_texture, sky_view) = create_sky_texture(&device, 1, 1, &default_sky_pixel);
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &sky_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &default_sky_pixel,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let sky_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("roxlap-gpu sky_sampler"),
+            // Voxlap-convention panorama: u = elevation [0, 1]
+            // (Repeat is a no-op since values don't go outside),
+            // v = azimuth (wraps 360° — Repeat is required).
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         Ok(Self {
             window,
             surface,
@@ -346,6 +407,16 @@ impl GpuRenderer {
             chunk_dda: None,
             grid_dda: None,
             scene_dda: None,
+            sky_texture,
+            sky_view,
+            sky_sampler,
+            // Fog disabled by default — voxlap's CPU rasterizer
+            // also runs without fog in the scene-demo, so matching
+            // it means no GPU fog out of the box. Hosts can opt in
+            // via `set_fog` (e.g. for atmospheric far-LOD masking).
+            fog_color: [0.66, 0.74, 0.88],
+            fog_near: 0.0,
+            fog_far: 1.0e30,
         })
     }
 
@@ -381,6 +452,60 @@ impl GpuRenderer {
     /// (`GpuChunkResident::read_voxel_blocking(gpu.device(), gpu.queue(), …)`).
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    /// GPU.8 — upload an equirectangular panorama as the scene's
+    /// sky texture. `rgba` is row-major, `width × height` pixels,
+    /// 4 bytes per pixel (R, G, B, A). The shader samples it with
+    /// `u = atan2(dir.x, dir.y) / (2π) + 0.5` (azimuth) and
+    /// `v = acos(-dir.z) / π` (elevation), matching standard
+    /// equirectangular layout (top of image = zenith for voxlap's
+    /// `+z = down` basis).
+    ///
+    /// # Panics
+    /// If `rgba.len() != (width * height * 4) as usize`.
+    pub fn set_sky_panorama(&mut self, rgba: &[u8], width: u32, height: u32) {
+        assert_eq!(
+            rgba.len(),
+            (width as usize) * (height as usize) * 4,
+            "set_sky_panorama: expected w*h*4 bytes, got {}",
+            rgba.len(),
+        );
+        let (tex, view) = create_sky_texture(&self.device, width, height, rgba);
+        // Upload pixel data via `queue.write_texture` so we don't
+        // have to map the buffer manually.
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.sky_texture = tex;
+        self.sky_view = view;
+    }
+
+    /// GPU.8 — set the fog blend. `color` is per-channel [0, 1];
+    /// `near`/`far` are world-space ray distances in voxel units.
+    /// Hits with `t < near` show their full colour; hits with
+    /// `t > far` show `color` exclusively; in between is a
+    /// smoothstep blend.
+    pub fn set_fog(&mut self, color: [f32; 3], near: f32, far: f32) {
+        self.fog_color = color;
+        self.fog_near = near;
+        self.fog_far = far.max(near + 1.0);
     }
 
     /// Re-configure the swapchain to a new physical size. Call from
@@ -1152,6 +1277,15 @@ impl GpuRenderer {
             screen_size: [surface_w, surface_h],
             _pad1: [0; 2],
             cameras: cam_array,
+            fog_color: [
+                self.fog_color[0],
+                self.fog_color[1],
+                self.fog_color[2],
+                self.fog_near,
+            ],
+            fog_far: self.fog_far,
+            _pad2: 0.0,
+            _pad3: [0.0; 2],
         };
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
@@ -1195,6 +1329,14 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(&dda.storage_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&self.sky_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::Sampler(&self.sky_sampler),
                 },
             ],
         });
@@ -1293,6 +1435,23 @@ impl GpuRenderer {
                             format: wgpu::TextureFormat::Rgba8Unorm,
                             view_dimension: wgpu::TextureViewDimension::D2,
                         },
+                        count: None,
+                    },
+                    // GPU.8 sky panorama + sampler.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
                 ],
@@ -1440,6 +1599,34 @@ fn bgl_storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntr
         },
         count: None,
     }
+}
+
+/// Create a fresh sky panorama texture sized `width × height` with
+/// the initial pixel data uploaded via `write_texture`. Used by
+/// `GpuRenderer::new` (1×1 default) and `set_sky_panorama` (host-
+/// supplied panorama).
+fn create_sky_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    _initial_pixels: &[u8],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("roxlap-gpu sky_texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
 }
 
 /// GPU.4 needs to upload a whole grid (~hundreds of MiB) as a few

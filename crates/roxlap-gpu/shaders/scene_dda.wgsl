@@ -55,6 +55,13 @@ struct Uniforms {
     screen_size: vec2<u32>,
     _pad1: vec2<u32>,
     cameras: array<PerGridCamera, 16>,
+    // GPU.8 fog. `fog_color.rgb` is the colour we blend toward at
+    // far distances. `fog_color.w` is `fog_near`, packed with the
+    // colour to keep std140 alignment simple.
+    fog_color: vec4<f32>,
+    fog_far: f32,
+    _pad2: f32,
+    _pad3: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -67,6 +74,9 @@ struct Uniforms {
 // GPU.7: per-slot chunk_idx, vec3<i32> with std430 16-byte stride.
 @group(0) @binding(7) var<storage, read> all_slot_chunk_idx: array<vec3<i32>>;
 @group(0) @binding(8) var output: texture_storage_2d<rgba8unorm, write>;
+// GPU.8: panoramic sky.
+@group(0) @binding(9) var sky_texture: texture_2d<f32>;
+@group(0) @binding(10) var sky_sampler: sampler;
 
 fn voxel_solid_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> bool {
     let m = grid_static_meta[g];
@@ -140,11 +150,32 @@ fn chunk_has_content(g: u32, slot_idx: u32, chunk_idx: vec3<i32>) -> bool {
         & (1u << (slot_idx & 31u))) != 0u;
 }
 
+// Voxlap-convention sky sample. The bundled `assets/sky.png` is
+// `width = elevation` (horizon → zenith), `height = azimuth`
+// (wraps 360°) — the OPPOSITE axes of a standard equirectangular
+// panorama. We sample `(elevation, azimuth)` in `(u, v)` to match
+// the CPU rasterizer's orientation, and rely on the sampler's
+// `Repeat` mode on both axes (elevation values stay in [0, 1] so
+// Repeat is a no-op there; azimuth needs the wrap).
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
-    let down_amount = clamp(dir.z * 0.5 + 0.5, 0.0, 1.0);
-    let zenith = vec3<f32>(0.18, 0.28, 0.55);
-    let horizon = vec3<f32>(0.66, 0.74, 0.88);
-    return mix(zenith, horizon, down_amount);
+    let pi = 3.1415926535897932;
+    let azimuth = atan2(dir.x, dir.y) * (0.5 / pi) + 0.5;
+    let elevation = clamp(acos(-dir.z) * (1.0 / pi), 0.0, 1.0);
+    return textureSampleLevel(
+        sky_texture,
+        sky_sampler,
+        vec2<f32>(elevation, azimuth),
+        0.0,
+    ).rgb;
+}
+
+// GPU.8 fog blend. `t` is the world-space hit distance; below
+// `fog_near` the hit shows through fully; above `fog_far` only the
+// fog colour shows. Smoothstep gives a soft mid-band.
+fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
+    let fog_near = u.fog_color.w;
+    let factor = smoothstep(fog_near, u.fog_far, t);
+    return mix(hit_color, u.fog_color.rgb, factor);
 }
 
 fn shield_parallel(t_max: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
@@ -229,7 +260,10 @@ fn march_grid(
                     if (t_hit < best_t) {
                         out.hit = true;
                         out.t = t_hit;
-                        out.color = voxel_color_in(g, slot_id, p_voxel);
+                        out.color = apply_fog(
+                            voxel_color_in(g, slot_id, p_voxel),
+                            t_hit,
+                        );
                         return out;
                     } else {
                         return out;
