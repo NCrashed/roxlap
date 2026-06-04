@@ -49,7 +49,7 @@ impl HeadlessGpu {
                 &wgpu::DeviceDescriptor {
                     label: Some("roxlap-gpu headless device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: crate::pick_required_limits(&adapter.limits()),
                     memory_hints: wgpu::MemoryHints::default(),
                 },
                 None,
