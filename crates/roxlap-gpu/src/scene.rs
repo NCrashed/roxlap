@@ -32,6 +32,23 @@ use crate::grid::GridUpload;
 /// the shader. The runtime check rejects scenes that overflow.
 pub const MAX_SCENE_GRIDS: u32 = 16;
 
+/// Per-chunk colour-slot stride, in u32 words (256 KiB). Each
+/// chunk's colour data lives at `meta_idx * COLORS_PER_CHUNK_WORDS`
+/// within its grid's colours range. Fixed-stride layout means
+/// every slot — present or absent at upload time — has the same
+/// capacity, so [`GpuSceneResident::refresh_chunk`] can always
+/// write new colour data into the slot when a chunk arrives via
+/// streaming or is re-baked.
+///
+/// 65536 u32s = 256 KiB. Scene-demo's densest ground-hills chunks
+/// run ~36 k colour entries (~144 KiB) — multiple textured voxels
+/// per column at slopes/cliffs; 256 KiB gives ~1.8× headroom.
+/// Memory cost on the demo's 32×32×1 static grid: 1024 slots ×
+/// 256 KiB = 256 MiB colours (~830 MiB resident scene total).
+/// Chunks past the cap truncate with a stderr warn; GPU.7
+/// sliding-window storage removes the cap entirely.
+pub const COLORS_PER_CHUNK_WORDS: u32 = 65536;
+
 /// Per-grid runtime transform — voxlap-style (world → grid-local).
 /// `rotation` is column-major and encodes the inverse rotation
 /// applied to the world camera basis before passing it to that
@@ -153,8 +170,17 @@ impl GpuSceneResident {
 
             let mut grid_occupancy = vec![0u32; total_chunks_us * occ_words_per_chunk];
             let mut grid_color_offsets = vec![0u32; total_chunks_us * offsets_words_per_chunk];
-            let mut grid_colors: Vec<u32> = Vec::new();
+            // Fixed-stride colours: every slot reserves
+            // `COLORS_PER_CHUNK_WORDS` u32 words regardless of
+            // whether the chunk exists at upload time. Lets GPU.6
+            // `refresh_chunk` always have space when a chunk
+            // streams into a previously-empty slot.
+            let colors_stride = COLORS_PER_CHUNK_WORDS as usize;
+            let mut grid_colors = vec![0u32; total_chunks_us * colors_stride];
             let mut grid_chunk_colors_base = vec![0u32; total_chunks_us];
+            for i in 0..total_chunks_us {
+                grid_chunk_colors_base[i] = (i * colors_stride) as u32;
+            }
             let mut grid_chunk_occupancy = vec![0u32; total_chunks_us.div_ceil(32)];
 
             for (chunk_idx, chunk) in &grid.chunks {
@@ -169,15 +195,21 @@ impl GpuSceneResident {
                 let off_start = mi * offsets_words_per_chunk;
                 grid_color_offsets[off_start..off_start + offsets_words_per_chunk]
                     .copy_from_slice(&chunk.color_offsets);
-                grid_chunk_colors_base[mi] =
-                    u32::try_from(grid_colors.len()).expect("colours fit in u32");
-                grid_colors.extend_from_slice(&chunk.colors);
+
+                let slot_start = mi * colors_stride;
+                let n = chunk.colors.len().min(colors_stride);
+                if chunk.colors.len() > colors_stride {
+                    eprintln!(
+                        "roxlap-gpu SceneUpload: scene grid chunk {chunk_idx:?} has {} colours \
+                         > COLORS_PER_CHUNK_WORDS ({colors_stride}); truncating",
+                        chunk.colors.len(),
+                    );
+                }
+                grid_colors[slot_start..slot_start + n].copy_from_slice(&chunk.colors[..n]);
+
                 if !chunk.colors.is_empty() {
                     grid_chunk_occupancy[mi >> 5] |= 1u32 << (mi & 31);
                 }
-            }
-            if grid_colors.is_empty() {
-                grid_colors.push(0);
             }
 
             let meta = GridStaticMeta {
@@ -194,20 +226,11 @@ impl GpuSceneResident {
                 origin_chunk: grid.origin_chunk,
                 _pad2: 0,
             };
-            // Compute per-chunk slot capacities (= next-base
-            // minus this-base; last slot gets trailing bytes up to
-            // grid_colors.len()). Stored as cheap CPU shadow for
-            // GPU.6 in-place re-uploads.
-            let grid_colors_len = u32::try_from(grid_colors.len()).expect("fits");
-            let mut grid_chunk_capacity = vec![0u32; total_chunks_us];
-            for i in 0..total_chunks_us {
-                let next_base = if i + 1 < total_chunks_us {
-                    grid_chunk_colors_base[i + 1]
-                } else {
-                    grid_colors_len
-                };
-                grid_chunk_capacity[i] = next_base.saturating_sub(grid_chunk_colors_base[i]);
-            }
+            // Fixed-stride slots: every chunk gets COLORS_PER_CHUNK_WORDS.
+            // `chunk_colors_base[i] = i * stride`, derivable but cached
+            // for the symmetry with `chunk_colors_capacity` (both
+            // referenced by GPU.6 `refresh_chunk`).
+            let grid_chunk_capacity = vec![COLORS_PER_CHUNK_WORDS; total_chunks_us];
             chunk_colors_base.push(grid_chunk_colors_base.clone());
             chunk_colors_capacity.push(grid_chunk_capacity);
             chunk_occupancy_shadow.push(grid_chunk_occupancy.clone());
