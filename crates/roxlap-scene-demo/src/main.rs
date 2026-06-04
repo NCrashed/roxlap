@@ -170,11 +170,15 @@ struct App {
     /// `ROXLAP_GPU=1` and WGPU init succeeded. Mutually exclusive
     /// with `surface`.
     gpu: Option<GpuRenderer>,
-    /// GPU.4 grid resident — uploaded once at startup from grid 0
-    /// (the ground). `None` means either the GPU path isn't active
-    /// or grid 0 had no materialised chunks at startup time; the
-    /// GPU branch falls back to clear-to-colour.
-    gpu_grid: Option<roxlap_gpu::GpuGridResident>,
+    /// GPU.5 scene resident — every grid (ground + ship + markers)
+    /// uploaded once at startup. `None` means the GPU path isn't
+    /// active or the scene had no materialised chunks; the GPU
+    /// branch falls back to clear-to-colour.
+    gpu_scene: Option<roxlap_gpu::GpuSceneResident>,
+    /// Grid IDs in the order they were uploaded — index in this
+    /// vec = the grid's index in `scene_dda`'s per-grid camera
+    /// array. Recomputed per frame from `scene.grid(gid).transform`.
+    gpu_scene_grid_ids: Vec<roxlap_scene::GridId>,
     engine: Engine,
     scene: SceneAndCamera,
     zbuffer: Vec<f32>,
@@ -236,7 +240,8 @@ impl App {
             window: None,
             surface: None,
             gpu: None,
-            gpu_grid: None,
+            gpu_scene: None,
+            gpu_scene_grid_ids: Vec::new(),
             engine,
             scene,
             zbuffer: vec![f32::INFINITY; (WIDTH * HEIGHT) as usize],
@@ -424,48 +429,60 @@ impl App {
         self.tick_fps();
     }
 
-    /// GPU.4 substitute for the softbuffer path: marches the
-    /// uploaded grid via the GPU renderer's outer-DDA + chunk
-    /// skipping when one is resident, else falls back to GPU.1's
-    /// clear-to-colour so the user still sees a window. Re-arms
-    /// the redraw loop.
+    /// GPU.5 substitute for the softbuffer path: builds per-grid
+    /// cameras (world → grid-local via inverse `GridTransform`)
+    /// and dispatches the multi-grid scene marcher. Falls back to
+    /// GPU.1's clear-to-colour when no scene is resident.
     fn redraw_gpu(&mut self) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        if let Some(resident) = &self.gpu_grid {
-            let cam = &self.scene.camera;
-            // Grid 0 has GridTransform::at(origin) → world == grid-
-            // local. Per-grid transforms land in GPU.5.
-            let camera = roxlap_gpu::Camera {
-                position: [
-                    self.scene.cam_pos[0] as f32,
-                    self.scene.cam_pos[1] as f32,
-                    self.scene.cam_pos[2] as f32,
-                ],
-                right: [
-                    cam.right[0] as f32,
-                    cam.right[1] as f32,
-                    cam.right[2] as f32,
-                ],
-                down: [cam.down[0] as f32, cam.down[1] as f32, cam.down[2] as f32],
-                forward: [
-                    cam.forward[0] as f32,
-                    cam.forward[1] as f32,
-                    cam.forward[2] as f32,
-                ],
-                fov_y_rad: 60_f32.to_radians(),
-            };
-            // `scan_dist` is in voxels but the outer DDA counts
-            // chunks. Convert by dividing by the smaller chunk
-            // extent (CHUNK_SIZE_XY) so the scan-distance slider
-            // still maps to "visible depth" in roughly the same
-            // units. Add headroom so the slider's typical range
-            // covers the demo's 32-chunk ground.
+        if let Some(resident) = &self.gpu_scene {
+            let world_cam = &self.scene.camera;
+            let world_pos = glam::DVec3::from_array(self.scene.cam_pos);
+            let world_right = glam::DVec3::from_array(world_cam.right);
+            let world_down = glam::DVec3::from_array(world_cam.down);
+            let world_forward = glam::DVec3::from_array(world_cam.forward);
+
+            let mut cameras: Vec<roxlap_gpu::Camera> =
+                Vec::with_capacity(self.gpu_scene_grid_ids.len());
+            for gid in &self.gpu_scene_grid_ids {
+                let Some(grid) = self.scene.scene.grid(*gid) else {
+                    cameras.push(roxlap_gpu::Camera::default());
+                    continue;
+                };
+                let inv_rot = grid.transform.rotation.inverse();
+                let local_pos = inv_rot * (world_pos - grid.transform.origin);
+                let local_right = inv_rot * world_right;
+                let local_down = inv_rot * world_down;
+                let local_forward = inv_rot * world_forward;
+                cameras.push(roxlap_gpu::Camera {
+                    position: [local_pos.x as f32, local_pos.y as f32, local_pos.z as f32],
+                    right: [
+                        local_right.x as f32,
+                        local_right.y as f32,
+                        local_right.z as f32,
+                    ],
+                    down: [
+                        local_down.x as f32,
+                        local_down.y as f32,
+                        local_down.z as f32,
+                    ],
+                    forward: [
+                        local_forward.x as f32,
+                        local_forward.y as f32,
+                        local_forward.z as f32,
+                    ],
+                    // fov is passed separately to render_scene; the
+                    // per-grid Camera's fov field is unused.
+                    fov_y_rad: 60_f32.to_radians(),
+                });
+            }
+
             let chunks_visible = u32::try_from(self.scan_dist.max(1)).unwrap_or(u32::MAX)
                 / roxlap_scene::CHUNK_SIZE_XY
                 + 4;
-            gpu.render_grid(resident, &camera, chunks_visible);
+            gpu.render_scene(resident, &cameras, 60_f32.to_radians(), chunks_visible);
         } else {
             gpu.render();
         }
@@ -475,13 +492,11 @@ impl App {
         self.tick_fps();
     }
 
-    /// At GPU startup, decompress every materialised chunk of the
-    /// lowest-id grid (= ground = grid 0) and upload it as one
-    /// `GpuGridResident`. Under streaming hills the ground starts
-    /// empty; we sync-pump the streamer around the camera spawn
-    /// pose and drive the bake tracker so freshly-installed chunks
-    /// have lightmode-1 alphas before they leave the CPU side.
-    fn upload_first_grid(&mut self, gpu: &GpuRenderer) {
+    /// At GPU startup, decompress every materialised chunk of
+    /// every grid and upload them as one `GpuSceneResident`.
+    /// Records the grid-id order so `redraw_gpu` can recompute
+    /// per-grid cameras from each grid's runtime `GridTransform`.
+    fn upload_first_scene(&mut self, gpu: &GpuRenderer) {
         if self.scene.streaming_enabled {
             self.scene
                 .scene
@@ -489,16 +504,25 @@ impl App {
             self.bake_tracker.process(&mut self.scene.scene);
         }
 
-        // Pick the lowest-id grid that has any chunks; for the demo
-        // that's the ground (grid 0). HashMap iteration is
-        // unspecified so we sort.
         let mut grids_by_id: Vec<_> = self.scene.scene.grids().collect();
         grids_by_id.sort_by_key(|(gid, _)| gid.raw());
+
+        let mut scene_grids: Vec<roxlap_gpu::GridUpload> = Vec::new();
+        let mut scene_grid_ids: Vec<roxlap_scene::GridId> = Vec::new();
+        let mut total_chunks_uploaded = 0usize;
+        let t0 = Instant::now();
         for (gid, grid) in grids_by_id {
             if grid.chunks.is_empty() {
                 continue;
             }
-            let t0 = Instant::now();
+            if scene_grids.len() == roxlap_gpu::MAX_SCENE_GRIDS as usize {
+                eprintln!(
+                    "GPU.5: scene cap ({} grids) reached — skipping grid {}+",
+                    roxlap_gpu::MAX_SCENE_GRIDS,
+                    gid.raw(),
+                );
+                break;
+            }
             let chunk_idxs: Vec<[i32; 3]> = grid.chunks.keys().map(|i| [i.x, i.y, i.z]).collect();
             let Some((origin_chunk, chunks_dims)) =
                 roxlap_gpu::bounding_box_of(chunk_idxs.iter().copied())
@@ -510,28 +534,33 @@ impl App {
                 .iter()
                 .map(|(idx, vxl)| ([idx.x, idx.y, idx.z], roxlap_gpu::decompress_chunk(vxl)))
                 .collect();
-            let info = roxlap_gpu::GridUpload {
+            total_chunks_uploaded += chunks.len();
+            scene_grids.push(roxlap_gpu::GridUpload {
                 vsid: roxlap_scene::CHUNK_SIZE_XY,
                 origin_chunk,
                 chunks_dims,
                 chunks,
-            };
-            let resident = roxlap_gpu::GpuGridResident::upload(gpu.device(), &info);
-            let upload_dt = t0.elapsed();
-            eprintln!(
-                "GPU.4: uploaded grid {} — {} chunks ({}×{}×{}), {:.1} MiB resident in {:.2?}",
-                gid.raw(),
-                grid.chunks.len(),
-                chunks_dims[0],
-                chunks_dims[1],
-                chunks_dims[2],
-                resident.resident_bytes() as f64 / (1024.0 * 1024.0),
-                upload_dt,
-            );
-            self.gpu_grid = Some(resident);
+            });
+            scene_grid_ids.push(gid);
+        }
+
+        if scene_grids.is_empty() {
+            eprintln!("GPU.5: no grids materialised — falling back to clear-to-colour.");
             return;
         }
-        eprintln!("GPU.4: no grids materialised — falling back to clear-to-colour.");
+
+        let info = roxlap_gpu::SceneUpload { grids: scene_grids };
+        let resident = roxlap_gpu::GpuSceneResident::upload(gpu.device(), &info);
+        let upload_dt = t0.elapsed();
+        eprintln!(
+            "GPU.5: uploaded scene — {} grids, {} chunks total, {:.1} MiB resident in {:.2?}",
+            scene_grid_ids.len(),
+            total_chunks_uploaded,
+            resident.resident_bytes() as f64 / (1024.0 * 1024.0),
+            upload_dt,
+        );
+        self.gpu_scene = Some(resident);
+        self.gpu_scene_grid_ids = scene_grid_ids;
     }
 
     /// Update camera position from the active input bits.
@@ -627,7 +656,7 @@ impl ApplicationHandler for App {
                     eprintln!("roxlap-gpu: {}", gpu.adapter_info());
                     self.title_base = format!("roxlap-scene-demo (GPU: {})", gpu.adapter_info());
                     window.set_title(&self.title_base);
-                    self.upload_first_grid(&gpu);
+                    self.upload_first_scene(&gpu);
                     self.gpu = Some(gpu);
                 }
                 Err(e) => {

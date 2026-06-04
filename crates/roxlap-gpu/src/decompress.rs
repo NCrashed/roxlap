@@ -34,7 +34,8 @@
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
     clippy::many_single_char_names,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::verbose_bit_mask
 )]
 
 use roxlap_formats::vxl::Vxl;
@@ -175,13 +176,17 @@ fn decompress_column(
             let off = ((z - ranges[range_cursor].z_start) as usize) * 4;
             let bytes = &ranges[range_cursor].colours[off..off + 4];
             let rgb = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            // Alpha = 0 means either an `empty_chunk_vxl` placeholder
-            // (chz != 0 streaming-hills layers) or a truly invisible
-            // voxel. CPU brightness multiplier would render it as
-            // pure black; treat it as air for the GPU marcher so
-            // rays through these "ceiling" placeholders fall to sky
-            // instead of hitting a black wall above the camera.
-            if (rgb >> 24) == 0 {
+            // `empty_chunk_vxl`'s placeholder voxel at z=255 keeps
+            // the seed bytes [0, 0, 0, 0] for unbaked chunks
+            // (streaming-hills chz != 0 layers) and [_, 0, 0, 0]
+            // for baked ones (ship grid, markers). The RGB stays
+            // zero either way. CPU brightness multiplier renders
+            // that as pure black, but voxlap CPU rendering avoids
+            // showing it via column-walk logic; treat such voxels
+            // as air on the GPU so the bug doesn't fire as "black
+            // ceiling above the camera" / "black floor below the
+            // ship".
+            if (rgb & 0x00ff_ffff) == 0 {
                 continue;
             }
 
