@@ -22,9 +22,12 @@ use std::time::Instant;
 
 use glam::IVec3;
 
+use roxlap_core::camera_math;
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::rasterizer::ScratchPool;
+use roxlap_core::sprite::{draw_sprite, DrawTarget, SpriteLighting};
 use roxlap_core::Engine;
+use roxlap_formats::sprite::Sprite;
 use roxlap_gpu::{GpuRenderer, GpuRendererSettings};
 use roxlap_scene::render::render_scene_composed;
 use winit::application::ApplicationHandler;
@@ -165,6 +168,21 @@ pub(crate) fn load_png_sky(png_bytes: &[u8]) -> Result<roxlap_core::sky::Sky, St
     }
     Ok(roxlap_core::sky::Sky::from_pixels(pixels, png_w, png_h))
 }
+/// GPU.9 — assemble the demo's KV6 sprites. Currently a single
+/// `coco.kv6` placed at the same world position the throwaway
+/// KV6-as-grid prototype used (~30 voxels in front of camera
+/// spawn). Returns an empty `Vec` if the embedded asset fails to
+/// parse, so the demo keeps booting either way.
+fn build_sprites() -> Vec<Sprite> {
+    match kv6_sprite::load_coco_kv6() {
+        Ok(kv6) => vec![Sprite::axis_aligned(kv6, [-5.0, -90.0, 30.0])],
+        Err(e) => {
+            eprintln!("kv6_sprite: load_coco_kv6 failed ({e}); skipping sprite");
+            Vec::new()
+        }
+    }
+}
+
 const FAST_MULT: f64 = 4.0;
 const MOUSE_SENS: f64 = 0.0025;
 /// Pitch clamped just shy of ±90° so the basis stays well-conditioned.
@@ -240,6 +258,11 @@ struct App {
     /// Live-adjustable scan distance (voxels). `+` / `-` bump it
     /// by `SCAN_DIST_STEP`; clamped to `[SCAN_DIST_MIN, SCAN_DIST_MAX]`.
     scan_dist: i32,
+    /// GPU.9 KV6 sprites. Drawn by `roxlap_core::sprite::draw_sprite`
+    /// each frame after the heightmap renderer composites the
+    /// world — z-test arbitrates between the splat and the
+    /// opticast pixels. GPU rendering of sprites is a follow-up.
+    sprites: Vec<Sprite>,
     /// Post-S7.6: lighting + mip bake driver for streaming grids.
     /// Runs each frame right after `pump_streaming`; bakes any
     /// newly-installed chunks (and re-bakes their 4 cardinal
@@ -299,6 +322,7 @@ impl App {
             last_frame: Instant::now(),
             capture_pending: false,
             scan_dist: SCAN_DIST_INITIAL,
+            sprites: build_sprites(),
             bake_tracker: StreamingBakeTracker::new(),
             title_base: "roxlap-scene-demo".to_string(),
             fps_frames: 0,
@@ -439,6 +463,32 @@ impl App {
             sky,
             self.engine.sky(),
         );
+
+        // GPU.9 KV6 splatter — voxlap's traditional sprite render
+        // (camera-facing voxel quads, z-tested against the world).
+        // Runs AFTER `render_scene_composed` so sprites layer on top
+        // of the heightmap world and arbitrate via the zbuffer.
+        if !self.sprites.is_empty() {
+            let cam_state = camera_math::derive(
+                &self.scene.camera,
+                size.width,
+                size.height,
+                settings.hx,
+                settings.hy,
+                settings.hz,
+            );
+            let lighting = SpriteLighting::from_engine(&self.engine);
+            let mut target = DrawTarget::new(
+                &mut buffer,
+                &mut self.zbuffer[..pixel_count],
+                pitch_pixels,
+                size.width,
+                size.height,
+            );
+            for sprite in &self.sprites {
+                let _written = draw_sprite(&mut target, &cam_state, &settings, &lighting, sprite);
+            }
+        }
 
         if self.capture_pending {
             self.capture_pending = false;
