@@ -64,12 +64,19 @@ struct Uniforms {
     // active this is 1 and `render_scene` records `best_t` per
     // pixel; otherwise 0 and the no-sprite path stays unchanged.
     write_depth: u32,
-    _pad2: f32,
-    _pad3: f32,
+    // Occupancy paging: words per storage page, and the number of
+    // real pages. `occ_num_pages == 1` (multi-GiB GPUs) takes a
+    // branch-free single-page read.
+    occ_page_words: u32,
+    occ_num_pages: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> all_occupancy: array<u32>;
+// Occupancy is split across up to MAX_OCC_PAGES (=4) storage
+// bindings so no single binding exceeds the device limit. Page 0 is
+// binding 1; pages 1..3 are bindings 12..14. `occ_word()` maps a
+// global word index to its page. See scene::split_occupancy_pages.
+@group(0) @binding(1) var<storage, read> occ_page0: array<u32>;
 @group(0) @binding(2) var<storage, read> all_color_offsets: array<u32>;
 @group(0) @binding(3) var<storage, read> all_colors: array<u32>;
 @group(0) @binding(4) var<storage, read> all_chunk_colors_base: array<u32>;
@@ -84,6 +91,26 @@ struct Uniforms {
 // GPU.9: per-pixel world-t depth (f32 bits as u32). Written here
 // when `u.write_depth != 0`, read+tested by the sprite splatter.
 @group(0) @binding(11) var<storage, read_write> depth_buffer: array<u32>;
+// Occupancy pages 1..3 (page 0 is binding 1). Unused pages bind a
+// 1-word dummy and are never indexed.
+@group(0) @binding(12) var<storage, read> occ_page1: array<u32>;
+@group(0) @binding(13) var<storage, read> occ_page2: array<u32>;
+@group(0) @binding(14) var<storage, read> occ_page3: array<u32>;
+
+// Read one occupancy word by global index, selecting its page.
+// Single-page scenes (multi-GiB GPUs) skip the division — the
+// branch is uniform across the workgroup, so it's effectively free.
+fn occ_word(i: u32) -> u32 {
+    if (u.occ_num_pages <= 1u) {
+        return occ_page0[i];
+    }
+    let page = i / u.occ_page_words;
+    let local = i % u.occ_page_words;
+    if (page == 0u) { return occ_page0[local]; }
+    if (page == 1u) { return occ_page1[local]; }
+    if (page == 2u) { return occ_page2[local]; }
+    return occ_page3[local];
+}
 
 fn voxel_solid_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> bool {
     let m = grid_static_meta[g];
@@ -93,7 +120,7 @@ fn voxel_solid_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> bool {
     let col_word_base = occ_base + col_idx * OCC_WORDS_PER_COLUMN;
     let z_word = u32(p_voxel.z) >> 5u;
     let z_bit = u32(p_voxel.z) & 31u;
-    return (all_occupancy[col_word_base + z_word] & (1u << z_bit)) != 0u;
+    return (occ_word(col_word_base + z_word) & (1u << z_bit)) != 0u;
 }
 
 fn voxel_color_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> vec3<f32> {
@@ -107,13 +134,13 @@ fn voxel_color_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> vec3<f32> {
 
     var rank: u32 = 0u;
     for (var w: u32 = 0u; w < z_word; w = w + 1u) {
-        rank = rank + countOneBits(all_occupancy[col_word_base + w]);
+        rank = rank + countOneBits(occ_word(col_word_base + w));
     }
     var mask: u32 = 0u;
     if (z_bit > 0u) {
         mask = (1u << z_bit) - 1u;
     }
-    rank = rank + countOneBits(all_occupancy[col_word_base + z_word] & mask);
+    rank = rank + countOneBits(occ_word(col_word_base + z_word) & mask);
 
     let offsets_base = m.color_offsets_offset + meta_id * (cols_per_chunk + 1u);
     let chunk_local_offset = all_color_offsets[offsets_base + col_idx];

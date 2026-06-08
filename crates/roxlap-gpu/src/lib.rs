@@ -262,8 +262,13 @@ struct SceneDdaUniform {
     /// GPU.9 — `1` when the sprite pass is active (scene pass then
     /// records `best_t` into the depth buffer), `0` otherwise.
     write_depth: u32,
-    _pad2: f32,
-    _pad3: f32,
+    /// Occupancy paging: words per storage page (see
+    /// `scene::split_occupancy_pages`). Only consulted by the shader
+    /// when `occ_num_pages > 1`.
+    occ_page_words: u32,
+    /// Number of real occupancy pages (1 on multi-GiB GPUs → the
+    /// shader takes a branch-free single-page read).
+    occ_num_pages: u32,
 }
 
 #[repr(C)]
@@ -1319,8 +1324,8 @@ impl GpuRenderer {
             ],
             fog_far: self.fog_far,
             write_depth: u32::from(self.sprite_voxel_count > 0),
-            _pad2: 0.0,
-            _pad3: 0.0,
+            occ_page_words: scene.occupancy_page_words,
+            occ_num_pages: scene.occupancy_num_pages,
         };
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
@@ -1333,9 +1338,11 @@ impl GpuRenderer {
                     binding: 0,
                     resource: dda.uniform_buf.as_entire_binding(),
                 },
+                // Occupancy page 0 at binding 1; pages 1..MAX_OCC_PAGES
+                // at bindings 12.. (see GPU.X occupancy paging).
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: scene.all_occupancy.as_entire_binding(),
+                    resource: scene.occupancy_pages[0].as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -1549,6 +1556,11 @@ impl GpuRenderer {
                     },
                     // GPU.9 — read-write per-pixel depth buffer.
                     bgl_storage_entry(11, false),
+                    // Occupancy pages 1..MAX_OCC_PAGES (page 0 is
+                    // binding 1). Unused pages bind a dummy buffer.
+                    bgl_storage_entry(12, true),
+                    bgl_storage_entry(13, true),
+                    bgl_storage_entry(14, true),
                 ],
             });
         let dda_pl = self
@@ -1674,12 +1686,25 @@ impl GpuRenderer {
     /// the splatter pass. Pass an empty slice to clear sprites. The
     /// buffer is camera-independent; re-call only when a sprite
     /// moves, rotates, or its voxel set changes.
+    ///
+    /// # Panics
+    /// If `voxels.len() > 0xFFFF` — the splatter packs the voxel index
+    /// into 16 bits of its per-pixel key.
     pub fn set_sprites(&mut self, voxels: &[sprite::SpriteVoxel]) {
         if voxels.is_empty() {
             self.sprite_voxels = None;
             self.sprite_voxel_count = 0;
             return;
         }
+        // The splatter packs `voxel_index + 1` into the low 16 bits of
+        // the per-pixel key, so the buffer can hold at most 0xFFFF
+        // voxels. Real KV6 sprites are far smaller (the demo's coco is
+        // 148); a model past this would need a wider key split.
+        assert!(
+            voxels.len() <= 0xFFFF,
+            "set_sprites: {} voxels exceeds the 65535-voxel key-packing limit",
+            voxels.len(),
+        );
         let buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1806,6 +1831,13 @@ pub(crate) fn pick_required_limits(adapter_limits: &wgpu::Limits) -> wgpu::Limit
     wgpu::Limits {
         max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
         max_buffer_size: adapter_limits.max_buffer_size,
+        // Occupancy paging adds up to MAX_OCC_PAGES-1 extra storage
+        // bindings; with the scene's other buffers + the GPU.9 depth
+        // buffer the scene_dda stage needs ~11. The default cap is 8.
+        // Both NVK and lavapipe advertise ≫16, so request 16.
+        max_storage_buffers_per_shader_stage: adapter_limits
+            .max_storage_buffers_per_shader_stage
+            .min(16),
         ..wgpu::Limits::default()
     }
 }

@@ -52,6 +52,22 @@ pub const MAX_SCENE_GRIDS: u32 = 16;
 /// sliding-window storage removes the cap entirely.
 pub const COLORS_PER_CHUNK_WORDS: u32 = 65536;
 
+/// Number of separate storage bindings the concatenated occupancy
+/// buffer is split ("paged") across. A single storage binding may
+/// not exceed the device's `max_storage_buffer_binding_size` — on
+/// strict drivers that's a hard 128 MiB (lavapipe), which the
+/// streaming demo's occupancy already reaches. Splitting into pages
+/// keeps every binding under the limit while preserving a single
+/// global word index in the shader (each page is a whole number of
+/// chunk slots, so no slot ever straddles a page boundary).
+///
+/// On GPUs with multi-GiB binding limits (NVK, native Vulkan) the
+/// whole buffer fits in page 0, the other bindings get a 1-word
+/// dummy, and the shader's page select is a single perfectly-
+/// predicted uniform branch → zero hot-loop cost. 4 pages covers
+/// 512 MiB of occupancy even on a 128 MiB-per-binding device.
+pub const MAX_OCC_PAGES: usize = 4;
+
 /// Per-grid runtime transform — voxlap-style (world → grid-local).
 /// `rotation` is column-major and encodes the inverse rotation
 /// applied to the world camera basis before passing it to that
@@ -126,7 +142,20 @@ pub const SLOT_EMPTY_SENTINEL: [i32; 3] = [i32::MIN, i32::MIN, i32::MIN];
 /// GPU-resident storage for an entire scene's grids.
 pub struct GpuSceneResident {
     pub grid_count: u32,
-    pub all_occupancy: wgpu::Buffer,
+    /// Concatenated per-slot occupancy, split into up to
+    /// [`MAX_OCC_PAGES`] storage bindings so no single binding
+    /// exceeds the device's `max_storage_buffer_binding_size`. The
+    /// vec is always exactly `MAX_OCC_PAGES` long — pages past
+    /// `occupancy_num_pages` are 1-word dummies kept only so the
+    /// bind group has a buffer for every layout entry. Page p holds
+    /// the global word range `[p*occupancy_page_words,
+    /// (p+1)*occupancy_page_words)`; `occupancy_page_words` is a
+    /// whole number of chunk slots so no slot straddles a boundary.
+    pub occupancy_pages: Vec<wgpu::Buffer>,
+    /// Words per occupancy page (a multiple of `occ_words_per_slot`).
+    pub occupancy_page_words: u32,
+    /// Number of real (non-dummy) pages in `occupancy_pages`.
+    pub occupancy_num_pages: u32,
     pub all_color_offsets: wgpu::Buffer,
     pub all_colors: wgpu::Buffer,
     pub all_chunk_colors_base: wgpu::Buffer,
@@ -326,7 +355,19 @@ impl GpuSceneResident {
             + slot_chunk_idx_bytes
             + static_meta_bytes;
 
-        let all_occupancy = create_storage(device, "roxlap-gpu scene.occupancy", &all_occupancy);
+        // Split the concatenated occupancy across storage pages so no
+        // single binding exceeds the device limit. Page size is a
+        // whole number of chunk slots (slot-aligned) so no per-slot
+        // refresh write ever straddles two pages.
+        let slot_align_words = info
+            .grids
+            .iter()
+            .map(|g| (g.vsid as u64) * (g.vsid as u64) * u64::from(OCC_WORDS_PER_COLUMN))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let (occupancy_pages, occupancy_page_words, occupancy_num_pages) =
+            split_occupancy_pages(device, &all_occupancy, slot_align_words);
         let all_color_offsets =
             create_storage(device, "roxlap-gpu scene.color_offsets", &all_color_offsets);
         let all_colors = create_storage(device, "roxlap-gpu scene.colors", &all_colors);
@@ -354,7 +395,9 @@ impl GpuSceneResident {
 
         Self {
             grid_count,
-            all_occupancy,
+            occupancy_pages,
+            occupancy_page_words,
+            occupancy_num_pages,
             all_color_offsets,
             all_colors,
             all_chunk_colors_base,
@@ -409,10 +452,20 @@ impl GpuSceneResident {
         );
 
         // ---- occupancy ----
+        // Route the per-slot write to its page. Page size is
+        // slot-aligned (see `split_occupancy_pages`) so the whole
+        // `occ_words_per_slot` run lands in a single page.
         let occ_word_offset = meta.occupancy_offset as usize + slot_idx * occ_words_per_slot;
+        let page_words = self.occupancy_page_words as usize;
+        let page = occ_word_offset / page_words;
+        let local_word = occ_word_offset % page_words;
+        debug_assert!(
+            local_word + occ_words_per_slot <= page_words,
+            "occupancy slot straddles a page boundary — page size not slot-aligned",
+        );
         queue.write_buffer(
-            &self.all_occupancy,
-            (occ_word_offset * 4) as u64,
+            &self.occupancy_pages[page],
+            (local_word * 4) as u64,
             bytemuck::cast_slice(&chunk.occupancy),
         );
 
@@ -574,4 +627,60 @@ fn create_storage(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu::Buf
         contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     })
+}
+
+/// Split the concatenated occupancy words into up to
+/// [`MAX_OCC_PAGES`] storage buffers, each no larger than the
+/// device's `max_storage_buffer_binding_size`, then pad the page
+/// list with 1-word dummy buffers so the returned vec is always
+/// exactly `MAX_OCC_PAGES` long (one buffer per bind-group entry).
+///
+/// `slot_align_words` is the per-slot occupancy stride: page size is
+/// rounded down to a multiple of it so no chunk slot — and therefore
+/// no per-slot `refresh_chunk` write — straddles a page boundary.
+/// Returns `(pages, page_words, num_pages)`.
+fn split_occupancy_pages(
+    device: &wgpu::Device,
+    words: &[u32],
+    slot_align_words: u64,
+) -> (Vec<wgpu::Buffer>, u32, u32) {
+    let total_words = words.len() as u64;
+    let limit_words = u64::from(device.limits().max_storage_buffer_binding_size) / 4;
+    // Largest slot-aligned page that fits one binding (≥ 1 slot).
+    let page_slots = (limit_words / slot_align_words).max(1);
+    let mut page_words = page_slots.saturating_mul(slot_align_words);
+    // A tiny scene (or the empty-scene 1-word pad) isn't slot-aligned;
+    // cap the page at the data length so we don't allocate emptiness.
+    page_words = page_words.min(total_words.max(1));
+    let num_pages = total_words.div_ceil(page_words);
+    assert!(
+        num_pages as usize <= MAX_OCC_PAGES,
+        "occupancy needs {num_pages} pages (>{MAX_OCC_PAGES}) at this device's \
+         {limit_words}-word binding limit; shrink the streaming pool or raise MAX_OCC_PAGES",
+    );
+
+    let mut pages: Vec<wgpu::Buffer> = Vec::with_capacity(MAX_OCC_PAGES);
+    let page_words_usize = page_words as usize;
+    for p in 0..num_pages as usize {
+        let start = p * page_words_usize;
+        let end = ((p + 1) * page_words_usize).min(words.len());
+        pages.push(create_storage(
+            device,
+            &format!("roxlap-gpu scene.occupancy.page{p}"),
+            &words[start..end],
+        ));
+    }
+    // Dummy 1-word buffers for the unused bindings.
+    while pages.len() < MAX_OCC_PAGES {
+        pages.push(create_storage(
+            device,
+            "roxlap-gpu scene.occupancy.page_dummy",
+            &[0u32],
+        ));
+    }
+    (
+        pages,
+        u32::try_from(page_words).expect("page_words fits u32"),
+        num_pages as u32,
+    )
 }
