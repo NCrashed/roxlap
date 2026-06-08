@@ -219,17 +219,31 @@ struct SceneDdaResources {
     /// `width * height * 4`. The scene pass writes it when sprites
     /// are present; the sprite pass reads + tests against it.
     depth_buffer: wgpu::Buffer,
+    /// GPU.9 — per-pixel sprite winner key (atomicMax target),
+    /// `width * height * 4`. Cleared to 0 each frame, written by the
+    /// splat pass, read by the resolve pass.
+    sprite_key_buffer: wgpu::Buffer,
 }
 
-/// GPU.9 — KV6 sprite-voxel splatter pipeline. One compute thread
-/// per sprite voxel; projects via `cameras[0]` and depth-tests
-/// against [`SceneDdaResources::depth_buffer`].
+/// GPU.9 — KV6 sprite-voxel splatter, two passes. `splat` runs one
+/// thread per voxel and `atomicMax`es a winner key per covered pixel
+/// into [`SceneDdaResources::sprite_key_buffer`]; `resolve` runs one
+/// thread per pixel, world-occludes against
+/// [`SceneDdaResources::depth_buffer`], and writes the winner colour.
 struct SpriteDdaResources {
-    bgl: wgpu::BindGroupLayout,
-    pipeline: wgpu::ComputePipeline,
+    bgl_splat: wgpu::BindGroupLayout,
+    pipeline_splat: wgpu::ComputePipeline,
+    bgl_resolve: wgpu::BindGroupLayout,
+    pipeline_resolve: wgpu::ComputePipeline,
 }
 
 const SCENE_MAX_GRIDS: usize = MAX_SCENE_GRIDS as usize;
+
+// The scene_dda bind group + layout wire occupancy pages 1..=3 at
+// bindings 12..=14 explicitly; keep that in lockstep with the page
+// count. Bump the bindings (here, in the WGSL, and in the bind
+// group) if MAX_OCC_PAGES changes.
+const _: () = assert!(scene::MAX_OCC_PAGES == 4);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1384,19 +1398,32 @@ impl GpuRenderer {
                     binding: 11,
                     resource: dda.depth_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: scene.occupancy_pages[1].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: scene.occupancy_pages[2].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: scene.occupancy_pages[3].as_entire_binding(),
+                },
             ],
         });
 
-        // GPU.9 — when sprites are present, build the splatter bind
-        // group up front (shares the scene depth buffer + colour
-        // texture). `dda` and `self.sprite_dda` are both immutable
-        // borrows of `self` here — `sprite_dda` was materialised
-        // above, before the `dda` borrow began.
-        let sprite_bg = match (&self.sprite_dda, &self.sprite_voxels) {
+        // GPU.9 — when sprites are present, build both splatter bind
+        // groups up front (the splat pass writes the key buffer; the
+        // resolve pass reads keys + scene depth and writes colour).
+        // `dda` and `self.sprite_dda` are both immutable borrows of
+        // `self` here — `sprite_dda` was materialised above, before
+        // the `dda` borrow began.
+        let sprite_bgs = match (&self.sprite_dda, &self.sprite_voxels) {
             (Some(sd), Some(voxels)) if self.sprite_voxel_count > 0 => {
-                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("roxlap-gpu sprite_dda.bg"),
-                    layout: &sd.bgl,
+                let splat = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("roxlap-gpu sprite_dda.splat_bg"),
+                    layout: &sd.bgl_splat,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -1408,14 +1435,37 @@ impl GpuRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: dda.depth_buffer.as_entire_binding(),
+                            resource: dda.sprite_key_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+                let resolve = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("roxlap-gpu sprite_dda.resolve_bg"),
+                    layout: &sd.bgl_resolve,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: dda.uniform_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: voxels.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: dda.sprite_key_buffer.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
+                            resource: dda.depth_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
                             resource: wgpu::BindingResource::TextureView(&dda.storage_view),
                         },
                     ],
-                }))
+                });
+                Some((splat, resolve))
             }
             _ => None,
         };
@@ -1434,16 +1484,30 @@ impl GpuRenderer {
             cpass.set_bind_group(0, &dda_bg, &[]);
             cpass.dispatch_workgroups(surface_w.div_ceil(8), surface_h.div_ceil(8), 1);
         }
-        // GPU.9 — sprite splatter: one thread per voxel, after the
-        // scene pass wrote the depth buffer, before the blit.
-        if let (Some(sd), Some(bg)) = (&self.sprite_dda, &sprite_bg) {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("roxlap-gpu sprite_dda compute"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&sd.pipeline);
-            cpass.set_bind_group(0, bg, &[]);
-            cpass.dispatch_workgroups(self.sprite_voxel_count.div_ceil(64), 1, 1);
+        // GPU.9 — sprite splatter, after the scene pass wrote the
+        // depth buffer, before the blit. Clear the key buffer, splat
+        // (one thread per voxel → atomicMax winner per pixel), then
+        // resolve (one thread per pixel → world-occlude + write).
+        if let (Some(sd), Some((splat_bg, resolve_bg))) = (&self.sprite_dda, &sprite_bgs) {
+            encoder.clear_buffer(&dda.sprite_key_buffer, 0, None);
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("roxlap-gpu sprite_dda splat"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&sd.pipeline_splat);
+                cpass.set_bind_group(0, splat_bg, &[]);
+                cpass.dispatch_workgroups(self.sprite_voxel_count.div_ceil(64), 1, 1);
+            }
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("roxlap-gpu sprite_dda resolve"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&sd.pipeline_resolve);
+                cpass.set_bind_group(0, resolve_bg, &[]);
+                cpass.dispatch_workgroups(surface_w.div_ceil(8), surface_h.div_ceil(8), 1);
+            }
         }
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1503,6 +1567,14 @@ impl GpuRenderer {
         // are active, read+tested by the sprite splatter.
         let depth_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.depth"),
+            size: u64::from(width) * u64::from(height) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // GPU.9 — per-pixel sprite winner key (atomicMax). COPY_DST so
+        // it can be cleared to 0 each frame via `clear_buffer`.
+        let sprite_key_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu scene_dda.sprite_keys"),
             size: u64::from(width) * u64::from(height) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -1679,6 +1751,7 @@ impl GpuRenderer {
             pipeline_blit,
             _sampler: sampler,
             depth_buffer,
+            sprite_key_buffer,
         }
     }
 
@@ -1716,8 +1789,9 @@ impl GpuRenderer {
         self.sprite_voxel_count = u32::try_from(voxels.len()).unwrap_or(u32::MAX);
     }
 
-    /// GPU.9 — build the sprite splatter compute pipeline. Lazily
-    /// invoked the first frame a sprite buffer is present.
+    /// GPU.9 — build the two sprite splatter pipelines (`splat` +
+    /// `resolve`). Lazily invoked the first frame a sprite buffer is
+    /// present.
     fn build_sprite_dda(&self) -> SpriteDdaResources {
         let shader = self
             .device
@@ -1725,16 +1799,49 @@ impl GpuRenderer {
                 label: Some("sprite_dda.wgsl"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sprite_dda.wgsl").into()),
             });
-        let bgl = self
+
+        // splat: uniform(0), sprite_voxels ro(1), sprite_keys rw(2).
+        let bgl_splat = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("roxlap-gpu sprite_dda.bgl"),
+                label: Some("roxlap-gpu sprite_dda.splat_bgl"),
                 entries: &[
                     bgl_uniform_entry(0),
                     bgl_storage_entry(1, true),
                     bgl_storage_entry(2, false),
+                ],
+            });
+        let pl_splat = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("roxlap-gpu sprite_dda.splat_layout"),
+                bind_group_layouts: &[&bgl_splat],
+                push_constant_ranges: &[],
+            });
+        let pipeline_splat =
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("roxlap-gpu sprite_dda.splat_pipeline"),
+                    layout: Some(&pl_splat),
+                    module: &shader,
+                    entry_point: "splat",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+
+        // resolve: uniform(0), sprite_voxels ro(1), sprite_keys rw(2),
+        // depth_buffer ro(3), output storage texture(4).
+        let bgl_resolve = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("roxlap-gpu sprite_dda.resolve_bgl"),
+                entries: &[
+                    bgl_uniform_entry(0),
+                    bgl_storage_entry(1, true),
+                    bgl_storage_entry(2, false),
+                    bgl_storage_entry(3, true),
                     wgpu::BindGroupLayoutEntry {
-                        binding: 3,
+                        binding: 4,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,
@@ -1745,24 +1852,30 @@ impl GpuRenderer {
                     },
                 ],
             });
-        let pl = self
+        let pl_resolve = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("roxlap-gpu sprite_dda.layout"),
-                bind_group_layouts: &[&bgl],
+                label: Some("roxlap-gpu sprite_dda.resolve_layout"),
+                bind_group_layouts: &[&bgl_resolve],
                 push_constant_ranges: &[],
             });
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("roxlap-gpu sprite_dda.pipeline"),
-                layout: Some(&pl),
-                module: &shader,
-                entry_point: "splat",
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
-        SpriteDdaResources { bgl, pipeline }
+        let pipeline_resolve =
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("roxlap-gpu sprite_dda.resolve_pipeline"),
+                    layout: Some(&pl_resolve),
+                    module: &shader,
+                    entry_point: "resolve",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+
+        SpriteDdaResources {
+            bgl_splat,
+            pipeline_splat,
+            bgl_resolve,
+            pipeline_resolve,
+        }
     }
 }
 

@@ -175,7 +175,10 @@ pub(crate) fn load_png_sky(png_bytes: &[u8]) -> Result<roxlap_core::sky::Sky, St
 /// parse, so the demo keeps booting either way.
 fn build_sprites() -> Vec<Sprite> {
     match kv6_sprite::load_coco_kv6() {
-        Ok(kv6) => vec![Sprite::axis_aligned(kv6, [-5.0, -90.0, 30.0])],
+        // Directly ahead of the spawn camera ([0, -120, 50] looking
+        // +y) at eye level, so the splatter is exercised and FPS is
+        // meaningful even with a static camera.
+        Ok(kv6) => vec![Sprite::axis_aligned(kv6, [0.0, -75.0, 50.0])],
         Err(e) => {
             eprintln!("kv6_sprite: load_coco_kv6 failed ({e}); skipping sprite");
             Vec::new()
