@@ -215,9 +215,11 @@ impl SpriteModelRegistry {
         &self.entries[self.chains[id as usize][0] as usize]
     }
 
-    /// Mutable access to the finest (mip-0) model for editing. (Re-run
-    /// [`Self::recolor_chain`] or rebuild to propagate to coarser
-    /// levels; structural relod is GPU.10.5.)
+    /// Mutable access to the finest (mip-0) model for editing — the
+    /// copy-on-modify entry point (typically on a [`Self::fork`]).
+    /// After a *structural* edit (occupancy/dims), call
+    /// [`Self::rebuild_lod`] so the coarser mips match; a pure recolour
+    /// can use [`Self::recolor_chain`] instead.
     pub fn model_mut(&mut self, id: u32) -> &mut SpriteModel {
         let e = self.chains[id as usize][0] as usize;
         &mut self.entries[e]
@@ -229,6 +231,22 @@ impl SpriteModelRegistry {
         for li in 0..self.chains[id as usize].len() {
             let e = self.chains[id as usize][li] as usize;
             self.entries[e].recolor(f);
+        }
+    }
+
+    /// Regenerate chain `id`'s coarser mip levels from its (possibly
+    /// just-edited) mip-0. Run after a structural edit via
+    /// [`Self::model_mut`] so the LOD ladder stays consistent. No-op
+    /// for a single-level (no-LOD) chain.
+    pub fn rebuild_lod(&mut self, id: u32) {
+        let levels = self.chains[id as usize].clone();
+        if levels.len() <= 1 {
+            return;
+        }
+        let mut cur = self.entries[levels[0] as usize].clone();
+        for &e in &levels[1..] {
+            cur = cur.downsample();
+            self.entries[e as usize] = cur.clone();
         }
     }
 
@@ -248,7 +266,8 @@ impl SpriteModel {
     /// Recolour every voxel via `f(old_rgba) -> new_rgba`. Structure
     /// (occupancy / offsets) is untouched, so this is a cheap in-place
     /// edit — handy on a [`SpriteModelRegistry::fork`] to make a tinted
-    /// variant. Structural edits (add/remove voxels) come in GPU.10.5.
+    /// variant. For structural edits, mutate the public occupancy /
+    /// colours / dims directly (via `model_mut`) then rebuild the LOD.
     pub fn recolor(&mut self, f: impl Fn(u32) -> u32) {
         for c in &mut self.colors {
             *c = f(*c);
@@ -833,5 +852,31 @@ mod tests {
     fn registry_gpu_structs_have_expected_sizes() {
         assert_eq!(std::mem::size_of::<SpriteModelMeta>(), 48);
         assert_eq!(std::mem::size_of::<SpriteInstanceGpu>(), 64);
+    }
+
+    #[test]
+    fn add_lod_builds_halving_mip_chain() {
+        let mut reg = SpriteModelRegistry::new();
+        // 8×8×8 single voxel-filled column model would be ideal, but
+        // kv6_unsorted is 2×1×8 → mips: 2×1×8 → 1×1×4 → 1×1×2 → 1×1×1.
+        let id = reg.add_lod(build_sprite_model(&kv6_unsorted()), 4);
+        let m0 = reg.model(id);
+        assert_eq!(m0.dims, [2, 1, 8]);
+        assert!((m0.voxel_world_size - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rebuild_lod_refreshes_coarse_levels_from_mip0() {
+        let mut reg = SpriteModelRegistry::new();
+        let id = reg.add_lod(build_sprite_model(&kv6_unsorted()), 3);
+        // Recolour mip-0 only via model_mut, then rebuild the ladder.
+        reg.model_mut(id).recolor(|_| 0x0000_2000);
+        reg.rebuild_lod(id);
+        // The mip-1 average of all-0x2000 voxels is still 0x2000.
+        let lvl1_entry = reg.chains[id as usize][1] as usize;
+        assert!(reg.entries[lvl1_entry]
+            .colors
+            .iter()
+            .all(|&c| c == 0x0000_2000));
     }
 }

@@ -870,30 +870,18 @@ impl ApplicationHandler for App {
                         }
                         Err(e) => eprintln!("roxlap-gpu: sky decode failed ({e})"),
                     }
-                    // Sprite rendering. Default GPU.10 path: render the
-                    // KV6 as a DDA-marched voxel model (precise, no
-                    // overdraw). `ROXLAP_SPRITE_SPLATTER=1` keeps the
-                    // GPU.9 splatter for A/B perf comparison.
-                    let use_splatter = std::env::var_os("ROXLAP_SPRITE_SPLATTER").is_some();
-                    if use_splatter {
-                        let sprite_voxels = roxlap_gpu::flatten_sprites(&self.sprites);
-                        if !sprite_voxels.is_empty() {
-                            eprintln!(
-                                "roxlap-gpu: splatter — {} sprite voxels",
-                                sprite_voxels.len()
-                            );
-                            gpu.set_sprites(&sprite_voxels);
-                        }
-                    } else if let Some(sprite) = self.sprites.first() {
-                        // GPU.10.1 — model registry + instancing. Add the
-                        // coco model once, fork a red-tinted variant
-                        // (copy-on-modify), then spawn a 5×5 wall of
-                        // instances (checkerboard of the two models) to
-                        // exercise instancing + shared models.
-                        let mut registry = roxlap_gpu::SpriteModelRegistry::new();
+                    // GPU.10 — render the KV6 sprites as DDA-marched
+                    // voxel-model instances (precise, no overdraw; the
+                    // GPU.9 splatter was retired in 10.5).
+                    if let Some(sprite) = self.sprites.first() {
+                        // Model registry + instancing: add the coco model
+                        // once, fork a red-tinted variant (copy-on-modify),
+                        // then spawn a field of instances (checkerboard of
+                        // the two models) to exercise instancing + sharing.
                         // GPU.10.4 — register with a 4-level LOD mip
                         // chain so distant instances march coarser
                         // volumes (less aliasing, fewer steps).
+                        let mut registry = roxlap_gpu::SpriteModelRegistry::new();
                         let base_id =
                             registry.add_lod(roxlap_gpu::build_sprite_model(&sprite.kv6), 4);
                         let red_id = registry.fork(base_id);

@@ -37,7 +37,6 @@ pub mod grid;
 pub mod headless;
 pub mod resident;
 pub mod scene;
-pub mod sprite;
 pub mod sprite_model;
 
 pub use camera::Camera;
@@ -49,7 +48,6 @@ pub use scene::{
     GpuSceneResident, GridRuntimeTransform, GridStaticMeta, RefreshOutcome, SceneUpload,
     MAX_SCENE_GRIDS,
 };
-pub use sprite::{flatten_sprites, sprite_voxels_world_space, SpriteVoxel};
 pub use sprite_model::{
     build_sprite_model, SpriteInstance, SpriteInstanceTransform, SpriteModel, SpriteModelRegistry,
     SpriteRegistryResident,
@@ -58,7 +56,6 @@ pub use sprite_model::{
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 /// Caller-controllable knobs for [`GpuRenderer::new`]. Defaults
@@ -174,19 +171,10 @@ pub struct GpuRenderer {
     fog_color: [f32; 3],
     fog_near: f32,
     fog_far: f32,
-    /// GPU.9 — flat world-space sprite-voxel buffer uploaded via
-    /// [`Self::set_sprites`]. `None` until the host uploads sprites;
-    /// `sprite_voxel_count` is the number of voxels in it.
-    sprite_voxels: Option<wgpu::Buffer>,
-    sprite_voxel_count: u32,
-    /// Lazy-built the first frame a sprite buffer is present. Holds
-    /// the splatter compute pipeline + its bind-group layout.
-    sprite_dda: Option<SpriteDdaResources>,
     /// GPU.10 — sprites rendered as DDA-marched voxel models (the
-    /// precise path that supersedes the splatter). Mutually exclusive
-    /// with `sprite_voxels` in practice: the host calls either
-    /// `set_sprites` (splatter) or `set_sprite_instances` (DDA).
-    /// Holds the concatenated model registry + the instance array.
+    /// precise path; the GPU.9 compute splatter it replaced was
+    /// retired in 10.5). Holds the concatenated model registry + the
+    /// per-frame instance array; set via [`Self::set_sprite_instances`].
     sprite_registry: Option<sprite_model::SpriteRegistryResident>,
     /// Lazy-built pipeline + uniform for the model-DDA pass.
     sprite_model_dda: Option<SpriteModelDdaResources>,
@@ -235,24 +223,9 @@ struct SceneDdaResources {
     _sampler: wgpu::Sampler,
     /// GPU.9 — per-pixel world-t depth (f32 bits as u32), sized
     /// `width * height * 4`. The scene pass writes it when sprites
-    /// are present; the sprite pass reads + tests against it.
+    /// are present; the sprite model-DDA pass reads + composites
+    /// against it.
     depth_buffer: wgpu::Buffer,
-    /// GPU.9 — per-pixel sprite winner key (atomicMax target),
-    /// `width * height * 4`. Cleared to 0 each frame, written by the
-    /// splat pass, read by the resolve pass.
-    sprite_key_buffer: wgpu::Buffer,
-}
-
-/// GPU.9 — KV6 sprite-voxel splatter, two passes. `splat` runs one
-/// thread per voxel and `atomicMax`es a winner key per covered pixel
-/// into [`SceneDdaResources::sprite_key_buffer`]; `resolve` runs one
-/// thread per pixel, world-occludes against
-/// [`SceneDdaResources::depth_buffer`], and writes the winner colour.
-struct SpriteDdaResources {
-    bgl_splat: wgpu::BindGroupLayout,
-    pipeline_splat: wgpu::ComputePipeline,
-    bgl_resolve: wgpu::BindGroupLayout,
-    pipeline_resolve: wgpu::ComputePipeline,
 }
 
 /// GPU.10.0 — single-sprite model-DDA pipeline: one thread per pixel
@@ -517,9 +490,6 @@ impl GpuRenderer {
             fog_color: [0.66, 0.74, 0.88],
             fog_near: 0.0,
             fog_far: 1.0e30,
-            sprite_voxels: None,
-            sprite_voxel_count: 0,
-            sprite_dda: None,
             sprite_registry: None,
             sprite_model_dda: None,
             // GPU.10.4 — default LOD threshold: step to a coarser mip
@@ -1364,10 +1334,8 @@ impl GpuRenderer {
         }
         // GPU.9 — materialise the sprite pipeline the first frame
         // sprites are present (before the immutable `dda` borrow).
-        if self.sprite_voxel_count > 0 && self.sprite_dda.is_none() {
-            self.sprite_dda = Some(self.build_sprite_dda());
-        }
-        // GPU.10.0 — same for the model-DDA pipeline.
+        // GPU.10.0 — build the model-DDA pipeline the first frame a
+        // sprite registry is present.
         if self.sprite_registry.is_some() && self.sprite_model_dda.is_none() {
             self.sprite_model_dda = Some(self.build_sprite_model_dda());
         }
@@ -1437,7 +1405,7 @@ impl GpuRenderer {
                 self.fog_near,
             ],
             fog_far: self.fog_far,
-            write_depth: u32::from(self.sprite_voxel_count > 0 || self.sprite_registry.is_some()),
+            write_depth: u32::from(self.sprite_registry.is_some()),
             occ_page_words: scene.occupancy_page_words,
             occ_num_pages: scene.occupancy_num_pages,
         };
@@ -1516,60 +1484,6 @@ impl GpuRenderer {
         // GPU.9 — when sprites are present, build both splatter bind
         // groups up front (the splat pass writes the key buffer; the
         // resolve pass reads keys + scene depth and writes colour).
-        // `dda` and `self.sprite_dda` are both immutable borrows of
-        // `self` here — `sprite_dda` was materialised above, before
-        // the `dda` borrow began.
-        let sprite_bgs = match (&self.sprite_dda, &self.sprite_voxels) {
-            (Some(sd), Some(voxels)) if self.sprite_voxel_count > 0 => {
-                let splat = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("roxlap-gpu sprite_dda.splat_bg"),
-                    layout: &sd.bgl_splat,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: dda.uniform_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: voxels.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: dda.sprite_key_buffer.as_entire_binding(),
-                        },
-                    ],
-                });
-                let resolve = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("roxlap-gpu sprite_dda.resolve_bg"),
-                    layout: &sd.bgl_resolve,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: dda.uniform_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: voxels.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: dda.sprite_key_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: dda.depth_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(&dda.storage_view),
-                        },
-                    ],
-                });
-                Some((splat, resolve))
-            }
-            _ => None,
-        };
-
         // GPU.10.3 — model-DDA bind group + per-frame uniform, using the
         // cull/bin results captured above. Per-model + per-instance data
         // + the tile lists live in the registry buffers.
@@ -1665,34 +1579,9 @@ impl GpuRenderer {
             cpass.set_bind_group(0, &dda_bg, &[]);
             cpass.dispatch_workgroups(surface_w.div_ceil(8), surface_h.div_ceil(8), 1);
         }
-        // GPU.9 — sprite splatter, after the scene pass wrote the
-        // depth buffer, before the blit. Clear the key buffer, splat
-        // (one thread per voxel → atomicMax winner per pixel), then
-        // resolve (one thread per pixel → world-occlude + write).
-        if let (Some(sd), Some((splat_bg, resolve_bg))) = (&self.sprite_dda, &sprite_bgs) {
-            encoder.clear_buffer(&dda.sprite_key_buffer, 0, None);
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("roxlap-gpu sprite_dda splat"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&sd.pipeline_splat);
-                cpass.set_bind_group(0, splat_bg, &[]);
-                cpass.dispatch_workgroups(self.sprite_voxel_count.div_ceil(64), 1, 1);
-            }
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("roxlap-gpu sprite_dda resolve"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&sd.pipeline_resolve);
-                cpass.set_bind_group(0, resolve_bg, &[]);
-                cpass.dispatch_workgroups(surface_w.div_ceil(8), surface_h.div_ceil(8), 1);
-            }
-        }
-        // GPU.10.0 — model-DDA pass: one thread per pixel marches the
-        // model volume + composites against scene depth. Replaces the
-        // splatter when a sprite model is set.
+        // GPU.10 — sprite model-DDA pass: one thread per pixel marches
+        // the tile's instances + composites against scene depth, after
+        // the scene pass wrote the depth buffer and before the blit.
         if let (Some(smd), Some(bg)) = (&self.sprite_model_dda, &sprite_model_bg) {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("roxlap-gpu sprite_model_dda"),
@@ -1764,15 +1653,6 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // GPU.9 — per-pixel sprite winner key (atomicMax). COPY_DST so
-        // it can be cleared to 0 each frame via `clear_buffer`.
-        let sprite_key_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("roxlap-gpu scene_dda.sprite_keys"),
-            size: u64::from(width) * u64::from(height) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         let dda_shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1944,136 +1824,11 @@ impl GpuRenderer {
             pipeline_blit,
             _sampler: sampler,
             depth_buffer,
-            sprite_key_buffer,
-        }
-    }
-
-    /// GPU.9 — upload a flat list of world-space sprite voxels for
-    /// the splatter pass. Pass an empty slice to clear sprites. The
-    /// buffer is camera-independent; re-call only when a sprite
-    /// moves, rotates, or its voxel set changes.
-    ///
-    /// # Panics
-    /// If `voxels.len() > 0xFFFF` — the splatter packs the voxel index
-    /// into 16 bits of its per-pixel key.
-    pub fn set_sprites(&mut self, voxels: &[sprite::SpriteVoxel]) {
-        if voxels.is_empty() {
-            self.sprite_voxels = None;
-            self.sprite_voxel_count = 0;
-            return;
-        }
-        // The splatter packs `voxel_index + 1` into the low 16 bits of
-        // the per-pixel key, so the buffer can hold at most 0xFFFF
-        // voxels. Real KV6 sprites are far smaller (the demo's coco is
-        // 148); a model past this would need a wider key split.
-        assert!(
-            voxels.len() <= 0xFFFF,
-            "set_sprites: {} voxels exceeds the 65535-voxel key-packing limit",
-            voxels.len(),
-        );
-        let buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("roxlap-gpu sprite_voxels"),
-                contents: bytemuck::cast_slice(voxels),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        self.sprite_voxels = Some(buf);
-        self.sprite_voxel_count = u32::try_from(voxels.len()).unwrap_or(u32::MAX);
-    }
-
-    /// GPU.9 — build the two sprite splatter pipelines (`splat` +
-    /// `resolve`). Lazily invoked the first frame a sprite buffer is
-    /// present.
-    fn build_sprite_dda(&self) -> SpriteDdaResources {
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("sprite_dda.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sprite_dda.wgsl").into()),
-            });
-
-        // splat: uniform(0), sprite_voxels ro(1), sprite_keys rw(2).
-        let bgl_splat = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("roxlap-gpu sprite_dda.splat_bgl"),
-                entries: &[
-                    bgl_uniform_entry(0),
-                    bgl_storage_entry(1, true),
-                    bgl_storage_entry(2, false),
-                ],
-            });
-        let pl_splat = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("roxlap-gpu sprite_dda.splat_layout"),
-                bind_group_layouts: &[&bgl_splat],
-                push_constant_ranges: &[],
-            });
-        let pipeline_splat =
-            self.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("roxlap-gpu sprite_dda.splat_pipeline"),
-                    layout: Some(&pl_splat),
-                    module: &shader,
-                    entry_point: "splat",
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    cache: None,
-                });
-
-        // resolve: uniform(0), sprite_voxels ro(1), sprite_keys rw(2),
-        // depth_buffer ro(3), output storage texture(4).
-        let bgl_resolve = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("roxlap-gpu sprite_dda.resolve_bgl"),
-                entries: &[
-                    bgl_uniform_entry(0),
-                    bgl_storage_entry(1, true),
-                    bgl_storage_entry(2, false),
-                    bgl_storage_entry(3, true),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-        let pl_resolve = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("roxlap-gpu sprite_dda.resolve_layout"),
-                bind_group_layouts: &[&bgl_resolve],
-                push_constant_ranges: &[],
-            });
-        let pipeline_resolve =
-            self.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("roxlap-gpu sprite_dda.resolve_pipeline"),
-                    layout: Some(&pl_resolve),
-                    module: &shader,
-                    entry_point: "resolve",
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    cache: None,
-                });
-
-        SpriteDdaResources {
-            bgl_splat,
-            pipeline_splat,
-            bgl_resolve,
-            pipeline_resolve,
         }
     }
 
     /// GPU.10.1 — upload a sprite model registry + its instances for
-    /// the DDA path. Supersedes the splatter; the host calls this *or*
-    /// [`Self::set_sprites`], not both. An empty instance slice clears.
+    /// the DDA path. An empty instance slice clears all sprites.
     pub fn set_sprite_instances(
         &mut self,
         registry: &sprite_model::SpriteModelRegistry,
