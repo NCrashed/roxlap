@@ -867,6 +867,13 @@ impl ApplicationHandler for App {
                         }
                         Err(e) => eprintln!("roxlap-gpu: sky decode failed ({e})"),
                     }
+                    // GPU.9: flatten the demo's KV6 sprites to world
+                    // space and upload them for the splatter pass.
+                    let sprite_voxels = roxlap_gpu::flatten_sprites(&self.sprites);
+                    if !sprite_voxels.is_empty() {
+                        eprintln!("roxlap-gpu: uploaded {} sprite voxels", sprite_voxels.len());
+                        gpu.set_sprites(&sprite_voxels);
+                    }
                     self.upload_first_scene(&gpu);
                     self.gpu = Some(gpu);
                 }

@@ -60,8 +60,12 @@ struct Uniforms {
     // colour to keep std140 alignment simple.
     fog_color: vec4<f32>,
     fog_far: f32,
+    // GPU.9: gate the depth-buffer write. When the sprite pass is
+    // active this is 1 and `render_scene` records `best_t` per
+    // pixel; otherwise 0 and the no-sprite path stays unchanged.
+    write_depth: u32,
     _pad2: f32,
-    _pad3: vec2<f32>,
+    _pad3: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -77,6 +81,9 @@ struct Uniforms {
 // GPU.8: panoramic sky.
 @group(0) @binding(9) var sky_texture: texture_2d<f32>;
 @group(0) @binding(10) var sky_sampler: sampler;
+// GPU.9: per-pixel world-t depth (f32 bits as u32). Written here
+// when `u.write_depth != 0`, read+tested by the sprite splatter.
+@group(0) @binding(11) var<storage, read_write> depth_buffer: array<u32>;
 
 fn voxel_solid_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> bool {
     let m = grid_static_meta[g];
@@ -353,4 +360,8 @@ fn render_scene(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     textureStore(output, vec2<i32>(gid.xy), vec4<f32>(best_color, 1.0));
+    if (u.write_depth != 0u) {
+        let pix_idx = gid.y * u.screen_size.x + gid.x;
+        depth_buffer[pix_idx] = bitcast<u32>(best_t);
+    }
 }
