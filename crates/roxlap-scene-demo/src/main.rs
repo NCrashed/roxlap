@@ -870,12 +870,29 @@ impl ApplicationHandler for App {
                         }
                         Err(e) => eprintln!("roxlap-gpu: sky decode failed ({e})"),
                     }
-                    // GPU.9: flatten the demo's KV6 sprites to world
-                    // space and upload them for the splatter pass.
-                    let sprite_voxels = roxlap_gpu::flatten_sprites(&self.sprites);
-                    if !sprite_voxels.is_empty() {
-                        eprintln!("roxlap-gpu: uploaded {} sprite voxels", sprite_voxels.len());
-                        gpu.set_sprites(&sprite_voxels);
+                    // Sprite rendering. Default GPU.10 path: render the
+                    // KV6 as a DDA-marched voxel model (precise, no
+                    // overdraw). `ROXLAP_SPRITE_SPLATTER=1` keeps the
+                    // GPU.9 splatter for A/B perf comparison.
+                    let use_splatter = std::env::var_os("ROXLAP_SPRITE_SPLATTER").is_some();
+                    if use_splatter {
+                        let sprite_voxels = roxlap_gpu::flatten_sprites(&self.sprites);
+                        if !sprite_voxels.is_empty() {
+                            eprintln!(
+                                "roxlap-gpu: splatter — {} sprite voxels",
+                                sprite_voxels.len()
+                            );
+                            gpu.set_sprites(&sprite_voxels);
+                        }
+                    } else if let Some(sprite) = self.sprites.first() {
+                        let model = roxlap_gpu::build_sprite_model(&sprite.kv6);
+                        let instance = roxlap_gpu::SpriteInstanceTransform::from_sprite(sprite);
+                        eprintln!(
+                            "roxlap-gpu: model-DDA sprite — dims {:?}, {} voxels",
+                            model.dims,
+                            model.colors.len()
+                        );
+                        gpu.set_sprite_model(Some((&model, instance)));
                     }
                     self.upload_first_scene(&gpu);
                     self.gpu = Some(gpu);
