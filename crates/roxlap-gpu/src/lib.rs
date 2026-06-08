@@ -279,12 +279,15 @@ struct SpriteModelUniform {
     instance_count: u32,
     fog_far: f32,
     fov_y_rad: f32,
-    _p4: f32,
-    _p5: f32,
+    tiles_x: u32,
+    tile_size: u32,
     _p6: f32,
 }
 
 const SCENE_MAX_GRIDS: usize = MAX_SCENE_GRIDS as usize;
+
+/// GPU.10.3 — sprite screen-tile edge in pixels for instance binning.
+const SPRITE_TILE_SIZE: u32 = 16;
 
 // The scene_dda bind group + layout wire occupancy pages 1..=3 at
 // bindings 12..=14 explicitly; keep that in lockstep with the page
@@ -1359,6 +1362,40 @@ impl GpuRenderer {
         if self.sprite_registry.is_some() && self.sprite_model_dda.is_none() {
             self.sprite_model_dda = Some(self.build_sprite_model_dda());
         }
+        // GPU.10.3 — frustum-cull + screen-tile-bin the sprite instances
+        // (needs &mut self for buffer growth, so before the immutable
+        // scene_dda borrow). Captures (visible_count, tiles_x); None when
+        // nothing is in view.
+        let sprite_pass: Option<(u32, u32)> = if let Some(reg) = self.sprite_registry.as_mut() {
+            if !cameras.is_empty() && reg.instance_capacity > 0 {
+                let cam = &cameras[0];
+                #[allow(clippy::cast_precision_loss)]
+                let aspect = surface_w as f32 / surface_h as f32;
+                let half_h = (fov_y_rad * 0.5).tan();
+                let frustum = sprite_model::ViewFrustum {
+                    pos: cam.position,
+                    right: cam.right,
+                    down: cam.down,
+                    forward: cam.forward,
+                    half_w: half_h * aspect,
+                    half_h,
+                    far: 1.0e9,
+                };
+                let (visible, tiles_x, _tiles_y) = reg.cull_bin_upload(
+                    &self.device,
+                    &self.queue,
+                    &frustum,
+                    surface_w,
+                    surface_h,
+                    SPRITE_TILE_SIZE,
+                );
+                (visible > 0).then_some((visible, tiles_x))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let dda = self.scene_dda.as_ref().expect("just built");
 
         // Pack per-grid cameras.
@@ -1523,97 +1560,83 @@ impl GpuRenderer {
             _ => None,
         };
 
-        // GPU.10.1 — model-DDA bind group + per-frame uniform when a
-        // sprite registry is present (mutually exclusive with the
-        // splatter). Projects via cameras[0] (the world/ground camera);
-        // per-model + per-instance data live in the registry buffers.
-        let sprite_model_bg = match (&self.sprite_model_dda, &self.sprite_registry) {
-            (Some(smd), Some(reg)) if !cameras.is_empty() && reg.instance_capacity > 0 => {
+        // GPU.10.3 — model-DDA bind group + per-frame uniform, using the
+        // cull/bin results captured above. Per-model + per-instance data
+        // + the tile lists live in the registry buffers.
+        let sprite_model_bg = match (&self.sprite_model_dda, &self.sprite_registry, sprite_pass) {
+            (Some(smd), Some(reg), Some((visible, tiles_x))) => {
                 let cam = &cameras[0];
-                // GPU.10.2 — frustum-cull the instance set on the CPU
-                // and upload only the visible subset, then loop just
-                // those in the shader.
-                #[allow(clippy::cast_precision_loss)]
-                let aspect = surface_w as f32 / surface_h as f32;
-                let half_h = (fov_y_rad * 0.5).tan();
-                let frustum = sprite_model::ViewFrustum {
-                    pos: cam.position,
-                    right: cam.right,
-                    down: cam.down,
-                    forward: cam.forward,
-                    half_w: half_h * aspect,
-                    half_h,
-                    far: 1.0e9,
+                let uni = SpriteModelUniform {
+                    cam_pos: cam.position,
+                    _p0: 0.0,
+                    cam_right: cam.right,
+                    _p1: 0.0,
+                    cam_down: cam.down,
+                    _p2: 0.0,
+                    cam_forward: cam.forward,
+                    _p3: 0.0,
+                    fog_color: [
+                        self.fog_color[0],
+                        self.fog_color[1],
+                        self.fog_color[2],
+                        self.fog_near,
+                    ],
+                    screen_size: [surface_w, surface_h],
+                    instance_count: visible,
+                    fog_far: self.fog_far,
+                    fov_y_rad,
+                    tiles_x,
+                    tile_size: SPRITE_TILE_SIZE,
+                    _p6: 0.0,
                 };
-                let visible = reg.cull_visible(&self.queue, &frustum);
-                if visible == 0 {
-                    // Nothing in view — skip the sprite pass entirely.
-                    None
-                } else {
-                    let uni = SpriteModelUniform {
-                        cam_pos: cam.position,
-                        _p0: 0.0,
-                        cam_right: cam.right,
-                        _p1: 0.0,
-                        cam_down: cam.down,
-                        _p2: 0.0,
-                        cam_forward: cam.forward,
-                        _p3: 0.0,
-                        fog_color: [
-                            self.fog_color[0],
-                            self.fog_color[1],
-                            self.fog_color[2],
-                            self.fog_near,
-                        ],
-                        screen_size: [surface_w, surface_h],
-                        instance_count: visible,
-                        fog_far: self.fog_far,
-                        fov_y_rad,
-                        _p4: 0.0,
-                        _p5: 0.0,
-                        _p6: 0.0,
-                    };
-                    self.queue
-                        .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));
-                    Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("roxlap-gpu sprite_model_dda.bg"),
-                        layout: &smd.bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: smd.uniform_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: reg.occupancy.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: reg.colors.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: reg.color_offsets.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: reg.model_meta.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 5,
-                                resource: reg.instances.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 6,
-                                resource: dda.depth_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 7,
-                                resource: wgpu::BindingResource::TextureView(&dda.storage_view),
-                            },
-                        ],
-                    }))
-                }
+                self.queue
+                    .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("roxlap-gpu sprite_model_dda.bg"),
+                    layout: &smd.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: smd.uniform_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: reg.occupancy.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: reg.colors.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: reg.color_offsets.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: reg.model_meta.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: reg.instances.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: dda.depth_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(&dda.storage_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: reg.tile_ranges.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: reg.tile_instances.as_entire_binding(),
+                        },
+                    ],
+                }))
             }
             _ => None,
         };
@@ -2090,6 +2113,8 @@ impl GpuRenderer {
                         },
                         count: None,
                     },
+                    bgl_storage_entry(8, true), // tile_ranges
+                    bgl_storage_entry(9, true), // tile_instances
                 ],
             });
         let pl = self

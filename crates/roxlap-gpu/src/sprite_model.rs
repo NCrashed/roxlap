@@ -16,7 +16,10 @@
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::many_single_char_names
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::similar_names
 )]
 
 use bytemuck::{Pod, Zeroable};
@@ -313,9 +316,17 @@ pub struct SpriteRegistryResident {
     pub color_offsets: wgpu::Buffer,
     pub model_meta: wgpu::Buffer,
     /// Holds up to `instance_capacity` instances; the visible subset
-    /// is packed into `[0, count)` each frame by [`Self::cull_visible`].
+    /// is packed into `[0, count)` each frame by [`Self::cull_bin_upload`].
     pub instances: wgpu::Buffer,
     pub instance_capacity: u32,
+    /// GPU.10.3 — per-tile `(offset, count)` into `tile_instances`,
+    /// flat `2 * tiles_x * tiles_y` u32s. Grown to fit the screen.
+    pub tile_ranges: wgpu::Buffer,
+    tile_ranges_cap: u32,
+    /// GPU.10.3 — flat list of visible-instance indices grouped by
+    /// tile. Grown to fit the per-frame total.
+    pub tile_instances: wgpu::Buffer,
+    tile_instances_cap: u32,
     /// CPU cull records (full set), with precomputed bounding spheres.
     cull: Vec<CullInstance>,
 }
@@ -388,6 +399,8 @@ impl SpriteRegistryResident {
             })
         };
 
+        let tile_ranges = storage_dst_u32(device, "roxlap-gpu sprite_reg.tile_ranges", 1);
+        let tile_instances = storage_dst_u32(device, "roxlap-gpu sprite_reg.tile_instances", 1);
         Self {
             occupancy: storage_u32(device, "roxlap-gpu sprite_reg.occupancy", &all_occ),
             colors: storage_u32(device, "roxlap-gpu sprite_reg.colors", &all_colors),
@@ -395,18 +408,48 @@ impl SpriteRegistryResident {
             model_meta: storage_pod(device, "roxlap-gpu sprite_reg.model_meta", &meta),
             instances: instances_buf,
             instance_capacity: cull.len() as u32,
+            tile_ranges,
+            tile_ranges_cap: 1,
+            tile_instances,
+            tile_instances_cap: 1,
             cull,
         }
     }
 
-    /// Frustum-cull the full instance set, pack the visible subset into
-    /// the front of the instance buffer, and return the visible count.
-    /// Conservative sphere test against the 4 side planes + the
-    /// near(behind)/far planes. Allocates a small scratch vec per call.
-    pub fn cull_visible(&self, queue: &wgpu::Queue, f: &ViewFrustum) -> u32 {
+    /// GPU.10.3 — frustum-cull, pack the visible subset into the
+    /// instance buffer, then bin those instances into screen tiles:
+    /// project each visible bounding sphere to a screen AABB and append
+    /// its (visible) index to every overlapped tile. Uploads the
+    /// instance buffer + `tile_ranges` (per-tile offset/count) +
+    /// `tile_instances` (flat grouped indices), growing the tile
+    /// buffers as needed. Returns `(visible_count, tiles_x, tiles_y)`.
+    pub fn cull_bin_upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        f: &ViewFrustum,
+        screen_w: u32,
+        screen_h: u32,
+        tile_size: u32,
+    ) -> (u32, u32, u32) {
+        let tiles_x = screen_w.div_ceil(tile_size).max(1);
+        let tiles_y = screen_h.div_ceil(tile_size).max(1);
+        let n_tiles = (tiles_x * tiles_y) as usize;
+
         let nw = (1.0 + f.half_w * f.half_w).sqrt();
         let nh = (1.0 + f.half_h * f.half_h).sqrt();
+        let cx = screen_w as f32 * 0.5;
+        let cy = screen_h as f32 * 0.5;
+        let px_per_world = cx / f.half_w; // isotropic: == cy/half_h
+        let ts = tile_size as f32;
+        let tx_max = tiles_x as i32 - 1;
+        let ty_max = tiles_y as i32 - 1;
+
         let mut visible: Vec<SpriteInstanceGpu> = Vec::with_capacity(self.cull.len());
+        // Per-visible tile AABB (tx0, tx1, ty0, ty1) for the bin pass.
+        let mut boxes: Vec<[i32; 4]> = Vec::with_capacity(self.cull.len());
+        let mut counts = vec![0u32; n_tiles];
+
         for ci in &self.cull {
             let rel = [
                 ci.center[0] - f.pos[0],
@@ -416,22 +459,97 @@ impl SpriteRegistryResident {
             let z = dot3(rel, f.forward);
             let r = ci.radius;
             if z + r < 0.0 || z - r > f.far {
-                continue; // behind the camera or beyond far
+                continue; // behind / beyond far
             }
             let x = dot3(rel, f.right);
             if (x - f.half_w * z) > r * nw || (-x - f.half_w * z) > r * nw {
-                continue; // right / left plane
+                continue; // right / left
             }
             let y = dot3(rel, f.down);
             if (y - f.half_h * z) > r * nh || (-y - f.half_h * z) > r * nh {
-                continue; // bottom / top plane
+                continue; // bottom / top
             }
+
+            // Visible: project the sphere to a screen AABB → tile range.
+            let (tx0, tx1, ty0, ty1) = if z > 1e-3 {
+                let sx = cx + (x / z) * px_per_world;
+                let sy = cy + (y / z) * px_per_world;
+                let sr = (r / z) * px_per_world;
+                (
+                    (((sx - sr) / ts).floor() as i32).clamp(0, tx_max),
+                    (((sx + sr) / ts).floor() as i32).clamp(0, tx_max),
+                    (((sy - sr) / ts).floor() as i32).clamp(0, ty_max),
+                    (((sy + sr) / ts).floor() as i32).clamp(0, ty_max),
+                )
+            } else {
+                // Sphere crosses the camera plane — cover all tiles.
+                (0, tx_max, 0, ty_max)
+            };
             visible.push(ci.gpu);
+            boxes.push([tx0, tx1, ty0, ty1]);
+            for ty in ty0..=ty1 {
+                for tx in tx0..=tx1 {
+                    counts[(ty * tiles_x as i32 + tx) as usize] += 1;
+                }
+            }
         }
-        if !visible.is_empty() {
-            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&visible));
+
+        if visible.is_empty() {
+            return (0, tiles_x, tiles_y);
         }
-        visible.len() as u32
+
+        // Prefix-sum counts → per-tile offsets; build the flat grouped
+        // index list.
+        let mut tile_ranges = vec![0u32; n_tiles * 2];
+        let mut running = 0u32;
+        for t in 0..n_tiles {
+            tile_ranges[2 * t] = running; // offset
+            tile_ranges[2 * t + 1] = counts[t]; // count
+            running += counts[t];
+        }
+        let total = running as usize;
+        let mut tile_instances = vec![0u32; total.max(1)];
+        let mut cursor: Vec<u32> = (0..n_tiles).map(|t| tile_ranges[2 * t]).collect();
+        for (vis_idx, b) in boxes.iter().enumerate() {
+            for ty in b[2]..=b[3] {
+                for tx in b[0]..=b[1] {
+                    let t = (ty * tiles_x as i32 + tx) as usize;
+                    tile_instances[cursor[t] as usize] = vis_idx as u32;
+                    cursor[t] += 1;
+                }
+            }
+        }
+
+        // Upload: instances + (grown) tile buffers. Grow a tile buffer
+        // only when this frame needs more than its capacity (wgpu has
+        // no Clone on Buffer, so we replace the field in place).
+        queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&visible));
+        let need_ranges = tile_ranges.len() as u32;
+        if need_ranges > self.tile_ranges_cap {
+            self.tile_ranges_cap = need_ranges.next_power_of_two();
+            self.tile_ranges = storage_dst_u32(
+                device,
+                "roxlap-gpu sprite_reg.tile_ranges",
+                self.tile_ranges_cap,
+            );
+        }
+        let need_inst = tile_instances.len() as u32;
+        if need_inst > self.tile_instances_cap {
+            self.tile_instances_cap = need_inst.next_power_of_two();
+            self.tile_instances = storage_dst_u32(
+                device,
+                "roxlap-gpu sprite_reg.tile_instances",
+                self.tile_instances_cap,
+            );
+        }
+        queue.write_buffer(&self.tile_ranges, 0, bytemuck::cast_slice(&tile_ranges));
+        queue.write_buffer(
+            &self.tile_instances,
+            0,
+            bytemuck::cast_slice(&tile_instances),
+        );
+
+        (visible.len() as u32, tiles_x, tiles_y)
     }
 }
 
@@ -448,6 +566,17 @@ fn storage_u32(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu::Buffer
         label: Some(label),
         contents: bytes,
         usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
+/// Create an uninitialised `STORAGE | COPY_DST` `u32` buffer of `cap`
+/// words (≥1). Written each frame via `queue.write_buffer`.
+fn storage_dst_u32(device: &wgpu::Device, label: &str, cap: u32) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: u64::from(cap.max(1)) * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     })
 }
 

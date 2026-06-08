@@ -37,7 +37,9 @@ struct Uniform {
     instance_count: u32,
     fog_far: f32,
     fov_y_rad: f32,
-    _p4: f32, _p5: f32, _p6: f32,
+    tiles_x: u32,    // GPU.10.3 screen-tile grid width
+    tile_size: u32,  // GPU.10.3 tile edge in pixels
+    _p6: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniform;
@@ -48,6 +50,10 @@ struct Uniform {
 @group(0) @binding(5) var<storage, read> instances: array<Instance>;
 @group(0) @binding(6) var<storage, read> depth_buffer: array<u32>;
 @group(0) @binding(7) var output: texture_storage_2d<rgba8unorm, write>;
+// GPU.10.3 — screen-tile binning: per-tile (offset,count) into the
+// flat grouped index list, so each pixel loops only its tile's sprites.
+@group(0) @binding(8) var<storage, read> tile_ranges: array<u32>;
+@group(0) @binding(9) var<storage, read> tile_instances: array<u32>;
 
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     let fog_near = u.fog_color.w;
@@ -178,8 +184,13 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     var best_color = vec3<f32>(0.0);
     var any = false;
 
-    for (var i: u32 = 0u; i < u.instance_count; i = i + 1u) {
-        let h = march_instance(instances[i], ray_dir, best_t);
+    // GPU.10.3 — loop only the instances binned to this pixel's tile.
+    let tile = (gid.y / u.tile_size) * u.tiles_x + (gid.x / u.tile_size);
+    let offset = tile_ranges[2u * tile];
+    let count = tile_ranges[2u * tile + 1u];
+    for (var k: u32 = 0u; k < count; k = k + 1u) {
+        let inst_idx = tile_instances[offset + k];
+        let h = march_instance(instances[inst_idx], ray_dir, best_t);
         if (h.hit) {
             best_t = h.t;
             best_color = h.color;
