@@ -891,12 +891,15 @@ impl ApplicationHandler for App {
                         // instances (checkerboard of the two models) to
                         // exercise instancing + shared models.
                         let mut registry = roxlap_gpu::SpriteModelRegistry::new();
-                        let base_id = registry.add(roxlap_gpu::build_sprite_model(&sprite.kv6));
+                        // GPU.10.4 — register with a 4-level LOD mip
+                        // chain so distant instances march coarser
+                        // volumes (less aliasing, fewer steps).
+                        let base_id =
+                            registry.add_lod(roxlap_gpu::build_sprite_model(&sprite.kv6), 4);
                         let red_id = registry.fork(base_id);
-                        registry
-                            .model_mut(red_id)
-                            // Keep the brightness/alpha byte; force RGB red.
-                            .recolor(|c| (c & 0xFF00_0000) | 0x00FF_0000);
+                        // Keep the brightness/alpha byte; force RGB red,
+                        // across every LOD level of the fork.
+                        registry.recolor_chain(red_id, |c| (c & 0xFF00_0000) | 0x00FF_0000);
 
                         // GPU.10.2 — spread an N×N field across the world
                         // (XY plane, above the terrain) so frustum culling
@@ -923,6 +926,17 @@ impl ApplicationHandler for App {
                                     transform: roxlap_gpu::SpriteInstanceTransform::from_sprite(&s),
                                 });
                             }
+                        }
+                        // GPU.10.4 — LOD trigger distance. `ROXLAP_LOD_PX=N`
+                        // steps to a coarser mip once a voxel projects
+                        // below N pixels; crank it (e.g. 64) to force LOD
+                        // close for inspection. Default 1.0 = production.
+                        if let Some(px) = std::env::var("ROXLAP_LOD_PX")
+                            .ok()
+                            .and_then(|v| v.parse::<f32>().ok())
+                        {
+                            eprintln!("roxlap-gpu: sprite LOD pixel threshold = {px}");
+                            gpu.set_sprite_lod_px(px);
                         }
                         eprintln!(
                             "roxlap-gpu: model-DDA — {} instances ({}×{} field), {} models",

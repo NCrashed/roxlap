@@ -190,6 +190,11 @@ pub struct GpuRenderer {
     sprite_registry: Option<sprite_model::SpriteRegistryResident>,
     /// Lazy-built pipeline + uniform for the model-DDA pass.
     sprite_model_dda: Option<SpriteModelDdaResources>,
+    /// GPU.10.4 — LOD aggressiveness: step a sprite to the next mip
+    /// once a mip-0 voxel projects below this many screen pixels.
+    /// Defaults to 4.0 (the empirical sweet spot); the host can tune
+    /// via [`Self::set_sprite_lod_px`].
+    sprite_lod_px: f32,
 }
 
 /// Per-renderer chunk-DDA pipeline state. The compute shader writes
@@ -517,6 +522,10 @@ impl GpuRenderer {
             sprite_dda: None,
             sprite_registry: None,
             sprite_model_dda: None,
+            // GPU.10.4 — default LOD threshold: step to a coarser mip
+            // once a voxel projects below 4 px. Empirically the best
+            // quality/cost tradeoff; the host can override.
+            sprite_lod_px: 4.0,
         })
     }
 
@@ -1388,6 +1397,7 @@ impl GpuRenderer {
                     surface_w,
                     surface_h,
                     SPRITE_TILE_SIZE,
+                    self.sprite_lod_px,
                 );
                 (visible > 0).then_some((visible, tiles_x))
             } else {
@@ -2078,6 +2088,15 @@ impl GpuRenderer {
             registry,
             instances,
         ));
+    }
+
+    /// GPU.10.4 — set the LOD pixel threshold: a sprite steps to the
+    /// next mip once a mip-0 voxel would project below `px` screen
+    /// pixels. `1.0` is the natural "no sub-pixel voxels" default;
+    /// larger values force LOD in closer (useful for inspection).
+    /// Clamped to ≥ 0.25.
+    pub fn set_sprite_lod_px(&mut self, px: f32) {
+        self.sprite_lod_px = px.max(0.25);
     }
 
     /// GPU.10.1 — build the instanced model-DDA pipeline (one thread

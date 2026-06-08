@@ -42,6 +42,11 @@ pub struct SpriteModel {
     /// Prefix sums: `color_offsets[col]` is the first colour index of
     /// column `col`; length `mx * my + 1`.
     pub color_offsets: Vec<u32>,
+    /// World-space size of one voxel of this model (GPU.10.4 LOD): 1.0
+    /// at mip-0, doubling each [`SpriteModel::downsample`]. The shader
+    /// divides the local ray by this so a coarse voxel spans the right
+    /// world extent and the march `t` stays in world units.
+    pub voxel_world_size: f32,
 }
 
 /// Build the DDA volume from a KV6. Columns are packed in
@@ -93,6 +98,7 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
         occupancy,
         color_offsets,
         colors,
+        voxel_world_size: 1.0,
     }
 }
 
@@ -129,58 +135,112 @@ impl SpriteInstanceTransform {
     }
 }
 
-/// A registry of sprite models. Instances reference a model by index
-/// (`model_id`); identical KV6s are added once and shared by many
-/// instances. **Copy-on-modify**: [`Self::fork`] deep-copies a model
-/// so edits to the fork leave the parent (and its instances) intact.
+/// A registry of sprite models. Instances reference a model by
+/// `model_id`, which is a **LOD chain** id: each chain holds one or
+/// more concrete mip levels (finest first; GPU.10.4), and the renderer
+/// picks the level per instance by distance. Identical KV6s are added
+/// once and shared by many instances. **Copy-on-modify**:
+/// [`Self::fork`] deep-copies a chain so edits to the fork leave the
+/// parent (and its instances) intact.
 #[derive(Debug, Clone, Default)]
 pub struct SpriteModelRegistry {
-    models: Vec<SpriteModel>,
+    /// Concrete mip-level volumes (the GPU buffers concatenate these).
+    entries: Vec<SpriteModel>,
+    /// `chains[model_id]` = entry ids, finest (mip-0) first.
+    chains: Vec<Vec<u32>>,
 }
 
 impl SpriteModelRegistry {
     #[must_use]
     pub fn new() -> Self {
-        Self { models: Vec::new() }
+        Self::default()
     }
 
-    /// Register a model and return its `model_id`.
-    pub fn add(&mut self, model: SpriteModel) -> u32 {
-        let id = self.models.len() as u32;
-        self.models.push(model);
+    fn push_entry(&mut self, model: SpriteModel) -> u32 {
+        let id = self.entries.len() as u32;
+        self.entries.push(model);
         id
     }
 
-    /// Copy-on-modify: deep-copy model `parent` into a new entry and
-    /// return its `model_id`. The fork owns independent voxel data, so
-    /// mutating it (e.g. via [`Self::model_mut`]) does not affect the
+    /// Register a single-level (no-LOD) model; returns its `model_id`.
+    pub fn add(&mut self, model: SpriteModel) -> u32 {
+        let e = self.push_entry(model);
+        let id = self.chains.len() as u32;
+        self.chains.push(vec![e]);
+        id
+    }
+
+    /// Register a model with up to `max_levels` LOD mips (each a 2×
+    /// [`SpriteModel::downsample`] of the previous; stops early once a
+    /// level collapses to 1³). Returns its `model_id`.
+    pub fn add_lod(&mut self, model: SpriteModel, max_levels: u32) -> u32 {
+        let mut levels = vec![self.push_entry(model.clone())];
+        let mut cur = model;
+        for _ in 1..max_levels.max(1) {
+            if cur.dims == [1, 1, 1] {
+                break;
+            }
+            cur = cur.downsample();
+            levels.push(self.push_entry(cur.clone()));
+        }
+        let id = self.chains.len() as u32;
+        self.chains.push(levels);
+        id
+    }
+
+    /// Copy-on-modify: deep-copy every level of chain `parent` into new
+    /// entries + a new chain, and return its `model_id`. The fork owns
+    /// independent voxel data, so mutating it does not affect the
     /// parent or any instance still pointing at it.
     ///
     /// # Panics
-    /// If `parent` is not a registered model id.
+    /// If `parent` is not a registered `model_id`.
     pub fn fork(&mut self, parent: u32) -> u32 {
-        let copy = self.models[parent as usize].clone();
-        self.add(copy)
+        let src = self.chains[parent as usize].clone();
+        let levels: Vec<u32> = src
+            .iter()
+            .map(|&e| {
+                let copy = self.entries[e as usize].clone();
+                self.push_entry(copy)
+            })
+            .collect();
+        let id = self.chains.len() as u32;
+        self.chains.push(levels);
+        id
     }
 
+    /// The finest (mip-0) model of chain `id`.
     #[must_use]
     pub fn model(&self, id: u32) -> &SpriteModel {
-        &self.models[id as usize]
+        &self.entries[self.chains[id as usize][0] as usize]
     }
 
-    /// Mutable access for editing a (typically forked) model.
+    /// Mutable access to the finest (mip-0) model for editing. (Re-run
+    /// [`Self::recolor_chain`] or rebuild to propagate to coarser
+    /// levels; structural relod is GPU.10.5.)
     pub fn model_mut(&mut self, id: u32) -> &mut SpriteModel {
-        &mut self.models[id as usize]
+        let e = self.chains[id as usize][0] as usize;
+        &mut self.entries[e]
     }
 
+    /// Recolour every LOD level of chain `id` (so a forked tint shows
+    /// at all distances).
+    pub fn recolor_chain(&mut self, id: u32, f: impl Fn(u32) -> u32 + Copy) {
+        for li in 0..self.chains[id as usize].len() {
+            let e = self.chains[id as usize][li] as usize;
+            self.entries[e].recolor(f);
+        }
+    }
+
+    /// Number of LOD chains (distinct `model_id`s).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.models.len()
+        self.chains.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.models.is_empty()
+        self.chains.is_empty()
     }
 }
 
@@ -212,6 +272,93 @@ impl SpriteModel {
         }
         r2.sqrt()
     }
+
+    /// GPU.10.4 — 2× voxel downsample for the next LOD level. A coarse
+    /// voxel is solid if any of its 2×2×2 fine voxels is, coloured by
+    /// their per-channel average. Dims/pivot halve and
+    /// `voxel_world_size` doubles, so the coarse model occupies the
+    /// same world box at half the resolution (origin-corner aligned).
+    #[must_use]
+    #[allow(clippy::manual_checked_ops)] // `n > 0` guards 4 divisions, not one checked_div
+    pub fn downsample(&self) -> SpriteModel {
+        let [fx, fy, fz] = self.dims;
+        let fidx = |x: u32, y: u32, z: u32| (x + y * fx + z * fx * fy) as usize;
+
+        // Reconstruct dense fine voxels (solid flag + colour).
+        let mut solid = vec![false; (fx * fy * fz) as usize];
+        let mut fine = vec![0u32; (fx * fy * fz) as usize];
+        for x in 0..fx {
+            for y in 0..fy {
+                let col = (x + y * fx) as usize;
+                let base = col * self.occ_words_per_col as usize;
+                let off = self.color_offsets[col] as usize;
+                let mut seen = 0usize;
+                for z in 0..fz {
+                    let w = base + (z >> 5) as usize;
+                    if (self.occupancy[w] >> (z & 31)) & 1 == 1 {
+                        fine[fidx(x, y, z)] = self.colors[off + seen];
+                        solid[fidx(x, y, z)] = true;
+                        seen += 1;
+                    }
+                }
+            }
+        }
+
+        let nx = fx.div_ceil(2).max(1);
+        let ny = fy.div_ceil(2).max(1);
+        let nz = fz.div_ceil(2).max(1);
+        let owpc = nz.div_ceil(32).max(1);
+        let cols = (nx * ny) as usize;
+        let mut occupancy = vec![0u32; cols * owpc as usize];
+        let mut color_offsets = vec![0u32; cols + 1];
+        let mut colors: Vec<u32> = Vec::new();
+
+        for cx in 0..nx {
+            for cy in 0..ny {
+                let ccol = (cx + cy * nx) as usize;
+                color_offsets[ccol] = colors.len() as u32;
+                for cz in 0..nz {
+                    let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+                    for dz in 0..2 {
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let (x, y, z) = (2 * cx + dx, 2 * cy + dy, 2 * cz + dz);
+                                if x < fx && y < fy && z < fz && solid[fidx(x, y, z)] {
+                                    let c = fine[fidx(x, y, z)];
+                                    a += (c >> 24) & 0xff;
+                                    r += (c >> 16) & 0xff;
+                                    g += (c >> 8) & 0xff;
+                                    b += c & 0xff;
+                                    n += 1;
+                                }
+                            }
+                        }
+                    }
+                    if n > 0 {
+                        let avg = ((a / n) << 24) | ((r / n) << 16) | ((g / n) << 8) | (b / n);
+                        let base = ccol * owpc as usize + (cz >> 5) as usize;
+                        occupancy[base] |= 1u32 << (cz & 31);
+                        colors.push(avg);
+                    }
+                }
+            }
+        }
+        color_offsets[cols] = colors.len() as u32;
+
+        SpriteModel {
+            dims: [nx, ny, nz],
+            occ_words_per_col: owpc,
+            pivot: [
+                self.pivot[0] * 0.5,
+                self.pivot[1] * 0.5,
+                self.pivot[2] * 0.5,
+            ],
+            occupancy,
+            colors,
+            color_offsets,
+            voxel_world_size: self.voxel_world_size * 2.0,
+        }
+    }
 }
 
 /// View frustum for CPU instance culling, in world space. Built each
@@ -232,7 +379,11 @@ pub struct ViewFrustum {
 /// CPU cull record: the GPU instance + its world bounding sphere.
 #[derive(Clone, Copy)]
 struct CullInstance {
+    /// Instance transform + a placeholder `model_id`; the cull
+    /// overwrites `model_id` with the distance-chosen LOD entry.
     gpu: SpriteInstanceGpu,
+    /// LOD chain this instance draws (the user-facing `model_id`).
+    chain_id: u32,
     center: [f32; 3],
     radius: f32,
 }
@@ -261,7 +412,8 @@ struct SpriteModelMeta {
     dims: [u32; 3],
     _pad0: u32,
     pivot: [f32; 3],
-    _pad1: f32,
+    /// GPU.10.4 — world size of one voxel of this (mip) entry.
+    voxel_world_size: f32,
 }
 
 /// GPU per-instance record. Mirrors `Instance` in the shader (std430,
@@ -329,6 +481,10 @@ pub struct SpriteRegistryResident {
     tile_instances_cap: u32,
     /// CPU cull records (full set), with precomputed bounding spheres.
     cull: Vec<CullInstance>,
+    /// GPU.10.4 — LOD chains: `chains[chain_id]` = entry ids, finest
+    /// first. The cull picks a level by distance and writes its entry
+    /// id into the packed instance's `model_id`.
+    chains: Vec<Vec<u32>>,
 }
 
 impl SpriteRegistryResident {
@@ -345,9 +501,10 @@ impl SpriteRegistryResident {
         let mut all_occ: Vec<u32> = Vec::new();
         let mut all_colors: Vec<u32> = Vec::new();
         let mut all_offsets: Vec<u32> = Vec::new();
-        let mut meta: Vec<SpriteModelMeta> = Vec::with_capacity(registry.models.len());
+        let mut meta: Vec<SpriteModelMeta> = Vec::with_capacity(registry.entries.len());
 
-        for m in &registry.models {
+        // One meta + concatenated data per concrete (mip-level) entry.
+        for m in &registry.entries {
             meta.push(SpriteModelMeta {
                 occupancy_offset: all_occ.len() as u32,
                 colors_offset: all_colors.len() as u32,
@@ -356,20 +513,15 @@ impl SpriteRegistryResident {
                 dims: m.dims,
                 _pad0: 0,
                 pivot: m.pivot,
-                _pad1: 0.0,
+                voxel_world_size: m.voxel_world_size,
             });
             all_occ.extend_from_slice(&m.occupancy);
             all_colors.extend_from_slice(&m.colors);
             all_offsets.extend_from_slice(&m.color_offsets);
         }
 
-        // Precompute per-model bound radius, then the per-instance cull
-        // records (sphere centred at the instance position).
-        let radii: Vec<f32> = registry
-            .models
-            .iter()
-            .map(SpriteModel::bound_radius)
-            .collect();
+        // Per-instance cull records: sphere centred at the instance
+        // position, radius from the chain's finest (mip-0) model.
         let cull: Vec<CullInstance> = instances
             .iter()
             .map(|i| CullInstance {
@@ -378,10 +530,11 @@ impl SpriteRegistryResident {
                     inv_rot1: i.transform.inv_rot[1],
                     inv_rot2: i.transform.inv_rot[2],
                     pos: i.transform.pos,
-                    model_id: i.model_id,
+                    model_id: i.model_id, // placeholder; cull rewrites
                 },
+                chain_id: i.model_id,
                 center: i.transform.pos,
-                radius: radii.get(i.model_id as usize).copied().unwrap_or(0.0),
+                radius: registry.model(i.model_id).bound_radius(),
             })
             .collect();
 
@@ -413,6 +566,7 @@ impl SpriteRegistryResident {
             tile_instances,
             tile_instances_cap: 1,
             cull,
+            chains: registry.chains.clone(),
         }
     }
 
@@ -423,6 +577,7 @@ impl SpriteRegistryResident {
     /// instance buffer + `tile_ranges` (per-tile offset/count) +
     /// `tile_instances` (flat grouped indices), growing the tile
     /// buffers as needed. Returns `(visible_count, tiles_x, tiles_y)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn cull_bin_upload(
         &mut self,
         device: &wgpu::Device,
@@ -431,6 +586,7 @@ impl SpriteRegistryResident {
         screen_w: u32,
         screen_h: u32,
         tile_size: u32,
+        lod_px: f32,
     ) -> (u32, u32, u32) {
         let tiles_x = screen_w.div_ceil(tile_size).max(1);
         let tiles_y = screen_h.div_ceil(tile_size).max(1);
@@ -485,7 +641,22 @@ impl SpriteRegistryResident {
                 // Sphere crosses the camera plane — cover all tiles.
                 (0, tx_max, 0, ty_max)
             };
-            visible.push(ci.gpu);
+            // GPU.10.4 — pick the LOD level by projected voxel size:
+            // choose the coarsest level whose voxel still covers at
+            // least `lod_px` screen pixels, i.e. step up once a mip-0
+            // voxel would be smaller than that. `lod_px = 1` is the
+            // natural "don't go sub-pixel" threshold; larger values
+            // force LOD in closer (tuning/inspection).
+            let chain = &self.chains[ci.chain_id as usize];
+            let level = if z > 1e-3 && chain.len() > 1 {
+                let voxel_px = px_per_world / z; // mip-0 voxel screen size
+                ((lod_px / voxel_px).log2().ceil().max(0.0) as usize).min(chain.len() - 1)
+            } else {
+                0
+            };
+            let mut g = ci.gpu;
+            g.model_id = chain[level];
+            visible.push(g);
             boxes.push([tx0, tx1, ty0, ty1]);
             for ty in ty0..=ty1 {
                 for tx in tx0..=tx1 {

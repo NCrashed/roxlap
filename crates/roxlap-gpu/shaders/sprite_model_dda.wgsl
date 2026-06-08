@@ -18,7 +18,7 @@ struct ModelMeta {
     dims: vec3<u32>,
     _pad0: u32,
     pivot: vec3<f32>,
-    _pad1: f32,
+    voxel_world_size: f32, // GPU.10.4 LOD: world size of one voxel
 };
 struct Instance {
     inv_rot0: vec4<f32>,
@@ -111,10 +111,13 @@ fn march_instance(inst: Instance, ray_dir: vec3<f32>, limit: f32) -> Hit {
 
     let m = models[inst.model_id];
     let inv = mat3x3<f32>(inst.inv_rot0.xyz, inst.inv_rot1.xyz, inst.inv_rot2.xyz);
-    // World → model-local. For an orthonormal basis this preserves
-    // length, so the local ray parameter equals world distance.
-    let o = inv * (u.cam_pos - inst.pos) + m.pivot;
-    let d = inv * ray_dir;
+    // World → model-local voxel space. Dividing by voxel_world_size
+    // makes one voxel span that many world units (GPU.10.4 LOD: coarse
+    // mips have larger voxels) and keeps the ray parameter `t` in world
+    // units, so the depth composite stays correct. mip-0 has size 1.
+    let s = m.voxel_world_size;
+    let o = inv * (u.cam_pos - inst.pos) / s + m.pivot;
+    let d = inv * ray_dir / s;
 
     let box_max = vec3<f32>(f32(m.dims.x), f32(m.dims.y), f32(m.dims.z));
     let inv_d = 1.0 / d;
