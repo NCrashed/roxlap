@@ -279,6 +279,14 @@ struct App {
     title_base: String,
     fps_frames: u32,
     fps_last: Instant,
+    /// GPU.12 — kept so the `G` hotkey can structurally edit a sprite
+    /// model at runtime and re-upload. The registry + the instance
+    /// list + the forked ("red") model id being carved + the next
+    /// z-layer to remove.
+    gpu_sprite_registry: Option<roxlap_gpu::SpriteModelRegistry>,
+    gpu_sprite_instances: Vec<roxlap_gpu::SpriteInstance>,
+    gpu_sprite_edit_id: u32,
+    gpu_sprite_carve_z: u32,
 }
 
 impl App {
@@ -330,6 +338,10 @@ impl App {
             title_base: "roxlap-scene-demo".to_string(),
             fps_frames: 0,
             fps_last: Instant::now(),
+            gpu_sprite_registry: None,
+            gpu_sprite_instances: Vec::new(),
+            gpu_sprite_edit_id: 0,
+            gpu_sprite_carve_z: 0,
         }
     }
 
@@ -818,6 +830,37 @@ impl App {
         }
     }
 
+    /// GPU.12 — carve the next z-layer off the forked ("red") sprite
+    /// model, rebuild its LOD mips, and re-upload. Demonstrates a
+    /// structural runtime edit + copy-on-modify (the base instances are
+    /// untouched). No-op without the GPU sprite path.
+    fn carve_sprite_layer(&mut self) {
+        let Some(gpu) = self.gpu.as_mut() else { return };
+        let Some(reg) = self.gpu_sprite_registry.as_mut() else {
+            return;
+        };
+        let id = self.gpu_sprite_edit_id;
+        let dims = reg.model(id).dims;
+        let z = self.gpu_sprite_carve_z;
+        if z >= dims[2] {
+            eprintln!("GPU.12: red model fully carved ({} layers)", dims[2]);
+            return;
+        }
+        let m = reg.model_mut(id);
+        let mut removed = 0u32;
+        for y in 0..dims[1] {
+            for x in 0..dims[0] {
+                if m.set_voxel(x, y, z, None) {
+                    removed += 1;
+                }
+            }
+        }
+        reg.rebuild_lod(id);
+        self.gpu_sprite_carve_z = z + 1;
+        gpu.set_sprite_instances(reg, &self.gpu_sprite_instances);
+        eprintln!("GPU.12: carved red-model z-layer {z} ({removed} voxels); re-uploaded");
+    }
+
     fn set_grab(&mut self, grab: bool) {
         let Some(window) = self.window.as_ref() else {
             return;
@@ -873,7 +916,7 @@ impl ApplicationHandler for App {
                     // GPU.10 — render the KV6 sprites as DDA-marched
                     // voxel-model instances (precise, no overdraw; the
                     // GPU.9 splatter was retired in 10.5).
-                    if let Some(sprite) = self.sprites.first() {
+                    if let Some(sprite) = self.sprites.first().cloned() {
                         // Model registry + instancing: add the coco model
                         // once, fork a red-tinted variant (copy-on-modify),
                         // then spawn a field of instances (checkerboard of
@@ -927,13 +970,24 @@ impl ApplicationHandler for App {
                             gpu.set_sprite_lod_px(px);
                         }
                         eprintln!(
-                            "roxlap-gpu: model-DDA — {} instances ({}×{} field), {} models",
+                            "roxlap-gpu: model-DDA — {} instances ({}×{} field), {} models \
+                             ('G' carves the red model live)",
                             instances.len(),
                             n,
                             n,
                             registry.len()
                         );
-                        gpu.set_sprite_instances(&registry, &instances);
+                        // GPU.12 — keep registry + instances so the `G`
+                        // hotkey can structurally edit the red model and
+                        // re-upload at runtime.
+                        self.gpu_sprite_edit_id = red_id;
+                        self.gpu_sprite_carve_z = 0;
+                        self.gpu_sprite_registry = Some(registry);
+                        self.gpu_sprite_instances = instances;
+                        gpu.set_sprite_instances(
+                            self.gpu_sprite_registry.as_ref().expect("just set"),
+                            &self.gpu_sprite_instances,
+                        );
                     }
                     self.upload_first_scene(&gpu);
                     self.gpu = Some(gpu);
@@ -1005,6 +1059,13 @@ impl ApplicationHandler for App {
                             "ship spin = {}",
                             if self.scene.spin_enabled { "ON" } else { "OFF" }
                         );
+                    }
+                    // GPU.12: `G` structurally carves the next z-layer
+                    // off the forked ("red") sprite model at runtime,
+                    // rebuilds its LOD mips, and re-uploads — the base
+                    // (non-red) instances stay intact (copy-on-modify).
+                    KeyCode::KeyG if pressed => {
+                        self.carve_sprite_layer();
                     }
                     // S6.6: `B` toggles the marker pillars'
                     // LOD configuration between always-Near

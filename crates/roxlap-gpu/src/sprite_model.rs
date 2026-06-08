@@ -66,27 +66,33 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
     let mut color_offsets = vec![0u32; cols + 1];
     let mut colors: Vec<u32> = Vec::with_capacity(kv6.voxels.len());
 
+    // Pass 1 — consume voxels in KV6 storage order (x-outer / y-inner)
+    // into per-column buckets keyed by `col = x + y*mx`.
+    let mut buckets: Vec<Vec<(u16, u32)>> = vec![Vec::new(); cols];
     let mut voxel_iter = kv6.voxels.iter();
     for x in 0..mx {
         for y in 0..my {
             let col = (x + y * mx) as usize;
-            color_offsets[col] = colors.len() as u32;
             let count = kv6.ylen[x as usize][y as usize];
-            // Collect the column's voxels and sort ascending z so the
-            // occupancy popcount rank matches the colour order.
-            let mut column: Vec<(u16, u32)> = (0..count)
-                .map(|_| {
-                    let v = voxel_iter.next().expect("KV6 ylen / voxels.len mismatch");
-                    (v.z, v.col)
-                })
-                .collect();
-            column.sort_by_key(|(z, _)| *z);
-            for (z, col_rgba) in column {
-                let z = u32::from(z);
-                let base = col * occ_words_per_col as usize + (z >> 5) as usize;
-                occupancy[base] |= 1u32 << (z & 31);
-                colors.push(col_rgba);
+            for _ in 0..count {
+                let v = voxel_iter.next().expect("KV6 ylen / voxels.len mismatch");
+                buckets[col].push((v.z, v.col));
             }
+        }
+    }
+
+    // Pass 2 — emit in COLUMN-INDEX order so `color_offsets` is a true
+    // monotonic prefix sum (the shader indexes by `col` either way, but
+    // structural edits / mip rebuilds rely on monotonic offsets). Each
+    // column's voxels sorted ascending z for the popcount-rank lookup.
+    for (col, bucket) in buckets.iter_mut().enumerate() {
+        color_offsets[col] = colors.len() as u32;
+        bucket.sort_by_key(|(z, _)| *z);
+        for &(z, col_rgba) in bucket.iter() {
+            let z = u32::from(z);
+            let base = col * occ_words_per_col as usize + (z >> 5) as usize;
+            occupancy[base] |= 1u32 << (z & 31);
+            colors.push(col_rgba);
         }
     }
     color_offsets[cols] = colors.len() as u32;
@@ -274,6 +280,61 @@ impl SpriteModel {
         }
     }
 
+    /// GPU.12 — structural edit of a single voxel within the model's
+    /// existing bounds. `Some(rgba)` sets/replaces the voxel at
+    /// `(x, y, z)`; `None` clears it. Maintains the ascending-z colour
+    /// invariant by inserting/removing at the voxel's popcount rank and
+    /// shifting the affected columns' `color_offsets`. Returns `true`
+    /// if the model changed. Out-of-bounds coordinates are ignored
+    /// (returns `false`) — growing `dims` is a separate concern.
+    ///
+    /// After editing, call [`SpriteModelRegistry::rebuild_lod`] to
+    /// refresh coarser mips, then re-upload via `set_sprite_instances`.
+    pub fn set_voxel(&mut self, x: u32, y: u32, z: u32, color: Option<u32>) -> bool {
+        if x >= self.dims[0] || y >= self.dims[1] || z >= self.dims[2] {
+            return false;
+        }
+        let owpc = self.occ_words_per_col as usize;
+        let cols = (self.dims[0] * self.dims[1]) as usize;
+        let col = (x + y * self.dims[0]) as usize;
+        let base = col * owpc;
+        let zw = (z >> 5) as usize;
+        let zb = z & 31;
+
+        // Rank = solid voxels strictly below z in this column.
+        let mut rank = 0usize;
+        for w in 0..zw {
+            rank += self.occupancy[base + w].count_ones() as usize;
+        }
+        let below_mask = if zb > 0 { (1u32 << zb) - 1 } else { 0 };
+        rank += (self.occupancy[base + zw] & below_mask).count_ones() as usize;
+        let idx = self.color_offsets[col] as usize + rank;
+        let was_set = (self.occupancy[base + zw] >> zb) & 1 == 1;
+
+        if let Some(rgba) = color {
+            if was_set {
+                self.colors[idx] = rgba; // replace in place
+            } else {
+                self.occupancy[base + zw] |= 1u32 << zb;
+                self.colors.insert(idx, rgba);
+                for c in &mut self.color_offsets[col + 1..=cols] {
+                    *c += 1;
+                }
+            }
+            true
+        } else {
+            if !was_set {
+                return false;
+            }
+            self.occupancy[base + zw] &= !(1u32 << zb);
+            self.colors.remove(idx);
+            for c in &mut self.color_offsets[col + 1..=cols] {
+                *c -= 1;
+            }
+            true
+        }
+    }
+
     /// Radius of a bounding sphere centred at the instance position
     /// (the pivot maps there): the farthest bbox corner from the
     /// pivot. Used for frustum culling. Assumes a unit basis; scaled
@@ -332,8 +393,10 @@ impl SpriteModel {
         let mut color_offsets = vec![0u32; cols + 1];
         let mut colors: Vec<u32> = Vec::new();
 
-        for cx in 0..nx {
-            for cy in 0..ny {
+        // Emit in column-index order (`ccol = cx + cy*nx`), cy outer,
+        // so `color_offsets` is a monotonic prefix sum like build's.
+        for cy in 0..ny {
+            for cx in 0..nx {
                 let ccol = (cx + cy * nx) as usize;
                 color_offsets[ccol] = colors.len() as u32;
                 for cz in 0..nz {
@@ -863,6 +926,122 @@ mod tests {
         let m0 = reg.model(id);
         assert_eq!(m0.dims, [2, 1, 8]);
         assert!((m0.voxel_world_size - 1.0).abs() < 1e-6);
+    }
+
+    /// kv6 from explicit voxels, ordered x-major/y-inner to match
+    /// `build_sprite_model`'s column walk.
+    fn kv6_from(xsiz: u32, ysiz: u32, zsiz: u32, voxels: &[(u32, u32, u16, u32)]) -> Kv6 {
+        let mut ylen = vec![vec![0u16; ysiz as usize]; xsiz as usize];
+        let mut flat = Vec::new();
+        for x in 0..xsiz {
+            for y in 0..ysiz {
+                let mut col: Vec<(u16, u32)> = voxels
+                    .iter()
+                    .filter(|(vx, vy, _, _)| *vx == x && *vy == y)
+                    .map(|(_, _, z, c)| (*z, *c))
+                    .collect();
+                col.sort_by_key(|(z, _)| *z);
+                ylen[x as usize][y as usize] = col.len() as u16;
+                for (z, c) in col {
+                    flat.push(Voxel {
+                        col: c,
+                        z,
+                        vis: 0,
+                        dir: 0,
+                    });
+                }
+            }
+        }
+        let xlen = ylen
+            .iter()
+            .map(|c| c.iter().map(|&v| u32::from(v)).sum())
+            .collect();
+        Kv6 {
+            xsiz,
+            ysiz,
+            zsiz,
+            xpiv: 0.0,
+            ypiv: 0.0,
+            zpiv: 0.0,
+            voxels: flat,
+            xlen,
+            ylen,
+            palette: None,
+        }
+    }
+
+    fn offsets_consistent(m: &SpriteModel) -> bool {
+        let cols = (m.dims[0] * m.dims[1]) as usize;
+        if m.color_offsets.len() != cols + 1 {
+            return false;
+        }
+        // Monotonic non-decreasing + last == colors.len + each column's
+        // span == its solid-voxel count.
+        for w in m.color_offsets.windows(2) {
+            if w[1] < w[0] {
+                return false;
+            }
+        }
+        m.color_offsets[cols] as usize == m.colors.len()
+    }
+
+    #[test]
+    fn carve_two_layers_keeps_offsets_consistent() {
+        // Mirror the demo's carve: columns with voxels at varied z,
+        // some sharing z=0/z=1, some not.
+        let kv6 = kv6_from(
+            3,
+            2,
+            8,
+            &[
+                (0, 0, 0, 0xA0),
+                (0, 0, 1, 0xA1),
+                (0, 0, 5, 0xA5),
+                (1, 0, 1, 0xB1),
+                (2, 1, 0, 0xC0),
+                (2, 1, 3, 0xC3),
+            ],
+        );
+        let mut m = build_sprite_model(&kv6);
+        assert!(offsets_consistent(&m));
+        for z in 0..2u32 {
+            for y in 0..m.dims[1] {
+                for x in 0..m.dims[0] {
+                    m.set_voxel(x, y, z, None);
+                }
+            }
+            assert!(offsets_consistent(&m), "inconsistent after carving z={z}");
+            // downsample must not panic on the carved model.
+            let _ = m.downsample();
+        }
+    }
+
+    #[test]
+    fn set_voxel_inserts_replaces_and_clears() {
+        // col 0 starts with z=1 (0xBB), z=5 (0xAA); col 1 with z=3 (0xCC).
+        let mut m = build_sprite_model(&kv6_unsorted());
+
+        // Insert z=3 into col 0 (between z=1 and z=5) → rank 1.
+        assert!(m.set_voxel(0, 0, 3, Some(0x55)));
+        assert_eq!(m.occupancy[0], (1 << 1) | (1 << 3) | (1 << 5));
+        // col 0 colours ascending z: 0xBB(z1), 0x55(z3), 0xAA(z5).
+        assert_eq!(m.color_offsets, vec![0, 3, 4]);
+        assert_eq!(&m.colors, &[0xBB, 0x55, 0xAA, 0xCC]);
+
+        // Replace z=3 in place (no offset shift).
+        assert!(m.set_voxel(0, 0, 3, Some(0x66)));
+        assert_eq!(&m.colors, &[0xBB, 0x66, 0xAA, 0xCC]);
+        assert_eq!(m.color_offsets, vec![0, 3, 4]);
+
+        // Clear z=1 (rank 0) from col 0.
+        assert!(m.set_voxel(0, 0, 1, None));
+        assert_eq!(m.occupancy[0], (1 << 3) | (1 << 5));
+        assert_eq!(m.color_offsets, vec![0, 2, 3]);
+        assert_eq!(&m.colors, &[0x66, 0xAA, 0xCC]);
+
+        // No-ops: clear an empty voxel, edit out of bounds.
+        assert!(!m.set_voxel(0, 0, 2, None));
+        assert!(!m.set_voxel(9, 0, 0, Some(1)));
     }
 
     #[test]
