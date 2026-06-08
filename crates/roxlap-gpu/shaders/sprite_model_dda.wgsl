@@ -1,44 +1,53 @@
-// GPU.10.0 — single KV6 sprite as a DDA-marched voxel model.
+// GPU.10.1 — instanced KV6 sprites as DDA-marched voxel models.
 //
-// One thread per screen pixel: build the world ray (same convention
-// as scene_dda), transform it into the model's local voxel space,
-// clip to the model AABB, and 3D-DDA-march the volume to the first
-// solid voxel. Composite against the terrain depth buffer (the scene
-// pass's per-pixel best_t) so the sprite occludes / is occluded by
-// the world correctly. No overdraw, no atomics — the precise path.
+// One thread per screen pixel. Build the world ray, then loop every
+// instance (naive — frustum cull + screen-tile binning come in 10.2 /
+// 10.3): transform the ray into that instance's model-local space,
+// AABB-clip to the model box, 3D-DDA-march to the first solid voxel,
+// and keep the nearest hit across all instances. Composite against the
+// terrain depth buffer so the world occludes / is occluded correctly.
+// Precise, no overdraw, no atomics.
 
 const T_INF: f32 = 1.0e30;
 
-struct ModelUniform {
+struct ModelMeta {
+    occupancy_offset: u32,
+    colors_offset: u32,
+    color_offsets_offset: u32,
+    occ_words_per_col: u32,
+    dims: vec3<u32>,
+    _pad0: u32,
+    pivot: vec3<f32>,
+    _pad1: f32,
+};
+struct Instance {
+    inv_rot0: vec4<f32>,
+    inv_rot1: vec4<f32>,
+    inv_rot2: vec4<f32>,
+    pos: vec3<f32>,
+    model_id: u32,
+};
+struct Uniform {
     cam_pos: vec3<f32>, _p0: f32,
     cam_right: vec3<f32>, _p1: f32,
     cam_down: vec3<f32>, _p2: f32,
     cam_forward: vec3<f32>, _p3: f32,
-    // Inverse model→world rotation, columns (w unused).
-    inv_rot0: vec4<f32>,
-    inv_rot1: vec4<f32>,
-    inv_rot2: vec4<f32>,
-    inst_pos: vec3<f32>, _p4: f32,
-    pivot: vec3<f32>, _p5: f32,
     fog_color: vec4<f32>, // rgb + fog_near in w
     screen_size: vec2<u32>,
-    dims: vec2<u32>, // mx, my
-    mz: u32,
-    occ_words_per_col: u32,
+    instance_count: u32,
     fog_far: f32,
     fov_y_rad: f32,
+    _p4: f32, _p5: f32, _p6: f32,
 };
 
-@group(0) @binding(0) var<uniform> u: ModelUniform;
+@group(0) @binding(0) var<uniform> u: Uniform;
 @group(0) @binding(1) var<storage, read> occupancy: array<u32>;
 @group(0) @binding(2) var<storage, read> colors: array<u32>;
 @group(0) @binding(3) var<storage, read> color_offsets: array<u32>;
-@group(0) @binding(4) var<storage, read> depth_buffer: array<u32>;
-@group(0) @binding(5) var output: texture_storage_2d<rgba8unorm, write>;
-
-fn apply_inv(v: vec3<f32>) -> vec3<f32> {
-    return u.inv_rot0.xyz * v.x + u.inv_rot1.xyz * v.y + u.inv_rot2.xyz * v.z;
-}
+@group(0) @binding(4) var<storage, read> models: array<ModelMeta>;
+@group(0) @binding(5) var<storage, read> instances: array<Instance>;
+@group(0) @binding(6) var<storage, read> depth_buffer: array<u32>;
+@group(0) @binding(7) var output: texture_storage_2d<rgba8unorm, write>;
 
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     let fog_near = u.fog_color.w;
@@ -46,20 +55,17 @@ fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     return mix(hit_color, u.fog_color.rgb, factor);
 }
 
-fn col_base(p: vec3<i32>) -> u32 {
-    return (u32(p.x) + u32(p.y) * u.dims.x) * u.occ_words_per_col;
-}
-
-fn model_solid(p: vec3<i32>) -> bool {
-    let base = col_base(p);
+fn model_solid(m: ModelMeta, p: vec3<i32>) -> bool {
+    let col = u32(p.x) + u32(p.y) * m.dims.x;
+    let base = m.occupancy_offset + col * m.occ_words_per_col;
     let zw = u32(p.z) >> 5u;
     let zb = u32(p.z) & 31u;
     return (occupancy[base + zw] & (1u << zb)) != 0u;
 }
 
-fn model_color(p: vec3<i32>) -> vec3<f32> {
-    let col = u32(p.x) + u32(p.y) * u.dims.x;
-    let base = col * u.occ_words_per_col;
+fn model_color(m: ModelMeta, p: vec3<i32>) -> vec3<f32> {
+    let col = u32(p.x) + u32(p.y) * m.dims.x;
+    let base = m.occupancy_offset + col * m.occ_words_per_col;
     let zw = u32(p.z) >> 5u;
     let zb = u32(p.z) & 31u;
     var rank: u32 = 0u;
@@ -70,7 +76,8 @@ fn model_color(p: vec3<i32>) -> vec3<f32> {
     if (zb > 0u) { mask = (1u << zb) - 1u; }
     rank = rank + countOneBits(occupancy[base + zw] & mask);
 
-    let packed = colors[color_offsets[col] + rank];
+    let local_off = color_offsets[m.color_offsets_offset + col];
+    let packed = colors[m.colors_offset + local_off + rank];
     let a = f32((packed >> 24u) & 0xffu);
     let r = f32((packed >> 16u) & 0xffu);
     let g = f32((packed >> 8u) & 0xffu);
@@ -87,30 +94,23 @@ fn shield_parallel(t: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     return o;
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= u.screen_size.x || gid.y >= u.screen_size.y) { return; }
-    let pix = gid.y * u.screen_size.x + gid.x;
+// March one instance; returns the hit t (or `limit` on miss) and
+// writes the colour into `out_color` when it improves on `limit`.
+struct Hit { t: f32, color: vec3<f32>, hit: bool };
+fn march_instance(inst: Instance, ray_dir: vec3<f32>, limit: f32) -> Hit {
+    var res: Hit;
+    res.hit = false;
+    res.t = limit;
+    res.color = vec3<f32>(0.0);
 
-    // World ray (matches scene_dda's ray construction exactly).
-    let aspect = f32(u.screen_size.x) / f32(u.screen_size.y);
-    let half_h = tan(u.fov_y_rad * 0.5);
-    let half_w = half_h * aspect;
-    let ndc_x = (f32(gid.x) + 0.5) / f32(u.screen_size.x) * 2.0 - 1.0;
-    let ndc_y_top = 1.0 - (f32(gid.y) + 0.5) / f32(u.screen_size.y) * 2.0;
-    let ray_dir = normalize(
-        u.cam_forward + ndc_x * half_w * u.cam_right - ndc_y_top * half_h * u.cam_down
-    );
+    let m = models[inst.model_id];
+    let inv = mat3x3<f32>(inst.inv_rot0.xyz, inst.inv_rot1.xyz, inst.inv_rot2.xyz);
+    // World → model-local. For an orthonormal basis this preserves
+    // length, so the local ray parameter equals world distance.
+    let o = inv * (u.cam_pos - inst.pos) + m.pivot;
+    let d = inv * ray_dir;
 
-    // World → model-local. For an orthonormal basis `apply_inv`
-    // preserves length, so the local ray parameter t equals the
-    // world-space distance and composites directly against the scene
-    // depth buffer.
-    let o = apply_inv(u.cam_pos - u.inst_pos) + u.pivot;
-    let d = apply_inv(ray_dir);
-
-    // Slab-clip the local ray to the model AABB [0,dims].
-    let box_max = vec3<f32>(f32(u.dims.x), f32(u.dims.y), f32(u.mz));
+    let box_max = vec3<f32>(f32(m.dims.x), f32(m.dims.y), f32(m.dims.z));
     let inv_d = 1.0 / d;
     let t0 = (vec3<f32>(0.0) - o) * inv_d;
     let t1 = (box_max - o) * inv_d;
@@ -118,15 +118,10 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     let thi = max(t0, t1);
     let t_enter = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
     let t_exit = min(thi.x, min(thi.y, thi.z));
-    if (t_exit < t_enter) { return; } // misses the box
+    if (t_exit < t_enter || t_enter >= limit) { return res; }
 
-    // Only worth marching if the sprite could be nearer than the world.
-    let scene_t = bitcast<f32>(depth_buffer[pix]);
-    if (t_enter >= scene_t) { return; }
-
-    // 3D-DDA from the entry point.
     let entry = o + t_enter * d;
-    let dim_i = vec3<i32>(i32(u.dims.x), i32(u.dims.y), i32(u.mz));
+    let dim_i = vec3<i32>(i32(m.dims.x), i32(m.dims.y), i32(m.dims.z));
     var p = clamp(vec3<i32>(floor(entry)), vec3<i32>(0), dim_i - vec3<i32>(1));
     let step = vec3<i32>(sign(d));
     let t_delta = abs(inv_d);
@@ -137,33 +132,63 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     var t_max = shield_parallel((next_b - o) * inv_d, d);
     var t_hit = t_enter;
+    let max_steps = m.dims.x + m.dims.y + m.dims.z + 3u;
 
-    // Bound steps to the volume's Manhattan diagonal.
-    let max_steps = u.dims.x + u.dims.y + u.mz + 3u;
     for (var i: u32 = 0u; i < max_steps; i = i + 1u) {
-        if (model_solid(p)) {
-            if (t_hit < scene_t) {
-                let col = apply_fog(model_color(p), t_hit);
-                textureStore(output, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
+        if (model_solid(m, p)) {
+            if (t_hit < limit) {
+                res.hit = true;
+                res.t = t_hit;
+                res.color = model_color(m, p);
             }
-            return;
+            return res;
         }
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
-            t_hit = t_max.x;
-            p.x = p.x + step.x;
-            t_max.x = t_max.x + t_delta.x;
-            if (p.x < 0 || p.x >= dim_i.x) { return; }
+            t_hit = t_max.x; p.x = p.x + step.x; t_max.x = t_max.x + t_delta.x;
+            if (p.x < 0 || p.x >= dim_i.x) { return res; }
         } else if (t_max.y < t_max.z) {
-            t_hit = t_max.y;
-            p.y = p.y + step.y;
-            t_max.y = t_max.y + t_delta.y;
-            if (p.y < 0 || p.y >= dim_i.y) { return; }
+            t_hit = t_max.y; p.y = p.y + step.y; t_max.y = t_max.y + t_delta.y;
+            if (p.y < 0 || p.y >= dim_i.y) { return res; }
         } else {
-            t_hit = t_max.z;
-            p.z = p.z + step.z;
-            t_max.z = t_max.z + t_delta.z;
-            if (p.z < 0 || p.z >= dim_i.z) { return; }
+            t_hit = t_max.z; p.z = p.z + step.z; t_max.z = t_max.z + t_delta.z;
+            if (p.z < 0 || p.z >= dim_i.z) { return res; }
         }
-        if (t_hit >= scene_t) { return; } // world already nearer
+        if (t_hit >= limit) { return res; }
+    }
+    return res;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= u.screen_size.x || gid.y >= u.screen_size.y) { return; }
+    let pix = gid.y * u.screen_size.x + gid.x;
+
+    let aspect = f32(u.screen_size.x) / f32(u.screen_size.y);
+    let half_h = tan(u.fov_y_rad * 0.5);
+    let half_w = half_h * aspect;
+    let ndc_x = (f32(gid.x) + 0.5) / f32(u.screen_size.x) * 2.0 - 1.0;
+    let ndc_y_top = 1.0 - (f32(gid.y) + 0.5) / f32(u.screen_size.y) * 2.0;
+    let ray_dir = normalize(
+        u.cam_forward + ndc_x * half_w * u.cam_right - ndc_y_top * half_h * u.cam_down
+    );
+
+    // Start the nearest-hit search at the terrain depth; only sprites
+    // closer than the world matter.
+    var best_t = bitcast<f32>(depth_buffer[pix]);
+    var best_color = vec3<f32>(0.0);
+    var any = false;
+
+    for (var i: u32 = 0u; i < u.instance_count; i = i + 1u) {
+        let h = march_instance(instances[i], ray_dir, best_t);
+        if (h.hit) {
+            best_t = h.t;
+            best_color = h.color;
+            any = true;
+        }
+    }
+
+    if (any) {
+        let col = apply_fog(best_color, best_t);
+        textureStore(output, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
     }
 }

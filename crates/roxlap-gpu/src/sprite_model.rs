@@ -122,6 +122,108 @@ impl SpriteInstanceTransform {
     }
 }
 
+/// A registry of sprite models. Instances reference a model by index
+/// (`model_id`); identical KV6s are added once and shared by many
+/// instances. **Copy-on-modify**: [`Self::fork`] deep-copies a model
+/// so edits to the fork leave the parent (and its instances) intact.
+#[derive(Debug, Clone, Default)]
+pub struct SpriteModelRegistry {
+    models: Vec<SpriteModel>,
+}
+
+impl SpriteModelRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { models: Vec::new() }
+    }
+
+    /// Register a model and return its `model_id`.
+    pub fn add(&mut self, model: SpriteModel) -> u32 {
+        let id = self.models.len() as u32;
+        self.models.push(model);
+        id
+    }
+
+    /// Copy-on-modify: deep-copy model `parent` into a new entry and
+    /// return its `model_id`. The fork owns independent voxel data, so
+    /// mutating it (e.g. via [`Self::model_mut`]) does not affect the
+    /// parent or any instance still pointing at it.
+    ///
+    /// # Panics
+    /// If `parent` is not a registered model id.
+    pub fn fork(&mut self, parent: u32) -> u32 {
+        let copy = self.models[parent as usize].clone();
+        self.add(copy)
+    }
+
+    #[must_use]
+    pub fn model(&self, id: u32) -> &SpriteModel {
+        &self.models[id as usize]
+    }
+
+    /// Mutable access for editing a (typically forked) model.
+    pub fn model_mut(&mut self, id: u32) -> &mut SpriteModel {
+        &mut self.models[id as usize]
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.models.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+}
+
+impl SpriteModel {
+    /// Recolour every voxel via `f(old_rgba) -> new_rgba`. Structure
+    /// (occupancy / offsets) is untouched, so this is a cheap in-place
+    /// edit — handy on a [`SpriteModelRegistry::fork`] to make a tinted
+    /// variant. Structural edits (add/remove voxels) come in GPU.10.5.
+    pub fn recolor(&mut self, f: impl Fn(u32) -> u32) {
+        for c in &mut self.colors {
+            *c = f(*c);
+        }
+    }
+}
+
+/// One sprite instance: a model reference + world pose.
+#[derive(Debug, Clone, Copy)]
+pub struct SpriteInstance {
+    pub model_id: u32,
+    pub transform: SpriteInstanceTransform,
+}
+
+/// GPU per-model metadata: where this model's data starts in the
+/// shared registry buffers + its dims/pivot. Mirrors `ModelMeta` in
+/// the shader (std430, 48 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+struct SpriteModelMeta {
+    occupancy_offset: u32,
+    colors_offset: u32,
+    color_offsets_offset: u32,
+    occ_words_per_col: u32,
+    dims: [u32; 3],
+    _pad0: u32,
+    pivot: [f32; 3],
+    _pad1: f32,
+}
+
+/// GPU per-instance record. Mirrors `Instance` in the shader (std430,
+/// 64 bytes): inverse rotation columns + position + model id.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+struct SpriteInstanceGpu {
+    inv_rot0: [f32; 4],
+    inv_rot1: [f32; 4],
+    inv_rot2: [f32; 4],
+    pos: [f32; 3],
+    model_id: u32,
+}
+
 /// Invert a 3×3 matrix given as basis columns `[c0, c1, c2]`,
 /// returning the inverse as columns. For an orthonormal basis this is
 /// the transpose; the general path covers rotation + non-unit scale.
@@ -150,47 +252,99 @@ fn mat3_inverse(cols: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     ]
 }
 
-/// GPU-resident model: occupancy / colours / offsets as storage
-/// buffers + the dims the shader needs.
-pub struct SpriteModelResident {
+/// GPU-resident registry + instances: every model's occupancy /
+/// colours / offsets concatenated into shared storage buffers, a
+/// per-model metadata table, and the instance array. One bind group
+/// serves all models (same approach as the multi-grid scene).
+pub struct SpriteRegistryResident {
     pub occupancy: wgpu::Buffer,
     pub colors: wgpu::Buffer,
     pub color_offsets: wgpu::Buffer,
-    pub dims: [u32; 3],
-    pub occ_words_per_col: u32,
-    pub pivot: [f32; 3],
+    pub model_meta: wgpu::Buffer,
+    pub instances: wgpu::Buffer,
+    pub instance_count: u32,
 }
 
-impl SpriteModelResident {
-    /// Upload `model` to GPU storage buffers.
+impl SpriteRegistryResident {
+    /// Concatenate `registry`'s models into shared buffers and upload
+    /// `instances`. Model-relative indices stay as built; the shader
+    /// adds each model's base offset from the metadata table.
     #[must_use]
-    pub fn upload(device: &wgpu::Device, model: &SpriteModel) -> Self {
-        use wgpu::util::DeviceExt;
-        let mk = |label: &str, data: &[u32]| {
-            // Pad empty buffers — wgpu rejects zero-sized storage.
-            let bytes: &[u8] = if data.is_empty() {
-                bytemuck::cast_slice(&[0u32])
-            } else {
-                bytemuck::cast_slice(data)
-            };
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytes,
-                usage: wgpu::BufferUsages::STORAGE,
+    pub fn upload(
+        device: &wgpu::Device,
+        registry: &SpriteModelRegistry,
+        instances: &[SpriteInstance],
+    ) -> Self {
+        let mut all_occ: Vec<u32> = Vec::new();
+        let mut all_colors: Vec<u32> = Vec::new();
+        let mut all_offsets: Vec<u32> = Vec::new();
+        let mut meta: Vec<SpriteModelMeta> = Vec::with_capacity(registry.models.len());
+
+        for m in &registry.models {
+            meta.push(SpriteModelMeta {
+                occupancy_offset: all_occ.len() as u32,
+                colors_offset: all_colors.len() as u32,
+                color_offsets_offset: all_offsets.len() as u32,
+                occ_words_per_col: m.occ_words_per_col,
+                dims: m.dims,
+                _pad0: 0,
+                pivot: m.pivot,
+                _pad1: 0.0,
+            });
+            all_occ.extend_from_slice(&m.occupancy);
+            all_colors.extend_from_slice(&m.colors);
+            all_offsets.extend_from_slice(&m.color_offsets);
+        }
+
+        let gpu_instances: Vec<SpriteInstanceGpu> = instances
+            .iter()
+            .map(|i| SpriteInstanceGpu {
+                inv_rot0: i.transform.inv_rot[0],
+                inv_rot1: i.transform.inv_rot[1],
+                inv_rot2: i.transform.inv_rot[2],
+                pos: i.transform.pos,
+                model_id: i.model_id,
             })
-        };
+            .collect();
+
         Self {
-            occupancy: mk("roxlap-gpu sprite_model.occupancy", &model.occupancy),
-            colors: mk("roxlap-gpu sprite_model.colors", &model.colors),
-            color_offsets: mk(
-                "roxlap-gpu sprite_model.color_offsets",
-                &model.color_offsets,
-            ),
-            dims: model.dims,
-            occ_words_per_col: model.occ_words_per_col,
-            pivot: model.pivot,
+            occupancy: storage_u32(device, "roxlap-gpu sprite_reg.occupancy", &all_occ),
+            colors: storage_u32(device, "roxlap-gpu sprite_reg.colors", &all_colors),
+            color_offsets: storage_u32(device, "roxlap-gpu sprite_reg.color_offsets", &all_offsets),
+            model_meta: storage_pod(device, "roxlap-gpu sprite_reg.model_meta", &meta),
+            instances: storage_pod(device, "roxlap-gpu sprite_reg.instances", &gpu_instances),
+            instance_count: instances.len() as u32,
         }
     }
+}
+
+/// Create a STORAGE buffer of u32s; pads empty input (wgpu rejects
+/// zero-sized storage bindings).
+fn storage_u32(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    let bytes: &[u8] = if data.is_empty() {
+        bytemuck::cast_slice(&[0u32])
+    } else {
+        bytemuck::cast_slice(data)
+    };
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytes,
+        usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
+/// Create a STORAGE buffer of Pod records; pads empty input with one
+/// zeroed `T`.
+fn storage_pod<T: Pod + Zeroable>(device: &wgpu::Device, label: &str, data: &[T]) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    let one = [T::zeroed()];
+    let src: &[T] = if data.is_empty() { &one } else { data };
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(src),
+        usage: wgpu::BufferUsages::STORAGE,
+    })
 }
 
 #[cfg(test)]
@@ -243,5 +397,24 @@ mod tests {
     fn identity_basis_inverts_to_identity() {
         let inv = mat3_inverse([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
         assert_eq!(inv, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+    }
+
+    #[test]
+    fn fork_is_independent_of_parent() {
+        let mut reg = SpriteModelRegistry::new();
+        let base = reg.add(build_sprite_model(&kv6_unsorted()));
+        let forked = reg.fork(base);
+        assert_ne!(base, forked);
+        // Recolour only the fork.
+        reg.model_mut(forked).recolor(|_| 0x11);
+        // Parent colours untouched; fork fully overwritten.
+        assert_eq!(&reg.model(base).colors, &[0xBB, 0xAA, 0xCC]);
+        assert_eq!(&reg.model(forked).colors, &[0x11, 0x11, 0x11]);
+    }
+
+    #[test]
+    fn registry_gpu_structs_have_expected_sizes() {
+        assert_eq!(std::mem::size_of::<SpriteModelMeta>(), 48);
+        assert_eq!(std::mem::size_of::<SpriteInstanceGpu>(), 64);
     }
 }

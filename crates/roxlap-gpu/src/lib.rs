@@ -51,7 +51,8 @@ pub use scene::{
 };
 pub use sprite::{flatten_sprites, sprite_voxels_world_space, SpriteVoxel};
 pub use sprite_model::{
-    build_sprite_model, SpriteInstanceTransform, SpriteModel, SpriteModelResident,
+    build_sprite_model, SpriteInstance, SpriteInstanceTransform, SpriteModel, SpriteModelRegistry,
+    SpriteRegistryResident,
 };
 
 use std::sync::Arc;
@@ -181,12 +182,12 @@ pub struct GpuRenderer {
     /// Lazy-built the first frame a sprite buffer is present. Holds
     /// the splatter compute pipeline + its bind-group layout.
     sprite_dda: Option<SpriteDdaResources>,
-    /// GPU.10 — sprite rendered as a DDA-marched voxel model (the
+    /// GPU.10 — sprites rendered as DDA-marched voxel models (the
     /// precise path that supersedes the splatter). Mutually exclusive
     /// with `sprite_voxels` in practice: the host calls either
-    /// `set_sprites` (splatter) or `set_sprite_model` (DDA).
-    sprite_model: Option<sprite_model::SpriteModelResident>,
-    sprite_model_instance: Option<sprite_model::SpriteInstanceTransform>,
+    /// `set_sprites` (splatter) or `set_sprite_instances` (DDA).
+    /// Holds the concatenated model registry + the instance array.
+    sprite_registry: Option<sprite_model::SpriteRegistryResident>,
     /// Lazy-built pipeline + uniform for the model-DDA pass.
     sprite_model_dda: Option<SpriteModelDdaResources>,
 }
@@ -258,8 +259,10 @@ struct SpriteModelDdaResources {
     uniform_buf: wgpu::Buffer,
 }
 
-/// Per-frame uniform for the model-DDA pass. Mirrors `ModelUniform`
-/// in `sprite_model_dda.wgsl` (std140, 192 bytes).
+/// Per-frame uniform for the model-DDA pass. Mirrors `Uniform` in
+/// `sprite_model_dda.wgsl` (std140). Per-model + per-instance data
+/// now live in storage buffers; this holds only the camera, fog, and
+/// instance count.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SpriteModelUniform {
@@ -271,20 +274,14 @@ struct SpriteModelUniform {
     _p2: f32,
     cam_forward: [f32; 3],
     _p3: f32,
-    inv_rot0: [f32; 4],
-    inv_rot1: [f32; 4],
-    inv_rot2: [f32; 4],
-    inst_pos: [f32; 3],
-    _p4: f32,
-    pivot: [f32; 3],
-    _p5: f32,
     fog_color: [f32; 4],
     screen_size: [u32; 2],
-    dims: [u32; 2],
-    mz: u32,
-    occ_words_per_col: u32,
+    instance_count: u32,
     fog_far: f32,
     fov_y_rad: f32,
+    _p4: f32,
+    _p5: f32,
+    _p6: f32,
 }
 
 const SCENE_MAX_GRIDS: usize = MAX_SCENE_GRIDS as usize;
@@ -515,8 +512,7 @@ impl GpuRenderer {
             sprite_voxels: None,
             sprite_voxel_count: 0,
             sprite_dda: None,
-            sprite_model: None,
-            sprite_model_instance: None,
+            sprite_registry: None,
             sprite_model_dda: None,
         })
     }
@@ -1360,7 +1356,7 @@ impl GpuRenderer {
             self.sprite_dda = Some(self.build_sprite_dda());
         }
         // GPU.10.0 — same for the model-DDA pipeline.
-        if self.sprite_model.is_some() && self.sprite_model_dda.is_none() {
+        if self.sprite_registry.is_some() && self.sprite_model_dda.is_none() {
             self.sprite_model_dda = Some(self.build_sprite_model_dda());
         }
         let dda = self.scene_dda.as_ref().expect("just built");
@@ -1394,7 +1390,7 @@ impl GpuRenderer {
                 self.fog_near,
             ],
             fog_far: self.fog_far,
-            write_depth: u32::from(self.sprite_voxel_count > 0 || self.sprite_model.is_some()),
+            write_depth: u32::from(self.sprite_voxel_count > 0 || self.sprite_registry.is_some()),
             occ_page_words: scene.occupancy_page_words,
             occ_num_pages: scene.occupancy_num_pages,
         };
@@ -1527,15 +1523,12 @@ impl GpuRenderer {
             _ => None,
         };
 
-        // GPU.10.0 — model-DDA bind group + per-frame uniform when a
-        // sprite model is present (mutually exclusive with the
-        // splatter). Projects via cameras[0] (the world/ground camera).
-        let sprite_model_bg = match (
-            &self.sprite_model_dda,
-            &self.sprite_model,
-            self.sprite_model_instance,
-        ) {
-            (Some(smd), Some(model), Some(instance)) if !cameras.is_empty() => {
+        // GPU.10.1 — model-DDA bind group + per-frame uniform when a
+        // sprite registry is present (mutually exclusive with the
+        // splatter). Projects via cameras[0] (the world/ground camera);
+        // per-model + per-instance data live in the registry buffers.
+        let sprite_model_bg = match (&self.sprite_model_dda, &self.sprite_registry) {
+            (Some(smd), Some(reg)) if !cameras.is_empty() && reg.instance_count > 0 => {
                 let cam = &cameras[0];
                 let uni = SpriteModelUniform {
                     cam_pos: cam.position,
@@ -1546,13 +1539,6 @@ impl GpuRenderer {
                     _p2: 0.0,
                     cam_forward: cam.forward,
                     _p3: 0.0,
-                    inv_rot0: instance.inv_rot[0],
-                    inv_rot1: instance.inv_rot[1],
-                    inv_rot2: instance.inv_rot[2],
-                    inst_pos: instance.pos,
-                    _p4: 0.0,
-                    pivot: model.pivot,
-                    _p5: 0.0,
                     fog_color: [
                         self.fog_color[0],
                         self.fog_color[1],
@@ -1560,11 +1546,12 @@ impl GpuRenderer {
                         self.fog_near,
                     ],
                     screen_size: [surface_w, surface_h],
-                    dims: [model.dims[0], model.dims[1]],
-                    mz: model.dims[2],
-                    occ_words_per_col: model.occ_words_per_col,
+                    instance_count: reg.instance_count,
                     fog_far: self.fog_far,
                     fov_y_rad,
+                    _p4: 0.0,
+                    _p5: 0.0,
+                    _p6: 0.0,
                 };
                 self.queue
                     .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));
@@ -1578,22 +1565,30 @@ impl GpuRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: model.occupancy.as_entire_binding(),
+                            resource: reg.occupancy.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: model.colors.as_entire_binding(),
+                            resource: reg.colors.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: model.color_offsets.as_entire_binding(),
+                            resource: reg.color_offsets.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 4,
-                            resource: dda.depth_buffer.as_entire_binding(),
+                            resource: reg.model_meta.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 5,
+                            resource: reg.instances.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: dda.depth_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
                             resource: wgpu::BindingResource::TextureView(&dda.storage_view),
                         },
                     ],
@@ -2022,27 +2017,27 @@ impl GpuRenderer {
         }
     }
 
-    /// GPU.10 — upload a KV6 as a DDA-marched voxel model + its
-    /// instance pose. Supersedes the splatter; the host calls this
-    /// *or* [`Self::set_sprites`], not both. Pass `None` to clear.
-    pub fn set_sprite_model(
+    /// GPU.10.1 — upload a sprite model registry + its instances for
+    /// the DDA path. Supersedes the splatter; the host calls this *or*
+    /// [`Self::set_sprites`], not both. An empty instance slice clears.
+    pub fn set_sprite_instances(
         &mut self,
-        model: Option<(
-            &sprite_model::SpriteModel,
-            sprite_model::SpriteInstanceTransform,
-        )>,
+        registry: &sprite_model::SpriteModelRegistry,
+        instances: &[sprite_model::SpriteInstance],
     ) {
-        let Some((m, instance)) = model else {
-            self.sprite_model = None;
-            self.sprite_model_instance = None;
+        if instances.is_empty() {
+            self.sprite_registry = None;
             return;
-        };
-        self.sprite_model = Some(sprite_model::SpriteModelResident::upload(&self.device, m));
-        self.sprite_model_instance = Some(instance);
+        }
+        self.sprite_registry = Some(sprite_model::SpriteRegistryResident::upload(
+            &self.device,
+            registry,
+            instances,
+        ));
     }
 
-    /// GPU.10.0 — build the model-DDA pipeline (one thread per pixel).
-    /// Lazily invoked the first frame a sprite model is present.
+    /// GPU.10.1 — build the instanced model-DDA pipeline (one thread
+    /// per pixel). Lazily invoked the first frame a registry is present.
     fn build_sprite_model_dda(&self) -> SpriteModelDdaResources {
         let shader = self
             .device
@@ -2061,9 +2056,11 @@ impl GpuRenderer {
                     bgl_storage_entry(1, true), // occupancy
                     bgl_storage_entry(2, true), // colors
                     bgl_storage_entry(3, true), // color_offsets
-                    bgl_storage_entry(4, true), // scene depth
+                    bgl_storage_entry(4, true), // model_meta
+                    bgl_storage_entry(5, true), // instances
+                    bgl_storage_entry(6, true), // scene depth
                     wgpu::BindGroupLayoutEntry {
-                        binding: 5,
+                        binding: 7,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,

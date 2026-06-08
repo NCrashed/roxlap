@@ -885,14 +885,41 @@ impl ApplicationHandler for App {
                             gpu.set_sprites(&sprite_voxels);
                         }
                     } else if let Some(sprite) = self.sprites.first() {
-                        let model = roxlap_gpu::build_sprite_model(&sprite.kv6);
-                        let instance = roxlap_gpu::SpriteInstanceTransform::from_sprite(sprite);
+                        // GPU.10.1 — model registry + instancing. Add the
+                        // coco model once, fork a red-tinted variant
+                        // (copy-on-modify), then spawn a 5×5 wall of
+                        // instances (checkerboard of the two models) to
+                        // exercise instancing + shared models.
+                        let mut registry = roxlap_gpu::SpriteModelRegistry::new();
+                        let base_id = registry.add(roxlap_gpu::build_sprite_model(&sprite.kv6));
+                        let red_id = registry.fork(base_id);
+                        registry
+                            .model_mut(red_id)
+                            // Keep the brightness/alpha byte; force RGB red.
+                            .recolor(|c| (c & 0xFF00_0000) | 0x00FF_0000);
+
+                        let n: i32 = 5;
+                        let spacing = 16.0_f32;
+                        let mut instances = Vec::new();
+                        for iz in 0..n {
+                            for ix in 0..n {
+                                let dx = (ix as f32 - (n as f32 - 1.0) * 0.5) * spacing;
+                                let dz = (iz as f32 - (n as f32 - 1.0) * 0.5) * spacing;
+                                let mut s = sprite.clone();
+                                s.p = [sprite.p[0] + dx, sprite.p[1], sprite.p[2] + dz];
+                                let model_id = if (ix + iz) % 2 == 0 { base_id } else { red_id };
+                                instances.push(roxlap_gpu::SpriteInstance {
+                                    model_id,
+                                    transform: roxlap_gpu::SpriteInstanceTransform::from_sprite(&s),
+                                });
+                            }
+                        }
                         eprintln!(
-                            "roxlap-gpu: model-DDA sprite — dims {:?}, {} voxels",
-                            model.dims,
-                            model.colors.len()
+                            "roxlap-gpu: model-DDA — {} instances, {} models",
+                            instances.len(),
+                            registry.len()
                         );
-                        gpu.set_sprite_model(Some((&model, instance)));
+                        gpu.set_sprite_instances(&registry, &instances);
                     }
                     self.upload_first_scene(&gpu);
                     self.gpu = Some(gpu);
