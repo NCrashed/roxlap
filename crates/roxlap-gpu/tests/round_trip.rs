@@ -6,12 +6,23 @@
 
 #![allow(clippy::cast_precision_loss)]
 
+use std::sync::Mutex;
 use std::time::Instant;
 
 use roxlap_formats::vxl::Vxl;
 use roxlap_gpu::{
     decompress_chunk, GpuChunkResident, GpuInitError, GpuRendererSettings, HeadlessGpu, CHUNK_Z,
 };
+
+/// Serialise the GPU-touching tests. `cargo test` runs test fns on
+/// separate threads by default; spinning up 4 independent wgpu
+/// devices + concurrent `map_async` readback on the same physical
+/// GPU is racy on some drivers (observed: Mesa NVK returns stale
+/// readback bytes under concurrent device load). The upload /
+/// readback logic itself is correct — it passes 100% serially —
+/// so a process-wide lock around each test's device work is the
+/// right fix, not a logic change.
+static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Build a `vsid × vsid` Vxl where every column has one textured
 /// floor voxel at z=100 with colour `0x80ff_8000` (red-orange).
@@ -44,11 +55,18 @@ fn fixture_one_voxel_per_column(vsid: u32) -> Vxl {
     }
 }
 
-/// Try to bring up a headless device. Skips the calling test with a
-/// stderr note when no adapter is present.
-fn try_init() -> Option<HeadlessGpu> {
+/// Try to bring up a headless device, holding [`GPU_TEST_LOCK`] for
+/// the duration so no two GPU tests touch the device concurrently.
+/// Skips the calling test (returns `None`) when no adapter is
+/// present. The returned guard must be kept alive for the whole
+/// test — bind it to a named local (`let _g = ...`) at the call
+/// site.
+fn try_init() -> Option<(HeadlessGpu, std::sync::MutexGuard<'static, ()>)> {
+    // Recover from a poisoned lock (a panicking test still releases
+    // the device); the data is `()` so there's nothing to corrupt.
+    let guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     match HeadlessGpu::new_blocking(GpuRendererSettings::default()) {
-        Ok(gpu) => Some(gpu),
+        Ok(gpu) => Some((gpu, guard)),
         Err(GpuInitError::NoAdapter) => {
             eprintln!("[skip] no GPU adapter reachable — set up Vulkan/Metal/DX12 to run");
             None
@@ -62,7 +80,9 @@ fn try_init() -> Option<HeadlessGpu> {
 
 #[test]
 fn round_trip_textured_voxel_matches_cpu() {
-    let Some(gpu) = try_init() else { return };
+    let Some((gpu, _gpu_lock)) = try_init() else {
+        return;
+    };
     eprintln!("round_trip: adapter = {}", gpu.adapter_info);
 
     let vxl = fixture_one_voxel_per_column(4);
@@ -91,7 +111,9 @@ fn round_trip_textured_voxel_matches_cpu() {
 
 #[test]
 fn round_trip_air_above_returns_none() {
-    let Some(gpu) = try_init() else { return };
+    let Some((gpu, _gpu_lock)) = try_init() else {
+        return;
+    };
     let vxl = fixture_one_voxel_per_column(4);
     let chunk = decompress_chunk(&vxl);
     let resident = GpuChunkResident::upload(&gpu.device, &chunk);
@@ -110,7 +132,9 @@ fn round_trip_air_above_returns_none() {
 fn round_trip_bedrock_below_now_returns_air() {
     // Bedrock-as-air refactor (GPU.4 prereq) — z > z1c is no
     // longer reported as solid by the GPU decompressor or shader.
-    let Some(gpu) = try_init() else { return };
+    let Some((gpu, _gpu_lock)) = try_init() else {
+        return;
+    };
     let vxl = fixture_one_voxel_per_column(4);
     let chunk = decompress_chunk(&vxl);
     let resident = GpuChunkResident::upload(&gpu.device, &chunk);
@@ -127,7 +151,9 @@ fn round_trip_bedrock_below_now_returns_air() {
 
 #[test]
 fn bench_single_chunk_upload() {
-    let Some(gpu) = try_init() else { return };
+    let Some((gpu, _gpu_lock)) = try_init() else {
+        return;
+    };
 
     // Scene-demo chunk size — vsid=128 matches roxlap-scene's
     // `CHUNK_SIZE_XY`. One textured voxel + bedrock per column =
