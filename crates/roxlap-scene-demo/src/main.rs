@@ -898,16 +898,26 @@ impl ApplicationHandler for App {
                             // Keep the brightness/alpha byte; force RGB red.
                             .recolor(|c| (c & 0xFF00_0000) | 0x00FF_0000);
 
-                        let n: i32 = 5;
-                        let spacing = 16.0_f32;
+                        // GPU.10.2 — spread an N×N field across the world
+                        // (XY plane, above the terrain) so frustum culling
+                        // is visible: most are off-screen at any time and
+                        // cost nothing. `ROXLAP_SPRITE_GRID=N` sets the
+                        // side (default 16 ⇒ 256 instances).
+                        let n: i32 = std::env::var("ROXLAP_SPRITE_GRID")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(16);
+                        let spacing = 40.0_f32;
                         let mut instances = Vec::new();
-                        for iz in 0..n {
+                        for iy in 0..n {
                             for ix in 0..n {
                                 let dx = (ix as f32 - (n as f32 - 1.0) * 0.5) * spacing;
-                                let dz = (iz as f32 - (n as f32 - 1.0) * 0.5) * spacing;
+                                let dy = (iy as f32 - (n as f32 - 1.0) * 0.5) * spacing;
                                 let mut s = sprite.clone();
-                                s.p = [sprite.p[0] + dx, sprite.p[1], sprite.p[2] + dz];
-                                let model_id = if (ix + iz) % 2 == 0 { base_id } else { red_id };
+                                // Centre the field on the world origin, a
+                                // little above the ground (z small = up).
+                                s.p = [dx, dy, 40.0];
+                                let model_id = if (ix + iy) % 2 == 0 { base_id } else { red_id };
                                 instances.push(roxlap_gpu::SpriteInstance {
                                     model_id,
                                     transform: roxlap_gpu::SpriteInstanceTransform::from_sprite(&s),
@@ -915,8 +925,10 @@ impl ApplicationHandler for App {
                             }
                         }
                         eprintln!(
-                            "roxlap-gpu: model-DDA — {} instances, {} models",
+                            "roxlap-gpu: model-DDA — {} instances ({}×{} field), {} models",
                             instances.len(),
+                            n,
+                            n,
                             registry.len()
                         );
                         gpu.set_sprite_instances(&registry, &instances);

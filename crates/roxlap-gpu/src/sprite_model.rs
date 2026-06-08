@@ -13,7 +13,11 @@
 //! The shader finds a voxel's colour by `offset[col] + popcount(bits
 //! below z)`, so colours MUST be ascending-z (we sort per column).
 
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::many_single_char_names
+)]
 
 use bytemuck::{Pod, Zeroable};
 use roxlap_formats::kv6::Kv6;
@@ -187,6 +191,51 @@ impl SpriteModel {
             *c = f(*c);
         }
     }
+
+    /// Radius of a bounding sphere centred at the instance position
+    /// (the pivot maps there): the farthest bbox corner from the
+    /// pivot. Used for frustum culling. Assumes a unit basis; scaled
+    /// instances would multiply this by their max basis length.
+    #[must_use]
+    pub fn bound_radius(&self) -> f32 {
+        let mut r2 = 0.0_f32;
+        for &cx in &[0.0, self.dims[0] as f32] {
+            for &cy in &[0.0, self.dims[1] as f32] {
+                for &cz in &[0.0, self.dims[2] as f32] {
+                    let d = [cx - self.pivot[0], cy - self.pivot[1], cz - self.pivot[2]];
+                    r2 = r2.max(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                }
+            }
+        }
+        r2.sqrt()
+    }
+}
+
+/// View frustum for CPU instance culling, in world space. Built each
+/// frame from the world camera. `half_w`/`half_h` are the tangents of
+/// the half-FOV (so the side planes are `|x| <= half_w * z` etc. in
+/// camera space).
+#[derive(Clone, Copy, Debug)]
+pub struct ViewFrustum {
+    pub pos: [f32; 3],
+    pub right: [f32; 3],
+    pub down: [f32; 3],
+    pub forward: [f32; 3],
+    pub half_w: f32,
+    pub half_h: f32,
+    pub far: f32,
+}
+
+/// CPU cull record: the GPU instance + its world bounding sphere.
+#[derive(Clone, Copy)]
+struct CullInstance {
+    gpu: SpriteInstanceGpu,
+    center: [f32; 3],
+    radius: f32,
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 /// One sprite instance: a model reference + world pose.
@@ -254,21 +303,28 @@ fn mat3_inverse(cols: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 
 /// GPU-resident registry + instances: every model's occupancy /
 /// colours / offsets concatenated into shared storage buffers, a
-/// per-model metadata table, and the instance array. One bind group
-/// serves all models (same approach as the multi-grid scene).
+/// per-model metadata table, and a capacity-sized instance buffer
+/// rewritten each frame with the frustum-visible subset (GPU.10.2).
+/// One bind group serves all models (same approach as the multi-grid
+/// scene).
 pub struct SpriteRegistryResident {
     pub occupancy: wgpu::Buffer,
     pub colors: wgpu::Buffer,
     pub color_offsets: wgpu::Buffer,
     pub model_meta: wgpu::Buffer,
+    /// Holds up to `instance_capacity` instances; the visible subset
+    /// is packed into `[0, count)` each frame by [`Self::cull_visible`].
     pub instances: wgpu::Buffer,
-    pub instance_count: u32,
+    pub instance_capacity: u32,
+    /// CPU cull records (full set), with precomputed bounding spheres.
+    cull: Vec<CullInstance>,
 }
 
 impl SpriteRegistryResident {
-    /// Concatenate `registry`'s models into shared buffers and upload
-    /// `instances`. Model-relative indices stay as built; the shader
-    /// adds each model's base offset from the metadata table.
+    /// Concatenate `registry`'s models into shared buffers and prepare
+    /// `instances` for per-frame culling. Model-relative indices stay
+    /// as built; the shader adds each model's base offset from the
+    /// metadata table.
     #[must_use]
     pub fn upload(
         device: &wgpu::Device,
@@ -296,25 +352,86 @@ impl SpriteRegistryResident {
             all_offsets.extend_from_slice(&m.color_offsets);
         }
 
-        let gpu_instances: Vec<SpriteInstanceGpu> = instances
+        // Precompute per-model bound radius, then the per-instance cull
+        // records (sphere centred at the instance position).
+        let radii: Vec<f32> = registry
+            .models
             .iter()
-            .map(|i| SpriteInstanceGpu {
-                inv_rot0: i.transform.inv_rot[0],
-                inv_rot1: i.transform.inv_rot[1],
-                inv_rot2: i.transform.inv_rot[2],
-                pos: i.transform.pos,
-                model_id: i.model_id,
+            .map(SpriteModel::bound_radius)
+            .collect();
+        let cull: Vec<CullInstance> = instances
+            .iter()
+            .map(|i| CullInstance {
+                gpu: SpriteInstanceGpu {
+                    inv_rot0: i.transform.inv_rot[0],
+                    inv_rot1: i.transform.inv_rot[1],
+                    inv_rot2: i.transform.inv_rot[2],
+                    pos: i.transform.pos,
+                    model_id: i.model_id,
+                },
+                center: i.transform.pos,
+                radius: radii.get(i.model_id as usize).copied().unwrap_or(0.0),
             })
             .collect();
+
+        // Capacity buffer (COPY_DST so cull can rewrite it each frame),
+        // seeded with the full set so frame 0 is valid pre-cull.
+        let seed: Vec<SpriteInstanceGpu> = cull.iter().map(|c| c.gpu).collect();
+        let instances_buf = {
+            use wgpu::util::DeviceExt;
+            let one = [SpriteInstanceGpu::zeroed()];
+            let src: &[SpriteInstanceGpu] = if seed.is_empty() { &one } else { &seed };
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("roxlap-gpu sprite_reg.instances"),
+                contents: bytemuck::cast_slice(src),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+        };
 
         Self {
             occupancy: storage_u32(device, "roxlap-gpu sprite_reg.occupancy", &all_occ),
             colors: storage_u32(device, "roxlap-gpu sprite_reg.colors", &all_colors),
             color_offsets: storage_u32(device, "roxlap-gpu sprite_reg.color_offsets", &all_offsets),
             model_meta: storage_pod(device, "roxlap-gpu sprite_reg.model_meta", &meta),
-            instances: storage_pod(device, "roxlap-gpu sprite_reg.instances", &gpu_instances),
-            instance_count: instances.len() as u32,
+            instances: instances_buf,
+            instance_capacity: cull.len() as u32,
+            cull,
         }
+    }
+
+    /// Frustum-cull the full instance set, pack the visible subset into
+    /// the front of the instance buffer, and return the visible count.
+    /// Conservative sphere test against the 4 side planes + the
+    /// near(behind)/far planes. Allocates a small scratch vec per call.
+    pub fn cull_visible(&self, queue: &wgpu::Queue, f: &ViewFrustum) -> u32 {
+        let nw = (1.0 + f.half_w * f.half_w).sqrt();
+        let nh = (1.0 + f.half_h * f.half_h).sqrt();
+        let mut visible: Vec<SpriteInstanceGpu> = Vec::with_capacity(self.cull.len());
+        for ci in &self.cull {
+            let rel = [
+                ci.center[0] - f.pos[0],
+                ci.center[1] - f.pos[1],
+                ci.center[2] - f.pos[2],
+            ];
+            let z = dot3(rel, f.forward);
+            let r = ci.radius;
+            if z + r < 0.0 || z - r > f.far {
+                continue; // behind the camera or beyond far
+            }
+            let x = dot3(rel, f.right);
+            if (x - f.half_w * z) > r * nw || (-x - f.half_w * z) > r * nw {
+                continue; // right / left plane
+            }
+            let y = dot3(rel, f.down);
+            if (y - f.half_h * z) > r * nh || (-y - f.half_h * z) > r * nh {
+                continue; // bottom / top plane
+            }
+            visible.push(ci.gpu);
+        }
+        if !visible.is_empty() {
+            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&visible));
+        }
+        visible.len() as u32
     }
 }
 

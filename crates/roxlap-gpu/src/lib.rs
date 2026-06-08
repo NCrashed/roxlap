@@ -1528,71 +1528,92 @@ impl GpuRenderer {
         // splatter). Projects via cameras[0] (the world/ground camera);
         // per-model + per-instance data live in the registry buffers.
         let sprite_model_bg = match (&self.sprite_model_dda, &self.sprite_registry) {
-            (Some(smd), Some(reg)) if !cameras.is_empty() && reg.instance_count > 0 => {
+            (Some(smd), Some(reg)) if !cameras.is_empty() && reg.instance_capacity > 0 => {
                 let cam = &cameras[0];
-                let uni = SpriteModelUniform {
-                    cam_pos: cam.position,
-                    _p0: 0.0,
-                    cam_right: cam.right,
-                    _p1: 0.0,
-                    cam_down: cam.down,
-                    _p2: 0.0,
-                    cam_forward: cam.forward,
-                    _p3: 0.0,
-                    fog_color: [
-                        self.fog_color[0],
-                        self.fog_color[1],
-                        self.fog_color[2],
-                        self.fog_near,
-                    ],
-                    screen_size: [surface_w, surface_h],
-                    instance_count: reg.instance_count,
-                    fog_far: self.fog_far,
-                    fov_y_rad,
-                    _p4: 0.0,
-                    _p5: 0.0,
-                    _p6: 0.0,
+                // GPU.10.2 — frustum-cull the instance set on the CPU
+                // and upload only the visible subset, then loop just
+                // those in the shader.
+                #[allow(clippy::cast_precision_loss)]
+                let aspect = surface_w as f32 / surface_h as f32;
+                let half_h = (fov_y_rad * 0.5).tan();
+                let frustum = sprite_model::ViewFrustum {
+                    pos: cam.position,
+                    right: cam.right,
+                    down: cam.down,
+                    forward: cam.forward,
+                    half_w: half_h * aspect,
+                    half_h,
+                    far: 1.0e9,
                 };
-                self.queue
-                    .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));
-                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("roxlap-gpu sprite_model_dda.bg"),
-                    layout: &smd.bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: smd.uniform_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: reg.occupancy.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: reg.colors.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: reg.color_offsets.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: reg.model_meta.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: reg.instances.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: dda.depth_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 7,
-                            resource: wgpu::BindingResource::TextureView(&dda.storage_view),
-                        },
-                    ],
-                }))
+                let visible = reg.cull_visible(&self.queue, &frustum);
+                if visible == 0 {
+                    // Nothing in view — skip the sprite pass entirely.
+                    None
+                } else {
+                    let uni = SpriteModelUniform {
+                        cam_pos: cam.position,
+                        _p0: 0.0,
+                        cam_right: cam.right,
+                        _p1: 0.0,
+                        cam_down: cam.down,
+                        _p2: 0.0,
+                        cam_forward: cam.forward,
+                        _p3: 0.0,
+                        fog_color: [
+                            self.fog_color[0],
+                            self.fog_color[1],
+                            self.fog_color[2],
+                            self.fog_near,
+                        ],
+                        screen_size: [surface_w, surface_h],
+                        instance_count: visible,
+                        fog_far: self.fog_far,
+                        fov_y_rad,
+                        _p4: 0.0,
+                        _p5: 0.0,
+                        _p6: 0.0,
+                    };
+                    self.queue
+                        .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));
+                    Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("roxlap-gpu sprite_model_dda.bg"),
+                        layout: &smd.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: smd.uniform_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: reg.occupancy.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: reg.colors.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: reg.color_offsets.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: reg.model_meta.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: reg.instances.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: dda.depth_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: wgpu::BindingResource::TextureView(&dda.storage_view),
+                            },
+                        ],
+                    }))
+                }
             }
             _ => None,
         };
