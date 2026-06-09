@@ -105,6 +105,17 @@ pub struct PickHit {
     pub voxel: glam::IVec3,
 }
 
+/// A world-space view ray: the canonical unproject output of
+/// [`SceneRenderer::view_ray`]. `dir` is unit-length. Feed it straight
+/// to [`roxlap_scene::Scene::raycast`] for depth-free, backend-agnostic
+/// voxel picking (`scene.raycast(ray.origin, ray.dir, max_dist)`), or
+/// intersect it with a plane for tile selection.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Ray {
+    pub origin: glam::DVec3,
+    pub dir: glam::DVec3,
+}
+
 /// Which renderer a [`SceneRenderer`] resolved to at construction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
@@ -313,6 +324,29 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.pixel_ray(camera, x, y),
             BackendImpl::Gpu(g) => g.pixel_ray(camera, x, y),
         }
+    }
+
+    /// Canonical screen→world unproject: the full view [`Ray`]
+    /// (`camera.pos` origin + unit direction) for window pixel
+    /// `(x, y)`, under whichever projection the last frame used. The
+    /// one entry point both backends honour — hosts never reconstruct
+    /// the projection. `None` before the first frame or for a
+    /// degenerate ray.
+    ///
+    /// Compose with [`roxlap_scene::Scene::raycast`] for depth-free
+    /// picking that's identical on CPU and GPU:
+    /// `renderer.view_ray(cam, x, y).and_then(|r| scene.raycast(r.origin, r.dir, max))`.
+    #[must_use]
+    pub fn view_ray(&self, camera: &Camera, x: f64, y: f64) -> Option<Ray> {
+        let d = self.pixel_ray(camera, x, y)?;
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if len < 1e-12 {
+            return None;
+        }
+        Some(Ray {
+            origin: glam::DVec3::from_array([camera.pos[0], camera.pos[1], camera.pos[2]]),
+            dir: glam::DVec3::new(d[0] / len, d[1] / len, d[2] / len),
+        })
     }
 
     /// One-call screen→world voxel pick: unproject pixel `(x, y)` with

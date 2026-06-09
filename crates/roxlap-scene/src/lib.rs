@@ -74,6 +74,110 @@ impl GridId {
     }
 }
 
+/// A solid-voxel hit from [`Scene::raycast`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RayHit {
+    /// The grid the ray hit.
+    pub grid: GridId,
+    /// Grid-local integer voxel coordinate of the hit cell.
+    pub voxel: IVec3,
+    /// World-space hit point (`origin + t · normalize(dir)`).
+    pub world: DVec3,
+    /// World distance from the ray origin to the hit.
+    pub t: f64,
+    /// Packed colour of the hit voxel, or `None` if it's an untextured
+    /// (bedrock / interior) cell. See [`Grid::voxel_color`].
+    pub color: Option<u32>,
+}
+
+/// Voxel DDA (Amanatides-Woo) in a grid's local space. `lo` / `ld` are
+/// the ray origin + unit direction already transformed into grid-local
+/// coords. Returns the first [`Grid::voxel_solid`] cell and its world-
+/// equal distance `t`, or `None` past `max_t`. The step budget is
+/// `~3·max_t` so a near-axis ray through empty space still terminates.
+fn voxel_dda(grid: &Grid, lo: DVec3, ld: DVec3, max_t: f64) -> Option<(IVec3, f64)> {
+    #[allow(clippy::cast_possible_truncation)]
+    let mut p = IVec3::new(
+        lo.x.floor() as i32,
+        lo.y.floor() as i32,
+        lo.z.floor() as i32,
+    );
+    if grid.voxel_solid(p) {
+        return Some((p, 0.0)); // origin already inside a solid voxel
+    }
+    let sign = |d: f64| -> i32 {
+        if d > 0.0 {
+            1
+        } else if d < 0.0 {
+            -1
+        } else {
+            0
+        }
+    };
+    let step = IVec3::new(sign(ld.x), sign(ld.y), sign(ld.z));
+    // Distance to advance one whole voxel along each axis (∞ if parallel).
+    let t_delta = DVec3::new(
+        if ld.x == 0.0 {
+            f64::INFINITY
+        } else {
+            (1.0 / ld.x).abs()
+        },
+        if ld.y == 0.0 {
+            f64::INFINITY
+        } else {
+            (1.0 / ld.y).abs()
+        },
+        if ld.z == 0.0 {
+            f64::INFINITY
+        } else {
+            (1.0 / ld.z).abs()
+        },
+    );
+    // Distance to the first voxel boundary on each axis.
+    let boundary = |o: f64, d: f64| -> f64 {
+        if d > 0.0 {
+            (o.floor() + 1.0 - o) / d
+        } else if d < 0.0 {
+            (o - o.floor()) / -d
+        } else {
+            f64::INFINITY
+        }
+    };
+    let mut t_max = DVec3::new(
+        boundary(lo.x, ld.x),
+        boundary(lo.y, ld.y),
+        boundary(lo.z, ld.z),
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let max_steps = (max_t * 3.0) as u64 + 8;
+    for _ in 0..max_steps {
+        // Advance across the nearest voxel boundary.
+        let t = if t_max.x <= t_max.y && t_max.x <= t_max.z {
+            p.x += step.x;
+            let t = t_max.x;
+            t_max.x += t_delta.x;
+            t
+        } else if t_max.y <= t_max.z {
+            p.y += step.y;
+            let t = t_max.y;
+            t_max.y += t_delta.y;
+            t
+        } else {
+            p.z += step.z;
+            let t = t_max.z;
+            t_max.z += t_delta.z;
+            t
+        };
+        if t > max_t {
+            return None;
+        }
+        if grid.voxel_solid(p) {
+            return Some((p, t));
+        }
+    }
+    None
+}
+
 /// f64 world placement of one grid: position + orientation.
 ///
 /// `origin` is the grid's local-space origin in world coords —
@@ -505,6 +609,49 @@ impl Scene {
         None
     }
 
+    /// Cast a world-space ray and return the nearest solid voxel hit
+    /// across all grids, or `None` if nothing solid lies within
+    /// `max_dist`. Renderer-independent (no depth buffer, no camera) —
+    /// the primitive for line-of-sight, projectiles, AI probing, and
+    /// off-screen / backend-agnostic picking.
+    ///
+    /// `dir` need not be normalised. Each grid's ray is transformed
+    /// into the grid's local frame (so rotated / translated grids are
+    /// handled exactly) and marched with a voxel DDA against
+    /// [`Grid::voxel_solid`]; the closest hit by world distance `t`
+    /// wins. The step budget is bounded by `max_dist`, so empty space
+    /// is safe but not free — a chunk-level skip is a future
+    /// optimisation if hot.
+    #[must_use]
+    pub fn raycast(&self, origin: DVec3, dir: DVec3, max_dist: f64) -> Option<RayHit> {
+        let len = dir.length();
+        if len < 1e-12 || max_dist <= 0.0 {
+            return None;
+        }
+        let dn = dir / len; // unit world direction → t is world distance
+        let mut best: Option<RayHit> = None;
+        for (id, grid) in self.grids() {
+            // World ray → grid-local: undo translation + rotation. The
+            // inverse rotation preserves length, so `t` stays in world
+            // units and is comparable across grids.
+            let inv = grid.transform.rotation.inverse();
+            let lo = inv * (origin - grid.transform.origin);
+            let ld = inv * dn;
+            if let Some((voxel, t)) = voxel_dda(grid, lo, ld, max_dist) {
+                if best.as_ref().is_none_or(|b| t < b.t) {
+                    best = Some(RayHit {
+                        grid: id,
+                        voxel,
+                        world: origin + dn * t,
+                        t,
+                        color: grid.voxel_color(voxel),
+                    });
+                }
+            }
+        }
+        best
+    }
+
     /// Configure the number of worker threads in the dedicated
     /// streaming pool (S7.3).
     ///
@@ -848,6 +995,76 @@ mod tests {
         let scene = Scene::new();
         assert_eq!(scene.grid_count(), 0);
         assert!(scene.grids().next().is_none());
+    }
+
+    #[test]
+    fn raycast_hits_axis_aligned_voxel() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .set_voxel(IVec3::new(5, 5, 10), Some(0x80_aa_bb_cc));
+
+        // Straight down the +z column through (5,5): hits z=10 at t≈10.
+        let hit = scene
+            .raycast(DVec3::new(5.5, 5.5, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
+            .expect("ray hits the voxel");
+        assert_eq!(hit.grid, id);
+        assert_eq!(hit.voxel, IVec3::new(5, 5, 10));
+        assert!((hit.t - 10.0).abs() < 1e-6, "t≈10, got {}", hit.t);
+        assert!(hit.color.is_some(), "textured voxel has a colour");
+
+        // A column with no voxel misses.
+        assert!(
+            scene
+                .raycast(DVec3::new(0.5, 0.5, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
+                .is_none(),
+            "empty column → no hit",
+        );
+    }
+
+    #[test]
+    fn raycast_respects_grid_transform() {
+        // A translated grid: the hit voxel is reported in GRID-LOCAL
+        // coords, and the world hit point is back in world space — so a
+        // host gets the true voxel regardless of where the grid sits.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::new(100.0, 0.0, 0.0)));
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .set_voxel(IVec3::new(5, 5, 10), Some(0x80_11_22_33));
+
+        let hit = scene
+            .raycast(DVec3::new(105.5, 5.5, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
+            .expect("ray hits the translated voxel");
+        assert_eq!(hit.voxel, IVec3::new(5, 5, 10), "grid-local voxel");
+        assert!((hit.world.x - 105.5).abs() < 1e-6, "world x preserved");
+        assert!((hit.t - 10.0).abs() < 1e-6, "t≈10, got {}", hit.t);
+    }
+
+    #[test]
+    fn raycast_picks_nearest_grid() {
+        // Two grids with a voxel each along the same world column; the
+        // raycast must return the closer one.
+        let mut scene = Scene::new();
+        let near = scene.add_grid(GridTransform::identity());
+        let far = scene.add_grid(GridTransform::identity());
+        scene
+            .grid_mut(near)
+            .unwrap()
+            .set_voxel(IVec3::new(1, 1, 20), Some(0x80_00_ff_00));
+        scene
+            .grid_mut(far)
+            .unwrap()
+            .set_voxel(IVec3::new(1, 1, 40), Some(0x80_ff_00_00));
+
+        let hit = scene
+            .raycast(DVec3::new(1.5, 1.5, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
+            .expect("hits the nearer voxel");
+        assert_eq!(hit.grid, near);
+        assert_eq!(hit.voxel, IVec3::new(1, 1, 20));
     }
 
     #[test]

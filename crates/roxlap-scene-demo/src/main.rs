@@ -460,11 +460,12 @@ impl App {
         if self.pick_mode && self.pick_models.len() >= 2 {
             let cam = self.scene.camera;
             let (mx, my) = self.mouse_px;
-            // Hover cursor: unproject via the library (matches whichever
-            // backend is active) and drop it on the ground plane. Uses
-            // the previous frame's projection — fine for a cursor.
-            if let Some(dir) = renderer.pixel_ray(&cam, mx, my) {
-                if let Some(w) = plane_hit(cam.pos, dir, PICK_GROUND_Z) {
+            // Hover cursor: the canonical unproject (matches whichever
+            // backend is active) dropped on the ground plane. Uses the
+            // previous frame's projection — fine for a cursor.
+            if let Some(ray) = renderer.view_ray(&cam, mx, my) {
+                if let Some(w) = plane_hit(ray.origin.to_array(), ray.dir.to_array(), PICK_GROUND_Z)
+                {
                     self.cursor_world = w;
                 }
             }

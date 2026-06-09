@@ -114,6 +114,62 @@ impl Vxl {
         &self.data[start..end]
     }
 
+    /// Packed BGRA colour of the **textured** voxel at `(x, y, z)`, or
+    /// `None` if that voxel is air or an untextured (bedrock / interior
+    /// / placeholder) cell. Walks the column's slab chain — both the
+    /// floor colour list (`[z1, z1c]`) of each slab and the ceiling
+    /// colour list stored in the previous slab's tail — mirroring
+    /// voxlap's `vbuf` layout. Short-circuits on the first range that
+    /// covers `z`, so it's an O(slabs) read with no decompression.
+    ///
+    /// The returned `u32` is the same packed colour the renderer reads
+    /// (`B | G<<8 | R<<16 | A<<24`, with `A` carrying voxlap brightness);
+    /// a zero-RGB cell (the `empty_chunk` placeholder) reads as `None`.
+    /// Surface voxels — what a from-air raycast or click hits — are
+    /// textured, so this returns their colour. Use [`column_data`] +
+    /// the bitmap path for full interior/solidity semantics.
+    ///
+    /// [`column_data`]: Self::column_data
+    #[must_use]
+    pub fn voxel_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
+        if x >= self.vsid || y >= self.vsid || z >= MAXZDIM as u32 {
+            return None;
+        }
+        let zi = z as i32;
+        let slab = self.column_data((y * self.vsid + x) as usize);
+        let texel = |b: &[u8]| -> Option<u32> {
+            let rgb = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            // Zero RGB = empty_chunk placeholder → treat as untextured.
+            (rgb & 0x00ff_ffff != 0).then_some(rgb)
+        };
+        let mut v = 0usize;
+        loop {
+            // Floor colour list of the current slab: z ∈ [z1, z1c].
+            let z_start = i32::from(slab[v + 1]);
+            let z1c = i32::from(slab[v + 2]);
+            if zi >= z_start && zi <= z1c {
+                let off = v + 4 + ((zi - z_start) as usize) * 4;
+                return texel(&slab[off..off + 4]);
+            }
+            let nextptr = slab[v];
+            if nextptr == 0 {
+                return None; // last slab, z not in its floor list
+            }
+            let (prev_z1, prev_z1c, prev_nextptr) = (z_start, z1c, i32::from(nextptr));
+            v += usize::from(nextptr) * 4;
+            // Ceiling colour list for the NEW slab — stored in the tail
+            // of the previous slab's bytes (voxlap `vbuf` convention).
+            let ze = i32::from(slab[v + 3]);
+            let ceil_z_start = ze + prev_z1c - prev_z1 - prev_nextptr + 2;
+            if zi >= ceil_z_start && zi < ze {
+                let ceil_n = (ze - ceil_z_start) as usize;
+                let ceil_start = v - ceil_n * 4;
+                let off = ceil_start + ((zi - ceil_z_start) as usize) * 4;
+                return texel(&slab[off..off + 4]);
+            }
+        }
+    }
+
     /// How many mip levels are currently built. Always `>= 1`
     /// (mip-0 is the parsed file). [`Vxl::generate_mips`] grows this
     /// up to its `max_mips` argument (capped by the world's
@@ -1178,6 +1234,35 @@ mod tests {
             vbit: Box::new([]),
             vbiti: 0,
         }
+    }
+
+    #[test]
+    fn voxel_color_reads_floor_surface() {
+        // 4 columns, each a floor voxel at z=10 with a distinct BGRA.
+        let colours = [0x0080_ff00u32, 0x00ff_0000, 0x0000_ff00, 0x8040_2010];
+        let vxl = build_synthetic_2x2(colours);
+        for (i, &c) in colours.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let (x, y) = ((i % 2) as u32, (i / 2) as u32);
+            assert_eq!(
+                vxl.voxel_color(x, y, 10),
+                Some(c),
+                "surface colour, col {i}"
+            );
+            assert_eq!(vxl.voxel_color(x, y, 9), None, "air below the floor");
+            assert_eq!(vxl.voxel_color(x, y, 11), None, "air above the floor");
+        }
+        // Out of bounds → None.
+        assert_eq!(vxl.voxel_color(2, 0, 10), None, "x OOB");
+        assert_eq!(vxl.voxel_color(0, 0, 256), None, "z OOB");
+    }
+
+    #[test]
+    fn voxel_color_zero_rgb_is_untextured() {
+        // A column whose only "voxel" has zero RGB (the empty-chunk
+        // placeholder shape) reads as air, not a black surface.
+        let vxl = build_synthetic_2x2([0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000]);
+        assert_eq!(vxl.voxel_color(0, 0, 10), None);
     }
 
     #[test]

@@ -125,6 +125,18 @@ impl Grid {
         }
     }
 
+    /// Packed BGRA colour of the textured voxel at grid-local `voxel`,
+    /// or `None` for air / untextured cells. Thin wrapper over
+    /// [`roxlap_formats::vxl::Vxl::voxel_color`] after the chunk split —
+    /// the colour-inspection companion to [`Self::voxel_solid`]. Use it
+    /// to read back what a pick / raycast hit looks like.
+    #[must_use]
+    pub fn voxel_color(&self, voxel: IVec3) -> Option<u32> {
+        let (chunk_idx, in_chunk) = crate::voxel_split(voxel);
+        self.chunk(chunk_idx)?
+            .voxel_color(in_chunk.x, in_chunk.y, in_chunk.z)
+    }
+
     /// Borrow the chunk at `chunk_idx` if it has been materialised.
     /// `None` means the chunk is implicitly all-air.
     #[must_use]
