@@ -233,6 +233,10 @@ struct SceneDdaResources {
     /// are present; the sprite model-DDA pass reads + composites
     /// against it.
     depth_buffer: wgpu::Buffer,
+    /// Picking — a `COPY_DST | MAP_READ` staging copy of `depth_buffer`
+    /// so the host can read back the per-pixel world-t after a frame
+    /// (e.g. click → which voxel). Same size as `depth_buffer`.
+    depth_readback: wgpu::Buffer,
 }
 
 /// GPU.10.0 — single-sprite model-DDA pipeline: one thread per pixel
@@ -1679,7 +1683,16 @@ impl GpuRenderer {
         let depth_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.depth"),
             size: u64::from(width) * u64::from(height) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            // COPY_SRC so `read_depth_pixel` can stage it for picking.
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let depth_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu scene_dda.depth_readback"),
+            size: u64::from(width) * u64::from(height) * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let dda_shader = self
@@ -1853,7 +1866,66 @@ impl GpuRenderer {
             pipeline_blit,
             _sampler: sampler,
             depth_buffer,
+            depth_readback,
         }
+    }
+
+    /// Read back the per-pixel world-t depth at window pixel `(x, y)`
+    /// from the last rendered frame, for screen→world picking. Returns
+    /// the distance `t` along the (normalised) view ray to the nearest
+    /// scene-grid surface, so the host reconstructs the world hit as
+    /// `cam.pos + t * normalize(ray_dir)`. `None` for out-of-bounds
+    /// pixels, sky / no-hit (the `T_INF` sentinel), or when no scene
+    /// frame has been rendered.
+    ///
+    /// The depth buffer is the SCENE pass's output (terrain + grids),
+    /// untouched by the sprite pass (which reads it read-only), so a
+    /// cursor sprite under the pointer does not occlude the pick.
+    ///
+    /// Synchronous: copies the depth buffer to a mapped staging buffer
+    /// and blocks on `device.poll(Wait)`. Cheap enough for click-time
+    /// picks; do not call it every frame.
+    ///
+    /// Requires the last frame to have written depth, which happens
+    /// when sprites are present (`write_depth`). The pick demo always
+    /// has a cursor sprite, so this holds.
+    #[must_use]
+    pub fn read_depth_pixel(&self, x: u32, y: u32) -> Option<f32> {
+        let dda = self.scene_dda.as_ref()?;
+        let (w, h) = dda.storage_size;
+        if x >= w || y >= h {
+            return None;
+        }
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("roxlap-gpu depth readback"),
+            });
+        let size = u64::from(w) * u64::from(h) * 4;
+        enc.copy_buffer_to_buffer(&dda.depth_buffer, 0, &dda.depth_readback, 0, size);
+        self.queue.submit(std::iter::once(enc.finish()));
+
+        let slice = dda.depth_readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().ok()?.ok()?;
+
+        let t = {
+            let data = slice.get_mapped_range();
+            let idx = ((y * w + x) * 4) as usize;
+            let bytes: [u8; 4] = data[idx..idx + 4].try_into().ok()?;
+            f32::from_le_bytes(bytes)
+        };
+        dda.depth_readback.unmap();
+
+        // Reject sky / no-hit (T_INF == 1e30 in the shader) + non-finite.
+        if !t.is_finite() || t >= 1.0e29 {
+            return None;
+        }
+        Some(t)
     }
 
     /// GPU.10.1 — upload a sprite model registry + its instances for

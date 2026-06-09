@@ -27,6 +27,9 @@ pub(crate) struct CpuBackend {
     surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
     pool: ScratchPool,
     zbuffer: Vec<f32>,
+    /// Framebuffer dimensions of the last `render` — the `zbuffer`
+    /// stride for [`Self::pick_depth`].
+    last_dims: (u32, u32),
     /// Widest combined-grid `vsid` the pool's `lastx` is sized for;
     /// kept so a window grow can re-create the pool.
     max_grid_vsid: u32,
@@ -61,6 +64,7 @@ impl CpuBackend {
             surface,
             pool,
             zbuffer,
+            last_dims: (w, h),
             max_grid_vsid: opts.cpu_max_grid_vsid,
             n_threads,
             clear_sky: opts.clear_sky,
@@ -78,6 +82,22 @@ impl CpuBackend {
     /// Take the most recently captured frame, if any.
     pub(crate) fn take_capture(&mut self) -> Option<(Vec<u32>, u32, u32)> {
         self.captured.take()
+    }
+
+    /// World-t depth at pixel `(x, y)` from the last frame's z-buffer
+    /// (already in CPU memory — no readback). `None` for out-of-bounds
+    /// or sky (`+INF`). See [`SceneRenderer::pick_depth`].
+    pub(crate) fn pick_depth(&self, x: u32, y: u32) -> Option<f32> {
+        let (w, h) = self.last_dims;
+        if x >= w || y >= h {
+            return None;
+        }
+        let t = *self.zbuffer.get((y * w + x) as usize)?;
+        if t.is_finite() {
+            Some(t)
+        } else {
+            None
+        }
     }
 
     /// Pre-build one [`Sprite`] per instance (model KV6 cloned, the
@@ -107,6 +127,7 @@ impl CpuBackend {
         };
         let (width, height) = (size.width, size.height);
         let pixel_count = (width as usize) * (height as usize);
+        self.last_dims = (width, height);
 
         // Grow the z-buffer + pool to follow a window resize.
         if self.zbuffer.len() < pixel_count {

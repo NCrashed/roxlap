@@ -128,6 +128,12 @@ impl GpuBackend {
         self.gpu.adapter_info()
     }
 
+    /// World-t depth at window pixel `(x, y)` from the last frame (for
+    /// screen→world picking). See [`SceneRenderer::pick_depth`].
+    pub(crate) fn pick_depth(&self, x: u32, y: u32) -> Option<f32> {
+        self.gpu.read_depth_pixel(x, y)
+    }
+
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         self.gpu.resize(width, height);
     }

@@ -265,6 +265,30 @@ impl SceneRenderer {
             BackendImpl::Gpu(_) => None,
         }
     }
+
+    /// Screen→world picking input: the world-space hit distance `t` at
+    /// window pixel `(x, y)` from the **last rendered frame**, or `None`
+    /// for out-of-bounds pixels and sky / no-hit. The host reconstructs
+    /// the world hit point as `cam.pos + t * normalize(ray_dir)`, where
+    /// `ray_dir` is the same per-pixel ray the frame was rendered with
+    /// (see the backend's projection).
+    ///
+    /// `t` is the distance to the nearest **scene-grid** surface
+    /// (terrain + grids); sprites do not occlude it (the sprite pass
+    /// reads depth read-only), so a cursor sprite under the pointer is
+    /// transparent to the pick.
+    ///
+    /// Cost: the CPU backend reads its in-memory z-buffer (free); the
+    /// GPU backend stages the depth buffer and blocks on a device poll
+    /// (cheap at click time — do not call every frame). The GPU path
+    /// only has depth when the last frame drew sprites (`write_depth`).
+    #[must_use]
+    pub fn pick_depth(&self, x: u32, y: u32) -> Option<f32> {
+        match &self.inner {
+            BackendImpl::Cpu(c) => c.pick_depth(x, y),
+            BackendImpl::Gpu(g) => g.pick_depth(x, y),
+        }
+    }
 }
 
 #[cfg(test)]
