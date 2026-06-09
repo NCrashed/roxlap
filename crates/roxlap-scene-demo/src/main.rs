@@ -359,6 +359,12 @@ impl App {
         if let Some(window) = self.window.as_ref() {
             window.set_title(&format!("{} — {:.1} FPS", self.title_base, fps));
         }
+        // GPU.11.2 — `ROXLAP_FPS_LOG=1` mirrors the title-bar FPS to
+        // stderr so it can be captured in a terminal alongside the
+        // present-mode / pass-toggle diagnostic lines.
+        if std::env::var_os("ROXLAP_FPS_LOG").is_some() {
+            eprintln!("fps: {fps:.1}");
+        }
         self.fps_frames = 0;
         self.fps_last = now;
     }
@@ -931,7 +937,17 @@ impl ApplicationHandler for App {
                     // GPU.10 — render the KV6 sprites as DDA-marched
                     // voxel-model instances (precise, no overdraw; the
                     // GPU.9 splatter was retired in 10.5).
-                    if let Some(sprite) = self.sprites.first().cloned() {
+                    // GPU.11.2 diagnostic — `ROXLAP_GPU_NO_SPRITES=1`
+                    // skips the whole sprite registry + model-DDA pass,
+                    // so a back-to-back FPS read isolates how much of
+                    // the frame the 256-instance sprite pass costs vs
+                    // the terrain marcher.
+                    let no_sprites =
+                        std::env::var_os("ROXLAP_GPU_NO_SPRITES").is_some_and(|v| v != "0");
+                    if no_sprites {
+                        eprintln!("roxlap-gpu: ROXLAP_GPU_NO_SPRITES — sprite pass disabled");
+                    }
+                    if let Some(sprite) = self.sprites.first().cloned().filter(|_| !no_sprites) {
                         // Model registry + instancing: add the coco model
                         // once, fork a red-tinted variant (copy-on-modify),
                         // then spawn a field of instances (checkerboard of

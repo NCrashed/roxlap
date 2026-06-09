@@ -431,6 +431,14 @@ impl GpuRenderer {
         } else {
             wgpu::PresentMode::Fifo
         };
+        // GPU.11.2 — surface the present mode: `Fifo` is vsync-capped
+        // (FPS pinned to refresh rate → compute optimisations like the
+        // mip LOD won't show up in the FPS counter). Mailbox/Immediate
+        // are uncapped. Wayland under Mesa frequently offers only Fifo.
+        eprintln!(
+            "roxlap-gpu: present mode = {present_mode:?} (available: {:?})",
+            caps.present_modes,
+        );
         let physical = window.inner_size();
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
