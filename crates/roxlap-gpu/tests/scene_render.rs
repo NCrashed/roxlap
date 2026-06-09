@@ -74,6 +74,134 @@ fn floor_chunk(vsid: u32) -> Vxl {
     }
 }
 
+/// `vsid × vsid` chunk: every column solid over `z ∈ [top, bot]`
+/// (a wall/block facing a horizontal ray), colour `0x80ff_8000`.
+fn block_chunk(vsid: u32, top: u8, bot: u8) -> Vxl {
+    let n_cols = (vsid as usize) * (vsid as usize);
+    let n_vox = (bot - top + 1) as usize;
+    let mut data: Vec<u8> = Vec::with_capacity(n_cols * (4 + n_vox * 4));
+    let mut column_offset: Vec<u32> = Vec::with_capacity(n_cols + 1);
+    let bgra = [0x00u8, 0x80, 0xff, 0x80];
+    for _ in 0..n_cols {
+        column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+        data.extend_from_slice(&[0, top, bot, 0]); // nextptr=0, z1=top, z1c=bot, z0=0
+        for _ in 0..n_vox {
+            data.extend_from_slice(&bgra);
+        }
+    }
+    column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+    Vxl {
+        vsid,
+        ipo: [0.0; 3],
+        ist: [1.0, 0.0, 0.0],
+        ihe: [0.0, 0.0, 1.0],
+        ifo: [0.0, 1.0, 0.0],
+        data: data.into_boxed_slice(),
+        column_offset: column_offset.into_boxed_slice(),
+        mip_base_offsets: Box::new([0, n_cols + 1]),
+        vbit: Box::new([]),
+        vbiti: 0,
+    }
+}
+
+/// Recognisably the orange block (`0x80ff_8000` at brightness 1.0 →
+/// ~(255,128,0)), not the bluish sky (~(120,150,220)). Loose because
+/// coarse mips average the (uniform) block colour.
+fn is_block_color(p: u32) -> bool {
+    let (r, g, b) = (p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff);
+    r > 180 && (80..=175).contains(&g) && b < 70
+}
+
+#[test]
+fn scene_dda_marches_coarse_mip_for_distant_chunk() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    eprintln!("mip_render: adapter = {}", gpu.adapter_info);
+
+    // One solid block chunk placed FAR along +y (chunk index 4) so a
+    // horizontal ray enters it at t ≈ 128 — past several octaves of
+    // mip_scan_dist, forcing a deep mip. The camera sits in the empty
+    // chunk (0,0,0).
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&block_chunk(vsid, 0, 31));
+    assert!(chunk.mips.len() >= 5, "need a deep ladder for mip-4");
+
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 8, 1],
+        pool_dims: [1, 8, 1],
+        chunks: vec![([0, 4, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, w, h);
+    // Camera in the empty near chunk, looking +y at the block; z=16
+    // lands inside the block's z=0..31 band. right × down == forward.
+    let cam = Camera {
+        position: [vsid as f32 * 0.5, 0.0, 16.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+        fov_y_rad: 30f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+
+    // mip-0 baseline (LOD off): the block renders.
+    let fb0 = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+    assert!(
+        is_block_color(fb0[centre]),
+        "mip-0 centre should be the block, got {:#08x}",
+        fb0[centre],
+    );
+
+    // Force a deep mip: msd=8 at t≈128 → mip-4. If mip-N occupancy /
+    // colour addressing were wrong the block would vanish (sky) or
+    // render a garbage colour.
+    let fb4 = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam],
+        cam.fov_y_rad,
+        64,
+        8.0,
+    );
+    eprintln!(
+        "mip_render: centre mip0={:#08x} mip4={:#08x}",
+        fb0[centre], fb4[centre]
+    );
+    assert!(
+        is_block_color(fb4[centre]),
+        "coarse-mip centre should still be the block, got {:#08x}",
+        fb4[centre],
+    );
+
+    // The coarse render should broadly agree with mip-0 (same block
+    // fills the view) — most pixels classify the same way.
+    let agree = fb0
+        .iter()
+        .zip(&fb4)
+        .filter(|(a, b)| is_block_color(**a) == is_block_color(**b))
+        .count();
+    let frac = agree as f32 / fb0.len() as f32;
+    eprintln!("mip_render: block/sky agreement = {frac:.3}");
+    assert!(
+        frac > 0.9,
+        "mip-0 vs mip-4 block coverage diverged: {frac:.3}"
+    );
+}
+
 #[test]
 fn scene_dda_renders_floor_through_mip_layout() {
     let Some((gpu, _lock)) = try_init() else {
@@ -115,6 +243,7 @@ fn scene_dda_renders_floor_through_mip_layout() {
         &[cam],
         30f32.to_radians(),
         64,
+        0.0, // mip_scan_dist=0 → always mip-0
     );
     assert_eq!(fb.len(), (w * h) as usize);
 

@@ -913,6 +913,21 @@ impl ApplicationHandler for App {
                         }
                         Err(e) => eprintln!("roxlap-gpu: sky decode failed ({e})"),
                     }
+                    // GPU.11.1 — scene-grid LOD scan distance (world
+                    // units). Default 64 (matches the CPU opticast
+                    // `mip_scan_dist`); a chunk entered at world-t `t`
+                    // marches at mip `floor(log2(max(t,msd)/msd))`.
+                    // `ROXLAP_GPU_MIP_SCAN_DIST=0` disables LOD (always
+                    // mip-0); crank it down (e.g. 16) to force coarse
+                    // mips close for inspection, or up to push banding
+                    // out (the axis-aligned-mip-beams mitigation).
+                    if let Some(msd) = std::env::var("ROXLAP_GPU_MIP_SCAN_DIST")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                    {
+                        eprintln!("roxlap-gpu: scene mip scan dist = {msd}");
+                        gpu.set_scene_mip_scan_dist(msd);
+                    }
                     // GPU.10 — render the KV6 sprites as DDA-marched
                     // voxel-model instances (precise, no overdraw; the
                     // GPU.9 splatter was retired in 10.5).

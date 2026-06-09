@@ -79,6 +79,14 @@ struct Uniforms {
     // branch-free single-page read.
     occ_page_words: u32,
     occ_num_pages: u32,
+    // GPU.11.1 — scene-grid LOD. A chunk entered at world-t `t` is
+    // marched at mip level `floor(log2(max(t, msd) / msd))`, clamped
+    // to the grid's `mip_count`. `0` disables LOD (always mip-0).
+    // Tunable for the axis-aligned-mip-beams mitigation (11.2).
+    mip_scan_dist: f32,
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -122,26 +130,42 @@ fn occ_word(i: u32) -> u32 {
     return occ_page3[local];
 }
 
-// GPU.11 — mip-0 occupancy + colour lookups. The per-slot stride is
-// now the whole mip ladder (`occ_words_per_slot` /
-// `offsets_words_per_slot`); mip-0's sub-block sits at relative
-// offset 0, so within a slot the indexing is identical to the
-// pre-mip layout. GPU.11.1 generalises these to an arbitrary mip.
-fn voxel_solid_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> bool {
-    let m = grid_static_meta[g];
-    let col_idx = u32(p_voxel.x) + u32(p_voxel.y) * m.vsid;
-    let occ_base = m.occupancy_offset + meta_id * m.occ_words_per_slot;
-    let col_word_base = occ_base + col_idx * OCC_WORDS_PER_COLUMN;
+// GPU.11.1 — occupancy words per column at `mip`
+// (`(CHUNK_Z >> mip) / 32`, min 1). Mirrors
+// `decompress::occ_words_per_column_for_mip`.
+fn occ_words_per_col_for_mip(mip: u32) -> u32 {
+    return max(1u, (CHUNK_Z >> mip) / 32u);
+}
+
+// GPU.11.1 — word base of column `(p_voxel.x, p_voxel.y)`'s occupancy
+// at `mip` within slot `meta_id`. Indexes `grid_static_meta`
+// **directly** (storage address space): WGSL forbids dynamic
+// indexing of an array member once the struct is copied into a value
+// `let`. `mip_occ_rel[mip]` is the within-slot start of that mip's
+// sub-block (0 for mip-0).
+fn col_word_base_mip(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> u32 {
+    let vsid_mip = grid_static_meta[g].vsid >> mip;
+    let col_idx = u32(p_voxel.x) + u32(p_voxel.y) * vsid_mip;
+    let occ_base = grid_static_meta[g].occupancy_offset
+        + meta_id * grid_static_meta[g].occ_words_per_slot
+        + grid_static_meta[g].mip_occ_rel[mip];
+    return occ_base + col_idx * occ_words_per_col_for_mip(mip);
+}
+
+// GPU.11 — occupancy + colour lookups at an arbitrary mip. The per-
+// slot stride spans the whole ladder; `mip_*_rel[mip]` selects the
+// sub-block. At mip-0 these reduce to the pre-mip addressing.
+fn voxel_solid_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> bool {
+    let col_word_base = col_word_base_mip(g, meta_id, mip, p_voxel);
     let z_word = u32(p_voxel.z) >> 5u;
     let z_bit = u32(p_voxel.z) & 31u;
     return (occ_word(col_word_base + z_word) & (1u << z_bit)) != 0u;
 }
 
-fn voxel_color_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> vec3<f32> {
-    let m = grid_static_meta[g];
-    let col_idx = u32(p_voxel.x) + u32(p_voxel.y) * m.vsid;
-    let occ_base = m.occupancy_offset + meta_id * m.occ_words_per_slot;
-    let col_word_base = occ_base + col_idx * OCC_WORDS_PER_COLUMN;
+fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> vec3<f32> {
+    let vsid_mip = grid_static_meta[g].vsid >> mip;
+    let col_idx = u32(p_voxel.x) + u32(p_voxel.y) * vsid_mip;
+    let col_word_base = col_word_base_mip(g, meta_id, mip, p_voxel);
     let z_word = u32(p_voxel.z) >> 5u;
     let z_bit = u32(p_voxel.z) & 31u;
 
@@ -155,10 +179,18 @@ fn voxel_color_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> vec3<f32> {
     }
     rank = rank + countOneBits(occ_word(col_word_base + z_word) & mask);
 
-    let offsets_base = m.color_offsets_offset + meta_id * m.offsets_words_per_slot;
+    // Cumulative-within-slot colour offsets: the mip's sub-table
+    // lives at `mip_coff_rel[mip]`, and its values already include
+    // every finer mip's colour count, so `chunk_colors_base + value
+    // + rank` indexes the slot's concatenated colour block directly.
+    let offsets_base = grid_static_meta[g].color_offsets_offset
+        + meta_id * grid_static_meta[g].offsets_words_per_slot
+        + grid_static_meta[g].mip_coff_rel[mip];
     let chunk_local_offset = all_color_offsets[offsets_base + col_idx];
-    let chunk_colors_base = all_chunk_colors_base[m.chunk_colors_base_offset + meta_id];
-    let packed = all_colors[m.colors_offset + chunk_colors_base + chunk_local_offset + rank];
+    let chunk_colors_base =
+        all_chunk_colors_base[grid_static_meta[g].chunk_colors_base_offset + meta_id];
+    let packed =
+        all_colors[grid_static_meta[g].colors_offset + chunk_colors_base + chunk_local_offset + rank];
 
     let a = f32((packed >> 24u) & 0xffu);
     let r = f32((packed >> 16u) & 0xffu);
@@ -233,6 +265,18 @@ fn shield_parallel(t_max: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     return t;
 }
 
+// GPU.11.1 — choose the mip a chunk is marched at, from the world-t
+// at which the ray enters it. mip-0 inside `mip_scan_dist`, then one
+// coarser level per distance-octave, clamped to the grid's ladder.
+fn pick_mip(t: f32, mip_count: u32) -> u32 {
+    if (u.mip_scan_dist <= 0.0 || mip_count <= 1u) {
+        return 0u;
+    }
+    let ratio = max(t, u.mip_scan_dist) / u.mip_scan_dist;
+    let lvl = u32(floor(log2(ratio)));
+    return min(lvl, mip_count - 1u);
+}
+
 // March one grid; return (hit, t, color). `best_t` is the world-t
 // threshold the caller already found in earlier grids; we early-out
 // once our outer t passes it.
@@ -276,39 +320,47 @@ fn march_grid(
         }
         let slot_id = slot_idx_of(g, p_chunk);
         if (chunk_has_content(g, slot_id, p_chunk)) {
-            let t_chunk_exit = min(t_max_chunk.x, min(t_max_chunk.y, t_max_chunk.z));
+            // GPU.11.1 — pick the mip for this chunk by entry distance.
+            // Voxels are `vsize` world units; the chunk holds
+            // `vsid>>mip` × `vsid>>mip` × `CHUNK_Z>>mip` of them.
+            let mip = pick_mip(t_enter, m.mip_count);
+            let vsize = f32(1u << mip);
+            let vsid_mip = i32(m.vsid >> mip);
+            let cz_mip = i32(CHUNK_Z >> mip);
+
             let entry_world = ray_origin + t_enter * ray_dir;
             let chunk_origin_world = vec3<f32>(p_chunk) * chunk_dim;
             let entry_in_chunk = entry_world - chunk_origin_world;
-            var p_voxel = vec3<i32>(floor(entry_in_chunk));
+            var p_voxel = vec3<i32>(floor(entry_in_chunk / vsize));
             p_voxel = clamp(
                 p_voxel,
                 vec3<i32>(0),
-                vec3<i32>(i32(m.vsid - 1u), i32(m.vsid - 1u), i32(CHUNK_Z - 1u)),
+                vec3<i32>(vsid_mip - 1, vsid_mip - 1, cz_mip - 1),
             );
 
+            // Voxel boundaries are at integer-mip-coord * vsize.
             let next_voxel_world = vec3<f32>(
-                select(f32(p_voxel.x), f32(p_voxel.x + 1), step_chunk.x > 0)
+                select(f32(p_voxel.x), f32(p_voxel.x + 1), step_chunk.x > 0) * vsize
                     + chunk_origin_world.x,
-                select(f32(p_voxel.y), f32(p_voxel.y + 1), step_chunk.y > 0)
+                select(f32(p_voxel.y), f32(p_voxel.y + 1), step_chunk.y > 0) * vsize
                     + chunk_origin_world.y,
-                select(f32(p_voxel.z), f32(p_voxel.z + 1), step_chunk.z > 0)
+                select(f32(p_voxel.z), f32(p_voxel.z + 1), step_chunk.z > 0) * vsize
                     + chunk_origin_world.z,
             );
             var t_max_voxel = shield_parallel(
                 (next_voxel_world - ray_origin) / ray_dir,
                 ray_dir,
             );
-            let t_delta_voxel = abs(1.0 / ray_dir);
+            let t_delta_voxel = abs(vsize / ray_dir);
             var t_hit: f32 = t_enter;
 
             for (var iv: u32 = 0u; iv < MAX_INNER_STEPS; iv = iv + 1u) {
-                if (voxel_solid_in(g, slot_id, p_voxel)) {
+                if (voxel_solid_in(g, slot_id, mip, p_voxel)) {
                     if (t_hit < best_t) {
                         out.hit = true;
                         out.t = t_hit;
                         out.color = apply_fog(
-                            voxel_color_in(g, slot_id, p_voxel),
+                            voxel_color_in(g, slot_id, mip, p_voxel),
                             t_hit,
                         );
                         return out;
@@ -320,21 +372,21 @@ fn march_grid(
                     t_hit = t_max_voxel.x;
                     p_voxel.x = p_voxel.x + step_chunk.x;
                     t_max_voxel.x = t_max_voxel.x + t_delta_voxel.x;
-                    if (p_voxel.x < 0 || u32(p_voxel.x) >= m.vsid) {
+                    if (p_voxel.x < 0 || p_voxel.x >= vsid_mip) {
                         break;
                     }
                 } else if (t_max_voxel.y < t_max_voxel.z) {
                     t_hit = t_max_voxel.y;
                     p_voxel.y = p_voxel.y + step_chunk.y;
                     t_max_voxel.y = t_max_voxel.y + t_delta_voxel.y;
-                    if (p_voxel.y < 0 || u32(p_voxel.y) >= m.vsid) {
+                    if (p_voxel.y < 0 || p_voxel.y >= vsid_mip) {
                         break;
                     }
                 } else {
                     t_hit = t_max_voxel.z;
                     p_voxel.z = p_voxel.z + step_chunk.z;
                     t_max_voxel.z = t_max_voxel.z + t_delta_voxel.z;
-                    if (p_voxel.z < 0 || u32(p_voxel.z) >= CHUNK_Z) {
+                    if (p_voxel.z < 0 || p_voxel.z >= cz_mip) {
                         break;
                     }
                 }

@@ -183,6 +183,13 @@ pub struct GpuRenderer {
     /// Defaults to 4.0 (the empirical sweet spot); the host can tune
     /// via [`Self::set_sprite_lod_px`].
     sprite_lod_px: f32,
+    /// GPU.11.1 — scene-grid LOD scan distance (world units). A chunk
+    /// entered at world-t `t` is marched at the mip level
+    /// `floor(log2(max(t, msd) / msd))`, clamped to the grid's mip
+    /// ladder. `0` disables LOD (always mip-0). Tunable via
+    /// [`Self::set_scene_mip_scan_dist`] — the axis-aligned-mip-beams
+    /// mitigation (GPU.11.2) pushes it outward if banding appears.
+    scene_mip_scan_dist: f32,
 }
 
 /// Per-renderer chunk-DDA pipeline state. The compute shader writes
@@ -311,6 +318,14 @@ struct SceneDdaUniform {
     /// Number of real occupancy pages (1 on multi-GiB GPUs → the
     /// shader takes a branch-free single-page read).
     occ_num_pages: u32,
+    /// GPU.11.1 — scene-grid LOD scan distance (world units). A chunk
+    /// entered at world-t `t` marches at mip
+    /// `floor(log2(max(t, msd) / msd))`, clamped to the grid's mip
+    /// count. `0` disables LOD (always mip-0).
+    mip_scan_dist: f32,
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
 }
 
 #[repr(C)]
@@ -496,6 +511,8 @@ impl GpuRenderer {
             // once a voxel projects below 4 px. Empirically the best
             // quality/cost tradeoff; the host can override.
             sprite_lod_px: 4.0,
+            // GPU.11.1 — matches the CPU demo's mip_scan_dist=64.
+            scene_mip_scan_dist: 64.0,
         })
     }
 
@@ -1408,6 +1425,10 @@ impl GpuRenderer {
             write_depth: u32::from(self.sprite_registry.is_some()),
             occ_page_words: scene.occupancy_page_words,
             occ_num_pages: scene.occupancy_num_pages,
+            mip_scan_dist: self.scene_mip_scan_dist,
+            _pad2: 0,
+            _pad3: 0,
+            _pad4: 0,
         };
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
@@ -1854,6 +1875,17 @@ impl GpuRenderer {
         self.sprite_lod_px = px.max(0.25);
     }
 
+    /// GPU.11.1 — set the scene-grid LOD scan distance (world units).
+    /// A chunk entered at world-t `t` is marched at mip
+    /// `floor(log2(max(t, msd) / msd))`, clamped to its grid's mip
+    /// ladder. `0` disables LOD (always mip-0). Larger values push
+    /// the coarser mips farther out — the axis-aligned-mip-beams
+    /// mitigation lever (GPU.11.2). Default 64 (matches CPU
+    /// `mip_scan_dist`).
+    pub fn set_scene_mip_scan_dist(&mut self, dist: f32) {
+        self.scene_mip_scan_dist = dist.max(0.0);
+    }
+
     /// GPU.10.1 — build the instanced model-DDA pipeline (one thread
     /// per pixel). Lazily invoked the first frame a registry is present.
     fn build_sprite_model_dda(&self) -> SpriteModelDdaResources {
@@ -2081,11 +2113,14 @@ impl HeadlessSceneRenderer {
 
     /// Render `scene` from `cameras` (one per grid) and read the
     /// framebuffer back as `width*height` packed `0xAABBGGRR` pixels
-    /// (R in the low byte). Fog is disabled. Blocks on readback.
+    /// (R in the low byte). Fog is disabled. `mip_scan_dist` drives
+    /// the GPU.11.1 scene-grid LOD (`0` = always mip-0). Blocks on
+    /// readback.
     ///
     /// # Panics
     /// If `cameras.len() != scene.grid_count`.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         device: &wgpu::Device,
@@ -2094,6 +2129,7 @@ impl HeadlessSceneRenderer {
         cameras: &[Camera],
         fov_y_rad: f32,
         max_outer_steps: u32,
+        mip_scan_dist: f32,
     ) -> Vec<u32> {
         assert_eq!(
             cameras.len(),
@@ -2130,6 +2166,10 @@ impl HeadlessSceneRenderer {
             write_depth: 0,
             occ_page_words: scene.occupancy_page_words,
             occ_num_pages: scene.occupancy_num_pages,
+            mip_scan_dist,
+            _pad2: 0,
+            _pad3: 0,
+            _pad4: 0,
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 
