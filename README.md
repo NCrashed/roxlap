@@ -1,9 +1,14 @@
 # roxlap
 
 A pure-Rust port of [Ken Silverman's Voxlap](http://advsys.net/ken/voxlap.htm)
-voxel engine — a CPU-rendered 3D voxel renderer from the Build-engine era.
-Runs on Linux / macOS / Windows from one Cargo workspace, no GPU required,
-no C dependency, idiomatic safe Rust with per-architecture SIMD.
+voxel engine — a 3D voxel renderer from the Build-engine era — grown into a
+small **voxel-scene engine**. The heritage CPU raycaster runs anywhere with
+no GPU and no C dependency; an **optional WGPU compute-shader renderer**
+sits alongside it behind one unified facade with automatic CPU fallback. On
+top is a **multi-grid scene graph** — f64 world placement + quaternion
+rotation, chunk streaming + procedural generation, serde snapshots, and
+real-time edit + screen→world picking APIs. One Cargo workspace, Linux /
+macOS / Windows + wasm, idiomatic safe Rust with per-architecture SIMD.
 
 ![sample render from roxlap-oracle](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/screenshot.png)
 
@@ -24,6 +29,13 @@ animation rigs) files Ken's engine reads, renders them with the same
 algorithms, and is **bit-exact** against the reference C engine
 ([voxlaptest](https://github.com/NCrashed/voxlaptest)) on every test
 pose where the underlying SIMD allows.
+
+It then grows past Ken's single-world engine: a multi-grid **scene graph**
+(`roxlap-scene`) places many independently-rotating chunked voxel grids in
+one f64 world with streaming + snapshots, and an **optional GPU compute
+renderer** (`roxlap-gpu`, WGPU/WGSL) renders the same scene at much higher
+frame rates — the same retro look, the CPU budget freed for game logic. A
+unified `roxlap-render` facade picks CPU or GPU and falls back automatically.
 
 ## Quick start
 
@@ -54,6 +66,19 @@ cargo run --release -p roxlap-host
 
 `L` toggles baked world-voxel lighting; `F` writes
 `roxlap-capture.{txt,ppm}` for off-line repro of render artifacts.
+
+For the **scene-graph showcase** — multiple voxel grids (streaming hilly
+terrain + a rotating ship) in one f64 world, on the unified renderer:
+
+```sh
+cargo run --release -p roxlap-scene-demo            # CPU softbuffer
+ROXLAP_GPU=1 cargo run --release -p roxlap-scene-demo   # GPU compute path
+```
+
+WASD + mouse-look to fly; `R` spins the ship; `T` prints streaming stats;
+`H` jumps to a high-altitude top-down vantage; `C` enters a top-down
+**pick mode** where the cursor follows the mouse and left-click reports the
+grid + voxel under the pointer (`SceneRenderer::pick` / `Scene::raycast`).
 
 For the **browser demos** — same engine, wasm32 + WebAssembly SIMD,
 running on a `<canvas>`:
@@ -93,7 +118,11 @@ won't spin up. Full setup + per-host header config in
 | [`roxlap-core`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-core) | The engine: framebuffer, camera, opticast raycaster, grouscan rasterizer, sprite + sky + voxel-lighting. |
 | [`roxlap-formats`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-formats) | On-disk file format parsers (`.vxl`, `.kv6`, `.kvx`, `.kfa`) **plus the voxel-edit module** — `delslab` / `insslab` / `ScumCtx` plus high-level `set_spans` / `set_cube` / `set_sphere` / `set_rect` (with bit-exact byte equivalence to voxlap C's `setspans` validated against captured fixtures). No renderer dependency; useful standalone for level editors, asset converters, and procedural-world tools. |
 | [`roxlap-cavegen`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cavegen) | Procedural cave generation. Worley-distance shape classification + Perlin overlay, two visual presets (`BlueCaveGenerator`, `MagCaveGenerator`) matching Ken + Tom Dobrowolski's 2003 *Justfly* demo screenshots, and a `pack_dense_grid_to_vxl` helper that folds a dense voxel mask + colour grid into voxlap's slab format. Pure-Rust (no `cmake` / C++ build deps). |
+| [`roxlap-scene`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-scene) | The scene-graph layer above the per-chunk renderer: many independently-placed chunked voxel grids in one f64 world (`GridTransform` = position + quaternion), cross-chunk raycast composition, runtime edits, serde snapshots, far-LOD billboards, chunk streaming + procedural generation (`ChunkGenerator`), and world queries — `Scene::raycast`, `resolve_voxel`, `Grid::voxel_solid` / `voxel_color`. |
+| [`roxlap-gpu`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-gpu) | Optional GPU renderer — a WGPU/WGSL compute-shader voxel marcher (two-level chunk + voxel DDA, per-chunk decompress/upload, multi-grid composition, sky + fog, edit/stream invalidation, KV6 sprite model-DDA, scene-grid mip LOD, chunk-AABB empty-space skip). Sibling to the CPU opticast, not a replacement; same retro look, much higher frame rates. |
+| [`roxlap-render`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-render) | Unified renderer facade — one `SceneRenderer` over the CPU opticast and the GPU marcher with **automatic CPU fallback**. Owns presentation, the Scene→GPU bridge, sprites, and screen→world picking (`pick` / `pixel_ray` / `view_ray` / `pick_depth`). Hosts stay thin: build a `Scene`, advance it, call `render`. |
 | [`roxlap-cave-demo`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cave-demo) | Procedural-cave showcase binary (winit + softbuffer). Cave-gen on startup, real-time edits via plasma bullets, fog, F/R preset+seed toggles. |
+| [`roxlap-scene-demo`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-scene-demo) | Scene-graph + GPU showcase binary: streaming hilly terrain + a rotating ship in one f64 world, on the unified renderer (`ROXLAP_GPU=1` selects the GPU backend). Mouse-pick mode, runtime carving, top-down vantage. |
 | [`roxlap-host`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). |
 | [`roxlap-web`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-web) | Engine demo for the browser (wasm32 + wasm-bindgen + canvas). Oracle world + WebAssembly SIMD batches, ~360 KB wasm bundle. Run via `trunk serve` for dev / `trunk build --release` for deploy. |
 | [`roxlap-cave-web`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cave-web) | Cave demo for the browser — Worley + Perlin cave-gen, fly + fire + carve with local relight on impact, all on wasm32. ~130 KB wasm bundle (no embedded asset; cave is generated client-side). |
@@ -130,13 +159,22 @@ and [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
 
 ## Status
 
-The renderer is feature-complete: voxel terrain (`opticast` + `grouscan`),
-animated kv6 sprites, world-voxel lighting, textured panoramic sky,
-x86_64 SSE2 batches. The cross-engine oracle tracks 9 of 12 voxlap C
-poses — 5 byte-for-byte bit-exact with the C reference, 4 frozen as
-roxlap's own goldens after visual verification (sub-pixel rounding
-noise from `_mm_rcp_ps`-based vertex projection is documented in
+Published on crates.io (`roxlap-core`, `-formats`, `-cavegen`, `-scene`,
+`-gpu`, `-render`). The CPU renderer is feature-complete: voxel terrain
+(`opticast` + `grouscan`), animated kv6 sprites, world-voxel lighting,
+textured panoramic sky, per-arch SIMD (SSE2 / NEON / wasm simd128), and
+rayon multicore. On top, the **scene graph** (S1–S7: multi-grid f64 world,
+rotation, cross-chunk gline, far-LOD billboards, streaming + procgen) and
+the **GPU compute renderer** (GPU.0–13) have landed, with a unified
+CPU/GPU facade and a screen→world picking / `raycast` query API.
+
+The cross-engine oracle pins CPU-render correctness — it tracks 9 of 12
+voxlap C poses: 5 byte-for-byte bit-exact with the C reference, 4 frozen as
+roxlap's own goldens after visual verification (sub-pixel rounding noise
+from `_mm_rcp_ps`-based vertex projection is documented in
 [PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md)).
+The GPU renderer is non-deterministic across devices by design and is
+validated by a headless render-diff harness rather than byte-goldens.
 
 ```text
 $ cargo run --release -p roxlap-oracle -- diff
@@ -152,9 +190,9 @@ MATCH    diag_down_lit  b536ce3fdf771b9e       (roxlap-frozen)
 9 match, 0 mismatch, 0 missing-from-golden (9 total roxlap rows)
 ```
 
-ARM NEON (R9) and wasm SIMD + browser host (R10) landed. Open
-work: crates.io publish (R11.9). See
-[PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md) for the full substage roadmap.
+See [PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md)
+for the CPU-port substage roadmap, plus `PORTING-SCENE.md` (scene graph) and
+`PORTING-GPU.md` (GPU renderer) for the later arcs.
 
 ## Multicore
 

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-06-10
+
+### Changed
+
+- **README rewrite to current scope.** The workspace README (the
+  crates.io / docs.rs pitch page for every published crate, via
+  `readme.workspace`) was stuck around the R10/R11 CPU-only era. It now
+  covers the `roxlap-scene` scene graph (multi-grid f64 world +
+  rotation, streaming, snapshots, world queries), the optional
+  `roxlap-gpu` compute renderer, and the unified `roxlap-render` facade
+  with screen→world picking — drops the now-inaccurate "no GPU" framing,
+  adds the four missing crates to the table and `roxlap-scene-demo` to
+  the quick-start, and refreshes Status (published; S1–S7 + GPU.0–13 +
+  picking landed). Docs only; no code or API changes.
+
 ## [0.6.0] — 2026-06-10
 
 A GPU outer-DDA perf win (GPU.13.0) plus a **screen→world picking and
