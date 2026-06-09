@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-06-10
+
+A GPU outer-DDA perf win (GPU.13.0) plus a **screen→world picking and
+voxel-query API** for downstream engines (turning a click — or any
+world ray — into a grid + voxel + colour). Purely additive; no
+public-API breakage versus 0.5.0.
+
 ### Added
 
 - **GPU.13.0 — chunk-AABB outer-DDA early-out.** `scene_dda.wgsl`'s
@@ -19,7 +26,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and re-upload it so streamed-in terrain is never skipped. Demo gains
   an `H` hotkey toggling a high-altitude top-down vantage for the FPS
   A/B. Render output is byte-stable (the early-out only skips empty
-  space).
+  space). On a 3070, the user's flagged high-altitude pose went from
+  the slow case to ~600 FPS.
+
+#### Screen→world picking + voxel queries
+
+- **`roxlap-render`** — `SceneRenderer::pick(scene, camera, x, y) ->
+  Option<PickHit>` resolves a pixel to its world point + owning grid +
+  grid-local voxel in one call. Supporting API: `pixel_ray`, the
+  canonical `view_ray` (returns a `Ray` — the one unproject both
+  backends honour), and `pick_depth` (per-pixel world-t; CPU reads its
+  z-buffer, GPU stages the depth buffer at click time). New `Ray` and
+  `PickHit` types. Each backend caches its last-frame projection so
+  callers never reconstruct it.
+- **`roxlap-scene`** — `Scene::raycast(origin, dir, max_dist) ->
+  Option<RayHit>`: a renderer-independent voxel DDA across grids
+  (per-grid local-space marching, transform-correct for rotated /
+  translated grids; nearest hit wins) for line-of-sight, projectiles,
+  and off-screen / backend-agnostic picking. `Scene::resolve_voxel`
+  maps a world surface point to its grid + voxel. `Grid::voxel_solid`
+  and `Grid::voxel_color` query a grid-local voxel. New `RayHit` type.
+- **`roxlap-formats`** — `Vxl::voxel_color(x, y, z)` reads a textured
+  voxel's packed colour straight from the slab chain (no decompress).
+- **`roxlap-gpu`** — `GpuRenderer::{read_depth_pixel, pixel_ray}` +
+  the standalone `pinhole_pixel_ray`; the scene depth buffer gained
+  `COPY_SRC` + a `MAP_READ` staging buffer for readback.
+- **`roxlap-scene-demo`** — `C` toggles a top-down pick mode: a cursor
+  sprite follows the mouse on a ground plane, and left-click resolves
+  and prints the true grid + grid-local voxel.
 
 ## [0.5.0] — 2026-06-09
 

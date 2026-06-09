@@ -14,10 +14,10 @@ readme.workspace = true
 
 [dependencies]
 # Both backends + the scene/world types they consume.
-roxlap-core = { path = "../roxlap-core", version = "0.5" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.5" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.5" }
-roxlap-gpu = { path = "../roxlap-gpu", version = "0.5" }
+roxlap-core = { path = "../roxlap-core", version = "0.6" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.6" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.6" }
+roxlap-gpu = { path = "../roxlap-gpu", version = "0.6" }
 glam = { workspace = true }
 # CPU strip-parallel render thread count (caps the ScratchPool slots).
 rayon = { workspace = true }

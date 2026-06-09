@@ -17,14 +17,14 @@ path = "src/main.rs"
 [dependencies]
 glam = { workspace = true }
 png = "0.17"
-roxlap-core = { path = "../roxlap-core", version = "0.5" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.5" }
+roxlap-core = { path = "../roxlap-core", version = "0.6" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.6" }
 # RF: unified CPU/GPU renderer facade. Owns presentation + the
 # Scene→GPU bridge + the CPU compositor; `ROXLAP_GPU=1` selects the
 # GPU backend with automatic CPU fallback. The demo no longer touches
 # roxlap-gpu or softbuffer directly.
 roxlap-render = { path = "../roxlap-render" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.5" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.6" }
 winit = "0.30"
 
 [lints]
