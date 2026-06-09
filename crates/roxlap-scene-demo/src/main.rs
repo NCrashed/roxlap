@@ -241,6 +241,11 @@ struct App {
     /// `ROXLAP_GPU_MIP_SCAN_DIST` (default 64). Fed to the GPU
     /// backend each frame; ignored by the CPU backend.
     gpu_mip_scan_dist: f32,
+    /// GPU.13.0 — saved `(pos, yaw, pitch)` so `H` can toggle between
+    /// the high-altitude top-down vantage (where the chunk-AABB
+    /// early-out pays off) and the previous ground-level pose for an
+    /// FPS A/B. `None` until the first `H` press.
+    saved_pose: Option<([f64; 3], f64, f64)>,
     /// Base KV6 sprite(s); `build_sprite_set` expands these into the
     /// demo's instanced field handed to the renderer at startup.
     sprites: Vec<Sprite>,
@@ -293,6 +298,7 @@ impl App {
             capture_pending: false,
             scan_dist: SCAN_DIST_INITIAL,
             gpu_mip_scan_dist: 64.0,
+            saved_pose: None,
             sprites: build_sprites(),
             bake_tracker: StreamingBakeTracker::new(),
             title_base: "roxlap-scene-demo".to_string(),
@@ -692,6 +698,35 @@ impl ApplicationHandler for App {
                                 r_evict = grid.stream_radius.r_evict,
                             );
                         }
+                    }
+                    // GPU.13.0: `H` teleports to a high-altitude
+                    // top-down vantage (and back) for the chunk-AABB
+                    // early-out FPS A/B. From way up, horizon + sky
+                    // rays cross many empty chunks before exiting the
+                    // grid's occupied box — exactly what 13.0 culls.
+                    // Toggles with the pre-teleport pose so the user
+                    // can compare framerate at the two poses.
+                    KeyCode::KeyH if pressed => {
+                        if let Some((pos, yaw, pitch)) = self.saved_pose.take() {
+                            self.scene.cam_pos = pos;
+                            self.scene.yaw = yaw;
+                            self.scene.pitch = pitch;
+                            eprintln!("camera restored to {pos:?}");
+                        } else {
+                            self.saved_pose =
+                                Some((self.scene.cam_pos, self.scene.yaw, self.scene.pitch));
+                            // High above the centred ground (z-down →
+                            // very negative z = high up), looking ~40°
+                            // down so terrain fills the lower frame and
+                            // the horizon/sky fills the upper.
+                            self.scene.cam_pos = [0.0, 0.0, -800.0];
+                            self.scene.pitch = 0.7; // ~40° down (z-down)
+                            eprintln!(
+                                "camera → high-altitude top-down {:?} (press H again to return)",
+                                self.scene.cam_pos
+                            );
+                        }
+                        self.scene.refresh_camera();
                     }
                     // `+` / `=` (same key on US layout, with or without Shift)
                     // and the numpad `+` bump scan distance up by

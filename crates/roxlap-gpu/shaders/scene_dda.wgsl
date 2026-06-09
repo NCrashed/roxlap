@@ -55,6 +55,11 @@ struct GridStaticMeta {
     _pad1: u32,
     mip_occ_rel: array<u32, MAX_GPU_MIPS>,
     mip_coff_rel: array<u32, MAX_GPU_MIPS>,
+    // GPU.13.0 — occupied chunk-AABB (inclusive) in chunk-index space.
+    // `vec3<i32>` aligns to 16 here (mip_coff_rel ends 16-aligned), so
+    // these mirror the host's `[i32;3] + pad` pair exactly (112→144).
+    aabb_min: vec3<i32>,
+    aabb_max: vec3<i32>,
 };
 
 struct Uniforms {
@@ -234,6 +239,30 @@ fn slot_idx_of(g: u32, chunk_idx: vec3<i32>) -> u32 {
         + u32(s.z) * m.pool_dims.x * m.pool_dims.y;
 }
 
+// GPU.13.0 — has the outer DDA left the grid's occupied chunk-AABB
+// for good? A 3D-DDA ray is inside the box only while all three axes
+// are within `[aabb_min, aabb_max]`; once it crosses the far slab on
+// any axis (in its travel direction) it can never re-enter, so no
+// resident chunk lies ahead. An axis the ray is parallel to (`step ==
+// 0`) and already outside the box means the ray misses the grid
+// entirely. Either way the caller returns `out` (sky / no closer hit).
+// The empty-grid sentinel (min = i32::MAX, max = i32::MIN) makes every
+// branch fire immediately, so an empty grid contributes nothing.
+fn aabb_passed(g: u32, p: vec3<i32>, step: vec3<i32>) -> bool {
+    let mn = grid_static_meta[g].aabb_min;
+    let mx = grid_static_meta[g].aabb_max;
+    if (step.x > 0 && p.x > mx.x) { return true; }
+    if (step.x < 0 && p.x < mn.x) { return true; }
+    if (step.x == 0 && (p.x < mn.x || p.x > mx.x)) { return true; }
+    if (step.y > 0 && p.y > mx.y) { return true; }
+    if (step.y < 0 && p.y < mn.y) { return true; }
+    if (step.y == 0 && (p.y < mn.y || p.y > mx.y)) { return true; }
+    if (step.z > 0 && p.z > mx.z) { return true; }
+    if (step.z < 0 && p.z < mn.z) { return true; }
+    if (step.z == 0 && (p.z < mn.z || p.z > mx.z)) { return true; }
+    return false;
+}
+
 fn chunk_has_content(g: u32, slot_idx: u32, chunk_idx: vec3<i32>) -> bool {
     let m = grid_static_meta[g];
     // Identity check: does this slot actually hold the chunk the
@@ -337,6 +366,12 @@ fn march_grid(
     for (var step: u32 = 0u; step < u.max_outer_steps; step = step + 1u) {
         if (t_enter > best_t) {
             return out; // no closer hit possible in this grid
+        }
+        // GPU.13.0 — once the ray has left the occupied chunk-AABB
+        // along its travel direction, no resident chunk lies ahead:
+        // stop instead of stepping empty space to max_outer_steps.
+        if (aabb_passed(g, p_chunk, step_chunk)) {
+            return out;
         }
         let slot_id = slot_idx_of(g, p_chunk);
         if (chunk_has_content(g, slot_id, p_chunk)) {

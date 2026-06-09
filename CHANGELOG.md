@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **GPU.13.0 — chunk-AABB outer-DDA early-out.** `scene_dda.wgsl`'s
+  outer chunk-DDA now stops the moment a ray leaves a grid's occupied
+  chunk-AABB along its travel direction, instead of stepping empty
+  space to `max_outer_steps`. Cuts the high-altitude / horizon
+  overscan where sky and beyond-terrain rays cross many empty chunks.
+  The AABB lives in `GridStaticMeta` (112→144 bytes) and is maintained
+  live — `GpuSceneResident::refresh_chunk` / `evict_chunk` recompute
+  and re-upload it so streamed-in terrain is never skipped. Demo gains
+  an `H` hotkey toggling a high-altitude top-down vantage for the FPS
+  A/B. Render output is byte-stable (the early-out only skips empty
+  space).
+
 ## [0.5.0] — 2026-06-09
 
 The **GPU compute-shader renderer** arc (GPU.0–GPU.12) plus the

@@ -199,6 +199,17 @@ pub struct GridStaticMeta {
     /// GPU.11 — within-slot u32 offset where mip `m`'s color_offsets
     /// start. `mip_coff_rel[0] == 0`.
     pub mip_coff_rel: [u32; MAX_GPU_MIPS],
+    /// GPU.13.0 — occupied chunk-AABB (inclusive) in chunk-index space.
+    /// The outer DDA stops once `p_chunk` passes this box along the
+    /// ray's travel direction (no resident chunk can lie ahead). An
+    /// empty grid uses the inverted sentinel (`aabb_min = i32::MAX`,
+    /// `aabb_max = i32::MIN`) so every ray early-outs immediately.
+    /// Maintained live: [`GpuSceneResident::refresh_chunk`] /
+    /// [`GpuSceneResident::evict_chunk`] recompute + re-upload it.
+    pub aabb_min: [i32; 3],
+    pub _pad2: i32,
+    pub aabb_max: [i32; 3],
+    pub _pad3: i32,
 }
 
 /// Sentinel chunk_idx written into empty slot_chunk_idx entries.
@@ -375,6 +386,8 @@ impl GpuSceneResident {
             // Slot_chunk_idx storage offset: each entry is 4 u32
             // words (vec3 padded to 16 bytes in std430).
             let slot_chunk_idx_offset = u32::try_from(all_slot_chunk_idx.len()).expect("fits");
+            // GPU.13.0 — occupied chunk-AABB for the outer-DDA early-out.
+            let (aabb_min, aabb_max) = aabb_of_slots(&grid_slot_chunk_idx);
             let meta = GridStaticMeta {
                 occupancy_offset: u32::try_from(all_occupancy.len()).expect("fits"),
                 color_offsets_offset: u32::try_from(all_color_offsets.len()).expect("fits"),
@@ -392,6 +405,10 @@ impl GpuSceneResident {
                 _pad1: 0,
                 mip_occ_rel: layout.mip_occ_rel,
                 mip_coff_rel: layout.mip_coff_rel,
+                aabb_min,
+                _pad2: 0,
+                aabb_max,
+                _pad3: 0,
             };
 
             chunk_occupancy_shadow.push(grid_chunk_occupancy.clone());
@@ -487,7 +504,9 @@ impl GpuSceneResident {
         let grid_static_meta = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("roxlap-gpu scene.grid_static_meta"),
             contents: bytemuck::cast_slice(&static_meta),
-            usage: wgpu::BufferUsages::STORAGE,
+            // GPU.13.0 — COPY_DST so the live chunk-AABB can be patched
+            // into a grid's meta on refresh_chunk / evict_chunk.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         Self {
@@ -615,6 +634,9 @@ impl GpuSceneResident {
         // ---- slot_chunk_idx (identity for the shader) ----
         self.set_slot_chunk_idx(queue, scene_idx, &meta, slot_idx, chunk_idx);
 
+        // ---- GPU.13.0 grid-AABB early-out box ----
+        self.sync_aabb(queue, scene_idx);
+
         outcome
     }
 
@@ -647,6 +669,8 @@ impl GpuSceneResident {
         }
         self.set_chunk_occupancy_bit(queue, scene_idx, &meta, slot_idx, false);
         self.set_slot_chunk_idx(queue, scene_idx, &meta, slot_idx, SLOT_EMPTY_SENTINEL);
+        // GPU.13.0 — eviction may shrink the occupied box; recompute.
+        self.sync_aabb(queue, scene_idx);
         true
     }
 
@@ -695,6 +719,52 @@ impl GpuSceneResident {
             bytemuck::cast_slice(&entry),
         );
     }
+
+    /// GPU.13.0 — recompute the grid's occupied chunk-AABB from its
+    /// `slot_chunk_idx` shadow and, if it changed, patch the grid's
+    /// [`GridStaticMeta`] on the GPU. Cheap: scans `total_slots`
+    /// entries and writes 144 bytes only when the box actually moves
+    /// (steady-state re-bakes leave it unchanged → no GPU write).
+    /// Called after every install/eviction so streaming grids keep a
+    /// tight, always-conservative early-out box.
+    fn sync_aabb(&mut self, queue: &wgpu::Queue, scene_idx: usize) {
+        let (aabb_min, aabb_max) = aabb_of_slots(&self.slot_chunk_idx_shadow[scene_idx]);
+        let meta = &mut self.static_meta[scene_idx];
+        if meta.aabb_min == aabb_min && meta.aabb_max == aabb_max {
+            return;
+        }
+        meta.aabb_min = aabb_min;
+        meta.aabb_max = aabb_max;
+        let off = (scene_idx * std::mem::size_of::<GridStaticMeta>()) as u64;
+        queue.write_buffer(&self.grid_static_meta, off, bytemuck::bytes_of(meta));
+    }
+}
+
+/// GPU.13.0 — inclusive chunk-AABB over a grid's `slot_chunk_idx`
+/// shadow, skipping the [`SLOT_EMPTY_SENTINEL`] entries. Returns the
+/// inverted sentinel box (`min = i32::MAX`, `max = i32::MIN`) when no
+/// slot is occupied, which makes the shader's `aabb_passed` early-out
+/// fire for every ray (an empty grid renders nothing).
+fn aabb_of_slots(slots: &[[i32; 4]]) -> ([i32; 3], [i32; 3]) {
+    let mut min = [i32::MAX; 3];
+    let mut max = [i32::MIN; 3];
+    for e in slots {
+        if e[0] == SLOT_EMPTY_SENTINEL[0]
+            && e[1] == SLOT_EMPTY_SENTINEL[1]
+            && e[2] == SLOT_EMPTY_SENTINEL[2]
+        {
+            continue;
+        }
+        for k in 0..3 {
+            if e[k] < min[k] {
+                min[k] = e[k];
+            }
+            if e[k] > max[k] {
+                max[k] = e[k];
+            }
+        }
+    }
+    (min, max)
 }
 
 /// Modular slot index for `chunk_idx` given the grid's
@@ -803,11 +873,11 @@ mod tests {
     fn grid_static_meta_matches_wgsl_std430_size() {
         // scene_dda.wgsl's GridStaticMeta is read as
         // array<GridStaticMeta>; the std430 array stride must equal
-        // the Rust size_of or wgpu rejects the binding. 12 scalar
-        // words + 2 array<u32,6> = 48 + 64 = 112... padded: see below.
+        // the Rust size_of or wgpu rejects the binding.
         // Concretely: 8 u32 (32) + vec3+pad (16) + 4 u32 (16) +
-        // 2*[u32;6] (48) = 112 bytes.
-        assert_eq!(std::mem::size_of::<GridStaticMeta>(), 112);
+        // 2*[u32;6] (48) = 112, then GPU.13.0 adds two vec3<i32>+pad
+        // (aabb_min, aabb_max) = 32 → 144 bytes.
+        assert_eq!(std::mem::size_of::<GridStaticMeta>(), 144);
         assert_eq!(std::mem::align_of::<GridStaticMeta>(), 4);
     }
 

@@ -233,6 +233,88 @@ fn scene_dda_marches_coarse_mip_for_distant_chunk() {
 }
 
 #[test]
+fn scene_dda_aabb_early_out_away_is_sky() {
+    // GPU.13.0 — the occupied chunk-AABB early-out must terminate a
+    // ray the moment it has left the box along its travel direction.
+    // One block chunk at +y (chunk 4); the camera sits in the near
+    // chunk (0,0,0) but looks the OTHER way (−y). Every ray starts
+    // already past the AABB's near slab (p.y=0 < aabb_min.y=4 with
+    // step.y<0) → instant early-out → pure sky, no block pixels.
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&block_chunk(vsid, 0, 31));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 8, 1],
+        pool_dims: [1, 8, 1],
+        chunks: vec![([0, 4, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+    // Sanity: the upload computed the occupied AABB at chunk y=4.
+    assert_eq!(scene.static_meta[0].aabb_min, [0, 4, 0]);
+    assert_eq!(scene.static_meta[0].aabb_max, [0, 4, 0]);
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, w, h);
+    let cam = Camera {
+        position: [vsid as f32 * 0.5, 0.0, 16.0],
+        right: [-1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, -1.0, 0.0], // look AWAY from the block
+        fov_y_rad: 30f32.to_radians(),
+    };
+    let fb = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+    let block_px = fb.iter().filter(|&&p| is_block_color(p)).count();
+    assert_eq!(
+        block_px, 0,
+        "looking away from the only chunk must be all sky, got {block_px} block pixels",
+    );
+}
+
+#[test]
+fn aabb_tracks_streaming_refresh_and_evict() {
+    // GPU.13.0 — the early-out box is maintained live: installing a
+    // chunk at a new index must GROW the AABB (so the shader never
+    // skips streamed-in terrain), and evicting it must SHRINK it back.
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [8, 8, 1], // room for streamed indices
+        chunks: vec![([0, 0, 0], decompress_chunk(&block_chunk(vsid, 0, 31)))],
+    };
+    let mut scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+    assert_eq!(scene.static_meta[0].aabb_min, [0, 0, 0]);
+    assert_eq!(scene.static_meta[0].aabb_max, [0, 0, 0]);
+
+    // Stream in a far chunk at (3, 2, 0) → AABB grows to cover it.
+    let far = decompress_chunk(&block_chunk(vsid, 0, 31));
+    scene.refresh_chunk(&gpu.queue, 0, [3, 2, 0], &far);
+    assert_eq!(scene.static_meta[0].aabb_min, [0, 0, 0]);
+    assert_eq!(scene.static_meta[0].aabb_max, [3, 2, 0]);
+
+    // Evict it → AABB shrinks back to the lone origin chunk.
+    scene.evict_chunk(&gpu.queue, 0, [3, 2, 0]);
+    assert_eq!(scene.static_meta[0].aabb_min, [0, 0, 0]);
+    assert_eq!(scene.static_meta[0].aabb_max, [0, 0, 0]);
+}
+
+#[test]
 fn scene_dda_renders_bedrock_wall_face_solid() {
     let Some((gpu, _lock)) = try_init() else {
         return;
