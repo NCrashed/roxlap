@@ -32,6 +32,7 @@
 
 #![allow(
     clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::many_single_char_names,
     clippy::missing_panics_doc,
@@ -69,6 +70,14 @@ pub struct ChunkUpload {
     pub color_offsets: Vec<u32>,
     /// Packed BGRA u32 per solid voxel (textured + bedrock).
     pub colors: Vec<u32>,
+    /// GPU.11 — the full mip ladder, finest (mip-0) first. `mips[0]`
+    /// is identical to the [`Self::occupancy`] / [`Self::color_offsets`]
+    /// / [`Self::colors`] fields above (which the older single-chunk
+    /// and single-grid GPU paths still read directly). The scene
+    /// path concatenates every mip per slot; the shader marches the
+    /// mip its LOD picker selects. Always at least one entry; count
+    /// is [`gpu_mip_count`]`(vsid)`.
+    pub mips: Vec<MipUpload>,
 }
 
 /// Number of u32 words per column in the occupancy bitmap
@@ -76,6 +85,67 @@ pub struct ChunkUpload {
 /// exactly 8 — the rank-count loop in the GPU shader runs in 8
 /// iterations max.
 pub const OCC_WORDS_PER_COLUMN: u32 = CHUNK_Z / 32;
+
+/// GPU.11 — number of mip levels [`decompress_chunk`] builds per
+/// chunk (capped by the chunk's own `vsid` / `CHUNK_Z` halving).
+/// Matches the CPU demo's `OpticastSettings::mip_levels = 6`, so the
+/// GPU mip ladder reaches the same ray-depth as the CPU path
+/// (`mip_scan_dist · 2⁵`). The per-mip relative-offset tables in
+/// [`crate::scene::GridStaticMeta`] are sized to this.
+pub const GPU_MAX_MIPS: u32 = 6;
+
+/// GPU.11 — how many mip levels a chunk of side `vsid` actually
+/// yields under [`GPU_MAX_MIPS`]. Mirrors the stopping rule in
+/// [`Vxl::generate_mips`] (`src_vsid > 1 && src_z > 1 && n < max`)
+/// so the upload, the per-slot stride math in [`crate::scene`], and
+/// the shader all agree on the level count for a given `vsid`.
+/// Always `>= 1` (mip-0).
+#[must_use]
+pub fn gpu_mip_count(vsid: u32) -> u32 {
+    let mut n = 1u32;
+    let mut v = vsid;
+    let mut z = CHUNK_Z as i32;
+    while v > 1 && z > 1 && n < GPU_MAX_MIPS {
+        v >>= 1;
+        z >>= 1;
+        n += 1;
+    }
+    n
+}
+
+/// GPU.11 — number of occupancy u32 words per column at a given mip
+/// (`(CHUNK_Z >> mip)` bits packed 32-per-word, min 1). Mip-0 is
+/// [`OCC_WORDS_PER_COLUMN`] (= 8).
+#[must_use]
+pub fn occ_words_per_column_for_mip(mip: u32) -> u32 {
+    (CHUNK_Z >> mip).div_ceil(32).max(1)
+}
+
+/// GPU.11 — one mip level of a chunk in the GPU upload shape. Mip-N
+/// has `(vsid >> mip)²` columns spanning z = 0..`CHUNK_Z >> mip`.
+///
+/// `color_offsets` are **absolute within the chunk's whole colour
+/// block** (cumulative across mips): mip-0's run [0..n0], mip-1's
+/// run [n0..n0+n1], etc. So `colors` of all mips concatenated in
+/// level order index directly via `chunk_colors_base + offset +
+/// rank` — the same formula the shader already uses for mip-0,
+/// independent of which mip is being read.
+#[derive(Debug, Clone)]
+pub struct MipUpload {
+    /// XY column extent at this mip = `vsid >> mip`.
+    pub vsid: u32,
+    /// Z-extent at this mip = `CHUNK_Z >> mip`.
+    pub cz: u32,
+    /// Occupancy words per column at this mip = `cz.div_ceil(32)`.
+    pub occ_words_per_col: u32,
+    /// `vsid² * occ_words_per_col` packed occupancy bits.
+    pub occupancy: Vec<u32>,
+    /// `vsid² + 1` cumulative-within-chunk colour offsets.
+    pub color_offsets: Vec<u32>,
+    /// This mip's packed BGRA colours (ascending z within a column,
+    /// columns in `x + y*vsid` order).
+    pub colors: Vec<u32>,
+}
 
 impl ChunkUpload {
     /// Helper for tests / debug — looks up the colour at `(x, y, z)`
@@ -112,35 +182,95 @@ impl ChunkUpload {
     }
 }
 
-/// Decompress a `Vxl` chunk's mip-0 slab data into the GPU upload
-/// shape. Caller guarantees `vxl` is shaped as a roxlap-scene chunk
-/// (`vsid` square, mip-0 only required).
+/// Decompress a `Vxl` chunk into the GPU upload shape, building the
+/// full mip ladder ([`gpu_mip_count`]`(vsid)` levels). Caller
+/// guarantees `vxl` is shaped as a roxlap-scene chunk (`vsid`
+/// square). If `vxl` already carries at least that many mips (the
+/// common scene path — the bake generates 6), they are read
+/// directly; otherwise the chunk is cloned and re-mipped so the
+/// upload always carries a deterministic, vsid-uniform level count.
+///
+/// `mips[0]` is the legacy mip-0 data, also mirrored into the
+/// top-level [`ChunkUpload`] fields for the older single-chunk /
+/// single-grid paths.
 #[must_use]
 pub fn decompress_chunk(vxl: &Vxl) -> ChunkUpload {
     let vsid = vxl.vsid;
+    let target = gpu_mip_count(vsid);
+
+    // Ensure `target` mips are available without mutating the
+    // caller's borrow. The terrain + streaming bake already builds
+    // 6, so the fast path takes the existing tables (no clone).
+    let owned;
+    let src: &Vxl = if vxl.mip_count() >= target {
+        vxl
+    } else {
+        let mut c = vxl.clone();
+        c.generate_mips(GPU_MAX_MIPS);
+        owned = c;
+        &owned
+    };
+
+    let mut mips: Vec<MipUpload> = Vec::with_capacity(target as usize);
+    let mut color_base = 0u32;
+    for m in 0..target {
+        let mip = decompress_mip(src, m, color_base);
+        color_base = *mip.color_offsets.last().expect("offsets non-empty");
+        mips.push(mip);
+    }
+
+    let m0 = &mips[0];
+    ChunkUpload {
+        vsid,
+        occupancy: m0.occupancy.clone(),
+        color_offsets: m0.color_offsets.clone(),
+        colors: m0.colors.clone(),
+        mips,
+    }
+}
+
+/// Decompress a single mip level `mip` of `src` into a [`MipUpload`].
+/// `color_base` is the cumulative colour count of all finer mips
+/// (mips `< mip`) so this level's `color_offsets` stay absolute
+/// within the chunk's whole colour block.
+#[must_use]
+fn decompress_mip(src: &Vxl, mip: u32, color_base: u32) -> MipUpload {
+    let vsid = src.vsid >> mip;
+    let cz = CHUNK_Z >> mip;
+    let occ_words_per_col = occ_words_per_column_for_mip(mip);
     let vsid_usize = vsid as usize;
     let n_cols = vsid_usize * vsid_usize;
-    let n_occ_words = n_cols * (OCC_WORDS_PER_COLUMN as usize);
+    let n_occ_words = n_cols * (occ_words_per_col as usize);
 
     let mut occupancy = vec![0u32; n_occ_words];
     let mut color_offsets = vec![0u32; n_cols + 1];
-    // Heuristic: each column ends up ~CHUNK_Z bedrock + ~10 textured
-    // on average for a typical scene-demo terrain chunk.
-    let mut colors: Vec<u32> = Vec::with_capacity(n_cols * 16);
+    let mut colors: Vec<u32> = Vec::with_capacity(n_cols * 4);
 
     for y in 0..vsid {
         for x in 0..vsid {
             let col_idx = (y as usize) * vsid_usize + (x as usize);
-            color_offsets[col_idx] = u32::try_from(colors.len()).expect("colours fit in u32");
+            color_offsets[col_idx] =
+                color_base + u32::try_from(colors.len()).expect("colours fit in u32");
 
-            let slab = vxl.column_data(col_idx);
-            decompress_column(slab, x, y, vsid, &mut occupancy, &mut colors);
+            let slab = src.column_data_for_mip(mip, col_idx);
+            decompress_column(
+                slab,
+                x,
+                y,
+                vsid,
+                cz,
+                occ_words_per_col,
+                &mut occupancy,
+                &mut colors,
+            );
         }
     }
-    color_offsets[n_cols] = u32::try_from(colors.len()).expect("colours fit in u32");
+    color_offsets[n_cols] = color_base + u32::try_from(colors.len()).expect("colours fit in u32");
 
-    ChunkUpload {
+    MipUpload {
         vsid,
+        cz,
+        occ_words_per_col,
         occupancy,
         color_offsets,
         colors,
@@ -150,17 +280,22 @@ pub fn decompress_chunk(vxl: &Vxl) -> ChunkUpload {
 /// Walk one column's slab chain. For each **textured** voxel sets
 /// the occupancy bit and pushes its packed BGRA u32 into `colors`.
 /// Bedrock voxels (implicit solid below a slab's textured floor)
-/// are skipped — treated as air for the GPU marcher.
+/// are skipped — treated as air for the GPU marcher. `cz` is the
+/// column's z-extent at the current mip (`CHUNK_Z >> mip`);
+/// `occ_words_per_col` is its packed-occupancy stride.
+#[allow(clippy::too_many_arguments)]
 fn decompress_column(
     slab: &[u8],
     x: u32,
     y: u32,
     vsid: u32,
+    cz: u32,
+    occ_words_per_col: u32,
     occupancy: &mut [u32],
     colors: &mut Vec<u32>,
 ) {
     let vsid_usize = vsid as usize;
-    let runs = expand_solid_runs(slab);
+    let runs = expand_solid_runs(slab, cz);
     let ranges = build_color_ranges(slab);
 
     let mut range_cursor = 0usize;
@@ -190,10 +325,11 @@ fn decompress_column(
                 continue;
             }
 
-            // z-innermost packing: each column owns 8 contiguous u32
-            // words covering z=0..256.
+            // z-innermost packing: each column owns
+            // `occ_words_per_col` contiguous u32 words covering
+            // z=0..cz.
             let col_idx = (x as usize) + (y as usize) * vsid_usize;
-            let col_word_base = col_idx * (OCC_WORDS_PER_COLUMN as usize);
+            let col_word_base = col_idx * (occ_words_per_col as usize);
             let z_word = (z as usize) / 32;
             let z_bit = (z as u32) & 31;
             occupancy[col_word_base + z_word] |= 1u32 << z_bit;
@@ -204,10 +340,12 @@ fn decompress_column(
 
 /// Port of `expandrle` (voxlap5.c:4131) but emitting `(top, bot)`
 /// pairs as half-open ranges instead of the in-place `uind` layout.
-/// Solid for `z ∈ [top, bot)`. Last run's `bot` is always `CHUNK_Z`
-/// (matches the voxlap "implicit bedrock below" assumption).
-fn expand_solid_runs(slab: &[u8]) -> Vec<(i32, i32)> {
-    // Worst case = MAXZDIM/2 alternating solid/air runs.
+/// Solid for `z ∈ [top, bot)`. Last run's `bot` is always `cz` (the
+/// column's z-extent at this mip — matches the voxlap "implicit
+/// bedrock below" assumption, halved per mip level).
+fn expand_solid_runs(slab: &[u8], cz: u32) -> Vec<(i32, i32)> {
+    // Worst case = MAXZDIM/2 alternating solid/air runs (mip-0 bound;
+    // coarser mips use fewer entries).
     let mut uind = [0i32; (CHUNK_Z as usize) + 2];
     uind[0] = i32::from(slab[1]);
     let mut i = 2usize;
@@ -221,7 +359,7 @@ fn expand_solid_runs(slab: &[u8]) -> Vec<(i32, i32)> {
         uind[i] = i32::from(slab[v + 1]);
         i += 2;
     }
-    uind[i - 1] = CHUNK_Z as i32;
+    uind[i - 1] = cz as i32;
 
     let n_runs = i / 2;
     let mut runs = Vec::with_capacity(n_runs);
@@ -362,6 +500,101 @@ mod tests {
         let solid: u32 = chunk.occupancy.iter().map(|w| w.count_ones()).sum();
         let expected = chunk.vsid * chunk.vsid;
         assert_eq!(solid, expected);
+    }
+
+    // ---- GPU.11 mip-ladder tests ------------------------------------
+
+    #[test]
+    fn gpu_mip_count_matches_generate_mips() {
+        // vsid=128 chunk supports the full GPU_MAX_MIPS=6.
+        assert_eq!(gpu_mip_count(128), 6);
+        // Small vsid caps the ladder where halving hits 1.
+        assert_eq!(gpu_mip_count(4), 3); // 4 -> 2 -> 1
+        assert_eq!(gpu_mip_count(2), 2); // 2 -> 1
+        assert_eq!(gpu_mip_count(1), 1);
+    }
+
+    #[test]
+    fn occ_words_per_column_halves_with_z() {
+        assert_eq!(occ_words_per_column_for_mip(0), 8); // 256/32
+        assert_eq!(occ_words_per_column_for_mip(1), 4); // 128/32
+        assert_eq!(occ_words_per_column_for_mip(2), 2); // 64/32
+        assert_eq!(occ_words_per_column_for_mip(3), 1); // 32/32
+        assert_eq!(occ_words_per_column_for_mip(4), 1); // 16 -> min 1
+        assert_eq!(occ_words_per_column_for_mip(5), 1); // 8 -> min 1
+    }
+
+    #[test]
+    fn mip0_mirrors_legacy_top_level_fields() {
+        let vxl = fixture_one_voxel_per_column();
+        let chunk = decompress_chunk(&vxl);
+        assert!(chunk.mips.len() >= 2, "fixture should build a mip ladder");
+        let m0 = &chunk.mips[0];
+        assert_eq!(m0.vsid, 4);
+        assert_eq!(m0.cz, CHUNK_Z);
+        assert_eq!(m0.occ_words_per_col, OCC_WORDS_PER_COLUMN);
+        assert_eq!(m0.occupancy, chunk.occupancy, "mip-0 occupancy == legacy");
+        assert_eq!(m0.colors, chunk.colors, "mip-0 colours == legacy");
+        assert_eq!(
+            m0.color_offsets, chunk.color_offsets,
+            "mip-0 offsets == legacy"
+        );
+        assert_eq!(m0.color_offsets[0], 0, "mip-0 starts at colour 0");
+    }
+
+    #[test]
+    fn each_mip_popcount_equals_color_count() {
+        // The 1:1 occupancy-bit ↔ colour invariant must hold at every
+        // mip level (the shader's rank-count colour lookup relies on
+        // it). The fixture's clone+generate_mips path exercises the
+        // coarse levels.
+        let vxl = fixture_one_voxel_per_column();
+        let chunk = decompress_chunk(&vxl);
+        assert_eq!(chunk.mips.len() as u32, gpu_mip_count(4));
+        for (m, mip) in chunk.mips.iter().enumerate() {
+            let solid: u32 = mip.occupancy.iter().map(|w| w.count_ones()).sum();
+            let in_mip = mip.colors.len() as u32;
+            assert_eq!(
+                solid, in_mip,
+                "mip {m}: {solid} solid bits but {in_mip} colours",
+            );
+            assert_eq!(mip.vsid, 4 >> m as u32);
+            assert_eq!(mip.cz, CHUNK_Z >> m as u32);
+            assert_eq!(
+                mip.occ_words_per_col,
+                occ_words_per_column_for_mip(m as u32)
+            );
+            assert_eq!(
+                mip.occupancy.len() as u32,
+                mip.vsid * mip.vsid * mip.occ_words_per_col,
+            );
+            assert_eq!(mip.color_offsets.len() as u32, mip.vsid * mip.vsid + 1);
+        }
+    }
+
+    #[test]
+    fn color_offsets_are_absolute_and_monotonic_across_mips() {
+        let vxl = fixture_one_voxel_per_column();
+        let chunk = decompress_chunk(&vxl);
+        let mut prev_end = 0u32;
+        for (m, mip) in chunk.mips.iter().enumerate() {
+            // Within a mip, offsets are non-decreasing.
+            for w in mip.color_offsets.windows(2) {
+                assert!(w[0] <= w[1], "mip {m} offsets not monotonic");
+            }
+            // First offset continues where the previous mip's colours
+            // ended (cumulative within the chunk's whole colour block).
+            assert_eq!(
+                mip.color_offsets[0], prev_end,
+                "mip {m} colour base not contiguous",
+            );
+            // Trailing sentinel == base + this mip's colour count.
+            assert_eq!(
+                *mip.color_offsets.last().unwrap(),
+                prev_end + mip.colors.len() as u32,
+            );
+            prev_end = *mip.color_offsets.last().unwrap();
+        }
     }
 
     #[test]

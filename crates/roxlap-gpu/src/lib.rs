@@ -1922,6 +1922,346 @@ impl GpuRenderer {
     }
 }
 
+/// GPU.11 — headless scene-DDA renderer for tests + offline visual
+/// gates. Owns the `scene_dda.wgsl` compute pipeline with no surface
+/// and no blit pass; renders a [`GpuSceneResident`] to an in-memory
+/// RGBA framebuffer via texture readback. The per-substage visual
+/// gate (render reference scenes, diff PPMs) and the GPU.11.1 mip
+/// render-diff both ride on this.
+pub struct HeadlessSceneRenderer {
+    width: u32,
+    height: u32,
+    output_tex: wgpu::Texture,
+    output_view: wgpu::TextureView,
+    depth_buffer: wgpu::Buffer,
+    uniform_buf: wgpu::Buffer,
+    _sky_texture: wgpu::Texture,
+    sky_view: wgpu::TextureView,
+    sky_sampler: wgpu::Sampler,
+    bgl: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+    readback: wgpu::Buffer,
+    padded_bytes_per_row: u32,
+}
+
+impl HeadlessSceneRenderer {
+    /// Build the compute pipeline + output/readback resources for a
+    /// `width × height` framebuffer. Validates `scene_dda.wgsl` and
+    /// the [`scene::GridStaticMeta`] std430 layout at pipeline /
+    /// bind-group time.
+    #[must_use]
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let output_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("roxlap-gpu headless.output"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let output_view = output_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu headless.uniform"),
+            size: std::mem::size_of::<SceneDdaUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let depth_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu headless.depth"),
+            size: u64::from(width) * u64::from(height) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let default_sky_pixel = [120u8, 150, 220, 255];
+        let (sky_texture, sky_view) = create_sky_texture(device, 1, 1, &default_sky_pixel);
+        let sky_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("roxlap-gpu headless.sky_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scene_dda.wgsl (headless)"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/scene_dda.wgsl").into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("roxlap-gpu headless.bgl"),
+            entries: &[
+                bgl_uniform_entry(0),
+                bgl_storage_entry(1, true),
+                bgl_storage_entry(2, true),
+                bgl_storage_entry(3, true),
+                bgl_storage_entry(4, true),
+                bgl_storage_entry(5, true),
+                bgl_storage_entry(6, true),
+                bgl_storage_entry(7, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                bgl_storage_entry(11, false),
+                bgl_storage_entry(12, true),
+                bgl_storage_entry(13, true),
+                bgl_storage_entry(14, true),
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("roxlap-gpu headless.layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("roxlap-gpu headless.pipeline"),
+            layout: Some(&pl),
+            module: &shader,
+            entry_point: "render_scene",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        // Readback buffer: row pitch must be 256-aligned for
+        // copy_texture_to_buffer.
+        let padded_bytes_per_row = (width * 4).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu headless.readback"),
+            size: u64::from(padded_bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            width,
+            height,
+            output_tex,
+            output_view,
+            depth_buffer,
+            uniform_buf,
+            _sky_texture: sky_texture,
+            sky_view,
+            sky_sampler,
+            bgl,
+            pipeline,
+            readback,
+            padded_bytes_per_row,
+        }
+    }
+
+    /// Render `scene` from `cameras` (one per grid) and read the
+    /// framebuffer back as `width*height` packed `0xAABBGGRR` pixels
+    /// (R in the low byte). Fog is disabled. Blocks on readback.
+    ///
+    /// # Panics
+    /// If `cameras.len() != scene.grid_count`.
+    #[must_use]
+    pub fn render(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &GpuSceneResident,
+        cameras: &[Camera],
+        fov_y_rad: f32,
+        max_outer_steps: u32,
+    ) -> Vec<u32> {
+        assert_eq!(
+            cameras.len(),
+            scene.grid_count as usize,
+            "headless render: {} cameras for {} grids",
+            cameras.len(),
+            scene.grid_count,
+        );
+
+        let mut cam_array = [SceneDdaPerGridCamera::zeroed(); SCENE_MAX_GRIDS];
+        for (i, cam) in cameras.iter().enumerate() {
+            cam_array[i] = SceneDdaPerGridCamera {
+                pos: cam.position,
+                _pad0: 0.0,
+                right: cam.right,
+                _pad1: 0.0,
+                down: cam.down,
+                _pad2: 0.0,
+                forward: cam.forward,
+                _pad3: 0.0,
+            };
+        }
+        let uniform = SceneDdaUniform {
+            fov_y_rad,
+            grid_count: scene.grid_count,
+            max_outer_steps,
+            _pad0: 0,
+            screen_size: [self.width, self.height],
+            _pad1: [0; 2],
+            cameras: cam_array,
+            // Fog off: near/far past any reachable t → factor 0.
+            fog_color: [0.0, 0.0, 0.0, 1.0e29],
+            fog_far: 1.0e30,
+            write_depth: 0,
+            occ_page_words: scene.occupancy_page_words,
+            occ_num_pages: scene.occupancy_num_pages,
+        };
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
+
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("roxlap-gpu headless.bg"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: scene.occupancy_pages[0].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scene.all_color_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: scene.all_colors.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: scene.all_chunk_colors_base.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: scene.all_chunk_occupancy.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: scene.grid_static_meta.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: scene.all_slot_chunk_idx.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&self.output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&self.sky_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::Sampler(&self.sky_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: self.depth_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: scene.occupancy_pages[1].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: scene.occupancy_pages[2].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: scene.occupancy_pages[3].as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("roxlap-gpu headless.pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
+        }
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.output_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &self.readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.padded_bytes_per_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(enc.finish()));
+
+        let slice = self.readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().expect("map_async channel").expect("map_async");
+
+        let data = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((self.width * self.height) as usize);
+        let pitch = self.padded_bytes_per_row as usize;
+        for y in 0..self.height as usize {
+            let row = &data[y * pitch..y * pitch + self.width as usize * 4];
+            for px in row.chunks_exact(4) {
+                out.push(
+                    u32::from(px[0])
+                        | (u32::from(px[1]) << 8)
+                        | (u32::from(px[2]) << 16)
+                        | (u32::from(px[3]) << 24),
+                );
+            }
+        }
+        drop(data);
+        self.readback.unmap();
+        out
+    }
+}
+
 fn bgl_uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,

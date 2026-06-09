@@ -26,8 +26,58 @@
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
 
-use crate::decompress::{ChunkUpload, OCC_WORDS_PER_COLUMN};
+use crate::decompress::{gpu_mip_count, occ_words_per_column_for_mip, ChunkUpload};
 use crate::grid::GridUpload;
+
+/// GPU.11 — max mip levels the per-slot layout reserves room for in
+/// [`GridStaticMeta`]'s relative-offset tables. Matches
+/// [`crate::decompress::GPU_MAX_MIPS`]; the shader's `array<u32, N>`
+/// must use the same N.
+pub const MAX_GPU_MIPS: usize = 6;
+
+/// GPU.11 — per-slot occupancy/color-offset strides + per-mip
+/// within-slot relative offsets for a grid of side `vsid`. All
+/// chunks of a grid share these (uniform mip count by
+/// [`gpu_mip_count`]). `colors` keep their fixed
+/// [`COLORS_PER_CHUNK_WORDS`] stride; each mip's colours are
+/// concatenated within that block and indexed by the chunk's own
+/// (absolute) `color_offsets`.
+#[derive(Debug, Clone, Copy)]
+pub struct MipLayout {
+    pub mip_count: u32,
+    pub occ_words_per_slot: u32,
+    pub offsets_words_per_slot: u32,
+    /// Within-slot u32 offset where mip `m`'s occupancy starts.
+    pub mip_occ_rel: [u32; MAX_GPU_MIPS],
+    /// Within-slot u32 offset where mip `m`'s color_offsets start.
+    pub mip_coff_rel: [u32; MAX_GPU_MIPS],
+}
+
+impl MipLayout {
+    #[must_use]
+    pub fn for_vsid(vsid: u32) -> Self {
+        let mip_count = gpu_mip_count(vsid);
+        let mut mip_occ_rel = [0u32; MAX_GPU_MIPS];
+        let mut mip_coff_rel = [0u32; MAX_GPU_MIPS];
+        let mut occ_acc = 0u32;
+        let mut coff_acc = 0u32;
+        for m in 0..mip_count {
+            mip_occ_rel[m as usize] = occ_acc;
+            mip_coff_rel[m as usize] = coff_acc;
+            let vsid_m = vsid >> m;
+            let cols = vsid_m * vsid_m;
+            occ_acc += cols * occ_words_per_column_for_mip(m);
+            coff_acc += cols + 1;
+        }
+        Self {
+            mip_count,
+            occ_words_per_slot: occ_acc,
+            offsets_words_per_slot: coff_acc,
+            mip_occ_rel,
+            mip_coff_rel,
+        }
+    }
+}
 
 /// Maximum number of grids the shader's per-grid camera uniform
 /// array can hold. The scene-demo has 12 (1 ground + 1 ship + 10
@@ -131,6 +181,21 @@ pub struct GridStaticMeta {
     pub total_slots: u32,
     pub pool_dims: [u32; 3],
     pub _pad0: u32,
+    /// GPU.11 — per-slot occupancy stride (sum over all mips).
+    /// `meta_id`'s occupancy slab starts at
+    /// `occupancy_offset + meta_id * occ_words_per_slot`.
+    pub occ_words_per_slot: u32,
+    /// GPU.11 — per-slot color_offsets stride (sum over all mips).
+    pub offsets_words_per_slot: u32,
+    /// GPU.11 — number of mip levels stored per slot.
+    pub mip_count: u32,
+    pub _pad1: u32,
+    /// GPU.11 — within-slot u32 offset where mip `m`'s occupancy
+    /// starts. `mip_occ_rel[0] == 0` so mip-0 reads are unchanged.
+    pub mip_occ_rel: [u32; MAX_GPU_MIPS],
+    /// GPU.11 — within-slot u32 offset where mip `m`'s color_offsets
+    /// start. `mip_coff_rel[0] == 0`.
+    pub mip_coff_rel: [u32; MAX_GPU_MIPS],
 }
 
 /// Sentinel chunk_idx written into empty slot_chunk_idx entries.
@@ -206,9 +271,10 @@ impl GpuSceneResident {
 
         for grid in &info.grids {
             let vsid = grid.vsid;
-            let cols_per_chunk = (vsid * vsid) as usize;
-            let occ_words_per_slot = cols_per_chunk * (OCC_WORDS_PER_COLUMN as usize);
-            let offsets_words_per_slot = cols_per_chunk + 1;
+            // GPU.11 — per-slot strides span the whole mip ladder.
+            let layout = MipLayout::for_vsid(vsid);
+            let occ_words_per_slot = layout.occ_words_per_slot as usize;
+            let offsets_words_per_slot = layout.offsets_words_per_slot as usize;
             let colors_stride = COLORS_PER_CHUNK_WORDS as usize;
 
             // Validate pool_dims are powers of 2 — required for the
@@ -260,25 +326,40 @@ impl GpuSceneResident {
                 let sz = (chunk_idx[2] & mask_z) as usize;
                 let slot_idx = sx + sy * pool_x + sz * chunks_per_layer;
 
+                // GPU.11 — write each mip at its within-slot offset.
+                // occupancy + color_offsets land in per-mip sub-blocks
+                // (mip-0 first, so its data is byte-identical to the
+                // pre-mip layout); colours of every mip concatenate
+                // into the slot's fixed COLORS_PER_CHUNK_WORDS block in
+                // level order, indexed by each chunk's own absolute
+                // `color_offsets`.
                 let occ_start = slot_idx * occ_words_per_slot;
-                grid_occupancy[occ_start..occ_start + occ_words_per_slot]
-                    .copy_from_slice(&chunk.occupancy);
                 let off_start = slot_idx * offsets_words_per_slot;
-                grid_color_offsets[off_start..off_start + offsets_words_per_slot]
-                    .copy_from_slice(&chunk.color_offsets);
-
                 let col_start = slot_idx * colors_stride;
-                let n = chunk.colors.len().min(colors_stride);
-                if chunk.colors.len() > colors_stride {
-                    eprintln!(
-                        "roxlap-gpu SceneUpload: scene grid chunk {chunk_idx:?} has {} colours \
-                         > COLORS_PER_CHUNK_WORDS ({colors_stride}); truncating",
-                        chunk.colors.len(),
-                    );
-                }
-                grid_colors[col_start..col_start + n].copy_from_slice(&chunk.colors[..n]);
+                let mut color_cursor = 0usize;
+                for (m, mip) in chunk.mips.iter().enumerate() {
+                    let occ_dst = occ_start + layout.mip_occ_rel[m] as usize;
+                    grid_occupancy[occ_dst..occ_dst + mip.occupancy.len()]
+                        .copy_from_slice(&mip.occupancy);
+                    let coff_dst = off_start + layout.mip_coff_rel[m] as usize;
+                    grid_color_offsets[coff_dst..coff_dst + mip.color_offsets.len()]
+                        .copy_from_slice(&mip.color_offsets);
 
-                if !chunk.colors.is_empty() {
+                    let remaining = colors_stride.saturating_sub(color_cursor);
+                    let n = mip.colors.len().min(remaining);
+                    if n < mip.colors.len() {
+                        eprintln!(
+                            "roxlap-gpu SceneUpload: scene grid chunk {chunk_idx:?} mip {m} \
+                             colours overflow COLORS_PER_CHUNK_WORDS ({colors_stride}); \
+                             truncating",
+                        );
+                    }
+                    grid_colors[col_start + color_cursor..col_start + color_cursor + n]
+                        .copy_from_slice(&mip.colors[..n]);
+                    color_cursor += n;
+                }
+
+                if !chunk.mips[0].colors.is_empty() {
                     grid_chunk_occupancy[slot_idx >> 5] |= 1u32 << (slot_idx & 31);
                 }
                 grid_slot_chunk_idx[slot_idx] = [chunk_idx[0], chunk_idx[1], chunk_idx[2], 0];
@@ -298,6 +379,12 @@ impl GpuSceneResident {
                 total_slots: total_slots as u32,
                 pool_dims: grid.pool_dims,
                 _pad0: 0,
+                occ_words_per_slot: layout.occ_words_per_slot,
+                offsets_words_per_slot: layout.offsets_words_per_slot,
+                mip_count: layout.mip_count,
+                _pad1: 0,
+                mip_occ_rel: layout.mip_occ_rel,
+                mip_coff_rel: layout.mip_coff_rel,
             };
 
             chunk_occupancy_shadow.push(grid_chunk_occupancy.clone());
@@ -359,10 +446,13 @@ impl GpuSceneResident {
         // single binding exceeds the device limit. Page size is a
         // whole number of chunk slots (slot-aligned) so no per-slot
         // refresh write ever straddles two pages.
+        // GPU.11 — page alignment is now the whole-ladder per-slot
+        // occupancy stride so a slot (all its mips) never straddles a
+        // page boundary.
         let slot_align_words = info
             .grids
             .iter()
-            .map(|g| (g.vsid as u64) * (g.vsid as u64) * u64::from(OCC_WORDS_PER_COLUMN))
+            .map(|g| u64::from(MipLayout::for_vsid(g.vsid).occ_words_per_slot))
             .max()
             .unwrap_or(1)
             .max(1);
@@ -434,73 +524,81 @@ impl GpuSceneResident {
         };
         let slot_idx = modular_slot_idx(chunk_idx, meta.pool_dims);
 
-        let vsid = meta.vsid as usize;
-        let cols_per_chunk = vsid * vsid;
-        let occ_words_per_slot = cols_per_chunk * (OCC_WORDS_PER_COLUMN as usize);
-        let offsets_words_per_slot = cols_per_chunk + 1;
+        // GPU.11 — the per-slot strides span the full mip ladder; the
+        // resident's layout was built from the same `MipLayout`.
+        let layout = MipLayout::for_vsid(meta.vsid);
+        let occ_words_per_slot = layout.occ_words_per_slot as usize;
+        let offsets_words_per_slot = layout.offsets_words_per_slot as usize;
         let colors_stride = COLORS_PER_CHUNK_WORDS as usize;
 
         assert_eq!(
-            chunk.occupancy.len(),
-            occ_words_per_slot,
-            "refresh_chunk: occupancy length mismatch",
-        );
-        assert_eq!(
-            chunk.color_offsets.len(),
-            offsets_words_per_slot,
-            "refresh_chunk: color_offsets length mismatch",
+            chunk.mips.len() as u32,
+            layout.mip_count,
+            "refresh_chunk: mip count mismatch (chunk {} vs grid {})",
+            chunk.mips.len(),
+            layout.mip_count,
         );
 
         // ---- occupancy ----
-        // Route the per-slot write to its page. Page size is
-        // slot-aligned (see `split_occupancy_pages`) so the whole
-        // `occ_words_per_slot` run lands in a single page.
-        let occ_word_offset = meta.occupancy_offset as usize + slot_idx * occ_words_per_slot;
+        // Route each mip's write to its page. Page size is slot-
+        // aligned (see `split_occupancy_pages`) so the whole slot's
+        // occupancy ladder lands in a single page.
+        let slot_occ_base = meta.occupancy_offset as usize + slot_idx * occ_words_per_slot;
         let page_words = self.occupancy_page_words as usize;
-        let page = occ_word_offset / page_words;
-        let local_word = occ_word_offset % page_words;
+        let page = slot_occ_base / page_words;
+        let slot_local_word = slot_occ_base % page_words;
         debug_assert!(
-            local_word + occ_words_per_slot <= page_words,
+            slot_local_word + occ_words_per_slot <= page_words,
             "occupancy slot straddles a page boundary — page size not slot-aligned",
         );
-        queue.write_buffer(
-            &self.occupancy_pages[page],
-            (local_word * 4) as u64,
-            bytemuck::cast_slice(&chunk.occupancy),
-        );
+        let off_slot_base = meta.color_offsets_offset as usize + slot_idx * offsets_words_per_slot;
+        let col_slot_base = meta.colors_offset as usize + slot_idx * colors_stride;
 
-        // ---- color_offsets ----
-        let off_word_offset =
-            meta.color_offsets_offset as usize + slot_idx * offsets_words_per_slot;
-        queue.write_buffer(
-            &self.all_color_offsets,
-            (off_word_offset * 4) as u64,
-            bytemuck::cast_slice(&chunk.color_offsets),
-        );
-
-        // ---- colours (truncate to slot stride) ----
-        let new_len = chunk.colors.len();
-        let outcome = if new_len > colors_stride {
-            eprintln!(
-                "roxlap-gpu refresh_chunk: scene_idx={scene_idx} chunk_idx={chunk_idx:?} colours \
-                 {new_len} > stride {colors_stride}; truncating",
-            );
-            RefreshOutcome::ColorsTruncated
-        } else {
-            RefreshOutcome::Ok
-        };
-        let write_len = new_len.min(colors_stride);
-        if write_len > 0 {
-            let colors_word_offset = meta.colors_offset as usize + slot_idx * colors_stride;
+        let mut outcome = RefreshOutcome::Ok;
+        let mut color_cursor = 0usize;
+        for (m, mip) in chunk.mips.iter().enumerate() {
+            // occupancy
+            let local = slot_local_word + layout.mip_occ_rel[m] as usize;
             queue.write_buffer(
-                &self.all_colors,
-                (colors_word_offset * 4) as u64,
-                bytemuck::cast_slice(&chunk.colors[..write_len]),
+                &self.occupancy_pages[page],
+                (local * 4) as u64,
+                bytemuck::cast_slice(&mip.occupancy),
             );
+            // color_offsets
+            let coff = off_slot_base + layout.mip_coff_rel[m] as usize;
+            queue.write_buffer(
+                &self.all_color_offsets,
+                (coff * 4) as u64,
+                bytemuck::cast_slice(&mip.color_offsets),
+            );
+            // colours (concatenated per slot, truncate to stride)
+            let remaining = colors_stride.saturating_sub(color_cursor);
+            let n = mip.colors.len().min(remaining);
+            if n < mip.colors.len() {
+                eprintln!(
+                    "roxlap-gpu refresh_chunk: scene_idx={scene_idx} chunk_idx={chunk_idx:?} \
+                     mip {m} colours overflow stride {colors_stride}; truncating",
+                );
+                outcome = RefreshOutcome::ColorsTruncated;
+            }
+            if n > 0 {
+                queue.write_buffer(
+                    &self.all_colors,
+                    ((col_slot_base + color_cursor) * 4) as u64,
+                    bytemuck::cast_slice(&mip.colors[..n]),
+                );
+            }
+            color_cursor += n;
         }
 
         // ---- chunk_occupancy bit ----
-        self.set_chunk_occupancy_bit(queue, scene_idx, &meta, slot_idx, !chunk.colors.is_empty());
+        self.set_chunk_occupancy_bit(
+            queue,
+            scene_idx,
+            &meta,
+            slot_idx,
+            !chunk.mips[0].colors.is_empty(),
+        );
 
         // ---- slot_chunk_idx (identity for the shader) ----
         self.set_slot_chunk_idx(queue, scene_idx, &meta, slot_idx, chunk_idx);
@@ -683,4 +781,51 @@ fn split_occupancy_pages(
         u32::try_from(page_words).expect("page_words fits u32"),
         num_pages as u32,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_static_meta_matches_wgsl_std430_size() {
+        // scene_dda.wgsl's GridStaticMeta is read as
+        // array<GridStaticMeta>; the std430 array stride must equal
+        // the Rust size_of or wgpu rejects the binding. 12 scalar
+        // words + 2 array<u32,6> = 48 + 64 = 112... padded: see below.
+        // Concretely: 8 u32 (32) + vec3+pad (16) + 4 u32 (16) +
+        // 2*[u32;6] (48) = 112 bytes.
+        assert_eq!(std::mem::size_of::<GridStaticMeta>(), 112);
+        assert_eq!(std::mem::align_of::<GridStaticMeta>(), 4);
+    }
+
+    #[test]
+    fn mip_layout_offsets_accumulate() {
+        // vsid=128 → 6 mips. Relative offsets are cumulative; mip-0
+        // sits at 0 so mip-0 reads are byte-identical to pre-mip.
+        let l = MipLayout::for_vsid(128);
+        assert_eq!(l.mip_count, 6);
+        assert_eq!(l.mip_occ_rel[0], 0);
+        assert_eq!(l.mip_coff_rel[0], 0);
+
+        // Recompute the strides independently and compare.
+        let mut occ = 0u32;
+        let mut coff = 0u32;
+        for m in 0..6u32 {
+            assert_eq!(l.mip_occ_rel[m as usize], occ, "occ rel mip {m}");
+            assert_eq!(l.mip_coff_rel[m as usize], coff, "coff rel mip {m}");
+            let v = 128u32 >> m;
+            occ += v * v * occ_words_per_column_for_mip(m);
+            coff += v * v + 1;
+        }
+        assert_eq!(l.occ_words_per_slot, occ);
+        assert_eq!(l.offsets_words_per_slot, coff);
+
+        // mip-0 occupancy stride is the historical vsid²·8.
+        assert_eq!(l.mip_occ_rel[1], 128 * 128 * 8);
+        // The whole ladder is only ~1/7 larger than mip-0 alone
+        // (geometric 1 + 1/8 + 1/64 + …), bounding the resident-bytes
+        // growth the GPU.11.0 gate expects (~+14% occupancy).
+        assert!(l.occ_words_per_slot < 128 * 128 * 8 * 5 / 4);
+    }
 }

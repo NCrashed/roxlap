@@ -21,6 +21,7 @@ const OCC_WORDS_PER_COLUMN: u32 = 8u; // CHUNK_Z (256) / 32
 const CHUNK_Z: u32 = 256u;
 const MAX_INNER_STEPS: u32 = 768u;
 const MAX_GRIDS: u32 = 16u;
+const MAX_GPU_MIPS: u32 = 6u; // GPU.11 — must match scene::MAX_GPU_MIPS
 const T_INF: f32 = 1.0e30;
 
 struct PerGridCamera {
@@ -45,6 +46,15 @@ struct GridStaticMeta {
     total_slots: u32,
     pool_dims: vec3<u32>,
     _pad0: u32,
+    // GPU.11 — per-slot strides spanning the whole mip ladder, plus
+    // per-mip within-slot relative offsets. mip_*_rel[0] == 0 so
+    // mip-0 reads index exactly as the pre-mip layout did.
+    occ_words_per_slot: u32,
+    offsets_words_per_slot: u32,
+    mip_count: u32,
+    _pad1: u32,
+    mip_occ_rel: array<u32, MAX_GPU_MIPS>,
+    mip_coff_rel: array<u32, MAX_GPU_MIPS>,
 };
 
 struct Uniforms {
@@ -112,11 +122,15 @@ fn occ_word(i: u32) -> u32 {
     return occ_page3[local];
 }
 
+// GPU.11 — mip-0 occupancy + colour lookups. The per-slot stride is
+// now the whole mip ladder (`occ_words_per_slot` /
+// `offsets_words_per_slot`); mip-0's sub-block sits at relative
+// offset 0, so within a slot the indexing is identical to the
+// pre-mip layout. GPU.11.1 generalises these to an arbitrary mip.
 fn voxel_solid_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> bool {
     let m = grid_static_meta[g];
     let col_idx = u32(p_voxel.x) + u32(p_voxel.y) * m.vsid;
-    let cols_per_chunk = m.vsid * m.vsid;
-    let occ_base = m.occupancy_offset + meta_id * cols_per_chunk * OCC_WORDS_PER_COLUMN;
+    let occ_base = m.occupancy_offset + meta_id * m.occ_words_per_slot;
     let col_word_base = occ_base + col_idx * OCC_WORDS_PER_COLUMN;
     let z_word = u32(p_voxel.z) >> 5u;
     let z_bit = u32(p_voxel.z) & 31u;
@@ -126,8 +140,7 @@ fn voxel_solid_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> bool {
 fn voxel_color_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> vec3<f32> {
     let m = grid_static_meta[g];
     let col_idx = u32(p_voxel.x) + u32(p_voxel.y) * m.vsid;
-    let cols_per_chunk = m.vsid * m.vsid;
-    let occ_base = m.occupancy_offset + meta_id * cols_per_chunk * OCC_WORDS_PER_COLUMN;
+    let occ_base = m.occupancy_offset + meta_id * m.occ_words_per_slot;
     let col_word_base = occ_base + col_idx * OCC_WORDS_PER_COLUMN;
     let z_word = u32(p_voxel.z) >> 5u;
     let z_bit = u32(p_voxel.z) & 31u;
@@ -142,7 +155,7 @@ fn voxel_color_in(g: u32, meta_id: u32, p_voxel: vec3<i32>) -> vec3<f32> {
     }
     rank = rank + countOneBits(occ_word(col_word_base + z_word) & mask);
 
-    let offsets_base = m.color_offsets_offset + meta_id * (cols_per_chunk + 1u);
+    let offsets_base = m.color_offsets_offset + meta_id * m.offsets_words_per_slot;
     let chunk_local_offset = all_color_offsets[offsets_base + col_idx];
     let chunk_colors_base = all_chunk_colors_base[m.chunk_colors_base_offset + meta_id];
     let packed = all_colors[m.colors_offset + chunk_colors_base + chunk_local_offset + rank];
