@@ -20,13 +20,20 @@
 //! slab's air-gap top. Bedrock has no per-voxel colour in the slab
 //! data — voxlap stores only textured surfaces.
 //!
-//! **Bedrock-as-air** (GPU.4 prerequisite): the GPU decompressor
-//! treats bedrock voxels as empty. Rays heading into bedrock fall
-//! through to the far surface (or sky); for the typical demo view
-//! (camera above terrain, looking out) this is visually
-//! indistinguishable from voxlap-CPU. Storing bedrock explicitly
-//! would balloon a vsid=128 chunk's colour array from ~80 KiB to
-//! ~10 MiB, blocking GPU.4's 32×32-chunk grid upload.
+//! **Bedrock-as-solid** (cliff-face fix): each [`MipUpload`] carries
+//! *two* bitmaps — `occupancy` (textured voxels only, for the colour
+//! rank) and `solid_occupancy` (textured surfaces **plus** the
+//! implicit bedrock interior below them). The marcher hit-tests
+//! `solid_occupancy`, so vertical wall/cliff faces are opaque; a
+//! bedrock hit (solid but uncoloured) inherits the colour of the
+//! textured surface above it. Bedrock is still stored as **1 bit**,
+//! not a per-voxel colour, so the colour array stays
+//! `O(textured voxels)` — storing bedrock colours would balloon a
+//! vsid=128 chunk from ~80 KiB to ~10 MiB. The cost is one extra
+//! occupancy bitmap (occupancy storage doubles; colours unchanged).
+//!
+//! (Originally "bedrock-as-air", GPU.4: bedrock was dropped entirely,
+//! which left cliff faces transparent to the sky.)
 //!
 //! This is `O(textured voxels)` work; not on the render hot path.
 
@@ -138,8 +145,17 @@ pub struct MipUpload {
     pub cz: u32,
     /// Occupancy words per column at this mip = `cz.div_ceil(32)`.
     pub occ_words_per_col: u32,
-    /// `vsid² * occ_words_per_col` packed occupancy bits.
+    /// `vsid² * occ_words_per_col` packed **textured** occupancy bits
+    /// (one set bit per voxel that has an explicit colour). The shader
+    /// rank-counts these for the colour lookup.
     pub occupancy: Vec<u32>,
+    /// Same shape as `occupancy`, but one set bit per **solid** voxel
+    /// — textured surfaces *and* the implicit bedrock interior below
+    /// them. The marcher hit-tests against this so vertical
+    /// wall/cliff faces are opaque; bedrock hits inherit the colour of
+    /// the textured surface above them. (Fixes the "cliff face shows
+    /// sky" bedrock-as-air artifact.)
+    pub solid_occupancy: Vec<u32>,
     /// `vsid² + 1` cumulative-within-chunk colour offsets.
     pub color_offsets: Vec<u32>,
     /// This mip's packed BGRA colours (ascending z within a column,
@@ -243,6 +259,7 @@ fn decompress_mip(src: &Vxl, mip: u32, color_base: u32) -> MipUpload {
     let n_occ_words = n_cols * (occ_words_per_col as usize);
 
     let mut occupancy = vec![0u32; n_occ_words];
+    let mut solid_occupancy = vec![0u32; n_occ_words];
     let mut color_offsets = vec![0u32; n_cols + 1];
     let mut colors: Vec<u32> = Vec::with_capacity(n_cols * 4);
 
@@ -261,6 +278,7 @@ fn decompress_mip(src: &Vxl, mip: u32, color_base: u32) -> MipUpload {
                 cz,
                 occ_words_per_col,
                 &mut occupancy,
+                &mut solid_occupancy,
                 &mut colors,
             );
         }
@@ -272,17 +290,26 @@ fn decompress_mip(src: &Vxl, mip: u32, color_base: u32) -> MipUpload {
         cz,
         occ_words_per_col,
         occupancy,
+        solid_occupancy,
         color_offsets,
         colors,
     }
 }
 
-/// Walk one column's slab chain. For each **textured** voxel sets
-/// the occupancy bit and pushes its packed BGRA u32 into `colors`.
-/// Bedrock voxels (implicit solid below a slab's textured floor)
-/// are skipped — treated as air for the GPU marcher. `cz` is the
-/// column's z-extent at the current mip (`CHUNK_Z >> mip`);
-/// `occ_words_per_col` is its packed-occupancy stride.
+/// Walk one column's slab chain, producing two bitmaps + the colour
+/// list:
+/// * `occupancy` — one bit per **textured** voxel (has an explicit
+///   colour); pushed into `colors` in ascending z. The shader
+///   rank-counts these for the colour lookup.
+/// * `solid_occupancy` — one bit per **solid** voxel: textured
+///   surfaces *and* the implicit bedrock interior below them. The
+///   marcher hit-tests this, so cliff/wall faces are opaque.
+///
+/// Bedrock (solid but uncoloured) is marked solid only *after* the
+/// column's first real textured surface, so the `empty_chunk_vxl`
+/// all-zero placeholder columns stay fully air (no spurious black
+/// floor/ceiling). `cz` is the column z-extent at this mip; the runs
+/// from [`expand_solid_runs`] already exclude overhang air gaps.
 #[allow(clippy::too_many_arguments)]
 fn decompress_column(
     slab: &[u8],
@@ -292,11 +319,19 @@ fn decompress_column(
     cz: u32,
     occ_words_per_col: u32,
     occupancy: &mut [u32],
+    solid_occupancy: &mut [u32],
     colors: &mut Vec<u32>,
 ) {
     let vsid_usize = vsid as usize;
     let runs = expand_solid_runs(slab, cz);
     let ranges = build_color_ranges(slab);
+
+    let col_idx = (x as usize) + (y as usize) * vsid_usize;
+    let col_word_base = col_idx * (occ_words_per_col as usize);
+    // Once a column has a real textured surface, everything solid
+    // below it is bedrock to fill (opaque). Before the first surface
+    // the run voxels are placeholder/air — leave them clear.
+    let mut have_surface = false;
 
     let mut range_cursor = 0usize;
     for (top, bot) in runs {
@@ -304,36 +339,36 @@ fn decompress_column(
             while range_cursor < ranges.len() && z >= ranges[range_cursor].z_end {
                 range_cursor += 1;
             }
-            // Skip bedrock z values — outside every colour range.
-            if range_cursor >= ranges.len() || z < ranges[range_cursor].z_start {
-                continue;
+            let in_range = range_cursor < ranges.len() && z >= ranges[range_cursor].z_start;
+            // A textured voxel has a non-zero RGB inside a colour
+            // range. `empty_chunk_vxl`'s placeholder keeps RGB 0
+            // ([0,0,0,0]); treat it as untextured so unbaked columns
+            // don't paint a black surface.
+            let mut rgb = 0u32;
+            if in_range {
+                let off = ((z - ranges[range_cursor].z_start) as usize) * 4;
+                let bytes = &ranges[range_cursor].colours[off..off + 4];
+                rgb = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             }
-            let off = ((z - ranges[range_cursor].z_start) as usize) * 4;
-            let bytes = &ranges[range_cursor].colours[off..off + 4];
-            let rgb = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            // `empty_chunk_vxl`'s placeholder voxel at z=255 keeps
-            // the seed bytes [0, 0, 0, 0] for unbaked chunks
-            // (streaming-hills chz != 0 layers) and [_, 0, 0, 0]
-            // for baked ones (ship grid, markers). The RGB stays
-            // zero either way. CPU brightness multiplier renders
-            // that as pure black, but voxlap CPU rendering avoids
-            // showing it via column-walk logic; treat such voxels
-            // as air on the GPU so the bug doesn't fire as "black
-            // ceiling above the camera" / "black floor below the
-            // ship".
-            if (rgb & 0x00ff_ffff) == 0 {
-                continue;
-            }
-
-            // z-innermost packing: each column owns
-            // `occ_words_per_col` contiguous u32 words covering
-            // z=0..cz.
-            let col_idx = (x as usize) + (y as usize) * vsid_usize;
-            let col_word_base = col_idx * (occ_words_per_col as usize);
             let z_word = (z as usize) / 32;
             let z_bit = (z as u32) & 31;
-            occupancy[col_word_base + z_word] |= 1u32 << z_bit;
-            colors.push(rgb);
+
+            if in_range && (rgb & 0x00ff_ffff) != 0 {
+                // Textured surface voxel: solid + coloured.
+                occupancy[col_word_base + z_word] |= 1u32 << z_bit;
+                solid_occupancy[col_word_base + z_word] |= 1u32 << z_bit;
+                colors.push(rgb);
+                have_surface = true;
+            } else if !in_range && have_surface {
+                // GENUINE bedrock — uncoloured solid below a surface
+                // (no colour range covers it). Mark solid; it inherits
+                // the surface colour above at render time. A voxel that
+                // IS in a colour range but reads RGB 0 is the
+                // `empty_chunk_vxl` placeholder (the column's z=255
+                // air filler) — leave it air, else floating objects
+                // grow a spurious floor plane below them.
+                solid_occupancy[col_word_base + z_word] |= 1u32 << z_bit;
+            }
         }
     }
 }
@@ -570,6 +605,35 @@ mod tests {
             );
             assert_eq!(mip.color_offsets.len() as u32, mip.vsid * mip.vsid + 1);
         }
+    }
+
+    #[test]
+    fn solid_occupancy_fills_bedrock_below_surface() {
+        // The cliff-face fix: every mip's `solid_occupancy` is solid
+        // from the textured surface down through the bedrock interior,
+        // while `occupancy` (textured) marks only the surface.
+        let vxl = fixture_one_voxel_per_column(); // textured at z=100
+        let chunk = decompress_chunk(&vxl);
+        let m0 = &chunk.mips[0];
+        let base = 0usize; // column (0,0)
+        let bit = |buf: &[u32], z: u32| (buf[base + (z / 32) as usize] >> (z & 31)) & 1 == 1;
+
+        assert!(bit(&m0.occupancy, 100), "surface textured");
+        assert!(bit(&m0.solid_occupancy, 100), "surface solid");
+        assert!(!bit(&m0.occupancy, 150), "bedrock is not textured");
+        assert!(
+            bit(&m0.solid_occupancy, 150),
+            "bedrock below surface is solid"
+        );
+        assert!(bit(&m0.solid_occupancy, 255), "bedrock fills to the bottom");
+        assert!(
+            !bit(&m0.solid_occupancy, 50),
+            "air above the surface stays air"
+        );
+        // The textured popcount still equals the colour count.
+        let solid: u32 = m0.solid_occupancy.iter().map(|w| w.count_ones()).sum();
+        let tex: u32 = m0.occupancy.iter().map(|w| w.count_ones()).sum();
+        assert!(solid > tex, "solid (surface + bedrock) exceeds textured");
     }
 
     #[test]

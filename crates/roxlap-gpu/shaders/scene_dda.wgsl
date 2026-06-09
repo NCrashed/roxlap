@@ -152,14 +152,23 @@ fn col_word_base_mip(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> u32 
     return occ_base + col_idx * occ_words_per_col_for_mip(mip);
 }
 
-// GPU.11 — occupancy + colour lookups at an arbitrary mip. The per-
-// slot stride spans the whole ladder; `mip_*_rel[mip]` selects the
-// sub-block. At mip-0 these reduce to the pre-mip addressing.
+// Within-slot word stride of one mip's textured occupancy block; the
+// SOLID occupancy block sits immediately after it (cliff-face fix). So
+// the solid word base for a column == its textured base + this.
+fn mip_occ_block_words(g: u32, mip: u32) -> u32 {
+    let vsid_mip = grid_static_meta[g].vsid >> mip;
+    return vsid_mip * vsid_mip * occ_words_per_col_for_mip(mip);
+}
+
+// GPU — hit-test against the SOLID bitmap (textured surfaces + bedrock
+// interior) so vertical wall/cliff faces are opaque. The textured
+// bitmap (used for colour rank) is the first block; solid is the
+// second.
 fn voxel_solid_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> bool {
-    let col_word_base = col_word_base_mip(g, meta_id, mip, p_voxel);
+    let solid_base = col_word_base_mip(g, meta_id, mip, p_voxel) + mip_occ_block_words(g, mip);
     let z_word = u32(p_voxel.z) >> 5u;
     let z_bit = u32(p_voxel.z) & 31u;
-    return (occ_word(col_word_base + z_word) & (1u << z_bit)) != 0u;
+    return (occ_word(solid_base + z_word) & (1u << z_bit)) != 0u;
 }
 
 fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> vec3<f32> {
@@ -169,6 +178,7 @@ fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> vec3<f3
     let z_word = u32(p_voxel.z) >> 5u;
     let z_bit = u32(p_voxel.z) & 31u;
 
+    // Rank = number of TEXTURED voxels below z. Indexes the colour.
     var rank: u32 = 0u;
     for (var w: u32 = 0u; w < z_word; w = w + 1u) {
         rank = rank + countOneBits(occ_word(col_word_base + w));
@@ -177,20 +187,30 @@ fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> vec3<f3
     if (z_bit > 0u) {
         mask = (1u << z_bit) - 1u;
     }
-    rank = rank + countOneBits(occ_word(col_word_base + z_word) & mask);
+    let z_word_bits = occ_word(col_word_base + z_word);
+    rank = rank + countOneBits(z_word_bits & mask);
+
+    // A bedrock hit (solid but not textured) inherits the colour of the
+    // textured surface directly above it: that's `rank - 1` (rank here
+    // counts surfaces strictly above). A textured hit uses `rank`.
+    let is_textured = (z_word_bits & (1u << z_bit)) != 0u;
+    var color_index = rank;
+    if (!is_textured && rank > 0u) {
+        color_index = rank - 1u;
+    }
 
     // Cumulative-within-slot colour offsets: the mip's sub-table
     // lives at `mip_coff_rel[mip]`, and its values already include
     // every finer mip's colour count, so `chunk_colors_base + value
-    // + rank` indexes the slot's concatenated colour block directly.
+    // + index` indexes the slot's concatenated colour block directly.
     let offsets_base = grid_static_meta[g].color_offsets_offset
         + meta_id * grid_static_meta[g].offsets_words_per_slot
         + grid_static_meta[g].mip_coff_rel[mip];
     let chunk_local_offset = all_color_offsets[offsets_base + col_idx];
     let chunk_colors_base =
         all_chunk_colors_base[grid_static_meta[g].chunk_colors_base_offset + meta_id];
-    let packed =
-        all_colors[grid_static_meta[g].colors_offset + chunk_colors_base + chunk_local_offset + rank];
+    let packed = all_colors[grid_static_meta[g].colors_offset + chunk_colors_base
+        + chunk_local_offset + color_index];
 
     let a = f32((packed >> 24u) & 0xffu);
     let r = f32((packed >> 16u) & 0xffu);

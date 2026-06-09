@@ -66,7 +66,10 @@ impl MipLayout {
             mip_coff_rel[m as usize] = coff_acc;
             let vsid_m = vsid >> m;
             let cols = vsid_m * vsid_m;
-            occ_acc += cols * occ_words_per_column_for_mip(m);
+            // Each mip stores TWO bitmaps back-to-back: the textured
+            // occupancy then the solid occupancy (cliff-face fix). The
+            // shader reads solid at `tex_base + cols*occ_words_per_col`.
+            occ_acc += 2 * cols * occ_words_per_column_for_mip(m);
             coff_acc += cols + 1;
         }
         Self {
@@ -341,6 +344,10 @@ impl GpuSceneResident {
                     let occ_dst = occ_start + layout.mip_occ_rel[m] as usize;
                     grid_occupancy[occ_dst..occ_dst + mip.occupancy.len()]
                         .copy_from_slice(&mip.occupancy);
+                    // Solid bitmap immediately follows the textured one.
+                    let solid_dst = occ_dst + mip.occupancy.len();
+                    grid_occupancy[solid_dst..solid_dst + mip.solid_occupancy.len()]
+                        .copy_from_slice(&mip.solid_occupancy);
                     let coff_dst = off_start + layout.mip_coff_rel[m] as usize;
                     grid_color_offsets[coff_dst..coff_dst + mip.color_offsets.len()]
                         .copy_from_slice(&mip.color_offsets);
@@ -557,12 +564,17 @@ impl GpuSceneResident {
         let mut outcome = RefreshOutcome::Ok;
         let mut color_cursor = 0usize;
         for (m, mip) in chunk.mips.iter().enumerate() {
-            // occupancy
+            // occupancy (textured) then solid, back-to-back.
             let local = slot_local_word + layout.mip_occ_rel[m] as usize;
             queue.write_buffer(
                 &self.occupancy_pages[page],
                 (local * 4) as u64,
                 bytemuck::cast_slice(&mip.occupancy),
+            );
+            queue.write_buffer(
+                &self.occupancy_pages[page],
+                ((local + mip.occupancy.len()) * 4) as u64,
+                bytemuck::cast_slice(&mip.solid_occupancy),
             );
             // color_offsets
             let coff = off_slot_base + layout.mip_coff_rel[m] as usize;
@@ -808,24 +820,25 @@ mod tests {
         assert_eq!(l.mip_occ_rel[0], 0);
         assert_eq!(l.mip_coff_rel[0], 0);
 
-        // Recompute the strides independently and compare.
+        // Recompute the strides independently and compare. Each mip
+        // stores TWO occupancy bitmaps (textured + solid) back-to-back.
         let mut occ = 0u32;
         let mut coff = 0u32;
         for m in 0..6u32 {
             assert_eq!(l.mip_occ_rel[m as usize], occ, "occ rel mip {m}");
             assert_eq!(l.mip_coff_rel[m as usize], coff, "coff rel mip {m}");
             let v = 128u32 >> m;
-            occ += v * v * occ_words_per_column_for_mip(m);
+            occ += 2 * v * v * occ_words_per_column_for_mip(m);
             coff += v * v + 1;
         }
         assert_eq!(l.occ_words_per_slot, occ);
         assert_eq!(l.offsets_words_per_slot, coff);
 
-        // mip-0 occupancy stride is the historical vsid²·8.
-        assert_eq!(l.mip_occ_rel[1], 128 * 128 * 8);
+        // mip-0 occupancy stride is 2 × the historical vsid²·8 (tex +
+        // solid bitmaps).
+        assert_eq!(l.mip_occ_rel[1], 2 * 128 * 128 * 8);
         // The whole ladder is only ~1/7 larger than mip-0 alone
-        // (geometric 1 + 1/8 + 1/64 + …), bounding the resident-bytes
-        // growth the GPU.11.0 gate expects (~+14% occupancy).
-        assert!(l.occ_words_per_slot < 128 * 128 * 8 * 5 / 4);
+        // (geometric 1 + 1/8 + 1/64 + …) — here on the doubled base.
+        assert!(l.occ_words_per_slot < 2 * 128 * 128 * 8 * 5 / 4);
     }
 }

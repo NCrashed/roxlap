@@ -112,6 +112,36 @@ fn is_block_color(p: u32) -> bool {
     r > 180 && (80..=175).contains(&g) && b < 70
 }
 
+/// `vsid × vsid` chunk: one textured floor voxel per column at `z =
+/// surf`, with implicit voxlap **bedrock** solid below it to z=255.
+/// Models a cliff/wall: only the top is coloured; the face below is
+/// bedrock. Pre-fix the GPU treated bedrock as air → the face showed
+/// sky. Slab `[nextptr=0, z1=surf, z1c=surf, z0=0]` + 1 colour.
+fn wall_chunk(vsid: u32, surf: u8) -> Vxl {
+    let n_cols = (vsid as usize) * (vsid as usize);
+    let mut data: Vec<u8> = Vec::with_capacity(n_cols * 8);
+    let mut column_offset: Vec<u32> = Vec::with_capacity(n_cols + 1);
+    let bgra = [0x00u8, 0x80, 0xff, 0x80];
+    for _ in 0..n_cols {
+        column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+        data.extend_from_slice(&[0, surf, surf, 0]);
+        data.extend_from_slice(&bgra);
+    }
+    column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+    Vxl {
+        vsid,
+        ipo: [0.0; 3],
+        ist: [1.0, 0.0, 0.0],
+        ihe: [0.0, 0.0, 1.0],
+        ifo: [0.0, 1.0, 0.0],
+        data: data.into_boxed_slice(),
+        column_offset: column_offset.into_boxed_slice(),
+        mip_base_offsets: Box::new([0, n_cols + 1]),
+        vbit: Box::new([]),
+        vbiti: 0,
+    }
+}
+
 #[test]
 fn scene_dda_marches_coarse_mip_for_distant_chunk() {
     let Some((gpu, _lock)) = try_init() else {
@@ -199,6 +229,56 @@ fn scene_dda_marches_coarse_mip_for_distant_chunk() {
     assert!(
         frac > 0.9,
         "mip-0 vs mip-4 block coverage diverged: {frac:.3}"
+    );
+}
+
+#[test]
+fn scene_dda_renders_bedrock_wall_face_solid() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    eprintln!("wall_render: adapter = {}", gpu.adapter_info);
+
+    // A wall chunk: textured top at z=40, bedrock 41..255 below. Place
+    // it far along +y; the camera looks at its face from BELOW the
+    // textured top (z=128, deep in the bedrock region) — exactly the
+    // cliff-face view that pre-fix showed sky through.
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&wall_chunk(vsid, 40));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 8, 1],
+        pool_dims: [1, 8, 1],
+        chunks: vec![([0, 4, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, w, h);
+    let cam = Camera {
+        position: [vsid as f32 * 0.5, 0.0, 128.0], // z=128 = bedrock region
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+        fov_y_rad: 30f32.to_radians(),
+    };
+    let fb = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+    let centre = fb[(h / 2 * w + w / 2) as usize];
+    eprintln!("wall_render: centre pixel = {centre:#08x}");
+    // The bedrock face must be SOLID and inherit the surface colour
+    // (was sky before the bedrock-as-solid fix).
+    assert!(
+        is_block_color(centre),
+        "bedrock wall face should be solid surface colour, got {centre:#08x} (sky = regression)",
     );
 }
 
