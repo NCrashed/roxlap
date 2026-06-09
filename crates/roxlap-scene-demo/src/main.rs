@@ -22,7 +22,9 @@ use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::Engine;
 use roxlap_formats::sprite::Sprite;
-use roxlap_render::{FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet};
+use roxlap_render::{
+    Backend, FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -184,6 +186,100 @@ const MOUSE_SENS: f64 = 0.0025;
 /// Pitch clamped just shy of ±90° so the basis stays well-conditioned.
 const PITCH_LIMIT: f64 = 88.0_f64 * std::f64::consts::PI / 180.0;
 
+/// Pick-demo (`C`): horizontal ground reference plane the mouse cursor
+/// is projected onto (world z; voxlap z is *down*, smaller = up). The
+/// streaming-hills surface sits near z≈80, so the cursor floats just
+/// above it. A fixed plane is the right primitive for a top-down tile
+/// cursor; snapping to the actual terrain height under the ray (read a
+/// voxel column) is a follow-up.
+const PICK_GROUND_Z: f64 = 72.0;
+/// Pick-demo top-down camera: high above the centred grid (z very
+/// negative = high up), looking steeply down with a touch of
+/// perspective so the scene reads as a strategy-game view.
+const PICK_CAM_POS: [f64; 3] = [0.0, 0.0, -520.0];
+const PICK_CAM_PITCH: f64 = 1.30; // ~74° down (z-down convention)
+/// Vertical FOV the GPU marcher renders with (`FrameParams.gpu_fov_y_rad`).
+/// The pick unproject must use the same value, so it lives here.
+const GPU_FOV_Y_DEG: f64 = 60.0;
+
+// Screen→world picking, which roxlap ships no helper for. The ray for
+// a window pixel must use the SAME projection the active backend
+// renders with, or the hit drifts off the pointer by an amount that
+// grows with distance from screen centre (a focal-length mismatch).
+// The CPU opticast and the GPU marcher use *different* projections, so
+// there's one ray builder per backend, plus a shared plane intersect.
+
+/// World ray direction for window pixel `(px, py)` under the **CPU
+/// opticast** projection (voxlap `setcamera`): `(px − hx)·right +
+/// (py − hy)·down + hz·forward` — exactly `camera_math::derive`'s
+/// `corn[0]` plus the per-pixel `right`/`down` steps.
+#[allow(clippy::too_many_arguments)]
+fn pixel_ray_cpu(
+    right: [f64; 3],
+    down: [f64; 3],
+    forward: [f64; 3],
+    px: f64,
+    py: f64,
+    hx: f32,
+    hy: f32,
+    hz: f32,
+) -> [f64; 3] {
+    let (a, b, c) = (px - f64::from(hx), py - f64::from(hy), f64::from(hz));
+    [
+        a * right[0] + b * down[0] + c * forward[0],
+        a * right[1] + b * down[1] + c * forward[1],
+        a * right[2] + b * down[2] + c * forward[2],
+    ]
+}
+
+/// World ray direction for window pixel `(px, py)` under the **GPU
+/// marcher** projection — a vertical-FOV pinhole matching
+/// `scene_dda.wgsl`'s `render_scene`:
+/// `forward + ndc_x·half_w·right − ndc_y_top·half_h·down`.
+#[allow(clippy::too_many_arguments)]
+fn pixel_ray_gpu(
+    right: [f64; 3],
+    down: [f64; 3],
+    forward: [f64; 3],
+    px: f64,
+    py: f64,
+    w: f64,
+    h: f64,
+    fov_y_rad: f64,
+) -> [f64; 3] {
+    let aspect = w / h;
+    let half_h = (fov_y_rad * 0.5).tan();
+    let half_w = half_h * aspect;
+    let ndc_x = (px + 0.5) / w * 2.0 - 1.0;
+    let ndc_y_top = 1.0 - (py + 0.5) / h * 2.0;
+    let kx = ndc_x * half_w;
+    let ky = ndc_y_top * half_h;
+    [
+        forward[0] + kx * right[0] - ky * down[0],
+        forward[1] + kx * right[1] - ky * down[1],
+        forward[2] + kx * right[2] - ky * down[2],
+    ]
+}
+
+/// Intersect a world ray `pos + t·dir` with the horizontal plane
+/// `z = ground_z`. `None` if the ray is parallel to the plane or the
+/// plane lies behind the camera.
+#[allow(clippy::cast_possible_truncation)]
+fn plane_hit(pos: [f64; 3], dir: [f64; 3], ground_z: f64) -> Option<[f32; 3]> {
+    if dir[2].abs() < 1e-9 {
+        return None; // ray parallel to the ground plane
+    }
+    let t = (ground_z - pos[2]) / dir[2];
+    if t <= 0.0 {
+        return None; // plane is behind the camera
+    }
+    Some([
+        (pos[0] + t * dir[0]) as f32,
+        (pos[1] + t * dir[1]) as f32,
+        ground_z as f32,
+    ])
+}
+
 fn main() {
     let event_loop = EventLoop::new().expect("winit: EventLoop::new");
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -246,6 +342,23 @@ struct App {
     /// early-out pays off) and the previous ground-level pose for an
     /// FPS A/B. `None` until the first `H` press.
     saved_pose: Option<([f64; 3], f64, f64)>,
+    /// Pick-demo mode (`C`): top-down camera + a free OS cursor that
+    /// places a sprite on a ground plane under the pointer. Prototype
+    /// for screen→world picking (roxlap ships no built-in picker).
+    pick_mode: bool,
+    /// Last cursor position in physical pixels (window space), from
+    /// `CursorMoved`; unprojected each frame while in pick mode.
+    mouse_px: (f64, f64),
+    /// World point under the cursor this frame (ground-plane hit).
+    cursor_world: [f32; 3],
+    /// Left-click-placed marker world positions.
+    placed: Vec<[f32; 3]>,
+    /// Recoloured `[cursor, marker]` KV6 models, built once on entering
+    /// pick mode from the base sprite.
+    pick_models: Vec<Sprite>,
+    /// `(pos, yaw, pitch)` saved on entering pick mode, restored on
+    /// exit.
+    pick_saved_pose: Option<([f64; 3], f64, f64)>,
     /// Base KV6 sprite(s); `build_sprite_set` expands these into the
     /// demo's instanced field handed to the renderer at startup.
     sprites: Vec<Sprite>,
@@ -299,6 +412,12 @@ impl App {
             scan_dist: SCAN_DIST_INITIAL,
             gpu_mip_scan_dist: 64.0,
             saved_pose: None,
+            pick_mode: false,
+            mouse_px: (0.0, 0.0),
+            cursor_world: [0.0, 0.0, PICK_GROUND_Z as f32],
+            placed: Vec::new(),
+            pick_models: Vec::new(),
+            pick_saved_pose: None,
             sprites: build_sprites(),
             bake_tracker: StreamingBakeTracker::new(),
             title_base: "roxlap-scene-demo".to_string(),
@@ -386,9 +505,60 @@ impl App {
             treat_z_max_as_air: true,
             gpu_mip_scan_dist: self.gpu_mip_scan_dist,
             gpu_max_outer_steps: chunks_visible,
-            gpu_fov_y_rad: 60_f32.to_radians(),
+            gpu_fov_y_rad: (GPU_FOV_Y_DEG as f32).to_radians(),
             sprite_lighting: Some(&lighting),
         };
+
+        // Pick mode: unproject the mouse onto the ground plane and
+        // re-place the cursor (+ any dropped markers) as sprites. Field
+        // accesses are disjoint from `self.renderer`, so this composes
+        // with the `renderer` borrow held above.
+        if self.pick_mode && self.pick_models.len() >= 2 {
+            let cam = self.scene.camera;
+            let (mx, my) = self.mouse_px;
+            // Unproject with the projection the ACTIVE backend renders
+            // with — CPU opticast and the GPU marcher differ, and using
+            // the wrong one drifts the cursor off-pointer proportionally
+            // to distance from screen centre.
+            let dir = match renderer.backend() {
+                Backend::Gpu => pixel_ray_gpu(
+                    cam.right,
+                    cam.down,
+                    cam.forward,
+                    mx,
+                    my,
+                    f64::from(size.width),
+                    f64::from(size.height),
+                    f64::from(frame.gpu_fov_y_rad),
+                ),
+                Backend::Cpu => pixel_ray_cpu(
+                    cam.right,
+                    cam.down,
+                    cam.forward,
+                    mx,
+                    my,
+                    settings.hx,
+                    settings.hy,
+                    settings.hz,
+                ),
+            };
+            if let Some(w) = plane_hit(cam.pos, dir, PICK_GROUND_Z) {
+                self.cursor_world = w;
+            }
+            let mut instances = vec![SpriteInstanceDesc {
+                model: 0,
+                pos: self.cursor_world,
+            }];
+            for p in &self.placed {
+                instances.push(SpriteInstanceDesc { model: 1, pos: *p });
+            }
+            let set = SpriteSet {
+                models: self.pick_models.clone(),
+                instances,
+                carve_model: None,
+            };
+            renderer.set_sprites(&set);
+        }
 
         if self.capture_pending {
             renderer.request_capture();
@@ -537,6 +707,100 @@ impl App {
             self.grabbed = false;
         }
     }
+
+    /// Toggle the pick demo (`C`). Entering: build recoloured cursor +
+    /// marker models, save the camera pose, jump to a top-down view,
+    /// and release the cursor so `CursorMoved` reports absolute window
+    /// positions. Leaving: restore the pose + the normal sprite field.
+    fn toggle_pick_mode(&mut self) {
+        self.pick_mode = !self.pick_mode;
+        if self.pick_mode {
+            // Cursor = cyan, placed markers = yellow. Recolour every
+            // KV6 voxel (keep alpha) once, like `build_sprite_set`'s
+            // red variant.
+            let models = if let Some(base) = self.sprites.first() {
+                let recolor = |rgb: u32| {
+                    let mut s = base.clone();
+                    for v in &mut s.kv6.voxels {
+                        v.col = (v.col & 0xFF00_0000) | rgb;
+                    }
+                    s
+                };
+                vec![recolor(0x0000_FFFF), recolor(0x00FF_FF00)]
+            } else {
+                eprintln!("pick mode: no base sprite loaded — cursor disabled");
+                Vec::new()
+            };
+            self.pick_models = models;
+            self.pick_saved_pose = Some((self.scene.cam_pos, self.scene.yaw, self.scene.pitch));
+            self.scene.cam_pos = PICK_CAM_POS;
+            self.scene.yaw = std::f64::consts::FRAC_PI_2; // look +y
+            self.scene.pitch = PICK_CAM_PITCH;
+            self.scene.refresh_camera();
+            self.set_grab(false);
+            eprintln!(
+                "pick mode ON — move the mouse to place the cursor, left-click to drop a \
+                 marker, C to exit",
+            );
+        } else {
+            if let Some((pos, yaw, pitch)) = self.pick_saved_pose.take() {
+                self.scene.cam_pos = pos;
+                self.scene.yaw = yaw;
+                self.scene.pitch = pitch;
+                self.scene.refresh_camera();
+            }
+            // Restore the normal sprite field (compute before borrowing
+            // the renderer to keep the borrows disjoint).
+            let restore = self.build_sprite_set();
+            if let (Some(renderer), Some(set)) = (self.renderer.as_mut(), restore) {
+                renderer.set_sprites(&set);
+            }
+            eprintln!("pick mode OFF");
+        }
+    }
+
+    /// Surface-exact pick: unproject window pixel `(px, py)`, read the
+    /// last frame's depth at that pixel, and reconstruct the world hit
+    /// `cam.pos + t·normalize(dir)`. `None` on sky / no depth / no
+    /// renderer. Uses the active backend's projection for the ray and
+    /// the same backend for the depth, so the two agree.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn precise_pick(&self, px: f64, py: f64) -> Option<[f32; 3]> {
+        let renderer = self.renderer.as_ref()?;
+        let window = self.window.as_ref()?;
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 || px < 0.0 || py < 0.0 {
+            return None;
+        }
+        let cam = self.scene.camera;
+        let dir = match renderer.backend() {
+            Backend::Gpu => pixel_ray_gpu(
+                cam.right,
+                cam.down,
+                cam.forward,
+                px,
+                py,
+                f64::from(size.width),
+                f64::from(size.height),
+                GPU_FOV_Y_DEG.to_radians(),
+            ),
+            Backend::Cpu => {
+                let s = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
+                pixel_ray_cpu(cam.right, cam.down, cam.forward, px, py, s.hx, s.hy, s.hz)
+            }
+        };
+        let t = f64::from(renderer.pick_depth(px as u32, py as u32)?);
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        if len < 1e-9 {
+            return None;
+        }
+        let s = t / len; // world = pos + t · (dir / |dir|)
+        Some([
+            (cam.pos[0] + dir[0] * s) as f32,
+            (cam.pos[1] + dir[1] * s) as f32,
+            (cam.pos[2] + dir[2] * s) as f32,
+        ])
+    }
 }
 
 impl ApplicationHandler for App {
@@ -622,11 +886,43 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
+            // Pick mode tracks the free cursor; FPS mode ignores absolute
+            // moves (it uses `DeviceEvent::MouseMotion` deltas instead).
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_px = (position.x, position.y);
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => self.set_grab(true),
+            } => {
+                if self.pick_mode {
+                    let (px, py) = self.mouse_px;
+                    // Surface-exact: read the depth buffer at the click
+                    // pixel → which voxel. Fall back to the ground-plane
+                    // cursor for sky clicks (no surface hit).
+                    let (world, exact) = match self.precise_pick(px, py) {
+                        Some(w) => (w, true),
+                        None => (self.cursor_world, false),
+                    };
+                    self.placed.push(world);
+                    let voxel = [
+                        world[0].floor() as i32,
+                        world[1].floor() as i32,
+                        world[2].floor() as i32,
+                    ];
+                    eprintln!(
+                        "{} hit at [{:.1}, {:.1}, {:.1}] → voxel {voxel:?} ({} placed)",
+                        if exact { "surface" } else { "ground-plane" },
+                        world[0],
+                        world[1],
+                        world[2],
+                        self.placed.len(),
+                    );
+                } else {
+                    self.set_grab(true);
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -684,6 +980,9 @@ impl ApplicationHandler for App {
                         let on = self.scene.toggle_billboards_lod();
                         eprintln!("S6 billboards = {}", if on { "ON" } else { "OFF" });
                     }
+                    // Pick demo: top-down camera + mouse-driven cursor
+                    // placement (screen→world unproject prototype).
+                    KeyCode::KeyC if pressed => self.toggle_pick_mode(),
                     // S7.6: `T` (telemetry) prints chunk count +
                     // pending count for each streaming-enabled
                     // grid. No-op when not in streaming mode.
@@ -845,4 +1144,115 @@ fn write_capture(
     let mut f = std::fs::File::create("roxlap-scene-capture.ppm")?;
     f.write_all(&bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::{pixel_ray_cpu, pixel_ray_gpu, plane_hit};
+
+    const RIGHT: [f64; 3] = [1.0, 0.0, 0.0];
+    const DOWN: [f64; 3] = [0.0, 1.0, 0.0];
+    const FWD_DOWN: [f64; 3] = [0.0, 0.0, 1.0]; // voxlap z-down "look down"
+
+    // CPU: the centre pixel (hx, hy) looks straight down `forward`, so
+    // it must unproject to the point directly under the camera.
+    #[test]
+    fn cpu_centre_pixel_lands_under_camera() {
+        let pos = [10.0, 20.0, -100.0];
+        let dir = pixel_ray_cpu(RIGHT, DOWN, FWD_DOWN, 320.0, 240.0, 320.0, 240.0, 320.0);
+        let p = plane_hit(pos, dir, 0.0).expect("ray hits the plane");
+        assert!((p[0] - 10.0).abs() < 1e-3, "x under camera, got {}", p[0]);
+        assert!((p[1] - 20.0).abs() < 1e-3, "y under camera, got {}", p[1]);
+        assert!((p[2] - 0.0).abs() < 1e-3, "on the plane, got {}", p[2]);
+    }
+
+    // CPU: a pixel right-of / below centre lands at greater world x / y,
+    // with the exact magnitude `(px-hx)·t` (hz=320, t=100/320).
+    #[test]
+    fn cpu_offcentre_pixel_shifts_hit() {
+        let dir = pixel_ray_cpu(RIGHT, DOWN, FWD_DOWN, 384.0, 272.0, 320.0, 240.0, 320.0);
+        let p = plane_hit([0.0, 0.0, -100.0], dir, 0.0).expect("ray hits the plane");
+        assert!((p[0] - 20.0).abs() < 1e-2, "x = (px-hx)*t, got {}", p[0]); // 64*100/320
+        assert!((p[1] - 10.0).abs() < 1e-2, "y = (py-hy)*t, got {}", p[1]); // 32*100/320
+    }
+
+    // GPU: the centre pixel (NDC 0,0) also looks straight down, landing
+    // under the camera — backend-independent at the centre (the bug the
+    // user hit only showed *off* centre).
+    #[test]
+    fn gpu_centre_pixel_lands_under_camera() {
+        let pos = [10.0, 20.0, -100.0];
+        // Pixel centre of an even-sized frame is (w/2 - 0.5, h/2 - 0.5)
+        // so that (px+0.5)/w*2-1 == 0.
+        let dir = pixel_ray_gpu(
+            RIGHT,
+            DOWN,
+            FWD_DOWN,
+            639.5,
+            359.5,
+            1280.0,
+            720.0,
+            60_f64.to_radians(),
+        );
+        let p = plane_hit(pos, dir, 0.0).expect("ray hits the plane");
+        assert!((p[0] - 10.0).abs() < 1e-3, "x under camera, got {}", p[0]);
+        assert!((p[1] - 20.0).abs() < 1e-3, "y under camera, got {}", p[1]);
+    }
+
+    // GPU vs CPU diverge OFF centre (different focal length) — this is
+    // exactly why the unproject must match the active backend. Same
+    // off-centre pixel, same basis, different world hit.
+    #[test]
+    fn gpu_and_cpu_differ_off_centre() {
+        let pos = [0.0, 0.0, -100.0];
+        let (px, py) = (1000.0, 600.0); // well off centre on a 1280×720 frame
+        let cpu = plane_hit(
+            pos,
+            pixel_ray_cpu(RIGHT, DOWN, FWD_DOWN, px, py, 640.0, 360.0, 640.0),
+            0.0,
+        )
+        .unwrap();
+        let gpu = plane_hit(
+            pos,
+            pixel_ray_gpu(
+                RIGHT,
+                DOWN,
+                FWD_DOWN,
+                px,
+                py,
+                1280.0,
+                720.0,
+                60_f64.to_radians(),
+            ),
+            0.0,
+        )
+        .unwrap();
+        let dx = (cpu[0] - gpu[0]).abs();
+        assert!(
+            dx > 1.0,
+            "CPU and GPU projections should differ off centre (got cpu.x={}, gpu.x={})",
+            cpu[0],
+            gpu[0],
+        );
+    }
+
+    // A ray pointing away from the plane returns None, not a point
+    // behind the camera.
+    #[test]
+    fn plane_behind_camera_is_none() {
+        let dir = pixel_ray_cpu(
+            RIGHT,
+            DOWN,
+            [0.0, 0.0, -1.0],
+            320.0,
+            240.0,
+            320.0,
+            240.0,
+            320.0,
+        );
+        assert!(
+            plane_hit([0.0, 0.0, -100.0], dir, 0.0).is_none(),
+            "ray pointing away from the plane → None",
+        );
+    }
 }
