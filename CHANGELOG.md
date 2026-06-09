@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-09
+
+The **GPU compute-shader renderer** arc (GPU.0–GPU.12) plus the
+**`roxlap-render`** unified renderer facade. Two new published crates
+(`roxlap-gpu`, `roxlap-render`); the existing crates are unchanged
+versus 0.4.2 and are version-bumped only to keep the workspace
+unified. No public-API breakage.
+
+### Added
+
+#### `roxlap-gpu` — GPU compute-shader renderer (new crate, first publish)
+
+- A WGPU + WGSL compute-shader voxel renderer alongside the CPU
+  opticast — "approximately the same retro look, much faster", freeing
+  the CPU budget for game logic. Two-level Amanatides-Woo DDA (outer
+  chunk grid + inner voxel), per-chunk occupancy/colour decompress +
+  upload, multi-grid scene composition with per-grid f64→f32 camera
+  transforms, panoramic sky + fog, per-chunk edit/streaming
+  invalidation, and a KV6 sprite path (instanced model-DDA with CPU
+  frustum cull, screen-tile binning, far-LOD mips, and structural
+  runtime edits).
+- **GPU.11 — scene-grid LOD.** Each chunk's full mip ladder is
+  uploaded (a second occupancy/colour set per level) and the marcher
+  picks a mip per chunk by entry distance. ~2.15× FPS at horizon views
+  on an RTX 3070 Laptop (58→125); tunable via
+  `ROXLAP_GPU_MIP_SCAN_DIST` (default 64, matching the CPU
+  `mip_scan_dist`).
+- Sibling to the CPU path, not a replacement: the byte-exact voxlap
+  oracle stays CPU-only. Falls back gracefully when no WGPU adapter is
+  available.
+
+#### `roxlap-render` — unified CPU/GPU renderer facade (new crate, first publish)
+
+- One `SceneRenderer` over the CPU opticast (presented via
+  `softbuffer`) and the GPU compute marcher (presented via `wgpu`).
+  Owns presentation, the `Scene`→GPU upload / dirty-chunk refresh /
+  per-grid camera transform bridge, the CPU compositor + scratch
+  pool, the sprite reps (CPU draw + GPU registry + carve), and
+  framebuffer capture — and **falls back to the CPU backend
+  automatically** when GPU init fails (the wasm/driver-gap path).
+  Hosts pick a backend with one call and render with one method.
+
+### Fixed
+
+#### `roxlap-gpu` — bedrock-as-solid (opaque cliff/wall faces)
+
+- Vertical wall and cliff faces rendered as sky holes (only the
+  textured top voxel showed). The decompressor dropped the implicit
+  voxlap bedrock interior below a surface to save memory; it is now
+  marked solid in a **second occupancy bitmap** used for hit-testing,
+  while colours stay textured-only — a bedrock hit inherits the
+  surface colour above it. Bedrock costs one bit, not a colour, so the
+  colour array is unchanged; the empty-chunk placeholder stays air so
+  floating objects (the ship) don't grow a spurious floor plane.
+
 ## [0.4.2] — 2026-06-03
 
 Axis-aligned-mip-beams resolution + `phase_remiporend`

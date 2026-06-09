@@ -17,15 +17,15 @@ name = "roxlap-oracle"
 path = "src/main.rs"
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core", version = "0.4" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.4" }
+roxlap-core = { path = "../roxlap-core", version = "0.5" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.5" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 # S1.W: outside-camera regression tests build a synthetic thin-floor
 # scene matching roxlap-host's small test scene to repro the BLACK
 # pentagon. Test-only; does not affect crate publication.
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.4" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.5" }
 
 # R10.1: wasm-bindgen-test scaffolding. Pulled in only when the
 # build target is wasm32; native cargo runs (the bin's golden-diff

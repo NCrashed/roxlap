@@ -10,9 +10,7 @@ description = "GPU compute-shader renderer for the roxlap voxel engine (WGPU + W
 documentation = "https://docs.rs/roxlap-gpu"
 keywords = ["voxlap", "voxel", "wgpu", "compute-shader", "renderer"]
 categories = ["game-development", "graphics", "rendering"]
-# Not yet published — the stage starts with the GPU.0 probe; first
-# release tag (`roxlap-gpu 0.1.0`) lands after GPU.5 per PORTING-GPU.md.
-publish = false
+readme.workspace = true
 
 [dependencies]
 # GPU.0 probe deps — WGPU is the cross-platform compute-shader
@@ -25,7 +23,7 @@ pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { workspace = true }
 # GPU.2: source of `Vxl` chunks for the CPU-side decompressor.
-roxlap-formats = { path = "../roxlap-formats", version = "0.4" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.5" }
 # Shared window/event loop with the rest of the workspace. Pinned to
 # 0.30 to match `roxlap-scene-demo`'s host stack so a future
 # host-side `--gpu` integration plugs into the same App pattern.

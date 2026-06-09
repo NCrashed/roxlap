@@ -7,15 +7,17 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "Unified CPU/GPU renderer facade for the roxlap scene-graph engine — one SceneRenderer over roxlap-core opticast (softbuffer) and roxlap-gpu (wgpu), with automatic CPU fallback."
-# Facade over the path-only roxlap-gpu; not published.
-publish = false
+documentation = "https://docs.rs/roxlap-render"
+keywords = ["voxlap", "voxel", "renderer", "wgpu", "fallback"]
+categories = ["game-development", "graphics", "rendering"]
+readme.workspace = true
 
 [dependencies]
 # Both backends + the scene/world types they consume.
-roxlap-core = { path = "../roxlap-core", version = "0.4" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.4" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.4" }
-roxlap-gpu = { path = "../roxlap-gpu" }
+roxlap-core = { path = "../roxlap-core", version = "0.5" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.5" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.5" }
+roxlap-gpu = { path = "../roxlap-gpu", version = "0.5" }
 glam = { workspace = true }
 # CPU strip-parallel render thread count (caps the ScratchPool slots).
 rayon = { workspace = true }
