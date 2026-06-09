@@ -190,6 +190,10 @@ pub struct GpuRenderer {
     /// [`Self::set_scene_mip_scan_dist`] — the axis-aligned-mip-beams
     /// mitigation (GPU.11.2) pushes it outward if banding appears.
     scene_mip_scan_dist: f32,
+    /// Vertical FOV (radians) the last `render_scene` marched with —
+    /// cached so [`Self::pixel_ray`] reconstructs the matching view ray
+    /// for picking. `0` until the first scene render.
+    last_fov_y_rad: f32,
 }
 
 /// Per-renderer chunk-DDA pipeline state. The compute shader writes
@@ -525,6 +529,7 @@ impl GpuRenderer {
             sprite_lod_px: 4.0,
             // GPU.11.1 — matches the CPU demo's mip_scan_dist=64.
             scene_mip_scan_dist: 64.0,
+            last_fov_y_rad: 0.0,
         })
     }
 
@@ -1334,6 +1339,7 @@ impl GpuRenderer {
             scene.grid_count,
             SCENE_MAX_GRIDS,
         );
+        self.last_fov_y_rad = fov_y_rad; // cached for pixel_ray (picking)
 
         let surf_tex = match self.surface.get_current_texture() {
             Ok(t) => t,
@@ -1928,6 +1934,38 @@ impl GpuRenderer {
         Some(t)
     }
 
+    /// World-space view-ray direction (un-normalised) for window pixel
+    /// `(x, y)`, under the GPU marcher's projection — the canonical GPU
+    /// unproject, mirroring `scene_dda.wgsl`'s `render_scene`
+    /// (vertical-FOV pinhole). Uses the last-rendered frame's target
+    /// size + FOV; `None` before the first scene render. Pair with
+    /// [`Self::read_depth_pixel`] for screen→world picking.
+    #[must_use]
+    pub fn pixel_ray(
+        &self,
+        right: [f64; 3],
+        down: [f64; 3],
+        forward: [f64; 3],
+        x: f64,
+        y: f64,
+    ) -> Option<[f64; 3]> {
+        let dda = self.scene_dda.as_ref()?;
+        let (w, h) = dda.storage_size;
+        if w == 0 || h == 0 || self.last_fov_y_rad <= 0.0 {
+            return None;
+        }
+        Some(pinhole_pixel_ray(
+            right,
+            down,
+            forward,
+            x,
+            y,
+            f64::from(w),
+            f64::from(h),
+            f64::from(self.last_fov_y_rad),
+        ))
+    }
+
     /// GPU.10.1 — upload a sprite model registry + its instances for
     /// the DDA path. An empty instance slice clears all sprites.
     pub fn set_sprite_instances(
@@ -2467,4 +2505,73 @@ fn pick_present_mode(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
         }
     }
     wgpu::PresentMode::Fifo
+}
+
+/// World-space view-ray direction (un-normalised) for window pixel
+/// `(x, y)` under a vertical-FOV pinhole — the projection
+/// `scene_dda.wgsl`'s `render_scene` uses. Shared by
+/// [`GpuRenderer::pixel_ray`]; standalone so it's unit-testable without
+/// a device. `right`/`down`/`forward` are the camera basis.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn pinhole_pixel_ray(
+    right: [f64; 3],
+    down: [f64; 3],
+    forward: [f64; 3],
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    fov_y_rad: f64,
+) -> [f64; 3] {
+    let half_h = (fov_y_rad * 0.5).tan();
+    let half_w = half_h * (w / h);
+    let ndc_x = (x + 0.5) / w * 2.0 - 1.0;
+    let ndc_y_top = 1.0 - (y + 0.5) / h * 2.0;
+    let (kx, ky) = (ndc_x * half_w, ndc_y_top * half_h);
+    [
+        forward[0] + kx * right[0] - ky * down[0],
+        forward[1] + kx * right[1] - ky * down[1],
+        forward[2] + kx * right[2] - ky * down[2],
+    ]
+}
+
+#[cfg(test)]
+mod pixel_ray_tests {
+    use super::pinhole_pixel_ray;
+
+    const RIGHT: [f64; 3] = [1.0, 0.0, 0.0];
+    const DOWN: [f64; 3] = [0.0, 1.0, 0.0];
+    const FWD: [f64; 3] = [0.0, 0.0, 1.0]; // voxlap z-down "look down"
+
+    // Frame centre (NDC 0,0) points straight along `forward`.
+    #[test]
+    fn centre_pixel_is_forward() {
+        let d = pinhole_pixel_ray(
+            RIGHT,
+            DOWN,
+            FWD,
+            639.5,
+            359.5,
+            1280.0,
+            720.0,
+            60_f64.to_radians(),
+        );
+        assert!(
+            d[0].abs() < 1e-9 && d[1].abs() < 1e-9,
+            "centre ≈ forward, got {d:?}"
+        );
+        assert!((d[2] - 1.0).abs() < 1e-9);
+    }
+
+    // Right edge pixel tilts +right by tan(hfov/2); the lateral
+    // component equals half_w = tan(fov_y/2)*aspect at the very edge.
+    #[test]
+    fn right_edge_tilts_by_half_w() {
+        let fov = 60_f64.to_radians();
+        let d = pinhole_pixel_ray(RIGHT, DOWN, FWD, 1279.5, 359.5, 1280.0, 720.0, fov);
+        let half_w = (fov * 0.5).tan() * (1280.0 / 720.0);
+        assert!((d[0] - half_w).abs() < 1e-6, "x={}, half_w={half_w}", d[0]);
+        assert!(d[0] > 0.0, "right edge tilts +right");
+    }
 }

@@ -94,6 +94,17 @@ pub struct FrameParams<'a> {
     pub sprite_lighting: Option<&'a SpriteLighting<'a>>,
 }
 
+/// Result of [`SceneRenderer::pick`] — a resolved screen→world voxel
+/// hit. `world` is the surface point (`cam.pos + t · normalize(ray)`);
+/// `grid` + `voxel` are the owning grid and its **grid-local** voxel
+/// (transform-correct for rotated / translated grids).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PickHit {
+    pub world: [f32; 3],
+    pub grid: roxlap_scene::GridId,
+    pub voxel: glam::IVec3,
+}
+
 /// Which renderer a [`SceneRenderer`] resolved to at construction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
@@ -288,6 +299,54 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.pick_depth(x, y),
             BackendImpl::Gpu(g) => g.pick_depth(x, y),
         }
+    }
+
+    /// World-space view-ray direction (un-normalised) for window pixel
+    /// `(x, y)`, under the projection the **last frame** rendered with.
+    /// The backends differ (CPU `setcamera` vs GPU vertical-FOV
+    /// pinhole), so this hides which one is active. `None` before the
+    /// first frame. Intersect it with a plane for tile picking, or feed
+    /// it to [`Self::pick`] for a voxel.
+    #[must_use]
+    pub fn pixel_ray(&self, camera: &Camera, x: f64, y: f64) -> Option<[f64; 3]> {
+        match &self.inner {
+            BackendImpl::Cpu(c) => c.pixel_ray(camera, x, y),
+            BackendImpl::Gpu(g) => g.pixel_ray(camera, x, y),
+        }
+    }
+
+    /// One-call screen→world voxel pick: unproject pixel `(x, y)` with
+    /// the active backend's projection, read the last frame's depth
+    /// there, reconstruct the world hit, and resolve it to the owning
+    /// grid + grid-local voxel via [`Scene::resolve_voxel`]. `None` on
+    /// sky / no-hit, or when no grid claims the surface.
+    ///
+    /// `scene` and `camera` must be the ones the last frame rendered;
+    /// the projection (size + FOV / `hx,hy,hz`) is taken from that
+    /// frame. Cheap on CPU (in-memory z-buffer); on GPU it stages the
+    /// depth buffer (a click-time device poll — not per frame).
+    #[must_use]
+    pub fn pick(&self, scene: &Scene, camera: &Camera, x: u32, y: u32) -> Option<PickHit> {
+        let dir = self.pixel_ray(camera, f64::from(x), f64::from(y))?;
+        let t = f64::from(self.pick_depth(x, y)?);
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        if len < 1e-9 {
+            return None;
+        }
+        let s = t / len; // world = cam.pos + t · (dir / |dir|)
+        let world = glam::DVec3::new(
+            camera.pos[0] + dir[0] * s,
+            camera.pos[1] + dir[1] * s,
+            camera.pos[2] + dir[2] * s,
+        );
+        let (grid, voxel) = scene.resolve_voxel(world, glam::DVec3::from_array(dir))?;
+        #[allow(clippy::cast_possible_truncation)]
+        let world_f32 = [world.x as f32, world.y as f32, world.z as f32];
+        Some(PickHit {
+            world: world_f32,
+            grid,
+            voxel,
+        })
     }
 }
 

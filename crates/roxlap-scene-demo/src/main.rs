@@ -22,9 +22,7 @@ use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::Engine;
 use roxlap_formats::sprite::Sprite;
-use roxlap_render::{
-    Backend, FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet,
-};
+use roxlap_render::{FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -202,64 +200,10 @@ const PICK_CAM_PITCH: f64 = 1.30; // ~74° down (z-down convention)
 /// The pick unproject must use the same value, so it lives here.
 const GPU_FOV_Y_DEG: f64 = 60.0;
 
-// Screen→world picking, which roxlap ships no helper for. The ray for
-// a window pixel must use the SAME projection the active backend
-// renders with, or the hit drifts off the pointer by an amount that
-// grows with distance from screen centre (a focal-length mismatch).
-// The CPU opticast and the GPU marcher use *different* projections, so
-// there's one ray builder per backend, plus a shared plane intersect.
-
-/// World ray direction for window pixel `(px, py)` under the **CPU
-/// opticast** projection (voxlap `setcamera`): `(px − hx)·right +
-/// (py − hy)·down + hz·forward` — exactly `camera_math::derive`'s
-/// `corn[0]` plus the per-pixel `right`/`down` steps.
-#[allow(clippy::too_many_arguments)]
-fn pixel_ray_cpu(
-    right: [f64; 3],
-    down: [f64; 3],
-    forward: [f64; 3],
-    px: f64,
-    py: f64,
-    hx: f32,
-    hy: f32,
-    hz: f32,
-) -> [f64; 3] {
-    let (a, b, c) = (px - f64::from(hx), py - f64::from(hy), f64::from(hz));
-    [
-        a * right[0] + b * down[0] + c * forward[0],
-        a * right[1] + b * down[1] + c * forward[1],
-        a * right[2] + b * down[2] + c * forward[2],
-    ]
-}
-
-/// World ray direction for window pixel `(px, py)` under the **GPU
-/// marcher** projection — a vertical-FOV pinhole matching
-/// `scene_dda.wgsl`'s `render_scene`:
-/// `forward + ndc_x·half_w·right − ndc_y_top·half_h·down`.
-#[allow(clippy::too_many_arguments)]
-fn pixel_ray_gpu(
-    right: [f64; 3],
-    down: [f64; 3],
-    forward: [f64; 3],
-    px: f64,
-    py: f64,
-    w: f64,
-    h: f64,
-    fov_y_rad: f64,
-) -> [f64; 3] {
-    let aspect = w / h;
-    let half_h = (fov_y_rad * 0.5).tan();
-    let half_w = half_h * aspect;
-    let ndc_x = (px + 0.5) / w * 2.0 - 1.0;
-    let ndc_y_top = 1.0 - (py + 0.5) / h * 2.0;
-    let kx = ndc_x * half_w;
-    let ky = ndc_y_top * half_h;
-    [
-        forward[0] + kx * right[0] - ky * down[0],
-        forward[1] + kx * right[1] - ky * down[1],
-        forward[2] + kx * right[2] - ky * down[2],
-    ]
-}
+// Screen→world picking. The ray-per-backend unproject + depth read +
+// grid resolution now live in the LIBRARY (`SceneRenderer::pixel_ray`
+// / `pick`, `Scene::resolve_voxel`); the demo only keeps the
+// ground-plane intersect below for the continuous hover cursor.
 
 /// Intersect a world ray `pos + t·dir` with the horizontal plane
 /// `z = ground_z`. `None` if the ray is parallel to the plane or the
@@ -516,34 +460,13 @@ impl App {
         if self.pick_mode && self.pick_models.len() >= 2 {
             let cam = self.scene.camera;
             let (mx, my) = self.mouse_px;
-            // Unproject with the projection the ACTIVE backend renders
-            // with — CPU opticast and the GPU marcher differ, and using
-            // the wrong one drifts the cursor off-pointer proportionally
-            // to distance from screen centre.
-            let dir = match renderer.backend() {
-                Backend::Gpu => pixel_ray_gpu(
-                    cam.right,
-                    cam.down,
-                    cam.forward,
-                    mx,
-                    my,
-                    f64::from(size.width),
-                    f64::from(size.height),
-                    f64::from(frame.gpu_fov_y_rad),
-                ),
-                Backend::Cpu => pixel_ray_cpu(
-                    cam.right,
-                    cam.down,
-                    cam.forward,
-                    mx,
-                    my,
-                    settings.hx,
-                    settings.hy,
-                    settings.hz,
-                ),
-            };
-            if let Some(w) = plane_hit(cam.pos, dir, PICK_GROUND_Z) {
-                self.cursor_world = w;
+            // Hover cursor: unproject via the library (matches whichever
+            // backend is active) and drop it on the ground plane. Uses
+            // the previous frame's projection — fine for a cursor.
+            if let Some(dir) = renderer.pixel_ray(&cam, mx, my) {
+                if let Some(w) = plane_hit(cam.pos, dir, PICK_GROUND_Z) {
+                    self.cursor_world = w;
+                }
             }
             let mut instances = vec![SpriteInstanceDesc {
                 model: 0,
@@ -758,49 +681,6 @@ impl App {
             eprintln!("pick mode OFF");
         }
     }
-
-    /// Surface-exact pick: unproject window pixel `(px, py)`, read the
-    /// last frame's depth at that pixel, and reconstruct the world hit
-    /// `cam.pos + t·normalize(dir)`. `None` on sky / no depth / no
-    /// renderer. Uses the active backend's projection for the ray and
-    /// the same backend for the depth, so the two agree.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn precise_pick(&self, px: f64, py: f64) -> Option<[f32; 3]> {
-        let renderer = self.renderer.as_ref()?;
-        let window = self.window.as_ref()?;
-        let size = window.inner_size();
-        if size.width == 0 || size.height == 0 || px < 0.0 || py < 0.0 {
-            return None;
-        }
-        let cam = self.scene.camera;
-        let dir = match renderer.backend() {
-            Backend::Gpu => pixel_ray_gpu(
-                cam.right,
-                cam.down,
-                cam.forward,
-                px,
-                py,
-                f64::from(size.width),
-                f64::from(size.height),
-                GPU_FOV_Y_DEG.to_radians(),
-            ),
-            Backend::Cpu => {
-                let s = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
-                pixel_ray_cpu(cam.right, cam.down, cam.forward, px, py, s.hx, s.hy, s.hz)
-            }
-        };
-        let t = f64::from(renderer.pick_depth(px as u32, py as u32)?);
-        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-        if len < 1e-9 {
-            return None;
-        }
-        let s = t / len; // world = pos + t · (dir / |dir|)
-        Some([
-            (cam.pos[0] + dir[0] * s) as f32,
-            (cam.pos[1] + dir[1] * s) as f32,
-            (cam.pos[2] + dir[2] * s) as f32,
-        ])
-    }
 }
 
 impl ApplicationHandler for App {
@@ -897,28 +777,43 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 if self.pick_mode {
-                    let (px, py) = self.mouse_px;
-                    // Surface-exact: read the depth buffer at the click
-                    // pixel → which voxel. Fall back to the ground-plane
-                    // cursor for sky clicks (no surface hit).
-                    let (world, exact) = match self.precise_pick(px, py) {
-                        Some(w) => (w, true),
-                        None => (self.cursor_world, false),
-                    };
-                    self.placed.push(world);
-                    let voxel = [
-                        world[0].floor() as i32,
-                        world[1].floor() as i32,
-                        world[2].floor() as i32,
-                    ];
-                    eprintln!(
-                        "{} hit at [{:.1}, {:.1}, {:.1}] → voxel {voxel:?} ({} placed)",
-                        if exact { "surface" } else { "ground-plane" },
-                        world[0],
-                        world[1],
-                        world[2],
-                        self.placed.len(),
-                    );
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let (px, py) = (self.mouse_px.0 as u32, self.mouse_px.1 as u32);
+                    // One library call: unproject → depth read → owning
+                    // grid + grid-local voxel. Sky clicks (None) fall
+                    // back to the ground-plane hover cursor.
+                    let hit = self
+                        .renderer
+                        .as_ref()
+                        .and_then(|r| r.pick(&self.scene.scene, &self.scene.camera, px, py));
+                    match hit {
+                        Some(h) => {
+                            self.placed.push(h.world);
+                            eprintln!(
+                                "surface [{:.1}, {:.1}, {:.1}] → grid #{} voxel ({}, {}, {}) \
+                                 ({} placed)",
+                                h.world[0],
+                                h.world[1],
+                                h.world[2],
+                                h.grid.raw(),
+                                h.voxel.x,
+                                h.voxel.y,
+                                h.voxel.z,
+                                self.placed.len(),
+                            );
+                        }
+                        None => {
+                            let world = self.cursor_world;
+                            self.placed.push(world);
+                            eprintln!(
+                                "ground-plane [{:.1}, {:.1}, {:.1}] ({} placed)",
+                                world[0],
+                                world[1],
+                                world[2],
+                                self.placed.len(),
+                            );
+                        }
+                    }
                 } else {
                     self.set_grab(true);
                 }
@@ -1148,111 +1043,41 @@ fn write_capture(
 
 #[cfg(test)]
 mod pick_tests {
-    use super::{pixel_ray_cpu, pixel_ray_gpu, plane_hit};
+    use super::plane_hit;
 
-    const RIGHT: [f64; 3] = [1.0, 0.0, 0.0];
-    const DOWN: [f64; 3] = [0.0, 1.0, 0.0];
-    const FWD_DOWN: [f64; 3] = [0.0, 0.0, 1.0]; // voxlap z-down "look down"
+    // The ray→world unproject (per-backend projection) is tested in
+    // roxlap-render; here we cover only the demo's ground-plane
+    // intersect used for the hover cursor.
 
-    // CPU: the centre pixel (hx, hy) looks straight down `forward`, so
-    // it must unproject to the point directly under the camera.
+    // A straight-down ray from above the plane hits directly below the
+    // camera, on the plane.
     #[test]
-    fn cpu_centre_pixel_lands_under_camera() {
-        let pos = [10.0, 20.0, -100.0];
-        let dir = pixel_ray_cpu(RIGHT, DOWN, FWD_DOWN, 320.0, 240.0, 320.0, 240.0, 320.0);
-        let p = plane_hit(pos, dir, 0.0).expect("ray hits the plane");
+    fn straight_down_hits_under_camera() {
+        let p = plane_hit([10.0, 20.0, -100.0], [0.0, 0.0, 1.0], 0.0).expect("hits the plane");
         assert!((p[0] - 10.0).abs() < 1e-3, "x under camera, got {}", p[0]);
         assert!((p[1] - 20.0).abs() < 1e-3, "y under camera, got {}", p[1]);
         assert!((p[2] - 0.0).abs() < 1e-3, "on the plane, got {}", p[2]);
     }
 
-    // CPU: a pixel right-of / below centre lands at greater world x / y,
-    // with the exact magnitude `(px-hx)·t` (hz=320, t=100/320).
+    // A slanted ray scales its lateral offset by the t to the plane:
+    // dir=(2,1,1) from z=-100 to z=0 → t=100 → (+200, +100).
     #[test]
-    fn cpu_offcentre_pixel_shifts_hit() {
-        let dir = pixel_ray_cpu(RIGHT, DOWN, FWD_DOWN, 384.0, 272.0, 320.0, 240.0, 320.0);
-        let p = plane_hit([0.0, 0.0, -100.0], dir, 0.0).expect("ray hits the plane");
-        assert!((p[0] - 20.0).abs() < 1e-2, "x = (px-hx)*t, got {}", p[0]); // 64*100/320
-        assert!((p[1] - 10.0).abs() < 1e-2, "y = (py-hy)*t, got {}", p[1]); // 32*100/320
+    fn slanted_ray_scales_by_t() {
+        let p = plane_hit([0.0, 0.0, -100.0], [2.0, 1.0, 1.0], 0.0).expect("hits the plane");
+        assert!((p[0] - 200.0).abs() < 1e-2, "x, got {}", p[0]);
+        assert!((p[1] - 100.0).abs() < 1e-2, "y, got {}", p[1]);
     }
 
-    // GPU: the centre pixel (NDC 0,0) also looks straight down, landing
-    // under the camera — backend-independent at the centre (the bug the
-    // user hit only showed *off* centre).
+    // Parallel to the plane, or pointing away from it → None.
     #[test]
-    fn gpu_centre_pixel_lands_under_camera() {
-        let pos = [10.0, 20.0, -100.0];
-        // Pixel centre of an even-sized frame is (w/2 - 0.5, h/2 - 0.5)
-        // so that (px+0.5)/w*2-1 == 0.
-        let dir = pixel_ray_gpu(
-            RIGHT,
-            DOWN,
-            FWD_DOWN,
-            639.5,
-            359.5,
-            1280.0,
-            720.0,
-            60_f64.to_radians(),
-        );
-        let p = plane_hit(pos, dir, 0.0).expect("ray hits the plane");
-        assert!((p[0] - 10.0).abs() < 1e-3, "x under camera, got {}", p[0]);
-        assert!((p[1] - 20.0).abs() < 1e-3, "y under camera, got {}", p[1]);
-    }
-
-    // GPU vs CPU diverge OFF centre (different focal length) — this is
-    // exactly why the unproject must match the active backend. Same
-    // off-centre pixel, same basis, different world hit.
-    #[test]
-    fn gpu_and_cpu_differ_off_centre() {
-        let pos = [0.0, 0.0, -100.0];
-        let (px, py) = (1000.0, 600.0); // well off centre on a 1280×720 frame
-        let cpu = plane_hit(
-            pos,
-            pixel_ray_cpu(RIGHT, DOWN, FWD_DOWN, px, py, 640.0, 360.0, 640.0),
-            0.0,
-        )
-        .unwrap();
-        let gpu = plane_hit(
-            pos,
-            pixel_ray_gpu(
-                RIGHT,
-                DOWN,
-                FWD_DOWN,
-                px,
-                py,
-                1280.0,
-                720.0,
-                60_f64.to_radians(),
-            ),
-            0.0,
-        )
-        .unwrap();
-        let dx = (cpu[0] - gpu[0]).abs();
+    fn degenerate_rays_are_none() {
         assert!(
-            dx > 1.0,
-            "CPU and GPU projections should differ off centre (got cpu.x={}, gpu.x={})",
-            cpu[0],
-            gpu[0],
-        );
-    }
-
-    // A ray pointing away from the plane returns None, not a point
-    // behind the camera.
-    #[test]
-    fn plane_behind_camera_is_none() {
-        let dir = pixel_ray_cpu(
-            RIGHT,
-            DOWN,
-            [0.0, 0.0, -1.0],
-            320.0,
-            240.0,
-            320.0,
-            240.0,
-            320.0,
+            plane_hit([0.0, 0.0, -100.0], [1.0, 0.0, 0.0], 0.0).is_none(),
+            "parallel to plane → None",
         );
         assert!(
-            plane_hit([0.0, 0.0, -100.0], dir, 0.0).is_none(),
-            "ray pointing away from the plane → None",
+            plane_hit([0.0, 0.0, -100.0], [0.0, 0.0, -1.0], 0.0).is_none(),
+            "pointing away → None",
         );
     }
 }

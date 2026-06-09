@@ -19,6 +19,31 @@ use winit::window::Window;
 
 use crate::{FrameParams, RenderOptions, SpriteSet};
 
+/// World-space view-ray direction (un-normalised) for window pixel
+/// `(x, y)` under the CPU opticast projection (voxlap `setcamera`):
+/// `(x − hx)·right + (y − hy)·down + hz·forward` — `camera_math`'s
+/// `corn[0]` plus the per-pixel `right`/`down` steps. Standalone so
+/// it's unit-testable without a window.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn setcamera_pixel_ray(
+    right: [f64; 3],
+    down: [f64; 3],
+    forward: [f64; 3],
+    x: f64,
+    y: f64,
+    hx: f32,
+    hy: f32,
+    hz: f32,
+) -> [f64; 3] {
+    let (a, b, c) = (x - f64::from(hx), y - f64::from(hy), f64::from(hz));
+    [
+        a * right[0] + b * down[0] + c * forward[0],
+        a * right[1] + b * down[1] + c * forward[1],
+        a * right[2] + b * down[2] + c * forward[2],
+    ]
+}
+
 pub(crate) struct CpuBackend {
     window: Arc<Window>,
     /// `softbuffer::Context` is dropped after surface creation — the
@@ -30,6 +55,10 @@ pub(crate) struct CpuBackend {
     /// Framebuffer dimensions of the last `render` — the `zbuffer`
     /// stride for [`Self::pick_depth`].
     last_dims: (u32, u32),
+    /// Opticast projection params `(hx, hy, hz)` of the last `render`,
+    /// from its [`OpticastSettings`] — the CPU unproject for
+    /// [`Self::pixel_ray`].
+    last_hxyz: (f32, f32, f32),
     /// Widest combined-grid `vsid` the pool's `lastx` is sized for;
     /// kept so a window grow can re-create the pool.
     max_grid_vsid: u32,
@@ -65,6 +94,7 @@ impl CpuBackend {
             pool,
             zbuffer,
             last_dims: (w, h),
+            last_hxyz: (0.0, 0.0, 0.0),
             max_grid_vsid: opts.cpu_max_grid_vsid,
             n_threads,
             clear_sky: opts.clear_sky,
@@ -82,6 +112,27 @@ impl CpuBackend {
     /// Take the most recently captured frame, if any.
     pub(crate) fn take_capture(&mut self) -> Option<(Vec<u32>, u32, u32)> {
         self.captured.take()
+    }
+
+    /// World-space view-ray direction (un-normalised) for pixel
+    /// `(x, y)` under the CPU opticast projection (voxlap `setcamera`):
+    /// `(x - hx)·right + (y - hy)·down + hz·forward`, using the last
+    /// frame's `(hx, hy, hz)`. `None` before the first render.
+    pub(crate) fn pixel_ray(&self, camera: &Camera, x: f64, y: f64) -> Option<[f64; 3]> {
+        let (hx, hy, hz) = self.last_hxyz;
+        if hz <= 0.0 {
+            return None;
+        }
+        Some(setcamera_pixel_ray(
+            camera.right,
+            camera.down,
+            camera.forward,
+            x,
+            y,
+            hx,
+            hy,
+            hz,
+        ))
     }
 
     /// World-t depth at pixel `(x, y)` from the last frame's z-buffer
@@ -128,6 +179,7 @@ impl CpuBackend {
         let (width, height) = (size.width, size.height);
         let pixel_count = (width as usize) * (height as usize);
         self.last_dims = (width, height);
+        self.last_hxyz = (frame.settings.hx, frame.settings.hy, frame.settings.hz);
 
         // Grow the z-buffer + pool to follow a window resize.
         if self.zbuffer.len() < pixel_count {
@@ -207,5 +259,28 @@ impl CpuBackend {
         }
 
         buffer.present().expect("softbuffer: present");
+    }
+}
+
+#[cfg(test)]
+mod cpu_ray_tests {
+    use super::setcamera_pixel_ray;
+
+    const RIGHT: [f64; 3] = [1.0, 0.0, 0.0];
+    const DOWN: [f64; 3] = [0.0, 1.0, 0.0];
+    const FWD: [f64; 3] = [0.0, 0.0, 1.0]; // voxlap z-down "look down"
+
+    // Centre pixel (hx, hy) → straight along `forward`.
+    #[test]
+    fn centre_pixel_is_forward() {
+        let d = setcamera_pixel_ray(RIGHT, DOWN, FWD, 320.0, 240.0, 320.0, 240.0, 320.0);
+        assert_eq!(d, [0.0, 0.0, 320.0]);
+    }
+
+    // Off-centre pixel tilts proportionally: (px-hx, py-hy, hz).
+    #[test]
+    fn offcentre_pixel_tilts_linearly() {
+        let d = setcamera_pixel_ray(RIGHT, DOWN, FWD, 384.0, 272.0, 320.0, 240.0, 320.0);
+        assert_eq!(d, [64.0, 32.0, 320.0]);
     }
 }

@@ -9,10 +9,10 @@
 //! [`Grid::chunks`]: crate::Grid::chunks
 
 use glam::IVec3;
-use roxlap_formats::edit::{set_spans, Vspan};
+use roxlap_formats::edit::{expandrle, set_spans, Vspan};
 use roxlap_formats::vxl::Vxl;
 
-use crate::{Grid, CHUNK_SIZE_XY};
+use crate::{Grid, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
 /// Bytes of edit-pool headroom reserved per chunk on creation.
 /// 256 bytes/column × 128² columns ≈ 4 MiB; a generous budget for
@@ -84,7 +84,47 @@ pub(crate) fn empty_chunk_vxl() -> Vxl {
     vxl
 }
 
+/// True if voxel `(x, y, z)` is solid within one chunk's [`Vxl`] —
+/// i.e. covered by a solid run in column `(x, y)`. Walks the column's
+/// expanded `[top, bot)` run list (voxlap b2 convention). `(x, y)` are
+/// `< CHUNK_SIZE_XY`, `z < CHUNK_SIZE_Z`.
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) fn vxl_voxel_solid(vxl: &Vxl, x: u32, y: u32, z: u32) -> bool {
+    let idx = (y * vxl.vsid + x) as usize;
+    let column = vxl.column_data(idx);
+    // Pre-fill with the MAXZDIM sentinel so unwritten slots terminate
+    // the walk (matches voxlap's b2 init convention).
+    let maxzdim = CHUNK_SIZE_Z as i32;
+    let mut b2 = vec![maxzdim; 2 * (CHUNK_SIZE_Z as usize) + 4];
+    expandrle(column, &mut b2);
+    let z = z as i32;
+    let mut i = 0;
+    while b2[i] < maxzdim {
+        let (top, bot) = (b2[i], b2[i + 1]);
+        if z >= top && z < bot {
+            return true;
+        }
+        i += 2;
+    }
+    false
+}
+
 impl Grid {
+    /// True if the grid-local integer voxel `voxel` is solid (inside a
+    /// solid run of its chunk). An implicit-air or absent chunk reads
+    /// as `false`. `voxel` is a grid-local voxel coordinate
+    /// (pre-transform) — get one from a world point via
+    /// [`crate::world_to_grid_local`] + [`crate::voxel_global`]. Useful
+    /// for picking, collision, and world queries.
+    #[must_use]
+    pub fn voxel_solid(&self, voxel: IVec3) -> bool {
+        let (chunk_idx, in_chunk) = crate::voxel_split(voxel);
+        match self.chunk(chunk_idx) {
+            Some(vxl) => vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z),
+            None => false,
+        }
+    }
+
     /// Borrow the chunk at `chunk_idx` if it has been materialised.
     /// `None` means the chunk is implicitly all-air.
     #[must_use]
@@ -289,34 +329,39 @@ pub struct ChunkXyBacking<'a> {
 pub(crate) mod tests {
     use super::*;
     use crate::{GridTransform, CHUNK_SIZE_Z};
-    use roxlap_formats::edit::expandrle;
 
     /// Decode `column`'s slab bytes and return `true` iff `z` is
     /// covered by any solid run. Mirrors voxlap's column-walk
     /// semantics — the b2 buffer is `[top0, bot0, top1, bot1, ...,
     /// MAXZDIM_sentinel]`, with each `[top, bot)` pair denoting a
     /// solid range.
-    #[allow(clippy::cast_possible_wrap)]
     pub(crate) fn voxel_is_solid(vxl: &Vxl, x: u32, y: u32, z: u32) -> bool {
-        let idx = (y * vxl.vsid + x) as usize;
-        let column = vxl.column_data(idx);
-        // Pre-fill with MAXZDIM so unwritten slots terminate the walk
-        // (matches voxlap's b2 init convention in `all_air_neighbor`
-        // and friends — expandrle only writes the prefix it needs).
-        let maxzdim = CHUNK_SIZE_Z as i32;
-        let mut b2 = vec![maxzdim; 2 * (CHUNK_SIZE_Z as usize) + 4];
-        expandrle(column, &mut b2);
-        let z = z as i32;
-        let mut i = 0;
-        while b2[i] < maxzdim {
-            let top = b2[i];
-            let bot = b2[i + 1];
-            if z >= top && z < bot {
-                return true;
-            }
-            i += 2;
-        }
-        false
+        super::vxl_voxel_solid(vxl, x, y, z)
+    }
+
+    #[test]
+    fn voxel_solid_reflects_set_voxel() {
+        // Grid::voxel_solid (the public picking query) reads back an
+        // edit: the set voxel is solid, its neighbour is air, and an
+        // unmaterialised chunk reads as air.
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_voxel(IVec3::new(5, 6, 7), Some(0x80_aa_bb_cc));
+        assert!(g.voxel_solid(IVec3::new(5, 6, 7)), "set voxel is solid");
+        assert!(!g.voxel_solid(IVec3::new(5, 6, 8)), "neighbour is air");
+        assert!(
+            !g.voxel_solid(IVec3::new(900, 900, 7)),
+            "absent chunk reads as air",
+        );
+    }
+
+    #[test]
+    fn voxel_solid_handles_negative_coords() {
+        // Negative grid-local voxels decompose via div_euclid (addr
+        // semantics); the query must follow the same split.
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_voxel(IVec3::new(-1, -1, 10), Some(0x80_11_22_33));
+        assert!(g.voxel_solid(IVec3::new(-1, -1, 10)));
+        assert!(!g.voxel_solid(IVec3::new(-1, -1, 11)));
     }
 
     #[test]

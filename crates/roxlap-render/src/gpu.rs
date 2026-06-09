@@ -134,6 +134,13 @@ impl GpuBackend {
         self.gpu.read_depth_pixel(x, y)
     }
 
+    /// World-space view ray for pixel `(x, y)` under the GPU marcher's
+    /// projection. See [`SceneRenderer::pixel_ray`].
+    pub(crate) fn pixel_ray(&self, camera: &Camera, x: f64, y: f64) -> Option<[f64; 3]> {
+        self.gpu
+            .pixel_ray(camera.right, camera.down, camera.forward, x, y)
+    }
+
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         self.gpu.resize(width, height);
     }

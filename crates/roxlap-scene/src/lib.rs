@@ -476,6 +476,35 @@ impl Scene {
         self.grids.iter_mut().map(|(id, g)| (*id, g))
     }
 
+    /// Resolve a world-space surface hit to the owning grid + its
+    /// grid-local voxel — the picking back half. `ray_dir` is the view
+    /// direction the hit was found along (need not be normalised); the
+    /// point is nudged half a voxel along it, past the surface and into
+    /// the solid cell, before each grid's [`Grid::voxel_solid`] test.
+    /// Returns the first grid that is solid there (transform-correct
+    /// for rotated/translated grids), or `None` if none claims it.
+    ///
+    /// Backend-agnostic: pair with a renderer depth read to turn a
+    /// click into a voxel — `world = cam.pos + t · normalize(ray_dir)`,
+    /// then `resolve_voxel(world, ray_dir)`. `roxlap-render`'s
+    /// `SceneRenderer::pick` wires exactly that.
+    #[must_use]
+    pub fn resolve_voxel(&self, world: DVec3, ray_dir: DVec3) -> Option<(GridId, IVec3)> {
+        let len = ray_dir.length();
+        if len < 1e-9 {
+            return None;
+        }
+        let inside = world + ray_dir * (0.5 / len); // half a voxel inward
+        for (id, grid) in self.grids() {
+            let glp = addr::world_to_grid_local(inside, &grid.transform);
+            let v = addr::voxel_global(glp.chunk, glp.voxel);
+            if grid.voxel_solid(v) {
+                return Some((id, v));
+            }
+        }
+        None
+    }
+
     /// Configure the number of worker threads in the dedicated
     /// streaming pool (S7.3).
     ///
