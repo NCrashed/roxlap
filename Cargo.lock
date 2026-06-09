@@ -1779,6 +1779,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxlap-render"
+version = "0.4.2"
+dependencies = [
+ "glam",
+ "rayon",
+ "roxlap-core",
+ "roxlap-formats",
+ "roxlap-gpu",
+ "roxlap-scene",
+ "softbuffer",
+ "winit",
+]
+
+[[package]]
 name = "roxlap-scene"
 version = "0.4.2"
 dependencies = [
@@ -1798,12 +1812,10 @@ version = "0.4.2"
 dependencies = [
  "glam",
  "png",
- "rayon",
  "roxlap-core",
  "roxlap-formats",
- "roxlap-gpu",
+ "roxlap-render",
  "roxlap-scene",
- "softbuffer",
  "winit",
 ]
 
