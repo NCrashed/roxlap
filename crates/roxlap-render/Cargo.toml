@@ -29,6 +29,16 @@ softbuffer = "0.4"
 # provider the host passes (winit, SDL, GLFW, …). Re-exported from the
 # crate root so hosts can name the bounds without their own dep.
 raw-window-handle = "0.6"
+# Optional `hud` feature: egui overlay support. CPU backend needs only
+# egui's tessellation types (software-rasterised here); the GPU backend
+# delegates to egui-wgpu inside roxlap-gpu (enabled via roxlap-gpu/hud).
+egui = { version = "0.29", optional = true }
+
+[features]
+# Overlay an egui UI on top of the rendered frame (`SceneRenderer::
+# paint_egui`). Pulls egui's tessellation types for the CPU
+# software-rasteriser and turns on roxlap-gpu's egui-wgpu paint path.
+hud = ["dep:egui", "roxlap-gpu/hud"]
 
 [dev-dependencies]
 # Doctests/examples construct a winit window to drive the facade; the

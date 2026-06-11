@@ -20,6 +20,8 @@
 #![forbid(unsafe_code)]
 
 mod cpu;
+#[cfg(feature = "hud")]
+mod cpu_egui;
 mod gpu;
 
 use std::sync::Arc;
@@ -35,6 +37,10 @@ pub use roxlap_gpu::{GpuInitError, GpuRendererSettings};
 // Re-exported so hosts can name the [`SceneRenderer::new`] bounds
 // without adding a direct `raw-window-handle` dependency of their own.
 pub use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+// Re-exported so hosts feed [`SceneRenderer::paint_egui`] from the exact
+// egui version the renderer was built against (`hud` feature).
+#[cfg(feature = "hud")]
+pub use egui;
 
 use crate::cpu::CpuBackend;
 use crate::gpu::GpuBackend;
@@ -260,15 +266,54 @@ impl SceneRenderer {
         }
     }
 
-    /// Render `scene` from `view` with `frame` params and present to
-    /// the window. The CPU backend fills sky, runs the opticast
-    /// compositor, and presents via softbuffer; the GPU backend
-    /// uploads/refreshes the scene and runs the compute marcher, then
-    /// the sprite pass.
+    /// Composite `scene` from `camera` with `frame` params into the
+    /// backend's frame buffer — **without presenting**. The CPU backend
+    /// fills sky + runs the opticast compositor into an owned buffer;
+    /// the GPU backend uploads/refreshes the scene, runs the compute
+    /// marcher + sprite pass, and acquires (but does not present) the
+    /// swapchain frame.
+    ///
+    /// Finish the frame with exactly one of [`present`](Self::present)
+    /// (no overlay) or [`paint_egui`](Self::paint_egui) (UI overlay).
+    /// Calling `render` again without finishing drops the pending frame.
     pub fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.render(scene, camera, frame),
             BackendImpl::Gpu(g) => g.render(scene, camera, frame),
+        }
+    }
+
+    /// Present the frame [`render`](Self::render) composited, with no UI
+    /// overlay. Pairs with `render`; use [`paint_egui`](Self::paint_egui)
+    /// instead to overlay an egui UI before presenting.
+    pub fn present(&mut self) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.present(),
+            BackendImpl::Gpu(g) => g.present(),
+        }
+    }
+
+    /// Overlay an egui UI on the frame [`render`](Self::render)
+    /// composited, then present it (`hud` feature). The host runs egui
+    /// itself (e.g. `egui` + `egui-winit`) and passes the tessellated
+    /// `jobs` ([`egui::Context::tessellate`]) and the per-frame
+    /// `textures` delta from [`egui::FullOutput`]; `pixels_per_point` is
+    /// the UI scale (`ctx.pixels_per_point()`).
+    ///
+    /// The GPU backend paints via `egui-wgpu`; the CPU backend
+    /// software-rasterises the tessellation into its framebuffer. Use
+    /// this **instead of** [`present`](Self::present) — both finish the
+    /// frame.
+    #[cfg(feature = "hud")]
+    pub fn paint_egui(
+        &mut self,
+        jobs: &[egui::ClippedPrimitive],
+        textures: &egui::TexturesDelta,
+        pixels_per_point: f32,
+    ) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.paint_egui(jobs, textures, pixels_per_point),
+            BackendImpl::Gpu(g) => g.paint_egui(jobs, textures, pixels_per_point),
         }
     }
 

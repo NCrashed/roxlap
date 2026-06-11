@@ -79,6 +79,16 @@ pub(crate) struct CpuBackend {
     /// buffer into `captured` before presenting.
     capture_next: bool,
     captured: Option<(Vec<u32>, u32, u32)>,
+    /// Owned composited frame (`0x00RRGGBB`), sized `width*height` of the
+    /// last [`Self::render`]. `render` composites the scene + sprites
+    /// here without touching the window; [`Self::present`] blits it into
+    /// the softbuffer surface and presents, and [`Self::paint_egui`]
+    /// rasterises egui over it first. Decoupling the composite from the
+    /// present lets a host slot a UI pass between them.
+    framebuffer: Vec<u32>,
+    /// egui atlas cache + software rasteriser (`hud` feature).
+    #[cfg(feature = "hud")]
+    egui_raster: crate::cpu_egui::EguiRaster,
 }
 
 impl CpuBackend {
@@ -102,6 +112,7 @@ impl CpuBackend {
             .clamp(1, rayon::current_num_threads().max(1));
         let pool = ScratchPool::new_parallel(w, h, opts.cpu_max_grid_vsid, n_threads);
         let zbuffer = vec![f32::INFINITY; (w as usize) * (h as usize)];
+        let framebuffer = vec![opts.clear_sky; (w as usize) * (h as usize)];
 
         Self {
             surface,
@@ -116,6 +127,9 @@ impl CpuBackend {
             sprites: Vec::new(),
             capture_next: false,
             captured: None,
+            framebuffer,
+            #[cfg(feature = "hud")]
+            egui_raster: crate::cpu_egui::EguiRaster::default(),
         }
     }
 
@@ -189,11 +203,10 @@ impl CpuBackend {
     }
 
     pub(crate) fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
-        let (cur_w, cur_h) = self.current_dims;
-        let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(cur_w), NonZeroU32::new(cur_h)) else {
+        let (width, height) = self.current_dims;
+        if width == 0 || height == 0 {
             return;
-        };
-        let (width, height) = (cur_w, cur_h);
+        }
         let pixel_count = (width as usize) * (height as usize);
         self.last_dims = (width, height);
         self.last_hxyz = (frame.settings.hx, frame.settings.hy, frame.settings.hz);
@@ -216,13 +229,16 @@ impl CpuBackend {
         self.pool.set_fog(fog_i, frame.fog_max_scan_dist);
         self.pool.set_treat_z_max_as_air(frame.treat_z_max_as_air);
 
-        self.surface.resize(w_nz, h_nz).expect("softbuffer: resize");
-        let mut buffer = self.surface.buffer_mut().expect("softbuffer: buffer_mut");
-
+        // Composite into the owned framebuffer (not the window) so the
+        // present can be deferred — a host may paint a UI over it first.
         // `render_scene_composed` convention: caller pre-fills the
         // framebuffer with sky + the z-buffer with +INF, then it
         // z-merges every grid in.
-        for px in buffer.iter_mut() {
+        if self.framebuffer.len() < pixel_count {
+            self.framebuffer.resize(pixel_count, self.clear_sky);
+        }
+        let fb = &mut self.framebuffer[..pixel_count];
+        for px in fb.iter_mut() {
             *px = self.clear_sky;
         }
         for z in &mut self.zbuffer[..pixel_count] {
@@ -230,7 +246,7 @@ impl CpuBackend {
         }
 
         let _outcome = render_scene_composed(
-            &mut buffer,
+            fb,
             &mut self.zbuffer[..pixel_count],
             width as usize,
             width,
@@ -257,7 +273,7 @@ impl CpuBackend {
                     frame.settings.hz,
                 );
                 let mut target = DrawTarget::new(
-                    &mut buffer,
+                    fb,
                     &mut self.zbuffer[..pixel_count],
                     width as usize,
                     width,
@@ -272,10 +288,60 @@ impl CpuBackend {
 
         if self.capture_next {
             self.capture_next = false;
-            self.captured = Some((buffer.to_vec(), width, height));
+            self.captured = Some((fb.to_vec(), width, height));
         }
+        // No present here — the host calls `present` or `paint_egui`.
+    }
 
+    /// Blit the composited [`Self::framebuffer`] into the softbuffer
+    /// surface and present it. The no-UI counterpart to
+    /// [`Self::paint_egui`]; both finish the frame `render` started.
+    pub(crate) fn present(&mut self) {
+        self.blit_and_present(self.last_dims);
+    }
+
+    /// Shared tail of `present` / `paint_egui`: copy the framebuffer to
+    /// the window surface at `(width, height)` and present.
+    fn blit_and_present(&mut self, dims: (u32, u32)) {
+        let (width, height) = dims;
+        let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
+            return;
+        };
+        let pixel_count = (width as usize) * (height as usize);
+        if self.framebuffer.len() < pixel_count {
+            return;
+        }
+        self.surface.resize(w_nz, h_nz).expect("softbuffer: resize");
+        let mut buffer = self.surface.buffer_mut().expect("softbuffer: buffer_mut");
+        buffer[..pixel_count].copy_from_slice(&self.framebuffer[..pixel_count]);
         buffer.present().expect("softbuffer: present");
+    }
+
+    /// Software-rasterise the egui `jobs` over the composited
+    /// framebuffer, then present (`hud` feature). Replaces
+    /// [`Self::present`] for the UI-overlay path.
+    #[cfg(feature = "hud")]
+    pub(crate) fn paint_egui(
+        &mut self,
+        jobs: &[egui::ClippedPrimitive],
+        textures: &egui::TexturesDelta,
+        pixels_per_point: f32,
+    ) {
+        let (width, height) = self.last_dims;
+        let pixel_count = (width as usize) * (height as usize);
+        if self.framebuffer.len() < pixel_count {
+            return;
+        }
+        self.egui_raster
+            .update_textures(&textures.set, &textures.free);
+        self.egui_raster.paint(
+            &mut self.framebuffer[..pixel_count],
+            width,
+            height,
+            jobs,
+            pixels_per_point,
+        );
+        self.blit_and_present((width, height));
     }
 }
 

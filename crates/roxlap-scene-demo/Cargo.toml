@@ -23,9 +23,15 @@ roxlap-formats = { path = "../roxlap-formats", version = "0.6" }
 # Scene→GPU bridge + the CPU compositor; `ROXLAP_GPU=1` selects the
 # GPU backend with automatic CPU fallback. The demo no longer touches
 # roxlap-gpu or softbuffer directly.
-roxlap-render = { path = "../roxlap-render" }
+roxlap-render = { path = "../roxlap-render", features = ["hud"] }
 roxlap-scene = { path = "../roxlap-scene", version = "0.6" }
 winit = "0.30"
+# HUD overlay: the host runs egui itself and feeds the tessellated
+# output to `SceneRenderer::paint_egui`. egui-winit translates winit
+# events into egui input. Pinned to 0.29 to match roxlap-render's egui
+# (egui-winit 0.29 → winit 0.30).
+egui = "0.29"
+egui-winit = "0.29"
 
 [lints]
 workspace = true

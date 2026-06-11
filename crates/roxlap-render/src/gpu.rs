@@ -236,9 +236,26 @@ impl GpuBackend {
                 frame.gpu_max_outer_steps,
             );
         } else {
-            // No materialised grids yet — clear to colour.
-            self.gpu.render();
+            // No materialised grids yet — clear to colour (deferred, so
+            // a HUD can still be painted over the empty scene).
+            self.gpu.render_clear_deferred();
         }
+    }
+
+    /// Present the frame `render` composited, with no UI overlay.
+    pub(crate) fn present(&mut self) {
+        self.gpu.present();
+    }
+
+    /// Overlay egui on the pending frame, then present (`hud` feature).
+    #[cfg(feature = "hud")]
+    pub(crate) fn paint_egui(
+        &mut self,
+        jobs: &[egui::ClippedPrimitive],
+        textures: &egui::TexturesDelta,
+        pixels_per_point: f32,
+    ) {
+        self.gpu.paint_egui(jobs, textures, pixels_per_point);
     }
 
     /// Decompress every materialised chunk of every grid and upload as

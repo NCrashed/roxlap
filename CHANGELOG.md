@@ -7,7 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **egui overlay seam (`hud` feature).** A renderer-level path to draw an
+  egui UI (HUD, debug panels, menus) on top of the rendered frame, on
+  **both** backends. `SceneRenderer::paint_egui(jobs, textures,
+  pixels_per_point)` takes the host's tessellated egui output and:
+  - GPU — paints via `egui-wgpu` (`LoadOp::Load` over the marcher's
+    frame);
+  - CPU — software-rasterises the tessellation (textured triangles,
+    font/image atlas, premultiplied src-over) into the framebuffer.
+
+  The host runs egui itself (e.g. `egui` + `egui-winit`); roxlap consumes
+  only `egui::ClippedPrimitive`s + the `TexturesDelta`. `roxlap-render`
+  re-exports `egui` (under `hud`) so the host builds against the exact
+  version. Pin: `egui`/`egui-wgpu` `0.29` (→ wgpu 22), `egui-winit`
+  `0.29` (→ winit 0.30). `roxlap-scene-demo` shows a live FPS/pose HUD
+  (toggle with `F1`).
+
+- **`roxlap-sdl-demo`** — an SDL2 host demo (WASD + mouse-look fly
+  camera over a small voxel scene) that drives the exact same
+  `SceneRenderer` as the winit `roxlap-scene-demo`, proving the windowing
+  decoupling end-to-end. Includes a `Send + Sync` raw-handle adapter
+  pattern for window providers (like SDL) whose window type is
+  `!Send`/`!Sync`. `nix develop` now provides `SDL2`.
+
 ### Changed
+
+- **`render` no longer presents — split into `render` + `present`.** To
+  let a host slot a UI pass between the world and the swap, `SceneRenderer::
+  render` now *composites without presenting* and the frame is finished
+  by exactly one of `present` (no overlay) or `paint_egui` (egui
+  overlay). The CPU backend composites into an owned framebuffer; the GPU
+  backend acquires-but-defers the swapchain frame (`GpuRenderer` gained
+  `render_clear_deferred` + `present`; `render_scene` no longer presents).
+  **Migration:** add a `renderer.present()` call after each
+  `renderer.render(...)` (or use `paint_egui`). Hosts that don't draw a
+  UI need only the one extra call.
 
 - **`roxlap-render` / `roxlap-gpu` decoupled from winit.** The window
   binding was nominal — both backends only ever needed the window's
@@ -47,15 +83,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `set_sky_panorama`) and forwards `fog_color` / `fog_max_scan_dist` to
   the GPU marcher. (GPU fog is a smoothstep where the CPU LUT is linear
   — same endpoints, slightly different mid-curve.)
-
-### Added
-
-- **`roxlap-sdl-demo`** — an SDL2 host demo (WASD + mouse-look fly
-  camera over a small voxel scene) that drives the exact same
-  `SceneRenderer` as the winit `roxlap-scene-demo`, proving the windowing
-  decoupling end-to-end. Includes a `Send + Sync` raw-handle adapter
-  pattern for window providers (like SDL) whose window type is
-  `!Send`/`!Sync`. `nix develop` now provides `SDL2`.
 
 ## [0.6.1] — 2026-06-10
 

@@ -198,6 +198,17 @@ pub struct GpuRenderer {
     /// cached so [`Self::pixel_ray`] reconstructs the matching view ray
     /// for picking. `0` until the first scene render.
     last_fov_y_rad: f32,
+    /// The acquired-but-not-yet-presented swapchain frame from the most
+    /// recent deferred render ([`Self::render_scene`] /
+    /// [`Self::render_clear_deferred`]). [`Self::present`] shows it as
+    /// is; [`Self::paint_egui`] overlays egui first. Lets a host slot a
+    /// UI pass between the marcher and present. `None` between present
+    /// and the next render.
+    pending_frame: Option<(wgpu::SurfaceTexture, wgpu::TextureView)>,
+    /// Lazy-built `egui-wgpu` paint pipeline; created on the first
+    /// [`Self::paint_egui`] call (`hud` feature).
+    #[cfg(feature = "hud")]
+    egui_renderer: Option<egui_wgpu::Renderer>,
 }
 
 /// Per-renderer chunk-DDA pipeline state. The compute shader writes
@@ -544,6 +555,9 @@ impl GpuRenderer {
             // GPU.11.1 — matches the CPU demo's mip_scan_dist=64.
             scene_mip_scan_dist: 64.0,
             last_fov_y_rad: 0.0,
+            pending_frame: None,
+            #[cfg(feature = "hud")]
+            egui_renderer: None,
         })
     }
 
@@ -1362,6 +1376,10 @@ impl GpuRenderer {
         );
         self.last_fov_y_rad = fov_y_rad; // cached for pixel_ray (picking)
 
+        // Deferred present: drop any frame a prior render left
+        // un-presented (a host that skipped present/paint_egui) so we
+        // never hold two outstanding swapchain textures.
+        self.pending_frame = None;
         let surf_tex = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -1675,8 +1693,133 @@ impl GpuRenderer {
             rpass.draw(0..3, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
-        surf_tex.present();
+        // Deferred present — the host calls `present` or `paint_egui`.
+        self.pending_frame = Some((surf_tex, surf_view));
         self.frame_count = self.frame_count.wrapping_add(1);
+    }
+
+    /// Like [`Self::render`] (clear to colour) but **deferred**: stashes
+    /// the frame for [`Self::present`] / [`Self::paint_egui`] instead of
+    /// presenting. The facade uses this before any grid is resident so a
+    /// HUD can still be painted over an empty scene.
+    pub fn render_clear_deferred(&mut self) {
+        self.pending_frame = None;
+        let surf_tex = match self.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return;
+            }
+            Err(e) => {
+                eprintln!("roxlap-gpu surface error: {e:?}");
+                return;
+            }
+        };
+        let view = surf_tex
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let [r, g, b] = self.clear_colour;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("roxlap-gpu clear (deferred)"),
+            });
+        {
+            let _rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("roxlap-gpu clear (deferred)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.pending_frame = Some((surf_tex, view));
+    }
+
+    /// Present the frame stashed by the last deferred render
+    /// ([`Self::render_scene`] / [`Self::render_clear_deferred`]). No-op
+    /// if nothing is pending (e.g. the surface was lost mid-render).
+    pub fn present(&mut self) {
+        if let Some((surf_tex, _view)) = self.pending_frame.take() {
+            surf_tex.present();
+        }
+    }
+
+    /// Overlay an `egui` UI on the pending frame, then present it
+    /// (`hud` feature). `jobs` are the host's tessellated primitives
+    /// (`egui::Context::tessellate`), `textures` the per-frame texture
+    /// delta from `egui::FullOutput`, `pixels_per_point` the UI scale.
+    ///
+    /// Draws with `LoadOp::Load` over the marcher's frame (a separate
+    /// encoder submitted after the scene's), so the UI composites on top
+    /// of the world. No-op if no frame is pending.
+    #[cfg(feature = "hud")]
+    pub fn paint_egui(
+        &mut self,
+        jobs: &[egui::ClippedPrimitive],
+        textures: &egui::TexturesDelta,
+        pixels_per_point: f32,
+    ) {
+        let Some((surf_tex, surf_view)) = self.pending_frame.take() else {
+            return;
+        };
+        let format = self.surface_config.format;
+        let egui_rend = self
+            .egui_renderer
+            .get_or_insert_with(|| egui_wgpu::Renderer::new(&self.device, format, None, 1, false));
+
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.surface_config.width, self.surface_config.height],
+            pixels_per_point,
+        };
+        for (id, delta) in &textures.set {
+            egui_rend.update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("roxlap-gpu egui"),
+            });
+        let user_bufs =
+            egui_rend.update_buffers(&self.device, &self.queue, &mut encoder, jobs, &screen);
+        {
+            // `LoadOp::Load` keeps the marcher's frame; egui draws over it.
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("roxlap-gpu egui paint"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &surf_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                // egui-wgpu 0.29 requires a `'static` pass (see its docs).
+                .forget_lifetime();
+            egui_rend.render(&mut pass, jobs, &screen);
+        }
+        for id in &textures.free {
+            egui_rend.free_texture(id);
+        }
+        self.queue.submit(
+            user_bufs
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
+        surf_tex.present();
     }
 
     fn build_scene_dda(

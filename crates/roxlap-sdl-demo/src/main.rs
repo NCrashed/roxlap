@@ -187,6 +187,8 @@ fn render_frame(
         sprite_lighting: None,
     };
     renderer.render(scene, camera, &frame);
+    // render() composites but doesn't present — finish the frame.
+    renderer.present();
 }
 
 /// A minimal scene: a flat grass plain spanning ~3×3 chunks, a stone

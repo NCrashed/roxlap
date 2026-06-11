@@ -209,6 +209,33 @@ const GPU_FOV_Y_DEG: f64 = 60.0;
 /// `z = ground_z`. `None` if the ray is parallel to the plane or the
 /// plane lies behind the camera.
 #[allow(clippy::cast_possible_truncation)]
+/// Build the HUD overlay panel (a fixed top-left info box). Run inside
+/// `egui::Context::run`; the renderer then composites the tessellation
+/// over the frame via `SceneRenderer::paint_egui`.
+fn hud_panel(
+    ctx: &egui::Context,
+    backend: &str,
+    fps: f64,
+    pos: [f64; 3],
+    yaw: f64,
+    pitch: f64,
+    scan: i32,
+) {
+    egui::Area::new(egui::Id::new("roxlap-hud"))
+        .fixed_pos(egui::pos2(8.0, 8.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(format!("roxlap-scene-demo — {backend} backend"));
+                ui.label(format!("{fps:.0} FPS"));
+                ui.label(format!("pos ({:.0}, {:.0}, {:.0})", pos[0], pos[1], pos[2]));
+                ui.label(format!("yaw {yaw:.2}   pitch {pitch:.2}"));
+                ui.label(format!("scan dist {scan}"));
+                ui.separator();
+                ui.label("F1: toggle HUD");
+            });
+        });
+}
+
 fn plane_hit(pos: [f64; 3], dir: [f64; 3], ground_z: f64) -> Option<[f32; 3]> {
     if dir[2].abs() < 1e-9 {
         return None; // ray parallel to the ground plane
@@ -319,6 +346,16 @@ struct App {
     title_base: String,
     fps_frames: u32,
     fps_last: Instant,
+    /// HUD: egui context (host-side) + the winit↔egui input bridge,
+    /// created in `resumed`. `F1` toggles `hud_on`; when on, `redraw`
+    /// overlays an egui panel via `SceneRenderer::paint_egui` instead of
+    /// a plain present. Demonstrates the renderer's egui seam on both
+    /// the CPU (software-rasterised) and GPU (egui-wgpu) backends.
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
+    hud_on: bool,
+    /// Last FPS computed in `tick_fps`, shown in the HUD.
+    last_fps: f64,
 }
 
 impl App {
@@ -367,6 +404,10 @@ impl App {
             title_base: "roxlap-scene-demo".to_string(),
             fps_frames: 0,
             fps_last: Instant::now(),
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
+            hud_on: true,
+            last_fps: 0.0,
         }
     }
 
@@ -381,6 +422,7 @@ impl App {
             return;
         }
         let fps = f64::from(self.fps_frames) / f64::from(dt);
+        self.last_fps = fps;
         if let Some(window) = self.window.as_ref() {
             window.set_title(&format!("{} — {:.1} FPS", self.title_base, fps));
         }
@@ -392,6 +434,27 @@ impl App {
         }
         self.fps_frames = 0;
         self.fps_last = now;
+    }
+
+    /// Feed a window event to egui (passive — never consumed, so the
+    /// game keeps its controls) and handle the `F1` HUD toggle.
+    fn handle_hud_event(&mut self, event: &WindowEvent) {
+        if let (Some(window), Some(state)) = (self.window.as_ref(), self.egui_state.as_mut()) {
+            let _ = state.on_window_event(window, event);
+        }
+        if let WindowEvent::KeyboardInput {
+            event:
+                KeyEvent {
+                    physical_key: PhysicalKey::Code(KeyCode::F1),
+                    state: ElementState::Pressed,
+                    repeat: false,
+                    ..
+                },
+            ..
+        } = event
+        {
+            self.hud_on = !self.hud_on;
+        }
     }
 
     /// One frame: advance the scene from input + streaming, then hand
@@ -489,6 +552,34 @@ impl App {
         }
         let camera = self.scene.camera; // Camera is Copy
         renderer.render(&mut self.scene.scene, &camera, &frame);
+
+        // RF: render no longer presents — finish the frame. With the HUD
+        // on, overlay an egui panel via `paint_egui`; otherwise a plain
+        // present. (The capture below reads the pre-HUD framebuffer.)
+        let hud_ready = self.hud_on && self.window.is_some() && self.egui_state.is_some();
+        if hud_ready {
+            let backend_label = match renderer.backend() {
+                roxlap_render::Backend::Gpu => "GPU",
+                roxlap_render::Backend::Cpu => "CPU",
+            };
+            let fps = self.last_fps;
+            let pos = self.scene.cam_pos;
+            let yaw = self.scene.yaw;
+            let pitch = self.scene.pitch;
+            let scan = self.scan_dist;
+            let window = self.window.as_ref().expect("hud_ready");
+            let state = self.egui_state.as_mut().expect("hud_ready");
+            let raw_input = state.take_egui_input(window);
+            let full = self.egui_ctx.run(raw_input, |ctx| {
+                hud_panel(ctx, backend_label, fps, pos, yaw, pitch, scan);
+            });
+            state.handle_platform_output(window, full.platform_output);
+            let ppp = self.egui_ctx.pixels_per_point();
+            let jobs = self.egui_ctx.tessellate(full.shapes, ppp);
+            renderer.paint_egui(&jobs, &full.textures_delta, ppp);
+        } else {
+            renderer.present();
+        }
 
         if self.capture_pending {
             self.capture_pending = false;
@@ -753,11 +844,23 @@ impl ApplicationHandler for App {
             renderer.set_sprites(&set);
         }
 
+        // HUD: bridge winit events into egui. `&*window` provides the
+        // display handle egui-winit needs for clipboard/IME.
+        self.egui_state = Some(egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            None,
+            None,
+            Some(2048),
+        ));
+
         self.renderer = Some(renderer);
         self.window = Some(window);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.handle_hud_event(&event);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(new_size) => {

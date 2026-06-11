@@ -28,6 +28,14 @@ roxlap-formats = { path = "../roxlap-formats", version = "0.6" }
 # binds the wgpu surface to whatever `HasWindowHandle`/
 # `HasDisplayHandle` provider the host passes (winit, SDL, GLFW, …).
 raw-window-handle = "0.6"
+# Optional `hud` feature: egui-wgpu paints an egui UI over the marcher's
+# frame (LoadOp::Load on the pending surface view). egui supplies the
+# tessellation + texture-delta types the host hands in.
+egui-wgpu = { version = "0.29", optional = true }
+egui = { version = "0.29", optional = true }
+
+[features]
+hud = ["dep:egui-wgpu", "dep:egui"]
 
 [dev-dependencies]
 # `examples/probe.rs` is a standalone winit host for the GPU.0 FPS
