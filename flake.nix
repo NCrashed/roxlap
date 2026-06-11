@@ -46,6 +46,10 @@
             # findable on LD_LIBRARY_PATH for non-NixOS-managed
             # binaries (i.e. ours).
             vulkan-loader
+            # `roxlap-sdl-demo` links libSDL2 (the `sdl2` crate finds
+            # it via pkg-config — see `buildInputs` below — and the
+            # runtime loader needs it on LD_LIBRARY_PATH too).
+            SDL2
           ];
 
           # R10.X.2: pin a specific nightly via rust-toolchain.toml.
@@ -88,6 +92,12 @@
               # level pixel diffing across the two engines.
               imagemagick
             ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxRuntimeLibs;
+
+            # `sdl2` (roxlap-sdl-demo) links libSDL2 at build time via
+            # pkg-config; mkShell exposes `buildInputs` on
+            # PKG_CONFIG_PATH so `sdl2.pc` is discoverable. macOS uses
+            # the SDL2 framework / Homebrew copy on the default path.
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.SDL2 ];
 
             # winit + softbuffer link these via dlopen at runtime;
             # nix mkShell only sets PATH / PKG_CONFIG_PATH, so we add

@@ -24,8 +24,6 @@ mod gpu;
 
 use std::sync::Arc;
 
-use winit::window::Window;
-
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sky::Sky;
 use roxlap_core::sprite::SpriteLighting;
@@ -34,9 +32,21 @@ use roxlap_scene::Scene;
 
 pub use roxlap_formats::sprite::Sprite;
 pub use roxlap_gpu::{GpuInitError, GpuRendererSettings};
+// Re-exported so hosts can name the [`SceneRenderer::new`] bounds
+// without adding a direct `raw-window-handle` dependency of their own.
+pub use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::cpu::CpuBackend;
 use crate::gpu::GpuBackend;
+
+/// Type-erased display handle stored by the CPU backend's softbuffer
+/// surface. `raw-window-handle` implements `HasDisplayHandle` for
+/// `Arc<H>` (`H: ?Sized`), and the bare trait object implements its
+/// own object-safe trait — so `Arc<W>` coerces to `Arc<DynDisplay>`
+/// for any provider `W`.
+pub(crate) type DynDisplay = dyn HasDisplayHandle + Send + Sync + 'static;
+/// Type-erased window handle counterpart to [`DynDisplay`].
+pub(crate) type DynWindow = dyn HasWindowHandle + Send + Sync + 'static;
 
 /// One placed sprite instance: which [`SpriteSet::models`] entry and
 /// where in the world.
@@ -175,14 +185,26 @@ pub struct SceneRenderer {
 }
 
 impl SceneRenderer {
-    /// Build a renderer for `window`. Selects the GPU backend when
-    /// `opts.want_gpu` and WGPU initialises; otherwise the CPU
-    /// backend. **Never fails** — a missing/incompatible GPU silently
-    /// yields the CPU path (the message is logged to stderr).
+    /// Build a renderer for `window` — any [`raw-window-handle`]
+    /// provider (winit, SDL, GLFW, …) in an `Arc`. `size` is the
+    /// window's initial physical framebuffer size in pixels; thereafter
+    /// the host reports changes via [`Self::resize`]. Passing the size
+    /// explicitly keeps the facade decoupled from any one windowing
+    /// library's size API.
+    ///
+    /// Selects the GPU backend when `opts.want_gpu` and WGPU
+    /// initialises; otherwise the CPU backend. **Never fails** — a
+    /// missing/incompatible GPU silently yields the CPU path (the
+    /// message is logged to stderr).
+    ///
+    /// [`raw-window-handle`]: raw_window_handle
     #[must_use]
-    pub fn new(window: Arc<Window>, opts: &RenderOptions) -> Self {
+    pub fn new<W>(window: Arc<W>, size: (u32, u32), opts: &RenderOptions) -> Self
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
         if opts.want_gpu {
-            match GpuBackend::new(window.clone(), opts) {
+            match GpuBackend::new(window.clone(), size, opts) {
                 Ok(g) => {
                     return Self {
                         inner: BackendImpl::Gpu(Box::new(g)),
@@ -196,7 +218,7 @@ impl SceneRenderer {
             }
         }
         Self {
-            inner: BackendImpl::Cpu(CpuBackend::new(window, opts)),
+            inner: BackendImpl::Cpu(CpuBackend::new(window, size, opts)),
         }
     }
 

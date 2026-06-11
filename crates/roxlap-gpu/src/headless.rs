@@ -1,7 +1,8 @@
 //! GPU.2 — headless device + queue for tests and offline tools.
 //!
-//! Stands up a wgpu device with no surface — the surface dependency
-//! is what couples `GpuRenderer` to winit. Tests that exercise the
+//! Stands up a wgpu device with no surface — the surface is the only
+//! part of `GpuRenderer` that needs a host window handle. Tests that
+//! exercise the
 //! decompressed-chunk upload + read-back path want neither a window
 //! nor a swapchain; this module exposes that bare device.
 //!

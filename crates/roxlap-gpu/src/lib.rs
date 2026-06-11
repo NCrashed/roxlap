@@ -2,7 +2,8 @@
 //! voxel engine. GPU.1 in `PORTING-GPU.md`.
 //!
 //! GPU.1's job: stand up the device + surface + swapchain on a
-//! winit window, present a clear-to-colour frame each render call,
+//! host window (any [`raw-window-handle`](raw_window_handle)
+//! provider), present a clear-to-colour frame each render call,
 //! and give the host a one-call opt-in. No voxel marching yet — the
 //! [`examples/probe.rs`](../examples/probe.rs) standalone holds
 //! the empirical FPS baseline from GPU.0.
@@ -18,8 +19,8 @@
 //! use std::sync::Arc;
 //! use roxlap_gpu::{GpuRenderer, GpuRendererSettings};
 //! # use winit::window::Window;
-//! # fn pick(w: Arc<Window>) -> Option<GpuRenderer> {
-//! match GpuRenderer::new_blocking(w, GpuRendererSettings::default()) {
+//! # fn pick(w: Arc<Window>, size: (u32, u32)) -> Option<GpuRenderer> {
+//! match GpuRenderer::new_blocking(w, size, GpuRendererSettings::default()) {
 //!     Ok(r) => Some(r),
 //!     Err(e) => {
 //!         eprintln!("GPU init failed: {e}; falling back to CPU");
@@ -56,7 +57,7 @@ pub use sprite_model::{
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use winit::window::Window;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 /// Caller-controllable knobs for [`GpuRenderer::new`]. Defaults
 /// target "highest-performance GPU, prefer Mailbox/Immediate over
@@ -134,11 +135,14 @@ impl From<wgpu::RequestDeviceError> for GpuInitError {
 }
 
 /// WGPU-backed renderer. Owns the device, queue, and surface
-/// bound to the host's winit window. [`Self::render`] is the GPU.1
+/// bound to the host's window. [`Self::render`] is the GPU.1
 /// clear-to-colour path; [`Self::render_chunk`] is GPU.3's
 /// single-chunk DDA marcher.
+///
+/// The window is consumed only at construction — `wgpu`'s
+/// `Surface<'static>` keeps its own `Arc` clone of the handle, so
+/// the renderer holds no window field of its own.
 pub struct GpuRenderer {
-    window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
     device: wgpu::Device,
@@ -376,14 +380,25 @@ impl GpuRenderer {
     /// Stand up the device + surface + swapchain on `window`. Async
     /// because `wgpu::Adapter`/`Device` requests are.
     ///
+    /// `window` is any [`raw-window-handle`] provider (winit, SDL,
+    /// GLFW, …) wrapped in an `Arc`; `size` is its initial physical
+    /// framebuffer size in pixels — passed explicitly so the renderer
+    /// stays decoupled from any one windowing library's size API.
+    ///
+    /// [`raw-window-handle`]: raw_window_handle
+    ///
     /// # Errors
     /// Returns [`GpuInitError`] if surface creation, adapter
     /// selection, or device request fails. Hosts treat any error as
     /// "fall back to the CPU path".
-    pub async fn new(
-        window: Arc<Window>,
+    pub async fn new<W>(
+        window: Arc<W>,
+        size: (u32, u32),
         settings: GpuRendererSettings,
-    ) -> Result<Self, GpuInitError> {
+    ) -> Result<Self, GpuInitError>
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone())?;
         let power_preference = match settings.power_preference {
@@ -447,12 +462,12 @@ impl GpuRenderer {
             "roxlap-gpu: present mode = {present_mode:?} (available: {:?})",
             caps.present_modes,
         );
-        let physical = window.inner_size();
+        let (init_w, init_h) = size;
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: physical.width.max(1),
-            height: physical.height.max(1),
+            width: init_w.max(1),
+            height: init_h.max(1),
             present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -500,7 +515,6 @@ impl GpuRenderer {
         });
 
         Ok(Self {
-            window,
             surface,
             surface_config,
             device,
@@ -538,21 +552,21 @@ impl GpuRenderer {
     ///
     /// # Errors
     /// See [`Self::new`].
-    pub fn new_blocking(
-        window: Arc<Window>,
+    pub fn new_blocking<W>(
+        window: Arc<W>,
+        size: (u32, u32),
         settings: GpuRendererSettings,
-    ) -> Result<Self, GpuInitError> {
-        pollster::block_on(Self::new(window, settings))
+    ) -> Result<Self, GpuInitError>
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
+        pollster::block_on(Self::new(window, size, settings))
     }
 
     /// Human-readable adapter description — name + backend +
     /// device type. The demo host prints this in the title bar.
     pub fn adapter_info(&self) -> &str {
         &self.adapter_info
-    }
-
-    pub fn window(&self) -> &Window {
-        &self.window
     }
 
     /// Borrow the underlying wgpu device — hosts use this to build

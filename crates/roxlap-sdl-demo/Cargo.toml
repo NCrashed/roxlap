@@ -1,0 +1,32 @@
+[package]
+name = "roxlap-sdl-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "SDL2 host demo for the roxlap scene-graph engine — shows that roxlap-render binds to any raw-window-handle window provider, not just winit."
+# Demo binary, not a published library.
+publish = false
+
+[dependencies]
+# The renderer facade. Decoupled from winit since 0.7: `SceneRenderer`
+# binds to any `HasWindowHandle`/`HasDisplayHandle` provider. This
+# demo proves the point with SDL2 instead of winit.
+roxlap-render = { path = "../roxlap-render", version = "0.6" }
+# Scene/world types + the edit API used to build the demo scene.
+roxlap-scene = { path = "../roxlap-scene", version = "0.6" }
+# Camera, OpticastSettings, Sky — the per-frame render params.
+roxlap-core = { path = "../roxlap-core", version = "0.6" }
+glam = { workspace = true }
+# The window provider under test. The `raw-window-handle` feature pulls
+# rwh 0.6 (matching softbuffer/wgpu inside roxlap-render) and makes
+# `sdl2::video::Window` implement `HasWindowHandle`/`HasDisplayHandle`.
+sdl2 = { version = "0.37", features = ["raw-window-handle"] }
+# Same rwh version roxlap-render re-exports — used for the Send+Sync
+# handle wrapper (SDL windows are !Send/!Sync; see `main.rs`).
+raw-window-handle = "0.6"
+
+[lints]
+workspace = true

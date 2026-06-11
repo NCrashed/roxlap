@@ -24,6 +24,15 @@ rayon = { workspace = true }
 # CPU-backend presentation (windowed software framebuffer); the GPU
 # backend presents via roxlap-gpu's own wgpu surface.
 softbuffer = "0.4"
+# The facade is decoupled from any specific windowing library: it
+# binds the surface to whatever `HasWindowHandle`/`HasDisplayHandle`
+# provider the host passes (winit, SDL, GLFW, …). Re-exported from the
+# crate root so hosts can name the bounds without their own dep.
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+# Doctests/examples construct a winit window to drive the facade; the
+# library itself no longer depends on winit.
 winit = "0.30"
 
 [lints]

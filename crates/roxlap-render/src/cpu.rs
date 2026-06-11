@@ -15,9 +15,10 @@ use roxlap_core::Camera;
 use roxlap_formats::sprite::Sprite;
 use roxlap_scene::render::render_scene_composed;
 use roxlap_scene::Scene;
-use winit::window::Window;
 
-use crate::{FrameParams, RenderOptions, SpriteSet};
+use crate::{
+    DynDisplay, DynWindow, FrameParams, HasDisplayHandle, HasWindowHandle, RenderOptions, SpriteSet,
+};
 
 /// World-space view-ray direction (un-normalised) for window pixel
 /// `(x, y)` under the CPU opticast projection (voxlap `setcamera`):
@@ -45,11 +46,17 @@ pub(crate) fn setcamera_pixel_ray(
 }
 
 pub(crate) struct CpuBackend {
-    window: Arc<Window>,
     /// `softbuffer::Context` is dropped after surface creation — the
     /// surface keeps its own clone of the display handle (matches the
-    /// existing scene-demo setup).
-    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    /// existing scene-demo setup). The display/window handles are
+    /// type-erased to `Arc<dyn …>` so the backend stays generic-free
+    /// over the host's windowing library.
+    surface: softbuffer::Surface<Arc<DynDisplay>, Arc<DynWindow>>,
+    /// Current framebuffer size in physical pixels. Seeded at
+    /// construction, updated by [`Self::resize`] — replaces the old
+    /// per-frame `window.inner_size()` poll so the backend never
+    /// touches a concrete window type.
+    current_dims: (u32, u32),
     pool: ScratchPool,
     zbuffer: Vec<f32>,
     /// Framebuffer dimensions of the last `render` — the `zbuffer`
@@ -75,13 +82,21 @@ pub(crate) struct CpuBackend {
 }
 
 impl CpuBackend {
-    pub(crate) fn new(window: Arc<Window>, opts: &RenderOptions) -> Self {
-        let context = softbuffer::Context::new(window.clone()).expect("softbuffer: Context::new");
-        let surface =
-            softbuffer::Surface::new(&context, window.clone()).expect("softbuffer: Surface::new");
+    pub(crate) fn new<W>(window: Arc<W>, size: (u32, u32), opts: &RenderOptions) -> Self
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
+        // Erase the concrete window type behind two `Arc<dyn …>`
+        // handles. `raw-window-handle` implements `HasDisplayHandle` /
+        // `HasWindowHandle` for `Arc<H>` with `H: ?Sized`, and a bare
+        // trait object implements its own (object-safe) trait, so both
+        // erased Arcs satisfy softbuffer's bounds.
+        let display: Arc<DynDisplay> = window.clone();
+        let window: Arc<DynWindow> = window;
+        let context = softbuffer::Context::new(display).expect("softbuffer: Context::new");
+        let surface = softbuffer::Surface::new(&context, window).expect("softbuffer: Surface::new");
 
-        let size = window.inner_size();
-        let (w, h) = (size.width.max(1), size.height.max(1));
+        let (w, h) = (size.0.max(1), size.1.max(1));
         let n_threads = opts
             .cpu_render_threads
             .clamp(1, rayon::current_num_threads().max(1));
@@ -89,8 +104,8 @@ impl CpuBackend {
         let zbuffer = vec![f32::INFINITY; (w as usize) * (h as usize)];
 
         Self {
-            window,
             surface,
+            current_dims: (w, h),
             pool,
             zbuffer,
             last_dims: (w, h),
@@ -166,17 +181,19 @@ impl CpuBackend {
     }
 
     #[allow(clippy::unused_self)] // symmetry with GpuBackend::resize
-    pub(crate) fn resize(&mut self, _width: u32, _height: u32) {
-        // softbuffer + the pool resize lazily inside `render`.
+    pub(crate) fn resize(&mut self, width: u32, height: u32) {
+        // softbuffer + the pool resize lazily inside `render`; we just
+        // record the new size the host reported (replacing the old
+        // per-frame `window.inner_size()` poll).
+        self.current_dims = (width.max(1), height.max(1));
     }
 
     pub(crate) fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
-        let size = self.window.inner_size();
-        let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-        else {
+        let (cur_w, cur_h) = self.current_dims;
+        let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(cur_w), NonZeroU32::new(cur_h)) else {
             return;
         };
-        let (width, height) = (size.width, size.height);
+        let (width, height) = (cur_w, cur_h);
         let pixel_count = (width as usize) * (height as usize);
         self.last_dims = (width, height);
         self.last_hxyz = (frame.settings.hx, frame.settings.hy, frame.settings.hz);

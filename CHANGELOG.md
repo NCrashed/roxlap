@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`roxlap-render` / `roxlap-gpu` decoupled from winit.** The window
+  binding was nominal — both backends only ever needed the window's
+  `raw-window-handle` traits (softbuffer + wgpu) plus its pixel size.
+  `SceneRenderer::new` and `GpuRenderer::new` / `new_blocking` are now
+  generic over any `W: HasWindowHandle + HasDisplayHandle + Send + Sync
+  + 'static` (winit, SDL, GLFW, a custom surface, …) and take the
+  initial framebuffer size as an explicit `(u32, u32)` argument instead
+  of calling `winit`'s `inner_size()`. The CPU backend tracks its size
+  from `resize()` (which hosts already call on resize events) rather
+  than polling the window each frame. `roxlap-render` re-exports
+  `HasWindowHandle` / `HasDisplayHandle` so hosts need no direct
+  `raw-window-handle` dependency. winit moves to a dev-dependency
+  (examples/doctests only). **Migration:** pass the window size to
+  `new`, e.g. `SceneRenderer::new(window, (w, h), &opts)`. Removed the
+  unused `GpuRenderer::window()` getter.
+
+### Added
+
+- **`roxlap-sdl-demo`** — an SDL2 host demo (WASD + mouse-look fly
+  camera over a small voxel scene) that drives the exact same
+  `SceneRenderer` as the winit `roxlap-scene-demo`, proving the windowing
+  decoupling end-to-end. Includes a `Send + Sync` raw-handle adapter
+  pattern for window providers (like SDL) whose window type is
+  `!Send`/`!Sync`. `nix develop` now provides `SDL2`.
+
 ## [0.6.1] — 2026-06-10
 
 ### Changed

@@ -705,7 +705,9 @@ impl ApplicationHandler for App {
             cpu_render_threads: RENDER_THREADS,
             ..RenderOptions::default()
         };
-        let mut renderer = SceneRenderer::new(window.clone(), &opts);
+        let init_size = window.inner_size();
+        let mut renderer =
+            SceneRenderer::new(window.clone(), (init_size.width, init_size.height), &opts);
 
         self.title_base = if let Some(info) = renderer.adapter_info() {
             eprintln!("roxlap-render: GPU backend — {info}");

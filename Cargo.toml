@@ -11,6 +11,7 @@ members = [
     "crates/roxlap-render",
     "crates/roxlap-scene",
     "crates/roxlap-scene-demo",
+    "crates/roxlap-sdl-demo",
     "crates/roxlap-web",
 ]
 resolver = "2"

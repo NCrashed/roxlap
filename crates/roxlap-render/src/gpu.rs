@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use crate::{FrameParams, HasDisplayHandle, HasWindowHandle, RenderOptions, SpriteSet};
 use glam::{DVec3, IVec3};
 use roxlap_core::Camera;
 use roxlap_gpu::{
@@ -23,9 +24,6 @@ use roxlap_gpu::{
     SpriteInstanceTransform, SpriteModelRegistry,
 };
 use roxlap_scene::{GridId, Scene};
-use winit::window::Window;
-
-use crate::{FrameParams, RenderOptions, SpriteSet};
 
 pub(crate) struct GpuBackend {
     gpu: GpuRenderer,
@@ -45,11 +43,15 @@ pub(crate) struct GpuBackend {
 }
 
 impl GpuBackend {
-    pub(crate) fn new(
-        window: std::sync::Arc<Window>,
+    pub(crate) fn new<W>(
+        window: std::sync::Arc<W>,
+        size: (u32, u32),
         opts: &RenderOptions,
-    ) -> Result<Self, GpuInitError> {
-        let gpu = GpuRenderer::new_blocking(window, opts.gpu)?;
+    ) -> Result<Self, GpuInitError>
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
+        let gpu = GpuRenderer::new_blocking(window, size, opts.gpu)?;
         Ok(Self {
             gpu,
             resident: None,
