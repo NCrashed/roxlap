@@ -47,22 +47,10 @@ const STONE: u32 = 0x80_7a_7a_82;
 const DOME: u32 = 0x80_40_60_c0;
 
 /// Sky colour (`0x00_RR_GG_BB`, the framebuffer's native packing).
+/// Both backends honour this: the CPU paints it flat, and the GPU
+/// backend mirrors it onto its sky texture (since 0.7 — no manual
+/// `set_sky_panorama` needed).
 const SKY: u32 = 0x00_8f_bc_d4;
-
-/// Build a 1×1 solid-`SKY` RGBA8 panorama for the GPU sky sampler.
-///
-/// The CPU path paints a flat sky from `FrameParams::sky_color`; the GPU
-/// path samples its own equirectangular sky *texture* (defaulting to a
-/// 1×1 mid-grey until the host uploads one). A solid panorama in the
-/// same colour makes the two backends match. No-op on the CPU backend.
-fn solid_sky_rgba() -> [u8; 4] {
-    [
-        ((SKY >> 16) & 0xff) as u8, // R
-        ((SKY >> 8) & 0xff) as u8,  // G
-        (SKY & 0xff) as u8,         // B
-        0xff,                       // A
-    ]
-}
 
 /// Mouse-look sensitivity (radians per pixel of relative motion).
 const LOOK_SENS: f64 = 0.0025;
@@ -260,9 +248,6 @@ fn main() -> Result<(), String> {
     };
     let (init_w, init_h) = window.size();
     let mut renderer = SceneRenderer::new(handle, (init_w, init_h), &opts);
-    // Match the CPU's flat-blue sky on the GPU path (which otherwise
-    // samples its default 1×1 grey panorama). No-op on the CPU backend.
-    renderer.set_sky_panorama(&solid_sky_rgba(), 1, 1);
     eprintln!(
         "roxlap-sdl-demo: backend = {:?}{}",
         renderer.backend(),

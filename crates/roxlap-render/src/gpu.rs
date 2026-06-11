@@ -25,6 +25,16 @@ use roxlap_gpu::{
 };
 use roxlap_scene::{GridId, Scene};
 
+/// Unpack a `0x00RRGGBB` packed colour (the framebuffer / `FrameParams`
+/// convention) into `[R, G, B]` bytes.
+fn unpack_rgb(packed: u32) -> [u8; 3] {
+    [
+        ((packed >> 16) & 0xff) as u8,
+        ((packed >> 8) & 0xff) as u8,
+        (packed & 0xff) as u8,
+    ]
+}
+
 pub(crate) struct GpuBackend {
     gpu: GpuRenderer,
     /// Whole-scene residency; `None` until the first non-empty render.
@@ -40,6 +50,15 @@ pub(crate) struct GpuBackend {
     /// Registry model id the `G`-carve edits + its next z-layer.
     carve_model_id: Option<u32>,
     carve_z: u32,
+    /// `true` once the host uploads a real sky panorama via
+    /// [`set_sky_panorama`](Self::set_sky_panorama). Until then the
+    /// backend mirrors [`FrameParams::sky_color`] into a 1×1 sky
+    /// texture each render so the GPU sky matches the CPU's flat sky
+    /// (the engine otherwise samples a default grey panorama).
+    host_sky_set: bool,
+    /// Last `sky_color` auto-uploaded under the parity path above —
+    /// re-uploads the 1×1 texture only when it changes.
+    auto_sky_color: Option<u32>,
 }
 
 impl GpuBackend {
@@ -61,6 +80,8 @@ impl GpuBackend {
             sprite_instances: Vec::new(),
             carve_model_id: None,
             carve_z: 0,
+            host_sky_set: false,
+            auto_sky_color: None,
         })
     }
 
@@ -150,9 +171,47 @@ impl GpuBackend {
     /// Upload a sky panorama for the GPU shader's sky sampling.
     pub(crate) fn set_sky_panorama(&mut self, rgba: &[u8], w: u32, h: u32) {
         self.gpu.set_sky_panorama(rgba, w, h);
+        // The host owns the sky now — stop mirroring `sky_color`.
+        self.host_sky_set = true;
+    }
+
+    /// Mirror the CPU path's flat sky + distance fog onto the GPU from
+    /// the per-frame [`FrameParams`]. The GPU marcher samples its own
+    /// sky *texture* (default grey) and carries its own fog state, so
+    /// without this the GPU diverges from the CPU's `sky_color` /
+    /// `fog_color` every frame. Skips the sky mirror once the host has
+    /// uploaded a real panorama.
+    fn sync_sky_and_fog(&mut self, frame: &FrameParams) {
+        if !self.host_sky_set && self.auto_sky_color != Some(frame.sky_color) {
+            let [r, g, b] = unpack_rgb(frame.sky_color);
+            self.gpu.set_sky_panorama(&[r, g, b, 0xff], 1, 1);
+            self.auto_sky_color = Some(frame.sky_color);
+        }
+
+        // CPU `set_fog` ramps hits to `fog_color` from t=0 to
+        // `fog_max_scan_dist`, and is off when that distance is ≤ 0.
+        // Match it: near = 0, far = the scan distance (a huge far ≈
+        // "no fog" when disabled). The GPU uses a smoothstep where the
+        // CPU LUT is linear — same endpoints, slightly different curve.
+        let [r, g, b] = unpack_rgb(frame.fog_color);
+        let color = [
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        ];
+        let far = if frame.fog_max_scan_dist > 0 {
+            frame.fog_max_scan_dist as f32
+        } else {
+            1.0e30
+        };
+        self.gpu.set_fog(color, 0.0, far);
     }
 
     pub(crate) fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
+        // CPU/GPU parity: mirror the frame's flat sky + fog onto the GPU
+        // (which carries its own sky texture + fog state).
+        self.sync_sky_and_fog(frame);
+
         if self.resident.is_none() {
             self.upload_scene(scene);
         } else {

@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `new`, e.g. `SceneRenderer::new(window, (w, h), &opts)`. Removed the
   unused `GpuRenderer::window()` getter.
 
+### Fixed
+
+- **GPU sky / fog parity with the CPU path.** The GPU backend ignored
+  `FrameParams::{sky_color, fog_color, fog_max_scan_dist}` — it sampled
+  its own default grey sky texture and never applied distance fog, so it
+  diverged from the CPU path (grey vs. flat-colour sky, no fog vs. fog).
+  `SceneRenderer::render` now mirrors `sky_color` onto a 1×1 GPU sky
+  texture each frame (unless the host uploaded a real panorama via
+  `set_sky_panorama`) and forwards `fog_color` / `fog_max_scan_dist` to
+  the GPU marcher. (GPU fog is a smoothstep where the CPU LUT is linear
+  — same endpoints, slightly different mid-curve.)
+
 ### Added
 
 - **`roxlap-sdl-demo`** — an SDL2 host demo (WASD + mouse-look fly
