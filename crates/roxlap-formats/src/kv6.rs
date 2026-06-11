@@ -72,6 +72,110 @@ pub struct Kv6 {
     pub palette: Option<[Rgb6; 256]>,
 }
 
+impl Kv6 {
+    /// Build a `Kv6` procedurally from a dense occupancy + colour
+    /// closure: `fill(x, y, z)` returns `Some(col)` for a solid voxel,
+    /// `None` for air. `col` is voxlap-packed `0x80RRGGBB` — the high
+    /// byte is **brightness**, not alpha, so `0x00…` renders black; use
+    /// `0x80…` for a flat-lit mid value.
+    ///
+    /// Only **surface** voxels are emitted (a voxel with at least one
+    /// of its six neighbours air or out of bounds), matching how a
+    /// `.kv6` stores a hull and how [`crate::sprite::Sprite`] expects to
+    /// be drawn; fully-enclosed interior voxels are skipped. Emitted
+    /// voxels get `vis = 63` (all faces) and `dir = 0`, mirroring
+    /// `roxlap_core::meltsphere`'s flat output — adequate for procedural
+    /// models that don't need per-face normals. The pivot is the
+    /// geometric centre.
+    ///
+    /// Voxels are emitted in the canonical x-major, then y, then
+    /// ascending-z order the format requires, with matching `xlen` /
+    /// `ylen` run tables.
+    // Dimensions are bounded by realistic model sizes: column/x counts
+    // fit u16/u32, sizes fit f32 exactly, and the closure-local i64
+    // neighbour coords are range-checked before the u32 cast.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    #[must_use]
+    pub fn from_fn<F: Fn(u32, u32, u32) -> Option<u32>>(
+        xsiz: u32,
+        ysiz: u32,
+        zsiz: u32,
+        fill: F,
+    ) -> Kv6 {
+        let occupied = |x: i64, y: i64, z: i64| -> bool {
+            x >= 0
+                && y >= 0
+                && z >= 0
+                && (x as u32) < xsiz
+                && (y as u32) < ysiz
+                && (z as u32) < zsiz
+                && fill(x as u32, y as u32, z as u32).is_some()
+        };
+
+        let mut voxels: Vec<Voxel> = Vec::new();
+        let mut xlen: Vec<u32> = Vec::with_capacity(xsiz as usize);
+        let mut ylen: Vec<Vec<u16>> = Vec::with_capacity(xsiz as usize);
+
+        for x in 0..xsiz {
+            let mut col_counts: Vec<u16> = Vec::with_capacity(ysiz as usize);
+            for y in 0..ysiz {
+                let before = voxels.len();
+                for z in 0..zsiz {
+                    let Some(col) = fill(x, y, z) else { continue };
+                    let (xi, yi, zi) = (i64::from(x), i64::from(y), i64::from(z));
+                    let exposed = !occupied(xi - 1, yi, zi)
+                        || !occupied(xi + 1, yi, zi)
+                        || !occupied(xi, yi - 1, zi)
+                        || !occupied(xi, yi + 1, zi)
+                        || !occupied(xi, yi, zi - 1)
+                        || !occupied(xi, yi, zi + 1);
+                    if exposed {
+                        voxels.push(Voxel {
+                            col,
+                            z: z as u16,
+                            vis: 63,
+                            dir: 0,
+                        });
+                    }
+                }
+                col_counts.push((voxels.len() - before) as u16);
+            }
+            xlen.push(col_counts.iter().map(|&c| u32::from(c)).sum());
+            ylen.push(col_counts);
+        }
+
+        Kv6 {
+            xsiz,
+            ysiz,
+            zsiz,
+            xpiv: xsiz as f32 * 0.5,
+            ypiv: ysiz as f32 * 0.5,
+            zpiv: zsiz as f32 * 0.5,
+            voxels,
+            xlen,
+            ylen,
+            palette: None,
+        }
+    }
+
+    /// A solid axis-aligned box of a single colour (voxlap-packed
+    /// `0x80RRGGBB`). Convenience over [`Kv6::from_fn`].
+    #[must_use]
+    pub fn solid_box(xsiz: u32, ysiz: u32, zsiz: u32, col: u32) -> Kv6 {
+        Kv6::from_fn(xsiz, ysiz, zsiz, |_, _, _| Some(col))
+    }
+
+    /// A solid `n³` cube of a single colour.
+    #[must_use]
+    pub fn solid_cube(n: u32, col: u32) -> Kv6 {
+        Kv6::solid_box(n, n, n, col)
+    }
+}
+
 /// Errors returned by [`parse`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
@@ -286,6 +390,62 @@ mod tests {
 
     /// `assets/coco.kv6`, produced from `coco.kvx` via SLAB6.
     const COCO_KV6: &[u8] = include_bytes!("../../../assets/coco.kv6");
+
+    #[test]
+    fn solid_cube_builder_is_surface_only_and_consistent() {
+        let cube = Kv6::solid_cube(4, 0x8012_3456);
+        assert_eq!((cube.xsiz, cube.ysiz, cube.zsiz), (4, 4, 4));
+        // Pivot at the geometric centre.
+        assert!((cube.xpiv - 2.0).abs() < f32::EPSILON);
+
+        // Surface-only: a solid 4³ has 64 voxels, minus the 2³ interior
+        // shell core (all six neighbours occupied) = 56 emitted.
+        assert_eq!(cube.voxels.len(), 64 - 8);
+        assert!(cube
+            .voxels
+            .iter()
+            .all(|v| v.vis == 63 && v.col == 0x8012_3456));
+
+        // Run tables match the format contract.
+        assert_eq!(cube.xlen.len(), 4);
+        assert_eq!(cube.ylen.len(), 4);
+        assert!(cube.ylen.iter().all(|row| row.len() == 4));
+        let xlen_sum: usize = cube.xlen.iter().map(|&n| n as usize).sum();
+        let ylen_sum: usize = cube
+            .ylen
+            .iter()
+            .flat_map(|r| r.iter())
+            .map(|&n| n as usize)
+            .sum();
+        assert_eq!(xlen_sum, cube.voxels.len());
+        assert_eq!(ylen_sum, cube.voxels.len());
+    }
+
+    #[test]
+    fn built_cube_round_trips_through_serialize_parse() {
+        let cube = Kv6::solid_cube(5, 0x80AB_CDEF);
+        let bytes = serialize(&cube);
+        let back = parse(&bytes).expect("parse built cube");
+        assert_eq!(back.xsiz, cube.xsiz);
+        assert_eq!(back.voxels.len(), cube.voxels.len());
+        assert_eq!(
+            serialize(&back),
+            bytes,
+            "serialize is stable across round-trip"
+        );
+    }
+
+    #[test]
+    fn from_fn_skips_air_and_keeps_z_order() {
+        // A single occupied column at (0,0,*): two voxels (z=0,1), both
+        // surface; ordered ascending z.
+        let kv6 = Kv6::from_fn(1, 1, 2, |_, _, _| Some(0x8000_FF00));
+        assert_eq!(kv6.voxels.len(), 2);
+        assert_eq!(kv6.voxels[0].z, 0);
+        assert_eq!(kv6.voxels[1].z, 1);
+        assert_eq!(kv6.xlen, vec![2]);
+        assert_eq!(kv6.ylen, vec![vec![2]]);
+    }
 
     #[test]
     fn parse_coco_header() {
