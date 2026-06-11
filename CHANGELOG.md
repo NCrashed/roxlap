@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-06-12
+
+Decouples the renderer from winit (binds to any `raw-window-handle`
+provider), adds an **egui overlay seam** on both backends, and ships an
+SDL2 host demo. Breaking: `SceneRenderer::new` is generic + takes a size,
+and `render` no longer presents (add a `present()` / `paint_egui()`
+call). GPU sprite-camera + sky/fog parity bugs fixed along the way.
+
 ### Added
 
 - **egui overlay seam (`hud` feature).** A renderer-level path to draw an
