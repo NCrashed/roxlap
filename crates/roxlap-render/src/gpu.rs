@@ -222,10 +222,16 @@ impl GpuBackend {
         self.gpu.set_scene_mip_scan_dist(frame.gpu_mip_scan_dist);
 
         let cameras = self.grid_cameras(scene, camera);
+        // Sprites are world-space, so they project through the world
+        // camera (identity transform), not any grid-local one. Without
+        // this the GPU sprite pass used `cameras[0]` and shifted every
+        // instance by grid 0's origin/rotation.
+        let sprite_camera = grid_local_camera(glam::DQuat::IDENTITY, DVec3::ZERO, camera);
         if let Some(resident) = &self.resident {
             self.gpu.render_scene(
                 resident,
                 &cameras,
+                &sprite_camera,
                 frame.gpu_fov_y_rad,
                 frame.gpu_max_outer_steps,
             );

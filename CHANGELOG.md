@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **GPU instanced sprites projected through the wrong camera.** The GPU
+  sprite pass (frustum-cull/tile-bin + model-DDA) used `cameras[0]` —
+  grid 0's *local* camera — to project world-space sprite instances. It
+  only looked correct when grid 0 sat at identity; any non-identity
+  transform on the first grid shifted every sprite by that grid's
+  origin/rotation. `render_scene` now takes an explicit world
+  `sprite_camera` (the facade passes the untransformed world camera) and
+  both sprite sites use it. The CPU path was already correct (it draws
+  sprites with the world camera directly). Also drops the sprite pass's
+  `!cameras.is_empty()` guard, so sprites no longer require any grid.
+
 - **GPU sky / fog parity with the CPU path.** The GPU backend ignored
   `FrameParams::{sky_color, fog_color, fog_max_scan_dist}` — it sampled
   its own default grey sky texture and never applied distance fog, so it

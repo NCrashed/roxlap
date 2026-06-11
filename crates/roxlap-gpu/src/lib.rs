@@ -1333,10 +1333,17 @@ impl GpuRenderer {
     /// # Panics
     /// If `cameras.len() != scene.grid_count` or
     /// `scene.grid_count > MAX_SCENE_GRIDS`.
+    /// `cameras[i]` is grid `i`'s world camera transformed into that
+    /// grid's local frame (the grid marcher works in grid-local space).
+    /// `sprite_camera` is the **world** camera: instanced sprites carry
+    /// world-space positions/transforms, so they must project through
+    /// the untransformed world camera — not `cameras[0]`, which is only
+    /// the world camera when grid 0 is at identity.
     pub fn render_scene(
         &mut self,
         scene: &GpuSceneResident,
         cameras: &[Camera],
+        sprite_camera: &Camera,
         fov_y_rad: f32,
         max_outer_steps: u32,
     ) {
@@ -1393,8 +1400,10 @@ impl GpuRenderer {
         // scene_dda borrow). Captures (visible_count, tiles_x); None when
         // nothing is in view.
         let sprite_pass: Option<(u32, u32)> = if let Some(reg) = self.sprite_registry.as_mut() {
-            if !cameras.is_empty() && reg.instance_capacity > 0 {
-                let cam = &cameras[0];
+            if reg.instance_capacity > 0 {
+                // World camera — sprite positions/transforms are world-
+                // space (independent of any grid's transform).
+                let cam = sprite_camera;
                 #[allow(clippy::cast_precision_loss)]
                 let aspect = surface_w as f32 / surface_h as f32;
                 let half_h = (fov_y_rad * 0.5).tan();
@@ -1542,7 +1551,9 @@ impl GpuRenderer {
         // + the tile lists live in the registry buffers.
         let sprite_model_bg = match (&self.sprite_model_dda, &self.sprite_registry, sprite_pass) {
             (Some(smd), Some(reg), Some((visible, tiles_x))) => {
-                let cam = &cameras[0];
+                // World camera (see the cull pass above) — sprites
+                // project through it regardless of grid 0's transform.
+                let cam = sprite_camera;
                 let uni = SpriteModelUniform {
                     cam_pos: cam.position,
                     _p0: 0.0,
