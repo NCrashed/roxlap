@@ -45,7 +45,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --release
+      # `roxlap-sdl-demo` links system SDL2 (`-lSDL2`), which isn't on
+      # the runner, and has no tests anyway — exclude it from the test
+      # link. It's still compile-checked by the clippy job
+      # (`--all-targets`), so API breakage against `roxlap-render` is
+      # caught. (To link it in CI instead, `apt-get install libsdl2-dev`
+      # here, or add the sdl2 `bundled` feature for a self-contained build.)
+      - run: cargo test --workspace --release --exclude roxlap-sdl-demo
 
   oracle:
     name: roxlap-oracle hash-diff vs goldens
