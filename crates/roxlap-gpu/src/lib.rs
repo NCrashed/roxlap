@@ -2326,7 +2326,7 @@ impl HeadlessSceneRenderer {
     /// the [`scene::GridStaticMeta`] std430 layout at pipeline /
     /// bind-group time.
     #[must_use]
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) -> Self {
         let output_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("roxlap-gpu headless.output"),
             size: wgpu::Extent3d {
@@ -2358,6 +2358,28 @@ impl HeadlessSceneRenderer {
 
         let default_sky_pixel = [120u8, 150, 220, 255];
         let (sky_texture, sky_view) = create_sky_texture(device, 1, 1, &default_sky_pixel);
+        // Upload the default sky texel (create_sky_texture only allocates
+        // — the texel must be written or the shader samples black, which
+        // is why a grid-less headless render came back black).
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &sky_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &default_sky_pixel,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
         let sky_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("roxlap-gpu headless.sky_sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,

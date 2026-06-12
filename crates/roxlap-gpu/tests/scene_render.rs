@@ -167,7 +167,7 @@ fn scene_dda_marches_coarse_mip_for_distant_chunk() {
     let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
 
     let (w, h) = (64u32, 64u32);
-    let renderer = HeadlessSceneRenderer::new(&gpu.device, w, h);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
     // Camera in the empty near chunk, looking +y at the block; z=16
     // lands inside the block's z=0..31 band. right × down == forward.
     let cam = Camera {
@@ -258,7 +258,7 @@ fn scene_dda_aabb_early_out_away_is_sky() {
     assert_eq!(scene.static_meta[0].aabb_max, [0, 4, 0]);
 
     let (w, h) = (64u32, 64u32);
-    let renderer = HeadlessSceneRenderer::new(&gpu.device, w, h);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
     let cam = Camera {
         position: [vsid as f32 * 0.5, 0.0, 16.0],
         right: [-1.0, 0.0, 0.0],
@@ -303,7 +303,7 @@ fn scene_dda_zero_grids_renders_sky() {
     );
 
     let (w, h) = (32u32, 32u32);
-    let renderer = HeadlessSceneRenderer::new(&gpu.device, w, h);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
     // Zero cameras matches grid_count == 0 (render_scene asserts equal).
     // Pre-fix this path was never dispatched (the facade short-circuited
     // to a clear); the win here is it runs end-to-end without panic and
@@ -319,18 +319,23 @@ fn scene_dda_zero_grids_renders_sky() {
     );
     assert_eq!(fb.len(), (w * h) as usize);
 
-    // No grids → no per-pixel grid hits → the whole frame is the single
-    // flat sky sample, so every pixel is identical. (We can't assert the
-    // colour: HeadlessSceneRenderer never uploads its sky texel — it's
-    // black here — whereas the windowed backend uploads the sky from
-    // `frame.sky_color`, where the sprite-only background is correct.)
-    // A uniform frame proves the zero-grid path neither reads garbage
-    // grid data nor diverges per pixel.
+    // No grids → no per-pixel grid hits → every pixel is the flat sky
+    // sample (headless default sky [120, 150, 220]). Uniform proves the
+    // zero-grid path reads no garbage grid data; bluish (b > r) + not
+    // black proves the sky direction is well-formed — the pre-fix
+    // (0,0,1) default fed atan2(0,0) → NaN → a black sample.
     let first = fb[0];
     assert!(
         fb.iter().all(|&p| p == first),
-        "zero-grid frame must be a uniform background, got varied pixels (first={first:#08x})",
+        "zero-grid frame must be a uniform sky, got varied pixels (first={first:#08x})",
     );
+    assert_ne!(
+        first & 0x00ff_ffff,
+        0,
+        "sky must not be black, got {first:#08x}"
+    );
+    let (r, _g, b) = (first & 0xff, (first >> 8) & 0xff, (first >> 16) & 0xff);
+    assert!(b > r, "headless sky is bluish (b>r), got {first:#08x}");
 }
 
 #[test]
@@ -388,7 +393,7 @@ fn scene_dda_renders_bedrock_wall_face_solid() {
     let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
 
     let (w, h) = (64u32, 64u32);
-    let renderer = HeadlessSceneRenderer::new(&gpu.device, w, h);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
     let cam = Camera {
         position: [vsid as f32 * 0.5, 0.0, 128.0], // z=128 = bedrock region
         right: [1.0, 0.0, 0.0],
@@ -438,7 +443,7 @@ fn scene_dda_renders_floor_through_mip_layout() {
     eprintln!("scene_render: resident {} bytes", scene.resident_bytes());
 
     let (w, h) = (64u32, 64u32);
-    let renderer = HeadlessSceneRenderer::new(&gpu.device, w, h);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
 
     // Camera at the chunk's XY centre, above the floor (small z),
     // looking straight down (+z). right × down == forward (RH).
