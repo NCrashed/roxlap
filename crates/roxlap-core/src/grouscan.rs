@@ -19,6 +19,18 @@
 // in from_sky but the rasterizer indexes via lat[]). Module-level
 // allow keeps the parity-driven layout intact without per-field churn.
 #![allow(dead_code)]
+// Incidental lints this ~3k-line asm port trips that aren't covered by
+// the workspace-wide voxel-port allow set: intentional `#[inline(always)]`
+// on hot deref, if-chains kept readable over `match`, elided lifetimes,
+// and a couple of doc-continuation/`if !`-style nits. File-allowed
+// (mirrors `kfa_draw.rs`) to preserve the 1:1 voxlap layout.
+#![allow(
+    clippy::inline_always,
+    clippy::comparison_chain,
+    clippy::if_not_else,
+    clippy::elidable_lifetime_names,
+    clippy::doc_lazy_continuation
+)]
 
 /// One entry on grouscan's `cf` stack — voxlap's `cftype`
 /// (`voxlap5.c:128`):
@@ -190,14 +202,18 @@ impl Default for ColumnSource<'_> {
 }
 
 // Diagnostic env-var caches. Each flag is read once at first access
-// via `LazyLock` instead of per-call. Pre-cache, the per-ray
+// (cached in a `OnceLock`) instead of per-call. Pre-cache, the per-ray
 // `std::env::var(..)` in `run_phases` alone accounted for ~29% of
 // render-frame CPU time (samply, 2026-05-31 vsid=4096 static-ground
-// bench).
-static TRACE_PHASES: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("ROXLAP_TRACE_PHASES").is_ok());
-static TRACE_STARTSKY: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("ROXLAP_TRACE_STARTSKY").is_ok());
+// bench). `OnceLock` (vs `LazyLock`) keeps the crate's MSRV at 1.77.
+fn trace_phases() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ROXLAP_TRACE_PHASES").is_ok())
+}
+fn trace_startsky() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("ROXLAP_TRACE_STARTSKY").is_ok())
+}
 /// Borrowed read-only view of an [`crate::sky::Sky`] resource —
 /// the subset `phase_startsky`'s textured-fill branch reads. Built
 /// from a `&Sky` once per ray (the per-ray sky-row state lives on
@@ -1040,7 +1056,7 @@ pub enum Phase {
 /// every phase as a stub that returns [`Phase::Done`]; R4.3f+
 /// replaces them with the actual fill loops.
 fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
-    let trace = *TRACE_PHASES;
+    let trace = trace_phases();
     let mut current = entry;
     let mut step_count = 0u32;
     loop {
@@ -2915,7 +2931,7 @@ fn slab_z_at(state: &GrouscanState<'_>, vptr_offset: usize, byte: usize) -> i32 
 // artifact.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 fn phase_remiporend(state: &mut GrouscanState<'_>) -> Phase {
-    if *TRACE_STARTSKY {
+    if trace_startsky() {
         eprintln!(
             "remiporend: gmipcnt={} gmipnum={} ce={} c={} gpz=[{}, {}] gxmax={} ngxmax={}",
             state.gmipcnt,
@@ -3200,7 +3216,7 @@ fn phase_startsky(state: &mut GrouscanState<'_>) -> Phase {
 /// `state.scratch.skycast` into every remaining radar slot.
 #[allow(clippy::cast_sign_loss)]
 fn phase_startsky_solid(state: &mut GrouscanState<'_>) -> Phase {
-    let trace = *TRACE_STARTSKY;
+    let trace = trace_startsky();
 
     let skycast = state.scratch.skycast;
     for c_idx in CF_SEED_INDEX..=state.ce_idx {
@@ -3445,7 +3461,7 @@ mod tests {
         // Multi-slab + last-slab columns. Same fixtures as the VC.2
         // test so any divergence between the two builders pops here
         // immediately.
-        let single = vec![0u8, 100, 105, 0, 0xAA, 0xBB, 0xCC, 0xDD];
+        let single = [0u8, 100, 105, 0, 0xAA, 0xBB, 0xCC, 0xDD];
         let mut multi = vec![4u8, 5, 10, 0]; // first slab: 16 bytes total
         multi.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]); // 3 colours
         multi.extend_from_slice(&[0, 50, 60, 40]); // last slab header

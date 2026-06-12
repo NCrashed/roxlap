@@ -338,7 +338,7 @@ impl SceneAndCamera {
 /// because: (a) the per-chunk bake is non-trivial cost, (b) the
 /// visual difference is minor for slowly-rotating scenes, and
 /// (c) re-baking each frame would dominate the render budget.
-
+///
 /// Diagnostic re-export for `repro.rs` to bake lighting+mips into a
 /// scene it builds itself (ring-artifact isolation tests). Gated
 /// behind `cfg(test)` so the release binary doesn't carry the

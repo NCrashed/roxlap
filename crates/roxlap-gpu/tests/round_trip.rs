@@ -64,7 +64,9 @@ fn fixture_one_voxel_per_column(vsid: u32) -> Vxl {
 fn try_init() -> Option<(HeadlessGpu, std::sync::MutexGuard<'static, ()>)> {
     // Recover from a poisoned lock (a panicking test still releases
     // the device); the data is `()` so there's nothing to corrupt.
-    let guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match HeadlessGpu::new_blocking(GpuRendererSettings::default()) {
         Ok(gpu) => Some((gpu, guard)),
         Err(GpuInitError::NoAdapter) => {

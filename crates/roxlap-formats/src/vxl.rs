@@ -131,11 +131,6 @@ impl Vxl {
     ///
     /// [`column_data`]: Self::column_data
     #[must_use]
-    // z ∈ [0, MAXZDIM) and every `as usize` cast is guarded
-    // non-negative (`zi >= z_start`, `zi >= ceil_z_start`, `zi < ze`),
-    // so the wrap/sign-loss can't fire — same convention as the other
-    // slab walkers in this file (e.g. `expandrle`).
-    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     pub fn voxel_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
         if x >= self.vsid || y >= self.vsid || z >= MAXZDIM as u32 {
             return None;

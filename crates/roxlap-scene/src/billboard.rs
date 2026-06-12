@@ -733,7 +733,7 @@ mod tests {
                 );
             }
             for &z in &snap.depth {
-                assert!(z.is_infinite(), "empty grid snapshot {i} depth not INF",);
+                assert!(z.is_infinite(), "empty grid snapshot {i} depth not INF");
             }
         }
     }

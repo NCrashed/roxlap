@@ -261,12 +261,12 @@ mod native {
     impl std::fmt::Debug for StreamingState {
         // Intentionally elides the channel + pool internals — they
         // print noisily and add nothing over the summary booleans.
-        #[allow(clippy::missing_fields_in_debug)]
+        // `finish_non_exhaustive` signals that omission to clippy.
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("StreamingState")
                 .field("thread_count", &self.thread_count)
                 .field("pool_built", &self.pool.is_some())
-                .finish()
+                .finish_non_exhaustive()
         }
     }
 

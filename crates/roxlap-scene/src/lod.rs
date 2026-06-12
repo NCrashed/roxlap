@@ -258,7 +258,7 @@ mod tests {
         // Exactly on Mid boundary — inclusive in Mid.
         assert_eq!(pick(1000.0), Lod::Mid);
         // Past Mid → Far.
-        assert_eq!(pick(1000.000_001), Lod::Far);
+        assert_eq!(pick(1_000.000_001), Lod::Far);
         assert_eq!(pick(1e6), Lod::Far);
     }
 

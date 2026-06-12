@@ -55,7 +55,7 @@ use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::{Camera, Engine};
 use roxlap_scene::render::render_scene_composed;
-use roxlap_scene::{GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+use roxlap_scene::{GridTransform, Scene, CHUNK_SIZE_XY};
 
 const W: u32 = 800;
 const H: u32 = 600;
@@ -112,7 +112,6 @@ fn build_3chz_grid_with_floor_at_chz2() -> Scene {
     let half_x = CHUNKS_X / 2;
     let half_y = CHUNKS_Y / 2;
     let cs_xy = CHUNK_SIZE_XY as i32;
-    let _cs_z = CHUNK_SIZE_Z as i32;
 
     // Materialise empty bedrock-placeholder chunks at chz=0 and
     // chz=1. `chunk_xyz_backing`'s bbox then spans chz=0..2 (origin

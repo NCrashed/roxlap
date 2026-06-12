@@ -61,7 +61,7 @@ pub struct ScanContext<'a> {
     /// For cross-chunk look-down (camera in all-air-bedrock column
     /// with terrain in a deeper chunk) it points to the chunk that
     /// holds the real floor. `gline_seed` reads it to route
-    /// state.column / slab_buf to the right chunk so rays start
+    /// state.column / `slab_buf` to the right chunk so rays start
     /// walking the real-terrain chunk directly.
     pub camera_seed_chunk_z: i32,
 }

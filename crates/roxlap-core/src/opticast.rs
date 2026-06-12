@@ -249,11 +249,11 @@ pub fn opticast<R: Rasterizer + Clone + Send + Sync>(
     // case (= chz=N all-air-bedrock with chz=N+1 below) it points
     // to the chunk holding the real floor. gline_seed reads it to
     // route state.column / slab_buf to the right chunk.
-    let (gstartz0, gstartz1, camera_vptr_offset, seed_chz) =
-        match column_walk::camera_chunk_air_gap(grid, &prelude, treat_z_max_as_air) {
-            Some(tuple) => tuple,
-            None => return OpticastOutcome::SkippedCameraInSolid,
-        };
+    let Some((gstartz0, gstartz1, camera_vptr_offset, seed_chz)) =
+        column_walk::camera_chunk_air_gap(grid, &prelude, treat_z_max_as_air)
+    else {
+        return OpticastOutcome::SkippedCameraInSolid;
+    };
 
     // Per-frame setup hook needs a `ScanContext` with cy / camera
     // state populated; build a "setup-only" projection over the

@@ -59,7 +59,7 @@ pub struct GridView<'a> {
     /// `(cx, cy)` in `[0, vsid)` never crosses a chunk boundary.
     /// For multi-chunk callers (S4B.2.c+), `chunk_size_xy` is the
     /// per-chunk dimension (typically 128) and `vsid` is the same
-    /// per-chunk value — they may diverge in S4B.4 when GridView
+    /// per-chunk value — they may diverge in S4B.4 when `GridView`
     /// stops carrying a "default" chunk's flat fields.
     pub chunk_size_xy: u32,
     /// S4B.6.a: Z extent of each chunk in voxel units. Locked to
@@ -401,6 +401,7 @@ mod tests {
     /// the multi-chunk lookup tests. Two synthetic 1×1 chunks at
     /// XY indices [0, 0] and [1, 0]. Their slab/column data is
     /// distinct so the lookup tests can tell them apart.
+    #[allow(clippy::type_complexity)] // test fixture: a bag of parallel arrays
     fn build_two_chunk_x_stripe() -> ([u8; 4], [u8; 4], [u32; 2], [u32; 2], [usize; 2], [usize; 2])
     {
         let slab_a = [10u8, 200, 254, 0];

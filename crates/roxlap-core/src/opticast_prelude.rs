@@ -49,11 +49,11 @@ pub struct OpticastPrelude {
     pub pos_z: i32,
     pub y_lookup: Vec<i32>,
     /// Caller-requested mip-level cap (voxlap's `gmipnum`). The
-    /// y_lookup table is sized for exactly this many levels, so the
+    /// `y_lookup` table is sized for exactly this many levels, so the
     /// rasterizer must clamp to it when passing `gmipnum` to grouscan
     /// — even when the underlying chunk's `mip_base_offsets` carries
     /// more levels (e.g. a pre-baked chunk read by a single-mip
-    /// renderer would otherwise OOB-read y_lookup at mip transition).
+    /// renderer would otherwise OOB-read `y_lookup` at mip transition).
     pub mip_levels: u32,
     pub x_mip: i32,
     pub max_scan_dist: i32,
@@ -509,9 +509,9 @@ mod tests {
         // window `[16, 32)` of the subtraction lands in the low
         // 16 bits — wrapping-i32 and true-i64 must produce the
         // same final value after the `& 0xFFFF` mask.
-        let pz_shifted = p.pos_z as i64; // j=0
+        let pz_shifted = i64::from(p.pos_z); // j=0
         for &i in &[0_usize, 127, 128, 2047, 2048, 2049, 4099] {
-            let want = (((pz_shifted - (i as i64) * PREC as i64) >> 16) & 0xFFFF) as i32;
+            let want = (((pz_shifted - (i as i64) * i64::from(PREC)) >> 16) & 0xFFFF) as i32;
             assert_eq!(p.y_lookup[i], want, "y_lookup[{i}] (chunks_z={chunks_z})");
         }
     }

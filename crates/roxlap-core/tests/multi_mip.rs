@@ -96,7 +96,7 @@ fn render_and_hash(vxl: &vxl::Vxl, mip_levels: u32) -> u64 {
     };
 
     {
-        let grid = roxlap_core::GridView::from_single_vxl(&vxl);
+        let grid = roxlap_core::GridView::from_single_vxl(vxl);
         let mut rasterizer =
             ScalarRasterizer::new(&mut framebuffer, &mut zbuffer, XRES as usize, grid);
         let outcome = opticast(&mut rasterizer, &mut pool, &cam, &settings, grid);

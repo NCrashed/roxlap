@@ -164,6 +164,7 @@ pub fn camera_chunk_air_gap(
         // stack) so callers route to that chunk's data — which is
         // not read anyway for OOB-XY, but keeps the indexing
         // canonical.
+        #[allow(clippy::cast_possible_wrap)] // chunks_z is a small slab count
         let chunks_z_signed = grid.chunk_grid.map_or(1, |cg| cg.chunks_z) as i32;
         let seed_chz = grid.chunk_grid.map_or(0, |cg| cg.origin_chunk_z);
         #[allow(clippy::cast_possible_wrap)]
@@ -171,6 +172,7 @@ pub fn camera_chunk_air_gap(
         return Some((0, world_z_max, 0, seed_chz));
     }
 
+    #[allow(clippy::cast_possible_wrap)] // chunks_z is a small slab count
     let chunks_z = grid.chunk_grid.map_or(1, |cg| cg.chunks_z) as i32;
     let origin_chunk_z = grid.chunk_grid.map_or(0, |cg| cg.origin_chunk_z);
     let max_chz = origin_chunk_z + chunks_z - 1;
@@ -217,6 +219,9 @@ pub fn camera_chunk_air_gap(
             chunk.column_offsets,
             column_idx_in_chunk,
         )?;
+        // Three distinct branches with long parity rationale each —
+        // clearer as an if-chain than a `match chz.cmp(..)`.
+        #[allow(clippy::comparison_chain)]
         let cz_local = if chz == camera_chz {
             prelude.camera_local_xyz[2]
         } else if chz > camera_chz {

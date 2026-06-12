@@ -61,3 +61,37 @@ unsafe_op_in_unsafe_fn = "warn"
 pedantic = { level = "warn", priority = -1 }
 # Module-name redundancy is fine for small crates that may grow.
 module_name_repetitions = "allow"
+# Pedantic lints this voxlap port trips pervasively *by design* — they
+# were already suppressed ad-hoc across the tree (kfa.rs, kfa_draw.rs,
+# sprite.rs, vxl.rs, grouscan.rs, …); centralising keeps new code
+# consistent without scattering `#[allow]`s. The substantive pedantic
+# lints (needless_pass_by_value, redundant_clone, …) stay on.
+#  - voxlap-identifier-heavy doc prose
+doc_markdown = "allow"
+#  - parity names (z1/z1c, cx/cy, sx0/sy0, …)
+similar_names = "allow"
+many_single_char_names = "allow"
+#  - the long monolithic asm-port phase functions + their signatures
+too_many_lines = "allow"
+too_many_arguments = "allow"
+#  - bounded voxel-coordinate casts (z ≤ 255, small chunk counts, …)
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+#  - widening int→float / int→wider-int casts (`as f64`, `as i64`)
+cast_lossless = "allow"
+#  - `x & 0xffffff == 0` colour/flag masks read clearer than trailing_zeros
+verbose_bit_mask = "allow"
+#  - exact float sentinels (INFINITY thresholds, 0.0 disabled-radii, …)
+float_cmp = "allow"
+#  - panics are via assert!/expect! invariants, not documented per-fn
+missing_panics_doc = "allow"
+#  - `use super::*` in test modules + a few intentional glob re-exports
+wildcard_imports = "allow"
+#  - `.for_each()` / `if cond { panic! }` / item-after-stmt / match-else
+#    are stylistic wash-vs-the-alternative
+needless_for_each = "allow"
+manual_assert = "allow"
+items_after_statements = "allow"
+single_match_else = "allow"

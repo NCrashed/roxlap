@@ -638,7 +638,7 @@ impl Scene {
             let lo = inv * (origin - grid.transform.origin);
             let ld = inv * dn;
             if let Some((voxel, t)) = voxel_dda(grid, lo, ld, max_dist) {
-                if best.as_ref().is_none_or(|b| t < b.t) {
+                if best.as_ref().map_or(true, |b| t < b.t) {
                     best = Some(RayHit {
                         grid: id,
                         voxel,
@@ -787,8 +787,8 @@ impl Scene {
     ///    may shrink, invalidating impostor projections; the next
     ///    Far-tier render rebuilds lazily).
     ///
-    /// Both passes use the f64 grid-local position so rotation
-    /// + non-axis-aligned grids stream and evict correctly. The
+    /// Both passes use the f64 grid-local position so rotation +
+    /// non-axis-aligned grids stream and evict correctly. The
     /// generate path is blocking — S7.3 will move it to a
     /// background rayon pool with `pump_streaming` (non-blocking).
     /// Callers that want the async variant in S7.0/S7.1 stages

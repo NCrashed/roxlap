@@ -283,6 +283,7 @@ fn stacked_demo_scene_renders_terrain_from_chz0() {
 ///   boundary issue.
 /// - Pose C `(21.50, 181.72, 177.21)` yaw 3.19 pitch 0.76: renders
 ///   both layers correctly.
+///
 /// These help isolate why some poses lose half the mountain.
 #[test]
 #[ignore = "expensive: builds the full 32x32 stacked ground (~3 s on dev hardware)"]
@@ -2009,8 +2010,7 @@ fn ship_disappears_at_captured_rotation() {
     assert!(
         captured_count > 100,
         "captured-rotation ship render produced only {captured_count} non-sky pixels — \
-         ship disappears at rotation {:?}",
-        SHIP_GONE_SHIP_ANGLES,
+         ship disappears at rotation {SHIP_GONE_SHIP_ANGLES:?}",
     );
 }
 

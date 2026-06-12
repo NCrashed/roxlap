@@ -284,7 +284,7 @@ struct FrameCache {
     /// S4B.6.e: chunk-z that owns `vptr_offset`. For the in-camera-
     /// chunk case this equals `prelude.camera_chunk_idx[2]`. For
     /// cross-chunk look-down it points to the chunk holding the
-    /// real floor — gline_seed routes state.column / slab_buf to
+    /// real floor — `gline_seed` routes state.column / `slab_buf` to
     /// it so rays start walking that chunk directly.
     seed_chunk_z: i32,
 }

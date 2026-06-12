@@ -182,7 +182,9 @@ impl Default for RenderOptions {
 /// The GPU variant owns the whole wgpu device/queue/pipelines, so
 /// it's boxed to keep the enum small.
 enum BackendImpl {
-    Cpu(CpuBackend),
+    // Both variants boxed so the enum stays small regardless of which
+    // backend's state is larger (clippy::large_enum_variant).
+    Cpu(Box<CpuBackend>),
     Gpu(Box<GpuBackend>),
 }
 
@@ -225,7 +227,7 @@ impl SceneRenderer {
             }
         }
         Self {
-            inner: BackendImpl::Cpu(CpuBackend::new(window, size, opts)),
+            inner: BackendImpl::Cpu(Box::new(CpuBackend::new(window, size, opts))),
         }
     }
 

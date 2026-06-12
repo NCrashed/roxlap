@@ -1980,7 +1980,7 @@ mod tests {
         let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         settings.mip_levels = 3;
         settings.mip_scan_dist = 32;
-        let grid_view = roxlap_core::GridView::from_single_vxl(&chunk);
+        let grid_view = roxlap_core::GridView::from_single_vxl(chunk);
         let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
         let _ = core_opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
         drop(rasterizer);

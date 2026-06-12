@@ -504,12 +504,12 @@ pub(crate) mod tests {
         assert_eq!(backing.chunks_z, 2);
         assert_eq!(backing.origin_chunk_xy, [0, 0]);
         assert_eq!(backing.origin_chunk_z, 0);
-        assert_eq!(backing.chunks.len(), 2 * 1 * 2);
-        // Index layout: [(dz * chunks_y + dy) * chunks_x + dx]
-        // (0, 0, 0) → dx=0, dy=0, dz=0 → 0
-        // (1, 0, 0) → dx=1, dy=0, dz=0 → 1
-        // (0, 0, 1) → dx=0, dy=0, dz=1 → 2
-        // (1, 0, 1) → dx=1, dy=0, dz=1 → 3 (implicit-air → None)
+        assert_eq!(backing.chunks.len(), 4); // dims [2, 1, 2]
+                                             // Index layout: [(dz * chunks_y + dy) * chunks_x + dx]
+                                             // (0, 0, 0) → dx=0, dy=0, dz=0 → 0
+                                             // (1, 0, 0) → dx=1, dy=0, dz=0 → 1
+                                             // (0, 0, 1) → dx=0, dy=0, dz=1 → 2
+                                             // (1, 0, 1) → dx=1, dy=0, dz=1 → 3 (implicit-air → None)
         assert!(backing.chunks[0].is_some(), "(0, 0, 0) present");
         assert!(backing.chunks[1].is_some(), "(1, 0, 0) present");
         assert!(backing.chunks[2].is_some(), "(0, 0, 1) present");
