@@ -43,6 +43,14 @@ pub(crate) struct GpuBackend {
     gpu: GpuRenderer,
     /// Whole-scene residency; `None` until the first non-empty render.
     resident: Option<GpuSceneResident>,
+    /// Lazily-built `grid_count == 0` resident used for the sprite-only
+    /// path (a scene with no grids but with sprites — e.g. an asset
+    /// viewer). Lets `render_scene` fill the sky background + far depth
+    /// and run the sprite pass without any voxel grids. Kept separate
+    /// from [`resident`](Self::resident) (which stays `None` for empty
+    /// scenes) so [`upload_scene`](Self::upload_scene) still re-runs and
+    /// picks up grids added later.
+    empty_resident: Option<GpuSceneResident>,
     /// Grid ids in upload order — index = per-grid camera slot.
     grid_ids: Vec<GridId>,
     /// Per-grid `chunk_idx → last-uploaded version` for the dirty poll.
@@ -91,6 +99,7 @@ impl GpuBackend {
         Ok(Self {
             gpu,
             resident: None,
+            empty_resident: None,
             grid_ids: Vec::new(),
             versions: Vec::new(),
             sprite_registry: None,
@@ -341,9 +350,28 @@ impl GpuBackend {
                 frame.gpu_fov_y_rad,
                 frame.gpu_max_outer_steps,
             );
+        } else if !self.sprite_instances.is_empty() {
+            // Sprite-only scene (no voxel grids — e.g. an asset/model
+            // viewer). Render through a zero-grid resident so the scene
+            // pass fills the sky background + far depth and the sprite
+            // pass composites the models over it (CPU/GPU parity). The
+            // sky comes from the 1×1 auto-sky (= `frame.sky_color`), so
+            // the background matches the CPU backend.
+            if self.empty_resident.is_none() {
+                let info = roxlap_gpu::SceneUpload { grids: Vec::new() };
+                self.empty_resident = Some(GpuSceneResident::upload(self.gpu.device(), &info));
+            }
+            let empty = self.empty_resident.as_ref().expect("just built");
+            self.gpu.render_scene(
+                empty,
+                &[],
+                &sprite_camera,
+                frame.gpu_fov_y_rad,
+                frame.gpu_max_outer_steps,
+            );
         } else {
-            // No materialised grids yet — clear to colour (deferred, so
-            // a HUD can still be painted over the empty scene).
+            // Truly empty (no grids, no sprites) — clear to colour
+            // (deferred, so a HUD can still be painted over it).
             self.gpu.render_clear_deferred();
         }
     }

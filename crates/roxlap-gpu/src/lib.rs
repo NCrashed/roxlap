@@ -316,6 +316,21 @@ struct SceneDdaPerGridCamera {
     _pad3: f32,
 }
 
+impl SceneDdaPerGridCamera {
+    fn from_camera(c: &Camera) -> Self {
+        Self {
+            pos: c.position,
+            _pad0: 0.0,
+            right: c.right,
+            _pad1: 0.0,
+            down: c.down,
+            _pad2: 0.0,
+            forward: c.forward,
+            _pad3: 0.0,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SceneDdaUniform {
@@ -349,6 +364,11 @@ struct SceneDdaUniform {
     _pad2: u32,
     _pad3: u32,
     _pad4: u32,
+    /// World camera used only to derive the per-pixel sky direction —
+    /// always valid, so a `grid_count == 0` (sprite-only / empty) scene
+    /// still paints a proper sky instead of a degenerate `(0,0,1)`
+    /// (whose `atan2(0,0)` sky lookup samples black).
+    sky_cam: SceneDdaPerGridCamera,
 }
 
 #[repr(C)]
@@ -1488,6 +1508,9 @@ impl GpuRenderer {
             _pad2: 0,
             _pad3: 0,
             _pad4: 0,
+            // Sky direction comes from the world (sprite) camera, so a
+            // grid-less sprite-only scene still paints a real sky.
+            sky_cam: SceneDdaPerGridCamera::from_camera(sprite_camera),
         };
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
@@ -2491,6 +2514,18 @@ impl HeadlessSceneRenderer {
             _pad2: 0,
             _pad3: 0,
             _pad4: 0,
+            // Sky direction from the first grid camera (the world frame
+            // in these tests); a default forward camera when there are
+            // none (grid_count == 0) so the sky lookup stays valid.
+            sky_cam: SceneDdaPerGridCamera::from_camera(&cameras.first().copied().unwrap_or(
+                Camera {
+                    position: [0.0; 3],
+                    right: [1.0, 0.0, 0.0],
+                    down: [0.0, 0.0, 1.0],
+                    forward: [0.0, 1.0, 0.0],
+                    fov_y_rad,
+                },
+            )),
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 

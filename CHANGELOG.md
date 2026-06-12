@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **GPU sprite-only / empty-scene rendering.** Sprites now render on the
+  GPU backend when the scene has no voxel grids (a pure model/sprite
+  viewer). Previously the facade short-circuited a grid-less scene to a
+  bare clear and never ran the sprite pass, so only the clear colour
+  showed (CPU rendered the sprite fine — a backend asymmetry). The
+  no-grids-but-sprites case now renders through a cached zero-grid
+  resident so the scene pass fills the sky background + far depth and
+  the sprite pass composites over it. Also fixed a latent degenerate
+  sky direction: with zero grids the sky ray was `(0,0,1)`, whose
+  `atan2(0,0)` panorama lookup sampled black — the scene shader now
+  derives the sky direction from a dedicated world camera in the
+  uniform (which also retires the "grid 0 is the world frame"
+  assumption for the sky on rotated grids).
+
 ### Added
 
 - **KFA animation-curve playback (`animsprite`).** Faithful port of

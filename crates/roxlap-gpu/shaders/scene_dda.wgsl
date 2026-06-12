@@ -92,6 +92,11 @@ struct Uniforms {
     _pad2: u32,
     _pad3: u32,
     _pad4: u32,
+    // World camera used purely to derive the per-pixel sky direction.
+    // Always valid (even with grid_count == 0, where no grid ray
+    // exists), so a grid-less scene still paints a proper sky instead
+    // of a degenerate (0,0,1) → atan2(0,0) → black sample.
+    sky_cam: PerGridCamera,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -478,10 +483,14 @@ fn render_scene(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ndc_y_top_pos = 1.0 - (f32(gid.y) + 0.5) / f32(u.screen_size.y) * 2.0;
 
     var best_t: f32 = T_INF;
-    // Sky-direction we paint on miss is derived from grid 0's
-    // camera (the world-frame ground grid). For demos with the
-    // ground at identity transform this is just the world camera.
-    var sky_dir = vec3<f32>(0.0, 0.0, 1.0);
+    // Sky direction = the per-pixel ray of the dedicated world/sky
+    // camera. Valid regardless of grid_count (a grid-less scene has no
+    // grid ray), so a sprite-only / empty scene paints a real sky.
+    let sky_dir = normalize(
+        u.sky_cam.forward
+        + ndc_x * half_w * u.sky_cam.right
+        - ndc_y_top_pos * half_h * u.sky_cam.down
+    );
     var best_color = vec3<f32>(0.6, 0.7, 0.85);
     var any_hit = false;
 
@@ -492,9 +501,6 @@ fn render_scene(@builtin(global_invocation_id) gid: vec3<u32>) {
             + ndc_x * half_w * cam.right
             - ndc_y_top_pos * half_h * cam.down
         );
-        if (g == 0u) {
-            sky_dir = ray_dir;
-        }
         let hit = march_grid(g, cam.pos, ray_dir, best_t);
         if (hit.hit && hit.t < best_t) {
             best_t = hit.t;

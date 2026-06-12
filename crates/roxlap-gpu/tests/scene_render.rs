@@ -283,6 +283,57 @@ fn scene_dda_aabb_early_out_away_is_sky() {
 }
 
 #[test]
+fn scene_dda_zero_grids_renders_sky() {
+    // Regression for the sprite-only / empty-scene GPU path: a scene
+    // with ZERO grids must still render a valid frame — the scene pass
+    // fills the flat sky everywhere (+ far depth), giving the sprite
+    // pass a background to composite over. Pre-fix the render facade
+    // short-circuited a grid-less scene to a bare clear and never ran
+    // `render_scene`, so a sprite-only viewer (no voxel grids) showed
+    // only the clear colour with the model invisible. This exercises
+    // the engine half the facade fix newly relies on: grid_count == 0
+    // with zero cameras renders the uniform sky without panicking.
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![] });
+    assert_eq!(
+        scene.grid_count, 0,
+        "empty SceneUpload → zero-grid resident"
+    );
+
+    let (w, h) = (32u32, 32u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, w, h);
+    // Zero cameras matches grid_count == 0 (render_scene asserts equal).
+    // Pre-fix this path was never dispatched (the facade short-circuited
+    // to a clear); the win here is it runs end-to-end without panic and
+    // produces a clean, consistent background for the sprite pass.
+    let fb = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[],
+        30f32.to_radians(),
+        64,
+        0.0,
+    );
+    assert_eq!(fb.len(), (w * h) as usize);
+
+    // No grids → no per-pixel grid hits → the whole frame is the single
+    // flat sky sample, so every pixel is identical. (We can't assert the
+    // colour: HeadlessSceneRenderer never uploads its sky texel — it's
+    // black here — whereas the windowed backend uploads the sky from
+    // `frame.sky_color`, where the sprite-only background is correct.)
+    // A uniform frame proves the zero-grid path neither reads garbage
+    // grid data nor diverges per pixel.
+    let first = fb[0];
+    assert!(
+        fb.iter().all(|&p| p == first),
+        "zero-grid frame must be a uniform background, got varied pixels (first={first:#08x})",
+    );
+}
+
+#[test]
 fn aabb_tracks_streaming_refresh_and_evict() {
     // GPU.13.0 — the early-out box is maintained live: installing a
     // chunk at a new index must GROW the AABB (so the shader never
