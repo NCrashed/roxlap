@@ -9,6 +9,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use roxlap_core::camera_math;
+use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::sprite::{draw_sprite, DrawTarget};
 use roxlap_core::Camera;
@@ -17,7 +18,8 @@ use roxlap_scene::render::render_scene_composed;
 use roxlap_scene::Scene;
 
 use crate::{
-    DynDisplay, DynWindow, FrameParams, HasDisplayHandle, HasWindowHandle, RenderOptions, SpriteSet,
+    DynDisplay, DynWindow, FrameParams, HasDisplayHandle, HasWindowHandle, KfaSprite,
+    RenderOptions, SpriteSet,
 };
 
 /// World-space view-ray direction (un-normalised) for window pixel
@@ -75,6 +77,10 @@ pub(crate) struct CpuBackend {
     /// model KV6 cloned once at `set_sprites`), drawn each frame after
     /// the world via `draw_sprite`.
     sprites: Vec<Sprite>,
+    /// Posed KFA limbs (flattened across all registered KFA sprites),
+    /// refreshed by [`Self::update_kfa_poses`] and drawn after the
+    /// static sprites each frame via `draw_sprite`.
+    kfa_limbs: Vec<Sprite>,
     /// `F`-capture: when set, the next frame copies its composited
     /// buffer into `captured` before presenting.
     capture_next: bool,
@@ -125,6 +131,7 @@ impl CpuBackend {
             n_threads,
             clear_sky: opts.clear_sky,
             sprites: Vec::new(),
+            kfa_limbs: Vec::new(),
             capture_next: false,
             captured: None,
             framebuffer,
@@ -192,6 +199,23 @@ impl CpuBackend {
             }
         }
         self.sprites = sprites;
+    }
+
+    /// Register KFA sprites — for the CPU backend this is the same as a
+    /// pose refresh: solve every limb's world transform from its
+    /// current `kfaval[]` and cache the resulting [`Sprite`]s.
+    pub(crate) fn set_kfa_sprites(&mut self, kfas: &mut [KfaSprite]) {
+        self.update_kfa_poses(kfas);
+    }
+
+    /// Re-solve every KFA limb's world transform and cache the posed
+    /// [`Sprite`]s for the next [`Self::render`].
+    pub(crate) fn update_kfa_poses(&mut self, kfas: &mut [KfaSprite]) {
+        self.kfa_limbs.clear();
+        for kfa in kfas.iter_mut() {
+            solve_kfa_limbs(kfa);
+            self.kfa_limbs.extend(kfa.limbs.iter().cloned());
+        }
     }
 
     #[allow(clippy::unused_self)] // symmetry with GpuBackend::resize
@@ -263,7 +287,7 @@ impl CpuBackend {
         // the same z-buffer (camera-facing voxel splat). Needs the
         // host-built lighting; skipped if absent or no sprites.
         if let Some(lighting) = frame.sprite_lighting {
-            if !self.sprites.is_empty() {
+            if !self.sprites.is_empty() || !self.kfa_limbs.is_empty() {
                 let cam_state = camera_math::derive(
                     camera,
                     width,
@@ -279,7 +303,10 @@ impl CpuBackend {
                     width,
                     height,
                 );
-                for sprite in &self.sprites {
+                // Static sprites, then the posed KFA limbs (already
+                // solved by `update_kfa_poses`); both z-test against the
+                // shared buffer so order doesn't affect the result.
+                for sprite in self.sprites.iter().chain(self.kfa_limbs.iter()) {
                     let _written =
                         draw_sprite(&mut target, &cam_state, frame.settings, lighting, sprite);
                 }

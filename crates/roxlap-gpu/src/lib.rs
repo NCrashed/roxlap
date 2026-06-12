@@ -2152,6 +2152,19 @@ impl GpuRenderer {
         ));
     }
 
+    /// Re-pose the already-resident sprite instances in place (no model
+    /// volume re-upload) — the cheap per-frame path for animated KFA
+    /// limbs. `instances` must match the last [`Self::set_sprite_instances`]
+    /// in length + order. No-op if no sprite registry is resident.
+    pub fn update_sprite_instance_transforms(
+        &mut self,
+        instances: &[sprite_model::SpriteInstance],
+    ) {
+        if let Some(reg) = self.sprite_registry.as_mut() {
+            reg.update_transforms(instances);
+        }
+    }
+
     /// GPU.10.4 — set the LOD pixel threshold: a sprite steps to the
     /// next mip once a mip-0 voxel would project below `px` screen
     /// pixels. `1.0` is the natural "no sub-pixel voxels" default;

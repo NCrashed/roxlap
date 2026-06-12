@@ -16,8 +16,9 @@
 
 use std::collections::HashMap;
 
-use crate::{FrameParams, HasDisplayHandle, HasWindowHandle, RenderOptions, SpriteSet};
+use crate::{FrameParams, HasDisplayHandle, HasWindowHandle, KfaSprite, RenderOptions, SpriteSet};
 use glam::{DVec3, IVec3};
+use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::Camera;
 use roxlap_gpu::{
     build_sprite_model, GpuInitError, GpuRenderer, GpuSceneResident, SpriteInstance,
@@ -47,6 +48,12 @@ pub(crate) struct GpuBackend {
     /// until [`set_sprites`](Self::set_sprites).
     sprite_registry: Option<SpriteModelRegistry>,
     sprite_instances: Vec<SpriteInstance>,
+    /// GPU.10 KFA — per registered KFA sprite, the registry model id of
+    /// each limb (in limb order). Built once by [`set_kfa_sprites`].
+    kfa_limb_models: Vec<Vec<u32>>,
+    /// Index into [`sprite_instances`] where the KFA limb instances
+    /// begin (static [`SpriteSet`] instances occupy `[0, kfa_base)`).
+    kfa_base: usize,
     /// Registry model id the `G`-carve edits + its next z-layer.
     carve_model_id: Option<u32>,
     carve_z: u32,
@@ -78,6 +85,8 @@ impl GpuBackend {
             versions: Vec::new(),
             sprite_registry: None,
             sprite_instances: Vec::new(),
+            kfa_limb_models: Vec::new(),
+            kfa_base: 0,
             carve_model_id: None,
             carve_z: 0,
             host_sky_set: false,
@@ -113,8 +122,64 @@ impl GpuBackend {
         self.gpu.set_sprite_instances(&registry, &instances);
         self.carve_model_id = set.carve_model.and_then(|i| model_ids.get(i).copied());
         self.carve_z = 0;
+        // Static instances reset the KFA region; re-register if needed.
+        self.kfa_base = instances.len();
+        self.kfa_limb_models.clear();
         self.sprite_registry = Some(registry);
         self.sprite_instances = instances;
+    }
+
+    /// Register KFA sprites: append each limb's kv6 as an instanced
+    /// model (with an LOD chain, like static sprites) and seed one
+    /// instance per limb at its current pose. Volumes upload once here;
+    /// [`update_kfa_poses`](Self::update_kfa_poses) only moves them.
+    pub(crate) fn set_kfa_sprites(&mut self, kfas: &mut [KfaSprite]) {
+        // Build on top of whatever static sprites already exist so the
+        // single GPU sprite pass draws both. `set_sprites` left
+        // `kfa_base` at the static instance count.
+        let mut registry = self.sprite_registry.take().unwrap_or_default();
+        let mut instances = std::mem::take(&mut self.sprite_instances);
+        self.kfa_base = instances.len();
+        self.kfa_limb_models.clear();
+
+        for kfa in kfas.iter_mut() {
+            // Pose the limbs so the seed instances are correct frame 0.
+            solve_kfa_limbs(kfa);
+            let mut limb_models = Vec::with_capacity(kfa.limbs.len());
+            for limb in &kfa.limbs {
+                let id = registry.add_lod(build_sprite_model(&limb.kv6), 4);
+                limb_models.push(id);
+                instances.push(SpriteInstance {
+                    model_id: id,
+                    transform: SpriteInstanceTransform::from_sprite(limb),
+                });
+            }
+            self.kfa_limb_models.push(limb_models);
+        }
+
+        self.gpu.set_sprite_instances(&registry, &instances);
+        self.sprite_registry = Some(registry);
+        self.sprite_instances = instances;
+    }
+
+    /// Re-pose registered KFA limbs and push the new transforms to the
+    /// GPU without re-uploading any model volume (GPU.10 cheap path).
+    pub(crate) fn update_kfa_poses(&mut self, kfas: &mut [KfaSprite]) {
+        if self.kfa_limb_models.is_empty() {
+            return;
+        }
+        let mut idx = self.kfa_base;
+        for kfa in kfas.iter_mut() {
+            solve_kfa_limbs(kfa);
+            for limb in &kfa.limbs {
+                if let Some(inst) = self.sprite_instances.get_mut(idx) {
+                    inst.transform = SpriteInstanceTransform::from_sprite(limb);
+                }
+                idx += 1;
+            }
+        }
+        self.gpu
+            .update_sprite_instance_transforms(&self.sprite_instances);
     }
 
     /// Carve the next z-layer off the carve model, rebuild its LOD

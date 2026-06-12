@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **KFA animation-curve playback (`animsprite`).** Faithful port of
+  voxlap's `animsprite` (`voxlap5.c:11125`): `KfaSprite::set_animation`
+  attaches the parsed `frmval` + `seq` tables and
+  `KfaSprite::animsprite(dt_ms)` advances the time cursor (honouring
+  `!target` loop/jump entries) and recomputes `kfaval[]` by wrap-aware,
+  fixed-point keyframe interpolation. Previously the host had to drive
+  `kfaval[]` by hand; baked `.kfa` curves now play back.
+- **KFA sprites on the GPU backend.** `SceneRenderer::set_kfa_sprites`
+  registers each limb's KV6 as an instanced model once, and
+  `update_kfa_poses` re-poses them every frame — GPU via a cheap
+  transform-only instance-buffer update (no model-volume re-upload,
+  `GpuRenderer::update_sprite_instance_transforms`), CPU by re-solving
+  limb transforms. Bone posing was factored out of `draw_kfa_sprite`
+  into the reusable `roxlap_core::kfa_draw::solve_kfa_limbs`. The
+  scene-demo shows an `animsprite`-driven swinging arm on both backends.
+
 ## [0.7.0] — 2026-06-12
 
 Decouples the renderer from winit (binds to any `raw-window-handle`

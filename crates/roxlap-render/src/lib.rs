@@ -32,6 +32,7 @@ use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::Camera;
 use roxlap_scene::Scene;
 
+pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::sprite::Sprite;
 pub use roxlap_gpu::{GpuInitError, GpuRendererSettings};
 // Re-exported so hosts can name the [`SceneRenderer::new`] bounds
@@ -324,6 +325,39 @@ impl SceneRenderer {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.set_sprites(set),
             BackendImpl::Gpu(g) => g.set_sprites(set),
+        }
+    }
+
+    /// Register animated KFA sprites (one or more bone hierarchies).
+    /// The GPU backend uploads each limb's kv6 as an instanced model
+    /// **once** (appended to the sprite registry) and seeds the limb
+    /// instances at their current pose; the CPU backend caches the
+    /// posed limbs for drawing. Call once at setup, after
+    /// [`set_sprites`](Self::set_sprites), then drive motion per frame
+    /// with [`update_kfa_poses`](Self::update_kfa_poses).
+    ///
+    /// Limbs are posed from the sprites' current
+    /// [`kfaval`](roxlap_formats::kfa::KfaSprite::kfaval) (advance
+    /// [`animsprite`](roxlap_formats::kfa::KfaSprite::animsprite) first
+    /// if using a baked curve), so `kfas` is taken `&mut`.
+    pub fn set_kfa_sprites(&mut self, kfas: &mut [KfaSprite]) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_kfa_sprites(kfas),
+            BackendImpl::Gpu(g) => g.set_kfa_sprites(kfas),
+        }
+    }
+
+    /// Re-pose the registered KFA sprites from their current
+    /// `kfaval[]`. Call each frame after advancing the animation
+    /// (`kfa.animsprite(dt_ms)` or poking `kfaval[]`). The GPU backend
+    /// takes the cheap transform-only update (no model-volume
+    /// re-upload); the CPU backend re-solves limb transforms for the
+    /// next [`render`](Self::render). Must follow a
+    /// [`set_kfa_sprites`](Self::set_kfa_sprites) with the same sprites.
+    pub fn update_kfa_poses(&mut self, kfas: &mut [KfaSprite]) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.update_kfa_poses(kfas),
+            BackendImpl::Gpu(g) => g.update_kfa_poses(kfas),
         }
     }
 

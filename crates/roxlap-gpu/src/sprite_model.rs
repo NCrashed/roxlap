@@ -652,6 +652,29 @@ impl SpriteRegistryResident {
         }
     }
 
+    /// Refresh instance poses in place from `instances` — for animated
+    /// sprites (e.g. KFA limbs re-posed each frame) — **without** any
+    /// model-volume re-upload. `instances` must match the set passed to
+    /// [`Self::upload`] in length + order; each keeps its `model_id`
+    /// (LOD chain) so only the transform + cull centre change. No GPU
+    /// write happens here: the next [`Self::cull_bin_upload`] re-uploads
+    /// the packed visible subset, as it already does every frame.
+    pub fn update_transforms(&mut self, instances: &[SpriteInstance]) {
+        debug_assert_eq!(
+            instances.len(),
+            self.cull.len(),
+            "update_transforms instance count must match upload"
+        );
+        for (ci, inst) in self.cull.iter_mut().zip(instances) {
+            ci.gpu.inv_rot0 = inst.transform.inv_rot[0];
+            ci.gpu.inv_rot1 = inst.transform.inv_rot[1];
+            ci.gpu.inv_rot2 = inst.transform.inv_rot[2];
+            ci.gpu.pos = inst.transform.pos;
+            // Bounding sphere follows the pivot; radius/chain unchanged.
+            ci.center = inst.transform.pos;
+        }
+    }
+
     /// GPU.10.3 — frustum-cull, pack the visible subset into the
     /// instance buffer, then bin those instances into screen tiles:
     /// project each visible bounding sphere to a screen AABB and append

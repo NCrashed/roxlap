@@ -21,8 +21,11 @@ use std::time::Instant;
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::Engine;
+use roxlap_formats::kfa::{Hinge, Point3, Seq};
 use roxlap_formats::sprite::Sprite;
-use roxlap_render::{FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet};
+use roxlap_render::{
+    FrameParams, KfaSprite, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -179,6 +182,80 @@ fn build_sprites() -> Vec<Sprite> {
     }
 }
 
+/// Build the demo's animated KFA sprite: a two-bone hierarchy (a static
+/// "body" + a hinged "arm", both `coco.kv6`) carrying a baked swing
+/// curve. The curve is played back per frame by
+/// [`KfaSprite::animsprite`] — the faithful port of voxlap's animation
+/// playback — so the arm sweeps ±~88° and loops, on **both** render
+/// backends (GPU: cheap per-frame transform update; CPU: re-solve).
+///
+/// Returns an empty `Vec` if the embedded KV6 fails to parse, so the
+/// demo keeps booting.
+fn build_kfa() -> Vec<KfaSprite> {
+    let Ok(kv6) = kv6_sprite::load_coco_kv6() else {
+        return Vec::new();
+    };
+    // Placed beside the static sprite, at spawn eye level.
+    let root_pos = [70.0, -75.0, 50.0];
+    let body = Sprite::axis_aligned(kv6.clone(), root_pos);
+    let arm = Sprite::axis_aligned(kv6, root_pos); // setlimb overwrites
+
+    let zero = Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    let z_axis = Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+    let body_hinge = Hinge {
+        parent: -1,
+        p: [zero, zero],
+        v: [z_axis, z_axis],
+        vmin: 0,
+        vmax: 0,
+        htype: 0,
+        filler: [0; 7],
+    };
+    let arm_hinge = Hinge {
+        parent: 0,
+        // Arm-side velcro at the arm origin; body-side velcro 40 voxels
+        // right of the body centre, so the arm pivots out to the side.
+        p: [
+            zero,
+            Point3 {
+                x: 40.0,
+                y: 0.0,
+                z: 0.0,
+            },
+        ],
+        v: [z_axis, z_axis],
+        // Free hinge → animsprite takes the shortest angular path.
+        vmin: i16::MIN,
+        vmax: i16::MAX,
+        htype: 0,
+        filler: [0; 7],
+    };
+
+    let mut kfa = KfaSprite::new(vec![body, arm], vec![body_hinge, arm_hinge], root_pos);
+    // Baked curve: arm angle (the second per-frame value; the first is
+    // the ignored root bone) swings 0 → +16000 → 0 → -16000 and loops.
+    // The trailing seq entry is a `!0` jump back to entry 0 (a 2 s
+    // cycle), exercising animsprite's loop-jump path.
+    let frmval = vec![vec![0, 0], vec![0, 16000], vec![0, 0], vec![0, -16000]];
+    let seq = vec![
+        Seq { tim: 0, frm: 0 },
+        Seq { tim: 500, frm: 1 },
+        Seq { tim: 1000, frm: 2 },
+        Seq { tim: 1500, frm: 3 },
+        Seq { tim: 2000, frm: !0 },
+    ];
+    kfa.set_animation(frmval, seq);
+    vec![kfa]
+}
+
 const FAST_MULT: f64 = 4.0;
 const MOUSE_SENS: f64 = 0.0025;
 /// Pitch clamped just shy of ±90° so the basis stays well-conditioned.
@@ -333,6 +410,9 @@ struct App {
     /// Base KV6 sprite(s); `build_sprite_set` expands these into the
     /// demo's instanced field handed to the renderer at startup.
     sprites: Vec<Sprite>,
+    /// Animated KFA sprite(s), registered once in `resumed` and re-posed
+    /// each frame via `animsprite` + `update_kfa_poses`.
+    kfa: Vec<KfaSprite>,
     /// Post-S7.6: lighting + mip bake driver for streaming grids.
     /// Runs each frame right after `pump_streaming`; bakes any
     /// newly-installed chunks (and re-bakes their 4 cardinal
@@ -400,6 +480,7 @@ impl App {
             pick_models: Vec::new(),
             pick_saved_pose: None,
             sprites: build_sprites(),
+            kfa: build_kfa(),
             bake_tracker: StreamingBakeTracker::new(),
             title_base: "roxlap-scene-demo".to_string(),
             fps_frames: 0,
@@ -493,6 +574,19 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+
+        // Advance + re-pose the animated KFA sprite(s): `animsprite`
+        // (voxlap's playback port) walks the baked curve from `dt`, then
+        // the renderer re-poses the limbs — GPU does a transform-only
+        // buffer update, CPU re-solves the bone transforms for drawing.
+        if !self.kfa.is_empty() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let dt_ms = (dt * 1000.0) as i32;
+            for k in &mut self.kfa {
+                k.animsprite(dt_ms);
+            }
+            renderer.update_kfa_poses(&mut self.kfa);
+        }
 
         // Per-frame opticast settings (host owns scan distance).
         let mut settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
@@ -842,6 +936,13 @@ impl ApplicationHandler for App {
                 set.models.len(),
             );
             renderer.set_sprites(&set);
+        }
+
+        // Animated KFA sprite (the swinging arm) — registered once;
+        // re-posed each frame in `redraw`. Shares the `no_sprites` knob.
+        if !no_sprites && !self.kfa.is_empty() {
+            eprintln!("roxlap-render: KFA sprite registered (animsprite-driven arm)");
+            renderer.set_kfa_sprites(&mut self.kfa);
         }
 
         // HUD: bridge winit events into egui. `&*window` provides the
