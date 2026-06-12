@@ -12,11 +12,13 @@
 //! [`crate::sprite::draw_sprite`] per limb to rasterise the kv6
 //! data.
 //!
-//! Voxlap's full animation system (`animsprite` + `seq[]` +
-//! `frmval[]` interpolation) is **not** ported here — the host
-//! drives `kfaval[]` directly each frame, which is enough for
-//! procedural animation. Adding `animsprite` later would let
-//! `.kfa` files with baked frame curves play back unchanged.
+//! Voxlap's animation-curve playback (`animsprite` + `seq[]` +
+//! `frmval[]` interpolation) lives in
+//! [`roxlap_formats::kfa::KfaSprite::animsprite`] — call it to
+//! advance `kfaval[]` from a baked curve, or poke `kfaval[]`
+//! directly for procedural animation, then render here. The bone
+//! posing this module computes is also exposed standalone as
+//! [`solve_kfa_limbs`] for non-CPU backends (the GPU sprite pass).
 //!
 //! No oracle pose exercises KFA, so this module's correctness
 //! gate is "looks right + tests verify the bone math". We can
@@ -217,11 +219,38 @@ pub fn draw_kfa_sprite(
     lighting: &SpriteLighting<'_>,
     kfa: &mut KfaSprite,
 ) -> u32 {
+    // Pose first, then rasterise. Voxlap interleaves the two in one
+    // descending loop, but a limb's transform depends only on its
+    // (already-posed) parent — never on drawing — so a full solve pass
+    // followed by a full draw pass is identical, and lets non-CPU
+    // backends reuse `solve_kfa_limbs` verbatim.
+    solve_kfa_limbs(kfa);
+    let n = kfa.hinge_sort.len();
+    let mut total: u32 = 0;
+    for k in (0..n).rev() {
+        let j = kfa.hinge_sort[k];
+        total += draw_sprite(target, cam, settings, lighting, &kfa.limbs[j]);
+    }
+    total
+}
+
+/// Pose every limb of a KFA sprite — the bone-transform half of
+/// [`draw_kfa_sprite`], without rasterising. Walks the hinge tree in
+/// topological order (parents first) and writes each limb's world
+/// `(s, h, f, p)` from its parent's via the per-limb `setlimb` math,
+/// reading the current [`KfaSprite::kfaval`] angles. Mirror of the
+/// transform portion of voxlap's `kfadraw` (voxlap5.c:9759).
+///
+/// Split out so non-CPU backends (e.g. the GPU instanced-sprite pass)
+/// can run the exact same posing and then consume `kfa.limbs[*]`
+/// transforms however they need. The host typically calls
+/// [`KfaSprite::animsprite`](roxlap_formats::kfa::KfaSprite::animsprite)
+/// to advance `kfaval[]` first, then this to resolve world transforms.
+pub fn solve_kfa_limbs(kfa: &mut KfaSprite) {
     // Voxlap iterates `for i = numhin-1; i >= 0; i--`; sort_hinges
     // puts parents at high indices, so descending iteration walks
     // parents first.
     let n = kfa.hinge_sort.len();
-    let mut total: u32 = 0;
     for k in (0..n).rev() {
         let j = kfa.hinge_sort[k];
         let parent = kfa.hinges[j].parent;
@@ -248,10 +277,7 @@ pub fn draw_kfa_sprite(
                 p_world[2] - tp[0] * s[2] - tp[1] * h[2] - tp[2] * f[2],
             ];
         }
-        // Render the limb's kv6 mesh.
-        total += draw_sprite(target, cam, settings, lighting, &kfa.limbs[j]);
     }
-    total
 }
 
 #[cfg(test)]
