@@ -501,7 +501,7 @@ fn stacked_demo_diagnostic_three_capture_poses() {
 /// transition.
 #[test]
 #[ignore = "expensive diagnostic: builds full stacked demo + 4 renders (~10 s)"]
-fn poseD_mip_ablation() {
+fn pose_d_mip_ablation() {
     std::env::set_var("ROXLAP_STACKED_GROUND", "1");
     let mut scene_and_cam = crate::scene::build_demo();
     std::env::remove_var("ROXLAP_STACKED_GROUND");
