@@ -608,6 +608,7 @@ impl App {
             gpu_max_outer_steps: chunks_visible,
             gpu_fov_y_rad: (GPU_FOV_Y_DEG as f32).to_radians(),
             sprite_lighting: Some(&lighting),
+            side_shades: self.engine.side_shades(),
         };
 
         // Pick mode: unproject the mouse onto the ground plane and

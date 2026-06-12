@@ -252,6 +252,11 @@ impl CpuBackend {
         let fog_i = i32::from_ne_bytes(frame.fog_color.to_ne_bytes());
         self.pool.set_fog(fog_i, frame.fog_max_scan_dist);
         self.pool.set_treat_z_max_as_air(frame.treat_z_max_as_air);
+        // Per-face grid shading (voxlap setsideshades) — the grid-scan
+        // analogue of sprite_lighting. Default [0;6] keeps sideshademode
+        // off (byte-identical to the no-side-shade path).
+        let [top, bot, left, right, up, down] = frame.side_shades;
+        self.pool.set_side_shades(top, bot, left, right, up, down);
 
         // Composite into the owned framebuffer (not the window) so the
         // present can be deferred — a host may paint a UI over it first.

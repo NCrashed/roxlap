@@ -320,6 +320,16 @@ impl GpuBackend {
         // Per-frame GPU scene-LOD knob (GPU.11.1).
         self.gpu.set_scene_mip_scan_dist(frame.gpu_mip_scan_dist);
 
+        // `frame.side_shades` (voxlap setsideshades) is applied by the
+        // CPU backend per frame. The GPU grid pass instead shades from
+        // the per-voxel brightness baked into each colour's alpha byte
+        // (the engine's lightmode bake), and deliberately does NOT do
+        // runtime per-face darkening — `chunk_dda.wgsl` notes that would
+        // double-darken the baked colours. Runtime side-shades on the
+        // GPU (derive the hit face from the DDA step axis, then darken
+        // by `side_shades[face]`) is a follow-up; until then the GPU
+        // background matches a host that bakes its sun into the voxels.
+
         // GPU.10 sprite lighting: rebuild each instance's voxlap
         // `kv6colmul` table from its current pose + the frame's lighting,
         // so the GPU sprite pass shades exactly like the CPU rasteriser

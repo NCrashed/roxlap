@@ -109,6 +109,16 @@ pub struct FrameParams<'a> {
     /// (its sprite pass shades from the uploaded model colours). `None`
     /// skips CPU sprite drawing.
     pub sprite_lighting: Option<&'a SpriteLighting<'a>>,
+    /// Per-face directional shading for the voxel grids — voxlap's
+    /// `setsideshades(top, bot, left, right, up, down)`, the grid-scan
+    /// analogue of [`sprite_lighting`](Self::sprite_lighting). Each
+    /// entry darkens the faces pointing that way; the host typically
+    /// passes its engine's `side_shades()`. The default `[0; 6]` keeps
+    /// `sideshademode` off (no per-side shading), so existing hosts and
+    /// the oracle goldens are unaffected. Applied by the CPU backend
+    /// each frame; the GPU grid pass does not yet consume it (a
+    /// follow-up — see the crate docs).
+    pub side_shades: [i8; 6],
 }
 
 /// Result of [`SceneRenderer::pick`] — a resolved screen→world voxel

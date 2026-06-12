@@ -12,11 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Ports voxlap's KFA animation-curve playback (`animsprite`) and brings the
 GPU sprite path to parity with the CPU: animated KFA sprites, directional
 normal-based sprite lighting, and sprite rendering in grid-less
-(model-viewer) scenes. **Breaking:** `HeadlessSceneRenderer::new` takes a
-`&wgpu::Queue` (so it uploads its default sky); `KfaSprite` gains public
+(model-viewer) scenes, plus a grid-lighting hook on the render API.
+**Breaking:** `FrameParams` gains a `side_shades: [i8; 6]` field (default
+`[0; 6]`); `HeadlessSceneRenderer::new` takes a `&wgpu::Queue` (so it
+uploads its default sky); `KfaSprite` gains public
 `frmval`/`seq`/`kfatim`/`okfatim` fields and `SpriteModel` a public `dirs`
 field (built by the existing constructors — only direct struct-literal
 construction is affected).
+
+### Added
+
+- **Grid side-shade lighting hook (`FrameParams.side_shades`).** Plumbs
+  voxlap's `setsideshades(top, bot, left, right, up, down)` through the
+  render API — the grid-scan analogue of `sprite_lighting`. The CPU
+  backend pushes it into the opticast pool each frame (default `[0; 6]`
+  keeps `sideshademode` off, byte-identical to before). A host passes its
+  engine's `side_shades()` so the board shades by the same sun. The GPU
+  grid pass shades from baked per-voxel brightness and does not yet
+  consume `side_shades` (a documented follow-up).
 
 ### Fixed
 
