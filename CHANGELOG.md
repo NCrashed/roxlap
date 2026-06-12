@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-06-12
+
+Ports voxlap's KFA animation-curve playback (`animsprite`) and brings the
+GPU sprite path to parity with the CPU: animated KFA sprites, directional
+normal-based sprite lighting, and sprite rendering in grid-less
+(model-viewer) scenes. **Breaking:** `HeadlessSceneRenderer::new` takes a
+`&wgpu::Queue` (so it uploads its default sky); `KfaSprite` gains public
+`frmval`/`seq`/`kfatim`/`okfatim` fields and `SpriteModel` a public `dirs`
+field (built by the existing constructors — only direct struct-literal
+construction is affected).
+
 ### Fixed
 
 - **GPU sprite-only / empty-scene rendering.** Sprites now render on the
