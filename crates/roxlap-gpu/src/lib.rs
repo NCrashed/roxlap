@@ -194,6 +194,11 @@ pub struct GpuRenderer {
     /// [`Self::set_scene_mip_scan_dist`] — the axis-aligned-mip-beams
     /// mitigation (GPU.11.2) pushes it outward if banding appears.
     scene_mip_scan_dist: f32,
+    /// Per-face grid side-shades (voxlap setsideshades), packed for the
+    /// scene-DDA uniform: `[0]=(top,bot,left,right)`, `[1]=(up,down,_,_)`.
+    /// Each is the u8 shade intensity. `[[0;4];2]` = no shading. Set via
+    /// [`Self::set_scene_side_shades`].
+    scene_side_shades: [[i32; 4]; 2],
     /// Vertical FOV (radians) the last `render_scene` marched with —
     /// cached so [`Self::pixel_ray`] reconstructs the matching view ray
     /// for picking. `0` until the first scene render.
@@ -369,6 +374,12 @@ struct SceneDdaUniform {
     /// still paints a proper sky instead of a degenerate `(0,0,1)`
     /// (whose `atan2(0,0)` sky lookup samples black).
     sky_cam: SceneDdaPerGridCamera,
+    /// Per-face side-shade intensities (voxlap setsideshades), each the
+    /// u8 shade subtracted from a voxel's brightness byte at a hit.
+    /// `side_shades0 = (top, bot, left, right)`,
+    /// `side_shades1 = (up, down, _, _)`. All-zero = no shading.
+    side_shades0: [i32; 4],
+    side_shades1: [i32; 4],
 }
 
 #[repr(C)]
@@ -574,6 +585,7 @@ impl GpuRenderer {
             sprite_lod_px: 4.0,
             // GPU.11.1 — matches the CPU demo's mip_scan_dist=64.
             scene_mip_scan_dist: 64.0,
+            scene_side_shades: [[0; 4]; 2],
             last_fov_y_rad: 0.0,
             pending_frame: None,
             #[cfg(feature = "hud")]
@@ -1511,6 +1523,8 @@ impl GpuRenderer {
             // Sky direction comes from the world (sprite) camera, so a
             // grid-less sprite-only scene still paints a real sky.
             sky_cam: SceneDdaPerGridCamera::from_camera(sprite_camera),
+            side_shades0: self.scene_side_shades[0],
+            side_shades1: self.scene_side_shades[1],
         };
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
@@ -2228,6 +2242,21 @@ impl GpuRenderer {
         self.scene_mip_scan_dist = dist.max(0.0);
     }
 
+    /// Set per-face grid side-shading — voxlap's
+    /// `setsideshades(top, bot, left, right, up, down)`. Each value is
+    /// subtracted (as a u8, matching the CPU `gcsub` high byte) from a
+    /// hit voxel's brightness byte before shading, so the scene-DDA pass
+    /// darkens grid faces the same way the CPU rasteriser does. `[0; 6]`
+    /// disables it (the default). The hit face is taken from the DDA's
+    /// last-stepped axis + ray direction.
+    pub fn set_scene_side_shades(&mut self, s: [i8; 6]) {
+        // Reinterpret each i8 as u8 (voxlap stamps `sxx` into gcsub's
+        // high byte verbatim), then pack (top, bot, left, right) /
+        // (up, down, 0, 0) for the two uniform vec4s.
+        let v = |i: usize| i32::from(s[i] as u8);
+        self.scene_side_shades = [[v(0), v(1), v(2), v(3)], [v(4), v(5), 0, 0]];
+    }
+
     /// GPU.10.1 — build the instanced model-DDA pipeline (one thread
     /// per pixel). Lazily invoked the first frame a registry is present.
     fn build_sprite_model_dda(&self) -> SpriteModelDdaResources {
@@ -2318,6 +2347,10 @@ pub struct HeadlessSceneRenderer {
     pipeline: wgpu::ComputePipeline,
     readback: wgpu::Buffer,
     padded_bytes_per_row: u32,
+    /// Per-face side-shades for the gate render (default none). Packed
+    /// `[(top,bot,left,right), (up,down,_,_)]`; set via
+    /// [`Self::set_side_shades`].
+    side_shades: [[i32; 4]; 2],
 }
 
 impl HeadlessSceneRenderer {
@@ -2474,7 +2507,17 @@ impl HeadlessSceneRenderer {
             pipeline,
             readback,
             padded_bytes_per_row,
+            side_shades: [[0; 4]; 2],
         }
+    }
+
+    /// Set per-face side-shades for subsequent [`Self::render`] calls —
+    /// voxlap `setsideshades(top, bot, left, right, up, down)`, each an
+    /// i8 stamped as u8 (matching the engine path). Lets the gate test
+    /// the GPU side-shade darkening.
+    pub fn set_side_shades(&mut self, s: [i8; 6]) {
+        let v = |i: usize| i32::from(s[i] as u8);
+        self.side_shades = [[v(0), v(1), v(2), v(3)], [v(4), v(5), 0, 0]];
     }
 
     /// Render `scene` from `cameras` (one per grid) and read the
@@ -2548,6 +2591,8 @@ impl HeadlessSceneRenderer {
                     fov_y_rad,
                 },
             )),
+            side_shades0: self.side_shades[0],
+            side_shades1: self.side_shades[1],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 

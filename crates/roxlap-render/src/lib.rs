@@ -115,9 +115,10 @@ pub struct FrameParams<'a> {
     /// entry darkens the faces pointing that way; the host typically
     /// passes its engine's `side_shades()`. The default `[0; 6]` keeps
     /// `sideshademode` off (no per-side shading), so existing hosts and
-    /// the oracle goldens are unaffected. Applied by the CPU backend
-    /// each frame; the GPU grid pass does not yet consume it (a
-    /// follow-up — see the crate docs).
+    /// the oracle goldens are unaffected. Applied each frame by **both**
+    /// backends: the CPU rasteriser via `gcsub`, and the GPU scene-DDA
+    /// pass by darkening a hit voxel's brightness by the hit face's
+    /// shade (the face taken from the DDA's last-stepped axis).
     pub side_shades: [i8; 6],
 }
 

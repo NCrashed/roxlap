@@ -24,12 +24,15 @@ construction is affected).
 
 - **Grid side-shade lighting hook (`FrameParams.side_shades`).** Plumbs
   voxlap's `setsideshades(top, bot, left, right, up, down)` through the
-  render API — the grid-scan analogue of `sprite_lighting`. The CPU
-  backend pushes it into the opticast pool each frame (default `[0; 6]`
-  keeps `sideshademode` off, byte-identical to before). A host passes its
-  engine's `side_shades()` so the board shades by the same sun. The GPU
-  grid pass shades from baked per-voxel brightness and does not yet
-  consume `side_shades` (a documented follow-up).
+  render API — the grid-scan analogue of `sprite_lighting` — on **both**
+  backends. The CPU rasteriser applies it via `gcsub`; the GPU scene-DDA
+  pass darkens a hit voxel's brightness by the hit face's shade (the face
+  from the DDA's last-stepped axis), reducing the alpha-brightness before
+  the `/128` divide exactly like `grouscan_shade`. With a flat (un-baked)
+  brightness it's pure runtime side-shading; with baked light it stacks,
+  as voxlap does. Default `[0; 6]` keeps `sideshademode` off
+  (byte-identical to before). A host passes its engine's `side_shades()`
+  so the board shades by the same sun.
 
 ### Fixed
 

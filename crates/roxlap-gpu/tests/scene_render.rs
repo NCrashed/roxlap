@@ -338,6 +338,82 @@ fn scene_dda_zero_grids_renders_sky() {
     assert!(b > r, "headless sky is bluish (b>r), got {first:#08x}");
 }
 
+/// GPU side-shade (voxlap setsideshades) darkens a grid face. Camera
+/// looks straight down at a floor plane; the floor is hit via a +z
+/// step, so its shade comes from the `bot` lane. Rendering with
+/// `bot = 64` must darken the floor ~half vs the unshaded baseline,
+/// proving the scene-DDA face detection + brightness reduction work.
+/// (Exact CPU parity needs visual inspection; this guards the
+/// mechanism + uniform plumbing against regressions.)
+#[test]
+fn scene_dda_side_shades_darken_floor() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&floor_chunk(vsid)); // floor voxel at z=100
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // Above the floor (z=50 < 100), looking straight down (+z, voxlap
+    // z-down). right × down == forward.
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+
+    let fb0 = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+    let base = fb0[centre];
+    assert!(
+        is_block_color(base),
+        "centre should be the lit floor, got {base:#08x}",
+    );
+
+    // Darken the floor face (bot lane = side_shades[1]).
+    renderer.set_side_shades([0, 64, 0, 0, 0, 0]);
+    let fb1 = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+    let shaded = fb1[centre];
+    assert!(
+        lum(shaded) < lum(base),
+        "side-shade should darken the floor: {base:#08x} -> {shaded:#08x}",
+    );
+    // bot=64 of 128 → ~half brightness, still textured (not black sky).
+    assert_ne!(
+        shaded & 0x00ff_ffff,
+        0,
+        "half-shaded floor must not be black"
+    );
+}
+
 #[test]
 fn aabb_tracks_streaming_refresh_and_evict() {
     // GPU.13.0 — the early-out box is maintained live: installing a

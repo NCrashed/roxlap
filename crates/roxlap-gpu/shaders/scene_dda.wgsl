@@ -97,6 +97,14 @@ struct Uniforms {
     // exists), so a grid-less scene still paints a proper sky instead
     // of a degenerate (0,0,1) → atan2(0,0) → black sample.
     sky_cam: PerGridCamera,
+    // Per-face directional shading (voxlap setsideshades), as the
+    // alpha-brightness reduction applied at a voxel hit. Each value is
+    // the u8 shade intensity (0..255) subtracted from the voxel's
+    // brightness byte before the /128 divide — matching the CPU
+    // `grouscan_shade`. side_shades0 = (top, bot, left, right),
+    // side_shades1 = (up, down, _, _). All-zero = no shading.
+    side_shades0: vec4<i32>,
+    side_shades1: vec4<i32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -181,7 +189,22 @@ fn voxel_solid_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> bool {
     return (occ_word(solid_base + z_word) & (1u << z_bit)) != 0u;
 }
 
-fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> vec3<f32> {
+// Per-face side-shade intensity for a voxel hit, mirroring the CPU's
+// gcsub-lane selection: z-faces → top/bot (ceiling/floor), x-faces →
+// left/right, y-faces → up/down, with the pair chosen by the ray's
+// direction sign along that axis (= voxlap's gixy-sign select).
+// `axis`: 0=x, 1=y, 2=z.
+fn side_shade_for(axis: i32, ray_dir: vec3<f32>) -> f32 {
+    if (axis == 2) {
+        // ray going +z (down, voxlap z-down) hits a floor → bot, else ceiling → top
+        return f32(select(u.side_shades0.x, u.side_shades0.y, ray_dir.z >= 0.0));
+    } else if (axis == 0) {
+        return f32(select(u.side_shades0.z, u.side_shades0.w, ray_dir.x >= 0.0));
+    }
+    return f32(select(u.side_shades1.x, u.side_shades1.y, ray_dir.y >= 0.0));
+}
+
+fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>, face_shade: f32) -> vec3<f32> {
     let vsid_mip = grid_static_meta[g].vsid >> mip;
     let col_idx = u32(p_voxel.x) + u32(p_voxel.y) * vsid_mip;
     let col_word_base = col_word_base_mip(g, meta_id, mip, p_voxel);
@@ -226,7 +249,11 @@ fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> vec3<f3
     let r = f32((packed >> 16u) & 0xffu);
     let g_chan = f32((packed >> 8u) & 0xffu);
     let b = f32(packed & 0xffu);
-    let brightness = a * (1.0 / 128.0);
+    // Side-shade: reduce the brightness byte by the hit face's shade
+    // before the /128 divide (CPU grouscan_shade equivalent). With no
+    // baked light (flat a=0x80) this is pure runtime side-shading; with
+    // baked light it stacks, exactly like voxlap.
+    let brightness = max(0.0, a - face_shade) * (1.0 / 128.0);
     return vec3<f32>(r, g_chan, b) * (brightness / 255.0);
 }
 
@@ -413,14 +440,20 @@ fn march_grid(
             );
             let t_delta_voxel = abs(vsize / ray_dir);
             var t_hit: f32 = t_enter;
+            // Axis of the last voxel step = the hit face normal (for
+            // side-shading). Defaults to z for an iv==0 hit (camera
+            // embedded in solid — a 1-voxel edge case); surfaces hit
+            // after any travel use the real last-stepped axis.
+            var hit_axis: i32 = 2;
 
             for (var iv: u32 = 0u; iv < MAX_INNER_STEPS; iv = iv + 1u) {
                 if (voxel_solid_in(g, slot_id, mip, p_voxel)) {
                     if (t_hit < best_t) {
                         out.hit = true;
                         out.t = t_hit;
+                        let shade = side_shade_for(hit_axis, ray_dir);
                         out.color = apply_fog(
-                            voxel_color_in(g, slot_id, mip, p_voxel),
+                            voxel_color_in(g, slot_id, mip, p_voxel, shade),
                             t_hit,
                         );
                         return out;
@@ -432,6 +465,7 @@ fn march_grid(
                     t_hit = t_max_voxel.x;
                     p_voxel.x = p_voxel.x + step_chunk.x;
                     t_max_voxel.x = t_max_voxel.x + t_delta_voxel.x;
+                    hit_axis = 0;
                     if (p_voxel.x < 0 || p_voxel.x >= vsid_mip) {
                         break;
                     }
@@ -439,6 +473,7 @@ fn march_grid(
                     t_hit = t_max_voxel.y;
                     p_voxel.y = p_voxel.y + step_chunk.y;
                     t_max_voxel.y = t_max_voxel.y + t_delta_voxel.y;
+                    hit_axis = 1;
                     if (p_voxel.y < 0 || p_voxel.y >= vsid_mip) {
                         break;
                     }
@@ -446,6 +481,7 @@ fn march_grid(
                     t_hit = t_max_voxel.z;
                     p_voxel.z = p_voxel.z + step_chunk.z;
                     t_max_voxel.z = t_max_voxel.z + t_delta_voxel.z;
+                    hit_axis = 2;
                     if (p_voxel.z < 0 || p_voxel.z >= cz_mip) {
                         break;
                     }
