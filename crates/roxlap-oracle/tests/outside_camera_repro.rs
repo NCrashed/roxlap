@@ -23,14 +23,23 @@ use roxlap_oracle::{fnv1a64, load_oracle_vxl, XRES, YRES};
 /// pinned for this arch yet" — the test will print the rendered
 /// hash so the next run on that arch can paste it back here.
 ///
-/// **Refrozen 2026-05-10** after the chunk-edge streaking fix in
-/// `opticast.rs` (OOB-XY camera now uses the bedrock placeholder
-/// `(0, 255, 0)` as the synthesized cf seed instead of the
-/// representative-column air gap, which created a fake floor and
-/// streaked visible voxel pixels at the chunk silhouette). The
-/// sky-vs-world pixel split is unchanged (29.8% / 70.2%).
+/// Refrozen 2026-05-10 after the chunk-edge streaking fix in
+/// `opticast.rs` (OOB-XY camera uses the bedrock placeholder
+/// `(0, 255, 0)` as the synthesized cf seed — still present, see
+/// `column_walk::camera_chunk_air_gap`). The sky-vs-world pixel split
+/// is 29.8% / 70.2%.
+///
+/// **Refrozen 2026-06-13** to `aa2b4263e714667b`: the VC opticast/
+/// column-walk rewrite changed this pose's exact bytes (the
+/// `40fbc42f` value above was from the superseded 2026-05-10
+/// implementation), so CI had been red on it since. Verified NOT a
+/// regression — the render is byte-deterministic (CI == local), the
+/// 29.8/70.2 split is unchanged (streaking would *add* world pixels),
+/// the bedrock-placeholder streaking fix is still in the code, and the
+/// rendered PPM shows a clean blue↔world silhouette with no
+/// chunk-edge streaks. Value coincides with the original S1 freeze.
 const OUTSIDE_ORBIT_GOLDEN: u64 = if cfg!(target_arch = "x86_64") {
-    0x40fb_c42f_d615_2650
+    0xaa2b_4263_e714_667b
 } else {
     0
 };
