@@ -320,6 +320,25 @@ pub struct KfaSprite {
     pub s: [f32; 3],
     pub h: [f32; 3],
     pub f: [f32; 3],
+    /// Animation keyframe table — `frmval[frame][hinge]`, Q15 angles.
+    /// Mirror of `kfatype.frmval`. Empty until [`Self::set_animation`];
+    /// an empty table makes [`Self::animsprite`] a no-op so hosts that
+    /// poke [`kfaval`](Self::kfaval) directly keep working.
+    pub frmval: Vec<Vec<i16>>,
+    /// Animation sequence — ordered `(tim, frm)` keyframes. Mirror of
+    /// `kfatype.seq`. `tim` is an absolute timestamp (ms); `frm` is a
+    /// frame index into [`frmval`](Self::frmval), or `!target`
+    /// (bitwise-NOT, hence negative) for a jump/loop to seq entry
+    /// `target`.
+    pub seq: Vec<Seq>,
+    /// Current animation time (ms) — voxlap's `vx5sprite.kfatim`.
+    /// Advanced by [`Self::animsprite`].
+    pub kfatim: i32,
+    /// Previous animation time (ms) — voxlap's `vx5sprite.okfatim`,
+    /// used to cross-fade when the active sequence entry is itself a
+    /// blend marker (`seq[z].frm < 0`). Host sets it when switching
+    /// animations; [`Self::animsprite`] never writes it.
+    pub okfatim: i32,
 }
 
 impl KfaSprite {
@@ -353,8 +372,216 @@ impl KfaSprite {
             s: [1.0, 0.0, 0.0],
             h: [0.0, 1.0, 0.0],
             f: [0.0, 0.0, 1.0],
+            frmval: Vec::new(),
+            seq: Vec::new(),
+            kfatim: 0,
+            okfatim: 0,
         }
     }
+
+    /// Attach an animation curve — the `frmval` + `seq` tables parsed
+    /// from a [`Kfa`]. After this, [`Self::animsprite`] drives
+    /// [`kfaval`](Self::kfaval) from playback time instead of the host
+    /// poking individual bones.
+    pub fn set_animation(&mut self, frmval: Vec<Vec<i16>>, seq: Vec<Seq>) {
+        self.frmval = frmval;
+        self.seq = seq;
+    }
+
+    /// Advance the animation by `ti` milliseconds and recompute every
+    /// child bone's [`kfaval`](Self::kfaval) — a faithful port of
+    /// voxlap's `animsprite` (`voxlap5.c:11125`).
+    ///
+    /// Walks the sequence forward from the current
+    /// [`kfatim`](Self::kfatim) (honouring `!target` jump/loop
+    /// entries), then piecewise-linearly interpolates the two bracketing
+    /// keyframes per hinge. Interpolation is angle-wrap-aware: a free
+    /// hinge (`vmin == vmax`) takes the shortest path, a limited hinge
+    /// winds in its allowed direction. When the active entry is itself a
+    /// blend marker (`seq[z].frm < 0`), the pose cross-fades from the
+    /// [`okfatim`](Self::okfatim)-derived frame.
+    ///
+    /// No-op when no animation curve is attached (see
+    /// [`Self::set_animation`]).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::similar_names
+    )]
+    pub fn animsprite(&mut self, mut ti: i32) {
+        if self.seq.is_empty() || self.frmval.is_empty() {
+            return;
+        }
+        let numhin = self.hinges.len();
+        let seqnum = self.seq.len();
+
+        // Phase 1 — advance kfatim by `ti` ms through the sequence,
+        // following `!target` jump entries (voxlap5.c:11133-11143).
+        let mut z = kfatime2seq(&self.seq, self.kfatim) as i32;
+        while ti > 0 {
+            z += 1;
+            if z as usize >= seqnum {
+                break;
+            }
+            let dt = self.seq[z as usize].tim - self.kfatim;
+            if dt <= 0 {
+                break;
+            }
+            if dt > ti {
+                self.kfatim += ti;
+                break;
+            }
+            ti -= dt;
+            let jump = !self.seq[z as usize].frm; // ~frm
+            if jump >= 0 {
+                if z == jump {
+                    break;
+                }
+                z = jump;
+            }
+            self.kfatim = self.seq[z as usize].tim;
+        }
+
+        // Phase 2 — resolve the bracketing frames + 16.16 blend ratios
+        // for the current segment (voxlap5.c:11147-11167).
+        let z_seq = kfatime2seq(&self.seq, self.kfatim);
+        let zz_idx = z_seq + 1;
+        let (trat, zz_frm) = if zz_idx < seqnum && self.seq[zz_idx].frm != !(zz_idx as i32) {
+            let span = self.seq[zz_idx].tim - self.seq[z_seq].tim;
+            let trat = if span != 0 {
+                shldiv16(self.kfatim - self.seq[z_seq].tim, span)
+            } else {
+                0
+            };
+            let i = self.seq[zz_idx].frm;
+            let zz_frm = if i < 0 {
+                self.seq[(!i) as usize].frm
+            } else {
+                i
+            };
+            (trat, zz_frm)
+        } else {
+            (0, 0)
+        };
+
+        let z_frm = self.seq[z_seq].frm;
+        // trat2 < 0 signals "no okfatim cross-fade" (the common path).
+        let mut trat2 = -1i32;
+        let mut z0_frm = 0i32;
+        let mut zz0_frm = 0i32;
+        if z_frm < 0 {
+            let z0_seq = kfatime2seq(&self.seq, self.okfatim);
+            let zz0_idx = z0_seq + 1;
+            if zz0_idx < seqnum && self.seq[zz0_idx].frm != !(zz0_idx as i32) {
+                let span = self.seq[zz0_idx].tim - self.seq[z0_seq].tim;
+                trat2 = if span != 0 {
+                    shldiv16(self.okfatim - self.seq[z0_seq].tim, span)
+                } else {
+                    0
+                };
+                let i = self.seq[zz0_idx].frm;
+                zz0_frm = if i < 0 {
+                    self.seq[(!i) as usize].frm
+                } else {
+                    i
+                };
+            } else {
+                trat2 = 0;
+            }
+            z0_frm = self.seq[z0_seq].frm;
+            if z0_frm < 0 {
+                z0_frm = zz0_frm;
+                trat2 = 0;
+            }
+        }
+
+        // Phase 3 — per-hinge interpolation into kfaval
+        // (voxlap5.c:11169-11195). Root bones (parent < 0) keep their
+        // value untouched, exactly as voxlap's `continue`.
+        for i in (0..numhin).rev() {
+            if self.hinges[i].parent < 0 {
+                continue;
+            }
+            let vmin = i32::from(self.hinges[i].vmin);
+            let vmax = i32::from(self.hinges[i].vmax);
+
+            let mut frm0: i32 = if trat2 < 0 {
+                i32::from(self.frmval[z_frm as usize][i])
+            } else {
+                let mut base = i32::from(self.frmval[z0_frm as usize][i]);
+                if trat2 > 0 {
+                    let target = i32::from(self.frmval[zz0_frm as usize][i]);
+                    base += interp_delta(base, target, vmin, vmax, trat2);
+                }
+                base
+            };
+            if trat > 0 {
+                let target = i32::from(self.frmval[zz_frm as usize][i]);
+                frm0 += interp_delta(frm0, target, vmin, vmax, trat);
+            }
+            // `vx5.kfaval[]` is `short`; the assignment truncates to the
+            // low 16 bits, which `as i16` reproduces.
+            self.kfaval[i] = frm0 as i16;
+        }
+    }
+}
+
+/// 16.16 fixed-point signed multiply-shift — voxlap's `mulshr16`
+/// (`voxlap5.c:276`): `((i64)a * d) >> 16`, low 32 bits.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn mulshr16(a: i32, d: i32) -> i32 {
+    ((i64::from(a) * i64::from(d)) >> 16) as i32
+}
+
+/// 16.16 fixed-point signed shift-divide — voxlap's `shldiv16`
+/// (`voxlap5.c:296`): `((i64)a << 16) / b`, truncating toward zero
+/// (matching x86 `idiv`).
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn shldiv16(a: i32, b: i32) -> i32 {
+    ((i64::from(a) << 16) / i64::from(b)) as i32
+}
+
+/// Binary-search the seq entry whose `tim` brackets `tim` from below —
+/// voxlap's `kfatime2seq` (`voxlap5.c`). Returns the index `a` such
+/// that `seq[a].tim <= tim < seq[a+1].tim` (clamped to the ends).
+/// Caller guarantees `seq` is non-empty.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+fn kfatime2seq(seq: &[Seq], tim: i32) -> usize {
+    let mut a: isize = 0;
+    let mut b: isize = seq.len() as isize - 1;
+    while b - a >= 2 {
+        let i = (a + b) >> 1;
+        if tim >= seq[i as usize].tim {
+            a = i;
+        } else {
+            b = i;
+        }
+    }
+    a as usize
+}
+
+/// One keyframe-pair angular interpolation step — the shared body of
+/// voxlap's two interp blocks in `animsprite`. Returns the delta to add
+/// to `from` to step `trat`/65536 of the way toward `to`, choosing the
+/// winding direction the way voxlap does: shortest path for a free
+/// hinge (`vmin == vmax`), else winding consistent with `vmin`.
+#[inline]
+fn interp_delta(from: i32, to: i32, vmin: i32, vmax: i32, trat: i32) -> i32 {
+    let mut x = (to - from) & 65535;
+    if vmin == vmax {
+        // Sign-extend the 16-bit delta → shortest angular path.
+        x = (x << 16) >> 16;
+    } else if ((to - vmin) & 65535) < ((from - vmin) & 65535) {
+        x -= 65536;
+    }
+    mulshr16(x, trat)
 }
 
 /// Build the hinge-sort order — voxlap's `kfasorthinge`
@@ -590,5 +817,145 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- animsprite playback ------------------------------------------
+
+    /// Minimal two-bone sprite (root + one child hinge) for driving
+    /// [`KfaSprite::animsprite`]. `limbs` is empty — `animsprite` reads
+    /// only the hinges + curve, never the limb geometry — so we build
+    /// the struct directly to avoid needing a kv6.
+    fn anim_sprite(
+        child_vmin: i16,
+        child_vmax: i16,
+        frmval: Vec<Vec<i16>>,
+        seq: Vec<Seq>,
+    ) -> KfaSprite {
+        let zero = Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let axis = Point3 {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let hinges = vec![
+            Hinge {
+                parent: -1,
+                p: [zero, zero],
+                v: [axis, axis],
+                vmin: 0,
+                vmax: 0,
+                htype: 0,
+                filler: [0; 7],
+            },
+            Hinge {
+                parent: 0,
+                p: [zero, zero],
+                v: [axis, axis],
+                vmin: child_vmin,
+                vmax: child_vmax,
+                htype: 0,
+                filler: [0; 7],
+            },
+        ];
+        KfaSprite {
+            limbs: Vec::new(),
+            hinge_sort: sort_hinges(&hinges),
+            kfaval: vec![0i16; hinges.len()],
+            hinges,
+            p: [0.0; 3],
+            s: [1.0, 0.0, 0.0],
+            h: [0.0, 1.0, 0.0],
+            f: [0.0, 0.0, 1.0],
+            frmval,
+            seq,
+            kfatim: 0,
+            okfatim: 0,
+        }
+    }
+
+    /// Half-way through a single 0→16384 segment a free hinge sits at
+    /// exactly 8192, and the root bone is left untouched.
+    #[test]
+    fn animsprite_lerps_free_hinge_midpoint() {
+        // Free hinge: vmin == vmax.
+        let mut kfa = anim_sprite(
+            0,
+            0,
+            vec![vec![0, 0], vec![0, 16384]],
+            vec![Seq { tim: 0, frm: 0 }, Seq { tim: 1000, frm: 1 }],
+        );
+        kfa.animsprite(500);
+        assert_eq!(kfa.kfatim, 500, "time cursor advanced by ti");
+        assert_eq!(kfa.kfaval[0], 0, "root bone untouched");
+        assert_eq!(kfa.kfaval[1], 8192, "child at segment midpoint");
+    }
+
+    /// A free hinge interpolating 30000 → -30000 takes the *short* way
+    /// (through ±32768), not the long way through 0 — so the midpoint
+    /// lands at the wrap boundary, not near 0.
+    #[test]
+    fn animsprite_free_hinge_takes_shortest_wrap() {
+        let mut kfa = anim_sprite(
+            0,
+            0,
+            vec![vec![0, 30000], vec![0, -30000]],
+            vec![Seq { tim: 0, frm: 0 }, Seq { tim: 1000, frm: 1 }],
+        );
+        kfa.animsprite(500);
+        // 30000 + (5536 short-path delta)/2 = 32768 ≡ -32768 as i16.
+        assert_eq!(kfa.kfaval[1], -32768);
+    }
+
+    /// `seq[].frm < 0` is a `!target` jump: advancing time past the
+    /// jump entry loops back to `target` and keeps consuming `ti`.
+    #[test]
+    fn animsprite_follows_loop_jump_entry() {
+        let mut kfa = anim_sprite(
+            0,
+            0,
+            vec![vec![0, 0], vec![0, 16384]],
+            vec![
+                Seq { tim: 0, frm: 0 },
+                Seq { tim: 1000, frm: 1 },
+                // Jump back to seq entry 0 (== !0 == -1).
+                Seq { tim: 2000, frm: !0 },
+            ],
+        );
+        // 2500 ms: 0→1000 (seg 0), 1000→2000 hits the jump → loop to 0,
+        // then 500 ms more into the first segment again.
+        kfa.animsprite(2500);
+        assert_eq!(kfa.kfatim, 500, "looped back and advanced 500 ms");
+    }
+
+    /// With no curve attached, animsprite leaves kfaval alone so hosts
+    /// that drive kfaval[] directly are unaffected.
+    #[test]
+    fn animsprite_no_curve_is_noop() {
+        let mut kfa = anim_sprite(0, 0, Vec::new(), Vec::new());
+        kfa.kfaval[1] = 1234;
+        kfa.animsprite(500);
+        assert_eq!(kfa.kfaval[1], 1234);
+        assert_eq!(kfa.kfatim, 0);
+    }
+
+    #[test]
+    fn kfatime2seq_brackets_from_below() {
+        let seq = vec![
+            Seq { tim: 0, frm: 0 },
+            Seq { tim: 100, frm: 1 },
+            Seq { tim: 200, frm: 2 },
+            Seq { tim: 300, frm: 3 },
+        ];
+        assert_eq!(kfatime2seq(&seq, 0), 0);
+        assert_eq!(kfatime2seq(&seq, 99), 0);
+        assert_eq!(kfatime2seq(&seq, 100), 1);
+        assert_eq!(kfatime2seq(&seq, 250), 2);
+        // Never returns the final index: the last entry is always the
+        // *upper* bracket, so beyond it we stay on the last segment.
+        assert_eq!(kfatime2seq(&seq, 9999), 2, "last segment's lower bracket");
     }
 }
