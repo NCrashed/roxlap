@@ -41,6 +41,10 @@ hud = ["dep:egui-wgpu", "dep:egui"]
 # `examples/probe.rs` is a standalone winit host for the GPU.0 FPS
 # baseline; the lib itself no longer depends on winit.
 winit = "0.30"
+# Static WGSL validation in unit tests (no GPU device needed) — same
+# front-end + validator wgpu runs at pipeline creation. Pinned to the
+# version wgpu 22 vendors so the dialect matches.
+naga = { version = "22", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

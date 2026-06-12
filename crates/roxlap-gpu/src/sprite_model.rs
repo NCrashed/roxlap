@@ -39,6 +39,11 @@ pub struct SpriteModel {
     pub occupancy: Vec<u32>,
     /// Voxel colours, ascending z within each column.
     pub colors: Vec<u32>,
+    /// Per-voxel surface-normal index (`Kv6::Voxel::dir`, 0..256),
+    /// parallel to [`colors`](Self::colors). The GPU sprite shader uses
+    /// it to index the per-instance `kv6colmul` lighting table, matching
+    /// the CPU rasteriser's normal-based shading.
+    pub dirs: Vec<u32>,
     /// Prefix sums: `color_offsets[col]` is the first colour index of
     /// column `col`; length `mx * my + 1`.
     pub color_offsets: Vec<u32>,
@@ -65,10 +70,12 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
     let mut occupancy = vec![0u32; cols * occ_words_per_col as usize];
     let mut color_offsets = vec![0u32; cols + 1];
     let mut colors: Vec<u32> = Vec::with_capacity(kv6.voxels.len());
+    let mut dirs: Vec<u32> = Vec::with_capacity(kv6.voxels.len());
 
     // Pass 1 — consume voxels in KV6 storage order (x-outer / y-inner)
-    // into per-column buckets keyed by `col = x + y*mx`.
-    let mut buckets: Vec<Vec<(u16, u32)>> = vec![Vec::new(); cols];
+    // into per-column buckets keyed by `col = x + y*mx`. Each entry is
+    // `(z, colour, normal-dir)`.
+    let mut buckets: Vec<Vec<(u16, u32, u8)>> = vec![Vec::new(); cols];
     let mut voxel_iter = kv6.voxels.iter();
     for x in 0..mx {
         for y in 0..my {
@@ -76,7 +83,7 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
             let count = kv6.ylen[x as usize][y as usize];
             for _ in 0..count {
                 let v = voxel_iter.next().expect("KV6 ylen / voxels.len mismatch");
-                buckets[col].push((v.z, v.col));
+                buckets[col].push((v.z, v.col, v.dir));
             }
         }
     }
@@ -87,12 +94,13 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
     // column's voxels sorted ascending z for the popcount-rank lookup.
     for (col, bucket) in buckets.iter_mut().enumerate() {
         color_offsets[col] = colors.len() as u32;
-        bucket.sort_by_key(|(z, _)| *z);
-        for &(z, col_rgba) in bucket.iter() {
+        bucket.sort_by_key(|(z, _, _)| *z);
+        for &(z, col_rgba, dir) in bucket.iter() {
             let z = u32::from(z);
             let base = col * occ_words_per_col as usize + (z >> 5) as usize;
             occupancy[base] |= 1u32 << (z & 31);
             colors.push(col_rgba);
+            dirs.push(u32::from(dir));
         }
     }
     color_offsets[cols] = colors.len() as u32;
@@ -104,6 +112,7 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
         occupancy,
         color_offsets,
         colors,
+        dirs,
         voxel_world_size: 1.0,
     }
 }
@@ -313,10 +322,13 @@ impl SpriteModel {
 
         if let Some(rgba) = color {
             if was_set {
-                self.colors[idx] = rgba; // replace in place
+                self.colors[idx] = rgba; // replace in place (keeps dir)
             } else {
                 self.occupancy[base + zw] |= 1u32 << zb;
                 self.colors.insert(idx, rgba);
+                // No normal supplied by this API — default to dir 0 (the
+                // sole caller, the carve hotkey, only ever clears).
+                self.dirs.insert(idx, 0);
                 for c in &mut self.color_offsets[col + 1..=cols] {
                     *c += 1;
                 }
@@ -328,6 +340,7 @@ impl SpriteModel {
             }
             self.occupancy[base + zw] &= !(1u32 << zb);
             self.colors.remove(idx);
+            self.dirs.remove(idx);
             for c in &mut self.color_offsets[col + 1..=cols] {
                 *c -= 1;
             }
@@ -364,9 +377,10 @@ impl SpriteModel {
         let [fx, fy, fz] = self.dims;
         let fidx = |x: u32, y: u32, z: u32| (x + y * fx + z * fx * fy) as usize;
 
-        // Reconstruct dense fine voxels (solid flag + colour).
+        // Reconstruct dense fine voxels (solid flag + colour + normal).
         let mut solid = vec![false; (fx * fy * fz) as usize];
         let mut fine = vec![0u32; (fx * fy * fz) as usize];
+        let mut fine_dir = vec![0u32; (fx * fy * fz) as usize];
         for x in 0..fx {
             for y in 0..fy {
                 let col = (x + y * fx) as usize;
@@ -377,6 +391,7 @@ impl SpriteModel {
                     let w = base + (z >> 5) as usize;
                     if (self.occupancy[w] >> (z & 31)) & 1 == 1 {
                         fine[fidx(x, y, z)] = self.colors[off + seen];
+                        fine_dir[fidx(x, y, z)] = self.dirs[off + seen];
                         solid[fidx(x, y, z)] = true;
                         seen += 1;
                     }
@@ -392,6 +407,7 @@ impl SpriteModel {
         let mut occupancy = vec![0u32; cols * owpc as usize];
         let mut color_offsets = vec![0u32; cols + 1];
         let mut colors: Vec<u32> = Vec::new();
+        let mut dirs: Vec<u32> = Vec::new();
 
         // Emit in column-index order (`ccol = cx + cy*nx`), cy outer,
         // so `color_offsets` is a monotonic prefix sum like build's.
@@ -401,12 +417,18 @@ impl SpriteModel {
                 color_offsets[ccol] = colors.len() as u32;
                 for cz in 0..nz {
                     let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+                    // Normals don't average meaningfully — keep the first
+                    // solid child's `dir` as the coarse voxel's normal.
+                    let mut rep_dir = 0u32;
                     for dz in 0..2 {
                         for dy in 0..2 {
                             for dx in 0..2 {
                                 let (x, y, z) = (2 * cx + dx, 2 * cy + dy, 2 * cz + dz);
                                 if x < fx && y < fy && z < fz && solid[fidx(x, y, z)] {
                                     let c = fine[fidx(x, y, z)];
+                                    if n == 0 {
+                                        rep_dir = fine_dir[fidx(x, y, z)];
+                                    }
                                     a += (c >> 24) & 0xff;
                                     r += (c >> 16) & 0xff;
                                     g += (c >> 8) & 0xff;
@@ -421,6 +443,7 @@ impl SpriteModel {
                         let base = ccol * owpc as usize + (cz >> 5) as usize;
                         occupancy[base] |= 1u32 << (cz & 31);
                         colors.push(avg);
+                        dirs.push(rep_dir);
                     }
                 }
             }
@@ -437,6 +460,7 @@ impl SpriteModel {
             ],
             occupancy,
             colors,
+            dirs,
             color_offsets,
             voxel_world_size: self.voxel_world_size * 2.0,
         }
@@ -459,7 +483,8 @@ pub struct ViewFrustum {
 }
 
 /// CPU cull record: the GPU instance + its world bounding sphere.
-#[derive(Clone, Copy)]
+/// Not `Copy` — carries a boxed 256-entry `kv6colmul` table.
+#[derive(Clone)]
 struct CullInstance {
     /// Instance transform + a placeholder `model_id`; the cull
     /// overwrites `model_id` with the distance-chosen LOD entry.
@@ -468,6 +493,20 @@ struct CullInstance {
     chain_id: u32,
     center: [f32; 3],
     radius: f32,
+    /// voxlap `kv6colmul[256]` — per-surface-normal colour modulation
+    /// for this instance's pose + lighting. Defaults to identity
+    /// (`0x0100` in every channel lane → unshaded) until the facade sets
+    /// it via [`SpriteRegistryResident::set_instance_colmul`]. Packed
+    /// into the `colmul` GPU buffer (in visible order) each frame.
+    colmul: Box<[u64; 256]>,
+}
+
+/// Identity `kv6colmul` table: every channel lane = `0x0100`, so the
+/// shader's `(rgb[c] << 8) * 0x0100 >> 16 == rgb[c]` — i.e. no shading.
+fn identity_colmul() -> Box<[u64; 256]> {
+    const LANE: u64 = 0x0100;
+    let w = LANE | (LANE << 16) | (LANE << 32) | (LANE << 48);
+    Box::new([w; 256])
 }
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -547,12 +586,22 @@ fn mat3_inverse(cols: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 pub struct SpriteRegistryResident {
     pub occupancy: wgpu::Buffer,
     pub colors: wgpu::Buffer,
+    /// Per-voxel surface-normal index, concatenated across models in the
+    /// same layout as [`colors`](Self::colors). The shader indexes the
+    /// per-instance `kv6colmul` table by it.
+    pub dirs: wgpu::Buffer,
     pub color_offsets: wgpu::Buffer,
     pub model_meta: wgpu::Buffer,
     /// Holds up to `instance_capacity` instances; the visible subset
     /// is packed into `[0, count)` each frame by [`Self::cull_bin_upload`].
     pub instances: wgpu::Buffer,
     pub instance_capacity: u32,
+    /// Per-visible-instance `kv6colmul[256]` tables, packed in the same
+    /// order as the `instances` buffer each frame (two u32 per u64
+    /// entry: lanes 0|1 then 2|3). Sized `instance_capacity * 256 * 2`
+    /// u32; rewritten by [`Self::cull_bin_upload`].
+    pub colmul: wgpu::Buffer,
+    colmul_cap: u32,
     /// GPU.10.3 — per-tile `(offset, count)` into `tile_instances`,
     /// flat `2 * tiles_x * tiles_y` u32s. Grown to fit the screen.
     pub tile_ranges: wgpu::Buffer,
@@ -582,10 +631,12 @@ impl SpriteRegistryResident {
     ) -> Self {
         let mut all_occ: Vec<u32> = Vec::new();
         let mut all_colors: Vec<u32> = Vec::new();
+        let mut all_dirs: Vec<u32> = Vec::new();
         let mut all_offsets: Vec<u32> = Vec::new();
         let mut meta: Vec<SpriteModelMeta> = Vec::with_capacity(registry.entries.len());
 
         // One meta + concatenated data per concrete (mip-level) entry.
+        // `dirs` parallels `colors` (same offsets/ranks).
         for m in &registry.entries {
             meta.push(SpriteModelMeta {
                 occupancy_offset: all_occ.len() as u32,
@@ -599,11 +650,14 @@ impl SpriteRegistryResident {
             });
             all_occ.extend_from_slice(&m.occupancy);
             all_colors.extend_from_slice(&m.colors);
+            all_dirs.extend_from_slice(&m.dirs);
             all_offsets.extend_from_slice(&m.color_offsets);
         }
 
         // Per-instance cull records: sphere centred at the instance
         // position, radius from the chain's finest (mip-0) model.
+        // `colmul` starts at identity (unshaded) until the facade sets
+        // per-instance lighting via `set_instance_colmul`.
         let cull: Vec<CullInstance> = instances
             .iter()
             .map(|i| CullInstance {
@@ -617,6 +671,7 @@ impl SpriteRegistryResident {
                 chain_id: i.model_id,
                 center: i.transform.pos,
                 radius: registry.model(i.model_id).bound_radius(),
+                colmul: identity_colmul(),
             })
             .collect();
 
@@ -636,19 +691,37 @@ impl SpriteRegistryResident {
 
         let tile_ranges = storage_dst_u32(device, "roxlap-gpu sprite_reg.tile_ranges", 1);
         let tile_instances = storage_dst_u32(device, "roxlap-gpu sprite_reg.tile_instances", 1);
+        // colmul: 256 entries × 2 u32 per visible instance. Sized to the
+        // full instance set (worst case all visible); rewritten per frame.
+        let colmul_cap = (cull.len() as u32).max(1) * 256 * 2;
+        let colmul = storage_dst_u32(device, "roxlap-gpu sprite_reg.colmul", colmul_cap);
         Self {
             occupancy: storage_u32(device, "roxlap-gpu sprite_reg.occupancy", &all_occ),
             colors: storage_u32(device, "roxlap-gpu sprite_reg.colors", &all_colors),
+            dirs: storage_u32(device, "roxlap-gpu sprite_reg.dirs", &all_dirs),
             color_offsets: storage_u32(device, "roxlap-gpu sprite_reg.color_offsets", &all_offsets),
             model_meta: storage_pod(device, "roxlap-gpu sprite_reg.model_meta", &meta),
             instances: instances_buf,
             instance_capacity: cull.len() as u32,
+            colmul,
+            colmul_cap,
             tile_ranges,
             tile_ranges_cap: 1,
             tile_instances,
             tile_instances_cap: 1,
             cull,
             chains: registry.chains.clone(),
+        }
+    }
+
+    /// Set the per-instance `kv6colmul[256]` lighting tables (voxlap's
+    /// `update_reflects` output), in the same order/length as the
+    /// instances passed to [`Self::upload`]. The next
+    /// [`Self::cull_bin_upload`] packs the visible subset to the GPU.
+    /// Instances beyond `tables.len()` keep their previous tables.
+    pub fn set_instance_colmul(&mut self, tables: &[[u64; 256]]) {
+        for (ci, t) in self.cull.iter_mut().zip(tables) {
+            ci.colmul.copy_from_slice(t);
         }
     }
 
@@ -709,6 +782,10 @@ impl SpriteRegistryResident {
         let mut visible: Vec<SpriteInstanceGpu> = Vec::with_capacity(self.cull.len());
         // Per-visible tile AABB (tx0, tx1, ty0, ty1) for the bin pass.
         let mut boxes: Vec<[i32; 4]> = Vec::with_capacity(self.cull.len());
+        // Per-visible kv6colmul tables, flattened to two u32 per u64
+        // entry (lanes 0|1, then 2|3), packed in visible order so the
+        // shader indexes `colmul[inst_idx*512 + dir*2 + {0,1}]`.
+        let mut visible_colmul: Vec<u32> = Vec::with_capacity(self.cull.len() * 512);
         let mut counts = vec![0u32; n_tiles];
 
         for ci in &self.cull {
@@ -763,6 +840,10 @@ impl SpriteRegistryResident {
             g.model_id = chain[level];
             visible.push(g);
             boxes.push([tx0, tx1, ty0, ty1]);
+            for &w in ci.colmul.iter() {
+                visible_colmul.push((w & 0xffff_ffff) as u32);
+                visible_colmul.push((w >> 32) as u32);
+            }
             for ty in ty0..=ty1 {
                 for tx in tx0..=tx1 {
                     counts[(ty * tiles_x as i32 + tx) as usize] += 1;
@@ -824,6 +905,12 @@ impl SpriteRegistryResident {
             0,
             bytemuck::cast_slice(&tile_instances),
         );
+        let need_colmul = visible_colmul.len() as u32;
+        if need_colmul > self.colmul_cap {
+            self.colmul_cap = need_colmul.next_power_of_two();
+            self.colmul = storage_dst_u32(device, "roxlap-gpu sprite_reg.colmul", self.colmul_cap);
+        }
+        queue.write_buffer(&self.colmul, 0, bytemuck::cast_slice(&visible_colmul));
 
         (visible.len() as u32, tiles_x, tiles_y)
     }

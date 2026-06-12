@@ -2066,6 +2066,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "glam",
+ "naga",
  "pollster",
  "raw-window-handle",
  "roxlap-formats",

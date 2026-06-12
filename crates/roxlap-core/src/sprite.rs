@@ -590,6 +590,24 @@ fn update_reflects(sprite: &Sprite, lighting: &SpriteLighting<'_>) -> (Box<[u64;
     (kv6colmul, kv6coladd)
 }
 
+/// Build voxlap's per-surface-normal colour-modulation table for a
+/// sprite under the given lighting — the `kv6colmul[256]` (one packed
+/// u64 per `Voxel::dir`, four 16-bit channel multipliers) plus the
+/// `kv6coladd` bias `draw_sprite` adds. This is exactly the table the
+/// CPU rasteriser uses (`update_reflects`); exposed so other backends
+/// (the GPU sprite pass) can shade KV6 sprites with identical math
+/// rather than re-deriving voxlap's lighting in a shader.
+///
+/// Per voxel, the final colour is, per channel `c`:
+/// `clamp(((rgb[c] << 8) * (kv6colmul[dir] >> 16*c & 0xffff)) >> 16
+///  + (kv6coladd >> 16*c & 0xffff), 0, 255)` — i.e. an
+/// `_mm_mulhi_epu16` + `_mm_add_epi16` + `_mm_packus_epi16`.
+#[must_use]
+pub fn sprite_colmul(sprite: &Sprite, lighting: &SpriteLighting<'_>) -> ([u64; 256], u64) {
+    let (mul, add) = update_reflects(sprite, lighting);
+    (*mul, add)
+}
+
 /// Voxlap's `pmaddwd(iunivec[k], lightlist) summed across two
 /// dword lanes mod 2^32, take high 16` reduction. Returns the
 /// `u16` modulation factor before any per-channel packing.

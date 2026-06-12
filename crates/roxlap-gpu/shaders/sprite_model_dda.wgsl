@@ -54,6 +54,12 @@ struct Uniform {
 // flat grouped index list, so each pixel loops only its tile's sprites.
 @group(0) @binding(8) var<storage, read> tile_ranges: array<u32>;
 @group(0) @binding(9) var<storage, read> tile_instances: array<u32>;
+// Per-voxel surface-normal index, parallel to `colors`.
+@group(0) @binding(10) var<storage, read> dirs: array<u32>;
+// Per-visible-instance voxlap kv6colmul[256] tables: two u32 per u64
+// entry (lanes 0|1, then 2|3), 512 u32 per instance, packed in the
+// same order as `instances`. Indexed `colmul[inst*512u + dir*2u + n]`.
+@group(0) @binding(11) var<storage, read> colmul: array<u32>;
 
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     let fog_near = u.fog_color.w;
@@ -69,7 +75,12 @@ fn model_solid(m: ModelMeta, p: vec3<i32>) -> bool {
     return (occupancy[base + zw] & (1u << zb)) != 0u;
 }
 
-fn model_color(m: ModelMeta, p: vec3<i32>) -> vec3<f32> {
+// Resolve the voxel at `p`, then shade it with this instance's
+// kv6colmul table indexed by the voxel's surface normal — the same
+// per-channel `_mm_mulhi_epu16` modulation the CPU rasteriser applies
+// (voxlap `drawboundcubesse`): `out[c] = min(255, (rgb[c] * mul[c]) >> 8)`.
+// Returns linear-ish 0..1 RGB (the marcher composites + fogs afterward).
+fn model_color(m: ModelMeta, p: vec3<i32>, inst_idx: u32) -> vec3<f32> {
     let col = u32(p.x) + u32(p.y) * m.dims.x;
     let base = m.occupancy_offset + col * m.occ_words_per_col;
     let zw = u32(p.z) >> 5u;
@@ -83,13 +94,18 @@ fn model_color(m: ModelMeta, p: vec3<i32>) -> vec3<f32> {
     rank = rank + countOneBits(occupancy[base + zw] & mask);
 
     let local_off = color_offsets[m.color_offsets_offset + col];
-    let packed = colors[m.colors_offset + local_off + rank];
-    let a = f32((packed >> 24u) & 0xffu);
-    let r = f32((packed >> 16u) & 0xffu);
-    let g = f32((packed >> 8u) & 0xffu);
-    let b = f32(packed & 0xffu);
-    let brightness = a * (1.0 / 128.0);
-    return vec3<f32>(r, g, b) * (brightness / 255.0);
+    let vidx = m.colors_offset + local_off + rank;
+    let packed = colors[vidx];
+    let dir = dirs[vidx] & 0xffu;
+
+    // kv6colmul[dir] for this instance: lanes (B,G) in lo, (R,A) in hi.
+    let cbase = inst_idx * 512u + dir * 2u;
+    let lo = colmul[cbase];
+    let hi = colmul[cbase + 1u];
+    let r = min(255u, (((packed >> 16u) & 0xffu) * (hi & 0xffffu)) >> 8u);
+    let g = min(255u, (((packed >> 8u) & 0xffu) * (lo >> 16u)) >> 8u);
+    let b = min(255u, ((packed & 0xffu) * (lo & 0xffffu)) >> 8u);
+    return vec3<f32>(f32(r), f32(g), f32(b)) / 255.0;
 }
 
 fn shield_parallel(t: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
@@ -103,7 +119,7 @@ fn shield_parallel(t: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
 // March one instance; returns the hit t (or `limit` on miss) and
 // writes the colour into `out_color` when it improves on `limit`.
 struct Hit { t: f32, color: vec3<f32>, hit: bool };
-fn march_instance(inst: Instance, ray_dir: vec3<f32>, limit: f32) -> Hit {
+fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32) -> Hit {
     var res: Hit;
     res.hit = false;
     res.t = limit;
@@ -148,7 +164,7 @@ fn march_instance(inst: Instance, ray_dir: vec3<f32>, limit: f32) -> Hit {
             if (t_hit < limit) {
                 res.hit = true;
                 res.t = t_hit;
-                res.color = model_color(m, p);
+                res.color = model_color(m, p, inst_idx);
             }
             return res;
         }
@@ -193,7 +209,7 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     let count = tile_ranges[2u * tile + 1u];
     for (var k: u32 = 0u; k < count; k = k + 1u) {
         let inst_idx = tile_instances[offset + k];
-        let h = march_instance(instances[inst_idx], ray_dir, best_t);
+        let h = march_instance(instances[inst_idx], inst_idx, ray_dir, best_t);
         if (h.hit) {
             best_t = h.t;
             best_color = h.color;

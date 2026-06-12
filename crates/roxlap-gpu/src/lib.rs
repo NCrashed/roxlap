@@ -1641,6 +1641,14 @@ impl GpuRenderer {
                             binding: 9,
                             resource: reg.tile_instances.as_entire_binding(),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 10,
+                            resource: reg.dirs.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 11,
+                            resource: reg.colmul.as_entire_binding(),
+                        },
                     ],
                 }))
             }
@@ -2165,6 +2173,18 @@ impl GpuRenderer {
         }
     }
 
+    /// Set the per-instance `kv6colmul[256]` lighting tables (voxlap's
+    /// `update_reflects` output, e.g. via `roxlap_core::sprite::
+    /// sprite_colmul`), in the same order/length as the last
+    /// [`Self::set_sprite_instances`]. The GPU sprite pass modulates each
+    /// voxel by its surface normal's entry — matching the CPU rasteriser.
+    /// No-op if no sprite registry is resident.
+    pub fn set_sprite_instance_colmul(&mut self, tables: &[[u64; 256]]) {
+        if let Some(reg) = self.sprite_registry.as_mut() {
+            reg.set_instance_colmul(tables);
+        }
+    }
+
     /// GPU.10.4 — set the LOD pixel threshold: a sprite steps to the
     /// next mip once a mip-0 voxel would project below `px` screen
     /// pixels. `1.0` is the natural "no sub-pixel voxels" default;
@@ -2218,8 +2238,10 @@ impl GpuRenderer {
                         },
                         count: None,
                     },
-                    bgl_storage_entry(8, true), // tile_ranges
-                    bgl_storage_entry(9, true), // tile_instances
+                    bgl_storage_entry(8, true),  // tile_ranges
+                    bgl_storage_entry(9, true),  // tile_instances
+                    bgl_storage_entry(10, true), // per-voxel dir
+                    bgl_storage_entry(11, true), // per-instance kv6colmul
                 ],
             });
         let pl = self
@@ -2754,5 +2776,35 @@ mod pixel_ray_tests {
         let half_w = (fov * 0.5).tan() * (1280.0 / 720.0);
         assert!((d[0] - half_w).abs() < 1e-6, "x={}, half_w={half_w}", d[0]);
         assert!(d[0] > 0.0, "right edge tilts +right");
+    }
+
+    /// Statically validate every WGSL shader with naga (the same
+    /// front-end + validator wgpu runs at pipeline creation), so shader
+    /// edits — e.g. the GPU.10 sprite lighting bindings — are caught in
+    /// CI without needing a GPU device.
+    #[test]
+    fn wgsl_shaders_validate() {
+        let shaders: &[(&str, &str)] = &[
+            (
+                "sprite_model_dda.wgsl",
+                include_str!("../shaders/sprite_model_dda.wgsl"),
+            ),
+            ("scene_dda.wgsl", include_str!("../shaders/scene_dda.wgsl")),
+            ("blit.wgsl", include_str!("../shaders/blit.wgsl")),
+            ("chunk_dda.wgsl", include_str!("../shaders/chunk_dda.wgsl")),
+            ("grid_dda.wgsl", include_str!("../shaders/grid_dda.wgsl")),
+        ];
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        for (name, src) in shaders {
+            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| {
+                panic!("{name}: WGSL parse failed:\n{}", e.emit_to_string(src))
+            });
+            validator
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: WGSL validation failed: {e:?}"));
+        }
     }
 }

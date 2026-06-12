@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limb transforms. Bone posing was factored out of `draw_kfa_sprite`
   into the reusable `roxlap_core::kfa_draw::solve_kfa_limbs`. The
   scene-demo shows an `animsprite`-driven swinging arm on both backends.
+- **Directional sprite lighting on the GPU backend.** The GPU sprite
+  pass now shades KV6 voxels by surface normal, matching the CPU
+  rasteriser instead of rendering flat colours. Each voxel's `dir` is
+  uploaded alongside its colour, and the renderer builds voxlap's
+  `kv6colmul[256]` table per instance via the new
+  `roxlap_core::sprite::sprite_colmul` (reusing the exact
+  `update_reflects` math); the shader applies the same per-channel
+  `mulhi`/saturate modulation. Tables are rebuilt each frame so rotating
+  KFA limbs re-shade correctly. A naga-based unit test statically
+  validates every WGSL shader.
 
 ## [0.7.0] — 2026-06-12
 

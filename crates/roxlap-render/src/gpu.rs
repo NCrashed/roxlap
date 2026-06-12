@@ -16,9 +16,12 @@
 
 use std::collections::HashMap;
 
-use crate::{FrameParams, HasDisplayHandle, HasWindowHandle, KfaSprite, RenderOptions, SpriteSet};
+use crate::{
+    FrameParams, HasDisplayHandle, HasWindowHandle, KfaSprite, RenderOptions, Sprite, SpriteSet,
+};
 use glam::{DVec3, IVec3};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
+use roxlap_core::sprite::sprite_colmul;
 use roxlap_core::Camera;
 use roxlap_gpu::{
     build_sprite_model, GpuInitError, GpuRenderer, GpuSceneResident, SpriteInstance,
@@ -48,6 +51,13 @@ pub(crate) struct GpuBackend {
     /// until [`set_sprites`](Self::set_sprites).
     sprite_registry: Option<SpriteModelRegistry>,
     sprite_instances: Vec<SpriteInstance>,
+    /// Forward-basis [`Sprite`] per instance, parallel to
+    /// [`sprite_instances`](Self::sprite_instances) (static then KFA
+    /// limbs). Kept so [`render`](Self::render) can rebuild each
+    /// instance's `kv6colmul` lighting table from its current pose +
+    /// the frame's [`FrameParams::sprite_lighting`]. The kv6 is cloned
+    /// once at registration; per-frame KFA updates only copy the basis.
+    sprite_basis: Vec<Sprite>,
     /// GPU.10 KFA — per registered KFA sprite, the registry model id of
     /// each limb (in limb order). Built once by [`set_kfa_sprites`].
     kfa_limb_models: Vec<Vec<u32>>,
@@ -85,6 +95,7 @@ impl GpuBackend {
             versions: Vec::new(),
             sprite_registry: None,
             sprite_instances: Vec::new(),
+            sprite_basis: Vec::new(),
             kfa_limb_models: Vec::new(),
             kfa_base: 0,
             carve_model_id: None,
@@ -106,6 +117,7 @@ impl GpuBackend {
             .collect();
 
         let mut instances = Vec::with_capacity(set.instances.len());
+        let mut basis = Vec::with_capacity(set.instances.len());
         for inst in &set.instances {
             let Some(&model_id) = model_ids.get(inst.model) else {
                 continue;
@@ -118,6 +130,7 @@ impl GpuBackend {
                 model_id,
                 transform: SpriteInstanceTransform::from_sprite(&s),
             });
+            basis.push(s);
         }
         self.gpu.set_sprite_instances(&registry, &instances);
         self.carve_model_id = set.carve_model.and_then(|i| model_ids.get(i).copied());
@@ -127,6 +140,7 @@ impl GpuBackend {
         self.kfa_limb_models.clear();
         self.sprite_registry = Some(registry);
         self.sprite_instances = instances;
+        self.sprite_basis = basis;
     }
 
     /// Register KFA sprites: append each limb's kv6 as an instanced
@@ -139,6 +153,8 @@ impl GpuBackend {
         // `kfa_base` at the static instance count.
         let mut registry = self.sprite_registry.take().unwrap_or_default();
         let mut instances = std::mem::take(&mut self.sprite_instances);
+        // Truncate any prior KFA basis; static basis stays in [0, kfa_base).
+        self.sprite_basis.truncate(self.kfa_base);
         self.kfa_base = instances.len();
         self.kfa_limb_models.clear();
 
@@ -153,6 +169,7 @@ impl GpuBackend {
                     model_id: id,
                     transform: SpriteInstanceTransform::from_sprite(limb),
                 });
+                self.sprite_basis.push(limb.clone());
             }
             self.kfa_limb_models.push(limb_models);
         }
@@ -174,6 +191,14 @@ impl GpuBackend {
             for limb in &kfa.limbs {
                 if let Some(inst) = self.sprite_instances.get_mut(idx) {
                     inst.transform = SpriteInstanceTransform::from_sprite(limb);
+                }
+                // Copy only the posed basis (no kv6 re-clone) so the
+                // next `render` rebuilds this limb's lighting table.
+                if let Some(b) = self.sprite_basis.get_mut(idx) {
+                    b.p = limb.p;
+                    b.s = limb.s;
+                    b.h = limb.h;
+                    b.f = limb.f;
                 }
                 idx += 1;
             }
@@ -285,6 +310,22 @@ impl GpuBackend {
 
         // Per-frame GPU scene-LOD knob (GPU.11.1).
         self.gpu.set_scene_mip_scan_dist(frame.gpu_mip_scan_dist);
+
+        // GPU.10 sprite lighting: rebuild each instance's voxlap
+        // `kv6colmul` table from its current pose + the frame's lighting,
+        // so the GPU sprite pass shades exactly like the CPU rasteriser
+        // (directional, normal-based). Cheap for the demo's handful of
+        // instances; recomputed every frame because KFA limbs rotate.
+        if let Some(lighting) = frame.sprite_lighting {
+            if !self.sprite_basis.is_empty() {
+                let tables: Vec<[u64; 256]> = self
+                    .sprite_basis
+                    .iter()
+                    .map(|s| sprite_colmul(s, lighting).0)
+                    .collect();
+                self.gpu.set_sprite_instance_colmul(&tables);
+            }
+        }
 
         let cameras = self.grid_cameras(scene, camera);
         // Sprites are world-space, so they project through the world
