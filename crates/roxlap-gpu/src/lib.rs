@@ -447,7 +447,8 @@ impl GpuRenderer {
     {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone())?;
-        Self::finish_init(instance, surface, size, settings).await
+        let adapter = Self::request_adapter(&instance, Some(&surface), settings).await?;
+        Self::finish_init(adapter, surface, size, settings).await
     }
 
     /// wasm/WebGPU: build the renderer against an HTML `canvas`. No
@@ -455,6 +456,14 @@ impl GpuRenderer {
     /// the `+atomics` shared-memory wasm build, and the browser host is
     /// single-threaded (`Rc<RefCell<…>>`). The native generic-`W` entry
     /// (which carries the bound) isn't reachable on wasm.
+    ///
+    /// Probes for an adapter **before** `create_surface`: on wasm,
+    /// creating the surface calls `canvas.getContext("webgpu")`, which
+    /// permanently locks the canvas's context type. If we bound it and
+    /// then found no adapter, a CPU/WebGL2 fallback on the *same* canvas
+    /// (the facade clones the handle, but it's the same DOM element)
+    /// would fail with "no webgl2 context". Probing first leaves the
+    /// canvas pristine when WebGPU is unavailable.
     ///
     /// # Errors
     /// See [`Self::new`].
@@ -465,33 +474,44 @@ impl GpuRenderer {
         settings: GpuRendererSettings,
     ) -> Result<Self, GpuInitError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let adapter = Self::request_adapter(&instance, None, settings).await?;
         let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas))?;
-        Self::finish_init(instance, surface, size, settings).await
+        Self::finish_init(adapter, surface, size, settings).await
     }
 
-    /// Shared adapter → device → swapchain → sky/sampler setup, run
-    /// after the surface exists — created from a window handle on native
-    /// ([`Self::new`]) or an HTML canvas on wasm
-    /// ([`Self::new_from_canvas`]).
-    async fn finish_init(
-        instance: wgpu::Instance,
-        surface: wgpu::Surface<'static>,
-        size: (u32, u32),
+    /// Pick a GPU adapter at the settings' power preference. `None`
+    /// `compatible_surface` is used on the wasm canvas path so the probe
+    /// doesn't bind the canvas's context (see [`Self::new_from_canvas`]);
+    /// WebGPU exposes a single surface-independent adapter, so this is
+    /// safe there.
+    async fn request_adapter(
+        instance: &wgpu::Instance,
+        compatible_surface: Option<&wgpu::Surface<'static>>,
         settings: GpuRendererSettings,
-    ) -> Result<Self, GpuInitError> {
+    ) -> Result<wgpu::Adapter, GpuInitError> {
         let power_preference = match settings.power_preference {
             PowerPreference::Low => wgpu::PowerPreference::LowPower,
             PowerPreference::High => wgpu::PowerPreference::HighPerformance,
         };
-        let adapter = instance
+        instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference,
-                compatible_surface: Some(&surface),
+                compatible_surface,
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(GpuInitError::NoAdapter)?;
+            .ok_or(GpuInitError::NoAdapter)
+    }
 
+    /// Shared device → swapchain → sky/sampler setup, run after the
+    /// adapter + surface exist (the surface comes from a window handle on
+    /// native, or an HTML canvas on wasm).
+    async fn finish_init(
+        adapter: wgpu::Adapter,
+        surface: wgpu::Surface<'static>,
+        size: (u32, u32),
+        settings: GpuRendererSettings,
+    ) -> Result<Self, GpuInitError> {
         let info = adapter.get_info();
         let adapter_info = format!(
             "{name} ({backend:?}, {device_type:?})",
