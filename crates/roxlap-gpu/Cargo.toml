@@ -18,7 +18,7 @@ readme.workspace = true
 # blocks on the async device-request inside `App::resumed`; bytemuck
 # casts the hand-built voxel chunk and uniforms to `&[u8]` for
 # `Queue::write_buffer`.
-wgpu = "22.1"
+wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { workspace = true }
 # GPU.2: source of `Vxl` chunks for the CPU-side decompressor.
@@ -30,8 +30,8 @@ raw-window-handle = "0.6"
 # Optional `hud` feature: egui-wgpu paints an egui UI over the marcher's
 # frame (LoadOp::Load on the pending surface view). egui supplies the
 # tessellation + texture-delta types the host hands in.
-egui-wgpu = { version = "0.29", optional = true }
-egui = { version = "0.29", optional = true }
+egui-wgpu = { version = "0.34", optional = true }
+egui = { version = "0.34", optional = true }
 
 # `pollster::block_on` powers the native `new_blocking` / headless
 # helpers; on wasm the host awaits the async `new_from_canvas` through
@@ -56,7 +56,7 @@ winit = "0.30"
 # Static WGSL validation in unit tests (no GPU device needed) — same
 # front-end + validator wgpu runs at pipeline creation. Pinned to the
 # version wgpu 22 vendors so the dialect matches.
-naga = { version = "22", features = ["wgsl-in"] }
+naga = { version = "29", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

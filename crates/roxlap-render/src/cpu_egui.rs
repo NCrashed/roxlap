@@ -47,13 +47,10 @@ impl EguiRaster {
     pub(crate) fn update_textures(&mut self, set: &[(TextureId, ImageDelta)], free: &[TextureId]) {
         for (id, delta) in set {
             let [pw, ph] = delta.image.size();
-            let patch: Vec<Color32> = match &delta.image {
-                // Color images are already premultiplied sRGBA.
-                ImageData::Color(img) => img.pixels.clone(),
-                // Font coverage → premultiplied sRGBA (gamma None = the
-                // default egui texture filtering curve).
-                ImageData::Font(font) => font.srgba_pixels(None).collect(),
-            };
+            // egui 0.34 merged font atlases into `Color` (the `Font`
+            // variant is gone); pixels are premultiplied sRGBA.
+            let ImageData::Color(img) = &delta.image;
+            let patch: Vec<Color32> = img.pixels.clone();
             match delta.pos {
                 // Whole-texture (re)upload.
                 None => {

@@ -25,7 +25,7 @@ impl HeadlessGpu {
     /// is present (no Vulkan/Metal/DX12 driver), or
     /// [`GpuInitError::RequestDevice`] if device creation fails.
     pub async fn new(settings: GpuRendererSettings) -> Result<Self, GpuInitError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let power_preference = match settings.power_preference {
             PowerPreference::Low => wgpu::PowerPreference::LowPower,
             PowerPreference::High => wgpu::PowerPreference::HighPerformance,
@@ -37,7 +37,7 @@ impl HeadlessGpu {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(GpuInitError::NoAdapter)?;
+            .map_err(|_| GpuInitError::NoAdapter)?;
         let info = adapter.get_info();
         let adapter_info = format!(
             "{name} ({backend:?}, {device_type:?})",
@@ -46,15 +46,14 @@ impl HeadlessGpu {
             device_type = info.device_type,
         );
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("roxlap-gpu headless device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: crate::pick_required_limits(&adapter.limits()),
-                    memory_hints: wgpu::MemoryHints::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("roxlap-gpu headless device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: crate::pick_required_limits(&adapter.limits()),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await?;
         Ok(Self {
             device,

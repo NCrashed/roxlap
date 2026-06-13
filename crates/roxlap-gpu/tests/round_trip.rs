@@ -169,7 +169,7 @@ fn bench_single_chunk_upload() {
     let resident = GpuChunkResident::upload(&gpu.device, &chunk);
     // `create_buffer_init` doesn't block on transfer completion;
     // poll to make the timing reflect the full upload.
-    gpu.device.poll(wgpu::Maintain::Wait);
+    gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
     let upload_dt = t0.elapsed();
 
     let bytes = resident.resident_bytes();

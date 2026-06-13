@@ -169,7 +169,7 @@ struct Renderer {
 
 impl Renderer {
     async fn new(window: Arc<Window>, probe_res: Resolution) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
             .create_surface(window.clone())
             .expect("create_surface");
@@ -190,15 +190,14 @@ impl Renderer {
         );
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("roxlap-gpu probe device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: wgpu::MemoryHints::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("roxlap-gpu probe device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await
             .expect("request_device");
 
@@ -264,14 +263,14 @@ impl Renderer {
         });
         let compute_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("probe.compute_layout"),
-            bind_group_layouts: &[&compute_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&compute_bgl)],
+            immediate_size: 0,
         });
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("probe.compute"),
             layout: Some(&compute_pl),
             module: &compute_shader,
-            entry_point: "render_frame",
+            entry_point: Some("render_frame"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
@@ -312,21 +311,21 @@ impl Renderer {
         });
         let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("probe.blit_layout"),
-            bind_group_layouts: &[&blit_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&blit_bgl)],
+            immediate_size: 0,
         });
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("probe.blit"),
             layout: Some(&blit_pl),
             vertex: wgpu::VertexState {
                 module: &blit_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &blit_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
@@ -337,7 +336,7 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -347,7 +346,7 @@ impl Renderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         let blit_bg = make_blit_bg(&device, &blit_bgl, &storage_view, &blit_sampler);
@@ -438,16 +437,14 @@ impl Renderer {
         self.queue
             .write_buffer(&self.uniforms_buf, 0, bytemuck::bytes_of(&uniforms));
 
+        use wgpu::CurrentSurfaceTexture as C;
         let surf_tex = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            C::Success(t) | C::Suboptimal(t) => t,
+            C::Outdated | C::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
                 return;
             }
-            Err(e) => {
-                eprintln!("surface error: {e:?}");
-                return;
-            }
+            C::Timeout | C::Occluded | C::Validation => return,
         };
         let surf_view = surf_tex
             .texture
@@ -474,6 +471,7 @@ impl Renderer {
                 label: Some("probe.blit_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &surf_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -483,6 +481,7 @@ impl Renderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             rpass.set_pipeline(&self.blit_pipeline);
             rpass.set_bind_group(0, &self.blit_bg, &[]);

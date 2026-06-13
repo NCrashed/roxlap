@@ -825,7 +825,8 @@ fn split_occupancy_pages(
     slot_align_words: u64,
 ) -> (Vec<wgpu::Buffer>, u32, u32) {
     let total_words = words.len() as u64;
-    let limit_words = u64::from(device.limits().max_storage_buffer_binding_size) / 4;
+    // wgpu 29 widened `max_storage_buffer_binding_size` to `u64`.
+    let limit_words = device.limits().max_storage_buffer_binding_size / 4;
     // Largest slot-aligned page that fits one binding (≥ 1 slot).
     let page_slots = (limit_words / slot_align_words).max(1);
     let mut page_words = page_slots.saturating_mul(slot_align_words);

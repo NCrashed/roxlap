@@ -34,6 +34,14 @@ one new `Grid` method).
   uses `softbuffer` on native, presents its composited framebuffer through
   a WebGL2 texture-blit (`cpu_blit.rs`) on wasm. So a browser without
   WebGPU still renders, via CPU opticast — same `SceneRenderer`, same API.
+- **Graphics stack upgraded to wgpu 29** (from 22) + naga 29 + egui/
+  egui-wgpu 0.34. wgpu 22 unconditionally sent the WebGPU-spec-removed
+  `maxInterStageShaderComponents` device limit, which current Chrome/Dawn
+  reject — so WebGPU device creation failed on modern browsers. wgpu 29
+  tracks the current spec. The wasm GPU init also now probes the adapter
+  **and** device before binding the canvas surface, so any GPU-init
+  failure leaves the canvas pristine for the WebGL2 CPU fallback (no
+  more "no webgl2 context" crash).
 - **`Grid::bake_lightmode(lightmode)`** in `roxlap-scene` — bakes voxlap
   `estnorm`/`updatevxl` per-voxel lighting into every materialised chunk's
   brightness bytes, neighbour-aware at chunk-XY seams. A reusable engine

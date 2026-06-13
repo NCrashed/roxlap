@@ -109,14 +109,14 @@ impl GpuChunkResident {
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("roxlap-gpu chunk.probe_layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("roxlap-gpu chunk.probe_pipeline"),
             layout: Some(&pl),
             module: &shader,
-            entry_point: "debug_read",
+            entry_point: Some("debug_read"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
@@ -214,7 +214,7 @@ impl GpuChunkResident {
         slice.map_async(wgpu::MapMode::Read, move |res| {
             tx.send(res).expect("send map result");
         });
-        device.poll(wgpu::Maintain::Wait);
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
         rx.recv()
             .expect("recv map result")
             .expect("map_async returned an error");

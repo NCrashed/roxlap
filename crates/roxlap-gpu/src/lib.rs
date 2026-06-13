@@ -445,10 +445,13 @@ impl GpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
     {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone())?;
         let adapter = Self::request_adapter(&instance, Some(&surface), settings).await?;
-        Self::finish_init(adapter, surface, size, settings).await
+        let (device, queue) = Self::request_device(&adapter).await?;
+        Ok(Self::finish_init(
+            &adapter, device, queue, surface, size, settings,
+        ))
     }
 
     /// wasm/WebGPU: build the renderer against an HTML `canvas`. No
@@ -473,10 +476,18 @@ impl GpuRenderer {
         size: (u32, u32),
         settings: GpuRendererSettings,
     ) -> Result<Self, GpuInitError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        // Probe adapter AND device before binding the canvas — both
+        // `requestAdapter` and `requestDevice` can fail on wasm, and
+        // `create_surface` permanently locks the canvas to a WebGPU
+        // context. Creating the surface last keeps the canvas pristine
+        // for the CPU/WebGL2 fallback on any GPU-init failure.
         let adapter = Self::request_adapter(&instance, None, settings).await?;
+        let (device, queue) = Self::request_device(&adapter).await?;
         let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas))?;
-        Self::finish_init(adapter, surface, size, settings).await
+        Ok(Self::finish_init(
+            &adapter, device, queue, surface, size, settings,
+        ))
     }
 
     /// Pick a GPU adapter at the settings' power preference. `None`
@@ -500,18 +511,42 @@ impl GpuRenderer {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(GpuInitError::NoAdapter)
+            .map_err(|_| GpuInitError::NoAdapter)
     }
 
-    /// Shared device → swapchain → sky/sampler setup, run after the
-    /// adapter + surface exist (the surface comes from a window handle on
-    /// native, or an HTML canvas on wasm).
-    async fn finish_init(
-        adapter: wgpu::Adapter,
+    /// Request the device + queue from `adapter`. Pulled out of
+    /// [`Self::finish_init`] so the wasm canvas path can validate the
+    /// device **before** `create_surface` binds the canvas's WebGPU
+    /// context — if the device request fails (e.g. a browser that
+    /// rejects a wgpu-sent limit), the canvas stays pristine for the
+    /// CPU/WebGL2 fallback instead of being poisoned.
+    async fn request_device(
+        adapter: &wgpu::Adapter,
+    ) -> Result<(wgpu::Device, wgpu::Queue), GpuInitError> {
+        Ok(adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("roxlap-gpu device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: pick_required_limits(&adapter.limits()),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
+            .await?)
+    }
+
+    /// Shared swapchain → sky/sampler setup, run after the adapter +
+    /// device + surface exist (the surface comes from a window handle on
+    /// native, or an HTML canvas on wasm — created last on wasm so a
+    /// failed device request never touches the canvas).
+    fn finish_init(
+        adapter: &wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
         surface: wgpu::Surface<'static>,
         size: (u32, u32),
         settings: GpuRendererSettings,
-    ) -> Result<Self, GpuInitError> {
+    ) -> Self {
         let info = adapter.get_info();
         let adapter_info = format!(
             "{name} ({backend:?}, {device_type:?})",
@@ -520,19 +555,7 @@ impl GpuRenderer {
             device_type = info.device_type,
         );
 
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("roxlap-gpu device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: pick_required_limits(&adapter.limits()),
-                    memory_hints: wgpu::MemoryHints::default(),
-                },
-                None,
-            )
-            .await?;
-
-        let caps = surface.get_capabilities(&adapter);
+        let caps = surface.get_capabilities(adapter);
         // Pick a NON-sRGB swapchain format. Voxlap colours are
         // already sRGB-encoded (the slab bytes are display-ready,
         // matching what the CPU softbuffer path writes straight to
@@ -580,14 +603,14 @@ impl GpuRenderer {
         let default_sky_pixel = [0x80u8, 0x80, 0x80, 0xff];
         let (sky_texture, sky_view) = create_sky_texture(&device, 1, 1, &default_sky_pixel);
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &sky_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &default_sky_pixel,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4),
                 rows_per_image: Some(1),
@@ -608,11 +631,11 @@ impl GpuRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
-        Ok(Self {
+        Self {
             surface,
             surface_config,
             device,
@@ -646,7 +669,7 @@ impl GpuRenderer {
             pending_frame: None,
             #[cfg(feature = "hud")]
             egui_renderer: None,
-        })
+        }
     }
 
     /// Synchronous wrapper for hosts that don't have an async
@@ -705,14 +728,14 @@ impl GpuRenderer {
         // Upload pixel data via `queue.write_texture` so we don't
         // have to map the buffer manually.
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(width * 4),
                 rows_per_image: Some(height),
@@ -753,20 +776,29 @@ impl GpuRenderer {
         self.scene_dda = None;
     }
 
+    /// Acquire the next swapchain frame, or `None` to skip this frame.
+    /// wgpu 29's `get_current_texture` returns a
+    /// [`wgpu::CurrentSurfaceTexture`] status enum (was
+    /// `Result<_, SurfaceError>`): an outdated/lost surface reconfigures
+    /// and skips, transient statuses just skip.
+    fn acquire_frame(&self) -> Option<wgpu::SurfaceTexture> {
+        use wgpu::CurrentSurfaceTexture as C;
+        match self.surface.get_current_texture() {
+            C::Success(t) | C::Suboptimal(t) => Some(t),
+            C::Outdated | C::Lost => {
+                self.surface.configure(&self.device, &self.surface_config);
+                None
+            }
+            C::Timeout | C::Occluded | C::Validation => None,
+        }
+    }
+
     /// GPU.1 render: single render pass clearing the swapchain to a
     /// slowly drifting colour, then presenting. Voxels arrive in
     /// GPU.3+.
     pub fn render(&mut self) {
-        let surf_tex = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return;
-            }
-            Err(e) => {
-                eprintln!("roxlap-gpu surface error: {e:?}");
-                return;
-            }
+        let Some(surf_tex) = self.acquire_frame() else {
+            return;
         };
         let view = surf_tex
             .texture
@@ -795,6 +827,7 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
@@ -804,6 +837,7 @@ impl GpuRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -828,16 +862,8 @@ impl GpuRenderer {
         camera: &Camera,
         max_scan_dist: u32,
     ) {
-        let surf_tex = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return;
-            }
-            Err(e) => {
-                eprintln!("roxlap-gpu surface error: {e:?}");
-                return;
-            }
+        let Some(surf_tex) = self.acquire_frame() else {
+            return;
         };
         let surf_view = surf_tex
             .texture
@@ -924,6 +950,7 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu chunk_dda blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &surf_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -933,6 +960,7 @@ impl GpuRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             rpass.set_pipeline(&dda.pipeline_blit);
             rpass.set_bind_group(0, &dda.blit_bg, &[]);
@@ -1003,8 +1031,8 @@ impl GpuRenderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("roxlap-gpu chunk_dda.layout"),
-                bind_group_layouts: &[&bgl_dda],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bgl_dda)],
+                immediate_size: 0,
             });
         let pipeline_dda = self
             .device
@@ -1012,7 +1040,7 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu chunk_dda.pipeline"),
                 layout: Some(&dda_pl),
                 module: &dda_shader,
-                entry_point: "render_chunk",
+                entry_point: Some("render_chunk"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
@@ -1052,8 +1080,8 @@ impl GpuRenderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("roxlap-gpu chunk_dda.blit_layout"),
-                bind_group_layouts: &[&bgl_blit],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bgl_blit)],
+                immediate_size: 0,
             });
         let pipeline_blit = self
             .device
@@ -1062,13 +1090,13 @@ impl GpuRenderer {
                 layout: Some(&blit_pl),
                 vertex: wgpu::VertexState {
                     module: &blit_shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     buffers: &[],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &blit_shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: surface_format,
@@ -1079,7 +1107,7 @@ impl GpuRenderer {
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1089,7 +1117,7 @@ impl GpuRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1129,16 +1157,8 @@ impl GpuRenderer {
     /// Internally `expect`s the grid-DDA resources to be built;
     /// they are constructed at the top of this function if missing.
     pub fn render_grid(&mut self, grid: &GpuGridResident, camera: &Camera, max_outer_steps: u32) {
-        let surf_tex = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return;
-            }
-            Err(e) => {
-                eprintln!("roxlap-gpu surface error: {e:?}");
-                return;
-            }
+        let Some(surf_tex) = self.acquire_frame() else {
+            return;
         };
         let surf_view = surf_tex
             .texture
@@ -1231,6 +1251,7 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu grid_dda blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &surf_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -1240,6 +1261,7 @@ impl GpuRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             rpass.set_pipeline(&dda.pipeline_blit);
             rpass.set_bind_group(0, &dda.blit_bg, &[]);
@@ -1312,8 +1334,8 @@ impl GpuRenderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("roxlap-gpu grid_dda.layout"),
-                bind_group_layouts: &[&bgl_dda],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bgl_dda)],
+                immediate_size: 0,
             });
         let pipeline_dda = self
             .device
@@ -1321,7 +1343,7 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu grid_dda.pipeline"),
                 layout: Some(&dda_pl),
                 module: &dda_shader,
-                entry_point: "render_grid",
+                entry_point: Some("render_grid"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
@@ -1359,8 +1381,8 @@ impl GpuRenderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("roxlap-gpu grid_dda.blit_layout"),
-                bind_group_layouts: &[&bgl_blit],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bgl_blit)],
+                immediate_size: 0,
             });
         let pipeline_blit = self
             .device
@@ -1369,13 +1391,13 @@ impl GpuRenderer {
                 layout: Some(&blit_pl),
                 vertex: wgpu::VertexState {
                     module: &blit_shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     buffers: &[],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &blit_shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: surface_format,
@@ -1386,7 +1408,7 @@ impl GpuRenderer {
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1396,7 +1418,7 @@ impl GpuRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1469,16 +1491,8 @@ impl GpuRenderer {
         // un-presented (a host that skipped present/paint_egui) so we
         // never hold two outstanding swapchain textures.
         self.pending_frame = None;
-        let surf_tex = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return;
-            }
-            Err(e) => {
-                eprintln!("roxlap-gpu surface error: {e:?}");
-                return;
-            }
+        let Some(surf_tex) = self.acquire_frame() else {
+            return;
         };
         let surf_view = surf_tex
             .texture
@@ -1780,6 +1794,7 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu scene_dda blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &surf_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -1789,6 +1804,7 @@ impl GpuRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             rpass.set_pipeline(&dda.pipeline_blit);
             rpass.set_bind_group(0, &dda.blit_bg, &[]);
@@ -1806,16 +1822,8 @@ impl GpuRenderer {
     /// HUD can still be painted over an empty scene.
     pub fn render_clear_deferred(&mut self) {
         self.pending_frame = None;
-        let surf_tex = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return;
-            }
-            Err(e) => {
-                eprintln!("roxlap-gpu surface error: {e:?}");
-                return;
-            }
+        let Some(surf_tex) = self.acquire_frame() else {
+            return;
         };
         let view = surf_tex
             .texture
@@ -1831,6 +1839,7 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu clear (deferred)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a: 1.0 }),
@@ -1840,6 +1849,7 @@ impl GpuRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -1874,9 +1884,18 @@ impl GpuRenderer {
             return;
         };
         let format = self.surface_config.format;
-        let egui_rend = self
-            .egui_renderer
-            .get_or_insert_with(|| egui_wgpu::Renderer::new(&self.device, format, None, 1, false));
+        let egui_rend = self.egui_renderer.get_or_insert_with(|| {
+            egui_wgpu::Renderer::new(
+                &self.device,
+                format,
+                egui_wgpu::RendererOptions {
+                    msaa_samples: 1,
+                    depth_stencil_format: None,
+                    dithering: false,
+                    ..Default::default()
+                },
+            )
+        });
 
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.surface_config.width, self.surface_config.height],
@@ -1899,6 +1918,7 @@ impl GpuRenderer {
                     label: Some("roxlap-gpu egui paint"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &surf_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
@@ -1908,6 +1928,7 @@ impl GpuRenderer {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 })
                 // egui-wgpu 0.29 requires a `'static` pass (see its docs).
                 .forget_lifetime();
@@ -2030,8 +2051,8 @@ impl GpuRenderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("roxlap-gpu scene_dda.layout"),
-                bind_group_layouts: &[&bgl_dda],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bgl_dda)],
+                immediate_size: 0,
             });
         let pipeline_dda = self
             .device
@@ -2039,7 +2060,7 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu scene_dda.pipeline"),
                 layout: Some(&dda_pl),
                 module: &dda_shader,
-                entry_point: "render_scene",
+                entry_point: Some("render_scene"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
@@ -2077,8 +2098,8 @@ impl GpuRenderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("roxlap-gpu scene_dda.blit_layout"),
-                bind_group_layouts: &[&bgl_blit],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bgl_blit)],
+                immediate_size: 0,
             });
         let pipeline_blit = self
             .device
@@ -2087,13 +2108,13 @@ impl GpuRenderer {
                 layout: Some(&blit_pl),
                 vertex: wgpu::VertexState {
                     module: &blit_shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     buffers: &[],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &blit_shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: surface_format,
@@ -2104,7 +2125,7 @@ impl GpuRenderer {
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2114,7 +2135,7 @@ impl GpuRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2191,7 +2212,7 @@ impl GpuRenderer {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
         rx.recv().ok()?.ok()?;
 
         let t = {
@@ -2362,8 +2383,8 @@ impl GpuRenderer {
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("roxlap-gpu sprite_model_dda.layout"),
-                bind_group_layouts: &[&bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
             });
         let pipeline = self
             .device
@@ -2371,7 +2392,7 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu sprite_model_dda.pipeline"),
                 layout: Some(&pl),
                 module: &shader,
-                entry_point: "march",
+                entry_point: Some("march"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
@@ -2457,14 +2478,14 @@ impl HeadlessSceneRenderer {
         // — the texel must be written or the shader samples black, which
         // is why a grid-less headless render came back black).
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &sky_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &default_sky_pixel,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4),
                 rows_per_image: Some(1),
@@ -2533,14 +2554,14 @@ impl HeadlessSceneRenderer {
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("roxlap-gpu headless.layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("roxlap-gpu headless.pipeline"),
             layout: Some(&pl),
             module: &shader,
-            entry_point: "render_scene",
+            entry_point: Some("render_scene"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
@@ -2737,15 +2758,15 @@ impl HeadlessSceneRenderer {
             pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
         }
         enc.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.output_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &self.readback,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(self.padded_bytes_per_row),
                     rows_per_image: Some(self.height),
@@ -2764,7 +2785,7 @@ impl HeadlessSceneRenderer {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        device.poll(wgpu::Maintain::Wait);
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
         rx.recv().expect("map_async channel").expect("map_async");
 
         let data = slice.get_mapped_range();

@@ -665,9 +665,12 @@ impl App {
             let window = self.window.as_ref().expect("hud_ready");
             let state = self.egui_state.as_mut().expect("hud_ready");
             let raw_input = state.take_egui_input(window);
-            let full = self.egui_ctx.run(raw_input, |ctx| {
-                hud_panel(ctx, backend_label, fps, pos, yaw, pitch, scan);
-            });
+            // egui 0.34 deprecated `Context::run` (Context closure) in
+            // favour of `run_ui` (Ui closure); the begin/end-pass pair
+            // keeps the Context-based `hud_panel` without the warning.
+            self.egui_ctx.begin_pass(raw_input);
+            hud_panel(&self.egui_ctx, backend_label, fps, pos, yaw, pitch, scan);
+            let full = self.egui_ctx.end_pass();
             state.handle_platform_output(window, full.platform_output);
             let ppp = self.egui_ctx.pixels_per_point();
             let jobs = self.egui_ctx.tessellate(full.shapes, ppp);
