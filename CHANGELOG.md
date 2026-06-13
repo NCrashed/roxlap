@@ -22,6 +22,18 @@ one new `Grid` method).
 
 ### Added
 
+- **kv6 per-voxel shading + a public `normal → dir` quantiser.**
+  `Kv6::from_fn_shaded` builds a model with real surface normals
+  (`Voxel::dir`) and exposed-face masks (`Voxel::vis`) instead of the
+  flat `dir = 0`, `vis = 63` of `from_fn`, so procedurally-authored
+  models shade with a directional gradient on the CPU sprite path (which
+  reads `kv6colmul[dir]`) like an authored `.kv6`. `Kv6::recompute_surface`
+  refreshes `vis`/`dir` after editing a model's voxels. The voxlap
+  `univec[256]` direction table moved to `roxlap-formats`
+  (`roxlap_formats::equivec`, re-exported from `roxlap-core`) so kv6 can
+  reach it without a circular dependency, and gained
+  `equivec::nearest_dir(n) -> u8`. The `vis` face-bit order is calibrated
+  against `coco.kv6`'s authored bytes (all six faces).
 - **`roxlap-gpu` + `roxlap-render` build for `wasm32` (WebGPU).** New async,
   canvas-based constructors — `GpuRenderer::new_from_canvas` and
   `SceneRenderer::new_from_canvas_async` — create the wgpu surface from an

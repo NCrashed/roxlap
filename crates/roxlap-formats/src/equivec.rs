@@ -101,9 +101,55 @@ pub fn iunivec() -> &'static [[i16; 4]; UNIVEC_LEN] {
     IUNIVEC.get_or_init(|| build_iunivec(univec()))
 }
 
+/// Index of the active `univec` direction nearest to `n` (largest
+/// `dot(n, univec[k])`), i.e. the voxlap `dir` byte for a surface
+/// voxel whose outward normal is `n`. Searches the `UNIVEC_N = 255`
+/// active slots only — slot 255 is the degenerate all-zero direction
+/// (its dot is always `0`, so it never wins for a non-degenerate `n`).
+///
+/// `n` need not be unit length (scaling doesn't change the argmax).
+/// For `n == [0, 0, 0]` every dot is `0` and slot `0` is returned.
+///
+/// This is the missing public `normal → dir` quantiser: feed it an
+/// estimated surface normal to fill [`crate::kv6::Voxel::dir`], which
+/// the CPU sprite rasteriser turns into per-voxel shading via
+/// `kv6colmul[dir]`.
+#[must_use]
+pub fn nearest_dir(n: [f32; 3]) -> u8 {
+    let u = univec();
+    let mut best_k = 0usize;
+    let mut best_dot = f32::NEG_INFINITY;
+    for k in 0..UNIVEC_N {
+        let d = n[0] * u[k][0] + n[1] * u[k][1] + n[2] * u[k][2];
+        if d > best_dot {
+            best_dot = d;
+            best_k = k;
+        }
+    }
+    best_k as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `nearest_dir` of a table entry returns that entry's own index
+    /// (each `univec[k]` is closest to itself).
+    #[test]
+    fn nearest_dir_roundtrips_table_entries() {
+        let u = univec();
+        for k in (0..UNIVEC_N).step_by(7) {
+            assert_eq!(nearest_dir(u[k]) as usize, k, "slot {k}");
+        }
+    }
+
+    /// A pure +Z normal lands on a near-north-pole slot, and -Z near
+    /// the south pole (the table's z is monotone in the index).
+    #[test]
+    fn nearest_dir_poles() {
+        assert!(univec()[nearest_dir([0.0, 0.0, 1.0]) as usize][2] > 0.99);
+        assert!(univec()[nearest_dir([0.0, 0.0, -1.0]) as usize][2] < -0.99);
+    }
 
     /// Voxlap's `equiind2vec` distributes 255 unit vectors over the
     /// sphere via a Fibonacci spiral. The first few should be near

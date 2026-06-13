@@ -17,6 +17,11 @@
 mod bytes;
 
 pub mod edit;
+/// Voxlap's `univec[256]` surface-normal direction table + the
+/// `normal → dir` quantiser ([`equivec::nearest_dir`]). Lives here (not
+/// roxlap-core) so [`kv6`] model builders can fill per-voxel `dir`
+/// without a circular dependency; roxlap-core re-exports it.
+pub mod equivec;
 pub mod kfa;
 pub mod kv6;
 pub mod kvx;

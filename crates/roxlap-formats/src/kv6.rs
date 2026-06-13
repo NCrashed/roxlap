@@ -35,6 +35,65 @@ use core::fmt;
 use crate::bytes::{Cursor, OutOfBounds};
 use crate::Rgb6;
 
+// Voxlap kv6 `vis` face bits. These must match the `mask` the CPU
+// sprite rasteriser ANDs `vis` with (`roxlap_core::sprite::kv6_iterate`
+// / `draw_boundcube_line`), which is the same convention an authored
+// `.kv6`'s `vis` uses. Derived from that mask construction and
+// calibrated against `coco.kv6` (see the `coco_vis_*` tests):
+//   x±/y± from the quadrant masks; z from the per-column z-run phases
+//   (`z < inz` ⇒ −z face uses 0x20; `z > inz` ⇒ +z face uses 0x10).
+const VIS_NEG_X: u8 = 0x01;
+const VIS_POS_X: u8 = 0x02;
+const VIS_NEG_Y: u8 = 0x04;
+const VIS_POS_Y: u8 = 0x08;
+// z bits calibrated against coco.kv6: 0x10 is the -z face, 0x20 the +z
+// face (the naive draw-order reading was reversed; see the test
+// `coco_vis_z_order_matches_authored`).
+const VIS_POS_Z: u8 = 0x20;
+const VIS_NEG_Z: u8 = 0x10;
+
+/// Per-voxel `(vis, dir)` for a surface voxel at local `(x, y, z)`,
+/// given an occupancy predicate `occ` (out-of-range ⇒ air). `vis` is
+/// the exposed-face bitmask; `dir` is the nearest voxlap direction
+/// ([`crate::equivec::nearest_dir`]) to the outward surface normal,
+/// estimated as the gradient of occupancy over the 3³ neighbourhood
+/// (summing the offsets to *empty* cells points away from the solid).
+fn compute_vis_dir(occ: &impl Fn(i64, i64, i64) -> bool, x: i64, y: i64, z: i64) -> (u8, u8) {
+    let mut vis = 0u8;
+    if !occ(x - 1, y, z) {
+        vis |= VIS_NEG_X;
+    }
+    if !occ(x + 1, y, z) {
+        vis |= VIS_POS_X;
+    }
+    if !occ(x, y - 1, z) {
+        vis |= VIS_NEG_Y;
+    }
+    if !occ(x, y + 1, z) {
+        vis |= VIS_POS_Y;
+    }
+    if !occ(x, y, z - 1) {
+        vis |= VIS_NEG_Z;
+    }
+    if !occ(x, y, z + 1) {
+        vis |= VIS_POS_Z;
+    }
+
+    let mut n = [0.0f32; 3];
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if (dx | dy | dz) != 0 && !occ(x + dx, y + dy, z + dz) {
+                    n[0] += dx as f32;
+                    n[1] += dy as f32;
+                    n[2] += dz as f32;
+                }
+            }
+        }
+    }
+    (vis, crate::equivec::nearest_dir(n))
+}
+
 /// One voxel record (`kv6voxtype` in voxlaptest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Voxel {
@@ -94,17 +153,53 @@ impl Kv6 {
     // Dimensions are bounded by realistic model sizes: column/x counts
     // fit u16/u32, sizes fit f32 exactly, and the closure-local i64
     // neighbour coords are range-checked before the u32 cast.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
     #[must_use]
     pub fn from_fn<F: Fn(u32, u32, u32) -> Option<u32>>(
         xsiz: u32,
         ysiz: u32,
         zsiz: u32,
         fill: F,
+    ) -> Kv6 {
+        Self::build_inner(xsiz, ysiz, zsiz, fill, false)
+    }
+
+    /// Like [`Kv6::from_fn`], but fills **real** per-voxel surface
+    /// normals ([`Voxel::dir`]) and face visibility ([`Voxel::vis`])
+    /// instead of the flat `dir = 0`, `vis = 63`. The CPU sprite
+    /// rasteriser shades each voxel by `dir` (`kv6colmul[dir]`), so a
+    /// `from_fn`-built model shades flat while a `from_fn_shaded` one
+    /// gets proper directional gradient shading — the difference an
+    /// authored `.kv6` shows.
+    ///
+    /// `dir` is the nearest voxlap direction
+    /// ([`crate::equivec::nearest_dir`]) to the voxel's outward surface
+    /// normal, estimated as the occupancy gradient over the 3³
+    /// neighbourhood (pointing toward empty space). `vis` is the bitmask
+    /// of the six exposed faces.
+    #[must_use]
+    pub fn from_fn_shaded<F: Fn(u32, u32, u32) -> Option<u32>>(
+        xsiz: u32,
+        ysiz: u32,
+        zsiz: u32,
+        fill: F,
+    ) -> Kv6 {
+        Self::build_inner(xsiz, ysiz, zsiz, fill, true)
+    }
+
+    // Dimensions are bounded by realistic model sizes: column/x counts
+    // fit u16/u32, sizes fit f32 exactly, and the closure-local i64
+    // neighbour coords are range-checked before the u32 cast.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn build_inner<F: Fn(u32, u32, u32) -> Option<u32>>(
+        xsiz: u32,
+        ysiz: u32,
+        zsiz: u32,
+        fill: F,
+        shaded: bool,
     ) -> Kv6 {
         let occupied = |x: i64, y: i64, z: i64| -> bool {
             x >= 0
@@ -134,11 +229,16 @@ impl Kv6 {
                         || !occupied(xi, yi, zi - 1)
                         || !occupied(xi, yi, zi + 1);
                     if exposed {
+                        let (vis, dir) = if shaded {
+                            compute_vis_dir(&occupied, xi, yi, zi)
+                        } else {
+                            (63, 0)
+                        };
                         voxels.push(Voxel {
                             col,
                             z: z as u16,
-                            vis: 63,
-                            dir: 0,
+                            vis,
+                            dir,
                         });
                     }
                 }
@@ -159,6 +259,42 @@ impl Kv6 {
             xlen,
             ylen,
             palette: None,
+        }
+    }
+
+    /// Recompute every stored voxel's [`Voxel::vis`] + [`Voxel::dir`]
+    /// from `occupied` (a predicate over the **full** solid in this
+    /// kv6's local coordinates; out-of-range / air ⇒ `false`). Use this
+    /// after editing a model's voxels to refresh its shading + face
+    /// visibility — the editor counterpart to building with
+    /// [`Kv6::from_fn_shaded`]. Geometry (positions, run tables) is left
+    /// untouched; only `vis`/`dir` change.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn recompute_surface(&mut self, occupied: impl Fn(i32, i32, i32) -> bool) {
+        let xsiz = self.xsiz;
+        let ysiz = self.ysiz;
+        let zsiz = self.zsiz;
+        let occ = |x: i64, y: i64, z: i64| -> bool {
+            x >= 0
+                && y >= 0
+                && z >= 0
+                && (x as u32) < xsiz
+                && (y as u32) < ysiz
+                && (z as u32) < zsiz
+                && occupied(x as i32, y as i32, z as i32)
+        };
+        let mut vi = 0usize;
+        for x in 0..xsiz as usize {
+            for y in 0..ysiz as usize {
+                let len = self.ylen[x][y] as usize;
+                for _ in 0..len {
+                    let z = i64::from(self.voxels[vi].z);
+                    let (vis, dir) = compute_vis_dir(&occ, x as i64, y as i64, z);
+                    self.voxels[vi].vis = vis;
+                    self.voxels[vi].dir = dir;
+                    vi += 1;
+                }
+            }
         }
     }
 
@@ -477,6 +613,156 @@ mod tests {
         let nv = kv6.voxels.len() as u64;
         assert_eq!(xlen_sum, nv);
         assert_eq!(ylen_sum, nv);
+    }
+
+    #[test]
+    fn from_fn_shaded_keeps_from_fn_geometry() {
+        // Shading must not change which voxels are emitted or the run
+        // tables — only vis/dir. (A hollow shell: surface of a 5³ cube.)
+        let fill = |x: u32, y: u32, z: u32| {
+            let on_face = x == 0 || x == 4 || y == 0 || y == 4 || z == 0 || z == 4;
+            on_face.then_some(0x80_44_55_66u32)
+        };
+        let flat = Kv6::from_fn(5, 5, 5, fill);
+        let shaded = Kv6::from_fn_shaded(5, 5, 5, fill);
+        assert_eq!(flat.voxels.len(), shaded.voxels.len());
+        assert_eq!(flat.xlen, shaded.xlen);
+        assert_eq!(flat.ylen, shaded.ylen);
+        for (f, s) in flat.voxels.iter().zip(&shaded.voxels) {
+            assert_eq!((f.col, f.z), (s.col, s.z));
+        }
+        // And shading actually varied dir (not all 0 like from_fn).
+        assert!(
+            shaded.voxels.iter().any(|v| v.dir != 0),
+            "from_fn_shaded left every dir flat"
+        );
+        assert!(flat.voxels.iter().all(|v| v.dir == 0 && v.vis == 63));
+    }
+
+    #[test]
+    fn from_fn_shaded_column_z_faces() {
+        // A 1×1×2 stack: lower voxel's +z face and upper's -z face are
+        // internal (the two touch); the four side faces + the outer z
+        // face are exposed. Validates the VIS_*_Z constants' internal
+        // consistency against the neighbour checks.
+        let kv = Kv6::from_fn_shaded(1, 1, 2, |_, _, _| Some(0x80_80_80_80));
+        assert_eq!(kv.voxels.len(), 2);
+        let (lower, upper) = (&kv.voxels[0], &kv.voxels[1]); // ascending z
+        assert_eq!(lower.z, 0);
+        assert_eq!(upper.z, 1);
+        assert_eq!(lower.vis & VIS_POS_Z, 0, "lower +z should be internal");
+        assert_eq!(lower.vis & VIS_NEG_Z, VIS_NEG_Z, "lower -z exposed");
+        assert_eq!(upper.vis & VIS_NEG_Z, 0, "upper -z should be internal");
+        assert_eq!(upper.vis & VIS_POS_Z, VIS_POS_Z, "upper +z exposed");
+        // All four side faces exposed on both.
+        let sides = VIS_NEG_X | VIS_POS_X | VIS_NEG_Y | VIS_POS_Y;
+        assert_eq!(lower.vis & sides, sides);
+        assert_eq!(upper.vis & sides, sides);
+    }
+
+    /// CALIBRATION: confirm every `vis` face bit matches voxlap's
+    /// authored convention, against `coco.kv6`. When two voxels are
+    /// stored adjacent along an axis, the face between them is internal,
+    /// so the corresponding bit must be clear in the authored `vis` —
+    /// interior-independent (the shared face is internal regardless of
+    /// any unstored solid), so it pins all six bits without needing
+    /// coco's full solid. (We don't assert the converse: a missing
+    /// stored neighbour may still be solid interior, leaving the bit
+    /// legitimately clear.)
+    #[test]
+    fn coco_vis_matches_authored_all_faces() {
+        use std::collections::HashMap;
+        let kv6 = parse(COCO_KV6).expect("parse coco.kv6");
+        let mut pos: HashMap<(u32, u32, u32), u8> = HashMap::new();
+        let mut vi = 0usize;
+        for x in 0..kv6.xsiz {
+            for y in 0..kv6.ysiz {
+                let len = kv6.ylen[x as usize][y as usize] as usize;
+                for _ in 0..len {
+                    pos.insert((x, y, u32::from(kv6.voxels[vi].z)), kv6.voxels[vi].vis);
+                    vi += 1;
+                }
+            }
+        }
+        let mut checked = 0u32;
+        for (&(x, y, z), &vis) in &pos {
+            let mut chk = |present: bool, bit: u8, face: &str| {
+                if present {
+                    assert_eq!(
+                        vis & bit,
+                        0,
+                        "coco ({x},{y},{z}): {face} internal but bit set"
+                    );
+                    checked += 1;
+                }
+            };
+            chk(pos.contains_key(&(x + 1, y, z)), VIS_POS_X, "+x");
+            chk(x > 0 && pos.contains_key(&(x - 1, y, z)), VIS_NEG_X, "-x");
+            chk(pos.contains_key(&(x, y + 1, z)), VIS_POS_Y, "+y");
+            chk(y > 0 && pos.contains_key(&(x, y - 1, z)), VIS_NEG_Y, "-y");
+            chk(pos.contains_key(&(x, y, z + 1)), VIS_POS_Z, "+z");
+            chk(z > 0 && pos.contains_key(&(x, y, z - 1)), VIS_NEG_Z, "-z");
+        }
+        assert!(
+            checked > 100,
+            "expected many adjacent faces in coco, got {checked}"
+        );
+    }
+
+    #[test]
+    fn recompute_surface_matches_from_fn_shaded() {
+        // recompute_surface on a flat-built model must reproduce exactly
+        // what from_fn_shaded would have emitted (same vis + dir).
+        let fill = |x: u32, y: u32, z: u32| {
+            let cx = x as f32 - 4.0;
+            let cy = y as f32 - 4.0;
+            let cz = z as f32 - 4.0;
+            (cx * cx + cy * cy + cz * cz <= 16.0).then_some(0x80_30_60_90u32)
+        };
+        let shaded = Kv6::from_fn_shaded(9, 9, 9, fill);
+        let mut edited = Kv6::from_fn(9, 9, 9, fill); // flat vis/dir
+        edited.recompute_surface(|x, y, z| {
+            x >= 0 && y >= 0 && z >= 0 && fill(x as u32, y as u32, z as u32).is_some()
+        });
+        assert_eq!(edited.voxels.len(), shaded.voxels.len());
+        for (e, s) in edited.voxels.iter().zip(&shaded.voxels) {
+            assert_eq!((e.vis, e.dir), (s.vis, s.dir), "voxel z={}", e.z);
+        }
+    }
+
+    #[test]
+    fn from_fn_shaded_slab_top_normal_points_up() {
+        use crate::equivec::univec;
+        // A solid slab filling z in [2,9]; the z=2 surface (smallest z =
+        // "up" in voxlap z-down) faces empty above, so its outward normal
+        // points toward -z. Check an interior-of-face voxel.
+        let kv = Kv6::from_fn_shaded(8, 8, 12, |_, _, z| {
+            (2..=9).contains(&z).then_some(0x80_aa_aa_aa)
+        });
+        let v = kv
+            .voxels
+            .iter()
+            .enumerate()
+            .find_map(|(i, v)| {
+                // recover (x,y) for voxel i
+                let mut acc = 0usize;
+                for x in 0..kv.xsiz as usize {
+                    for y in 0..kv.ysiz as usize {
+                        let len = kv.ylen[x][y] as usize;
+                        if i < acc + len {
+                            return (x == 4 && y == 4 && v.z == 2).then_some(*v);
+                        }
+                        acc += len;
+                    }
+                }
+                None
+            })
+            .expect("centre top-face voxel present");
+        let n = univec()[v.dir as usize];
+        assert!(
+            n[2] < -0.5,
+            "top-face normal should point -z (up), got {n:?}"
+        );
     }
 
     #[test]

@@ -12,7 +12,11 @@ pub mod camera_math;
 pub(crate) mod column_walk;
 pub mod drawtile;
 mod engine;
-pub(crate) mod equivec;
+// `equivec` (voxlap's normal table) moved to roxlap-formats so kv6
+// model builders can fill per-voxel `dir` without a circular dep;
+// re-exported here so in-crate `crate::equivec::…` paths (the sprite
+// `kv6colmul` build) keep resolving.
+pub(crate) use roxlap_formats::equivec;
 pub(crate) mod fixed;
 pub mod gline;
 pub mod grid_view;
