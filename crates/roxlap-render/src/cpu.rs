@@ -5,7 +5,9 @@
 //! ([`render_scene_composed`]). Mirrors the scene-demo's old `redraw`
 //! world pass. Sprites land in RF.3.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::num::NonZeroU32;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
 use roxlap_core::camera_math;
@@ -17,10 +19,17 @@ use roxlap_formats::sprite::Sprite;
 use roxlap_scene::render::render_scene_composed;
 use roxlap_scene::Scene;
 
-use crate::{
-    DynDisplay, DynWindow, FrameParams, HasDisplayHandle, HasWindowHandle, KfaSprite,
-    RenderOptions, SpriteSet,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{DynDisplay, DynWindow, HasDisplayHandle, HasWindowHandle};
+use crate::{FrameParams, KfaSprite, RenderOptions, SpriteSet};
+
+/// The CPU backend's framebuffer presenter. Native blits into a
+/// `softbuffer` window surface; wasm uploads to a WebGL2 texture +
+/// fullscreen quad on the canvas (no softbuffer in the browser).
+#[cfg(not(target_arch = "wasm32"))]
+type Presenter = softbuffer::Surface<Arc<DynDisplay>, Arc<DynWindow>>;
+#[cfg(target_arch = "wasm32")]
+type Presenter = crate::cpu_blit::WebGlBlit;
 
 /// World-space view-ray direction (un-normalised) for window pixel
 /// `(x, y)` under the CPU opticast projection (voxlap `setcamera`):
@@ -48,12 +57,13 @@ pub(crate) fn setcamera_pixel_ray(
 }
 
 pub(crate) struct CpuBackend {
-    /// `softbuffer::Context` is dropped after surface creation — the
-    /// surface keeps its own clone of the display handle (matches the
-    /// existing scene-demo setup). The display/window handles are
-    /// type-erased to `Arc<dyn …>` so the backend stays generic-free
-    /// over the host's windowing library.
-    surface: softbuffer::Surface<Arc<DynDisplay>, Arc<DynWindow>>,
+    /// Framebuffer presenter — native `softbuffer` window surface, or
+    /// the wasm WebGL2 canvas blitter (see [`Presenter`]). On native,
+    /// `softbuffer::Context` is dropped after surface creation; the
+    /// surface keeps its own clone of the type-erased `Arc<dyn …>`
+    /// display/window handles so the backend stays generic-free over
+    /// the host's windowing library.
+    present_target: Presenter,
     /// Current framebuffer size in physical pixels. Seeded at
     /// construction, updated by [`Self::resize`] — replaces the old
     /// per-frame `window.inner_size()` poll so the backend never
@@ -98,20 +108,10 @@ pub(crate) struct CpuBackend {
 }
 
 impl CpuBackend {
-    pub(crate) fn new<W>(window: Arc<W>, size: (u32, u32), opts: &RenderOptions) -> Self
-    where
-        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
-    {
-        // Erase the concrete window type behind two `Arc<dyn …>`
-        // handles. `raw-window-handle` implements `HasDisplayHandle` /
-        // `HasWindowHandle` for `Arc<H>` with `H: ?Sized`, and a bare
-        // trait object implements its own (object-safe) trait, so both
-        // erased Arcs satisfy softbuffer's bounds.
-        let display: Arc<DynDisplay> = window.clone();
-        let window: Arc<DynWindow> = window;
-        let context = softbuffer::Context::new(display).expect("softbuffer: Context::new");
-        let surface = softbuffer::Surface::new(&context, window).expect("softbuffer: Surface::new");
-
+    /// Shared construction: build the pool / z-buffer / framebuffer
+    /// around an already-created `present_target` (native softbuffer
+    /// surface or wasm WebGL2 blitter).
+    fn assemble(present_target: Presenter, size: (u32, u32), opts: &RenderOptions) -> Self {
         let (w, h) = (size.0.max(1), size.1.max(1));
         let n_threads = opts
             .cpu_render_threads
@@ -121,7 +121,7 @@ impl CpuBackend {
         let framebuffer = vec![opts.clear_sky; (w as usize) * (h as usize)];
 
         Self {
-            surface,
+            present_target,
             current_dims: (w, h),
             pool,
             zbuffer,
@@ -138,6 +138,38 @@ impl CpuBackend {
             #[cfg(feature = "hud")]
             egui_raster: crate::cpu_egui::EguiRaster::default(),
         }
+    }
+
+    /// Native: present into a `softbuffer` surface bound to `window`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn new<W>(window: Arc<W>, size: (u32, u32), opts: &RenderOptions) -> Self
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
+        // Erase the concrete window type behind two `Arc<dyn …>`
+        // handles. `raw-window-handle` implements `HasDisplayHandle` /
+        // `HasWindowHandle` for `Arc<H>` with `H: ?Sized`, and a bare
+        // trait object implements its own (object-safe) trait, so both
+        // erased Arcs satisfy softbuffer's bounds.
+        let display: Arc<DynDisplay> = window.clone();
+        let window: Arc<DynWindow> = window;
+        let context = softbuffer::Context::new(display).expect("softbuffer: Context::new");
+        let surface = softbuffer::Surface::new(&context, window).expect("softbuffer: Surface::new");
+        Self::assemble(surface, size, opts)
+    }
+
+    /// wasm: present into a WebGL2 blitter over `canvas` (no softbuffer
+    /// in the browser).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn new_from_canvas(
+        canvas: web_sys::HtmlCanvasElement,
+        size: (u32, u32),
+        opts: &RenderOptions,
+    ) -> Self {
+        let (w, h) = (size.0.max(1), size.1.max(1));
+        let blit = crate::cpu_blit::WebGlBlit::new(&canvas, w, h)
+            .expect("roxlap-render: WebGL2 blit init");
+        Self::assemble(blit, size, opts)
     }
 
     /// Request that the next rendered frame be captured for readback.
@@ -218,12 +250,15 @@ impl CpuBackend {
         }
     }
 
-    #[allow(clippy::unused_self)] // symmetry with GpuBackend::resize
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         // softbuffer + the pool resize lazily inside `render`; we just
         // record the new size the host reported (replacing the old
-        // per-frame `window.inner_size()` poll).
+        // per-frame `window.inner_size()` poll). The WebGL2 blitter's
+        // texture, by contrast, must be re-allocated eagerly.
         self.current_dims = (width.max(1), height.max(1));
+        #[cfg(target_arch = "wasm32")]
+        self.present_target
+            .resize(self.current_dims.0, self.current_dims.1);
     }
 
     pub(crate) fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
@@ -334,6 +369,7 @@ impl CpuBackend {
 
     /// Shared tail of `present` / `paint_egui`: copy the framebuffer to
     /// the window surface at `(width, height)` and present.
+    #[cfg(not(target_arch = "wasm32"))]
     fn blit_and_present(&mut self, dims: (u32, u32)) {
         let (width, height) = dims;
         let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
@@ -343,10 +379,29 @@ impl CpuBackend {
         if self.framebuffer.len() < pixel_count {
             return;
         }
-        self.surface.resize(w_nz, h_nz).expect("softbuffer: resize");
-        let mut buffer = self.surface.buffer_mut().expect("softbuffer: buffer_mut");
+        self.present_target
+            .resize(w_nz, h_nz)
+            .expect("softbuffer: resize");
+        let mut buffer = self
+            .present_target
+            .buffer_mut()
+            .expect("softbuffer: buffer_mut");
         buffer[..pixel_count].copy_from_slice(&self.framebuffer[..pixel_count]);
         buffer.present().expect("softbuffer: present");
+    }
+
+    /// wasm counterpart: upload the framebuffer to the WebGL2 texture
+    /// and draw the fullscreen quad on the canvas.
+    #[cfg(target_arch = "wasm32")]
+    fn blit_and_present(&mut self, dims: (u32, u32)) {
+        let (width, height) = dims;
+        let pixel_count = (width as usize) * (height as usize);
+        if width == 0 || height == 0 || self.framebuffer.len() < pixel_count {
+            return;
+        }
+        self.present_target.resize(width, height);
+        self.present_target
+            .present(&self.framebuffer[..pixel_count]);
     }
 
     /// Software-rasterise the egui `jobs` over the composited

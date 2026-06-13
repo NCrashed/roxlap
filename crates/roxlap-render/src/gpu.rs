@@ -16,9 +16,9 @@
 
 use std::collections::HashMap;
 
-use crate::{
-    FrameParams, HasDisplayHandle, HasWindowHandle, KfaSprite, RenderOptions, Sprite, SpriteSet,
-};
+use crate::{FrameParams, KfaSprite, RenderOptions, Sprite, SpriteSet};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::sprite::sprite_colmul;
@@ -87,16 +87,10 @@ pub(crate) struct GpuBackend {
 }
 
 impl GpuBackend {
-    pub(crate) fn new<W>(
-        window: std::sync::Arc<W>,
-        size: (u32, u32),
-        opts: &RenderOptions,
-    ) -> Result<Self, GpuInitError>
-    where
-        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
-    {
-        let gpu = GpuRenderer::new_blocking(window, size, opts.gpu)?;
-        Ok(Self {
+    /// Backend-agnostic field seeding shared by the native + wasm
+    /// constructors, given an already-initialised [`GpuRenderer`].
+    fn from_gpu(gpu: GpuRenderer) -> Self {
+        Self {
             gpu,
             resident: None,
             empty_resident: None,
@@ -111,7 +105,34 @@ impl GpuBackend {
             carve_z: 0,
             host_sky_set: false,
             auto_sky_color: None,
-        })
+        }
+    }
+
+    /// Native: block on the async wgpu init against a window handle.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn new<W>(
+        window: std::sync::Arc<W>,
+        size: (u32, u32),
+        opts: &RenderOptions,
+    ) -> Result<Self, GpuInitError>
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
+        let gpu = GpuRenderer::new_blocking(window, size, opts.gpu)?;
+        Ok(Self::from_gpu(gpu))
+    }
+
+    /// wasm/WebGPU: await the async wgpu init against an HTML canvas.
+    /// The browser drives the adapter/device futures through its event
+    /// loop, so there's no blocking wrapper here.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn new_async(
+        canvas: web_sys::HtmlCanvasElement,
+        size: (u32, u32),
+        opts: &RenderOptions,
+    ) -> Result<Self, GpuInitError> {
+        let gpu = GpuRenderer::new_from_canvas(canvas, size, opts.gpu).await?;
+        Ok(Self::from_gpu(gpu))
     }
 
     /// Build an instanced model registry from `set` and upload it.
@@ -252,8 +273,19 @@ impl GpuBackend {
 
     /// World-t depth at window pixel `(x, y)` from the last frame (for
     /// screen→world picking). See [`SceneRenderer::pick_depth`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn pick_depth(&self, x: u32, y: u32) -> Option<f32> {
         self.gpu.read_depth_pixel(x, y)
+    }
+
+    /// wasm: depth picking is deferred on the GPU path — WebGPU has no
+    /// blocking readback, so the staging-buffer map can't be awaited
+    /// synchronously here. Always `None`; the CPU fallback picks
+    /// normally from its in-memory z-buffer.
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::unused_self)]
+    pub(crate) fn pick_depth(&self, _x: u32, _y: u32) -> Option<f32> {
+        None
     }
 
     /// World-space view ray for pixel `(x, y)` under the GPU marcher's

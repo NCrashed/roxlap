@@ -35,6 +35,9 @@
 pub mod camera;
 pub mod decompress;
 pub mod grid;
+// Headless rendering is a native-only test/bench aid: it blocks on
+// `pollster` + `device.poll(Wait)`, neither of which exists on wasm.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod headless;
 pub mod resident;
 pub mod scene;
@@ -43,6 +46,7 @@ pub mod sprite_model;
 pub use camera::Camera;
 pub use decompress::{decompress_chunk, ChunkUpload, BEDROCK_RGB, CHUNK_Z};
 pub use grid::{bounding_box_of, GpuGridResident, GridUpload};
+#[cfg(not(target_arch = "wasm32"))]
 pub use headless::HeadlessGpu;
 pub use resident::GpuChunkResident;
 pub use scene::{
@@ -443,6 +447,38 @@ impl GpuRenderer {
     {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone())?;
+        Self::finish_init(instance, surface, size, settings).await
+    }
+
+    /// wasm/WebGPU: build the renderer against an HTML `canvas`. No
+    /// `Send + Sync` bound — wgpu's surface/device/queue are `!Send` on
+    /// the `+atomics` shared-memory wasm build, and the browser host is
+    /// single-threaded (`Rc<RefCell<…>>`). The native generic-`W` entry
+    /// (which carries the bound) isn't reachable on wasm.
+    ///
+    /// # Errors
+    /// See [`Self::new`].
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_from_canvas(
+        canvas: web_sys::HtmlCanvasElement,
+        size: (u32, u32),
+        settings: GpuRendererSettings,
+    ) -> Result<Self, GpuInitError> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas))?;
+        Self::finish_init(instance, surface, size, settings).await
+    }
+
+    /// Shared adapter → device → swapchain → sky/sampler setup, run
+    /// after the surface exists — created from a window handle on native
+    /// ([`Self::new`]) or an HTML canvas on wasm
+    /// ([`Self::new_from_canvas`]).
+    async fn finish_init(
+        instance: wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        size: (u32, u32),
+        settings: GpuRendererSettings,
+    ) -> Result<Self, GpuInitError> {
         let power_preference = match settings.power_preference {
             PowerPreference::Low => wgpu::PowerPreference::LowPower,
             PowerPreference::High => wgpu::PowerPreference::HighPerformance,
@@ -598,6 +634,7 @@ impl GpuRenderer {
     ///
     /// # Errors
     /// See [`Self::new`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new_blocking<W>(
         window: Arc<W>,
         size: (u32, u32),
@@ -2108,6 +2145,11 @@ impl GpuRenderer {
     /// Requires the last frame to have written depth, which happens
     /// when sprites are present (`write_depth`). The pick demo always
     /// has a cursor sprite, so this holds.
+    ///
+    /// Compiles on wasm, but the wasm facade never calls it: WebGPU's
+    /// `device.poll` doesn't block for the GPU, so the blocking
+    /// `recv()` here would hang the single browser thread. Picking is
+    /// deferred on the wasm GPU path (the facade returns `None`).
     #[must_use]
     pub fn read_depth_pixel(&self, x: u32, y: u32) -> Option<f32> {
         let dda = self.scene_dda.as_ref()?;

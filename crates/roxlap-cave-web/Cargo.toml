@@ -17,15 +17,22 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core", version = "0.8" }
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.8" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.8" }
+# GW.3: rendered through the facade (WebGPU marcher + CPU/WebGL2
+# fallback). roxlap-cavegen builds the cave; roxlap-scene holds it as a
+# single-chunk grid + does collision / carving / lighting bake;
+# roxlap-formats builds the bullet sprite kv6; roxlap-core supplies
+# Camera / Engine / OpticastSettings / SpriteLighting; glam types coords.
+roxlap-core = { path = "../roxlap-core", version = "1.0" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "1.0" }
+roxlap-formats = { path = "../roxlap-formats", version = "1.0" }
+roxlap-render = { path = "../roxlap-render", version = "1.0" }
+roxlap-scene = { path = "../roxlap-scene", version = "1.0" }
+glam = { workspace = true }
 
 # wasm-bindgen / web-sys versions pinned to the same major+minor as
 # `wasm-bindgen-cli` shipped by nixpkgs (see crates/roxlap-oracle/
 # Cargo.toml's R10.1 block for the schema-mismatch reasoning).
 wasm-bindgen = "=0.2.117"
-js-sys = "0.3"
 console_error_panic_hook = "0.1"
 # R10.X.2: Web-Worker-backed rayon thread pool. `init_thread_pool`
 # is re-exported from lib.rs so JS awaits the worker spin-up
@@ -37,9 +44,8 @@ wasm-bindgen-futures = "0.4"
 
 [dependencies.web-sys]
 version = "0.3"
-# R10.X.3: WebGL2 blit (texture upload + fullscreen quad) replaces
-# the 2D `putImageData` path. Frag shader does the BGRA→RGBA
-# swizzle on GPU; pack_rgba step disappears entirely.
+# DOM + input only — the framebuffer presentation (WebGL2 blit on the
+# CPU path / wgpu surface on the GPU path) is owned by roxlap-render.
 features = [
     "Window",
     "Document",
@@ -58,13 +64,6 @@ features = [
     # R10.X.2: `Navigator.hardwareConcurrency` for rayon's
     # worker count.
     "Navigator",
-    "WebGl2RenderingContext",
-    "WebGlBuffer",
-    "WebGlProgram",
-    "WebGlShader",
-    "WebGlTexture",
-    "WebGlUniformLocation",
-    "WebGlVertexArrayObject",
 ]
 
 [lints]

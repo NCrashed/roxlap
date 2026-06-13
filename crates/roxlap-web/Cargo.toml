@@ -20,16 +20,22 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core", version = "0.8" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.8" }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# GW.2: the demo now renders through the unified facade (WebGPU
+# marcher + automatic CPU/WebGL2 fallback). roxlap-core supplies
+# Camera / Engine / OpticastSettings for the per-frame FrameParams;
+# roxlap-scene builds the voxel world (Scene + Grid edits); glam types
+# the grid coords. The WebGL2 presenter + opticast call site that used
+# to live here now live inside roxlap-render.
+roxlap-core = { path = "../roxlap-core", version = "1.0" }
+roxlap-render = { path = "../roxlap-render", version = "1.0" }
+roxlap-scene = { path = "../roxlap-scene", version = "1.0" }
+glam = { workspace = true }
 
 # wasm-bindgen / web-sys versions pinned to the same major+minor as
 # `wasm-bindgen-cli` shipped by nixpkgs (see crates/roxlap-oracle/
 # Cargo.toml's R10.1 block for the schema-mismatch reasoning). When
 # nixpkgs bumps the CLI, lift these in lockstep.
 wasm-bindgen = "=0.2.117"
-js-sys = "0.3"
 console_error_panic_hook = "0.1"
 # R10.X.2: spin a Web-Worker-backed rayon thread pool. The
 # crate exposes an `init_thread_pool` JS export that we re-
@@ -45,11 +51,9 @@ wasm-bindgen-futures = "0.4"
 
 [dependencies.web-sys]
 version = "0.3"
-# R10.X.3: WebGL2 blit replaces the 2D `putImageData` path —
-# texture upload + fullscreen-quad draw. The fragment shader
-# does the BGRA→RGBA swizzle on GPU, so the per-frame
-# `pack_rgba` step disappears entirely. Frame time benefit at
-# 640×480 is ~1-2 ms.
+# DOM + input only — the framebuffer presentation (WebGL2 blit on the
+# CPU path / wgpu surface on the GPU path) is owned by roxlap-render
+# now, so the `WebGl*` features moved there.
 features = [
     "Window",
     "Document",
@@ -67,13 +71,6 @@ features = [
     # R10.X.2: `Navigator.hardwareConcurrency` decides how many
     # rayon worker threads to spin up.
     "Navigator",
-    "WebGl2RenderingContext",
-    "WebGlBuffer",
-    "WebGlProgram",
-    "WebGlShader",
-    "WebGlTexture",
-    "WebGlUniformLocation",
-    "WebGlVertexArrayObject",
 ]
 
 [lints]

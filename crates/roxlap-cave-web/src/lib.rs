@@ -1,13 +1,15 @@
 //! roxlap-cave-web — procedural cave demo on wasm32 + canvas.
 //!
-//! Combines the engine + cave-gen pipeline from
-//! `roxlap-cave-demo` with the canvas / `requestAnimationFrame`
-//! / pointer-lock scaffolding from `roxlap-web`. The whole
-//! pipeline (Worley + Perlin cave gen, voxlap renderer, sphere
-//! carve, lightmode-1 bake) runs in the browser; the player
-//! flies through with WASD + mouse-look, fires plasma bullets
-//! that carve craters with local relight on impact, and can
-//! regenerate the cave via `F` (preset) or `R` (seed).
+//! GW.3: rendered through the `roxlap-render` [`SceneRenderer`] facade
+//! — the WebGPU compute marcher when the browser has WebGPU, else the
+//! CPU opticast path presented via the facade's WebGL2 blit. The cave
+//! is generated into a single-chunk `roxlap_scene::Scene` grid;
+//! flying, per-voxel collision, and runtime carving all run against
+//! the scene. Plasma bullets are facade **sprites** (small glowing
+//! voxel spheres); on impact they carve a crater into the scene grid
+//! with a local lightmode-1 re-bake, which the facade re-uploads to
+//! the GPU via its per-chunk dirty tracking. `F` cycles the preset,
+//! `R` reseeds — both regenerate the cave in place.
 
 #![cfg(target_arch = "wasm32")]
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -15,17 +17,19 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use glam::{DVec3, IVec3};
 use roxlap_cavegen::{BlueCaveGenerator, CaveParams, Generator, MagCaveGenerator, MAXZDIM};
-use roxlap_core::opticast::opticast;
-use roxlap_core::rasterizer::ScratchPool;
-use roxlap_core::scalar_rasterizer::ScalarRasterizer;
-use roxlap_core::update_lighting;
-use roxlap_core::world_query::{getcube, Cube};
+use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::{Camera, Engine, OpticastSettings};
-use roxlap_formats::edit::{set_sphere_with_colfunc, SpanOp};
+use roxlap_formats::kv6::Kv6;
+use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_NO_SHADING};
 use roxlap_formats::vxl;
+use roxlap_render::{
+    Backend, FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet,
+};
+use roxlap_scene::{GridId, GridTransform, Scene};
 use wasm_bindgen::prelude::*;
-use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent, WebGl2RenderingContext as Gl};
+use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
 
 // ----- World / camera tuning (mirrors roxlap-cave-demo) ----------------------
 
@@ -42,21 +46,20 @@ const PLAYER_RADIUS: f64 = 0.3;
 const BULLET_MAX_DIST: f64 = 96.0;
 const BULLET_VEL: f64 = 60.0;
 const FIRE_RADIUS: u32 = 4;
-const BULLET_RADIUS_PX_MAX: i32 = 12;
-const BULLET_RADIUS_PX_MIN: i32 = 1;
+/// Bullet sprite half-extent in voxels (a small glowing sphere).
+const BULLET_SPRITE_RADIUS: u32 = 2;
 const BULLET_COLOR_CORE: u32 = 0x00FF_4080;
-const BULLET_COLOR_HALO: u32 = 0x00FF_A0C0;
 
-#[allow(clippy::cast_possible_wrap)]
-const CARVE_COLOR: i32 = 0x8050_3018u32 as i32;
-#[allow(clippy::cast_possible_wrap)]
-const SPAWN_BUBBLE_COLOR: i32 = 0x8060_6068u32 as i32;
+const CARVE_COLOR: u32 = 0x8050_3018;
+const SPAWN_BUBBLE_COLOR: u32 = 0x8060_6068;
 const SPAWN_BUBBLE_RADIUS: u32 = 6;
 
 const LIGHTMODE: u32 = 1;
 
 const FOG_COLOR: u32 = 0x0090_98B0;
 const FOG_MAX_SCAN_DIST: i32 = 128;
+/// GPU marcher vertical field-of-view, degrees → radians at use.
+const GPU_FOV_Y_DEG: f32 = 70.0;
 
 // ----- Types ----------------------------------------------------------------
 
@@ -88,6 +91,9 @@ impl Preset {
             Self::Mag => MagCaveGenerator::default_params(),
         }
     }
+    /// Generate the cave as a single `vsid = VSID` voxel chunk — the
+    /// cavegen output is exactly one `roxlap_scene` chunk
+    /// (`CHUNK_SIZE_XY = VSID`, `CHUNK_SIZE_Z = MAXZDIM`).
     fn generate(self, seed: u64) -> vxl::Vxl {
         let mut params = self.default_params();
         params.seed = seed;
@@ -100,16 +106,19 @@ impl Preset {
 
 struct State {
     engine: Engine,
-    vxl: vxl::Vxl,
-    pool: ScratchPool,
-    fb: Vec<u32>,
-    zb: Vec<f32>,
+    /// The voxel world (one identity-transform grid, one chunk).
+    scene: Scene,
+    grid: GridId,
+    /// Unified CPU/GPU renderer over the canvas.
+    renderer: SceneRenderer,
+    /// Glowing bullet sprite model, reused for every live bullet
+    /// instance via the facade's [`SpriteSet`].
+    bullet_model: Sprite,
     cam_pos: [f64; 3],
     yaw: f64,
     pitch: f64,
     input: Input,
     last_frame_ms: f64,
-    blit: WebGlBlit,
     bullets: Vec<Bullet>,
     preset: Preset,
     seed: u64,
@@ -140,195 +149,6 @@ enum TouchZone {
     Look,
 }
 
-/// R10.X.3: GPU-side framebuffer presenter — same shape as
-/// `roxlap-web::WebGlBlit`. See that crate for the full design
-/// notes; in short, the frag shader swizzles voxlap's BGRA byte
-/// order to RGBA on the GPU and forces alpha = 1.0, dropping
-/// the per-frame `pack_rgba` step.
-struct WebGlBlit {
-    gl: Gl,
-    texture: web_sys::WebGlTexture,
-    width: u32,
-    height: u32,
-}
-
-const QUAD_VS: &str = "#version 300 es
-in vec2 a_pos;
-in vec2 a_uv;
-out vec2 v_uv;
-void main() {
-    v_uv = a_uv;
-    gl_Position = vec4(a_pos, 0.0, 1.0);
-}
-";
-
-const QUAD_FS: &str = "#version 300 es
-precision highp float;
-in vec2 v_uv;
-uniform sampler2D u_tex;
-out vec4 frag;
-void main() {
-    vec4 c = texture(u_tex, v_uv);
-    frag = vec4(c.bgr, 1.0);
-}
-";
-
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-impl WebGlBlit {
-    fn new(canvas: &HtmlCanvasElement, width: u32, height: u32) -> Result<Self, JsValue> {
-        let gl: Gl = canvas
-            .get_context("webgl2")?
-            .ok_or_else(|| JsValue::from_str("no webgl2 context"))?
-            .dyn_into::<Gl>()
-            .map_err(|_| JsValue::from_str("got the wrong webgl context type"))?;
-        let program = compile_program(&gl, QUAD_VS, QUAD_FS)?;
-        gl.use_program(Some(&program));
-        #[rustfmt::skip]
-        let quad: [f32; 16] = [
-            -1.0, -1.0, 0.0, 1.0,
-             1.0, -1.0, 1.0, 1.0,
-            -1.0,  1.0, 0.0, 0.0,
-             1.0,  1.0, 1.0, 0.0,
-        ];
-        let vao = gl
-            .create_vertex_array()
-            .ok_or_else(|| JsValue::from_str("create_vertex_array failed"))?;
-        gl.bind_vertex_array(Some(&vao));
-        let vbo = gl
-            .create_buffer()
-            .ok_or_else(|| JsValue::from_str("create_buffer failed"))?;
-        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&vbo));
-        unsafe {
-            // SAFETY: js_sys::Float32Array::view borrows wasm
-            // linear-memory backing of `quad`; bufferData copies
-            // into the GPU before the view escapes.
-            let view = js_sys::Float32Array::view(&quad);
-            gl.buffer_data_with_array_buffer_view(Gl::ARRAY_BUFFER, &view, Gl::STATIC_DRAW);
-        }
-        let stride = (4 * std::mem::size_of::<f32>()) as i32;
-        let pos_loc = gl.get_attrib_location(&program, "a_pos");
-        let uv_loc = gl.get_attrib_location(&program, "a_uv");
-        if pos_loc < 0 || uv_loc < 0 {
-            return Err(JsValue::from_str("attribute lookup failed"));
-        }
-        let pos_loc_u = pos_loc as u32;
-        let uv_loc_u = uv_loc as u32;
-        gl.enable_vertex_attrib_array(pos_loc_u);
-        gl.vertex_attrib_pointer_with_i32(pos_loc_u, 2, Gl::FLOAT, false, stride, 0);
-        gl.enable_vertex_attrib_array(uv_loc_u);
-        gl.vertex_attrib_pointer_with_i32(
-            uv_loc_u,
-            2,
-            Gl::FLOAT,
-            false,
-            stride,
-            (2 * std::mem::size_of::<f32>()) as i32,
-        );
-
-        let texture = gl
-            .create_texture()
-            .ok_or_else(|| JsValue::from_str("create_texture failed"))?;
-        gl.active_texture(Gl::TEXTURE0);
-        gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
-        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
-        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
-        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
-        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
-        gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
-            Gl::TEXTURE_2D,
-            0,
-            Gl::RGBA8 as i32,
-            width as i32,
-            height as i32,
-            0,
-            Gl::RGBA,
-            Gl::UNSIGNED_BYTE,
-            None,
-        )?;
-
-        let u_tex = gl.get_uniform_location(&program, "u_tex");
-        gl.uniform1i(u_tex.as_ref(), 0);
-        gl.viewport(0, 0, width as i32, height as i32);
-
-        Ok(Self {
-            gl,
-            texture,
-            width,
-            height,
-        })
-    }
-
-    fn present(&self, framebuffer: &[u32]) -> Result<(), JsValue> {
-        debug_assert_eq!(framebuffer.len(), (self.width * self.height) as usize);
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                framebuffer.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(framebuffer),
-            )
-        };
-        self.gl.bind_texture(Gl::TEXTURE_2D, Some(&self.texture));
-        self.gl
-            .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
-                Gl::TEXTURE_2D,
-                0,
-                0,
-                0,
-                self.width as i32,
-                self.height as i32,
-                Gl::RGBA,
-                Gl::UNSIGNED_BYTE,
-                Some(bytes),
-            )?;
-        self.gl.draw_arrays(Gl::TRIANGLE_STRIP, 0, 4);
-        Ok(())
-    }
-}
-
-fn compile_shader(gl: &Gl, kind: u32, src: &str) -> Result<web_sys::WebGlShader, JsValue> {
-    let shader = gl
-        .create_shader(kind)
-        .ok_or_else(|| JsValue::from_str("create_shader failed"))?;
-    gl.shader_source(&shader, src);
-    gl.compile_shader(&shader);
-    if !gl
-        .get_shader_parameter(&shader, Gl::COMPILE_STATUS)
-        .as_bool()
-        .unwrap_or(false)
-    {
-        let log = gl
-            .get_shader_info_log(&shader)
-            .unwrap_or_else(|| "?".into());
-        return Err(JsValue::from_str(&format!("shader compile: {log}")));
-    }
-    Ok(shader)
-}
-
-fn compile_program(gl: &Gl, vs: &str, fs: &str) -> Result<web_sys::WebGlProgram, JsValue> {
-    let vs = compile_shader(gl, Gl::VERTEX_SHADER, vs)?;
-    let fs = compile_shader(gl, Gl::FRAGMENT_SHADER, fs)?;
-    let program = gl
-        .create_program()
-        .ok_or_else(|| JsValue::from_str("create_program failed"))?;
-    gl.attach_shader(&program, &vs);
-    gl.attach_shader(&program, &fs);
-    gl.link_program(&program);
-    if !gl
-        .get_program_parameter(&program, Gl::LINK_STATUS)
-        .as_bool()
-        .unwrap_or(false)
-    {
-        let log = gl
-            .get_program_info_log(&program)
-            .unwrap_or_else(|| "?".into());
-        return Err(JsValue::from_str(&format!("program link: {log}")));
-    }
-    Ok(program)
-}
-
 #[derive(Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct Input {
@@ -355,66 +175,45 @@ struct Input {
 // ----- World gen + lighting --------------------------------------------------
 
 #[allow(clippy::cast_possible_wrap)]
-fn spawn_centre() -> [i32; 3] {
-    [(VSID / 2) as i32, (VSID / 2) as i32, MAXZDIM / 2]
+fn spawn_centre() -> IVec3 {
+    IVec3::new((VSID / 2) as i32, (VSID / 2) as i32, MAXZDIM / 2)
 }
 
-fn build_world(preset: Preset, seed: u64) -> vxl::Vxl {
-    let mut vxl = preset.generate(seed);
-    let centre = spawn_centre();
-    set_sphere_with_colfunc(
-        &mut vxl,
-        centre,
-        SPAWN_BUBBLE_RADIUS,
-        SpanOp::Carve,
-        |_, _, _| SPAWN_BUBBLE_COLOR,
-    );
-    vxl
+/// (Re)generate the cave into the grid's single chunk in place, carve
+/// the spawn bubble, and bake lightmode-1. Editing in place (rather
+/// than building a fresh `Scene`) keeps the same `GridId` so the
+/// facade's GPU residency tracker re-uploads the changed chunk instead
+/// of going stale.
+fn regen_cave(grid: &mut roxlap_scene::Grid, preset: Preset, seed: u64) {
+    let vxl = preset.generate(seed);
+    *grid.ensure_chunk(IVec3::ZERO) = vxl;
+    let c = spawn_centre();
+    grid.set_sphere(c, SPAWN_BUBBLE_RADIUS, Some(SPAWN_BUBBLE_COLOR));
+    grid.bake_lightmode(LIGHTMODE);
+    // `set_sphere` bumped the version; bump once more so a re-gen with
+    // an identical spawn-bubble edit still differs from the tracker.
+    grid.bump_chunk_version(IVec3::ZERO);
 }
 
-fn relight_world(vxl: &mut vxl::Vxl, engine: &Engine) {
-    #[allow(clippy::cast_possible_wrap)]
-    update_lighting(
-        &mut vxl.data,
-        &vxl.column_offset,
-        vxl.vsid,
-        0,
-        0,
-        0,
-        vxl.vsid as i32,
-        vxl.vsid as i32,
-        MAXZDIM,
-        engine.lightmode(),
-        engine.lights(),
-    );
-}
-
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-fn relight_bbox(vxl: &mut vxl::Vxl, engine: &Engine, centre: [i32; 3], radius: u32) {
-    let r = radius as i32;
-    let vsid_i = vxl.vsid as i32;
-    let x0 = (centre[0] - r).max(0);
-    let y0 = (centre[1] - r).max(0);
-    let z0 = (centre[2] - r).max(0);
-    let x1 = (centre[0] + r + 1).min(vsid_i);
-    let y1 = (centre[1] + r + 1).min(vsid_i);
-    let z1 = (centre[2] + r + 1).min(MAXZDIM);
-    if x0 >= x1 || y0 >= y1 || z0 >= z1 {
-        return;
-    }
-    update_lighting(
-        &mut vxl.data,
-        &vxl.column_offset,
-        vxl.vsid,
-        x0,
-        y0,
-        z0,
-        x1,
-        y1,
-        z1,
-        engine.lightmode(),
-        engine.lights(),
-    );
+/// Build the bullet sprite model: a small solid glowing sphere. The
+/// `NO_SHADING` flag makes it emissive (uniform bright colour) so it
+/// reads as plasma rather than a lit rock.
+fn build_bullet_model() -> Sprite {
+    let d = BULLET_SPRITE_RADIUS * 2 + 1;
+    let r = BULLET_SPRITE_RADIUS as i32;
+    let kv6 = Kv6::from_fn(d, d, d, |x, y, z| {
+        let dx = x as i32 - r;
+        let dy = y as i32 - r;
+        let dz = z as i32 - r;
+        if dx * dx + dy * dy + dz * dz <= r * r {
+            Some(BULLET_COLOR_CORE)
+        } else {
+            None
+        }
+    });
+    let mut sprite = Sprite::axis_aligned(kv6, [0.0, 0.0, 0.0]);
+    sprite.flags = SPRITE_FLAG_NO_SHADING;
+    sprite
 }
 
 // ----- Camera + collision ---------------------------------------------------
@@ -432,29 +231,29 @@ fn cam_from_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
     }
 }
 
+/// `true` if the `PLAYER_RADIUS` box around `pos` overlaps any solid
+/// voxel or leaves the cave's `VSID³`-ish bounds. Grid is identity-
+/// transformed so a world point is also its grid-local voxel.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss
 )]
-fn is_blocked(vxl: &vxl::Vxl, pos: [f64; 3]) -> bool {
+fn is_blocked(grid: &roxlap_scene::Grid, pos: [f64; 3]) -> bool {
     let lo_x = (pos[0] - PLAYER_RADIUS).floor() as i32;
     let hi_x = (pos[0] + PLAYER_RADIUS).floor() as i32;
     let lo_y = (pos[1] - PLAYER_RADIUS).floor() as i32;
     let hi_y = (pos[1] + PLAYER_RADIUS).floor() as i32;
     let lo_z = (pos[2] - PLAYER_RADIUS).floor() as i32;
     let hi_z = (pos[2] + PLAYER_RADIUS).floor() as i32;
-    let vsid = vxl.vsid as i32;
+    let vsid = VSID as i32;
     for vz in lo_z..=hi_z {
         for vy in lo_y..=hi_y {
             for vx in lo_x..=hi_x {
                 if vx < 0 || vy < 0 || vz < 0 || vx >= vsid || vy >= vsid || vz >= MAXZDIM {
                     return true;
                 }
-                if !matches!(
-                    getcube(&vxl.data, &vxl.column_offset, vxl.vsid, vx, vy, vz),
-                    Cube::Air
-                ) {
+                if grid.voxel_solid(IVec3::new(vx, vy, vz)) {
                     return true;
                 }
             }
@@ -529,11 +328,12 @@ fn integrate_input(state: &mut State, dt: f64) {
         delta[1] / mag * speed * dt,
         delta[2] / mag * speed * dt,
     ];
-    let already_stuck = is_blocked(&state.vxl, state.cam_pos);
+    let grid = state.scene.grid(state.grid).expect("cave grid present");
+    let already_stuck = is_blocked(grid, state.cam_pos);
     for axis in 0..3 {
         let mut candidate = state.cam_pos;
         candidate[axis] += step[axis];
-        if already_stuck || !is_blocked(&state.vxl, candidate) {
+        if already_stuck || !is_blocked(grid, candidate) {
             state.cam_pos[axis] = candidate[axis];
         }
     }
@@ -560,13 +360,17 @@ fn fire_bullet(state: &mut State) {
     });
 }
 
+/// Advance bullets, carve craters on impact, and re-bake the cave's
+/// lighting once if anything was carved. Returns `true` if the grid
+/// was edited (so the caller knows the facade will re-upload).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn step_bullets(state: &mut State, dt: f64) {
+fn step_bullets(state: &mut State, dt: f64) -> bool {
     if dt <= 0.0 {
-        return;
+        return false;
     }
-    let vsid = state.vxl.vsid;
-    let mut impacts: Vec<[i32; 3]> = Vec::new();
+    let grid = state.scene.grid(state.grid).expect("cave grid present");
+    let vsid = VSID as i32;
+    let mut impacts: Vec<IVec3> = Vec::new();
     state.bullets.retain_mut(|b| {
         let dx = b.vel[0] * dt;
         let dy = b.vel[1] * dt;
@@ -575,156 +379,79 @@ fn step_bullets(state: &mut State, dt: f64) {
         b.pos[1] += dy;
         b.pos[2] += dz;
         b.travelled += (dx * dx + dy * dy + dz * dz).sqrt();
-        if bullet_radius_px(b) < BULLET_RADIUS_PX_MIN {
+        if b.travelled > BULLET_MAX_DIST {
             return false;
         }
         let vx = b.pos[0].floor() as i32;
         let vy = b.pos[1].floor() as i32;
         let vz = b.pos[2].floor() as i32;
-        if vx < 0
-            || vy < 0
-            || (vx as u32) >= vsid
-            || (vy as u32) >= vsid
-            || !(0..MAXZDIM).contains(&vz)
-        {
+        if vx < 0 || vy < 0 || vx >= vsid || vy >= vsid || !(0..MAXZDIM).contains(&vz) {
             return false;
         }
-        if !matches!(
-            getcube(&state.vxl.data, &state.vxl.column_offset, vsid, vx, vy, vz),
-            Cube::Air
-        ) {
-            impacts.push([vx, vy, vz]);
+        if grid.voxel_solid(IVec3::new(vx, vy, vz)) {
+            impacts.push(IVec3::new(vx, vy, vz));
             return false;
         }
         true
     });
-    for hit in impacts {
-        set_sphere_with_colfunc(
-            &mut state.vxl,
-            hit,
-            FIRE_RADIUS,
-            SpanOp::Carve,
-            |_x, _y, _z| CARVE_COLOR,
-        );
-        relight_bbox(&mut state.vxl, &state.engine, hit, FIRE_RADIUS);
+    if impacts.is_empty() {
+        return false;
     }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
-fn bullet_radius_px(bullet: &Bullet) -> i32 {
-    let t = (bullet.travelled / BULLET_MAX_DIST).clamp(0.0, 1.0);
-    let r = (1.0 - t) * f64::from(BULLET_RADIUS_PX_MAX);
-    r.round() as i32
+    let grid = state.scene.grid_mut(state.grid).expect("cave grid present");
+    for hit in impacts {
+        grid.set_sphere(hit, FIRE_RADIUS, Some(CARVE_COLOR));
+    }
+    // Re-bake the (single) chunk's lighting once after all craters so
+    // estnorm shading follows the new cavity walls; the carve already
+    // bumped the chunk version, so the facade re-uploads this frame.
+    grid.bake_lightmode(LIGHTMODE);
+    true
 }
 
 // ----- Render ---------------------------------------------------------------
 
-fn render_frame(state: &mut State) {
-    let sky = state.engine.sky_color();
-    state.fb.fill(sky);
-    for z in &mut state.zb {
-        *z = 0.0;
-    }
-    let sky_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    state.pool.set_skycast(sky_i, 0);
-    let fog_i = i32::from_ne_bytes(state.engine.fog_color().to_ne_bytes());
-    state.pool.set_fog(fog_i, state.engine.fog_max_scan_dist());
+/// Rebuild the per-frame sprite set from the live bullets and march +
+/// present the scene through the facade.
+fn render(state: &mut State) {
+    // Bullets → facade sprite instances (all share the one model).
+    let instances: Vec<SpriteInstanceDesc> = state
+        .bullets
+        .iter()
+        .map(|b| SpriteInstanceDesc {
+            model: 0,
+            pos: [b.pos[0] as f32, b.pos[1] as f32, b.pos[2] as f32],
+        })
+        .collect();
+    let set = SpriteSet {
+        models: vec![state.bullet_model.clone()],
+        instances,
+        carve_model: None,
+    };
+    state.renderer.set_sprites(&set);
 
+    // `lighting` + `frame` borrow `state.engine` immutably; the render
+    // call below mutably borrows the disjoint `state.scene` +
+    // `state.renderer` fields, so NLL lets them coexist.
+    let lighting = SpriteLighting::from_engine(&state.engine);
     let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
-    let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-    let grid = roxlap_core::GridView::from_single_vxl(&state.vxl);
-    let mut rasterizer = ScalarRasterizer::new(&mut state.fb, &mut state.zb, XRES as usize, grid);
-    let _ = opticast(&mut rasterizer, &mut state.pool, &cam, &settings, grid);
-    drop(rasterizer);
-
-    // Bullet billboards on top of the rasterized scene.
-    let cam_for_bullet = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
-    let settings_for_bullet = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-    for bullet in &state.bullets {
-        draw_bullet(
-            &mut state.fb,
-            &state.zb,
-            XRES,
-            YRES,
-            &cam_for_bullet,
-            &settings_for_bullet,
-            bullet,
-        );
-    }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::similar_names
-)]
-fn draw_bullet(
-    fb: &mut [u32],
-    zb: &[f32],
-    width: u32,
-    height: u32,
-    cam: &Camera,
-    settings: &OpticastSettings,
-    bullet: &Bullet,
-) {
-    // World-space → camera-space
-    let dx = bullet.pos[0] - cam.pos[0];
-    let dy = bullet.pos[1] - cam.pos[1];
-    let dz = bullet.pos[2] - cam.pos[2];
-    // Voxlap basis projection: x_cam = right · delta, y_cam = down ·
-    // delta, z_cam = forward · delta. Cull anything behind the eye.
-    let zc = cam.forward[0] * dx + cam.forward[1] * dy + cam.forward[2] * dz;
-    if zc <= 1e-3 {
-        return;
-    }
-    let xc = cam.right[0] * dx + cam.right[1] * dy + cam.right[2] * dz;
-    let yc = cam.down[0] * dx + cam.down[1] * dy + cam.down[2] * dz;
-    let inv_z = 1.0 / zc;
-    let cx = f64::from(settings.hx) + xc * inv_z * f64::from(settings.hz);
-    let cy = f64::from(settings.hy) + yc * inv_z * f64::from(settings.hz);
-    let r_px = bullet_radius_px(bullet);
-    if r_px < 1 {
-        return;
-    }
-    let r2 = r_px * r_px;
-    let r_halo2 = (r_px - 1).max(0).pow(2);
-    let cx_i = cx.round() as i32;
-    let cy_i = cy.round() as i32;
-    let z_value = zc as f32;
-    let w = width as i32;
-    let h = height as i32;
-    for py in (cy_i - r_px)..=(cy_i + r_px) {
-        if py < 0 || py >= h {
-            continue;
-        }
-        for px in (cx_i - r_px)..=(cx_i + r_px) {
-            if px < 0 || px >= w {
-                continue;
-            }
-            let ddx = px - cx_i;
-            let ddy = py - cy_i;
-            let d2 = ddx * ddx + ddy * ddy;
-            if d2 > r2 {
-                continue;
-            }
-            let idx = (py as usize) * (width as usize) + px as usize;
-            // z-test: bullet is in front of the world voxel here.
-            if zb[idx] > 0.0 && zb[idx] < z_value {
-                continue;
-            }
-            fb[idx] = if d2 <= r_halo2 {
-                BULLET_COLOR_CORE
-            } else {
-                BULLET_COLOR_HALO
-            };
-        }
-    }
+    let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+    settings.max_scan_dist = MAXZDIM;
+    let chunks_visible = (settings.max_scan_dist.max(1) as u32) / roxlap_scene::CHUNK_SIZE_XY + 4;
+    let frame = FrameParams {
+        settings: &settings,
+        sky_color: state.engine.sky_color(),
+        sky: state.engine.sky(),
+        fog_color: state.engine.fog_color(),
+        fog_max_scan_dist: state.engine.fog_max_scan_dist(),
+        treat_z_max_as_air: true,
+        gpu_mip_scan_dist: 64.0,
+        gpu_max_outer_steps: chunks_visible,
+        gpu_fov_y_rad: GPU_FOV_Y_DEG.to_radians(),
+        sprite_lighting: Some(&lighting),
+        side_shades: [0; 6],
+    };
+    state.renderer.render(&mut state.scene, &cam, &frame);
+    state.renderer.present();
 }
 
 fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_ms: f64) {
@@ -740,30 +467,23 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_m
         state.input.tap_fire = false;
         fire_bullet(&mut state);
     }
-    step_bullets(&mut state, dt);
-    render_frame(&mut state);
-
-    // R10.X.3: GPU-side blit — texture upload + cached
-    // fullscreen quad. Frag shader does the BGRA→RGBA swizzle
-    // and forces alpha = 1.0 so voxlap's brightness byte
-    // doesn't darken via canvas compositing. ~1-2 ms/frame
-    // faster than the prior 2D `pack_rgba + putImageData`
-    // path.
-    let _ = state.blit.present(&state.fb);
+    let _carved = step_bullets(&mut state, dt);
+    render(&mut state);
 }
 
 // ----- Regenerate -----------------------------------------------------------
 
 fn regenerate(state: &mut State) {
-    state.vxl = build_world(state.preset, state.seed);
-    relight_world(&mut state.vxl, &state.engine);
+    let preset = state.preset;
+    let seed = state.seed;
+    let grid = state.scene.grid_mut(state.grid).expect("cave grid present");
+    regen_cave(grid, preset, seed);
     state.cam_pos = [
         f64::from(VSID) * 0.5,
         f64::from(VSID) * 0.5,
         f64::from(MAXZDIM) * 0.5,
     ];
     state.bullets.clear();
-    state.pool = ScratchPool::new(XRES, YRES, state.vxl.vsid);
 }
 
 // ----- Init -----------------------------------------------------------------
@@ -790,7 +510,7 @@ pub fn auto_start() {
             web_sys::console::error_2(&"roxlap-cave-web: initThreadPool failed".into(), &e);
             return;
         }
-        if let Err(e) = start() {
+        if let Err(e) = start().await {
             web_sys::console::error_2(&"roxlap-cave-web: start() failed".into(), &e);
         }
     });
@@ -805,15 +525,14 @@ fn navigator_hardware_concurrency() -> usize {
         .clamp(1, 16)
 }
 
-/// Demo init — runs after the rayon thread pool is ready.
+/// Demo init — runs after the rayon thread pool is ready. Async
+/// because the facade's GPU backend awaits WebGPU through the event
+/// loop.
 ///
 /// # Errors
-/// Returns a JS-bridged error if the DOM doesn't have the
-/// expected `<canvas id="roxlap-canvas">`, or if a WebGL2
-/// rendering context can't be acquired.
-fn start() -> Result<(), JsValue> {
-    console_error_panic_hook::set_once();
-
+/// Returns a JS-bridged error if the DOM doesn't have the expected
+/// `<canvas id="roxlap-canvas">`.
+async fn start() -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
     let document = window
         .document()
@@ -825,33 +544,43 @@ fn start() -> Result<(), JsValue> {
         .map_err(|_| JsValue::from_str("#roxlap-canvas is not a <canvas>"))?;
     canvas.set_width(XRES);
     canvas.set_height(YRES);
-    let blit = WebGlBlit::new(&canvas, XRES, YRES)?;
 
     let perf = window.performance();
-    let preset = Preset::Blue;
-    let seed = preset.default_params().seed;
-    let t_gen_start = perf.as_ref().map_or(0.0, web_sys::Performance::now);
-    let mut vxl = build_world(preset, seed);
-    let t_gen_end = perf.as_ref().map_or(0.0, web_sys::Performance::now);
-
     let mut engine = Engine::new();
     engine.set_fog(FOG_COLOR, FOG_MAX_SCAN_DIST);
     engine.set_lightmode(LIGHTMODE);
-    let t_bake_start = perf.as_ref().map_or(0.0, web_sys::Performance::now);
-    relight_world(&mut vxl, &engine);
-    let t_bake_end = perf.as_ref().map_or(0.0, web_sys::Performance::now);
 
-    let pool = ScratchPool::new(XRES, YRES, vxl.vsid);
-    let fb = vec![0u32; (XRES * YRES) as usize];
-    let zb = vec![0f32; (XRES * YRES) as usize];
+    let preset = Preset::Blue;
+    let seed = preset.default_params().seed;
+    let t_gen_start = perf.as_ref().map_or(0.0, web_sys::Performance::now);
+    let mut scene = Scene::new();
+    let grid_id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+    regen_cave(
+        scene.grid_mut(grid_id).expect("cave grid present"),
+        preset,
+        seed,
+    );
+    let t_gen_end = perf.as_ref().map_or(0.0, web_sys::Performance::now);
+
+    let opts = RenderOptions {
+        want_gpu: true,
+        cpu_max_grid_vsid: VSID,
+        cpu_render_threads: navigator_hardware_concurrency(),
+        ..RenderOptions::default()
+    };
+    let renderer = SceneRenderer::new_from_canvas_async(canvas.clone(), (XRES, YRES), &opts).await;
+    let backend = match renderer.backend() {
+        Backend::Gpu => "WebGPU",
+        Backend::Cpu => "CPU (WebGL2 present)",
+    };
 
     let now_ms = perf.as_ref().map_or(0.0, web_sys::Performance::now);
     let state = State {
         engine,
-        vxl,
-        pool,
-        fb,
-        zb,
+        scene,
+        grid: grid_id,
+        renderer,
+        bullet_model: build_bullet_model(),
         cam_pos: [
             f64::from(VSID) * 0.5,
             f64::from(VSID) * 0.5,
@@ -861,7 +590,6 @@ fn start() -> Result<(), JsValue> {
         pitch: 0.0,
         input: Input::default(),
         last_frame_ms: now_ms,
-        blit,
         bullets: Vec::new(),
         preset,
         seed,
@@ -871,9 +599,14 @@ fn start() -> Result<(), JsValue> {
 
     web_sys::console::log_1(
         &format!(
-            "roxlap-cave-web: cave-gen {:.0} ms, lightmode-1 bake {:.0} ms — controls: WASD move, Space/Shift up/down, Shift+/Ctrl fast, click canvas to look around, click again to fire, F preset, R reseed",
+            "roxlap-cave-web: cave-gen + bake {:.0} ms — renderer = {backend}{} — controls: WASD move, Space/Shift up/down, Ctrl fast, click canvas to look around, click again to fire, F preset, R reseed",
             t_gen_end - t_gen_start,
-            t_bake_end - t_bake_start,
+            state
+                .borrow()
+                .renderer
+                .adapter_info()
+                .map(|a| format!(" [{a}]"))
+                .unwrap_or_default(),
         )
         .into(),
     );

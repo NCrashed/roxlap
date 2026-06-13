@@ -24,13 +24,13 @@ name = "roxlap-host"
 path = "src/main.rs"
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core", version = "0.8" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.8" }
+roxlap-core = { path = "../roxlap-core", version = "1.0" }
+roxlap-formats = { path = "../roxlap-formats", version = "1.0" }
 # S1.X: small procedural test scene for the outside-camera scene
 # engine work. The default oracle.vxl is a 2 km^2 enclosed cave —
 # not flyable from outside. roxlap-cavegen at vsid=128 + edge-strip
 # gives an open structure suitable for orbital probing.
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.8" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "1.0" }
 # winit + softbuffer is a pure-Rust windowing + framebuffer-blit pair
 # that compiles on Linux / Windows / macOS today and on wasm32 once
 # R10 lands.

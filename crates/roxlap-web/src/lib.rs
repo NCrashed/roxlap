@@ -13,24 +13,21 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::cell::RefCell;
-use std::io::Read;
 use std::rc::Rc;
 
-use flate2::read::GzDecoder;
-use roxlap_core::opticast::opticast;
-use roxlap_core::rasterizer::ScratchPool;
-use roxlap_core::scalar_rasterizer::ScalarRasterizer;
 use roxlap_core::{Camera, Engine, OpticastSettings};
-use roxlap_formats::vxl;
+use roxlap_render::{Backend, FrameParams, RenderOptions, SceneRenderer};
+use roxlap_scene::Scene;
 use wasm_bindgen::prelude::*;
-use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent, WebGl2RenderingContext as Gl};
+use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
 
 const XRES: u32 = 640;
 const YRES: u32 = 480;
 
-/// Embedded gzipped oracle world. ~207 KB on disk; ~37 MB in
-/// memory after gunzip + parse.
-const ORACLE_VXL_GZ: &[u8] = include_bytes!("../../../assets/oracle.vxl.gz");
+/// GPU marcher vertical field-of-view, degrees → radians at use.
+const GPU_FOV_Y_DEG: f32 = 60.0;
+/// World render distance (voxels) for both backends.
+const SCAN_DIST: i32 = 768;
 
 /// Movement speed in voxlap world-space units per second. Tuned so
 /// strafing across the oracle scene feels natural without
@@ -53,18 +50,24 @@ type RafCell = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 
 /// Per-frame, mutable engine state. Kept in a single `Rc<RefCell>`
 /// so the RAF closure + input handlers can all reach it.
+///
+/// GW.2: the demo now renders through the `roxlap-render`
+/// [`SceneRenderer`] facade — WebGPU compute marcher when the browser
+/// has WebGPU, else the CPU opticast path presented via WebGL2 (the
+/// facade owns both). The host keeps only the `Scene` + camera +
+/// engine sky/fog; the renderer owns the framebuffer + presentation.
 struct State {
+    /// Sky + fog source for the per-frame [`FrameParams`].
     engine: Engine,
-    world: vxl::Vxl,
-    pool: ScratchPool,
-    fb: Vec<u32>,
-    zb: Vec<f32>,
+    /// The voxel world the renderer marches each frame.
+    scene: Scene,
+    /// Unified CPU/GPU renderer over the canvas.
+    renderer: SceneRenderer,
     cam_pos: [f64; 3],
     yaw: f64,
     pitch: f64,
     input: Input,
     last_frame_ms: f64,
-    blit: WebGlBlit,
     /// R10.X.4: per-frame multi-touch state. Empty most of the
     /// time on desktop; one or two entries while a phone player
     /// holds the canvas.
@@ -75,25 +78,6 @@ struct State {
     /// at which point stats are dumped to the console and the
     /// field is cleared back to `None`.
     bench: Option<Bench>,
-}
-
-/// R10.X.3: GPU-side framebuffer presenter. The voxlap renderer
-/// produces a `Vec<u32>` in BGRA byte order
-/// (`(brightness << 24) | (R << 16) | (G << 8) | B`); the
-/// fragment shader swizzles `.bgr` and forces alpha = 1.0 so
-/// the canvas compositor doesn't darken pixels via voxlap's
-/// brightness byte. One texture, one shader program, one
-/// vertex array — all created at init and reused per frame.
-struct WebGlBlit {
-    gl: Gl,
-    texture: web_sys::WebGlTexture,
-    /// Width × height of the bound texture, in voxlap-renderer
-    /// pixels. The render targets a fixed 640×480; if the
-    /// canvas's CSS-driven viewport is larger or smaller, the
-    /// fullscreen quad scales (the texture is sampled with
-    /// linear filtering, so resizing reads cleanly).
-    width: u32,
-    height: u32,
 }
 
 /// In-flight bench session — captures per-frame `render+pack+
@@ -166,243 +150,57 @@ fn cam_from_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
     }
 }
 
-fn render_frame(state: &mut State) {
-    let sky = state.engine.sky_color();
-    state.fb.fill(sky);
-    for z in &mut state.zb {
-        *z = 0.0;
-    }
+// Voxlap-packed colours: `(brightness << 24) | (R << 16) | (G << 8) | B`,
+// `0x80` brightness = the neutral lit baseline.
+const GRASS: u32 = 0x80_4d_8a_3a; // mossy green hilltops
+const DIRT: u32 = 0x80_6b_4a_28; // earthy brown
+const STONE: u32 = 0x80_7a_7a_82; // cool grey rock
 
-    let sky_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    state.pool.set_skycast(sky_i, 0);
-    let fog_i = i32::from_ne_bytes(state.engine.fog_color().to_ne_bytes());
-    state.pool.set_fog(fog_i, state.engine.fog_max_scan_dist());
+/// Build the demo world: one ground grid of coarse terraced hills
+/// plus a few landmark boulders + a pillar so motion reads clearly.
+/// Kept compact — a ~512×512 footprint at 8-voxel column resolution
+/// (≈4 k bulk `set_rect` calls) — so wasm startup stays well under a
+/// second even on a phone. Voxlap is z-down: smaller z is *higher*.
+fn build_scene() -> Scene {
+    use glam::{DVec3, IVec3};
+    use roxlap_scene::GridTransform;
 
-    let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
-    let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-    let grid = roxlap_core::GridView::from_single_vxl(&state.world);
-    let mut rasterizer = ScalarRasterizer::new(&mut state.fb, &mut state.zb, XRES as usize, grid);
-    let _ = opticast(&mut rasterizer, &mut state.pool, &cam, &settings, grid);
-}
+    let mut scene = Scene::new();
+    let ground = scene.add_grid(GridTransform::at(DVec3::ZERO));
+    let g = scene.grid_mut(ground).expect("ground grid present");
 
-// ----- WebGL blit -----------------------------------------------------------
+    const EXTENT: i32 = 512; // world footprint along grid-local x and y
+    const STEP: i32 = 8; // terrace column size in voxels
+    const FLOOR_Z: i32 = 254; // solid fill bottom (just above bedrock)
 
-/// Vertex shader for the fullscreen-quad presenter. Two
-/// triangles covering NDC `[-1, 1]²`; per-vertex `a_uv`
-/// supplies the texture coordinates (flipped vertically so
-/// voxlap's top-down framebuffer maps to screen-top correctly
-/// — texture coord (0, 0) is bottom-left in WebGL).
-const QUAD_VS: &str = "#version 300 es
-in vec2 a_pos;
-in vec2 a_uv;
-out vec2 v_uv;
-void main() {
-    v_uv = a_uv;
-    gl_Position = vec4(a_pos, 0.0, 1.0);
-}
-";
-
-/// Fragment shader: samples the framebuffer texture and
-/// swizzles `.bgr` so voxlap's `(B, G, R, A)` byte order
-/// (uploaded as `RGBA8`) reads back as the correct RGB. Alpha
-/// is forced to `1.0` so the canvas compositor doesn't darken
-/// pixels via voxlap's brightness byte (which lives in `.a`
-/// after the upload).
-const QUAD_FS: &str = "#version 300 es
-precision highp float;
-in vec2 v_uv;
-uniform sampler2D u_tex;
-out vec4 frag;
-void main() {
-    vec4 c = texture(u_tex, v_uv);
-    frag = vec4(c.bgr, 1.0);
-}
-";
-
-// WebGL's API takes `i32` for sizes / locations and `u32` /
-// signed mixed bit-flags for enum constants — the cast warnings
-// fire at every call site. The values are bounded by canvas
-// pixel dimensions and never wrap in practice.
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-impl WebGlBlit {
-    /// Build a blit context for `canvas`. Allocates the texture,
-    /// compiles the shader program, uploads a single fullscreen
-    /// quad VAO. All resources are bound once and reused per
-    /// frame; `present` is the only per-frame call.
-    fn new(canvas: &HtmlCanvasElement, width: u32, height: u32) -> Result<Self, JsValue> {
-        let gl: Gl = canvas
-            .get_context("webgl2")?
-            .ok_or_else(|| JsValue::from_str("no webgl2 context"))?
-            .dyn_into::<Gl>()
-            .map_err(|_| JsValue::from_str("got the wrong webgl context type"))?;
-
-        let program = compile_program(&gl, QUAD_VS, QUAD_FS)?;
-        gl.use_program(Some(&program));
-
-        // Fullscreen quad: pos.xy + uv.xy interleaved.
-        // Voxlap is top-down; WebGL UV (0,0) is bottom-left, so we
-        // flip the V coord to get the engine's first row at the top.
-        #[rustfmt::skip]
-        let quad: [f32; 16] = [
-            -1.0, -1.0, 0.0, 1.0,
-             1.0, -1.0, 1.0, 1.0,
-            -1.0,  1.0, 0.0, 0.0,
-             1.0,  1.0, 1.0, 0.0,
-        ];
-        let vao = gl
-            .create_vertex_array()
-            .ok_or_else(|| JsValue::from_str("create_vertex_array failed"))?;
-        gl.bind_vertex_array(Some(&vao));
-
-        let vbo = gl
-            .create_buffer()
-            .ok_or_else(|| JsValue::from_str("create_buffer failed"))?;
-        gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&vbo));
-        unsafe {
-            // SAFETY: js_sys::Float32Array::view borrows the wasm
-            // linear-memory backing of `quad` for the duration of
-            // the call — must not allocate / grow memory while the
-            // view is live. `bufferData_with_array_buffer_view`
-            // copies into the GPU before returning.
-            let view = js_sys::Float32Array::view(&quad);
-            gl.buffer_data_with_array_buffer_view(Gl::ARRAY_BUFFER, &view, Gl::STATIC_DRAW);
+    for ly in (0..EXTENT).step_by(STEP as usize) {
+        for lx in (0..EXTENT).step_by(STEP as usize) {
+            // Smooth rolling heightfield oscillating around z≈150.
+            let fx = lx as f32 * 0.018;
+            let fy = ly as f32 * 0.018;
+            let h =
+                150.0 - 26.0 * (fx.sin() + (fy * 0.9).cos()) - 12.0 * (fx * 0.5 + fy * 0.7).sin();
+            let surface_z = h.round() as i32;
+            // High terraces (low z) expose rock; lower ground is grass.
+            let col = if surface_z < 126 { STONE } else { GRASS };
+            g.set_rect(
+                IVec3::new(lx, ly, surface_z),
+                IVec3::new(lx + STEP - 1, ly + STEP - 1, FLOOR_Z),
+                Some(col),
+            );
         }
-        let stride = (4 * std::mem::size_of::<f32>()) as i32;
-        let pos_loc = gl.get_attrib_location(&program, "a_pos");
-        let uv_loc = gl.get_attrib_location(&program, "a_uv");
-        if pos_loc < 0 || uv_loc < 0 {
-            return Err(JsValue::from_str("attribute lookup failed"));
-        }
-        let pos_loc_u = pos_loc as u32;
-        let uv_loc_u = uv_loc as u32;
-        gl.enable_vertex_attrib_array(pos_loc_u);
-        gl.vertex_attrib_pointer_with_i32(pos_loc_u, 2, Gl::FLOAT, false, stride, 0);
-        gl.enable_vertex_attrib_array(uv_loc_u);
-        gl.vertex_attrib_pointer_with_i32(
-            uv_loc_u,
-            2,
-            Gl::FLOAT,
-            false,
-            stride,
-            (2 * std::mem::size_of::<f32>()) as i32,
-        );
-
-        // RGBA8 texture sized to the engine framebuffer. Linear
-        // filtering keeps it readable when the canvas's CSS-driven
-        // viewport scales it up or down.
-        let texture = gl
-            .create_texture()
-            .ok_or_else(|| JsValue::from_str("create_texture failed"))?;
-        gl.active_texture(Gl::TEXTURE0);
-        gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
-        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
-        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
-        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
-        gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
-        // Allocate storage with `tex_image_2d` once (null source);
-        // per-frame uploads via `tex_sub_image_2d` are cheaper than
-        // re-allocating each frame.
-        gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
-            Gl::TEXTURE_2D,
-            0,
-            Gl::RGBA8 as i32,
-            width as i32,
-            height as i32,
-            0,
-            Gl::RGBA,
-            Gl::UNSIGNED_BYTE,
-            None,
-        )?;
-
-        let u_tex = gl.get_uniform_location(&program, "u_tex");
-        gl.uniform1i(u_tex.as_ref(), 0);
-
-        gl.viewport(0, 0, width as i32, height as i32);
-
-        Ok(Self {
-            gl,
-            texture,
-            width,
-            height,
-        })
     }
 
-    /// Upload `framebuffer` (XRES × YRES `u32` ARGB voxlap pixels)
-    /// to the bound texture, then draw the fullscreen quad. `fb`
-    /// is treated as raw bytes — the frag shader does the BGRA →
-    /// RGBA swizzle on the GPU, so no CPU-side pack step.
-    fn present(&self, framebuffer: &[u32]) -> Result<(), JsValue> {
-        debug_assert_eq!(framebuffer.len(), (self.width * self.height) as usize);
-        let bytes: &[u8] = unsafe {
-            // SAFETY: `Vec<u32>` is `Vec<u8>` + alignment guarantee.
-            // Reading 4× the u32 byte count as a u8 slice is
-            // well-defined (no `T: Send`-style invariants).
-            std::slice::from_raw_parts(
-                framebuffer.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(framebuffer),
-            )
-        };
-        self.gl.bind_texture(Gl::TEXTURE_2D, Some(&self.texture));
-        self.gl
-            .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
-                Gl::TEXTURE_2D,
-                0,
-                0,
-                0,
-                self.width as i32,
-                self.height as i32,
-                Gl::RGBA,
-                Gl::UNSIGNED_BYTE,
-                Some(bytes),
-            )?;
-        self.gl.draw_arrays(Gl::TRIANGLE_STRIP, 0, 4);
-        Ok(())
-    }
-}
+    // Landmarks.
+    g.set_sphere(IVec3::new(120, 160, 150), 22, Some(STONE));
+    g.set_sphere(IVec3::new(360, 300, 140), 30, Some(DIRT));
+    g.set_rect(
+        IVec3::new(250, 250, 70),
+        IVec3::new(270, 270, 170),
+        Some(STONE),
+    );
 
-fn compile_shader(gl: &Gl, kind: u32, src: &str) -> Result<web_sys::WebGlShader, JsValue> {
-    let shader = gl
-        .create_shader(kind)
-        .ok_or_else(|| JsValue::from_str("create_shader failed"))?;
-    gl.shader_source(&shader, src);
-    gl.compile_shader(&shader);
-    if !gl
-        .get_shader_parameter(&shader, Gl::COMPILE_STATUS)
-        .as_bool()
-        .unwrap_or(false)
-    {
-        let log = gl
-            .get_shader_info_log(&shader)
-            .unwrap_or_else(|| "?".into());
-        return Err(JsValue::from_str(&format!("shader compile: {log}")));
-    }
-    Ok(shader)
-}
-
-fn compile_program(gl: &Gl, vs: &str, fs: &str) -> Result<web_sys::WebGlProgram, JsValue> {
-    let vs = compile_shader(gl, Gl::VERTEX_SHADER, vs)?;
-    let fs = compile_shader(gl, Gl::FRAGMENT_SHADER, fs)?;
-    let program = gl
-        .create_program()
-        .ok_or_else(|| JsValue::from_str("create_program failed"))?;
-    gl.attach_shader(&program, &vs);
-    gl.attach_shader(&program, &fs);
-    gl.link_program(&program);
-    if !gl
-        .get_program_parameter(&program, Gl::LINK_STATUS)
-        .as_bool()
-        .unwrap_or(false)
-    {
-        let log = gl
-            .get_program_info_log(&program)
-            .unwrap_or_else(|| "?".into());
-        return Err(JsValue::from_str(&format!("program link: {log}")));
-    }
-    Ok(program)
+    scene
 }
 
 /// Convert `now_ms` from `performance.now()` into the seconds-of-
@@ -478,17 +276,44 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, perf: &web_sys::Performance, now_ms
     let frame_start_ms = perf.now();
 
     integrate_input(&mut state, dt);
-    render_frame(&mut state);
 
-    // R10.X.3: GPU-side blit. `WebGlBlit::present` uploads
-    // `state.fb` (voxlap u32 BGRA) to the bound texture and
-    // draws the cached fullscreen quad. The frag shader does
-    // the BGRA→RGBA swizzle on GPU; alpha is forced to 1.0
-    // so voxlap's brightness byte doesn't darken via canvas
-    // compositing. ~1-2 ms/frame faster than the previous 2D
-    // `pack_rgba + putImageData` path because we drop the CPU
-    // byte-swap.
-    let _ = state.blit.present(&state.fb);
+    // GW.2: march the world + present through the `roxlap-render`
+    // facade — WebGPU compute marcher if available, else CPU opticast
+    // presented via the facade's own WebGL2 blit. Disjoint `State`
+    // fields are split-borrowed so the immutable engine sky/fog read
+    // coexists with the mutable scene + renderer.
+    {
+        let State {
+            engine,
+            scene,
+            renderer,
+            cam_pos,
+            yaw,
+            pitch,
+            ..
+        } = &mut *state;
+        let cam = cam_from_yaw_pitch(*cam_pos, *yaw, *pitch);
+        let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        settings.max_scan_dist = SCAN_DIST;
+        settings.mip_levels = 4;
+        settings.mip_scan_dist = 64;
+        let chunks_visible = (SCAN_DIST.max(1) as u32) / roxlap_scene::CHUNK_SIZE_XY + 4;
+        let frame = FrameParams {
+            settings: &settings,
+            sky_color: engine.sky_color(),
+            sky: engine.sky(),
+            fog_color: engine.fog_color(),
+            fog_max_scan_dist: engine.fog_max_scan_dist(),
+            treat_z_max_as_air: true,
+            gpu_mip_scan_dist: 64.0,
+            gpu_max_outer_steps: chunks_visible,
+            gpu_fov_y_rad: GPU_FOV_Y_DEG.to_radians(),
+            sprite_lighting: None,
+            side_shades: [0; 6],
+        };
+        renderer.render(scene, &cam, &frame);
+        renderer.present();
+    }
 
     // R10.5: if a bench session is in flight, record the work
     // we just did and check whether we've hit the target frame
@@ -558,7 +383,7 @@ pub fn auto_start() {
             web_sys::console::error_2(&"roxlap-web: initThreadPool failed".into(), &e);
             return;
         }
-        if let Err(e) = start() {
+        if let Err(e) = start().await {
             web_sys::console::error_2(&"roxlap-web: start() failed".into(), &e);
         }
     });
@@ -576,15 +401,14 @@ fn navigator_hardware_concurrency() -> usize {
         .clamp(1, 16)
 }
 
-/// Demo init body — same shape as before R10.X.2; just runs after
-/// the rayon thread pool is ready.
+/// Demo init body — runs after the rayon thread pool is ready. Async
+/// because the `roxlap-render` GPU backend awaits wgpu's WebGPU
+/// adapter/device through the browser event loop.
 ///
 /// # Errors
-/// Returns a JS-bridged error if the DOM doesn't have the
-/// expected `<canvas id="roxlap-canvas">`, if a WebGL2 rendering
-/// context can't be acquired, or if the embedded
-/// `oracle.vxl.gz` fails to decompress / parse.
-fn start() -> Result<(), JsValue> {
+/// Returns a JS-bridged error if the DOM doesn't have the expected
+/// `<canvas id="roxlap-canvas">`.
+async fn start() -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
     let document = window
         .document()
@@ -596,48 +420,52 @@ fn start() -> Result<(), JsValue> {
         .map_err(|_| JsValue::from_str("#roxlap-canvas is not a <canvas>"))?;
     canvas.set_width(XRES);
     canvas.set_height(YRES);
-    let blit = WebGlBlit::new(&canvas, XRES, YRES)?;
 
     let perf = window.performance();
-    let t_parse_start = perf.as_ref().map_or(0.0, web_sys::Performance::now);
-    let mut bytes = Vec::with_capacity(40 * 1024 * 1024);
-    GzDecoder::new(ORACLE_VXL_GZ)
-        .read_to_end(&mut bytes)
-        .map_err(|e| JsValue::from_str(&format!("gunzip oracle.vxl.gz: {e}")))?;
-    let world =
-        vxl::parse(&bytes).map_err(|e| JsValue::from_str(&format!("parse oracle.vxl: {e:?}")))?;
-    let t_parse_end = perf.as_ref().map_or(0.0, web_sys::Performance::now);
+    let t_build_start = perf.as_ref().map_or(0.0, web_sys::Performance::now);
+    let scene = build_scene();
+    let t_build_end = perf.as_ref().map_or(0.0, web_sys::Performance::now);
 
-    let engine = Engine::new();
-    let pool = ScratchPool::new(XRES, YRES, world.vsid);
-    let fb = vec![0u32; (XRES * YRES) as usize];
-    let zb = vec![0f32; (XRES * YRES) as usize];
+    // Prefer the WebGPU compute marcher; the facade falls back to the
+    // CPU opticast path (presented via WebGL2) when WebGPU is absent.
+    let opts = RenderOptions {
+        want_gpu: true,
+        cpu_max_grid_vsid: 8 * roxlap_scene::CHUNK_SIZE_XY,
+        cpu_render_threads: navigator_hardware_concurrency(),
+        ..RenderOptions::default()
+    };
+    let renderer = SceneRenderer::new_from_canvas_async(canvas.clone(), (XRES, YRES), &opts).await;
+
+    let backend = match renderer.backend() {
+        Backend::Gpu => "WebGPU",
+        Backend::Cpu => "CPU (WebGL2 present)",
+    };
+    web_sys::console::log_1(
+        &format!(
+            "roxlap-web: built scene in {:.1} ms — renderer = {backend}{} — controls: WASD move, Space/Shift up/down, click canvas to look around, B to bench",
+            t_build_end - t_build_start,
+            renderer
+                .adapter_info()
+                .map(|a| format!(" [{a}]"))
+                .unwrap_or_default(),
+        )
+        .into(),
+    );
 
     let now_ms = perf.as_ref().map_or(0.0, web_sys::Performance::now);
     let state = State {
-        engine,
-        world,
-        pool,
-        fb,
-        zb,
-        cam_pos: [1024.0, 1024.0, 128.0],
+        engine: Engine::new(),
+        scene,
+        renderer,
+        cam_pos: [256.0, -30.0, 90.0],
         yaw: std::f64::consts::FRAC_PI_2,
-        pitch: 0.0,
+        pitch: 0.2,
         input: Input::default(),
         last_frame_ms: now_ms,
-        blit,
         touches: Vec::new(),
         bench: None,
     };
     let state = Rc::new(RefCell::new(state));
-
-    web_sys::console::log_1(
-        &format!(
-            "roxlap-web: parsed oracle.vxl in {:.1} ms — controls: WASD move, Space/Shift up/down, click canvas to look around, B to bench",
-            t_parse_end - t_parse_start,
-        )
-        .into(),
-    );
 
     install_input_handlers(&document, &canvas, &state)?;
     spawn_raf_loop(&window, &state);

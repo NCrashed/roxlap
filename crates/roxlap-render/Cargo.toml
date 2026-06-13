@@ -14,16 +14,14 @@ readme.workspace = true
 
 [dependencies]
 # Both backends + the scene/world types they consume.
-roxlap-core = { path = "../roxlap-core", version = "0.8" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.8" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.8" }
-roxlap-gpu = { path = "../roxlap-gpu", version = "0.8" }
+roxlap-core = { path = "../roxlap-core", version = "1.0" }
+roxlap-formats = { path = "../roxlap-formats", version = "1.0" }
+roxlap-scene = { path = "../roxlap-scene", version = "1.0" }
+roxlap-gpu = { path = "../roxlap-gpu", version = "1.0" }
 glam = { workspace = true }
 # CPU strip-parallel render thread count (caps the ScratchPool slots).
+# Runs on wasm too via wasm-bindgen-rayon (the host inits the pool).
 rayon = { workspace = true }
-# CPU-backend presentation (windowed software framebuffer); the GPU
-# backend presents via roxlap-gpu's own wgpu surface.
-softbuffer = "0.4"
 # The facade is decoupled from any specific windowing library: it
 # binds the surface to whatever `HasWindowHandle`/`HasDisplayHandle`
 # provider the host passes (winit, SDL, GLFW, …). Re-exported from the
@@ -33,6 +31,34 @@ raw-window-handle = "0.6"
 # egui's tessellation types (software-rasterised here); the GPU backend
 # delegates to egui-wgpu inside roxlap-gpu (enabled via roxlap-gpu/hud).
 egui = { version = "0.29", optional = true }
+
+# CPU-backend presentation on native: a windowed software framebuffer
+# (softbuffer). The GPU backend presents via roxlap-gpu's own wgpu
+# surface, and the wasm CPU fallback presents via WebGL2 (see below),
+# so softbuffer is native-only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+softbuffer = "0.4"
+
+# wasm/WebGPU: the GPU backend binds the wgpu surface to the canvas;
+# the CPU fallback presents the composited framebuffer through a
+# WebGL2 blit (`cpu_blit.rs`). `wasm-bindgen` is pinned to the same
+# exact version the web crates use so the workspace lock unifies.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.117"
+# Unsafe-free `u32`-framebuffer / `f32`-quad → byte reinterpretation
+# for the WebGL2 uploads (the facade is `#![forbid(unsafe_code)]`).
+bytemuck = "1"
+web-sys = { version = "0.3", features = [
+    "HtmlCanvasElement",
+    "WebGl2RenderingContext",
+    "WebGlBuffer",
+    "WebGlProgram",
+    "WebGlShader",
+    "WebGlTexture",
+    "WebGlUniformLocation",
+    "WebGlVertexArrayObject",
+    "console",
+] }
 
 [features]
 # Overlay an egui UI on top of the rendered frame (`SceneRenderer::

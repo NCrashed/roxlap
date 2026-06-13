@@ -174,7 +174,7 @@ impl GpuChunkResident {
     /// `None` for empty / out-of-bounds.
     ///
     /// Blocks until the GPU finishes; not intended for the render
-    /// hot path. The GPU.2 validation test is the only caller.
+    /// hot path. The GPU.2 validation test is the only caller (native).
     pub fn read_voxel_blocking(
         &self,
         device: &wgpu::Device,

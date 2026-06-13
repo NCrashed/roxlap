@@ -1,12 +1,14 @@
 # roxlap-web
 
-Browser demo of the roxlap engine — same `opticast` raycaster +
-scalar rasterizer the native demos use, compiled to
-`wasm32-unknown-unknown` with WebAssembly SIMD (`simd128`)
-batches, running on a `<canvas>` via wasm-bindgen + 2D
-`putImageData` blits. Single-threaded for v1 (rayon's wasm
-threads via SharedArrayBuffer + COOP/COEP are deferred to a
-future R10.X).
+Browser demo of the roxlap engine, rendered through the
+[`roxlap-render`](../roxlap-render) facade (since 1.0.0): the
+WebGPU compute marcher (`roxlap-gpu`) when the browser has
+WebGPU, otherwise the CPU `opticast` path presented via a WebGL2
+blit. Both backends compile to `wasm32-unknown-unknown` with
+WebAssembly SIMD (`simd128`) and a wasm-bindgen-rayon worker
+pool (SharedArrayBuffer + COOP/COEP); the demo flies a
+procedural terraced-hills voxel world on a `<canvas>`. The
+resolved backend is logged to the devtools console.
 
 ## Quick start
 

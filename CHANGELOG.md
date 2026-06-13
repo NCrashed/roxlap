@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-06-13
+
+The GPU renderer reaches the browser. `roxlap-gpu` and the `roxlap-render`
+facade now compile and run on `wasm32-unknown-unknown` (WebGPU), and both
+web demos — `roxlap-web` and `roxlap-cave-web` — are rebuilt **on top of
+`roxlap-render`** instead of calling `roxlap-core` opticast directly. In a
+WebGPU browser they render via the wgpu compute marcher; elsewhere the
+facade falls back to the CPU opticast path, now presented through a WebGL2
+blit owned by the facade. This is the last architectural gap from the GPU
+and scene-graph roadmaps — hence **1.0.0**. No public API of the existing
+native crates is broken; the change is additive (new wasm constructors +
+one new `Grid` method).
+
+### Added
+
+- **`roxlap-gpu` + `roxlap-render` build for `wasm32` (WebGPU).** New async,
+  canvas-based constructors — `GpuRenderer::new_from_canvas` and
+  `SceneRenderer::new_from_canvas_async` — create the wgpu surface from an
+  `HtmlCanvasElement` via `SurfaceTarget::Canvas`. The browser drives the
+  adapter/device futures through its event loop (no `pollster`). The
+  generic window-handle constructors stay the native path; the wasm
+  constructors drop the `Send + Sync` bound (wgpu types are `!Send` on the
+  `+atomics` shared-memory build, and the browser host is single-threaded).
+- **CPU fallback presents on the web.** The facade's CPU backend, which
+  uses `softbuffer` on native, presents its composited framebuffer through
+  a WebGL2 texture-blit (`cpu_blit.rs`) on wasm. So a browser without
+  WebGPU still renders, via CPU opticast — same `SceneRenderer`, same API.
+- **`Grid::bake_lightmode(lightmode)`** in `roxlap-scene` — bakes voxlap
+  `estnorm`/`updatevxl` per-voxel lighting into every materialised chunk's
+  brightness bytes, neighbour-aware at chunk-XY seams. A reusable engine
+  API (previously a scene-demo-only helper); the cave web demo bakes with
+  it after generation and after each carve.
+
+### Changed
+
+- **`roxlap-web`** renders a procedural terraced-hills world through the
+  facade (WebGPU, CPU fallback). The bundled `oracle.vxl` parse + the
+  hand-rolled WebGL2 blit are gone (the blit now lives in the facade); the
+  resolved backend (WebGPU vs CPU) is logged to the console.
+- **`roxlap-cave-web`** renders the procedural cave as a single-chunk
+  `Scene` grid through the facade. Flying + per-voxel collision + runtime
+  carving run against the scene; plasma bullets are now facade **sprites**
+  (glowing voxel spheres) that carve a crater with a local lightmode-1
+  re-bake on impact, which the GPU path re-uploads via per-chunk dirty
+  tracking. `F`/`R` regenerate the cave in place.
+
 ## [0.8.0] — 2026-06-13
 
 Ports voxlap's KFA animation-curve playback (`animsprite`) and brings the

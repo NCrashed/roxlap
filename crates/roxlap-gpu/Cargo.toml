@@ -19,11 +19,10 @@ readme.workspace = true
 # casts the hand-built voxel chunk and uniforms to `&[u8]` for
 # `Queue::write_buffer`.
 wgpu = "22.1"
-pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { workspace = true }
 # GPU.2: source of `Vxl` chunks for the CPU-side decompressor.
-roxlap-formats = { path = "../roxlap-formats", version = "0.8" }
+roxlap-formats = { path = "../roxlap-formats", version = "1.0" }
 # The renderer is decoupled from any specific windowing library: it
 # binds the wgpu surface to whatever `HasWindowHandle`/
 # `HasDisplayHandle` provider the host passes (winit, SDL, GLFW, …).
@@ -33,6 +32,19 @@ raw-window-handle = "0.6"
 # tessellation + texture-delta types the host hands in.
 egui-wgpu = { version = "0.29", optional = true }
 egui = { version = "0.29", optional = true }
+
+# `pollster::block_on` powers the native `new_blocking` / headless
+# helpers; on wasm the host awaits the async `new_from_canvas` through
+# the browser event loop instead, so pollster isn't pulled in.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.3"
+
+# wasm/WebGPU surface entry: `new_from_canvas` takes an
+# `HtmlCanvasElement` and binds the wgpu surface via
+# `SurfaceTarget::Canvas`. wgpu already depends on web-sys transitively
+# on wasm, so this resolves to the same version.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
 
 [features]
 hud = ["dep:egui-wgpu", "dep:egui"]

@@ -144,6 +144,65 @@ impl Grid {
         self.chunks.get(&chunk_idx)
     }
 
+    /// Bake per-voxel lighting (voxlap `updatevxl`/`estnorm` shading)
+    /// into every materialised chunk's brightness bytes, in place.
+    /// `lightmode` is voxlap's mode (1 = directional estnorm shading,
+    /// the look the cave + terrain demos use). Both the CPU rasteriser
+    /// and the GPU marcher read these pre-baked brightness bytes, so
+    /// call this once after building a grid and again over edited
+    /// chunks after a carve (then bump their versions so the GPU
+    /// re-uploads — edits already do, via [`Grid::set_voxel`] &c.).
+    ///
+    /// Each chunk is baked neighbour-aware on its own `chz`: estnorm's
+    /// ±2-voxel padding that crosses a chunk-XY face reads the actual
+    /// neighbour chunk (when populated), so brightness is continuous at
+    /// seams. Cross-`chz` padding still clips at the z boundary. Point
+    /// lights aren't applied (directional-only) — matching the demos'
+    /// bake. No-op for an empty grid.
+    pub fn bake_lightmode(&mut self, lightmode: u32) {
+        #[allow(clippy::cast_possible_wrap)]
+        let cs_xy = CHUNK_SIZE_XY as i32;
+        #[allow(clippy::cast_possible_wrap)]
+        let cs_z = CHUNK_SIZE_Z as i32;
+        let chunk_idxs: Vec<IVec3> = self.chunks.keys().copied().collect();
+        for chunk_idx in chunk_idxs {
+            // Build the estnorm cache from an immutable grid borrow: the
+            // reader resolves a chunk-local `(px, py)` (which may extend
+            // ±ESTNORMRAD outside the target chunk) into the neighbour
+            // chunk that owns that voxel column, same `chz`. Padding over
+            // an unpopulated neighbour returns `None` (= treated as air).
+            let cache = {
+                let grid_ref: &Self = &*self;
+                let reader = |px: i32, py: i32| -> Option<&[u8]> {
+                    let nb_chx = chunk_idx.x + px.div_euclid(cs_xy);
+                    let nb_chy = chunk_idx.y + py.div_euclid(cs_xy);
+                    let in_x = px.rem_euclid(cs_xy);
+                    let in_y = py.rem_euclid(cs_xy);
+                    let chunk = grid_ref.chunk(IVec3::new(nb_chx, nb_chy, chunk_idx.z))?;
+                    let col_idx = (in_y as u32) * CHUNK_SIZE_XY + (in_x as u32);
+                    let off = chunk.column_offset[col_idx as usize] as usize;
+                    Some(&chunk.data[off..])
+                };
+                roxlap_core::EstNormCache::build_with_reader(reader, 0, 0, cs_xy, cs_xy)
+            };
+            let target = self.chunks.get_mut(&chunk_idx).expect("populated chunk");
+            roxlap_core::apply_lighting_with_cache(
+                &mut target.data,
+                &target.column_offset,
+                CHUNK_SIZE_XY,
+                0,
+                0,
+                0,
+                cs_xy,
+                cs_xy,
+                cs_z,
+                &cache,
+                lightmode,
+                &[],
+            );
+        }
+    }
+
     /// Mutably borrow a materialised chunk. Returns `None` for
     /// implicit-air chunks; use [`Grid::ensure_chunk`] when you
     /// need a `&mut Vxl` for an edit that may write voxels.

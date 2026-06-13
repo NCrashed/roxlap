@@ -20,10 +20,15 @@
 #![forbid(unsafe_code)]
 
 mod cpu;
+/// WebGL2 framebuffer presenter for the CPU backend on wasm (the
+/// browser has no `softbuffer`).
+#[cfg(target_arch = "wasm32")]
+mod cpu_blit;
 #[cfg(feature = "hud")]
 mod cpu_egui;
 mod gpu;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
 use roxlap_core::opticast::OpticastSettings;
@@ -51,8 +56,10 @@ use crate::gpu::GpuBackend;
 /// `Arc<H>` (`H: ?Sized`), and the bare trait object implements its
 /// own object-safe trait — so `Arc<W>` coerces to `Arc<DynDisplay>`
 /// for any provider `W`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) type DynDisplay = dyn HasDisplayHandle + Send + Sync + 'static;
 /// Type-erased window handle counterpart to [`DynDisplay`].
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) type DynWindow = dyn HasWindowHandle + Send + Sync + 'static;
 
 /// One placed sprite instance: which [`SpriteSet::models`] entry and
@@ -218,6 +225,7 @@ impl SceneRenderer {
     /// message is logged to stderr).
     ///
     /// [`raw-window-handle`]: raw_window_handle
+    #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
     pub fn new<W>(window: Arc<W>, size: (u32, u32), opts: &RenderOptions) -> Self
     where
@@ -239,6 +247,46 @@ impl SceneRenderer {
         }
         Self {
             inner: BackendImpl::Cpu(Box::new(CpuBackend::new(window, size, opts))),
+        }
+    }
+
+    /// wasm/WebGPU build-time entry: build a renderer over an HTML
+    /// `canvas`. `size` is the canvas's initial framebuffer size in
+    /// pixels; the host reports later changes via [`Self::resize`].
+    ///
+    /// Async because the browser drives wgpu's adapter/device requests
+    /// through its event loop — `await` it inside a
+    /// `wasm_bindgen_futures::spawn_local` task. Selects the GPU
+    /// (WebGPU) backend when `opts.want_gpu` and WebGPU is available;
+    /// otherwise (no WebGPU, or init failed) it falls back to the CPU
+    /// opticast path presented through a WebGL2 blit on the same canvas.
+    /// **Never fails** — the message is logged to the browser console.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_from_canvas_async(
+        canvas: web_sys::HtmlCanvasElement,
+        size: (u32, u32),
+        opts: &RenderOptions,
+    ) -> Self {
+        if opts.want_gpu {
+            // `SurfaceTarget::Canvas` moves the canvas into wgpu, so the
+            // GPU attempt gets a clone — the CPU fallback keeps the
+            // original if WebGPU init fails.
+            match GpuBackend::new_async(canvas.clone(), size, opts).await {
+                Ok(g) => {
+                    return Self {
+                        inner: BackendImpl::Gpu(Box::new(g)),
+                    };
+                }
+                Err(e) => {
+                    web_sys::console::warn_1(
+                        &format!("roxlap-render: WebGPU init failed ({e}); using the CPU renderer")
+                            .into(),
+                    );
+                }
+            }
+        }
+        Self {
+            inner: BackendImpl::Cpu(Box::new(CpuBackend::new_from_canvas(canvas, size, opts))),
         }
     }
 

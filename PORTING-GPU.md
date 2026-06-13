@@ -360,3 +360,40 @@ Public version targets (tentative):
 
 The umbrella roxlap version (`roxlap-core` + `roxlap-scene`) is
 independent; GPU work doesn't force a major bump there.
+
+## GW — GPU renderer on the web (landed 2026-06-13, roxlap 1.0.0)
+
+The last gap: bring the GPU path to the browser (WebGPU) and rebuild
+the wasm demos on `roxlap-render` instead of direct `roxlap-core`
+opticast. Landed as sub-substages GW.0..GW.4; cut **roxlap 1.0.0**.
+
+| # | Scope |
+|---|-------|
+| GW.0 | `roxlap-gpu` builds for `wasm32`. `pollster`/`headless` gated native; `new_from_canvas` (`SurfaceTarget::Canvas`, no `Send+Sync`) + a shared `finish_init`. `read_depth_pixel` left compiled (facade just doesn't call it on wasm). |
+| GW.1 | `roxlap-render` builds for `wasm32`. `softbuffer` native-only; CPU backend presents via a ported WebGL2 blit (`cpu_blit.rs`) on wasm; async `new_from_canvas_async` (GPU-first, CPU fallback, canvas cloned before the GPU attempt); wasm `pick_depth` returns `None`. |
+| GW.2 | `roxlap-web` on the facade — procedural terraced-hills `Scene`, async init after `init_thread_pool`, RAF `render`+`present`, kept input + bench. |
+| GW.3 | `roxlap-cave-web` on the facade — single-chunk cave `Scene`, scene collision (`Grid::voxel_solid`) + carving (`Grid::set_sphere` + new `Grid::bake_lightmode`), bullets as facade sprites. |
+| GW.4 | 1.0.0: console backend message, docs, workspace 0.8.0→1.0.0, CHANGELOG. |
+
+### Why these decisions
+
+- **wgpu `!Send+!Sync` on wasm.** The wasm build uses `+atomics` +
+  shared memory, so wgpu's `fragile-send-sync-non-atomic-wasm` does
+  not apply. The single-threaded `Rc<RefCell>` browser host makes
+  that fine; the canvas constructors carry no `Send+Sync` bound.
+- **No blocking on wasm.** `pollster::block_on` and
+  `device.poll(Wait)` have no WebGPU equivalent, so init is async and
+  GPU depth-picking is deferred (the CPU fallback still picks).
+- **CPU fallback kept.** WebGPU isn't universal (Safari/Firefox lag),
+  so the facade's CPU opticast path stays available on the web,
+  presented via WebGL2 instead of softbuffer.
+
+### Browser-only caveats (not caught by `cargo build`)
+
+- WebGPU may be disabled under COEP `require-corp` in some browsers;
+  the CPU fallback covers it, but whether GPU activates in the
+  threaded build is unverifiable offline.
+- `!Send` wgpu resources must stay on the main thread (they do — the
+  host is `Rc<RefCell>`; rayon workers only touch the CPU
+  compositor's framebuffer slices).
+- GPU click-picking returns `None` on wasm (deferred); CPU picks.
