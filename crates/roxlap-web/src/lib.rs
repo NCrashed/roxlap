@@ -22,7 +22,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
 
 const XRES: u32 = 640;
-const YRES: u32 = 480;
+const YRES: u32 = 512;
 
 /// GPU marcher vertical field-of-view, degrees → radians at use.
 const GPU_FOV_Y_DEG: f32 = 60.0;

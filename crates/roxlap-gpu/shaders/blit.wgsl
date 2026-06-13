@@ -22,9 +22,21 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
+// Kept for bind-group/layout compatibility; the pixel-exact `textureLoad`
+// path below doesn't sample, so this sampler is unused.
 @group(0) @binding(1) var samp: sampler;
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(src, samp, in.uv);
+    // Pixel-exact fetch instead of `textureSample`. Normalised-UV
+    // sampling of the compute pass's storage texture mis-strided on
+    // some WebGPU/Dawn drivers (the output tiled across the screen);
+    // resolving the source texel by `uv * dimensions` + `textureLoad`
+    // reads the logical texel directly, with no sampler/row-stride
+    // ambiguity. Nearest-neighbour by construction — preserves the
+    // chunky retro look and still upscales a lower-res source (the
+    // GPU.0 probe) correctly.
+    let dims = vec2<f32>(textureDimensions(src));
+    let texel = vec2<i32>(clamp(in.uv, vec2<f32>(0.0), vec2<f32>(0.999999)) * dims);
+    return textureLoad(src, texel, 0);
 }

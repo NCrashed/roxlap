@@ -120,7 +120,13 @@ struct Uniforms {
 @group(0) @binding(6) var<storage, read> grid_static_meta: array<GridStaticMeta>;
 // GPU.7: per-slot chunk_idx, vec3<i32> with std430 16-byte stride.
 @group(0) @binding(7) var<storage, read> all_slot_chunk_idx: array<vec3<i32>>;
-@group(0) @binding(8) var output: texture_storage_2d<rgba8unorm, write>;
+// Framebuffer as a storage BUFFER (packed `rgba8unorm` per pixel),
+// not a storage texture: Chrome's Dawn lays out write storage
+// textures with GPU-optimal tiling that the sampled read-back
+// disagrees with, producing a 128×256-tiled image. A linear buffer
+// + an explicit `screen_size.x` stride is layout-unambiguous on every
+// backend (the depth buffer already uses this).
+@group(0) @binding(8) var<storage, read_write> output: array<u32>;
 // GPU.8: panoramic sky.
 @group(0) @binding(9) var sky_texture: texture_2d<f32>;
 @group(0) @binding(10) var sky_sampler: sampler;
@@ -548,7 +554,7 @@ fn render_scene(@builtin(global_invocation_id) gid: vec3<u32>) {
         best_color = sky_color(sky_dir);
     }
 
-    textureStore(output, vec2<i32>(gid.xy), vec4<f32>(best_color, 1.0));
+    output[gid.y * u.screen_size.x + gid.x] = pack4x8unorm(vec4<f32>(best_color, 1.0));
     if (u.write_depth != 0u) {
         let pix_idx = gid.y * u.screen_size.x + gid.x;
         depth_buffer[pix_idx] = bitcast<u32>(best_t);

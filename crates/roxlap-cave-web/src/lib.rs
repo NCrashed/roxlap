@@ -34,7 +34,7 @@ use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
 // ----- World / camera tuning (mirrors roxlap-cave-demo) ----------------------
 
 const XRES: u32 = 640;
-const YRES: u32 = 480;
+const YRES: u32 = 512;
 const VSID: u32 = 128;
 
 const MOVE_SPEED: f64 = 32.0;

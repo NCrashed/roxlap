@@ -249,13 +249,17 @@ struct GridDdaResources {
 
 struct SceneDdaResources {
     storage_size: (u32, u32),
-    storage_view: wgpu::TextureView,
+    /// Framebuffer as a packed-`rgba8unorm` storage **buffer** (row
+    /// stride = width), written by the scene + sprite compute passes
+    /// and read by the blit. A buffer (not a storage texture) dodges
+    /// Chrome-Dawn's tiled write-texture layout (which produced a
+    /// 128×256-tiled image); linear + explicit stride is portable.
+    framebuffer: wgpu::Buffer,
     uniform_buf: wgpu::Buffer,
     bgl_dda: wgpu::BindGroupLayout,
     pipeline_dda: wgpu::ComputePipeline,
     blit_bg: wgpu::BindGroup,
     pipeline_blit: wgpu::RenderPipeline,
-    _sampler: wgpu::Sampler,
     /// GPU.9 — per-pixel world-t depth (f32 bits as u32), sized
     /// `width * height * 4`. The scene pass writes it when sprites
     /// are present; the sprite model-DDA pass reads + composites
@@ -556,19 +560,28 @@ impl GpuRenderer {
         );
 
         let caps = surface.get_capabilities(adapter);
-        // Pick a NON-sRGB swapchain format. Voxlap colours are
+        // Pick a NON-sRGB, 8-bit swapchain format. Voxlap colours are
         // already sRGB-encoded (the slab bytes are display-ready,
-        // matching what the CPU softbuffer path writes straight to
-        // the framebuffer with no conversion). An sRGB swapchain
-        // would re-apply the gamma curve on top, producing a
-        // washed-out / pastel look that diverges from the CPU
-        // renderer. Falls back to `caps.formats[0]` only if every
-        // offered format is sRGB.
+        // matching what the CPU softbuffer path writes straight to the
+        // framebuffer with no conversion); an sRGB swapchain would
+        // re-apply the gamma curve, washing the look out. We also
+        // *prefer 8-bit BGRA/RGBA* over any other non-sRGB format: some
+        // adapters (e.g. NVK) advertise a 16-bit-unorm format first,
+        // and wgpu 29 gates `create_view` on 16-bit-norm formats behind
+        // the `TEXTURE_FORMAT_16BIT_NORM` device feature (which we don't
+        // enable, to stay WebGPU-portable). Falls back to the first
+        // non-sRGB format, then `caps.formats[0]`.
         let surface_format = caps
             .formats
             .iter()
             .copied()
-            .find(|f| !f.is_srgb())
+            .find(|f| {
+                matches!(
+                    f,
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+                )
+            })
+            .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
             .unwrap_or(caps.formats[0]);
         let present_mode = if settings.uncapped_present {
             pick_present_mode(&caps.present_modes)
@@ -1640,7 +1653,7 @@ impl GpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: wgpu::BindingResource::TextureView(&dda.storage_view),
+                    resource: dda.framebuffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
@@ -1739,7 +1752,7 @@ impl GpuRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 7,
-                            resource: wgpu::BindingResource::TextureView(&dda.storage_view),
+                            resource: dda.framebuffer.as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 8,
@@ -1951,21 +1964,23 @@ impl GpuRenderer {
         height: u32,
         surface_format: wgpu::TextureFormat,
     ) -> SceneDdaResources {
-        let storage_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("roxlap-gpu scene_dda.storage"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+        // Framebuffer as a packed-`rgba8unorm` storage buffer (1 u32 per
+        // pixel, row stride = `width`). See the struct-field note.
+        let framebuffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu scene_dda.framebuffer"),
+            size: u64::from(width) * u64::from(height) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
         });
-        let storage_view = storage_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Screen size for the blit's pixel→index math (`vec2<u32>`).
+        let blit_dims = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu scene_dda.blit_dims"),
+            size: 8,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&blit_dims, 0, bytemuck::bytes_of(&[width, height]));
 
         let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.uniform"),
@@ -2011,16 +2026,9 @@ impl GpuRenderer {
                     bgl_storage_entry(5, true),
                     bgl_storage_entry(6, true),
                     bgl_storage_entry(7, true),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 8,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
+                    // Framebuffer storage buffer (read-write; the scene +
+                    // sprite passes write packed pixels into it).
+                    bgl_storage_entry(8, false),
                     // GPU.8 sky panorama + sampler.
                     wgpu::BindGroupLayoutEntry {
                         binding: 9,
@@ -2068,28 +2076,34 @@ impl GpuRenderer {
         let blit_shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("blit.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
+                label: Some("scene_blit.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/scene_blit.wgsl").into()),
             });
         let bgl_blit = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("roxlap-gpu scene_dda.blit_bgl"),
                 entries: &[
+                    // Framebuffer storage buffer (read-only in the blit).
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
                         },
                         count: None,
                     },
+                    // Screen-size uniform for the pixel→index math.
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -2128,40 +2142,29 @@ impl GpuRenderer {
                 multiview_mask: None,
                 cache: None,
             });
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("roxlap-gpu scene_dda.blit_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
         let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("roxlap-gpu scene_dda.blit_bg"),
             layout: &bgl_blit,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&storage_view),
+                    resource: framebuffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: blit_dims.as_entire_binding(),
                 },
             ],
         });
 
         SceneDdaResources {
             storage_size: (width, height),
-            storage_view,
+            framebuffer,
             uniform_buf,
             bgl_dda,
             pipeline_dda,
             blit_bg,
             pipeline_blit,
-            _sampler: sampler,
             depth_buffer,
             depth_readback,
         }
@@ -2357,22 +2360,13 @@ impl GpuRenderer {
                 label: Some("roxlap-gpu sprite_model_dda.bgl"),
                 entries: &[
                     bgl_uniform_entry(0),
-                    bgl_storage_entry(1, true), // occupancy
-                    bgl_storage_entry(2, true), // colors
-                    bgl_storage_entry(3, true), // color_offsets
-                    bgl_storage_entry(4, true), // model_meta
-                    bgl_storage_entry(5, true), // instances
-                    bgl_storage_entry(6, true), // scene depth
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 7,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
+                    bgl_storage_entry(1, true),  // occupancy
+                    bgl_storage_entry(2, true),  // colors
+                    bgl_storage_entry(3, true),  // color_offsets
+                    bgl_storage_entry(4, true),  // model_meta
+                    bgl_storage_entry(5, true),  // instances
+                    bgl_storage_entry(6, true),  // scene depth
+                    bgl_storage_entry(7, false), // framebuffer (read-write buffer)
                     bgl_storage_entry(8, true),  // tile_ranges
                     bgl_storage_entry(9, true),  // tile_instances
                     bgl_storage_entry(10, true), // per-voxel dir
@@ -2419,8 +2413,9 @@ impl GpuRenderer {
 pub struct HeadlessSceneRenderer {
     width: u32,
     height: u32,
-    output_tex: wgpu::Texture,
-    output_view: wgpu::TextureView,
+    /// Framebuffer storage buffer (packed `rgba8unorm`, tight rows) —
+    /// matches the buffer-output `scene_dda.wgsl` (see its note).
+    framebuffer: wgpu::Buffer,
     depth_buffer: wgpu::Buffer,
     uniform_buf: wgpu::Buffer,
     _sky_texture: wgpu::Texture,
@@ -2429,7 +2424,6 @@ pub struct HeadlessSceneRenderer {
     bgl: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     readback: wgpu::Buffer,
-    padded_bytes_per_row: u32,
     /// Per-face side-shades for the gate render (default none). Packed
     /// `[(top,bot,left,right), (up,down,_,_)]`; set via
     /// [`Self::set_side_shades`].
@@ -2443,21 +2437,12 @@ impl HeadlessSceneRenderer {
     /// bind-group time.
     #[must_use]
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) -> Self {
-        let output_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("roxlap-gpu headless.output"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+        let framebuffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu headless.framebuffer"),
+            size: u64::from(width) * u64::from(height) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
         });
-        let output_view = output_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu headless.uniform"),
@@ -2520,16 +2505,8 @@ impl HeadlessSceneRenderer {
                 bgl_storage_entry(5, true),
                 bgl_storage_entry(6, true),
                 bgl_storage_entry(7, true),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
+                // Framebuffer storage buffer (read-write).
+                bgl_storage_entry(8, false),
                 wgpu::BindGroupLayoutEntry {
                     binding: 9,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -2566,12 +2543,11 @@ impl HeadlessSceneRenderer {
             cache: None,
         });
 
-        // Readback buffer: row pitch must be 256-aligned for
-        // copy_texture_to_buffer.
-        let padded_bytes_per_row = (width * 4).div_ceil(256) * 256;
+        // Readback is a tight buffer-to-buffer copy (no 256-byte row
+        // padding, unlike the old texture-to-buffer path).
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu headless.readback"),
-            size: u64::from(padded_bytes_per_row) * u64::from(height),
+            size: u64::from(width) * u64::from(height) * 4,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2579,8 +2555,7 @@ impl HeadlessSceneRenderer {
         Self {
             width,
             height,
-            output_tex,
-            output_view,
+            framebuffer,
             depth_buffer,
             uniform_buf,
             _sky_texture: sky_texture,
@@ -2589,7 +2564,6 @@ impl HeadlessSceneRenderer {
             bgl,
             pipeline,
             readback,
-            padded_bytes_per_row,
             side_shades: [[0; 4]; 2],
         }
     }
@@ -2717,7 +2691,7 @@ impl HeadlessSceneRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: wgpu::BindingResource::TextureView(&self.output_view),
+                    resource: self.framebuffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 9,
@@ -2757,26 +2731,12 @@ impl HeadlessSceneRenderer {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
         }
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.output_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &self.readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.padded_bytes_per_row),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
+        enc.copy_buffer_to_buffer(
+            &self.framebuffer,
+            0,
+            &self.readback,
+            0,
+            u64::from(self.width) * u64::from(self.height) * 4,
         );
         queue.submit(Some(enc.finish()));
 
@@ -2789,19 +2749,13 @@ impl HeadlessSceneRenderer {
         rx.recv().expect("map_async channel").expect("map_async");
 
         let data = slice.get_mapped_range();
-        let mut out = Vec::with_capacity((self.width * self.height) as usize);
-        let pitch = self.padded_bytes_per_row as usize;
-        for y in 0..self.height as usize {
-            let row = &data[y * pitch..y * pitch + self.width as usize * 4];
-            for px in row.chunks_exact(4) {
-                out.push(
-                    u32::from(px[0])
-                        | (u32::from(px[1]) << 8)
-                        | (u32::from(px[2]) << 16)
-                        | (u32::from(px[3]) << 24),
-                );
-            }
-        }
+        // Tight `width*height` packed pixels — the shader's
+        // `pack4x8unorm(vec4(r,g,b,a))` already yields `0xAABBGGRR`
+        // little-endian, so a straight u32 read reconstructs each pixel.
+        let out: Vec<u32> = data
+            .chunks_exact(4)
+            .map(|px| u32::from_le_bytes([px[0], px[1], px[2], px[3]]))
+            .collect();
         drop(data);
         self.readback.unmap();
         out

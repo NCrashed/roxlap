@@ -39,7 +39,7 @@ use roxlap_scene::Scene;
 
 pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::sprite::Sprite;
-pub use roxlap_gpu::{GpuInitError, GpuRendererSettings};
+pub use roxlap_gpu::{GpuInitError, GpuRendererSettings, PowerPreference};
 // Re-exported so hosts can name the [`SceneRenderer::new`] bounds
 // without adding a direct `raw-window-handle` dependency of their own.
 pub use raw_window_handle::{HasDisplayHandle, HasWindowHandle};

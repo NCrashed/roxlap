@@ -49,7 +49,9 @@ struct Uniform {
 @group(0) @binding(4) var<storage, read> models: array<ModelMeta>;
 @group(0) @binding(5) var<storage, read> instances: array<Instance>;
 @group(0) @binding(6) var<storage, read> depth_buffer: array<u32>;
-@group(0) @binding(7) var output: texture_storage_2d<rgba8unorm, write>;
+// Framebuffer as a storage BUFFER (packed `rgba8unorm`), shared with
+// the scene pass — see the note in `scene_dda.wgsl`.
+@group(0) @binding(7) var<storage, read_write> output: array<u32>;
 // GPU.10.3 — screen-tile binning: per-tile (offset,count) into the
 // flat grouped index list, so each pixel loops only its tile's sprites.
 @group(0) @binding(8) var<storage, read> tile_ranges: array<u32>;
@@ -219,6 +221,6 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (any) {
         let col = apply_fog(best_color, best_t);
-        textureStore(output, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
+        output[gid.y * u.screen_size.x + gid.x] = pack4x8unorm(vec4<f32>(col, 1.0));
     }
 }
