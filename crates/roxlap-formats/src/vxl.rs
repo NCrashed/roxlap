@@ -44,6 +44,10 @@
 use core::fmt;
 
 use crate::bytes::{Cursor, OutOfBounds};
+// `Vxl::empty` / `Vxl::from_dense` build a world by seeding voxlap's
+// `loadnul` slab shape then carving/inserting via the edit pipeline, so
+// callers never hand-roll the slab format.
+use crate::edit::{set_spans, set_spans_with_colfunc, SpanOp, Vspan};
 
 const MAGIC: u32 = 0x0907_2000;
 const HEADER_LEN: usize = 4 + 4 + 4 + 4 * 24;
@@ -98,6 +102,123 @@ pub struct Vxl {
 }
 
 impl Vxl {
+    /// Build an **all-air** `Vxl` of side `vsid` (every `vsid × vsid`
+    /// column empty over `z ∈ [0, 256)`). The blessed empty-world
+    /// constructor: seeds voxlap's `loadnul` slab shape and carves every
+    /// column to air, so the slab / `z`-down / edit conventions are
+    /// correct without hand-building the format. Ready for the
+    /// [`crate::edit`] primitives (`set_cube`, `set_spans`,
+    /// `set_sphere`, …); call [`Vxl::reserve_edit_capacity`] for more
+    /// headroom before a heavy edit batch.
+    ///
+    /// Coordinates: `x, y ∈ [0, vsid)`, `z ∈ [0, 256)` with voxlap's
+    /// **z-down** convention (`z = 0` is the top / sky, `z = 255` the
+    /// bottom). Serialise with [`serialize`].
+    #[must_use]
+    pub fn empty(vsid: u32) -> Vxl {
+        Self::seeded_air(vsid, DEFAULT_EDIT_HEADROOM_PER_COLUMN)
+    }
+
+    /// Build a `Vxl` from a dense voxel model: `occupied(x, y, z)`
+    /// returns `Some(colour)` for a solid voxel, `None` for air.
+    /// `colour` is voxlap-packed `0x80RRGGBB` (the high byte is the
+    /// brightness flag, **not** alpha — the same packing
+    /// [`crate::kv6`] uses); it round-trips through
+    /// [`Vxl::voxel_color`].
+    ///
+    /// Coordinates match [`Vxl::empty`]: `x, y ∈ [0, vsid)`,
+    /// `z ∈ [0, 256)`, **z-down** (`z = 0` = top). A model that doesn't
+    /// fill the bottom is left floating (the column simply has air
+    /// below it) — there's no implicit ground. Then [`serialize`] to a
+    /// `.vxl`.
+    ///
+    /// This is the one-call "dense model → `.vxl`" path: no slab-format
+    /// reimplementation. Internally an [`Vxl::empty`] world with each
+    /// column's solid runs inserted via the colour-callback edit path.
+    #[must_use]
+    pub fn from_dense<F: Fn(u32, u32, u32) -> Option<u32>>(vsid: u32, occupied: F) -> Vxl {
+        let mut vxl = Self::seeded_air(vsid, DEFAULT_EDIT_HEADROOM_PER_COLUMN);
+        // Solid runs per column, in (y, x) ascending then ascending-z
+        // order — `set_spans`' sort contract.
+        let mut spans: Vec<Vspan> = Vec::new();
+        for y in 0..vsid {
+            for x in 0..vsid {
+                let mut z = 0u32;
+                while z < MAXZDIM as u32 {
+                    if occupied(x, y, z).is_some() {
+                        let z0 = z;
+                        while z < MAXZDIM as u32 && occupied(x, y, z).is_some() {
+                            z += 1;
+                        }
+                        #[allow(clippy::cast_possible_truncation)]
+                        spans.push(Vspan {
+                            x,
+                            y,
+                            z0: z0 as u8,
+                            z1: (z - 1) as u8, // inclusive (voxlap vspans)
+                        });
+                    } else {
+                        z += 1;
+                    }
+                }
+            }
+        }
+        if !spans.is_empty() {
+            set_spans_with_colfunc(&mut vxl, &spans, SpanOp::Insert, |x, y, z| {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+                {
+                    occupied(x as u32, y as u32, z as u32).unwrap_or(0) as i32
+                }
+            });
+        }
+        vxl
+    }
+
+    /// Shared seed for [`Vxl::empty`] / [`Vxl::from_dense`]: build the
+    /// `loadnul` slab shape (one placeholder voxel per column), reserve
+    /// `headroom_per_column` bytes of edit pool, then carve every
+    /// column to air.
+    #[allow(clippy::cast_possible_truncation)]
+    fn seeded_air(vsid: u32, headroom_per_column: usize) -> Vxl {
+        let n_cols = (vsid as usize) * (vsid as usize);
+        let mut data: Vec<u8> = Vec::with_capacity(n_cols * 8);
+        let mut column_offset: Vec<u32> = Vec::with_capacity(n_cols + 1);
+        for _ in 0..n_cols {
+            column_offset.push(u32::try_from(data.len()).expect("offset fits in u32"));
+            data.extend_from_slice(&[0, 0, 0, 0]); // loadnul slab header
+            data.extend_from_slice(&[0, 0, 0, 0]); // placeholder colour
+        }
+        column_offset.push(u32::try_from(data.len()).expect("offset fits in u32"));
+
+        let mut vxl = Vxl {
+            vsid,
+            ipo: [0.0; 3],
+            ist: [1.0, 0.0, 0.0],
+            ihe: [0.0, 0.0, 1.0],
+            ifo: [0.0, 1.0, 0.0],
+            data: data.into_boxed_slice(),
+            column_offset: column_offset.into_boxed_slice(),
+            mip_base_offsets: Box::new([0, n_cols + 1]),
+            vbit: Box::new([]),
+            vbiti: 0,
+        };
+        vxl.reserve_edit_capacity(n_cols * headroom_per_column);
+
+        let mut spans: Vec<Vspan> = Vec::with_capacity(n_cols);
+        for y in 0..vsid {
+            for x in 0..vsid {
+                spans.push(Vspan {
+                    x,
+                    y,
+                    z0: 0,
+                    z1: (MAXZDIM - 1) as u8, // inclusive → carve all of [0, 256)
+                });
+            }
+        }
+        set_spans(&mut vxl, &spans, None); // None = carve to air
+        vxl
+    }
+
     /// Raw slab bytes for mip-0 column `idx` (`idx < vsid * vsid`).
     /// Equivalent to `column_data_for_mip(0, idx)` — kept for the
     /// pre-multi-mip call sites.
@@ -557,6 +678,12 @@ fn vbit_is_set(vbit: &[u32], dword_idx: u32) -> bool {
 /// Maximum z-extent of a column — voxlap's `MAXZDIM` from
 /// `voxlap5.h:10`. Each mip level halves this bound.
 const MAXZDIM: i32 = 256;
+
+/// Default per-column edit-pool headroom reserved by [`Vxl::empty`] /
+/// [`Vxl::from_dense`] — enough slab/colour bytes for a typical column
+/// plus runtime edits. Callers expecting heavier edits can
+/// [`Vxl::reserve_edit_capacity`] more.
+const DEFAULT_EDIT_HEADROOM_PER_COLUMN: usize = 256;
 
 /// Number of z-buckets in the per-cell colour-mixing accumulator.
 /// Mip-N+1's z range is `MAXZDIM >> (N+1)`, so the largest first-
@@ -1078,6 +1205,7 @@ pub fn parse(bytes: &[u8]) -> Result<Vxl, ParseError> {
 /// the input that produced this `Vxl` via [`parse`].
 #[must_use]
 pub fn serialize(vxl: &Vxl) -> Vec<u8> {
+    let n_cols = (vxl.vsid as usize) * (vxl.vsid as usize);
     let mut out = Vec::with_capacity(HEADER_LEN + vxl.data.len());
     out.extend_from_slice(&MAGIC.to_le_bytes());
     out.extend_from_slice(&vxl.vsid.to_le_bytes());
@@ -1086,7 +1214,16 @@ pub fn serialize(vxl: &Vxl) -> Vec<u8> {
     write_dpoint3d(&mut out, &vxl.ist);
     write_dpoint3d(&mut out, &vxl.ihe);
     write_dpoint3d(&mut out, &vxl.ifo);
-    out.extend_from_slice(&vxl.data);
+    // Emit each column's slab bytes in column-index order. For a
+    // freshly-parsed world the columns are already contiguous and
+    // in order, so this is byte-identical to dumping `data`. For a
+    // POST-EDIT world (columns scattered across the `voxalloc` pool,
+    // interleaved with reserved headroom) it rebuilds a valid
+    // contiguous `.vxl` — so `Vxl::from_dense(..)` / runtime edits
+    // serialise correctly without a separate compaction pass.
+    for i in 0..n_cols {
+        out.extend_from_slice(vxl.column_data(i));
+    }
     out
 }
 
@@ -1619,5 +1756,73 @@ mod tests {
         let _ = vxl.voxalloc(8);
         let _ = vxl.voxalloc(8);
         let _ = vxl.voxalloc(8); // panics
+    }
+
+    #[test]
+    fn empty_is_all_air() {
+        let vxl = Vxl::empty(8);
+        assert_eq!(vxl.vsid, 8);
+        for z in (0..256).step_by(37) {
+            for y in 0..8 {
+                for x in 0..8 {
+                    assert_eq!(vxl.voxel_color(x, y, z), None, "({x},{y},{z}) not air");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn from_dense_builds_and_round_trips() {
+        // A 4³ solid block + one floating voxel elsewhere (no implicit
+        // ground beneath either — tests the floating case).
+        const BLOCK: u32 = 0x80_aa_bb_cc;
+        const FLOAT: u32 = 0x80_11_22_33;
+        let model = |x: u32, y: u32, z: u32| {
+            if (2..6).contains(&x) && (2..6).contains(&y) && (10..14).contains(&z) {
+                Some(BLOCK)
+            } else if (x, y, z) == (1, 1, 5) {
+                Some(FLOAT)
+            } else {
+                None
+            }
+        };
+        let vxl = Vxl::from_dense(8, model);
+
+        let check = |v: &Vxl, label: &str| {
+            // The block's top-of-run surface (z = 10 is the top in
+            // z-down) + the isolated floater carry their colour. (Fully
+            // buried voxels are uncoloured — voxlap never stores them.)
+            assert_eq!(
+                v.voxel_color(2, 2, 10),
+                Some(BLOCK),
+                "{label}: block top corner"
+            );
+            assert_eq!(v.voxel_color(4, 4, 10), Some(BLOCK), "{label}: block top");
+            assert_eq!(
+                v.voxel_color(1, 1, 5),
+                Some(FLOAT),
+                "{label}: floating voxel"
+            );
+            // Air everywhere else.
+            assert_eq!(v.voxel_color(3, 3, 9), None, "{label}: above block");
+            assert_eq!(v.voxel_color(3, 3, 14), None, "{label}: below block");
+            assert_eq!(v.voxel_color(0, 0, 0), None, "{label}: empty corner");
+            assert_eq!(v.voxel_color(1, 1, 6), None, "{label}: below floater");
+        };
+        check(&vxl, "built");
+
+        // Round-trips through the on-disk .vxl format.
+        let bytes = serialize(&vxl);
+        let back = parse(&bytes).expect("parse serialized from_dense");
+        assert_eq!(back.vsid, 8);
+        check(&back, "round-tripped");
+    }
+
+    #[test]
+    fn from_dense_color_packs_exactly() {
+        // The 0x80RRGGBB packing round-trips bit-for-bit.
+        let c = 0x80_12_34_56u32;
+        let vxl = Vxl::from_dense(4, |x, y, z| ((x, y, z) == (1, 2, 3)).then_some(c));
+        assert_eq!(vxl.voxel_color(1, 2, 3), Some(c));
     }
 }

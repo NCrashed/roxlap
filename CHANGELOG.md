@@ -22,6 +22,18 @@ one new `Grid` method).
 
 ### Added
 
+- **`Vxl::from_dense` + `Vxl::empty` — one-call dense-model → `.vxl`
+  export.** `Vxl::from_dense(vsid, |x,y,z| -> Option<u32>)` builds a world
+  from a dense occupancy + `0x80RRGGBB` colour closure (z-down,
+  `z ∈ [0,256)`), and `Vxl::empty(vsid)` is the blessed all-air
+  constructor — both seed voxlap's `loadnul` slab shape and edit it, so
+  callers never hand-roll the slab format. `from_dense(..)` +
+  `vxl::serialize(..)` is now the whole export path. Relatedly,
+  **`vxl::serialize` now round-trips a post-edit `Vxl`**: it rebuilds the
+  column data in column-index order (was raw-dumping `data`, which is
+  wrong once `voxalloc` scatters columns), so any edited world — not just
+  a freshly-parsed one — serialises to a valid `.vxl`. Byte-identical for
+  unedited worlds.
 - **kv6 per-voxel shading + a public `normal → dir` quantiser.**
   `Kv6::from_fn_shaded` builds a model with real surface normals
   (`Voxel::dir`) and exposed-face masks (`Voxel::vis`) instead of the
