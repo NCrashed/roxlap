@@ -311,6 +311,160 @@ fn build_line_vertices(
     out
 }
 
+/// A world-space 2D image-sprite quad for [`GpuRenderer::draw_images_deferred`].
+/// `corners` are the four world points `TL, TR, BL, BR` (UVs `(0,0) (1,0)
+/// (0,1) (1,1)`); `image` indexes a texture uploaded via
+/// [`GpuRenderer::upload_image`]; `tint` is straight RGBA in `0..=1`
+/// (multiplied into every texel); `depth_test` occludes the quad behind
+/// nearer marched geometry. The facade resolves orientation + back-face
+/// culling, so this is pure geometry.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuImageQuad {
+    pub corners: [[f32; 3]; 4],
+    pub image: usize,
+    pub tint: [f32; 4],
+    pub depth_test: bool,
+}
+
+/// One expanded textured-quad vertex (`build_image_vertices` output).
+/// `ndc` is the projected NDC xy; `w` is the source `forward` depth, fed
+/// back into a homogeneous clip position so the rasterizer interpolates
+/// `uv` perspective-correctly; `depth` is the euclidean world distance
+/// (the marcher's `best_t`) for the manual depth test.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ImageVertex {
+    ndc: [f32; 2],
+    w: f32,
+    depth: f32,
+    depth_test: f32,
+    uv: [f32; 2],
+    tint: [f32; 4],
+}
+
+/// Lazy-built image-sprite pipeline (mirrors [`LineResources`]). The
+/// per-draw bind group adds the quad's texture + a sampler to the line
+/// pass's uniform + scene-depth bindings.
+struct ImageResources {
+    pipeline: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    uniform_buf: wgpu::Buffer,
+    dummy_depth: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+}
+
+/// A retained image-sprite texture (uploaded via
+/// [`GpuRenderer::upload_image`], referenced by [`GpuImageQuad::image`]).
+struct ImageResident {
+    view: wgpu::TextureView,
+    // Held so the view stays valid + the texture shows in profiler dumps.
+    _texture: wgpu::Texture,
+}
+
+/// Camera-space textured-quad vertex (near-clip working set): the
+/// `(right, down, forward)` components + the texture `uv`.
+#[derive(Clone, Copy)]
+struct ImgClipV {
+    cam: [f32; 3],
+    uv: [f32; 2],
+}
+
+/// Clip a convex camera-space polygon against the near plane
+/// (`forward >= LINE_NEAR_Z`), interpolating UVs at each crossing.
+fn clip_near_image(poly: &[ImgClipV]) -> Vec<ImgClipV> {
+    let n = poly.len();
+    let mut out: Vec<ImgClipV> = Vec::with_capacity(n + 1);
+    for i in 0..n {
+        let cur = poly[i];
+        let prev = poly[(i + n - 1) % n];
+        let cur_in = cur.cam[2] >= LINE_NEAR_Z;
+        let prev_in = prev.cam[2] >= LINE_NEAR_Z;
+        if cur_in != prev_in {
+            let t = (LINE_NEAR_Z - prev.cam[2]) / (cur.cam[2] - prev.cam[2]);
+            out.push(ImgClipV {
+                cam: [
+                    prev.cam[0] + (cur.cam[0] - prev.cam[0]) * t,
+                    prev.cam[1] + (cur.cam[1] - prev.cam[1]) * t,
+                    LINE_NEAR_Z,
+                ],
+                uv: [
+                    prev.uv[0] + (cur.uv[0] - prev.uv[0]) * t,
+                    prev.uv[1] + (cur.uv[1] - prev.uv[1]) * t,
+                ],
+            });
+        }
+        if cur_in {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+/// Project + near-clip a world-space [`GpuImageQuad`] into perspective-correct
+/// textured-quad vertices for `image.wgsl`. Mirrors the scene-DDA pinhole
+/// (the same one [`build_line_vertices`] uses), carrying each vertex's
+/// euclidean world distance as the depth-test key. Quads fully behind the
+/// near plane produce no vertices.
+fn build_image_vertices(
+    cam: &GpuLineCamera,
+    quad: &GpuImageQuad,
+    w: u32,
+    h: u32,
+    fov_y: f32,
+) -> Vec<ImageVertex> {
+    let aspect = w as f32 / h as f32;
+    let half_h = (fov_y * 0.5).tan();
+    let half_w = half_h * aspect;
+    let dt = if quad.depth_test { 1.0 } else { 0.0 };
+
+    let cam_coords = |p: [f32; 3]| -> [f32; 3] {
+        let d = [p[0] - cam.pos[0], p[1] - cam.pos[1], p[2] - cam.pos[2]];
+        [
+            cam.right[0] * d[0] + cam.right[1] * d[1] + cam.right[2] * d[2],
+            cam.down[0] * d[0] + cam.down[1] * d[1] + cam.down[2] * d[2],
+            cam.forward[0] * d[0] + cam.forward[1] * d[1] + cam.forward[2] * d[2],
+        ]
+    };
+    let project = |v: ImgClipV| -> ImageVertex {
+        let (cx, cy, cz) = (v.cam[0], v.cam[1], v.cam[2]);
+        ImageVertex {
+            ndc: [cx / (cz * half_w), -cy / (cz * half_h)],
+            w: cz,
+            depth: (cx * cx + cy * cy + cz * cz).sqrt(),
+            depth_test: dt,
+            uv: v.uv,
+            tint: quad.tint,
+        }
+    };
+
+    // Per-corner UV: TL(0,0) TR(1,0) BL(0,1) BR(1,1).
+    let uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+    let verts: Vec<ImgClipV> = quad
+        .corners
+        .iter()
+        .zip(uvs)
+        .map(|(c, uv)| ImgClipV {
+            cam: cam_coords(*c),
+            uv,
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(12);
+    for tri in [[0usize, 1, 2], [1, 3, 2]] {
+        let poly = [verts[tri[0]], verts[tri[1]], verts[tri[2]]];
+        let clipped = clip_near_image(&poly);
+        if clipped.len() < 3 {
+            continue;
+        }
+        for i in 1..clipped.len() - 1 {
+            out.push(project(clipped[0]));
+            out.push(project(clipped[i]));
+            out.push(project(clipped[i + 1]));
+        }
+    }
+    out
+}
+
 pub struct GpuRenderer {
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
@@ -388,6 +542,17 @@ pub struct GpuRenderer {
     /// is its capacity in bytes.
     line_vbuf: Option<wgpu::Buffer>,
     line_vbuf_cap: u64,
+    /// Lazy-built image-sprite pipeline — built on the first
+    /// [`Self::draw_images_deferred`] call.
+    image_resources: Option<ImageResources>,
+    /// Persistent image-sprite vertex buffer, grown on demand and reused
+    /// across frames (like [`Self::line_vbuf`]).
+    image_vbuf: Option<wgpu::Buffer>,
+    image_vbuf_cap: u64,
+    /// Retained image-sprite textures, indexed by the id
+    /// [`Self::upload_image`] returns. A dropped slot is `None` and is
+    /// re-used by a later upload.
+    images: Vec<Option<ImageResident>>,
     /// Lazy-built `egui-wgpu` paint pipeline; created on the first
     /// [`Self::paint_egui`] call (`hud` feature).
     #[cfg(feature = "hud")]
@@ -871,6 +1036,10 @@ impl GpuRenderer {
             line_resources: None,
             line_vbuf: None,
             line_vbuf_cap: 0,
+            image_resources: None,
+            image_vbuf: None,
+            image_vbuf_cap: 0,
+            images: Vec::new(),
             #[cfg(feature = "hud")]
             egui_renderer: None,
         }
@@ -2277,6 +2446,383 @@ impl GpuRenderer {
         });
     }
 
+    /// Upload (or replace) an RGBA8 image as a sampled texture, returning
+    /// a stable id for [`GpuImageQuad::image`]. `rgba` is row-major,
+    /// `width * height * 4` bytes, straight (un-premultiplied) alpha.
+    /// Reuses a dropped slot when one exists. Returns `0` for malformed
+    /// input (an id that draws nothing).
+    pub fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> usize {
+        if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
+            return 0;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("roxlap-gpu image_sprite"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let resident = ImageResident {
+            view,
+            _texture: texture,
+        };
+        if let Some(slot) = self.images.iter().position(Option::is_none) {
+            self.images[slot] = Some(resident);
+            slot
+        } else {
+            self.images.push(Some(resident));
+            self.images.len() - 1
+        }
+    }
+
+    /// Release an image uploaded with [`Self::upload_image`] (the slot
+    /// becomes reusable).
+    pub fn drop_image(&mut self, id: usize) {
+        if let Some(slot) = self.images.get_mut(id) {
+            *slot = None;
+        }
+    }
+
+    /// Draw world-space 2D image sprites ([`GpuImageQuad`]) over the
+    /// pending frame — the textured-quad sibling of
+    /// [`Self::draw_lines_deferred`]. Projects each quad with `cam` (the
+    /// marcher's pinhole) + the last frame's FOV / surface size, expands +
+    /// near-clips to triangles, and runs one `LoadOp::Load` pass with a
+    /// draw per quad (each binds its own texture). UVs are perspective-correct;
+    /// depth-tested quads are occluded by nearer marched geometry. Call
+    /// after `render`, before `present` / `paint_egui`. No-op if no frame
+    /// is pending.
+    pub fn draw_images_deferred(&mut self, cam: &GpuLineCamera, quads: &[GpuImageQuad]) {
+        if self.pending_frame.is_none() || quads.is_empty() {
+            return;
+        }
+        let (w, h) = (self.surface_config.width, self.surface_config.height);
+        let fov = self.last_fov_y_rad;
+        if w == 0 || h == 0 || fov <= 0.0 {
+            return;
+        }
+
+        // Concatenate every quad's verts into one buffer, recording each
+        // quad's (range, texture) so they share a single render pass.
+        let mut verts: Vec<ImageVertex> = Vec::new();
+        let mut draws: Vec<(u32, u32, usize)> = Vec::new();
+        for quad in quads {
+            if !matches!(self.images.get(quad.image), Some(Some(_))) {
+                continue; // dropped / never-uploaded id
+            }
+            let v = build_image_vertices(cam, quad, w, h, fov);
+            if v.is_empty() {
+                continue;
+            }
+            let start = verts.len() as u32;
+            verts.extend_from_slice(&v);
+            draws.push((start, verts.len() as u32, quad.image));
+        }
+        if draws.is_empty() {
+            return;
+        }
+
+        self.ensure_image_resources();
+        let no_depth = u32::from(self.scene_dda.is_none());
+        let params = LineParams {
+            screen_w: w,
+            screen_h: h,
+            depth_bias: LINE_DEPTH_BIAS,
+            no_depth,
+        };
+        {
+            let res = self.image_resources.as_ref().expect("just built");
+            self.queue
+                .write_buffer(&res.uniform_buf, 0, bytemuck::bytes_of(&params));
+        }
+
+        // Grow-only persistent vertex buffer (mirrors the line vbuf).
+        let needed = std::mem::size_of_val(verts.as_slice()) as u64;
+        if self.image_vbuf_cap < needed {
+            let cap = needed.next_power_of_two().max(4096);
+            self.image_vbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("roxlap-gpu image.vbuf"),
+                size: cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.image_vbuf_cap = cap;
+        }
+        let vbuf = self.image_vbuf.as_ref().expect("ensured above");
+        self.queue
+            .write_buffer(vbuf, 0, bytemuck::cast_slice(&verts));
+
+        // One bind group per draw (the texture view differs per quad).
+        let res = self.image_resources.as_ref().expect("just built");
+        let depth_resource = match &self.scene_dda {
+            Some(dda) => dda.depth_buffer.as_entire_binding(),
+            None => res.dummy_depth.as_entire_binding(),
+        };
+        let bind_groups: Vec<wgpu::BindGroup> = draws
+            .iter()
+            .map(|&(_, _, image_id)| {
+                let resident = self.images[image_id].as_ref().expect("checked present");
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("roxlap-gpu image.bg"),
+                    layout: &res.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: res.uniform_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: depth_resource.clone(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&resident.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&res.sampler),
+                        },
+                    ],
+                })
+            })
+            .collect();
+
+        let view = &self.pending_frame.as_ref().expect("checked above").1;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("roxlap-gpu images"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("roxlap-gpu image paint"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&res.pipeline);
+            pass.set_vertex_buffer(0, vbuf.slice(..));
+            for (&(start, end, _), bg) in draws.iter().zip(&bind_groups) {
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw(start..end, 0..1);
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        // pending_frame left intact — present/paint_egui finishes it.
+    }
+
+    /// Lazy-build the [`ImageResources`] (`image.wgsl` pipeline + uniform +
+    /// nearest sampler + dummy depth). Straight-alpha over-blend, no
+    /// depth-stencil attachment (the depth test is manual in the FS).
+    fn ensure_image_resources(&mut self) {
+        if self.image_resources.is_some() {
+            return;
+        }
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("image.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/image.wgsl").into()),
+            });
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("roxlap-gpu image.bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("roxlap-gpu image.layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("roxlap-gpu image.pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<ImageVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x2, // ndc
+                            1 => Float32,   // w
+                            2 => Float32,   // depth
+                            3 => Float32,   // depth_test
+                            4 => Float32x2, // uv
+                            5 => Float32x4, // tint
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.surface_config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu image.uniform"),
+            size: std::mem::size_of::<LineParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dummy_depth = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu image.dummy_depth"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("roxlap-gpu image.sampler"),
+            // Nearest + clamp: pixel-art references want crisp texels and
+            // no wrap bleed at the quad edges.
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        self.image_resources = Some(ImageResources {
+            pipeline,
+            bgl,
+            uniform_buf,
+            dummy_depth,
+            sampler,
+        });
+    }
+
+    /// Project a world point to window pixels under the marcher's
+    /// vertical-FOV pinhole (the inverse of [`Self::pixel_ray`]), using
+    /// the last-rendered frame's size + FOV. `None` before the first
+    /// scene render or for a point at/behind the near plane.
+    #[must_use]
+    pub fn project_point(
+        &self,
+        cam_pos: [f32; 3],
+        right: [f32; 3],
+        down: [f32; 3],
+        forward: [f32; 3],
+        world: [f32; 3],
+    ) -> Option<(f32, f32)> {
+        let dda = self.scene_dda.as_ref()?;
+        let (w, h) = dda.storage_size;
+        if w == 0 || h == 0 || self.last_fov_y_rad <= 0.0 {
+            return None;
+        }
+        let d = [
+            world[0] - cam_pos[0],
+            world[1] - cam_pos[1],
+            world[2] - cam_pos[2],
+        ];
+        let cz = forward[0] * d[0] + forward[1] * d[1] + forward[2] * d[2];
+        if cz < LINE_NEAR_Z {
+            return None;
+        }
+        let cx = right[0] * d[0] + right[1] * d[1] + right[2] * d[2];
+        let cy = down[0] * d[0] + down[1] * d[1] + down[2] * d[2];
+        let half_h = (self.last_fov_y_rad * 0.5).tan();
+        let half_w = half_h * (w as f32 / h as f32);
+        let ndc_x = (cx / cz) / half_w;
+        let ndc_y = -(cy / cz) / half_h;
+        let sx = (ndc_x * 0.5 + 0.5) * w as f32;
+        let sy = (0.5 - ndc_y * 0.5) * h as f32;
+        Some((sx, sy))
+    }
+
     /// Overlay an `egui` UI on the pending frame, then present it
     /// (`hud` feature). `jobs` are the host's tessellated primitives
     /// (`egui::Context::tessellate`), `textures` the per-frame texture
@@ -3350,6 +3896,7 @@ mod pixel_ray_tests {
                 include_str!("../shaders/scene_blit.wgsl"),
             ),
             ("line.wgsl", include_str!("../shaders/line.wgsl")),
+            ("image.wgsl", include_str!("../shaders/image.wgsl")),
         ];
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -3362,6 +3909,39 @@ mod pixel_ray_tests {
             validator
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{name}: WGSL validation failed: {e:?}"));
+        }
+    }
+
+    /// A 2×2 world quad centred straight ahead projects to vertices whose
+    /// homogeneous `w` equals the camera-forward distance (so the shader's
+    /// `clip = ndc·w` recovers perspective-correct UVs) and whose `depth`
+    /// is the euclidean range. Verifies geometry without a GPU device.
+    #[test]
+    fn image_vertices_carry_forward_w_and_euclidean_depth() {
+        let cam = crate::GpuLineCamera {
+            pos: [0.0, 0.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        // Quad 10 units ahead (forward = +Z), spanning x∈[-1,1], y∈[-1,1].
+        let quad = crate::GpuImageQuad {
+            corners: [
+                [-1.0, -1.0, 10.0], // TL
+                [1.0, -1.0, 10.0],  // TR
+                [-1.0, 1.0, 10.0],  // BL
+                [1.0, 1.0, 10.0],   // BR
+            ],
+            image: 0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            depth_test: true,
+        };
+        let verts = crate::build_image_vertices(&cam, &quad, 800, 600, 60_f32.to_radians());
+        assert_eq!(verts.len(), 6, "two triangles, no near-clip");
+        for v in &verts {
+            assert!((v.w - 10.0).abs() < 1e-4, "w == forward distance");
+            assert!(v.depth >= 10.0, "euclidean depth >= forward distance");
+            assert_eq!(v.depth_test, 1.0);
         }
     }
 }

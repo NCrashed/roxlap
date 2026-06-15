@@ -25,8 +25,8 @@ use roxlap_formats::kfa::{Hinge, Point3, Seq};
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
 use roxlap_render::{
-    FrameParams, KfaSprite, Line3, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteModelId,
-    SpriteSet,
+    FrameParams, ImageFacing, ImageId, ImageSprite, KfaSprite, Line3, RenderOptions, SceneRenderer,
+    SpriteInstanceDesc, SpriteModelId, SpriteSet,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -480,6 +480,35 @@ fn hud_panel(
 /// terrain. The grid/box are `depth_test = true` (hills in front occlude
 /// them); the axes are `depth_test = false`. Placed in front of the spawn
 /// camera (`(0, -120, 50)` looking `+y`).
+/// Generate a 64×64 RGBA8 reference texture for the `I`-toggle image
+/// sprite: a magenta/teal checkerboard with a red top edge and a green
+/// left edge, so orientation (row 0 = top, col 0 = left) and
+/// perspective-correctness read at a glance. Fully opaque.
+fn make_reference_image() -> (Vec<u8>, u32, u32) {
+    const N: u32 = 64;
+    let mut rgba = vec![0u8; (N * N * 4) as usize];
+    for y in 0..N {
+        for x in 0..N {
+            let i = ((y * N + x) * 4) as usize;
+            let checker = ((x / 8) + (y / 8)) % 2 == 0;
+            let (r, g, b) = if y < 3 {
+                (255, 40, 40) // red top edge
+            } else if x < 3 {
+                (40, 255, 40) // green left edge
+            } else if checker {
+                (220, 40, 200) // magenta
+            } else {
+                (40, 200, 200) // teal
+            };
+            rgba[i] = r;
+            rgba[i + 1] = g;
+            rgba[i + 2] = b;
+            rgba[i + 3] = 255;
+        }
+    }
+    (rgba, N, N)
+}
+
 fn debug_overlay_lines() -> Vec<Line3> {
     const GROUND_Z: f64 = 199.0; // just above the surface (smaller z = up)
     let mut lines = Vec::new();
@@ -705,6 +734,12 @@ struct App {
     /// always-on-top origin axes) drawn via `SceneRenderer::draw_lines` —
     /// the L3.0 occlusion gate.
     lines_on: bool,
+    /// `I` toggles a world-placed 2D image sprite drawn via
+    /// [`SceneRenderer::draw_images`] — a depth-tested reference quad
+    /// (the demiurg editor's first consumer of the primitive). The
+    /// texture is uploaded once in `resumed`; `image_id` holds its handle.
+    images_on: bool,
+    image_id: Option<ImageId>,
     /// Last FPS computed in `tick_fps`, shown in the HUD.
     last_fps: f64,
     /// Shoot-to-carve target: left-click (while grabbed) casts the
@@ -770,6 +805,8 @@ impl App {
             egui_state: None,
             hud_on: true,
             lines_on: true,
+            images_on: false,
+            image_id: None,
             last_fps: 0.0,
             carve_target: CarveTarget::new(),
             carve_target_id: None,
@@ -939,6 +976,27 @@ impl App {
         if self.lines_on {
             let lines = debug_overlay_lines();
             renderer.draw_lines(&camera, &lines);
+        }
+
+        // 2D image sprite (depth-tested reference quad). Placed on the
+        // Front plane (normal +Y, u=+X, v=+Z) at 1 texel = 1 voxel, so the
+        // terrain occludes the parts behind it.
+        if self.images_on {
+            if let Some(id) = self.image_id {
+                let sprite = ImageSprite {
+                    image: id,
+                    origin: [-32.0, 0.0, -64.0],
+                    facing: ImageFacing::World {
+                        u: [1.0, 0.0, 0.0],
+                        v: [0.0, 0.0, 1.0],
+                    },
+                    size: [64.0, 64.0],
+                    tint: 0xFFFF_FFFF,
+                    depth_test: true,
+                    double_sided: true,
+                };
+                renderer.draw_images(&camera, &[sprite]);
+            }
         }
 
         // RF: render no longer presents — finish the frame. With the HUD
@@ -1321,6 +1379,11 @@ impl ApplicationHandler for App {
             Some(2048),
         ));
 
+        // Upload the demo reference image once (a generated checkerboard +
+        // axis tint), so the `I`-toggle draw is a cheap per-frame call.
+        let (rgba, iw, ih) = make_reference_image();
+        self.image_id = Some(renderer.upload_image(&rgba, iw, ih));
+
         self.renderer = Some(renderer);
         self.window = Some(window);
     }
@@ -1458,6 +1521,12 @@ impl ApplicationHandler for App {
                     KeyCode::KeyL if pressed => {
                         self.lines_on = !self.lines_on;
                         eprintln!("debug lines = {}", self.lines_on);
+                    }
+                    // Toggle the world-placed 2D image sprite (the
+                    // `draw_images` reference-quad primitive).
+                    KeyCode::KeyI if pressed => {
+                        self.images_on = !self.images_on;
+                        eprintln!("image sprite = {}", self.images_on);
                     }
                     // S7.6: `T` (telemetry) prints chunk count +
                     // pending count for each streaming-enabled

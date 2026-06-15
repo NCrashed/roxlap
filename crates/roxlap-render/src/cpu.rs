@@ -22,7 +22,7 @@ use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{DynDisplay, DynWindow, HasDisplayHandle, HasWindowHandle};
-use crate::{FrameParams, KfaSprite, Line3, RenderOptions, SpriteSet};
+use crate::{FrameParams, ImageId, KfaSprite, Line3, QuadDraw, RenderOptions, SpriteSet};
 
 /// Near plane (camera-forward distance, voxel units) below which a
 /// [`Line3`] endpoint is clipped — keeps the pinhole divide finite and
@@ -44,6 +44,181 @@ fn blend_rgb(dst: u32, rgb: u32, alpha: u32) -> u32 {
     let g = (((rgb >> 8) & 0xff) * alpha + ((dst >> 8) & 0xff) * ia) / 255;
     let b = ((rgb & 0xff) * alpha + (dst & 0xff) * ia) / 255;
     (r << 16) | (g << 8) | b
+}
+
+/// A retained RGBA8 image-sprite texture (straight alpha, row-major).
+/// Sampled nearest-neighbour by [`CpuBackend::draw_images`].
+struct CpuImage {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl CpuImage {
+    /// Nearest-neighbour fetch at normalised `(u, v)` (clamped to the
+    /// edge) → `(r, g, b, a)` bytes.
+    fn sample(&self, u: f32, v: f32) -> (u32, u32, u32, u32) {
+        let w = self.width.max(1);
+        let h = self.height.max(1);
+        // `as i32` truncates toward zero; clamp keeps us in-bounds for
+        // UVs that drift just outside [0, 1] at a quad edge.
+        let tx = ((u * w as f32) as i32).clamp(0, w as i32 - 1) as u32;
+        let ty = ((v * h as f32) as i32).clamp(0, h as i32 - 1) as u32;
+        let idx = ((ty * w + tx) * 4) as usize;
+        (
+            u32::from(self.rgba[idx]),
+            u32::from(self.rgba[idx + 1]),
+            u32::from(self.rgba[idx + 2]),
+            u32::from(self.rgba[idx + 3]),
+        )
+    }
+}
+
+/// A near-clipped quad/triangle vertex in camera space (`cam` =
+/// `(right, down, forward)` components) carrying its texture `uv`.
+#[derive(Clone, Copy)]
+struct ClipVert {
+    cam: [f32; 3],
+    uv: [f32; 2],
+}
+
+/// A projected vertex ready for the perspective-correct raster: screen
+/// `(sx, sy)`, the linear-in-screen-space `inv_w = 1/forward`, and the
+/// pre-divided `u/forward`, `v/forward` (also linear in screen space).
+#[derive(Clone, Copy)]
+struct ScreenVert {
+    sx: f32,
+    sy: f32,
+    inv_w: f32,
+    su: f32,
+    sv: f32,
+}
+
+/// Clip a convex camera-space polygon against the near plane
+/// (`forward >= NEAR_Z`) with Sutherland–Hodgman, interpolating UVs at
+/// each crossing. Keeps the pinhole divide finite and drops geometry
+/// behind the camera. Returns `< 3` vertices when fully clipped.
+fn clip_near(poly: &[ClipVert]) -> Vec<ClipVert> {
+    let n = poly.len();
+    let mut out: Vec<ClipVert> = Vec::with_capacity(n + 1);
+    for i in 0..n {
+        let cur = poly[i];
+        let prev = poly[(i + n - 1) % n];
+        let cur_in = cur.cam[2] >= NEAR_Z;
+        let prev_in = prev.cam[2] >= NEAR_Z;
+        if cur_in != prev_in {
+            let t = (NEAR_Z - prev.cam[2]) / (cur.cam[2] - prev.cam[2]);
+            out.push(ClipVert {
+                cam: [
+                    prev.cam[0] + (cur.cam[0] - prev.cam[0]) * t,
+                    prev.cam[1] + (cur.cam[1] - prev.cam[1]) * t,
+                    NEAR_Z,
+                ],
+                uv: [
+                    prev.uv[0] + (cur.uv[0] - prev.uv[0]) * t,
+                    prev.uv[1] + (cur.uv[1] - prev.uv[1]) * t,
+                ],
+            });
+        }
+        if cur_in {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+/// Pinhole-project a near-clipped camera-space vertex to a [`ScreenVert`],
+/// pre-dividing the UVs by `forward` for the perspective-correct raster.
+fn project_clip(v: ClipVert, hx: f32, hy: f32, hz: f32) -> ScreenVert {
+    let inv_w = 1.0 / v.cam[2];
+    ScreenVert {
+        sx: hx + v.cam[0] * hz * inv_w,
+        sy: hy + v.cam[1] * hz * inv_w,
+        inv_w,
+        su: v.uv[0] * inv_w,
+        sv: v.uv[1] * inv_w,
+    }
+}
+
+/// Rasterise one perspective-correct textured triangle into `fb`,
+/// depth-tested against `zb` (forward distance, smaller = closer). The
+/// per-vertex `inv_w` / `su` / `sv` interpolate linearly in screen space;
+/// the true `u, v, forward` are recovered per pixel by dividing by the
+/// interpolated `inv_w`. Nearest sampling, straight-alpha `tint`, over-blend.
+#[allow(clippy::too_many_arguments)]
+fn fill_textured_tri(
+    fb: &mut [u32],
+    zb: &[f32],
+    w: u32,
+    h: u32,
+    v0: &ScreenVert,
+    v1: &ScreenVert,
+    v2: &ScreenVert,
+    image: &CpuImage,
+    tint: u32,
+    depth_test: bool,
+) {
+    // Signed area (== barycentric denominator); skip degenerate slivers.
+    let det = (v1.sx - v0.sx) * (v2.sy - v0.sy) - (v2.sx - v0.sx) * (v1.sy - v0.sy);
+    if det.abs() < 1e-6 {
+        return;
+    }
+    let inv_det = 1.0 / det;
+
+    let (wi, hi) = (w as i32, h as i32);
+    let minx = v0.sx.min(v1.sx).min(v2.sx).floor().max(0.0) as i32;
+    let maxx = v0.sx.max(v1.sx).max(v2.sx).ceil().min(wi as f32 - 1.0) as i32;
+    let miny = v0.sy.min(v1.sy).min(v2.sy).floor().max(0.0) as i32;
+    let maxy = v0.sy.max(v1.sy).max(v2.sy).ceil().min(hi as f32 - 1.0) as i32;
+    if minx > maxx || miny > maxy {
+        return;
+    }
+
+    let tint_a = (tint >> 24) & 0xff;
+    let tint_r = (tint >> 16) & 0xff;
+    let tint_g = (tint >> 8) & 0xff;
+    let tint_b = tint & 0xff;
+
+    for py in miny..=maxy {
+        let fy = py as f32 + 0.5;
+        for px in minx..=maxx {
+            let fx = px as f32 + 0.5;
+            // Barycentric weights (signed-area form; valid for both
+            // windings since each term carries `det`'s sign).
+            let b0 = ((v1.sy - v2.sy) * (fx - v2.sx) + (v2.sx - v1.sx) * (fy - v2.sy)) * inv_det;
+            let b1 = ((v2.sy - v0.sy) * (fx - v2.sx) + (v0.sx - v2.sx) * (fy - v2.sy)) * inv_det;
+            let b2 = 1.0 - b0 - b1;
+            // Small epsilon so shared edges between the two triangles
+            // don't leave a 1px gap.
+            if b0 < -1e-4 || b1 < -1e-4 || b2 < -1e-4 {
+                continue;
+            }
+
+            let inv_w = b0 * v0.inv_w + b1 * v1.inv_w + b2 * v2.inv_w;
+            if inv_w <= 0.0 {
+                continue;
+            }
+            let fwd = 1.0 / inv_w; // forward distance — the z-buffer metric
+
+            let idx = (py as usize) * (w as usize) + (px as usize);
+            if depth_test && fwd > zb[idx] + DEPTH_BIAS {
+                continue; // occluded by nearer rendered geometry
+            }
+
+            let u = (b0 * v0.su + b1 * v1.su + b2 * v2.su) * fwd;
+            let v = (b0 * v0.sv + b1 * v1.sv + b2 * v2.sv) * fwd;
+            let (tr, tg, tb, ta) = image.sample(u, v);
+
+            // Combine texel alpha with the tint's alpha byte.
+            let alpha = ta * tint_a / 255;
+            if alpha == 0 {
+                continue;
+            }
+            let rgb =
+                ((tr * tint_r / 255) << 16) | ((tg * tint_g / 255) << 8) | (tb * tint_b / 255);
+            fb[idx] = blend_rgb(fb[idx], rgb, alpha);
+        }
+    }
 }
 
 /// The CPU backend's framebuffer presenter. Native blits into a
@@ -130,6 +305,9 @@ pub(crate) struct CpuBackend {
     /// rasterises egui over it first. Decoupling the composite from the
     /// present lets a host slot a UI pass between them.
     framebuffer: Vec<u32>,
+    /// Retained image-sprite textures, indexed by [`ImageId`]. A dropped
+    /// slot is `None` and may be re-used by a later `upload_image`.
+    images: Vec<Option<CpuImage>>,
     /// egui atlas cache + software rasteriser (`hud` feature).
     #[cfg(feature = "hud")]
     egui_raster: crate::cpu_egui::EguiRaster,
@@ -164,6 +342,7 @@ impl CpuBackend {
             capture_next: false,
             captured: None,
             framebuffer,
+            images: Vec::new(),
             #[cfg(feature = "hud")]
             egui_raster: crate::cpu_egui::EguiRaster::default(),
         }
@@ -529,6 +708,139 @@ impl CpuBackend {
         }
     }
 
+    /// Upload (or replace) an RGBA8 image; reuses a freed slot when one
+    /// exists, else appends. See [`SceneRenderer::upload_image`].
+    pub(crate) fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> ImageId {
+        if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
+            return ImageId(0); // malformed — a draw with this id is a no-op
+        }
+        let img = CpuImage {
+            rgba: rgba.to_vec(),
+            width,
+            height,
+        };
+        if let Some(slot) = self.images.iter().position(Option::is_none) {
+            self.images[slot] = Some(img);
+            ImageId(slot)
+        } else {
+            self.images.push(Some(img));
+            ImageId(self.images.len() - 1)
+        }
+    }
+
+    /// Release a previously uploaded image (the slot becomes reusable).
+    pub(crate) fn drop_image(&mut self, id: ImageId) {
+        if let Some(slot) = self.images.get_mut(id.0) {
+            *slot = None;
+        }
+    }
+
+    /// Project a world point to window pixels under the last frame's
+    /// `setcamera` projection. See [`SceneRenderer::project_point`].
+    pub(crate) fn project_point(&self, camera: &Camera, world: [f32; 3]) -> Option<(f32, f32)> {
+        let (hx, hy, hz) = self.last_hxyz;
+        let (w, h) = self.last_dims;
+        if hz <= 0.0 || w == 0 || h == 0 {
+            return None;
+        }
+        let cam = camera_math::derive(camera, w, h, hx, hy, hz);
+        let d = [
+            world[0] - cam.pos[0],
+            world[1] - cam.pos[1],
+            world[2] - cam.pos[2],
+        ];
+        let cz = cam.forward[0] * d[0] + cam.forward[1] * d[1] + cam.forward[2] * d[2];
+        if cz < NEAR_Z {
+            return None;
+        }
+        let cx = cam.right[0] * d[0] + cam.right[1] * d[1] + cam.right[2] * d[2];
+        let cy = cam.down[0] * d[0] + cam.down[1] * d[1] + cam.down[2] * d[2];
+        Some((hx + cx * hz / cz, hy + cy * hz / cz))
+    }
+
+    /// Rasterise world-space textured quads ([`QuadDraw`]) over the
+    /// framebuffer the last [`render`](Self::render) composited, with
+    /// perspective-correct UVs and the same depth buffer the world pass
+    /// filled (so the terrain occludes quads behind it). Nearest-neighbour
+    /// sampling, straight-alpha tint, over-blend. Call after `render`,
+    /// before `present` / `paint_egui`.
+    pub(crate) fn draw_images(&mut self, camera: &Camera, quads: &[QuadDraw]) {
+        let (w, h) = self.last_dims;
+        let (hx, hy, hz) = self.last_hxyz;
+        if w == 0 || h == 0 || hz <= 0.0 {
+            return; // nothing rendered yet — no projection to reuse
+        }
+        let pixel_count = (w as usize) * (h as usize);
+        if self.framebuffer.len() < pixel_count || self.zbuffer.len() < pixel_count {
+            return;
+        }
+        let cam = camera_math::derive(camera, w, h, hx, hy, hz);
+        let cam_coords = |p: [f32; 3]| -> [f32; 3] {
+            let d = [p[0] - cam.pos[0], p[1] - cam.pos[1], p[2] - cam.pos[2]];
+            [
+                cam.right[0] * d[0] + cam.right[1] * d[1] + cam.right[2] * d[2],
+                cam.down[0] * d[0] + cam.down[1] * d[1] + cam.down[2] * d[2],
+                cam.forward[0] * d[0] + cam.forward[1] * d[1] + cam.forward[2] * d[2],
+            ]
+        };
+
+        let fb = &mut self.framebuffer[..pixel_count];
+        let zb = &self.zbuffer[..pixel_count];
+
+        for quad in quads {
+            let Some(Some(image)) = self.images.get(quad.image.0) else {
+                continue; // dropped or never-uploaded id
+            };
+            let [tl, tr, bl, br] = quad.corners;
+            // Per-corner UV: TL(0,0) TR(1,0) BL(0,1) BR(1,1).
+            let verts = [
+                ClipVert {
+                    cam: cam_coords(tl),
+                    uv: [0.0, 0.0],
+                },
+                ClipVert {
+                    cam: cam_coords(tr),
+                    uv: [1.0, 0.0],
+                },
+                ClipVert {
+                    cam: cam_coords(bl),
+                    uv: [0.0, 1.0],
+                },
+                ClipVert {
+                    cam: cam_coords(br),
+                    uv: [1.0, 1.0],
+                },
+            ];
+            // Two triangles: (TL, TR, BL) and (TR, BR, BL).
+            for tri in [[0usize, 1, 2], [1, 3, 2]] {
+                let poly = [verts[tri[0]], verts[tri[1]], verts[tri[2]]];
+                let clipped = clip_near(&poly);
+                if clipped.len() < 3 {
+                    continue;
+                }
+                // Project once, then fan-triangulate the clipped polygon.
+                let screen: Vec<ScreenVert> = clipped
+                    .iter()
+                    .map(|v| project_clip(*v, hx, hy, hz))
+                    .collect();
+                for i in 1..screen.len() - 1 {
+                    fill_textured_tri(
+                        fb,
+                        zb,
+                        w,
+                        h,
+                        &screen[0],
+                        &screen[i],
+                        &screen[i + 1],
+                        image,
+                        quad.tint,
+                        quad.depth_test,
+                    );
+                }
+            }
+        }
+    }
+
     /// Shared tail of `present` / `paint_egui`: copy the framebuffer to
     /// the window surface at `(width, height)` and present.
     #[cfg(not(target_arch = "wasm32"))]
@@ -614,6 +926,115 @@ mod cpu_ray_tests {
     fn offcentre_pixel_tilts_linearly() {
         let d = setcamera_pixel_ray(RIGHT, DOWN, FWD, 384.0, 272.0, 320.0, 240.0, 320.0);
         assert_eq!(d, [64.0, 32.0, 320.0]);
+    }
+}
+
+#[cfg(test)]
+mod image_raster_tests {
+    use super::{clip_near, fill_textured_tri, ClipVert, CpuImage, ScreenVert, NEAR_Z};
+
+    fn cv(cam: [f32; 3], uv: [f32; 2]) -> ClipVert {
+        ClipVert { cam, uv }
+    }
+
+    #[test]
+    fn clip_near_keeps_a_front_triangle() {
+        let tri = [
+            cv([0.0, 0.0, 10.0], [0.0, 0.0]),
+            cv([1.0, 0.0, 10.0], [1.0, 0.0]),
+            cv([0.0, 1.0, 10.0], [0.0, 1.0]),
+        ];
+        assert_eq!(clip_near(&tri).len(), 3, "fully in front: unchanged");
+    }
+
+    #[test]
+    fn clip_near_splits_a_straddling_triangle() {
+        // One vertex behind the near plane → the clipped polygon gains a
+        // vertex (two edges cross the plane).
+        let tri = [
+            cv([0.0, 0.0, -1.0], [0.0, 0.0]), // behind
+            cv([1.0, 0.0, 10.0], [1.0, 0.0]),
+            cv([0.0, 1.0, 10.0], [0.0, 1.0]),
+        ];
+        let out = clip_near(&tri);
+        assert_eq!(out.len(), 4, "one-behind triangle clips to a quad");
+        for v in &out {
+            assert!(v.cam[2] >= NEAR_Z - 1e-6, "no vertex behind the near plane");
+        }
+    }
+
+    /// Render a screen-aligned quad (constant forward depth) over a 10×10
+    /// framebuffer from a 2×2 colour image and read back corner pixels.
+    fn render_quad(depth_test: bool, zb_fill: f32) -> Vec<u32> {
+        // 2×2: TL red, TR green, BL blue, BR white (row-major RGBA8).
+        let rgba = vec![
+            255, 0, 0, 255, /* (0,0) */ 0, 255, 0, 255, /* (1,0) */
+            0, 0, 255, 255, /* (0,1) */ 255, 255, 255, 255, /* (1,1) */
+        ];
+        let image = CpuImage {
+            rgba,
+            width: 2,
+            height: 2,
+        };
+        let (w, h) = (10u32, 10u32);
+        let mut fb = vec![0u32; (w * h) as usize];
+        let zb = vec![zb_fill; (w * h) as usize];
+
+        let fwd = 10.0f32;
+        let iw = 1.0 / fwd;
+        // Quad corners in screen space, UVs TL(0,0) TR(1,0) BL(0,1) BR(1,1).
+        let sv = |sx: f32, sy: f32, u: f32, v: f32| ScreenVert {
+            sx,
+            sy,
+            inv_w: iw,
+            su: u * iw,
+            sv: v * iw,
+        };
+        let tl = sv(0.0, 0.0, 0.0, 0.0);
+        let tr = sv(10.0, 0.0, 1.0, 0.0);
+        let bl = sv(0.0, 10.0, 0.0, 1.0);
+        let br = sv(10.0, 10.0, 1.0, 1.0);
+        for tri in [[tl, tr, bl], [tr, br, bl]] {
+            fill_textured_tri(
+                &mut fb,
+                &zb,
+                w,
+                h,
+                &tri[0],
+                &tri[1],
+                &tri[2],
+                &image,
+                0xFFFF_FFFF,
+                depth_test,
+            );
+        }
+        fb
+    }
+
+    #[test]
+    fn textured_quad_maps_uv_corners() {
+        let fb = render_quad(false, f32::INFINITY);
+        let at = |x: u32, y: u32| fb[(y * 10 + x) as usize];
+        // Corners sample the matching texel (top-left of image = TL of quad).
+        assert_eq!(at(1, 1), 0x00FF_0000, "TL → red");
+        assert_eq!(at(8, 1), 0x0000_FF00, "TR → green");
+        assert_eq!(at(1, 8), 0x0000_00FF, "BL → blue");
+        assert_eq!(at(8, 8), 0x00FF_FFFF, "BR → white");
+    }
+
+    #[test]
+    fn depth_test_occludes_quad_behind_geometry() {
+        // Quad at forward distance 10; z-buffer says geometry is at 5
+        // everywhere → the whole quad is occluded and nothing is written.
+        let fb = render_quad(true, 5.0);
+        assert!(fb.iter().all(|&p| p == 0), "occluded quad writes nothing");
+    }
+
+    #[test]
+    fn depth_test_passes_when_in_front() {
+        // Geometry behind the quad (z-buffer at 100) → quad draws.
+        let fb = render_quad(true, 100.0);
+        assert!(fb.iter().any(|&p| p != 0), "unoccluded quad draws");
     }
 }
 

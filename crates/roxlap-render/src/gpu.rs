@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 
-use crate::{FrameParams, KfaSprite, Kv6, Line3, RenderOptions, Sprite, SpriteSet};
+use crate::{
+    FrameParams, ImageId, KfaSprite, Kv6, Line3, QuadDraw, RenderOptions, Sprite, SpriteSet,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
@@ -481,6 +483,62 @@ impl GpuBackend {
             })
             .collect();
         self.gpu.draw_lines_deferred(&cam, &glines);
+    }
+
+    /// Upload (or replace) an RGBA8 image-sprite texture.
+    pub(crate) fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> ImageId {
+        ImageId(self.gpu.upload_image(rgba, width, height))
+    }
+
+    /// Release a previously uploaded image-sprite texture.
+    pub(crate) fn drop_image(&mut self, id: ImageId) {
+        self.gpu.drop_image(id.0);
+    }
+
+    /// Project a world point to window pixels under the marcher's
+    /// projection. See [`SceneRenderer::project_point`].
+    pub(crate) fn project_point(&self, camera: &Camera, world: [f32; 3]) -> Option<(f32, f32)> {
+        self.gpu.project_point(
+            camera.pos.map(|v| v as f32),
+            camera.right.map(|v| v as f32),
+            camera.down.map(|v| v as f32),
+            camera.forward.map(|v| v as f32),
+            world,
+        )
+    }
+
+    /// Draw world-space 2D image sprites over the pending frame — the
+    /// textured-quad sibling of [`Self::draw_lines`]. Converts the
+    /// facade-resolved [`QuadDraw`]s + world `camera` to the GPU image
+    /// types and runs the `roxlap-gpu` image pipeline (perspective-correct
+    /// UV, manual depth test against the marched `best_t`).
+    pub(crate) fn draw_images(&mut self, camera: &Camera, quads: &[QuadDraw]) {
+        if quads.is_empty() {
+            return;
+        }
+        let cam = roxlap_gpu::GpuLineCamera {
+            pos: camera.pos.map(|v| v as f32),
+            right: camera.right.map(|v| v as f32),
+            down: camera.down.map(|v| v as f32),
+            forward: camera.forward.map(|v| v as f32),
+        };
+        let gquads: Vec<roxlap_gpu::GpuImageQuad> = quads
+            .iter()
+            .map(|q| {
+                // 0xAARRGGBB tint → straight RGBA in 0..=1.
+                let a = ((q.tint >> 24) & 0xff) as f32 / 255.0;
+                let r = ((q.tint >> 16) & 0xff) as f32 / 255.0;
+                let g = ((q.tint >> 8) & 0xff) as f32 / 255.0;
+                let b = (q.tint & 0xff) as f32 / 255.0;
+                roxlap_gpu::GpuImageQuad {
+                    corners: q.corners,
+                    image: q.image.0,
+                    tint: [r, g, b, a],
+                    depth_test: q.depth_test,
+                }
+            })
+            .collect();
+        self.gpu.draw_images_deferred(&cam, &gquads);
     }
 
     /// Overlay egui on the pending frame, then present (`hud` feature).

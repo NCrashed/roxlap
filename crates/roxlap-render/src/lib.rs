@@ -190,6 +190,79 @@ pub struct Line3 {
     pub depth_test: bool,
 }
 
+/// A handle to an uploaded image-sprite texture, returned by
+/// [`SceneRenderer::upload_image`]. Positional (like [`SpriteModelId`]):
+/// it indexes the backend's texture store. Pass it in an [`ImageSprite`]
+/// for [`SceneRenderer::draw_images`], or to
+/// [`drop_image`](SceneRenderer::drop_image) to release it. Opaque on
+/// purpose — there's no arithmetic to do on it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ImageId(pub(crate) usize);
+
+/// How an [`ImageSprite`]'s quad is oriented in the world.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ImageFacing {
+    /// Fixed in world space: the quad lies in the plane spanned by `u`
+    /// (the image's +column / width direction) and `v` (its +row /
+    /// height direction). Both are world-space directions; their length
+    /// is ignored (the quad is sized by [`ImageSprite::size`]), so pass
+    /// the plane's axes directly. Row 0 of the image is the `origin`
+    /// edge and rows grow along `v`.
+    World { u: [f32; 3], v: [f32; 3] },
+    /// Always faces the camera (billboard); `up` is the world direction
+    /// the image's top edge points toward (e.g. world `-Z` for the
+    /// scene-demo's z-down world, or any "up" the host prefers).
+    Billboard { up: [f32; 3] },
+}
+
+/// One placed 2D image sprite for the current frame: a flat textured
+/// quad in world space, composited over the rendered scene with the
+/// frame's depth buffer (so the voxel model can occlude it). Built per
+/// frame and passed to [`SceneRenderer::draw_images`], mirroring
+/// [`Line3`] / [`SceneRenderer::draw_lines`]. The texture is uploaded
+/// once via [`SceneRenderer::upload_image`] and referenced by [`image`].
+///
+/// [`image`]: ImageSprite::image
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ImageSprite {
+    /// The uploaded texture to draw (from [`SceneRenderer::upload_image`]).
+    pub image: ImageId,
+    /// World position of the quad's **top-left** corner — the image's
+    /// `(column 0, row 0)` texel. The quad extends `size[0]` along the
+    /// facing's `u` and `size[1]` along its `v`.
+    pub origin: [f32; 3],
+    /// World orientation of the quad — fixed in world or camera-facing.
+    pub facing: ImageFacing,
+    /// World size of the quad along `u` and `v`. For pixel-art traced at
+    /// 1 texel = 1 voxel, pass `[width as f32, height as f32]`.
+    pub size: [f32; 2],
+    /// Multiplied into every sampled texel (tint + opacity), `0xAARRGGBB`.
+    /// `0xFFFFFFFF` draws the texture unchanged; the high byte scales
+    /// the texel alpha (e.g. `0x80FFFFFF` = 50 % opacity).
+    pub tint: u32,
+    /// `true`: occluded by nearer rendered geometry (depth-tested against
+    /// the frame's depth buffer, with a bias so a quad resting on a
+    /// coincident voxel face doesn't z-fight). `false`: always on top.
+    pub depth_test: bool,
+    /// `true`: draw regardless of which way the quad faces (no backface
+    /// cull) — what reference images usually want. `false`: cull when the
+    /// quad faces away from the camera. Ignored for
+    /// [`ImageFacing::Billboard`] (it always faces the camera).
+    pub double_sided: bool,
+}
+
+/// Backend-agnostic resolved quad: four world corners (`TL, TR, BL, BR`,
+/// with UVs `(0,0) (1,0) (0,1) (1,1)`) + the texture to map. The facade
+/// resolves [`ImageSprite::facing`] into corners and culls back-facing
+/// quads once, so both backends draw from the same geometry.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuadDraw {
+    pub corners: [[f32; 3]; 4],
+    pub image: ImageId,
+    pub tint: u32,
+    pub depth_test: bool,
+}
+
 /// Which renderer a [`SceneRenderer`] resolved to at construction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
@@ -233,6 +306,102 @@ impl Default for RenderOptions {
             cpu_render_threads: 4,
         }
     }
+}
+
+// --- image-sprite geometry helpers (shared by both backends) ---
+
+fn v_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn v_add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+fn v_scale(a: [f32; 3], s: f32) -> [f32; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+fn v_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn v_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn v_norm(a: [f32; 3]) -> [f32; 3] {
+    let len = v_dot(a, a).sqrt();
+    if len < 1e-12 {
+        a
+    } else {
+        v_scale(a, 1.0 / len)
+    }
+}
+
+/// Resolve an [`ImageSprite`] into its four world corners (`TL, TR, BL,
+/// BR`), or `None` when a `double_sided == false` world quad faces away
+/// from the camera (back-face cull) or its plane is degenerate. The
+/// camera basis is used only for [`ImageFacing::Billboard`] and the cull
+/// test.
+fn resolve_quad(sprite: &ImageSprite, camera: &Camera) -> Option<QuadDraw> {
+    let cam_pos = [
+        camera.pos[0] as f32,
+        camera.pos[1] as f32,
+        camera.pos[2] as f32,
+    ];
+    let cam_fwd = v_norm([
+        camera.forward[0] as f32,
+        camera.forward[1] as f32,
+        camera.forward[2] as f32,
+    ]);
+
+    let (u_hat, v_hat) = match sprite.facing {
+        ImageFacing::World { u, v } => (v_norm(u), v_norm(v)),
+        ImageFacing::Billboard { up } => {
+            // Horizontal axis ⟂ both the view direction and `up`; fall
+            // back to the camera right when `up` is parallel to the view.
+            let mut u_hat = v_norm(v_cross(up, cam_fwd));
+            if v_dot(u_hat, u_hat) < 1e-12 {
+                u_hat = v_norm([
+                    camera.right[0] as f32,
+                    camera.right[1] as f32,
+                    camera.right[2] as f32,
+                ]);
+            }
+            // Vertical axis ⟂ both, pointing *down* (rows grow downward)
+            // so the top edge ends up toward `up`.
+            let mut v_hat = v_norm(v_cross(cam_fwd, u_hat));
+            if v_dot(v_hat, up) > 0.0 {
+                v_hat = v_scale(v_hat, -1.0);
+            }
+            (u_hat, v_hat)
+        }
+    };
+
+    let du = v_scale(u_hat, sprite.size[0]);
+    let dv = v_scale(v_hat, sprite.size[1]);
+    let tl = sprite.origin;
+    let tr = v_add(tl, du);
+    let bl = v_add(tl, dv);
+    let br = v_add(tr, dv);
+
+    // Back-face cull for fixed world quads (billboards always face us).
+    if !sprite.double_sided {
+        if let ImageFacing::World { .. } = sprite.facing {
+            let normal = v_cross(du, dv);
+            // Front-facing when the quad normal points toward the camera.
+            if v_dot(normal, v_sub(cam_pos, tl)) <= 0.0 {
+                return None;
+            }
+        }
+    }
+
+    Some(QuadDraw {
+        corners: [tl, tr, bl, br],
+        image: sprite.image,
+        tint: sprite.tint,
+        depth_test: sprite.depth_test,
+    })
 }
 
 /// Renderer-internal backend; never exposes wgpu or softbuffer types.
@@ -401,6 +570,78 @@ impl SceneRenderer {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.draw_lines(camera, lines),
             BackendImpl::Gpu(g) => g.draw_lines(camera, lines),
+        }
+    }
+
+    /// Upload (or replace) an RGBA8 image and return a stable [`ImageId`]
+    /// to reference it in [`draw_images`](Self::draw_images). `rgba` is
+    /// row-major, `width * height * 4` bytes, **straight** (un-premultiplied)
+    /// alpha. The texture is retained until [`drop_image`](Self::drop_image),
+    /// so the per-frame draw call stays cheap. Sampling is
+    /// nearest-neighbour (pixel-art friendly — no blurring).
+    ///
+    /// Returns `ImageId(0)` for malformed input (wrong byte count or a
+    /// zero dimension); such an id draws nothing.
+    pub fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> ImageId {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.upload_image(rgba, width, height),
+            BackendImpl::Gpu(g) => g.upload_image(rgba, width, height),
+        }
+    }
+
+    /// Release a texture uploaded with [`upload_image`](Self::upload_image).
+    /// The id must not be reused afterwards (a later `upload_image` may
+    /// hand the slot back out under a fresh id).
+    pub fn drop_image(&mut self, id: ImageId) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.drop_image(id),
+            BackendImpl::Gpu(g) => g.drop_image(id),
+        }
+    }
+
+    /// Draw 2D [`ImageSprite`]s over the frame [`render`](Self::render)
+    /// composited — flat textured quads placed in world space, using that
+    /// frame's camera + projection + depth buffer. Same contract as
+    /// [`draw_lines`](Self::draw_lines): call **after** [`render`](Self::render)
+    /// and **before** [`present`](Self::present) / [`paint_egui`](Self::paint_egui).
+    ///
+    /// UVs are perspective-correct (no affine warp on an obliquely-viewed
+    /// quad). Depth-tested sprites are occluded by nearer rendered
+    /// geometry (with a bias to avoid z-fighting on a coincident face);
+    /// the texture's straight alpha + the [`ImageSprite::tint`] composite
+    /// over the scene. `camera` must be the one the last frame rendered.
+    pub fn draw_images(&mut self, camera: &Camera, images: &[ImageSprite]) {
+        if images.is_empty() {
+            return;
+        }
+        let quads: Vec<QuadDraw> = images
+            .iter()
+            .filter_map(|s| resolve_quad(s, camera))
+            .collect();
+        if quads.is_empty() {
+            return;
+        }
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.draw_images(camera, &quads),
+            BackendImpl::Gpu(g) => g.draw_images(camera, &quads),
+        }
+    }
+
+    /// Project a world point to window pixel coordinates `(x, y)` under
+    /// the projection the **last frame** rendered with — the backend-correct
+    /// `world → screen` inverse of [`view_ray`](Self::view_ray). `None`
+    /// before the first frame or for a point at/behind the camera near
+    /// plane.
+    ///
+    /// Both backends honour their own projection (CPU `setcamera`
+    /// `hx/hy/hz`, GPU vertical-FOV pinhole), so hosts never reconstruct
+    /// it themselves. The returned `(x, y)` may fall outside `[0, w) ×
+    /// [0, h)` for points off-screen but in front of the camera.
+    #[must_use]
+    pub fn project_point(&self, camera: &Camera, world: [f32; 3]) -> Option<(f32, f32)> {
+        match &self.inner {
+            BackendImpl::Cpu(c) => c.project_point(camera, world),
+            BackendImpl::Gpu(g) => g.project_point(camera, world),
         }
     }
 
@@ -641,5 +882,116 @@ mod tests {
         let o = RenderOptions::default();
         assert!(!o.want_gpu);
         assert_eq!(o.clear_sky & 0xFF00_0000, 0, "clear_sky is 0x00RRGGBB");
+    }
+
+    /// A camera at the origin looking down +Y (voxlap z-down world): right
+    /// = +X, down = +Z, forward = +Y. Handedness `right × down == forward`.
+    fn cam_looking_y() -> Camera {
+        Camera {
+            pos: [0.0, 0.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn world_quad_corner_layout() {
+        // Top-left at (-5, 10, -5); u = +X (width), v = +Z (down). A
+        // 10×10 quad facing the camera (its +Y normal points back at us).
+        let sprite = ImageSprite {
+            image: ImageId(0),
+            origin: [-5.0, 10.0, -5.0],
+            facing: ImageFacing::World {
+                u: [1.0, 0.0, 0.0],
+                v: [0.0, 0.0, 1.0],
+            },
+            size: [10.0, 10.0],
+            tint: 0xFFFF_FFFF,
+            depth_test: true,
+            double_sided: true,
+        };
+        let q = resolve_quad(&sprite, &cam_looking_y()).expect("front-facing");
+        assert_eq!(q.corners[0], [-5.0, 10.0, -5.0], "TL = origin");
+        assert_eq!(q.corners[1], [5.0, 10.0, -5.0], "TR = origin + u·size");
+        assert_eq!(q.corners[2], [-5.0, 10.0, 5.0], "BL = origin + v·size");
+        assert_eq!(q.corners[3], [5.0, 10.0, 5.0], "BR = origin + u + v");
+    }
+
+    #[test]
+    fn world_quad_backface_culls_when_single_sided() {
+        // Same plane but spanned so its normal (u × v) points *away* from
+        // the camera: swap u/v so the winding flips.
+        let sprite = ImageSprite {
+            image: ImageId(0),
+            origin: [-5.0, 10.0, -5.0],
+            facing: ImageFacing::World {
+                u: [0.0, 0.0, 1.0], // v-ish
+                v: [1.0, 0.0, 0.0], // u-ish → normal flips to -Y... toward camera?
+            },
+            size: [10.0, 10.0],
+            tint: 0xFFFF_FFFF,
+            depth_test: true,
+            double_sided: false,
+        };
+        // With double_sided=false one of the two windings must cull; the
+        // opposite winding must draw. Exactly one of the two resolves.
+        let a = resolve_quad(&sprite, &cam_looking_y()).is_some();
+        let mut flipped = sprite;
+        flipped.facing = ImageFacing::World {
+            u: [1.0, 0.0, 0.0],
+            v: [0.0, 0.0, 1.0],
+        };
+        let b = resolve_quad(&flipped, &cam_looking_y()).is_some();
+        assert!(a ^ b, "exactly one winding is front-facing");
+    }
+
+    #[test]
+    fn double_sided_never_culls() {
+        let mut sprite = ImageSprite {
+            image: ImageId(0),
+            origin: [-5.0, 10.0, -5.0],
+            facing: ImageFacing::World {
+                u: [0.0, 0.0, 1.0],
+                v: [1.0, 0.0, 0.0],
+            },
+            size: [10.0, 10.0],
+            tint: 0xFFFF_FFFF,
+            depth_test: true,
+            double_sided: true,
+        };
+        assert!(resolve_quad(&sprite, &cam_looking_y()).is_some());
+        sprite.facing = ImageFacing::World {
+            u: [1.0, 0.0, 0.0],
+            v: [0.0, 0.0, 1.0],
+        };
+        assert!(resolve_quad(&sprite, &cam_looking_y()).is_some());
+    }
+
+    #[test]
+    fn billboard_axes_orthogonal_and_top_toward_up() {
+        // World up = -Z (z-down world). The billboard's v (top→bottom)
+        // must point away from `up`, and u/v must be ⟂ the view direction.
+        let up = [0.0, 0.0, -1.0];
+        let sprite = ImageSprite {
+            image: ImageId(0),
+            origin: [0.0, 50.0, 0.0],
+            facing: ImageFacing::Billboard { up },
+            size: [4.0, 4.0],
+            tint: 0xFFFF_FFFF,
+            depth_test: false,
+            double_sided: false, // billboards must NEVER cull
+        };
+        let q = resolve_quad(&sprite, &cam_looking_y()).expect("billboard always faces camera");
+        let u = v_sub(q.corners[1], q.corners[0]); // TR - TL = u·size
+        let v = v_sub(q.corners[2], q.corners[0]); // BL - TL = v·size
+        let fwd = [0.0, 1.0, 0.0];
+        assert!(v_dot(u, fwd).abs() < 1e-5, "u ⟂ view");
+        assert!(v_dot(v, fwd).abs() < 1e-5, "v ⟂ view");
+        assert!(v_dot(u, v).abs() < 1e-5, "u ⟂ v");
+        assert!(
+            v_dot(v, up) < 0.0,
+            "rows grow away from `up` (top edge toward up)"
+        );
     }
 }
