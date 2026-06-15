@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use crate::{FrameParams, KfaSprite, Line3, RenderOptions, Sprite, SpriteSet};
+use crate::{FrameParams, KfaSprite, Kv6, Line3, RenderOptions, Sprite, SpriteSet};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
@@ -277,10 +277,10 @@ impl GpuBackend {
     }
 
     /// GPU.12 incremental — re-register host model `model_index`'s
-    /// geometry from the (already-edited) `sprite.kv6`, refreshing only
-    /// that LOD chain's GPU data. The instance set is untouched. No-op if
-    /// no registry is resident or `model_index` is unknown.
-    pub(crate) fn update_sprite_model(&mut self, model_index: usize, sprite: &Sprite) {
+    /// geometry from the (already-edited) `kv6`, refreshing only that LOD
+    /// chain's GPU data. The instance set is untouched. No-op if no
+    /// registry is resident or `model_index` is unknown.
+    pub(crate) fn update_sprite_model(&mut self, model_index: usize, kv6: &Kv6) {
         let Some(&chain_id) = self.sprite_model_ids.get(model_index) else {
             return;
         };
@@ -289,7 +289,7 @@ impl GpuBackend {
         };
         // Rebuild mip-0 from the edited kv6, then refresh the coarse mips
         // so every LOD level matches before the single-chain re-upload.
-        *reg.model_mut(chain_id) = build_sprite_model(&sprite.kv6);
+        *reg.model_mut(chain_id) = build_sprite_model(kv6);
         reg.rebuild_lod(chain_id);
         self.gpu.update_sprite_model(reg, chain_id);
     }

@@ -25,7 +25,8 @@ use roxlap_formats::kfa::{Hinge, Point3, Seq};
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
 use roxlap_render::{
-    FrameParams, KfaSprite, Line3, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet,
+    FrameParams, KfaSprite, Line3, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteModelId,
+    SpriteSet,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -710,6 +711,12 @@ struct App {
     /// centre-screen ray and subtracts a sphere via
     /// [`Sprite::carve_sphere_with_colfunc`].
     carve_target: CarveTarget,
+    /// Stable handle for the carve target's registered model, captured
+    /// from [`SceneRenderer::set_sprites`] whenever the normal sprite
+    /// field is (re)registered. `fire` refreshes this model incrementally
+    /// instead of re-deriving a positional index. `None` until the first
+    /// registration (or when sprites are disabled).
+    carve_target_id: Option<SpriteModelId>,
 }
 
 impl App {
@@ -765,6 +772,7 @@ impl App {
             lines_on: true,
             last_fps: 0.0,
             carve_target: CarveTarget::new(),
+            carve_target_id: None,
         }
     }
 
@@ -999,15 +1007,6 @@ impl App {
     /// N×N field (`ROXLAP_SPRITE_GRID`, default 16 ⇒ 256 instances).
     /// The red model is the `G`-carve target. Content only — the
     /// renderer builds the CPU draws + GPU registry from this.
-    /// The [`SpriteSet::models`] index of the shoot-to-carve target —
-    /// kept in sync with [`build_sprite_set`](Self::build_sprite_set),
-    /// which appends the target as the last model (after the green + red
-    /// `coco` variants, when `coco.kv6` loaded). Used by
-    /// [`fire`](Self::fire) to re-upload only that model incrementally.
-    fn carve_target_model_index(&self) -> usize {
-        usize::from(!self.sprites.is_empty()) * 2
-    }
-
     fn build_sprite_set(&self) -> Option<SpriteSet> {
         let mut models = Vec::new();
         let mut instances = Vec::new();
@@ -1098,12 +1097,11 @@ impl App {
             "hit target at local ({}, {}, {}) — carved {removed} voxels",
             hit[0], hit[1], hit[2],
         );
-        // GPU.12 incremental: re-upload ONLY the carve target's model, not
+        // GPU.12 incremental: refresh ONLY the carve target's model, not
         // the whole 256-instance sprite field. The instance set and every
-        // other model are untouched.
-        let idx = self.carve_target_model_index();
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.update_sprite_model(idx, &self.carve_target.sprite);
+        // other model are untouched. The handle came from `set_sprites`.
+        if let (Some(renderer), Some(id)) = (self.renderer.as_mut(), self.carve_target_id) {
+            renderer.refresh_sprite_model(id, &self.carve_target.sprite.kv6);
         }
     }
 
@@ -1220,10 +1218,12 @@ impl App {
                 self.scene.refresh_camera();
             }
             // Restore the normal sprite field (compute before borrowing
-            // the renderer to keep the borrows disjoint).
+            // the renderer to keep the borrows disjoint). The carve
+            // target is the last model, so its handle is the last id.
             let restore = self.build_sprite_set();
             if let (Some(renderer), Some(set)) = (self.renderer.as_mut(), restore) {
-                renderer.set_sprites(&set);
+                let ids = renderer.set_sprites(&set);
+                self.carve_target_id = ids.last().copied();
             }
             eprintln!("pick mode OFF");
         }
@@ -1298,7 +1298,9 @@ impl ApplicationHandler for App {
                 set.instances.len(),
                 set.models.len(),
             );
-            renderer.set_sprites(&set);
+            // The carve target is the last model — keep its handle for
+            // the incremental shoot-to-carve refresh in `fire`.
+            self.carve_target_id = renderer.set_sprites(&set).last().copied();
         }
 
         // Animated KFA sprite (the swinging arm) — registered once;

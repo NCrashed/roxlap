@@ -15,6 +15,7 @@ use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::sprite::{draw_sprite, DrawTarget};
 use roxlap_core::Camera;
+use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
 use roxlap_scene::render::render_scene_composed;
 use roxlap_scene::Scene;
@@ -264,16 +265,16 @@ impl CpuBackend {
         self.sprite_models = sprite_models;
     }
 
-    /// GPU.12 incremental — swap the edited `sprite.kv6` into every cached
+    /// GPU.12 incremental — swap the edited `kv6` into every cached
     /// instance of host model `model_index`, keeping each instance's
     /// world position. Mirrors the GPU backend's single-model update on
     /// the software path (where "rebuild" is just a kv6 clone per
     /// instance, so the win is parity rather than bandwidth). No-op if no
     /// instance references `model_index`.
-    pub(crate) fn update_sprite_model(&mut self, model_index: usize, sprite: &Sprite) {
+    pub(crate) fn update_sprite_model(&mut self, model_index: usize, kv6: &Kv6) {
         for (s, &m) in self.sprites.iter_mut().zip(&self.sprite_models) {
             if m == model_index {
-                s.kv6 = sprite.kv6.clone();
+                s.kv6 = kv6.clone();
             }
         }
     }

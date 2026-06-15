@@ -46,6 +46,7 @@ use roxlap_core::Camera;
 use roxlap_scene::Scene;
 
 pub use roxlap_formats::kfa::KfaSprite;
+pub use roxlap_formats::kv6::Kv6;
 pub use roxlap_formats::sprite::Sprite;
 pub use roxlap_gpu::{GpuInitError, GpuRendererSettings, PowerPreference};
 // Re-exported so hosts can name the [`SceneRenderer::new`] bounds
@@ -76,6 +77,16 @@ pub struct SpriteInstanceDesc {
     pub model: usize,
     pub pos: [f32; 3],
 }
+
+/// Stable handle to a registered sprite model, returned (one per
+/// [`SpriteSet::models`] entry, in order) by
+/// [`SceneRenderer::set_sprites`]. Pass it to
+/// [`refresh_sprite_model`](SceneRenderer::refresh_sprite_model) to
+/// re-register that model's geometry after a content edit — so callers
+/// never track the positional `usize` index themselves. Opaque on
+/// purpose: there is no arithmetic to do on it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SpriteModelId(pub(crate) usize);
 
 /// Backend-agnostic sprite description. The facade builds the CPU
 /// per-instance draw list and the GPU instanced registry from the
@@ -430,28 +441,37 @@ impl SceneRenderer {
     /// Register sprite models + instances. The CPU backend builds a
     /// per-instance draw list; the GPU backend builds an instanced
     /// model registry. Call once at setup (or again to replace).
-    pub fn set_sprites(&mut self, set: &SpriteSet) {
+    pub fn set_sprites(&mut self, set: &SpriteSet) -> Vec<SpriteModelId> {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.set_sprites(set),
             BackendImpl::Gpu(g) => g.set_sprites(set),
         }
+        // Handles are positional by construction (model index = chain id
+        // on both backends), so the facade hands them out directly —
+        // callers keep the handle instead of re-deriving the index.
+        (0..set.models.len()).map(SpriteModelId).collect()
     }
 
-    /// GPU.12 incremental — re-register a single sprite model's geometry
-    /// after an in-place edit (carve / recolour of `sprite.kv6`), without
-    /// rebuilding the whole sprite field. `model_index` is the index into
-    /// the [`SpriteSet::models`] last passed to
-    /// [`set_sprites`](Self::set_sprites); the instance set is left
-    /// untouched (an edit never moves or adds an instance). On the GPU
-    /// backend this re-uploads only that model's voxel data through a
-    /// slack-backed suballocator (one model's bytes, not the registry);
-    /// on the CPU backend it swaps the cached `kv6` of every instance of
-    /// that model. Use [`set_sprites`](Self::set_sprites) to add/remove
+    /// Re-register one sprite model's geometry after you've edited its
+    /// content (a carve or recolour of its `kv6`). `model` is the
+    /// [`SpriteModelId`] handed back by [`set_sprites`](Self::set_sprites);
+    /// `kv6` is the model's **new** geometry — the caller owns the source
+    /// of truth (e.g. a dense carve grid the surface-only `kv6` can't
+    /// represent) and supplies the refreshed mesh here.
+    ///
+    /// This is a **backend-agnostic content refresh**, not a GPU upload:
+    /// the renderer brings its stored model up to date however its active
+    /// backend needs to. The instance set is left untouched (an edit never
+    /// moves or adds an instance), so on the GPU backend only that one
+    /// model's voxel data is re-uploaded — through a slack-backed
+    /// suballocator, one model's bytes rather than the whole registry —
+    /// while the CPU backend swaps the cached `kv6` into each instance of
+    /// the model. Use [`set_sprites`](Self::set_sprites) to add/remove
     /// models or change the instance set.
-    pub fn update_sprite_model(&mut self, model_index: usize, sprite: &Sprite) {
+    pub fn refresh_sprite_model(&mut self, model: SpriteModelId, kv6: &Kv6) {
         match &mut self.inner {
-            BackendImpl::Cpu(c) => c.update_sprite_model(model_index, sprite),
-            BackendImpl::Gpu(g) => g.update_sprite_model(model_index, sprite),
+            BackendImpl::Cpu(c) => c.update_sprite_model(model.0, kv6),
+            BackendImpl::Gpu(g) => g.update_sprite_model(model.0, kv6),
         }
     }
 
