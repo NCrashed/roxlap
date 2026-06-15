@@ -14,10 +14,10 @@ readme.workspace = true
 
 [dependencies]
 # Both backends + the scene/world types they consume.
-roxlap-core = { path = "../roxlap-core", version = "0.11" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.11" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.11" }
-roxlap-gpu = { path = "../roxlap-gpu", version = "0.11" }
+roxlap-core = { path = "../roxlap-core", version = "0.12" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.12" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.12" }
+roxlap-gpu = { path = "../roxlap-gpu", version = "0.12" }
 glam = { workspace = true }
 # CPU strip-parallel render thread count (caps the ScratchPool slots).
 # Runs on wasm too via wasm-bindgen-rayon (the host inits the pool).

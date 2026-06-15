@@ -7,8 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-06-16
+
+Two additive features, no breaking changes. The renderer gains a
+world-placed 2D **image-sprite** primitive — a flat RGBA texture drawn as
+a depth-composited quad in world space — and `roxlap-core` gains canonical
+right-handed `Camera` constructors so hosts stop hand-rolling (and
+mis-handing) the camera basis.
+
 ### Added
 
+- **World-placed 2D image sprites (`SceneRenderer::draw_images`).** A
+  renderer primitive that draws an RGBA texture as a flat quad positioned
+  in world space, composited with the scene depth buffer so voxel geometry
+  occludes it correctly (not a screen-space overlay, not a voxel slab).
+  Follows the `draw_lines` lineage: upload a texture once
+  (`upload_image` → `ImageId`, released by `drop_image`), then draw it
+  per frame between `render` and `present`/`paint_egui` from an
+  `ImageSprite { image, origin, facing, size, tint, depth_test,
+  double_sided }`, where `ImageFacing` is either world-fixed
+  (`World { u, v }`) or camera-facing (`Billboard { up }`). `origin` is
+  the top-left corner; `size` scales `u`/`v` (1 texel = 1 voxel for traced
+  pixel-art). UVs are perspective-correct on both backends (CPU: a
+  near-clipped textured-triangle rasteriser into the same framebuffer/
+  z-buffer; GPU: `image.wgsl`, re-homogenised quads + a manual depth test
+  against the scene-DDA `best_t`, nearest sampling, straight-alpha
+  over-blend). Depth-tested sprites are occluded with a bias to avoid
+  z-fighting on a coincident face; `double_sided: false` back-face-culls
+  world quads. The first consumer is the demiurg voxel editor's reference
+  overlay; the `scene-demo` `I` hotkey toggles a demo reference quad.
+- **`SceneRenderer::project_point` (`world → screen`).** The backend-correct
+  inverse of `view_ray`: projects a world point to window pixels under the
+  last frame's projection (CPU `setcamera` `hx/hy/hz`, GPU vertical-FOV
+  pinhole), so hosts never reconstruct it themselves.
 - **Canonical camera constructors `Camera::from_yaw_pitch`,
   `Camera::orbit`, and `Camera::look_at`.** All three build the
   right-handed `(right, down, forward)` basis the engine actually
