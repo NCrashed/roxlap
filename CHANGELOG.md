@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-06-15
+
+Multi-grid scenes get cheaper on both backends. The GPU renderer's
+16-grid-per-scene cap is gone (per-grid cameras moved to a runtime-sized
+storage buffer), and the CPU compositor now scissors each grid to its
+projected screen footprint instead of paying a full frame per grid. The
+only breaking change is the removal of the now-meaningless
+`roxlap_gpu::MAX_SCENE_GRIDS` constant.
+
 ### Performance
 
 - **Per-grid screen scissor for the CPU multi-grid compositor.**
