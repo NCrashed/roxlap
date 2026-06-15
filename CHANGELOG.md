@@ -34,8 +34,19 @@ mis-handing) the camera basis.
   against the scene-DDA `best_t`, nearest sampling, straight-alpha
   over-blend). Depth-tested sprites are occluded with a bias to avoid
   z-fighting on a coincident face; `double_sided: false` back-face-culls
-  world quads. The first consumer is the demiurg voxel editor's reference
-  overlay; the `scene-demo` `I` hotkey toggles a demo reference quad.
+  world quads. Each sprite carries an `alpha_cutoff` (texels below it are
+  discarded outright, not blended — crisp pixel-art edges, and the same
+  threshold defines pick-solidity). The first consumer is the demiurg
+  voxel editor's reference overlay; the `scene-demo` `I` hotkey toggles a
+  demo reference quad.
+- **`SceneRenderer::pick_image` (screen→sprite picking).** The nearest
+  image sprite under a window pixel, resolving which `uv` / source texel
+  was hit (`ImagePickHit`). Transparent texels (below `alpha_cutoff`) are
+  see-through — the pick passes through them to a sprite behind — and a
+  `depth_test` sprite occluded by nearer scene geometry is rejected
+  (shares `pick`'s depth convention). Lets an editor eyedrop a colour off
+  the reference or snap placement to its pixel grid; the GPU backend keeps
+  a CPU shadow copy of each upload for the alpha test.
 - **`SceneRenderer::project_point` (`world → screen`).** The backend-correct
   inverse of `view_ray`: projects a world point to window pixels under the
   last frame's projection (CPU `setcamera` `hx/hy/hz`, GPU vertical-FOV

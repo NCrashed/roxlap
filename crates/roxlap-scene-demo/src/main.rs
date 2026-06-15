@@ -509,6 +509,25 @@ fn make_reference_image() -> (Vec<u8>, u32, u32) {
     (rgba, N, N)
 }
 
+/// The demo's `I`-toggle reference sprite (shared by the draw + pick
+/// paths so they agree on placement): a 64×64 quad on the Front plane
+/// (normal +Y, u=+X, v=+Z) at 1 texel = 1 voxel, depth-tested + two-sided.
+fn demo_image_sprite(id: ImageId) -> ImageSprite {
+    ImageSprite {
+        image: id,
+        origin: [-32.0, 0.0, -64.0],
+        facing: ImageFacing::World {
+            u: [1.0, 0.0, 0.0],
+            v: [0.0, 0.0, 1.0],
+        },
+        size: [64.0, 64.0],
+        tint: 0xFFFF_FFFF,
+        alpha_cutoff: 0.0,
+        depth_test: true,
+        double_sided: true,
+    }
+}
+
 fn debug_overlay_lines() -> Vec<Line3> {
     const GROUND_Z: f64 = 199.0; // just above the surface (smaller z = up)
     let mut lines = Vec::new();
@@ -983,19 +1002,7 @@ impl App {
         // terrain occludes the parts behind it.
         if self.images_on {
             if let Some(id) = self.image_id {
-                let sprite = ImageSprite {
-                    image: id,
-                    origin: [-32.0, 0.0, -64.0],
-                    facing: ImageFacing::World {
-                        u: [1.0, 0.0, 0.0],
-                        v: [0.0, 0.0, 1.0],
-                    },
-                    size: [64.0, 64.0],
-                    tint: 0xFFFF_FFFF,
-                    depth_test: true,
-                    double_sided: true,
-                };
-                renderer.draw_images(&camera, &[sprite]);
+                renderer.draw_images(&camera, &[demo_image_sprite(id)]);
             }
         }
 
@@ -1411,6 +1418,22 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                // When the image sprite is shown, a left click reports the
+                // texel under the cursor via `pick_image` (alpha- and
+                // occlusion-aware) — the demiurg eyedropper/probe path.
+                if self.images_on {
+                    if let (Some(renderer), Some(id)) = (self.renderer.as_ref(), self.image_id) {
+                        let sprite = demo_image_sprite(id);
+                        let (mx, my) = self.mouse_px;
+                        match renderer.pick_image(&self.scene.camera, mx, my, &[sprite]) {
+                            Some(h) => eprintln!(
+                                "image hit: texel ({}, {}) uv ({:.3}, {:.3}) @ dist {:.1}",
+                                h.texel.0, h.texel.1, h.uv[0], h.uv[1], h.t,
+                            ),
+                            None => eprintln!("image hit: none (miss / transparent / occluded)"),
+                        }
+                    }
+                }
                 if self.pick_mode {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let (px, py) = (self.mouse_px.0 as u32, self.mouse_px.1 as u32);

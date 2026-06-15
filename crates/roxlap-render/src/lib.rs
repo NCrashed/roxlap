@@ -240,6 +240,12 @@ pub struct ImageSprite {
     /// `0xFFFFFFFF` draws the texture unchanged; the high byte scales
     /// the texel alpha (e.g. `0x80FFFFFF` = 50 % opacity).
     pub tint: u32,
+    /// Alpha cutoff in `0.0..=1.0`. Texels whose **own** alpha is below
+    /// this are discarded outright (not blended) — crisp pixel-art edges
+    /// instead of a semi-transparent haze, and the same threshold decides
+    /// what [`SceneRenderer::pick_image`] treats as solid. `0.0` keeps the
+    /// plain straight-alpha over-blend (every non-zero texel draws).
+    pub alpha_cutoff: f32,
     /// `true`: occluded by nearer rendered geometry (depth-tested against
     /// the frame's depth buffer, with a bias so a quad resting on a
     /// coincident voxel face doesn't z-fight). `false`: always on top.
@@ -261,6 +267,20 @@ pub(crate) struct QuadDraw {
     pub image: ImageId,
     pub tint: u32,
     pub depth_test: bool,
+    pub alpha_cutoff: f32,
+}
+
+/// Result of [`SceneRenderer::pick_image`] — a resolved screen→sprite hit.
+/// `uv` is the normalised position within the quad (`(0,0)` = top-left
+/// corner); `texel` is the matching source-image pixel; `world` is the
+/// hit point; `t` is its euclidean distance from the camera.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ImagePickHit {
+    pub image: ImageId,
+    pub uv: [f32; 2],
+    pub texel: (u32, u32),
+    pub world: [f32; 3],
+    pub t: f32,
 }
 
 /// Which renderer a [`SceneRenderer`] resolved to at construction.
@@ -308,6 +328,11 @@ impl Default for RenderOptions {
     }
 }
 
+/// Depth-test slack (same spirit as the backends' `DEPTH_BIAS`) so a
+/// [`SceneRenderer::pick_image`] hit on a sprite resting on a coincident
+/// voxel face isn't rejected as "occluded".
+const PICK_DEPTH_BIAS: f32 = 0.5;
+
 // --- image-sprite geometry helpers (shared by both backends) ---
 
 fn v_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -336,6 +361,49 @@ fn v_norm(a: [f32; 3]) -> [f32; 3] {
     } else {
         v_scale(a, 1.0 / len)
     }
+}
+
+/// Intersect a ray (`origin` + `dir`, `dir` un-normalised) with a quad
+/// `[TL, TR, BL, BR]` and return `(uv, t)` for a front/back hit inside
+/// the quad — `uv` in `0..=1` (`(0,0)` = `TL`), `t` the ray parameter
+/// (`hit = origin + dir·t`). `None` for a parallel ray, a hit behind the
+/// origin, a degenerate quad, or a hit outside the `u`/`v` span. Solves
+/// affine coords exactly for a (possibly skew) parallelogram. Standalone
+/// so the geometry is unit-testable without a renderer.
+fn ray_quad_uv(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    corners: &[[f32; 3]; 4],
+) -> Option<([f32; 2], f32)> {
+    let [tl, tr, bl, _br] = *corners;
+    let ue = v_sub(tr, tl); // +u edge (width)
+    let ve = v_sub(bl, tl); // +v edge (height)
+    let n = v_cross(ue, ve);
+    let denom = v_dot(dir, n);
+    if denom.abs() < 1e-12 {
+        return None; // ray parallel to the quad's plane
+    }
+    let t = v_dot(v_sub(tl, origin), n) / denom;
+    if t <= 1e-6 {
+        return None; // behind / at the origin
+    }
+    let p = v_add(origin, v_scale(dir, t));
+    let rel = v_sub(p, tl);
+    let guu = v_dot(ue, ue);
+    let guv = v_dot(ue, ve);
+    let gvv = v_dot(ve, ve);
+    let det = guu * gvv - guv * guv;
+    if det.abs() < 1e-12 {
+        return None; // degenerate quad
+    }
+    let wu = v_dot(rel, ue);
+    let wv = v_dot(rel, ve);
+    let a = (gvv * wu - guv * wv) / det;
+    let b = (guu * wv - guv * wu) / det;
+    if !(0.0..=1.0).contains(&a) || !(0.0..=1.0).contains(&b) {
+        return None; // outside the quad
+    }
+    Some(([a, b], t))
 }
 
 /// Resolve an [`ImageSprite`] into its four world corners (`TL, TR, BL,
@@ -401,6 +469,7 @@ fn resolve_quad(sprite: &ImageSprite, camera: &Camera) -> Option<QuadDraw> {
         image: sprite.image,
         tint: sprite.tint,
         depth_test: sprite.depth_test,
+        alpha_cutoff: sprite.alpha_cutoff,
     })
 }
 
@@ -642,6 +711,115 @@ impl SceneRenderer {
         match &self.inner {
             BackendImpl::Cpu(c) => c.project_point(camera, world),
             BackendImpl::Gpu(g) => g.project_point(camera, world),
+        }
+    }
+
+    /// Screen→sprite pick: the nearest [`ImageSprite`] hit under window
+    /// pixel `(x, y)`, resolving which texel was clicked. `sprites` is the
+    /// same list passed to [`draw_images`](Self::draw_images) (image
+    /// sprites are immediate-mode, so the caller owns the set). `None` for
+    /// a miss.
+    ///
+    /// The ray is intersected with each quad's plane and mapped to its
+    /// `uv` / source texel. A texel whose alpha is below the sprite's
+    /// [`ImageSprite::alpha_cutoff`] (and any fully-transparent texel) is
+    /// **see-through** — the pick passes through it to a sprite behind.
+    /// For [`depth_test`](ImageSprite::depth_test) sprites the hit is
+    /// rejected when nearer scene geometry occludes that pixel (shares the
+    /// depth convention + bias of [`pick`](Self::pick); on the GPU backend
+    /// the occlusion test costs a click-time depth readback).
+    #[must_use]
+    pub fn pick_image(
+        &self,
+        camera: &Camera,
+        x: f64,
+        y: f64,
+        sprites: &[ImageSprite],
+    ) -> Option<ImagePickHit> {
+        if sprites.is_empty() {
+            return None;
+        }
+        let dir = self.pixel_ray(camera, x, y)?;
+        let dir = [dir[0] as f32, dir[1] as f32, dir[2] as f32];
+        let dir_len = v_dot(dir, dir).sqrt();
+        if dir_len < 1e-9 {
+            return None;
+        }
+        let origin = [
+            camera.pos[0] as f32,
+            camera.pos[1] as f32,
+            camera.pos[2] as f32,
+        ];
+        // Scene surface distance under this pixel (sky / no-hit → None);
+        // used to occlude depth-tested sprites. Same metric as `pick`.
+        let scene_t = self.pick_depth(x as u32, y as u32);
+
+        let mut best: Option<ImagePickHit> = None;
+        for sprite in sprites {
+            // Reuse the render-path resolve (back-face cull included), so
+            // a single-sided quad that isn't drawn also can't be picked.
+            let Some(q) = resolve_quad(sprite, camera) else {
+                continue;
+            };
+            let Some(([a, b], t)) = ray_quad_uv(origin, dir, &q.corners) else {
+                continue; // miss / parallel / behind
+            };
+            let d_eucl = t * dir_len;
+            if best.is_some_and(|cur| d_eucl >= cur.t) {
+                continue; // a nearer sprite already won
+            }
+            let p = v_add(origin, v_scale(dir, t));
+
+            let Some((iw, ih)) = self.image_dims(sprite.image) else {
+                continue; // dropped / unknown image
+            };
+            let tx = ((a * iw as f32) as i32).clamp(0, iw as i32 - 1) as u32;
+            let ty = ((b * ih as f32) as i32).clamp(0, ih as i32 - 1) as u32;
+
+            // See-through test: a texel is solid when its alpha clears the
+            // cutoff (and a fully-transparent texel is never solid).
+            let cutoff_u8 = (sprite.alpha_cutoff.clamp(0.0, 1.0) * 255.0) as u32;
+            let solid_thresh = cutoff_u8.max(1);
+            if u32::from(self.image_alpha_at(sprite.image, tx, ty)) < solid_thresh {
+                continue;
+            }
+
+            // Occlusion: a depth-tested sprite behind nearer geometry loses.
+            if sprite.depth_test {
+                if let Some(st) = scene_t {
+                    if d_eucl > st + PICK_DEPTH_BIAS {
+                        continue;
+                    }
+                }
+            }
+
+            best = Some(ImagePickHit {
+                image: sprite.image,
+                uv: [a, b],
+                texel: (tx, ty),
+                world: p,
+                t: d_eucl,
+            });
+        }
+        best
+    }
+
+    /// Source dimensions of an uploaded image, or `None` if the id was
+    /// dropped / never uploaded. Internal helper for [`Self::pick_image`].
+    fn image_dims(&self, id: ImageId) -> Option<(u32, u32)> {
+        match &self.inner {
+            BackendImpl::Cpu(c) => c.image_dims(id),
+            BackendImpl::Gpu(g) => g.image_dims(id),
+        }
+    }
+
+    /// Alpha byte of texel `(tx, ty)` in an uploaded image (`0` for an
+    /// unknown id / out-of-range texel). Internal helper for
+    /// [`Self::pick_image`].
+    fn image_alpha_at(&self, id: ImageId, tx: u32, ty: u32) -> u8 {
+        match &self.inner {
+            BackendImpl::Cpu(c) => c.image_alpha_at(id, tx, ty),
+            BackendImpl::Gpu(g) => g.image_alpha_at(id, tx, ty),
         }
     }
 
@@ -908,6 +1086,7 @@ mod tests {
             },
             size: [10.0, 10.0],
             tint: 0xFFFF_FFFF,
+            alpha_cutoff: 0.0,
             depth_test: true,
             double_sided: true,
         };
@@ -931,6 +1110,7 @@ mod tests {
             },
             size: [10.0, 10.0],
             tint: 0xFFFF_FFFF,
+            alpha_cutoff: 0.0,
             depth_test: true,
             double_sided: false,
         };
@@ -957,6 +1137,7 @@ mod tests {
             },
             size: [10.0, 10.0],
             tint: 0xFFFF_FFFF,
+            alpha_cutoff: 0.0,
             depth_test: true,
             double_sided: true,
         };
@@ -966,6 +1147,43 @@ mod tests {
             v: [0.0, 0.0, 1.0],
         };
         assert!(resolve_quad(&sprite, &cam_looking_y()).is_some());
+    }
+
+    #[test]
+    fn ray_quad_uv_center_and_corners() {
+        // 10×10 quad on the y=10 plane: TL(-5,10,-5) u=+X v=+Z. Camera at
+        // origin looking +Y. A ray straight at the quad centre → uv (.5,.5).
+        let corners = [
+            [-5.0, 10.0, -5.0], // TL
+            [5.0, 10.0, -5.0],  // TR
+            [-5.0, 10.0, 5.0],  // BL
+            [5.0, 10.0, 5.0],   // BR
+        ];
+        let (uv, t) = ray_quad_uv([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], &corners).expect("center hit");
+        assert!(
+            (uv[0] - 0.5).abs() < 1e-5 && (uv[1] - 0.5).abs() < 1e-5,
+            "centre → (.5,.5)"
+        );
+        assert!((t - 10.0).abs() < 1e-4, "t = plane distance");
+        // Ray toward the TL corner texel region (−x, +y, −z) → uv near (0,0).
+        let (uv_tl, _) = ray_quad_uv([0.0, 0.0, 0.0], [-4.0, 10.0, -4.0], &corners).unwrap();
+        assert!(uv_tl[0] < 0.2 && uv_tl[1] < 0.2, "toward TL → small uv");
+    }
+
+    #[test]
+    fn ray_quad_uv_misses_outside_and_behind() {
+        let corners = [
+            [-5.0, 10.0, -5.0],
+            [5.0, 10.0, -5.0],
+            [-5.0, 10.0, 5.0],
+            [5.0, 10.0, 5.0],
+        ];
+        // Ray pointing away (−Y) never reaches the +Y plane in front.
+        assert!(ray_quad_uv([0.0, 0.0, 0.0], [0.0, -1.0, 0.0], &corners).is_none());
+        // Ray parallel to the quad plane (in +X) → no intersection.
+        assert!(ray_quad_uv([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], &corners).is_none());
+        // Ray hitting the plane far outside the quad → outside uv.
+        assert!(ray_quad_uv([100.0, 0.0, 0.0], [0.0, 1.0, 0.0], &corners).is_none());
     }
 
     #[test]
@@ -979,6 +1197,7 @@ mod tests {
             facing: ImageFacing::Billboard { up },
             size: [4.0, 4.0],
             tint: 0xFFFF_FFFF,
+            alpha_cutoff: 0.0,
             depth_test: false,
             double_sided: false, // billboards must NEVER cull
         };

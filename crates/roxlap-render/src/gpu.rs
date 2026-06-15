@@ -91,6 +91,11 @@ pub(crate) struct GpuBackend {
     /// Last `sky_color` auto-uploaded under the parity path above —
     /// re-uploads the 1×1 texture only when it changes.
     auto_sky_color: Option<u32>,
+    /// CPU shadow copy of each uploaded image (`rgba`, `w`, `h`), keyed by
+    /// the [`ImageId`] `roxlap-gpu` hands back. The GPU texture isn't read
+    /// back, so `pick_image`'s alpha test samples this instead. Indexed by
+    /// id (resized on demand); a dropped slot is `None`.
+    image_pixels: Vec<Option<(Vec<u8>, u32, u32)>>,
 }
 
 impl GpuBackend {
@@ -113,6 +118,7 @@ impl GpuBackend {
             carve_z: 0,
             host_sky_set: false,
             auto_sky_color: None,
+            image_pixels: Vec::new(),
         }
     }
 
@@ -485,14 +491,48 @@ impl GpuBackend {
         self.gpu.draw_lines_deferred(&cam, &glines);
     }
 
-    /// Upload (or replace) an RGBA8 image-sprite texture.
+    /// Upload (or replace) an RGBA8 image-sprite texture, keeping a CPU
+    /// shadow copy so `pick_image`'s alpha test can sample it (the GPU
+    /// texture isn't read back).
     pub(crate) fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> ImageId {
-        ImageId(self.gpu.upload_image(rgba, width, height))
+        let id = self.gpu.upload_image(rgba, width, height);
+        let valid =
+            width != 0 && height != 0 && rgba.len() == (width as usize) * (height as usize) * 4;
+        let shadow = valid.then(|| (rgba.to_vec(), width, height));
+        if id >= self.image_pixels.len() {
+            self.image_pixels.resize_with(id + 1, || None);
+        }
+        self.image_pixels[id] = shadow;
+        ImageId(id)
     }
 
     /// Release a previously uploaded image-sprite texture.
     pub(crate) fn drop_image(&mut self, id: ImageId) {
         self.gpu.drop_image(id.0);
+        if let Some(slot) = self.image_pixels.get_mut(id.0) {
+            *slot = None;
+        }
+    }
+
+    /// Source `(width, height)` of an uploaded image, for `pick_image`.
+    pub(crate) fn image_dims(&self, id: ImageId) -> Option<(u32, u32)> {
+        self.image_pixels
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|(_, w, h)| (*w, *h))
+    }
+
+    /// Alpha byte of texel `(tx, ty)` from the shadow copy; `0` for an
+    /// unknown id / out-of-range texel.
+    pub(crate) fn image_alpha_at(&self, id: ImageId, tx: u32, ty: u32) -> u8 {
+        let Some(Some((rgba, w, h))) = self.image_pixels.get(id.0) else {
+            return 0;
+        };
+        if tx >= *w || ty >= *h {
+            return 0;
+        }
+        let idx = ((ty * w + tx) * 4 + 3) as usize;
+        rgba.get(idx).copied().unwrap_or(0)
     }
 
     /// Project a world point to window pixels under the marcher's
@@ -535,6 +575,7 @@ impl GpuBackend {
                     image: q.image.0,
                     tint: [r, g, b, a],
                     depth_test: q.depth_test,
+                    alpha_cutoff: q.alpha_cutoff,
                 }
             })
             .collect();

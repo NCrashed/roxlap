@@ -157,7 +157,10 @@ fn fill_textured_tri(
     image: &CpuImage,
     tint: u32,
     depth_test: bool,
+    alpha_cutoff: f32,
 ) {
+    // Texels with alpha below this are discarded outright (crisp edges).
+    let cutoff_u8 = (alpha_cutoff.clamp(0.0, 1.0) * 255.0) as u32;
     // Signed area (== barycentric denominator); skip degenerate slivers.
     let det = (v1.sx - v0.sx) * (v2.sy - v0.sy) - (v2.sx - v0.sx) * (v1.sy - v0.sy);
     if det.abs() < 1e-6 {
@@ -208,6 +211,9 @@ fn fill_textured_tri(
             let u = (b0 * v0.su + b1 * v1.su + b2 * v2.su) * fwd;
             let v = (b0 * v0.sv + b1 * v1.sv + b2 * v2.sv) * fwd;
             let (tr, tg, tb, ta) = image.sample(u, v);
+            if ta < cutoff_u8 {
+                continue; // below the alpha cutoff — discard, don't blend
+            }
 
             // Combine texel alpha with the tint's alpha byte.
             let alpha = ta * tint_a / 255;
@@ -735,6 +741,26 @@ impl CpuBackend {
         }
     }
 
+    /// Source `(width, height)` of an uploaded image, for `pick_image`.
+    pub(crate) fn image_dims(&self, id: ImageId) -> Option<(u32, u32)> {
+        self.images
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|img| (img.width, img.height))
+    }
+
+    /// Alpha byte of texel `(tx, ty)`; `0` for an unknown id / out-of-range.
+    pub(crate) fn image_alpha_at(&self, id: ImageId, tx: u32, ty: u32) -> u8 {
+        let Some(Some(img)) = self.images.get(id.0) else {
+            return 0;
+        };
+        if tx >= img.width || ty >= img.height {
+            return 0;
+        }
+        let idx = ((ty * img.width + tx) * 4 + 3) as usize;
+        img.rgba.get(idx).copied().unwrap_or(0)
+    }
+
     /// Project a world point to window pixels under the last frame's
     /// `setcamera` projection. See [`SceneRenderer::project_point`].
     pub(crate) fn project_point(&self, camera: &Camera, world: [f32; 3]) -> Option<(f32, f32)> {
@@ -835,6 +861,7 @@ impl CpuBackend {
                         image,
                         quad.tint,
                         quad.depth_test,
+                        quad.alpha_cutoff,
                     );
                 }
             }
@@ -966,6 +993,10 @@ mod image_raster_tests {
     /// Render a screen-aligned quad (constant forward depth) over a 10×10
     /// framebuffer from a 2×2 colour image and read back corner pixels.
     fn render_quad(depth_test: bool, zb_fill: f32) -> Vec<u32> {
+        render_quad_cutoff(depth_test, zb_fill, 0.0)
+    }
+
+    fn render_quad_cutoff(depth_test: bool, zb_fill: f32, alpha_cutoff: f32) -> Vec<u32> {
         // 2×2: TL red, TR green, BL blue, BR white (row-major RGBA8).
         let rgba = vec![
             255, 0, 0, 255, /* (0,0) */ 0, 255, 0, 255, /* (1,0) */
@@ -1006,6 +1037,7 @@ mod image_raster_tests {
                 &image,
                 0xFFFF_FFFF,
                 depth_test,
+                alpha_cutoff,
             );
         }
         fb
@@ -1035,6 +1067,59 @@ mod image_raster_tests {
         // Geometry behind the quad (z-buffer at 100) → quad draws.
         let fb = render_quad(true, 100.0);
         assert!(fb.iter().any(|&p| p != 0), "unoccluded quad draws");
+    }
+
+    /// A half-transparent (alpha 100) texel draws below its cutoff and is
+    /// discarded above it.
+    #[test]
+    fn alpha_cutoff_discards_below_threshold() {
+        let image = CpuImage {
+            rgba: vec![255, 255, 255, 100], // white, alpha 100/255
+            width: 1,
+            height: 1,
+        };
+        let render = |cutoff: f32| {
+            let (w, h) = (4u32, 4u32);
+            let mut fb = vec![0u32; (w * h) as usize];
+            let zb = vec![f32::INFINITY; (w * h) as usize];
+            let iw = 0.1f32;
+            let sv = |sx: f32, sy: f32, u: f32, v: f32| ScreenVert {
+                sx,
+                sy,
+                inv_w: iw,
+                su: u * iw,
+                sv: v * iw,
+            };
+            let tl = sv(0.0, 0.0, 0.0, 0.0);
+            let tr = sv(4.0, 0.0, 1.0, 0.0);
+            let bl = sv(0.0, 4.0, 0.0, 1.0);
+            let br = sv(4.0, 4.0, 1.0, 1.0);
+            for tri in [[tl, tr, bl], [tr, br, bl]] {
+                fill_textured_tri(
+                    &mut fb,
+                    &zb,
+                    w,
+                    h,
+                    &tri[0],
+                    &tri[1],
+                    &tri[2],
+                    &image,
+                    0xFFFF_FFFF,
+                    false,
+                    cutoff,
+                );
+            }
+            fb
+        };
+        // 100/255 ≈ 0.39 — below 0.3 draws, above 0.5 is discarded.
+        assert!(
+            render(0.3).iter().any(|&p| p != 0),
+            "alpha 100 > cutoff 0.3 draws"
+        );
+        assert!(
+            render(0.5).iter().all(|&p| p == 0),
+            "alpha 100 < cutoff 0.5 discarded"
+        );
     }
 }
 

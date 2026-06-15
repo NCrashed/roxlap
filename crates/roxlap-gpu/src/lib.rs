@@ -324,6 +324,9 @@ pub struct GpuImageQuad {
     pub image: usize,
     pub tint: [f32; 4],
     pub depth_test: bool,
+    /// Texels with alpha below this (`0..=1`) are discarded in the FS.
+    /// `0.0` keeps the plain over-blend.
+    pub alpha_cutoff: f32,
 }
 
 /// One expanded textured-quad vertex (`build_image_vertices` output).
@@ -338,6 +341,7 @@ struct ImageVertex {
     w: f32,
     depth: f32,
     depth_test: f32,
+    cutoff: f32,
     uv: [f32; 2],
     tint: [f32; 4],
 }
@@ -432,6 +436,7 @@ fn build_image_vertices(
             w: cz,
             depth: (cx * cx + cy * cy + cz * cz).sqrt(),
             depth_test: dt,
+            cutoff: quad.alpha_cutoff,
             uv: v.uv,
             tint: quad.tint,
         }
@@ -2728,8 +2733,9 @@ impl GpuRenderer {
                             1 => Float32,   // w
                             2 => Float32,   // depth
                             3 => Float32,   // depth_test
-                            4 => Float32x2, // uv
-                            5 => Float32x4, // tint
+                            4 => Float32,   // cutoff
+                            5 => Float32x2, // uv
+                            6 => Float32x4, // tint
                         ],
                     }],
                 },
@@ -3935,6 +3941,7 @@ mod pixel_ray_tests {
             image: 0,
             tint: [1.0, 1.0, 1.0, 1.0],
             depth_test: true,
+            alpha_cutoff: 0.0,
         };
         let verts = crate::build_image_vertices(&cam, &quad, 800, 600, 60_f32.to_radians());
         assert_eq!(verts.len(), 6, "two triangles, no near-clip");

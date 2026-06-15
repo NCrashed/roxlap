@@ -32,8 +32,9 @@ struct VsIn {
     @location(1) w: f32,
     @location(2) depth: f32,
     @location(3) depth_test: f32,
-    @location(4) uv: vec2<f32>,
-    @location(5) tint: vec4<f32>,
+    @location(4) cutoff: f32,
+    @location(5) uv: vec2<f32>,
+    @location(6) tint: vec4<f32>,
 };
 
 struct VsOut {
@@ -42,6 +43,7 @@ struct VsOut {
     @location(1) tint: vec4<f32>,
     @location(2) depth: f32,
     @location(3) depth_test: f32,
+    @location(4) cutoff: f32,
 };
 
 @vertex
@@ -55,6 +57,7 @@ fn vs_main(in: VsIn) -> VsOut {
     o.tint = in.tint;
     o.depth = in.depth;
     o.depth_test = in.depth_test;
+    o.cutoff = in.cutoff;
     return o;
 }
 
@@ -71,6 +74,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
     let texel = textureSample(img_tex, img_samp, in.uv);
+    // Alpha cutoff: discard below-threshold texels (crisp pixel-art edges).
+    if (texel.a < in.cutoff) {
+        discard;
+    }
     // Straight alpha in; the pipeline's ALPHA_BLENDING does the over-blend.
     return vec4<f32>(texel.rgb * in.tint.rgb, texel.a * in.tint.a);
 }
