@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
 pub use billboard::{canonical_viewpoints, BillboardCache, BillboardSnapshot};
+pub use edit::SpanOp;
 pub use lod::{select_lod, Lod, LodThresholds};
 pub use streaming::{ChunkGenerator, StreamRadius};
 

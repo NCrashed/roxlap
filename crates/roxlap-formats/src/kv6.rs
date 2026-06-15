@@ -31,6 +31,7 @@
 //! it so byte equality holds.
 
 use core::fmt;
+use std::collections::HashMap;
 
 use crate::bytes::{Cursor, OutOfBounds};
 use crate::Rgb6;
@@ -298,6 +299,106 @@ impl Kv6 {
         }
     }
 
+    /// Map of every stored surface voxel's local `(x, y, z)` to its
+    /// colour, decoded from the run tables. Used by
+    /// [`Kv6::carve_sphere_with_colfunc`] to keep surviving surface
+    /// voxels at their authored colour while the cut repaints only the
+    /// freshly-exposed ones.
+    fn surface_color_map(&self) -> HashMap<(u32, u32, u32), u32> {
+        let mut map = HashMap::with_capacity(self.voxels.len());
+        let mut vi = 0usize;
+        for x in 0..self.xsiz as usize {
+            for y in 0..self.ysiz as usize {
+                let len = self.ylen[x][y] as usize;
+                for _ in 0..len {
+                    let v = self.voxels[vi];
+                    #[allow(clippy::cast_lossless)]
+                    map.insert((x as u32, y as u32, u32::from(v.z)), v.col);
+                    vi += 1;
+                }
+            }
+        }
+        map
+    }
+
+    /// Carve a sphere out of this model and control the colour of the
+    /// interior the cut exposes — the sprite counterpart of
+    /// [`roxlap_scene::Grid::set_sphere_with_colfunc`] /
+    /// [`crate::edit::set_sphere_with_colfunc`].
+    ///
+    /// **Why a `solid` predicate is required.** A `.kv6` stores only
+    /// its *surface* hull — fully-enclosed interior voxels are not
+    /// recorded (see [`Kv6::from_fn`]). A carve must therefore know the
+    /// model's *full* occupancy to expose meaningful interior walls,
+    /// which the data alone can't provide. The caller supplies it via
+    /// `solid(x, y, z) -> bool` in kv6-local voxel coords (e.g. the
+    /// same predicate used to build the model with
+    /// [`Kv6::from_fn_shaded`]). `solid` must report `true` for at
+    /// least every stored surface voxel.
+    ///
+    /// Behaviour:
+    /// - Voxels inside the sphere (`dx²+dy²+dz² <= r²`, matching
+    ///   [`crate::edit::set_sphere`]) become air.
+    /// - Voxels the cut newly exposes get their colour from
+    ///   `colfunc(x, y, z)` (kv6-local coords, voxlap-packed
+    ///   `0x80RRGGBB`). Pass `|_, _, _| col` for a flat crater colour.
+    /// - Voxels that were already on the surface keep their stored
+    ///   colour.
+    ///
+    /// `centre` / `radius` are in kv6-local voxel units. Dimensions,
+    /// pivot, and palette are preserved; the model is re-extracted with
+    /// real per-voxel normals + face visibility (as
+    /// [`Kv6::from_fn_shaded`]).
+    ///
+    /// [`roxlap_scene::Grid::set_sphere_with_colfunc`]: https://docs.rs/roxlap-scene
+    pub fn carve_sphere_with_colfunc<S, C>(
+        &mut self,
+        centre: [i32; 3],
+        radius: u32,
+        solid: S,
+        colfunc: C,
+    ) where
+        S: Fn(i32, i32, i32) -> bool,
+        C: Fn(i32, i32, i32) -> u32,
+    {
+        let orig = self.surface_color_map();
+        // Preserve identity fields the rebuild would otherwise reset.
+        let (xpiv, ypiv, zpiv) = (self.xpiv, self.ypiv, self.zpiv);
+        let palette = self.palette;
+
+        #[allow(clippy::cast_possible_wrap)]
+        let r = radius as i32;
+        let r_sq = r * r;
+        let (cx, cy, cz) = (centre[0], centre[1], centre[2]);
+        let inside = |x: i32, y: i32, z: i32| {
+            let (dx, dy, dz) = (x - cx, y - cy, z - cz);
+            dx * dx + dy * dy + dz * dz <= r_sq
+        };
+
+        let rebuilt = Kv6::from_fn_shaded(self.xsiz, self.ysiz, self.zsiz, |x, y, z| {
+            #[allow(clippy::cast_possible_wrap)]
+            let (xi, yi, zi) = (x as i32, y as i32, z as i32);
+            if inside(xi, yi, zi) || !solid(xi, yi, zi) {
+                return None;
+            }
+            // Surviving surface voxels keep their authored colour;
+            // anything else solid here is freshly exposed → colfunc.
+            Some(
+                orig.get(&(x, y, z))
+                    .copied()
+                    .unwrap_or_else(|| colfunc(xi, yi, zi)),
+            )
+        });
+
+        self.voxels = rebuilt.voxels;
+        self.xlen = rebuilt.xlen;
+        self.ylen = rebuilt.ylen;
+        self.xpiv = xpiv;
+        self.ypiv = ypiv;
+        self.zpiv = zpiv;
+        self.palette = palette;
+    }
+
     /// A solid axis-aligned box of a single colour (voxlap-packed
     /// `0x80RRGGBB`). Convenience over [`Kv6::from_fn`].
     #[must_use]
@@ -555,6 +656,76 @@ mod tests {
             .sum();
         assert_eq!(xlen_sum, cube.voxels.len());
         assert_eq!(ylen_sum, cube.voxels.len());
+    }
+
+    /// Decode the colour stored at local `(tx, ty, tz)`, or `None` if
+    /// no surface voxel sits there.
+    fn color_at(kv6: &Kv6, tx: u32, ty: u32, tz: u32) -> Option<u32> {
+        let mut vi = 0usize;
+        for x in 0..kv6.xsiz {
+            for y in 0..kv6.ysiz {
+                let len = kv6.ylen[x as usize][y as usize] as usize;
+                for _ in 0..len {
+                    let v = kv6.voxels[vi];
+                    if x == tx && y == ty && u32::from(v.z) == tz {
+                        return Some(v.col);
+                    }
+                    vi += 1;
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn carve_sphere_exposes_interior_with_colfunc() {
+        const BASE: u32 = 0x8011_2233;
+        // A full solid 16³ cube — its occupancy predicate is "all".
+        let mut cube = Kv6::from_fn_shaded(16, 16, 16, |_, _, _| Some(BASE));
+        // Custom pivot to verify carve preserves it.
+        cube.xpiv = 1.0;
+        cube.ypiv = 2.0;
+        cube.zpiv = 3.0;
+
+        // colfunc encodes kv6-local coords into the low 24 bits so we
+        // can assert the closure sees local (not some shifted) coords.
+        let encode = |x: i32, y: i32, z: i32| ((x << 16) | (y << 8) | z) as u32;
+        cube.carve_sphere_with_colfunc([8, 8, 8], 4, |_, _, _| true, encode);
+
+        // Sphere centre removed.
+        assert_eq!(color_at(&cube, 8, 8, 8), None);
+        // (8,8,3) sits just below the carved range (its +z neighbour
+        // (8,8,4) is carved): solid, freshly exposed → colfunc colour
+        // at its LOCAL coords.
+        assert_eq!(color_at(&cube, 8, 8, 3), Some(encode(8, 8, 3)));
+        // An original face voxel far from the cut keeps its colour.
+        assert_eq!(color_at(&cube, 0, 8, 8), Some(BASE));
+
+        // Pivot preserved across the rebuild.
+        assert!((cube.xpiv - 1.0).abs() < f32::EPSILON);
+        assert!((cube.ypiv - 2.0).abs() < f32::EPSILON);
+        assert!((cube.zpiv - 3.0).abs() < f32::EPSILON);
+
+        // Run tables stay consistent with the voxel list.
+        let xlen_sum: usize = cube.xlen.iter().map(|&n| n as usize).sum();
+        assert_eq!(xlen_sum, cube.voxels.len());
+    }
+
+    #[test]
+    fn carve_sphere_respects_caller_solid_predicate() {
+        const BASE: u32 = 0x80AA_BBCC;
+        // Build from a half-solid predicate (only x < 8 solid), and
+        // pass the SAME predicate as `solid`. A carve centred in the
+        // solid half must not resurrect the air half.
+        let solid = |x: i32, _y: i32, _z: i32| (0..8).contains(&x);
+        #[allow(clippy::cast_sign_loss)]
+        let mut m =
+            Kv6::from_fn_shaded(16, 16, 16, |x, _, _| solid(x as i32, 0, 0).then_some(BASE));
+        m.carve_sphere_with_colfunc([4, 8, 8], 3, solid, |_, _, _| 0x8000_FF00);
+        // Air half stays air (never solid → never emitted).
+        assert_eq!(color_at(&m, 12, 8, 8), None);
+        // Carved centre gone.
+        assert_eq!(color_at(&m, 4, 8, 8), None);
     }
 
     #[test]

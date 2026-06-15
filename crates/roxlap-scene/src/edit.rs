@@ -18,10 +18,18 @@
 //! carving from already-air voxels is a no-op.
 
 use glam::IVec3;
-use roxlap_formats::edit::{set_cube, set_rect, set_sphere};
+use roxlap_formats::edit::{
+    set_cube, set_rect, set_rect_with_colfunc, set_sphere, set_sphere_with_colfunc,
+};
 
 use crate::addr::{voxel_split, GridLocalPos};
 use crate::{Grid, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+
+/// Re-export of [`roxlap_formats::edit::SpanOp`] so scene callers can
+/// name the add-vs-carve flag without depending on `roxlap-formats`
+/// directly. Used by [`Grid::set_sphere_with_colfunc`] /
+/// [`Grid::set_rect_with_colfunc`].
+pub use roxlap_formats::edit::SpanOp;
 
 /// Per-axis chunk size as an [`IVec3`]. Duplicated from
 /// [`crate::addr`]'s private helper; kept local because exposing
@@ -144,6 +152,120 @@ impl Grid {
                     let chunk_origin = chunk_idx * cs;
                     let local_centre = centre - chunk_origin;
                     apply_set_sphere(self, chunk_idx, local_centre, radius, color);
+                }
+            }
+        }
+    }
+
+    /// Carve or insert a sphere with a per-voxel colour callback —
+    /// the colfunc counterpart of [`Grid::set_sphere`], forwarding to
+    /// [`roxlap_formats::edit::set_sphere_with_colfunc`].
+    ///
+    /// Use this (with [`SpanOp::Carve`]) to control the colour of the
+    /// interior surface a carve newly exposes: a plain `set_sphere`
+    /// carve paints those walls colour `0` (black), whereas this lets
+    /// the closure return a crater colour, a depth gradient, jitter,
+    /// or a texture lookup. With [`SpanOp::Insert`] the closure colours
+    /// the inserted voxels.
+    ///
+    /// `colfunc(x, y, z)` receives **grid-local** voxel coordinates
+    /// (not chunk-local) and returns a voxlap-packed BGRA colour as
+    /// `i32` — the per-chunk decomposition translates coordinates back
+    /// to grid-local before invoking the closure, so a position- or
+    /// depth-dependent colour stays continuous across chunk seams.
+    ///
+    /// Like [`Grid::set_sphere`]: [`SpanOp::Insert`] materialises
+    /// missing chunks; [`SpanOp::Carve`] skips chunks that don't yet
+    /// exist (carving implicit air is a no-op).
+    pub fn set_sphere_with_colfunc<F>(
+        &mut self,
+        centre: IVec3,
+        radius: u32,
+        op: SpanOp,
+        mut colfunc: F,
+    ) where
+        F: FnMut(i32, i32, i32) -> i32,
+    {
+        // S6.2: edit invalidates billboard cache (see set_voxel doc).
+        self.billboards = None;
+        #[allow(clippy::cast_possible_wrap)]
+        let r_i = radius as i32;
+        let lo = centre - IVec3::splat(r_i);
+        let hi = centre + IVec3::splat(r_i);
+        let (lo_c, _) = voxel_split(lo);
+        let (hi_c, _) = voxel_split(hi);
+        let cs = chunk_size_ivec3();
+        let inserting = op == SpanOp::Insert;
+
+        for cz in lo_c.z..=hi_c.z {
+            for cy in lo_c.y..=hi_c.y {
+                for cx in lo_c.x..=hi_c.x {
+                    let chunk_idx = IVec3::new(cx, cy, cz);
+                    let chunk_origin = chunk_idx * cs;
+                    let local_centre = centre - chunk_origin;
+                    let (ox, oy, oz) = (chunk_origin.x, chunk_origin.y, chunk_origin.z);
+                    // Translate chunk-local coords back to grid-local
+                    // so the user's closure sees a continuous frame.
+                    let mut shim = |lx: i32, ly: i32, lz: i32| colfunc(lx + ox, ly + oy, lz + oz);
+                    let mut wrote = false;
+                    if inserting {
+                        let vxl = self.ensure_chunk(chunk_idx);
+                        set_sphere_with_colfunc(vxl, local_centre.into(), radius, op, &mut shim);
+                        wrote = true;
+                    } else if let Some(vxl) = self.chunks.get_mut(&chunk_idx) {
+                        set_sphere_with_colfunc(vxl, local_centre.into(), radius, op, &mut shim);
+                        wrote = true;
+                    }
+                    if wrote {
+                        self.bump_chunk_version(chunk_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Carve or insert an axis-aligned box `[lo, hi]` (inclusive) with
+    /// a per-voxel colour callback — the colfunc counterpart of
+    /// [`Grid::set_rect`], forwarding to
+    /// [`roxlap_formats::edit::set_rect_with_colfunc`]. See
+    /// [`Grid::set_sphere_with_colfunc`] for the coordinate and
+    /// chunk-materialisation contract; `colfunc` likewise receives
+    /// grid-local coordinates.
+    pub fn set_rect_with_colfunc<F>(&mut self, lo: IVec3, hi: IVec3, op: SpanOp, mut colfunc: F)
+    where
+        F: FnMut(i32, i32, i32) -> i32,
+    {
+        // S6.2: edit invalidates billboard cache (see set_voxel doc).
+        self.billboards = None;
+        let lo_n = lo.min(hi);
+        let hi_n = lo.max(hi);
+        let (lo_c, _) = voxel_split(lo_n);
+        let (hi_c, _) = voxel_split(hi_n);
+        let cs = chunk_size_ivec3();
+        let inserting = op == SpanOp::Insert;
+
+        for cz in lo_c.z..=hi_c.z {
+            for cy in lo_c.y..=hi_c.y {
+                for cx in lo_c.x..=hi_c.x {
+                    let chunk_idx = IVec3::new(cx, cy, cz);
+                    let chunk_origin = chunk_idx * cs;
+                    let chunk_end = chunk_origin + cs - IVec3::ONE;
+                    let local_lo = lo_n.max(chunk_origin) - chunk_origin;
+                    let local_hi = hi_n.min(chunk_end) - chunk_origin;
+                    let (ox, oy, oz) = (chunk_origin.x, chunk_origin.y, chunk_origin.z);
+                    let mut shim = |lx: i32, ly: i32, lz: i32| colfunc(lx + ox, ly + oy, lz + oz);
+                    let mut wrote = false;
+                    if inserting {
+                        let vxl = self.ensure_chunk(chunk_idx);
+                        set_rect_with_colfunc(vxl, local_lo.into(), local_hi.into(), op, &mut shim);
+                        wrote = true;
+                    } else if let Some(vxl) = self.chunks.get_mut(&chunk_idx) {
+                        set_rect_with_colfunc(vxl, local_lo.into(), local_hi.into(), op, &mut shim);
+                        wrote = true;
+                    }
+                    if wrote {
+                        self.bump_chunk_version(chunk_idx);
+                    }
                 }
             }
         }
@@ -492,6 +614,120 @@ mod tests {
         g.set_rect(IVec3::new(126, 0, 0), IVec3::new(129, 0, 0), None);
         assert_eq!(g.chunk_version(IVec3::ZERO), 2);
         assert_eq!(g.chunk_version(IVec3::new(1, 0, 0)), 0);
+    }
+
+    // ---- variant (a): colfunc carve/insert on Grid ----
+
+    /// Carving a sphere with a colfunc paints the newly-exposed
+    /// interior walls with the closure's colour, whereas a plain
+    /// `set_sphere(None)` carve leaves them colour 0 (read back as
+    /// `None` / untextured by `voxel_color`).
+    #[test]
+    fn set_sphere_with_colfunc_paints_exposed_interior() {
+        const CRATER: i32 = 0x00_44_55_66;
+        // A solid block; (64,64,55) starts as a buried interior voxel.
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_rect(
+            IVec3::new(40, 40, 40),
+            IVec3::new(90, 90, 90),
+            Some(TEST_COL),
+        );
+        assert!(g.voxel_color(IVec3::new(64, 64, 55)).is_none()); // interior: not a surface texel yet
+
+        g.set_sphere_with_colfunc(IVec3::new(64, 64, 64), 8, SpanOp::Carve, |_x, _y, _z| {
+            CRATER
+        });
+
+        // Centre carved away.
+        assert!(!g.voxel_solid(IVec3::new(64, 64, 64)));
+        // (64,64,55) is just below the carved z-range [56,72]: still
+        // solid, now exposed upward, and painted CRATER.
+        assert!(g.voxel_solid(IVec3::new(64, 64, 55)));
+        assert_eq!(g.voxel_color(IVec3::new(64, 64, 55)), Some(CRATER as u32));
+
+        // Contrast: a plain None-carve exposes the same voxel as
+        // solid-but-black (voxel_color → None).
+        let mut g2 = Grid::new(GridTransform::identity());
+        g2.set_rect(
+            IVec3::new(40, 40, 40),
+            IVec3::new(90, 90, 90),
+            Some(TEST_COL),
+        );
+        g2.set_sphere(IVec3::new(64, 64, 64), 8, None);
+        assert!(g2.voxel_solid(IVec3::new(64, 64, 55)));
+        assert_eq!(g2.voxel_color(IVec3::new(64, 64, 55)), None);
+    }
+
+    /// The colfunc must receive **grid-local** coordinates, not the
+    /// per-chunk-local coordinates the decomposition uses internally.
+    /// Carve a sphere straddling the x=128 chunk seam and encode the
+    /// coordinate into the colour: an exposed voxel in chunk (1,0,0)
+    /// must read back its grid-local position, not its chunk-local one.
+    #[test]
+    fn set_sphere_with_colfunc_uses_grid_local_coords_across_chunks() {
+        // Encode grid-local (x,y,z) into the low 24 bits.
+        #[allow(clippy::cast_sign_loss)]
+        let encode = |x: i32, y: i32, z: i32| (x << 16) | (y << 8) | z;
+
+        let mut g = Grid::new(GridTransform::identity());
+        // Solid block spanning chunks (0,0,0) and (1,0,0) (seam at 128).
+        g.set_rect(
+            IVec3::new(120, 60, 60),
+            IVec3::new(140, 80, 80),
+            Some(TEST_COL),
+        );
+        // Centre on the seam; reaches into chunk 1 (+x side).
+        g.set_sphere_with_colfunc(IVec3::new(128, 70, 70), 5, SpanOp::Carve, |x, y, z| {
+            encode(x, y, z)
+        });
+
+        // Column (130,70) in chunk 1 (local x=2) carves z∈[66,74];
+        // z=65 is just below → exposed, solid, painted with its
+        // GRID-LOCAL coords. The chunk-local bug would store
+        // encode(2,70,65) instead.
+        let p = IVec3::new(130, 70, 65);
+        assert!(g.voxel_solid(p));
+        #[allow(clippy::cast_sign_loss)]
+        let want = encode(130, 70, 65) as u32;
+        assert_eq!(g.voxel_color(p), Some(want));
+        // Sanity: it is NOT the chunk-local encoding.
+        #[allow(clippy::cast_sign_loss)]
+        let chunk_local = encode(2, 70, 65) as u32;
+        assert_ne!(g.voxel_color(p), Some(chunk_local));
+    }
+
+    #[test]
+    fn set_rect_with_colfunc_carve_paints_exposed_face() {
+        const WALL: i32 = 0x00_12_34_56;
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_rect(
+            IVec3::new(40, 40, 40),
+            IVec3::new(90, 90, 90),
+            Some(TEST_COL),
+        );
+        // Carve a box out of the middle; (64,64,49) sits just below it.
+        g.set_rect_with_colfunc(
+            IVec3::new(50, 50, 50),
+            IVec3::new(80, 80, 80),
+            SpanOp::Carve,
+            |_x, _y, _z| WALL,
+        );
+        assert!(!g.voxel_solid(IVec3::new(64, 64, 64)));
+        assert!(g.voxel_solid(IVec3::new(64, 64, 49)));
+        assert_eq!(g.voxel_color(IVec3::new(64, 64, 49)), Some(WALL as u32));
+    }
+
+    #[test]
+    fn set_sphere_with_colfunc_invalidates_billboard_cache() {
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_rect(
+            IVec3::new(40, 40, 40),
+            IVec3::new(90, 90, 90),
+            Some(TEST_COL),
+        );
+        stamp_sentinel_cache(&mut g);
+        g.set_sphere_with_colfunc(IVec3::new(64, 64, 64), 6, SpanOp::Carve, |_, _, _| 1);
+        assert!(g.billboards.is_none());
     }
 
     #[test]

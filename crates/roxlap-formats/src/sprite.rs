@@ -103,4 +103,46 @@ impl Sprite {
             flags: 0,
         }
     }
+
+    /// Carve a sphere out of this sprite's voxel model, controlling
+    /// the colour of the interior the cut exposes. Thin delegate to
+    /// [`Kv6::carve_sphere_with_colfunc`] — `centre` / `radius`,
+    /// `solid`, and `colfunc` are all in **kv6-local** voxel
+    /// coordinates (the sprite pose `p`/`s`/`h`/`f` is untouched). See
+    /// that method for why the `solid` occupancy predicate is required.
+    pub fn carve_sphere_with_colfunc<S, C>(
+        &mut self,
+        centre: [i32; 3],
+        radius: u32,
+        solid: S,
+        colfunc: C,
+    ) where
+        S: Fn(i32, i32, i32) -> bool,
+        C: Fn(i32, i32, i32) -> u32,
+    {
+        self.kv6
+            .carve_sphere_with_colfunc(centre, radius, solid, colfunc);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn carve_sphere_delegates_to_kv6_and_leaves_pose() {
+        const BASE: u32 = 0x8033_4455;
+        let kv6 = Kv6::from_fn_shaded(16, 16, 16, |_, _, _| Some(BASE));
+        let mut sprite = Sprite::axis_aligned(kv6, [10.0, 20.0, 30.0]);
+        let before = sprite.kv6.voxels.len();
+
+        sprite.carve_sphere_with_colfunc([8, 8, 8], 4, |_, _, _| true, |_, _, _| 0x8000_FF00);
+
+        // The hollowed-out shell has more surface voxels than the
+        // solid hull did, so the model definitely changed.
+        assert_ne!(sprite.kv6.voxels.len(), before);
+        // Pose untouched — carving is kv6-local only.
+        assert_eq!(sprite.p, [10.0, 20.0, 30.0]);
+        assert_eq!(sprite.s, [1.0, 0.0, 0.0]);
+    }
 }
