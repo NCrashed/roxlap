@@ -6,6 +6,47 @@
 //! Stage R3 lands the public [`Engine`] / [`Camera`] surface with a
 //! sky-fill stub renderer. R4 replaces the stub with the full
 //! opticast + grouscan algorithm.
+//!
+//! # World handedness and the horizontal mirror
+//!
+//! roxlap's world is **z-down**: `x` = east, `y` = north, `z` points
+//! *down* into the map. Physically the triple (east, north, up) is
+//! left-handed, so a faithfully-projected view is **horizontally
+//! mirrored** relative to a real camera at the same heading — the
+//! viewer's geometric *right* lands on screen-*left*. This is Voxlap's
+//! native convention; it is baked into the projection, the frustum
+//! cull, the scan loops, and every bit-exact oracle golden, and is
+//! reproduced deliberately. It is **not** a bug.
+//!
+//! The camera basis the engine actually renders with is
+//! right-handed in the `(right, down, forward)` sense
+//! (`right × down = +forward`). Build it with
+//! [`Camera::from_yaw_pitch`], [`Camera::orbit`], or
+//! [`Camera::look_at`] — never by rotating [`Camera::default`], whose
+//! placeholder basis is left-handed and will make the sprite cull
+//! reject every sprite.
+//!
+//! ## I want an un-mirrored world
+//!
+//! Do **not** "fix" the mirror by negating `right` in the basis. That
+//! flips the chirality to `right × down = -forward`; the world still
+//! renders, but the sprite frustum cull then rejects every sprite
+//! (and you diverge from the oracle goldens). The mirror is in the
+//! projection, not the basis.
+//!
+//! Handle it on the **consumer side** instead — pick one and stay
+//! consistent:
+//!
+//! - mirror a single world axis in your scene → world mapping (e.g.
+//!   negate world-x when you place content), or
+//! - negate your yaw input so headings sweep the opposite way.
+//!
+//! Either re-establishes the chirality your project expects without
+//! touching the engine. (A true engine-side de-mirror would mean
+//! negating screen-x in *both* the grid raycaster and the sprite
+//! rasteriser while preserving the cull's normal winding — a large,
+//! golden-breaking change that diverges from Voxlap, and is out of
+//! scope here.)
 
 mod camera;
 pub mod camera_math;

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Canonical camera constructors `Camera::from_yaw_pitch`,
+  `Camera::orbit`, and `Camera::look_at`.** All three build the
+  right-handed `(right, down, forward)` basis the engine actually
+  renders with (`right × down = +forward`), reproducing
+  `oracle.c::set_camera_yaw_pitch`. Projects previously hand-rolled
+  `right = [-sin yaw, cos yaw, 0]`; copying that form by hand is the
+  usual source of a left-handed basis, which silently makes the sprite
+  frustum cull reject every sprite. New crate-level docs explain the
+  z-down world's inherent horizontal mirror versus a real camera and
+  why an un-mirrored world must be handled consumer-side (mirror a
+  world axis or negate yaw) rather than by flipping `right`. `Camera`'s
+  placeholder `Default` is now documented as left-handed and not for
+  interactive use.
+
 ## [0.11.0] — 2026-06-15
 
 Multi-grid scenes get cheaper on both backends. The GPU renderer's
