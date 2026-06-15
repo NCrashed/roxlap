@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0] — 2026-06-13
+## [0.9.0] — 2026-06-15
 
 The GPU renderer reaches the browser. `roxlap-gpu` and the `roxlap-render`
 facade now compile and run on `wasm32-unknown-unknown` (WebGPU), and both
@@ -15,10 +15,14 @@ web demos — `roxlap-web` and `roxlap-cave-web` — are rebuilt **on top of
 `roxlap-render`** instead of calling `roxlap-core` opticast directly. In a
 WebGPU browser they render via the wgpu compute marcher; elsewhere the
 facade falls back to the CPU opticast path, now presented through a WebGL2
-blit owned by the facade. This is the last architectural gap from the GPU
-and scene-graph roadmaps — hence **1.0.0**. No public API of the existing
-native crates is broken; the change is additive (new wasm constructors +
-one new `Grid` method).
+blit owned by the facade. This closes the last *architectural* gap from
+the GPU and scene-graph roadmaps; the release stays **0.9.x** rather than
+1.0 because engine limitations remain open (e.g. VC.6 mip-N multi-chz,
+the deep-mip axis-aligned beam mitigation) and the API is not yet frozen.
+No public API of the existing native crates is broken; the change is
+additive (new wasm constructors + one new `Grid` method). This release
+also lands three editor (demiurg) handoffs — kv6 surface normals, a
+dense-model → `.vxl` export path, and depth-tested overlay lines.
 
 ### Added
 

@@ -361,11 +361,11 @@ Public version targets (tentative):
 The umbrella roxlap version (`roxlap-core` + `roxlap-scene`) is
 independent; GPU work doesn't force a major bump there.
 
-## GW — GPU renderer on the web (landed 2026-06-13, roxlap 1.0.0)
+## GW — GPU renderer on the web (landed 2026-06-13, roxlap 0.9.0)
 
 The last gap: bring the GPU path to the browser (WebGPU) and rebuild
 the wasm demos on `roxlap-render` instead of direct `roxlap-core`
-opticast. Landed as sub-substages GW.0..GW.4; cut **roxlap 1.0.0**.
+opticast. Landed as sub-substages GW.0..GW.4; cut in **roxlap 0.9.0**.
 
 | # | Scope |
 |---|-------|
@@ -373,7 +373,7 @@ opticast. Landed as sub-substages GW.0..GW.4; cut **roxlap 1.0.0**.
 | GW.1 | `roxlap-render` builds for `wasm32`. `softbuffer` native-only; CPU backend presents via a ported WebGL2 blit (`cpu_blit.rs`) on wasm; async `new_from_canvas_async` (GPU-first, CPU fallback, canvas cloned before the GPU attempt); wasm `pick_depth` returns `None`. |
 | GW.2 | `roxlap-web` on the facade — procedural terraced-hills `Scene`, async init after `init_thread_pool`, RAF `render`+`present`, kept input + bench. |
 | GW.3 | `roxlap-cave-web` on the facade — single-chunk cave `Scene`, scene collision (`Grid::voxel_solid`) + carving (`Grid::set_sphere` + new `Grid::bake_lightmode`), bullets as facade sprites. |
-| GW.4 | 1.0.0: console backend message, docs, workspace 0.8.0→1.0.0, CHANGELOG. |
+| GW.4 | release: console backend message, docs, workspace bump, CHANGELOG. |
 
 ### Why these decisions
 

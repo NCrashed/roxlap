@@ -1,7 +1,7 @@
 # roxlap-web
 
 Browser demo of the roxlap engine, rendered through the
-[`roxlap-render`](../roxlap-render) facade (since 1.0.0): the
+[`roxlap-render`](../roxlap-render) facade (since 0.9.0): the
 WebGPU compute marcher (`roxlap-gpu`) when the browser has
 WebGPU, otherwise the CPU `opticast` path presented via a WebGL2
 blit. Both backends compile to `wasm32-unknown-unknown` with

@@ -14,9 +14,9 @@ categories = ["game-development", "graphics"]
 
 [dependencies]
 glam = { workspace = true }
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "1.0" }
-roxlap-core = { path = "../roxlap-core", version = "1.0" }
-roxlap-formats = { path = "../roxlap-formats", version = "1.0" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.9" }
+roxlap-core = { path = "../roxlap-core", version = "0.9" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.9" }
 serde = { workspace = true }
 # S7.3: background chunk-generation pool + result channel. Both are
 # native-only — on wasm32 the streaming pump short-circuits to the

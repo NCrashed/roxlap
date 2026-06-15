@@ -14,11 +14,11 @@ publish = false
 # The renderer facade. Decoupled from winit since 0.7: `SceneRenderer`
 # binds to any `HasWindowHandle`/`HasDisplayHandle` provider. This
 # demo proves the point with SDL2 instead of winit.
-roxlap-render = { path = "../roxlap-render", version = "1.0" }
+roxlap-render = { path = "../roxlap-render", version = "0.9" }
 # Scene/world types + the edit API used to build the demo scene.
-roxlap-scene = { path = "../roxlap-scene", version = "1.0" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.9" }
 # Camera, OpticastSettings, Sky — the per-frame render params.
-roxlap-core = { path = "../roxlap-core", version = "1.0" }
+roxlap-core = { path = "../roxlap-core", version = "0.9" }
 glam = { workspace = true }
 # The window provider under test. The `raw-window-handle` feature pulls
 # rwh 0.6 (matching softbuffer/wgpu inside roxlap-render) and makes
