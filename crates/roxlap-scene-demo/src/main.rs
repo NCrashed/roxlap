@@ -22,6 +22,7 @@ use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::Engine;
 use roxlap_formats::kfa::{Hinge, Point3, Seq};
+use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
 use roxlap_render::{
     FrameParams, KfaSprite, Line3, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet,
@@ -179,6 +180,165 @@ fn build_sprites() -> Vec<Sprite> {
             eprintln!("kv6_sprite: load_coco_kv6 failed ({e}); skipping sprite");
             Vec::new()
         }
+    }
+}
+
+// ---- shoot-to-carve target ------------------------------------------
+
+/// Edge length (voxels) of the procedural carve target.
+const TARGET_N: u32 = 48;
+/// World position the carve target floats at — straight ahead of the
+/// spawn camera ([0, -120, 50] looking +y) and a bit above eye level so
+/// it reads clearly against the sky.
+const TARGET_WORLD: [f32; 3] = [0.0, 60.0, 95.0];
+/// Radius (voxels) of the sphere each shot subtracts.
+const SHOT_RADIUS: u32 = 5;
+/// Surface colour of the intact blob (voxlap-packed `0x80RRGGBB`).
+const TARGET_SKIN: u32 = 0x8050_70A0;
+
+/// A procedural blob you can shoot craters into — the demo for
+/// [`Sprite::carve_sphere_with_colfunc`]. Unlike a loaded `.kv6` (which
+/// stores only its surface hull and so has no interior to carve), this
+/// target owns a dense occupancy grid, so each hit can expose a real
+/// interior wall whose colour the carve's colfunc controls.
+struct CarveTarget {
+    sprite: Sprite,
+    /// Dense `n³` solid occupancy in kv6-local voxel coords; the carve's
+    /// `solid` predicate reads this and each shot clears the carved cells.
+    occ: Vec<bool>,
+    n: u32,
+}
+
+impl CarveTarget {
+    fn new() -> Self {
+        let n = TARGET_N;
+        #[allow(clippy::cast_precision_loss)]
+        let c = n as f32 * 0.5;
+        let r = c - 1.0;
+        let inside = |x: u32, y: u32, z: u32| {
+            #[allow(clippy::cast_precision_loss)]
+            let (dx, dy, dz) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c, z as f32 + 0.5 - c);
+            dx * dx + dy * dy + dz * dz <= r * r
+        };
+        let kv6 = Kv6::from_fn_shaded(n, n, n, |x, y, z| inside(x, y, z).then_some(TARGET_SKIN));
+        let mut occ = vec![false; (n * n * n) as usize];
+        for z in 0..n {
+            for y in 0..n {
+                for x in 0..n {
+                    if inside(x, y, z) {
+                        occ[((z * n + y) * n + x) as usize] = true;
+                    }
+                }
+            }
+        }
+        Self {
+            sprite: Sprite::axis_aligned(kv6, TARGET_WORLD),
+            occ,
+            n,
+        }
+    }
+
+    #[inline]
+    fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+        if x < 0 || y < 0 || z < 0 {
+            return false;
+        }
+        let (x, y, z) = (x as u32, y as u32, z as u32);
+        x < self.n && y < self.n && z < self.n && self.occ[((z * self.n + y) * self.n + x) as usize]
+    }
+
+    /// March a world-space ray through the target and return the first
+    /// solid voxel it hits, in kv6-local integer coords. The sprite is
+    /// axis-aligned with unit basis, so world↔local is the pivot shift
+    /// `local = world - p + pivot` (see `kv6_draw_prepare`).
+    fn raycast(&self, origin: [f64; 3], dir: [f64; 3]) -> Option<[i32; 3]> {
+        let p = self.sprite.p;
+        let piv = [
+            f64::from(self.sprite.kv6.xpiv),
+            f64::from(self.sprite.kv6.ypiv),
+            f64::from(self.sprite.kv6.zpiv),
+        ];
+        const STEP: f64 = 0.3;
+        const T_MAX: f64 = 2000.0;
+        let mut t = 0.0;
+        while t < T_MAX {
+            let l = [
+                origin[0] + dir[0] * t - f64::from(p[0]) + piv[0],
+                origin[1] + dir[1] * t - f64::from(p[1]) + piv[1],
+                origin[2] + dir[2] * t - f64::from(p[2]) + piv[2],
+            ];
+            #[allow(clippy::cast_possible_truncation)]
+            let v = [
+                l[0].floor() as i32,
+                l[1].floor() as i32,
+                l[2].floor() as i32,
+            ];
+            if self.solid(v[0], v[1], v[2]) {
+                return Some(v);
+            }
+            t += STEP;
+        }
+        None
+    }
+
+    /// Carve a `SHOT_RADIUS` sphere at kv6-local `centre`, painting the
+    /// freshly-exposed interior with a vertical molten gradient. Returns
+    /// the number of voxels removed.
+    fn carve(&mut self, centre: [i32; 3]) -> u32 {
+        let n = self.n;
+        let r = SHOT_RADIUS as i32;
+        let r_sq = r * r;
+        let (cx, cy, cz) = (centre[0], centre[1], centre[2]);
+        let inside = |x: i32, y: i32, z: i32| {
+            let (dx, dy, dz) = (x - cx, y - cy, z - cz);
+            dx * dx + dy * dy + dz * dz <= r_sq
+        };
+
+        // Molten crater: dark-red rim at the bottom → bright yellow at
+        // the top, demonstrating colfunc control over the new surface.
+        let crater = move |_x: i32, _y: i32, z: i32| -> u32 {
+            #[allow(clippy::cast_precision_loss)]
+            let up = ((z - cz + r) as f32 / (2.0 * r as f32)).clamp(0.0, 1.0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let red = 0xC0 + (up * 63.0) as u32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let grn = 0x20 + (up * 0xB0 as f32) as u32;
+            0x8000_0000 | (red << 16) | (grn << 8) | 0x10
+        };
+
+        // `solid` borrows occ immutably; sprite is a disjoint field.
+        {
+            let occ = &self.occ;
+            let solid = |x: i32, y: i32, z: i32| {
+                x >= 0
+                    && y >= 0
+                    && z >= 0
+                    && (x as u32) < n
+                    && (y as u32) < n
+                    && (z as u32) < n
+                    && occ[((z as u32 * n + y as u32) * n + x as u32) as usize]
+            };
+            self.sprite
+                .carve_sphere_with_colfunc(centre, SHOT_RADIUS, solid, crater);
+        }
+
+        // Mirror the carve into our occupancy so the next shot's `solid`
+        // predicate is correct.
+        let mut removed = 0u32;
+        for z in (cz - r).max(0)..=(cz + r).min(n as i32 - 1) {
+            for y in (cy - r).max(0)..=(cy + r).min(n as i32 - 1) {
+                for x in (cx - r).max(0)..=(cx + r).min(n as i32 - 1) {
+                    if inside(x, y, z) {
+                        let idx = ((z as u32 * n + y as u32) * n + x as u32) as usize;
+                        if self.occ[idx] {
+                            self.occ[idx] = false;
+                            removed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        removed
     }
 }
 
@@ -546,6 +706,10 @@ struct App {
     lines_on: bool,
     /// Last FPS computed in `tick_fps`, shown in the HUD.
     last_fps: f64,
+    /// Shoot-to-carve target: left-click (while grabbed) casts the
+    /// centre-screen ray and subtracts a sphere via
+    /// [`Sprite::carve_sphere_with_colfunc`].
+    carve_target: CarveTarget,
 }
 
 impl App {
@@ -600,6 +764,7 @@ impl App {
             hud_on: true,
             lines_on: true,
             last_fps: 0.0,
+            carve_target: CarveTarget::new(),
         }
     }
 
@@ -835,15 +1000,44 @@ impl App {
     /// The red model is the `G`-carve target. Content only — the
     /// renderer builds the CPU draws + GPU registry from this.
     fn build_sprite_set(&self) -> Option<SpriteSet> {
-        let base = self.sprites.first()?;
-        // Red variant: recolour every KV6 voxel (keep alpha, force red)
-        // — applied once on the CPU so both backends agree.
-        let mut red = base.clone();
-        for v in &mut red.kv6.voxels {
-            v.col = (v.col & 0xFF00_0000) | 0x00FF_0000;
-        }
-        let models = vec![base.clone(), red];
+        let mut models = Vec::new();
+        let mut instances = Vec::new();
+        let mut carve_model = None;
 
+        if let Some(base) = self.sprites.first() {
+            // Red variant: recolour every KV6 voxel (keep alpha, force red)
+            // — applied once on the CPU so both backends agree.
+            let mut red = base.clone();
+            for v in &mut red.kv6.voxels {
+                v.col = (v.col & 0xFF00_0000) | 0x00FF_0000;
+            }
+            models.push(base.clone()); // model 0: green
+            models.push(red); // model 1: red (G-carve target)
+            carve_model = Some(1);
+            instances.extend(Self::coco_field_instances());
+        }
+
+        // Shoot-to-carve target: always present, as the last model, so
+        // it renders even if `coco.kv6` failed to load.
+        let target_model = models.len();
+        models.push(self.carve_target.sprite.clone());
+        instances.push(SpriteInstanceDesc {
+            model: target_model,
+            pos: TARGET_WORLD,
+        });
+
+        if models.is_empty() {
+            return None;
+        }
+        Some(SpriteSet {
+            models,
+            instances,
+            carve_model,
+        })
+    }
+
+    /// The checkerboarded green/red `coco` field (model indices 0/1).
+    fn coco_field_instances() -> Vec<SpriteInstanceDesc> {
         let n: i32 = std::env::var("ROXLAP_SPRITE_GRID")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -863,11 +1057,43 @@ impl App {
                 });
             }
         }
-        Some(SpriteSet {
-            models,
-            instances,
-            carve_model: Some(1),
-        })
+        instances
+    }
+
+    /// Cast the centre-screen ray and, if it hits the carve target,
+    /// subtract a `SHOT_RADIUS` sphere (with a molten-gradient interior)
+    /// and re-upload the sprite field. Bound to left-click while grabbed.
+    fn fire(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let size = window.inner_size();
+        let (cx, cy) = (f64::from(size.width) * 0.5, f64::from(size.height) * 0.5);
+        let camera = self.scene.camera;
+        let Some(ray) = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.view_ray(&camera, cx, cy))
+        else {
+            return;
+        };
+        let Some(hit) = self
+            .carve_target
+            .raycast(ray.origin.to_array(), ray.dir.to_array())
+        else {
+            eprintln!("shot missed the carve target");
+            return;
+        };
+        let removed = self.carve_target.carve(hit);
+        eprintln!(
+            "hit target at local ({}, {}, {}) — carved {removed} voxels",
+            hit[0], hit[1], hit[2],
+        );
+        // Re-upload (compute the set before borrowing the renderer).
+        let set = self.build_sprite_set();
+        if let (Some(renderer), Some(set)) = (self.renderer.as_mut(), set) {
+            renderer.set_sprites(&set);
+        }
     }
 
     /// Update camera position from the active input bits.
@@ -1055,7 +1281,9 @@ impl ApplicationHandler for App {
             eprintln!("roxlap-render: ROXLAP_GPU_NO_SPRITES — sprites disabled");
         } else if let Some(set) = self.build_sprite_set() {
             eprintln!(
-                "roxlap-render: {} sprite instances, {} models ('G' carves the red model)",
+                "roxlap-render: {} sprite instances, {} models \
+                 (click to grab, then left-click shoots spheres out of the blob ahead; \
+                 'G' carves the red model)",
                 set.instances.len(),
                 set.models.len(),
             );
@@ -1145,6 +1373,10 @@ impl ApplicationHandler for App {
                             );
                         }
                     }
+                } else if self.grabbed {
+                    // FPS mode: a click is a shot — carve a sphere out of
+                    // the target where the crosshair points.
+                    self.fire();
                 } else {
                     self.set_grab(true);
                 }
