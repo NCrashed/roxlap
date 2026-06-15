@@ -51,7 +51,6 @@ pub use headless::HeadlessGpu;
 pub use resident::GpuChunkResident;
 pub use scene::{
     GpuSceneResident, GridRuntimeTransform, GridStaticMeta, RefreshOutcome, SceneUpload,
-    MAX_SCENE_GRIDS,
 };
 pub use sprite_model::{
     build_sprite_model, SpriteInstance, SpriteInstanceTransform, SpriteModel, SpriteModelRegistry,
@@ -480,10 +479,25 @@ struct SpriteModelUniform {
     _p6: f32,
 }
 
-const SCENE_MAX_GRIDS: usize = MAX_SCENE_GRIDS as usize;
-
 /// GPU.10.3 — sprite screen-tile edge in pixels for instance binning.
 const SPRITE_TILE_SIZE: u32 = 16;
+
+/// Build the per-grid camera storage buffer bound at `scene_dda.wgsl`
+/// binding 15 (read-only). One [`SceneDdaPerGridCamera`] per grid; the
+/// shader only indexes `0..grid_count`. An empty scene pads to one
+/// zeroed element (wgpu rejects a zero-sized storage binding). This
+/// replaces the old fixed `[…; 16]` uniform array, so a scene can hold
+/// any number of grids — the only ceiling is the device's storage size.
+fn upload_grid_cameras(device: &wgpu::Device, cams: &[SceneDdaPerGridCamera]) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    let one = [SceneDdaPerGridCamera::zeroed()];
+    let src: &[SceneDdaPerGridCamera] = if cams.is_empty() { &one } else { cams };
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("roxlap-gpu scene_dda.grid_cameras"),
+        contents: bytemuck::cast_slice(src),
+        usage: wgpu::BufferUsages::STORAGE,
+    })
+}
 
 // The scene_dda bind group + layout wire occupancy pages 1..=3 at
 // bindings 12..=14 explicitly; keep that in lockstep with the page
@@ -528,7 +542,6 @@ struct SceneDdaUniform {
     _pad0: u32,
     screen_size: [u32; 2],
     _pad1: [u32; 2],
-    cameras: [SceneDdaPerGridCamera; SCENE_MAX_GRIDS],
     /// GPU.8 — `[r, g, b, fog_near]`. The `near` distance is packed
     /// into the colour's alpha channel to keep std140 alignment
     /// tidy (a bare `f32` after the `vec4` would force extra pads).
@@ -1647,8 +1660,7 @@ impl GpuRenderer {
     /// grid.
     ///
     /// # Panics
-    /// If `cameras.len() != scene.grid_count` or
-    /// `scene.grid_count > MAX_SCENE_GRIDS`.
+    /// If `cameras.len() != scene.grid_count`.
     /// `cameras[i]` is grid `i`'s world camera transformed into that
     /// grid's local frame (the grid marcher works in grid-local space).
     /// `sprite_camera` is the **world** camera: instanced sprites carry
@@ -1669,12 +1681,6 @@ impl GpuRenderer {
             "render_scene: {} cameras supplied, scene has {} grids",
             cameras.len(),
             scene.grid_count,
-        );
-        assert!(
-            scene.grid_count as usize <= SCENE_MAX_GRIDS,
-            "render_scene: scene has {} grids, shader supports {}",
-            scene.grid_count,
-            SCENE_MAX_GRIDS,
         );
         self.last_fov_y_rad = fov_y_rad; // cached for pixel_ray (picking)
 
@@ -1746,20 +1752,13 @@ impl GpuRenderer {
         };
         let dda = self.scene_dda.as_ref().expect("just built");
 
-        // Pack per-grid cameras.
-        let mut cam_array = [SceneDdaPerGridCamera::zeroed(); SCENE_MAX_GRIDS];
-        for (i, cam) in cameras.iter().enumerate() {
-            cam_array[i] = SceneDdaPerGridCamera {
-                pos: cam.position,
-                _pad0: 0.0,
-                right: cam.right,
-                _pad1: 0.0,
-                down: cam.down,
-                _pad2: 0.0,
-                forward: cam.forward,
-                _pad3: 0.0,
-            };
-        }
+        // Pack per-grid cameras into a runtime-sized storage buffer
+        // (binding 15) — no fixed cap on grid count.
+        let cam_vec: Vec<SceneDdaPerGridCamera> = cameras
+            .iter()
+            .map(SceneDdaPerGridCamera::from_camera)
+            .collect();
+        let grid_cameras = upload_grid_cameras(&self.device, &cam_vec);
         let uniform = SceneDdaUniform {
             fov_y_rad,
             grid_count: scene.grid_count,
@@ -1767,7 +1766,6 @@ impl GpuRenderer {
             _pad0: 0,
             screen_size: [surface_w, surface_h],
             _pad1: [0; 2],
-            cameras: cam_array,
             fog_color: [
                 self.fog_color[0],
                 self.fog_color[1],
@@ -1859,6 +1857,10 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry {
                     binding: 14,
                     resource: scene.occupancy_pages[3].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: grid_cameras.as_entire_binding(),
                 },
             ],
         });
@@ -2450,6 +2452,8 @@ impl GpuRenderer {
                     bgl_storage_entry(12, true),
                     bgl_storage_entry(13, true),
                     bgl_storage_entry(14, true),
+                    // Per-grid cameras (runtime-sized; one per grid).
+                    bgl_storage_entry(15, true),
                 ],
             });
         let dda_pl = self
@@ -2939,6 +2943,8 @@ impl HeadlessSceneRenderer {
                 bgl_storage_entry(12, true),
                 bgl_storage_entry(13, true),
                 bgl_storage_entry(14, true),
+                // Per-grid cameras (runtime-sized; one per grid).
+                bgl_storage_entry(15, true),
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3017,19 +3023,11 @@ impl HeadlessSceneRenderer {
             scene.grid_count,
         );
 
-        let mut cam_array = [SceneDdaPerGridCamera::zeroed(); SCENE_MAX_GRIDS];
-        for (i, cam) in cameras.iter().enumerate() {
-            cam_array[i] = SceneDdaPerGridCamera {
-                pos: cam.position,
-                _pad0: 0.0,
-                right: cam.right,
-                _pad1: 0.0,
-                down: cam.down,
-                _pad2: 0.0,
-                forward: cam.forward,
-                _pad3: 0.0,
-            };
-        }
+        let cam_vec: Vec<SceneDdaPerGridCamera> = cameras
+            .iter()
+            .map(SceneDdaPerGridCamera::from_camera)
+            .collect();
+        let grid_cameras = upload_grid_cameras(device, &cam_vec);
         let uniform = SceneDdaUniform {
             fov_y_rad,
             grid_count: scene.grid_count,
@@ -3037,7 +3035,6 @@ impl HeadlessSceneRenderer {
             _pad0: 0,
             screen_size: [self.width, self.height],
             _pad1: [0; 2],
-            cameras: cam_array,
             // Fog off: near/far past any reachable t → factor 0.
             fog_color: [0.0, 0.0, 0.0, 1.0e29],
             fog_far: 1.0e30,
@@ -3128,6 +3125,10 @@ impl HeadlessSceneRenderer {
                 wgpu::BindGroupEntry {
                     binding: 14,
                     resource: scene.occupancy_pages[3].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: grid_cameras.as_entire_binding(),
                 },
             ],
         });

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Lifted the 16-grid-per-scene cap on the GPU renderer.** The shader's
+  per-grid cameras moved out of a fixed `array<…, 16>` uniform field into
+  a runtime-sized storage buffer (`scene_dda.wgsl` binding 15), so a scene
+  can now hold any number of grids — the only ceiling is the device's
+  storage limits (per-grid metadata + voxel data were already unbounded
+  storage arrays, and the CPU path never had a cap). Removes the
+  `MAX_SCENE_GRIDS` constant, the `GpuSceneResident::upload` /
+  `render_scene` grid-count asserts, and the facade's grid-skip cap.
+  Per-pixel cost stays linear in the *uploaded* grid count (no cross-grid
+  culling on the GPU), so a host with many grids should still upload only
+  the visible ones. **Breaking:** `roxlap_gpu::MAX_SCENE_GRIDS` is gone.
+
 ## [0.10.0] — 2026-06-15
 
 A small, additive release: editing a single registered sprite model no

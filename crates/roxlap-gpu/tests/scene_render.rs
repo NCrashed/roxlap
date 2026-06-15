@@ -414,6 +414,86 @@ fn scene_dda_side_shades_darken_floor() {
     );
 }
 
+/// Lifting the 16-grid cap moved the per-grid cameras out of a fixed
+/// `array<…, 16>` uniform and into a runtime-sized storage buffer
+/// (binding 15). This guards that grid `g` marches with **its own**
+/// `grid_cameras[g]`, not `cameras[0]` for every grid. Two identical
+/// floor grids get OPPOSITE cameras: grid 0 looks up (away → sky), grid
+/// 1 looks down (at the floor). The floor can only appear if grid 1's
+/// own camera was used; a control with both cameras up must be pure sky.
+#[test]
+fn scene_dda_per_grid_cameras_are_independent() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let mk_floor = || GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], decompress_chunk(&floor_chunk(vsid)))],
+    };
+    let scene = GpuSceneResident::upload(
+        &gpu.device,
+        &SceneUpload {
+            grids: vec![mk_floor(), mk_floor()],
+        },
+    );
+    assert_eq!(scene.grid_count, 2, "two-grid scene");
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // Above the floor (z=50 < 100). Down = +z (voxlap z-down) hits it;
+    // up = −z looks at empty space → sky.
+    let cam_down = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let cam_up = Camera {
+        forward: [0.0, 0.0, -1.0],
+        ..cam_down
+    };
+    let fov = cam_down.fov_y_rad;
+
+    // grid 0 looks away (sky), grid 1 looks at its floor.
+    let fb = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam_up, cam_down],
+        fov,
+        64,
+        0.0,
+    );
+    let floor_px = fb.iter().filter(|&&p| is_block_color(p)).count();
+    assert!(
+        floor_px > 0,
+        "grid 1's floor must be visible via grid_cameras[1] — got {floor_px} floor px \
+         (per-grid camera indexing broken?)",
+    );
+
+    // Control: BOTH grids look away → pure sky. If the shader read a
+    // stale/shared camera this would disagree with the result above.
+    let fb2 = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam_up, cam_up],
+        fov,
+        64,
+        0.0,
+    );
+    let floor_px2 = fb2.iter().filter(|&&p| is_block_color(p)).count();
+    assert_eq!(
+        floor_px2, 0,
+        "both grids looking away must be all sky — got {floor_px2} floor px",
+    );
+}
+
 #[test]
 fn aabb_tracks_streaming_refresh_and_evict() {
     // GPU.13.0 — the early-out box is maintained live: installing a

@@ -82,12 +82,6 @@ impl MipLayout {
     }
 }
 
-/// Maximum number of grids the shader's per-grid camera uniform
-/// array can hold. The scene-demo has 12 (1 ground + 1 ship + 10
-/// markers); 16 leaves headroom for a future +4 without re-cooking
-/// the shader. The runtime check rejects scenes that overflow.
-pub const MAX_SCENE_GRIDS: u32 = 16;
-
 /// Per-chunk colour-slot stride, in u32 words (256 KiB). Each
 /// chunk's colour data lives at `meta_idx * COLORS_PER_CHUNK_WORDS`
 /// within its grid's colours range. Fixed-stride layout means
@@ -262,16 +256,11 @@ pub struct GpuSceneResident {
 impl GpuSceneResident {
     /// Pack + upload `info`. Each grid is uploaded as a contiguous
     /// slab inside the shared storage buffers; per-grid offsets
-    /// live in `grid_static_meta`.
-    ///
-    /// # Panics
-    /// If `info.grids.len() > MAX_SCENE_GRIDS`.
+    /// live in `grid_static_meta`. The grid count is bounded only by
+    /// the device's storage-buffer limits (per-grid cameras + metadata
+    /// are runtime-sized storage arrays, not a fixed shader array).
     pub fn upload(device: &wgpu::Device, info: &SceneUpload) -> Self {
         let grid_count = info.grid_count();
-        assert!(
-            grid_count <= MAX_SCENE_GRIDS,
-            "GpuSceneResident: scene has {grid_count} grids, shader supports {MAX_SCENE_GRIDS}",
-        );
 
         let mut all_occupancy: Vec<u32> = Vec::new();
         let mut all_color_offsets: Vec<u32> = Vec::new();

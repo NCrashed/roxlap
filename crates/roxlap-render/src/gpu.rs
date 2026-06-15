@@ -517,14 +517,6 @@ impl GpuBackend {
             if grid.chunks.is_empty() && !is_streaming {
                 continue;
             }
-            if scene_grids.len() == roxlap_gpu::MAX_SCENE_GRIDS as usize {
-                eprintln!(
-                    "roxlap-render: scene cap ({} grids) reached — skipping grid {}+",
-                    roxlap_gpu::MAX_SCENE_GRIDS,
-                    gid.raw(),
-                );
-                break;
-            }
             let chunk_idxs: Vec<[i32; 3]> = grid.chunks.keys().map(|i| [i.x, i.y, i.z]).collect();
             // Empty streaming grid → placeholder bbox; the modular pool
             // ignores the bbox for slot assignment anyway.

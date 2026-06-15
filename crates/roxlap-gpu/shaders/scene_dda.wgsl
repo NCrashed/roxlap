@@ -20,7 +20,6 @@
 const OCC_WORDS_PER_COLUMN: u32 = 8u; // CHUNK_Z (256) / 32
 const CHUNK_Z: u32 = 256u;
 const MAX_INNER_STEPS: u32 = 768u;
-const MAX_GRIDS: u32 = 16u;
 const MAX_GPU_MIPS: u32 = 6u; // GPU.11 — must match scene::MAX_GPU_MIPS
 const T_INF: f32 = 1.0e30;
 
@@ -69,7 +68,6 @@ struct Uniforms {
     _pad0: u32,
     screen_size: vec2<u32>,
     _pad1: vec2<u32>,
-    cameras: array<PerGridCamera, 16>,
     // GPU.8 fog. `fog_color.rgb` is the colour we blend toward at
     // far distances. `fog_color.w` is `fog_near`, packed with the
     // colour to keep std140 alignment simple.
@@ -138,6 +136,12 @@ struct Uniforms {
 @group(0) @binding(12) var<storage, read> occ_page1: array<u32>;
 @group(0) @binding(13) var<storage, read> occ_page2: array<u32>;
 @group(0) @binding(14) var<storage, read> occ_page3: array<u32>;
+// Per-grid world->grid cameras, one per grid (`grid_count` of them).
+// Moved out of the uniform (was a fixed `array<…, 16>`) into a runtime-
+// sized storage array so a scene can hold any number of grids — the cap
+// is now the device's storage limit, not a baked-in 16. The shader only
+// indexes `0..grid_count`, so a grid-less scene binds a 1-element dummy.
+@group(0) @binding(15) var<storage, read> grid_cameras: array<PerGridCamera>;
 
 // Read one occupancy word by global index, selecting its page.
 // Single-page scenes (multi-GiB GPUs) skip the division — the
@@ -537,7 +541,7 @@ fn render_scene(@builtin(global_invocation_id) gid: vec3<u32>) {
     var any_hit = false;
 
     for (var g: u32 = 0u; g < u.grid_count; g = g + 1u) {
-        let cam = u.cameras[g];
+        let cam = grid_cameras[g];
         let ray_dir = normalize(
             cam.forward
             + ndc_x * half_w * cam.right
