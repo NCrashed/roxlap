@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Per-grid screen scissor for the CPU multi-grid compositor.**
+  `render_scene_composed` previously rendered every in-range grid as a
+  near-full-frame opticast plus several full-screen memory passes (temp
+  reset, sentinel sweep, compose), so a scene of N grids cost ≈ N full
+  frames regardless of how little of the screen each grid covered. Each
+  grid is now projected to a conservative screen rectangle and (a) skipped
+  outright when it falls off-screen on either axis, (b) opticast-clipped to
+  its vertical band via the existing `y_start`/`y_end` strip path, and (c)
+  has its temp reset / sentinel sweep / compose restricted to that band.
+  Byte-identical to the old output (a new test renders a scene with the
+  scissor on and off and asserts the framebuffer matches). The horizontal
+  opticast *march* is **not** clipped — the radar's column-indexed
+  `angstart` table isn't reset per grid, so column-clipping reads stale
+  entries and crashes at extreme poses; that remains future work.
+
 ### Changed
 
 - **Lifted the 16-grid-per-scene cap on the GPU renderer.** The shader's

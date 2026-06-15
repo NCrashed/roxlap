@@ -243,6 +243,112 @@ pub fn compose_into(
     }
 }
 
+/// Half-open screen rectangle `[x0, x1) × [y0, y1)` a grid's
+/// projection is confined to — the scissor [`render_scene_composed`]
+/// uses to render and compose each grid only within its screen
+/// footprint instead of over the whole frame.
+#[derive(Clone, Copy, Debug)]
+struct ScreenRect {
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+}
+
+impl ScreenRect {
+    fn is_empty(self) -> bool {
+        self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+}
+
+/// Project a world-space bounding sphere `(centre, radius)` to a
+/// conservative screen rectangle under opticast's pinhole — focal `hz`,
+/// principal point `(hx, hy)`, ray for pixel `(px, py)` being
+/// `(px-hx)·right + (py-hy)·down + hz·forward` (camera_math). Returns:
+///
+/// - `Some(rect)` clamped to the viewport when the sphere is safely in
+///   front of the camera. The rect may be **empty** (sphere off to one
+///   side) → the grid can't appear, so the caller skips it entirely.
+/// - `None` when the camera is inside or near the sphere (forward-depth
+///   `z ≤ radius`), where a finite screen bound is unsafe → the caller
+///   must render the grid full-frame.
+///
+/// Conservative on purpose (never clips a pixel the full render would
+/// touch): the projected radius uses the over-estimate `hz·R/(z−R)`
+/// (exact is `hz·R/√(z²−R²)`) and pads by `anginc + 1`, matching the
+/// projection's `anginc` viewport padding.
+fn project_sphere_to_screen(
+    camera: &Camera,
+    centre: DVec3,
+    radius: f64,
+    settings: &OpticastSettings,
+) -> Option<ScreenRect> {
+    let d = centre - DVec3::from_array(camera.pos);
+    let z = d.dot(DVec3::from_array(camera.forward));
+    if z <= radius {
+        return None; // camera inside / in front of the sphere shell
+    }
+    let x = d.dot(DVec3::from_array(camera.right));
+    let y = d.dot(DVec3::from_array(camera.down));
+    let (hx, hy, hz) = (
+        f64::from(settings.hx),
+        f64::from(settings.hy),
+        f64::from(settings.hz),
+    );
+    let sr = hz * radius / (z - radius); // over-estimated screen radius
+    let sx = hx + x / z * hz;
+    let sy = hy + y / z * hz;
+    let pad = f64::from(settings.anginc) + 1.0;
+    let (xres, yres) = (f64::from(settings.xres), f64::from(settings.yres));
+    let clamp = |v: f64, hi: f64| v.clamp(0.0, hi);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(ScreenRect {
+        x0: clamp((sx - sr - pad).floor(), xres) as u32,
+        x1: clamp((sx + sr + pad).ceil(), xres) as u32,
+        y0: clamp((sy - sr - pad).floor(), yres) as u32,
+        y1: clamp((sy + sr + pad).ceil(), yres) as u32,
+    })
+}
+
+/// Fill each `rect` row of a `u32` buffer (row stride `pitch`) with
+/// `val` — the scissored analogue of `slice.fill(val)`.
+fn fill_rect_u32(buf: &mut [u32], pitch: usize, rect: ScreenRect, val: u32) {
+    for y in rect.y0..rect.y1 {
+        let row = y as usize * pitch;
+        buf[row + rect.x0 as usize..row + rect.x1 as usize].fill(val);
+    }
+}
+
+/// Fill each `rect` row of an `f32` buffer (row stride `pitch`) with `val`.
+fn fill_rect_f32(buf: &mut [f32], pitch: usize, rect: ScreenRect, val: f32) {
+    for y in rect.y0..rect.y1 {
+        let row = y as usize * pitch;
+        buf[row + rect.x0 as usize..row + rect.x1 as usize].fill(val);
+    }
+}
+
+/// Min-z compose `temp_*` into `fb`/`zb` over `rect` only — the
+/// scissored analogue of [`compose_into`]. A `temp` pixel wins where its
+/// `z` is strictly smaller than the destination's.
+fn compose_rect(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    temp_fb: &[u32],
+    temp_zb: &[f32],
+    pitch: usize,
+    rect: ScreenRect,
+) {
+    for y in rect.y0..rect.y1 {
+        let row = y as usize * pitch;
+        for i in row + rect.x0 as usize..row + rect.x1 as usize {
+            if temp_zb[i] < zb[i] {
+                zb[i] = temp_zb[i];
+                fb[i] = temp_fb[i];
+            }
+        }
+    }
+}
+
 /// Render every grid in `scene` with per-grid temporary buffers +
 /// z-buffer composition. The canonical multi-grid scene render
 /// path.
@@ -286,6 +392,43 @@ pub fn render_scene_composed(
     settings: &OpticastSettings,
     sky_color: u32,
     sky: Option<&Sky>,
+) -> RenderOutcome {
+    render_scene_composed_scissored(
+        fb,
+        zb,
+        pitch_pixels,
+        width,
+        height,
+        pool,
+        scene,
+        camera,
+        settings,
+        sky_color,
+        sky,
+        true,
+    )
+}
+
+/// Backing implementation of [`render_scene_composed`] with the
+/// per-grid screen-AABB scissor toggleable. `scissor = true` is the
+/// production path; the regression test renders the same scene with
+/// `false` (full-frame per grid, the pre-scissor behaviour) and asserts
+/// the framebuffer is byte-identical — the scissor must be a pure
+/// speed-up, never change a pixel.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn render_scene_composed_scissored(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
+    pool: &mut ScratchPool,
+    scene: &mut Scene,
+    camera: &Camera,
+    settings: &OpticastSettings,
+    sky_color: u32,
+    sky: Option<&Sky>,
+    scissor: bool,
 ) -> RenderOutcome {
     debug_assert_eq!(fb.len(), zb.len());
     let pixel_count = (width as usize) * (height as usize);
@@ -401,6 +544,45 @@ pub fn render_scene_composed(
         if dist_to_centre - bounds.radius > f64::from(settings.max_scan_dist) {
             continue;
         }
+
+        // Per-grid screen-space scissor: confine this grid's opticast +
+        // temp reset + compose to the vertical band its projection spans
+        // (full width), and skip the grid entirely when it projects fully
+        // off-screen on EITHER axis. `project_sphere_to_screen` is
+        // conservative (over-estimates the footprint), so the rendered
+        // pixels stay byte-identical to the full-frame path — only the
+        // work shrinks. The horizontal extent is used for the lateral
+        // cull but NOT to clip opticast: the radar's column-indexed
+        // `angstart` isn't reset per grid, so x-clipping reads stale
+        // entries at extreme poses (a crash reproduced at the `z=-19`
+        // pose — same angular-projection fragility that closed the
+        // cf-narrowing investigation). `None` (camera inside/near the
+        // sphere) renders full-frame. `scissor = false` disables it all
+        // for the regression test.
+        let full_rect = ScreenRect {
+            x0: 0,
+            x1: width,
+            y0: 0,
+            y1: height,
+        };
+        let rect = if scissor {
+            match project_sphere_to_screen(camera, centre_world, bounds.radius, settings) {
+                // Off-screen on either axis → the grid can't appear.
+                Some(r) if r.is_empty() => continue,
+                // Vertical band only (full width); lateral extent already
+                // served the cull above.
+                Some(r) => ScreenRect {
+                    x0: 0,
+                    x1: width,
+                    y0: r.y0,
+                    y1: r.y1,
+                },
+                None => full_rect,
+            }
+        } else {
+            full_rect
+        };
+
         // S5.2-followup: per-grid sky opt-out. Grids with
         // `render_sky = false` (e.g. a rotating ship) must not
         // contribute sky pixels — the grid-local sky lookup
@@ -426,11 +608,11 @@ pub fn render_scene_composed(
             pool.set_skycast(SKY_MASK_SENTINEL as i32, 0);
         }
 
-        // Reset temp to sky / INFINITY so each grid starts fresh.
-        // The reset cost is O(pixels) per grid; for small grid counts
-        // this is negligible vs the opticast work.
-        temp_fb.fill(local_sky_color);
-        temp_zb.fill(f32::INFINITY);
+        // Reset temp to sky / INFINITY so each grid starts fresh —
+        // only within the grid's screen rect (opticast writes nothing
+        // outside it, and the rect-limited compose reads nothing there).
+        fill_rect_u32(&mut temp_fb, pitch_pixels, rect, local_sky_color);
+        fill_rect_f32(&mut temp_zb, pitch_pixels, rect, f32::INFINITY);
 
         let local_cam = world_camera_to_grid_local(camera, &grid.transform);
         let cg = roxlap_core::ChunkGrid {
@@ -513,22 +695,28 @@ pub fn render_scene_composed(
                     rasterizer = rasterizer.with_sky(sky_ref);
                 }
             }
-            opticast(
-                &mut rasterizer,
-                pool,
-                &local_cam,
-                active_settings,
-                grid_view,
-            )
+            // Vertical scissor: restrict opticast to the grid's screen
+            // y-band (full width). `rect` is always full-width here (see
+            // the rect computation), so this is the proven `y_start /
+            // y_end` strip path — byte-identical to the full frame when
+            // the band is `0..height`. The lateral cull happened above;
+            // a horizontal opticast scissor is unsafe (the radar's
+            // column-indexed `angstart` isn't reset per grid, so column
+            // clipping reads stale entries at extreme poses — see the
+            // `cpu-grid-scissor` memo).
+            let scissored = (*active_settings).with_y_range(rect.y0, rect.y1);
+            opticast(&mut rasterizer, pool, &local_cam, &scissored, grid_view)
         };
 
         if !owns_sky {
-            // Mask sentinel pixels so compose drops them. One linear
-            // sweep of the temp framebuffer; sentinel pixels become
-            // `INFINITY` in temp_zb (= always lose min-z).
-            for (px, z) in temp_fb.iter().zip(temp_zb.iter_mut()) {
-                if *px == SKY_MASK_SENTINEL {
-                    *z = f32::INFINITY;
+            // Mask sentinel pixels so compose drops them — only within
+            // the grid's rect (opticast wrote nothing outside it).
+            for y in rect.y0..rect.y1 {
+                let row = y as usize * pitch_pixels;
+                for i in row + rect.x0 as usize..row + rect.x1 as usize {
+                    if temp_fb[i] == SKY_MASK_SENTINEL {
+                        temp_zb[i] = f32::INFINITY;
+                    }
                 }
             }
             // Restore the pool's sky colour so subsequent grids
@@ -537,7 +725,7 @@ pub fn render_scene_composed(
         }
 
         if outcome == OpticastOutcome::Rendered {
-            compose_into(fb, zb, &temp_fb, &temp_zb);
+            compose_rect(fb, zb, &temp_fb, &temp_zb, pitch_pixels, rect);
             grids_drawn += 1;
         }
     }
@@ -1177,6 +1365,73 @@ mod tests {
         assert!(
             blue_count > 0,
             "no blue pixels: grid 1 (blue box) not visible after compose"
+        );
+    }
+
+    /// The per-grid screen scissor (vertical band + lateral/vertical
+    /// off-screen cull + rect-limited memory passes) must be a pure
+    /// speed-up: rendering a multi-grid scene with it on
+    /// (`render_scene_composed`) must produce a **byte-identical**
+    /// framebuffer to rendering each grid full-frame
+    /// (`scissor = false`). Includes a third grid placed off the left
+    /// edge but within scan distance, so the lateral cull (scissor on)
+    /// vs a sky-only full render (scissor off) must still agree pixel
+    /// for pixel.
+    #[test]
+    fn scissor_render_is_byte_identical_to_full_frame() {
+        let (mut scene, red, blue) = build_two_grid_side_by_side();
+        // Third grid far to the +x side at the camera's depth: within
+        // max_scan_dist (so the distance cull doesn't fire) but its box
+        // projects off the left screen edge → screen-culled with the
+        // scissor, sky-only when rendered full-frame.
+        let g2 = scene.add_grid(GridTransform::at(DVec3::new(700.0, 130.0, 0.0)));
+        let g2_id = scene
+            .grids()
+            .map(|(id, _)| id)
+            .max_by_key(|id| id.raw())
+            .unwrap();
+        let _ = g2;
+        scene.grid_mut(g2_id).unwrap().set_rect(
+            IVec3::new(56, 56, 92),
+            IVec3::new(71, 71, 107),
+            Some(0x80_22_88_22), // green — must never appear (off-screen)
+        );
+
+        let camera = camera_at([160.0, 100.0, 100.0]);
+        let render = |scene: &mut Scene, scissor: bool| -> Vec<u32> {
+            let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+            let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+            let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+            let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+            render_scene_composed_scissored(
+                &mut fb,
+                &mut zb,
+                XRES as usize,
+                XRES,
+                YRES,
+                &mut pool,
+                scene,
+                &camera,
+                &settings,
+                sky_color,
+                None,
+                scissor,
+            );
+            fb
+        };
+
+        let scissored = render(&mut scene, true);
+        let full = render(&mut scene, false);
+        assert_eq!(
+            scissored, full,
+            "the screen scissor changed the framebuffer — it must be a pure speed-up",
+        );
+        // Sanity: the scene actually drew content (not a vacuous all-sky
+        // match), and the off-screen green grid never appears.
+        assert!(scissored.iter().any(|&p| p == red || p == blue));
+        assert!(
+            !scissored.iter().any(|&p| p == 0x80_22_88_22),
+            "off-screen grid leaked pixels",
         );
     }
 
