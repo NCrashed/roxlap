@@ -383,6 +383,12 @@ pub struct GpuRenderer {
     /// Lazy-built debug-line pipeline (L3.2) — built on the first
     /// [`Self::draw_lines_deferred`] call.
     line_resources: Option<LineResources>,
+    /// Persistent debug-line vertex buffer (L3.3) — grown on demand and
+    /// reused across frames so a per-frame overlay (hundreds of segments)
+    /// costs one `write_buffer`, not a fresh allocation. `line_vbuf_cap`
+    /// is its capacity in bytes.
+    line_vbuf: Option<wgpu::Buffer>,
+    line_vbuf_cap: u64,
     /// Lazy-built `egui-wgpu` paint pipeline; created on the first
     /// [`Self::paint_egui`] call (`hud` feature).
     #[cfg(feature = "hud")]
@@ -850,6 +856,8 @@ impl GpuRenderer {
             last_fov_y_rad: 0.0,
             pending_frame: None,
             line_resources: None,
+            line_vbuf: None,
+            line_vbuf_cap: 0,
             #[cfg(feature = "hud")]
             egui_renderer: None,
         }
@@ -2108,14 +2116,23 @@ impl GpuRenderer {
             ],
         });
 
-        let vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("roxlap-gpu line.vbuf"),
-            size: std::mem::size_of_val(verts.as_slice()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Grow-only persistent vertex buffer (L3.3): one `write_buffer`
+        // per overlay, reused across frames. Power-of-two capacity keeps
+        // re-allocation rare as the segment count drifts.
+        let needed = std::mem::size_of_val(verts.as_slice()) as u64;
+        if self.line_vbuf_cap < needed {
+            let cap = needed.next_power_of_two().max(4096);
+            self.line_vbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("roxlap-gpu line.vbuf"),
+                size: cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.line_vbuf_cap = cap;
+        }
+        let vbuf = self.line_vbuf.as_ref().expect("ensured above");
         self.queue
-            .write_buffer(&vbuf, 0, bytemuck::cast_slice(&verts));
+            .write_buffer(vbuf, 0, bytemuck::cast_slice(&verts));
 
         let view = &self.pending_frame.as_ref().expect("checked above").1;
         let mut encoder = self

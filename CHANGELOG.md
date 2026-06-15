@@ -22,6 +22,26 @@ one new `Grid` method).
 
 ### Added
 
+- **Depth-tested 3D line drawing — `SceneRenderer::draw_lines`.** A
+  world-space line-overlay pass on the `roxlap-render` facade, drawn
+  **between `render` and `present`/`paint_egui`** and dispatched
+  per-backend, for editor gizmos / debug geometry (bounding boxes, floor
+  grids, origin axes, paths). `draw_lines(camera, &[Line3])` projects each
+  segment with the frame's own projection and **depth-tests it against the
+  frame's z-buffer**, so rendered geometry occludes lines behind it.
+  `Line3 { a, b: [f64;3], color: u32 /*0xAARRGGBB*/, width_px: f32,
+  depth_test: bool }` — alpha-blended by the colour's high byte, screen-
+  space thickness via `width_px`, and `depth_test: false` for always-on-
+  top overlays (e.g. a hover highlight). Both backends honour the same
+  semantics in **their own depth metric** (CPU: perpendicular distance;
+  GPU: euclidean `best_t`): the CPU backend rasterises the segments into
+  the framebuffer with a perspective-correct depth interpolation, while
+  the GPU backend expands them to screen-space quads (`line.wgsl`) and
+  composites a `LoadOp::Load` pass that samples the scene-DDA depth
+  buffer. The GPU scene pass now **always writes depth** (was gated on
+  sprites being present), which also makes `pick_depth` work on a
+  sprite-less GPU frame. egui overlay ordering is unaffected — the lines
+  land in the framebuffer, so `paint_egui` still draws panels on top.
 - **`Vxl::from_dense` + `Vxl::empty` — one-call dense-model → `.vxl`
   export.** `Vxl::from_dense(vsid, |x,y,z| -> Option<u32>)` builds a world
   from a dense occupancy + `0x80RRGGBB` colour closure (z-down,

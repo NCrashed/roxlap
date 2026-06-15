@@ -13,6 +13,14 @@
 //! surface, the framebuffer/z-buffer (CPU) or the resident scene +
 //! dirty-chunk tracking (GPU), and presentation.
 //!
+//! The per-frame flow is `render` → *(optional overlays)* → finish.
+//! Between [`SceneRenderer::render`] and the finishing
+//! [`SceneRenderer::present`] / [`SceneRenderer::paint_egui`] call, a
+//! host may overlay depth-tested world-space lines with
+//! [`SceneRenderer::draw_lines`] (editor gizmos, debug geometry — see
+//! [`Line3`]); they land in the framebuffer, occluded by the rendered
+//! scene, with egui still painting panels on top.
+//!
 //! This is the RF.0 skeleton: backend selection + fallback + a
 //! clear-to-sky frame. RF.1/RF.2 fill in the real CPU/GPU scene
 //! render; RF.3 adds sprites; RF.4 adds framebuffer capture.
