@@ -1430,7 +1430,7 @@ mod tests {
         // match), and the off-screen green grid never appears.
         assert!(scissored.iter().any(|&p| p == red || p == blue));
         assert!(
-            !scissored.iter().any(|&p| p == 0x80_22_88_22),
+            !scissored.contains(&0x80_22_88_22),
             "off-screen grid leaked pixels",
         );
     }
