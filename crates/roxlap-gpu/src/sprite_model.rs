@@ -616,6 +616,21 @@ pub struct SpriteRegistryResident {
     /// first. The cull picks a level by distance and writes its entry
     /// id into the packed instance's `model_id`.
     chains: Vec<Vec<u32>>,
+    /// GPU.12 incremental — CPU mirror of the GPU `model_meta` table, one
+    /// per concrete entry. [`Self::update_model`] reads the fixed
+    /// occupancy/color_offsets bases from here and rewrites the changed
+    /// `colors_offset` on a relocation.
+    meta: Vec<SpriteModelMeta>,
+    /// GPU.12 incremental — per-entry placement of `colors`/`dirs` in the
+    /// shared buffers (drives both; same offsets/ranks). Lets an edit
+    /// re-upload one model's data without touching the others.
+    colors_alloc: ColorsAllocator,
+    /// Per-entry word length of the dims-fixed `occupancy` and
+    /// `color_offsets` arrays, kept so [`Self::update_model`] can assert a
+    /// carve never changed dims (which would invalidate the in-place
+    /// writes — growing dims is out of scope, handled by a full re-upload).
+    occ_lens: Vec<u32>,
+    coloff_lens: Vec<u32>,
 }
 
 impl SpriteRegistryResident {
@@ -629,18 +644,32 @@ impl SpriteRegistryResident {
         registry: &SpriteModelRegistry,
         instances: &[SpriteInstance],
     ) -> Self {
-        let mut all_occ: Vec<u32> = Vec::new();
-        let mut all_colors: Vec<u32> = Vec::new();
-        let mut all_dirs: Vec<u32> = Vec::new();
-        let mut all_offsets: Vec<u32> = Vec::new();
-        let mut meta: Vec<SpriteModelMeta> = Vec::with_capacity(registry.entries.len());
+        // `occupancy` + `color_offsets` are dims-fixed → tightly
+        // concatenated (never grow on a carve). `colors` + `dirs` are
+        // variable → laid out by the suballocator with per-slot slack so
+        // an incremental edit can rewrite one model in place.
+        let entry_lens: Vec<u32> = registry
+            .entries
+            .iter()
+            .map(|m| m.colors.len() as u32)
+            .collect();
+        let colors_alloc = ColorsAllocator::new(&entry_lens);
+        let cap_total = colors_alloc.cap_total();
 
-        // One meta + concatenated data per concrete (mip-level) entry.
-        // `dirs` parallels `colors` (same offsets/ranks).
-        for m in &registry.entries {
+        let mut all_occ: Vec<u32> = Vec::new();
+        let mut all_offsets: Vec<u32> = Vec::new();
+        let mut all_colors: Vec<u32> = vec![0; cap_total as usize];
+        let mut all_dirs: Vec<u32> = vec![0; cap_total as usize];
+        let mut meta: Vec<SpriteModelMeta> = Vec::with_capacity(registry.entries.len());
+        let mut occ_lens: Vec<u32> = Vec::with_capacity(registry.entries.len());
+        let mut coloff_lens: Vec<u32> = Vec::with_capacity(registry.entries.len());
+
+        // One meta + placed data per concrete (mip-level) entry.
+        for (e, m) in registry.entries.iter().enumerate() {
+            let slot = colors_alloc.slot(e);
             meta.push(SpriteModelMeta {
                 occupancy_offset: all_occ.len() as u32,
-                colors_offset: all_colors.len() as u32,
+                colors_offset: slot.off,
                 color_offsets_offset: all_offsets.len() as u32,
                 occ_words_per_col: m.occ_words_per_col,
                 dims: m.dims,
@@ -648,10 +677,13 @@ impl SpriteRegistryResident {
                 pivot: m.pivot,
                 voxel_world_size: m.voxel_world_size,
             });
+            occ_lens.push(m.occupancy.len() as u32);
+            coloff_lens.push(m.color_offsets.len() as u32);
             all_occ.extend_from_slice(&m.occupancy);
-            all_colors.extend_from_slice(&m.colors);
-            all_dirs.extend_from_slice(&m.dirs);
             all_offsets.extend_from_slice(&m.color_offsets);
+            let off = slot.off as usize;
+            all_colors[off..off + m.colors.len()].copy_from_slice(&m.colors);
+            all_dirs[off..off + m.dirs.len()].copy_from_slice(&m.dirs);
         }
 
         // Per-instance cull records: sphere centred at the instance
@@ -696,11 +728,26 @@ impl SpriteRegistryResident {
         let colmul_cap = (cull.len() as u32).max(1) * 256 * 2;
         let colmul = storage_dst_u32(device, "roxlap-gpu sprite_reg.colmul", colmul_cap);
         Self {
-            occupancy: storage_u32(device, "roxlap-gpu sprite_reg.occupancy", &all_occ),
-            colors: storage_u32(device, "roxlap-gpu sprite_reg.colors", &all_colors),
-            dirs: storage_u32(device, "roxlap-gpu sprite_reg.dirs", &all_dirs),
-            color_offsets: storage_u32(device, "roxlap-gpu sprite_reg.color_offsets", &all_offsets),
-            model_meta: storage_pod(device, "roxlap-gpu sprite_reg.model_meta", &meta),
+            occupancy: storage_dst_u32_cap(
+                device,
+                "roxlap-gpu sprite_reg.occupancy",
+                &all_occ,
+                all_occ.len() as u32,
+            ),
+            colors: storage_dst_u32_cap(
+                device,
+                "roxlap-gpu sprite_reg.colors",
+                &all_colors,
+                cap_total,
+            ),
+            dirs: storage_dst_u32_cap(device, "roxlap-gpu sprite_reg.dirs", &all_dirs, cap_total),
+            color_offsets: storage_dst_u32_cap(
+                device,
+                "roxlap-gpu sprite_reg.color_offsets",
+                &all_offsets,
+                all_offsets.len() as u32,
+            ),
+            model_meta: storage_dst_pod(device, "roxlap-gpu sprite_reg.model_meta", &meta),
             instances: instances_buf,
             instance_capacity: cull.len() as u32,
             colmul,
@@ -711,6 +758,10 @@ impl SpriteRegistryResident {
             tile_instances_cap: 1,
             cull,
             chains: registry.chains.clone(),
+            meta,
+            colors_alloc,
+            occ_lens,
+            coloff_lens,
         }
     }
 
@@ -746,6 +797,135 @@ impl SpriteRegistryResident {
             // Bounding sphere follows the pivot; radius/chain unchanged.
             ci.center = inst.transform.pos;
         }
+    }
+
+    /// GPU.12 incremental — re-upload only the entries of LOD chain
+    /// `chain_id` after an in-place edit (carve / recolour) of its model,
+    /// **without** rebuilding the whole registry. `registry` must be the
+    /// same registry uploaded (same entry ids), with chain `chain_id`'s
+    /// entries already edited (`model_mut` + `rebuild_lod`).
+    ///
+    /// For each entry: occupancy + color_offsets are dims-fixed, so they
+    /// are written in place; colors + dirs (variable, parallel) go through
+    /// the suballocator — written in place when they fit the slack,
+    /// relocated (with a `model_meta` rewrite) when they outgrow it, and
+    /// only when the buffer tail overflows are colors/dirs grown + the
+    /// whole registry repacked. Instances / cull / colmul are untouched
+    /// (a carve never moves an instance or grows its bounds) — that is the
+    /// win over [`Self::upload`].
+    ///
+    /// # Panics (debug)
+    /// If an entry's dims changed (occupancy / color_offsets length), which
+    /// the in-place path can't absorb — growing dims needs a full
+    /// re-upload via [`Self::upload`].
+    pub fn update_model(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        registry: &SpriteModelRegistry,
+        chain_id: u32,
+    ) {
+        let entries = self.chains[chain_id as usize].clone();
+        let mut grew = false;
+        for &e in &entries {
+            let e = e as usize;
+            let m = &registry.entries[e];
+
+            // Dims-fixed arrays: assert unchanged, then write in place.
+            debug_assert_eq!(
+                m.occupancy.len() as u32,
+                self.occ_lens[e],
+                "update_model: entry {e} occupancy length changed (dims grew?)"
+            );
+            debug_assert_eq!(
+                m.color_offsets.len() as u32,
+                self.coloff_lens[e],
+                "update_model: entry {e} color_offsets length changed (dims grew?)"
+            );
+            queue.write_buffer(
+                &self.occupancy,
+                u64::from(self.meta[e].occupancy_offset) * 4,
+                bytemuck::cast_slice(&m.occupancy),
+            );
+            queue.write_buffer(
+                &self.color_offsets,
+                u64::from(self.meta[e].color_offsets_offset) * 4,
+                bytemuck::cast_slice(&m.color_offsets),
+            );
+
+            // Variable colors/dirs via the suballocator.
+            let new_len = m.colors.len() as u32;
+            match self.colors_alloc.place(e, new_len) {
+                Some(off) => {
+                    queue.write_buffer(
+                        &self.colors,
+                        u64::from(off) * 4,
+                        bytemuck::cast_slice(&m.colors),
+                    );
+                    queue.write_buffer(
+                        &self.dirs,
+                        u64::from(off) * 4,
+                        bytemuck::cast_slice(&m.dirs),
+                    );
+                    if self.meta[e].colors_offset != off {
+                        // Relocated — rewrite this entry's meta record.
+                        self.meta[e].colors_offset = off;
+                        queue.write_buffer(
+                            &self.model_meta,
+                            (e * std::mem::size_of::<SpriteModelMeta>()) as u64,
+                            bytemuck::bytes_of(&self.meta[e]),
+                        );
+                    }
+                }
+                None => grew = true,
+            }
+        }
+
+        // Buffer overflow on at least one entry → grow colors/dirs and
+        // repack the WHOLE registry (rare; offsets for every entry move).
+        if grew {
+            self.grow_and_repack(device, queue, registry);
+        }
+    }
+
+    /// Grow the `colors`/`dirs` buffers and repack every entry compactly
+    /// (with fresh slack) when an [`Self::update_model`] edit overflowed
+    /// the buffer tail. Recreates both buffers (the next frame's bind
+    /// group picks up the new handles) and rewrites every `model_meta`
+    /// `colors_offset`. O(registry) but rare — logged so a growth burst
+    /// is visible.
+    fn grow_and_repack(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        registry: &SpriteModelRegistry,
+    ) {
+        let new_lens: Vec<u32> = registry
+            .entries
+            .iter()
+            .map(|m| m.colors.len() as u32)
+            .collect();
+        self.colors_alloc.repack(&new_lens);
+        let cap_total = self.colors_alloc.cap_total();
+
+        let mut all_colors = vec![0u32; cap_total as usize];
+        let mut all_dirs = vec![0u32; cap_total as usize];
+        for (e, m) in registry.entries.iter().enumerate() {
+            let off = self.colors_alloc.slot(e).off as usize;
+            all_colors[off..off + m.colors.len()].copy_from_slice(&m.colors);
+            all_dirs[off..off + m.dirs.len()].copy_from_slice(&m.dirs);
+            self.meta[e].colors_offset = off as u32;
+        }
+        self.colors = storage_dst_u32_cap(
+            device,
+            "roxlap-gpu sprite_reg.colors",
+            &all_colors,
+            cap_total,
+        );
+        self.dirs = storage_dst_u32_cap(device, "roxlap-gpu sprite_reg.dirs", &all_dirs, cap_total);
+        // Every entry's colors_offset moved → rewrite the whole meta table.
+        queue.write_buffer(&self.model_meta, 0, bytemuck::cast_slice(&self.meta));
+        eprintln!("roxlap-gpu: sprite registry colors/dirs grew + repacked to {cap_total} words");
     }
 
     /// GPU.10.3 — frustum-cull, pack the visible subset into the
@@ -916,8 +1096,123 @@ impl SpriteRegistryResident {
     }
 }
 
+/// GPU.12 incremental — per-entry placement of one model's `colors`
+/// (and the parallel `dirs`) within the shared registry buffers: a
+/// `[off, off+cap)` word window holding `len` live words. `cap >= len`
+/// gives slack so a carve that *grows* the surface-voxel count can be
+/// rewritten in place without relocating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ColorSlot {
+    off: u32,
+    cap: u32,
+    len: u32,
+}
+
+/// First-fit suballocator over the parallel `colors`/`dirs` buffers
+/// (same offsets/ranks → one allocator drives both). Each registry
+/// entry owns a [`ColorSlot`]; growth past a slot's `cap` relocates it
+/// (freeing the old block) via the free list or a bump tail, and only
+/// when the tail would exceed `cap_total` does the caller grow + repack
+/// the whole buffer. Pure (no GPU) so it unit-tests on its own.
+#[derive(Debug, Default)]
+struct ColorsAllocator {
+    /// Per-entry slot, indexed by entry id.
+    slots: Vec<ColorSlot>,
+    /// Freed `(off, cap)` blocks available for first-fit reuse.
+    free: Vec<(u32, u32)>,
+    /// Next bump-allocation position (words).
+    tail: u32,
+    /// Total buffer capacity in words.
+    cap_total: u32,
+}
+
+/// Slack-padded capacity for a `len`-word array: +25% + 16 words, so a
+/// few extra surface voxels from a carve fit without relocating.
+fn slot_cap(len: u32) -> u32 {
+    len + len / 4 + 16
+}
+
+impl ColorsAllocator {
+    /// Lay every entry out contiguously (with per-slot slack) and add a
+    /// global tail headroom so early growth bump-allocates rather than
+    /// repacks.
+    fn new(entry_lens: &[u32]) -> Self {
+        let mut a = Self::default();
+        a.repack(entry_lens);
+        a
+    }
+
+    fn slot(&self, entry: usize) -> ColorSlot {
+        self.slots[entry]
+    }
+
+    fn cap_total(&self) -> u32 {
+        self.cap_total
+    }
+
+    /// Repack ALL entries compactly to fit `new_lens`, resetting the
+    /// free list + tail and choosing a fresh `cap_total` with headroom.
+    /// Used at initial build and on a buffer grow.
+    fn repack(&mut self, new_lens: &[u32]) {
+        self.free.clear();
+        let mut off = 0u32;
+        let mut slots = Vec::with_capacity(new_lens.len());
+        for &len in new_lens {
+            let cap = slot_cap(len);
+            slots.push(ColorSlot { off, cap, len });
+            off += cap;
+        }
+        self.slots = slots;
+        self.tail = off;
+        // Global headroom: +50% + 256 words.
+        self.cap_total = off + off / 2 + 256;
+    }
+
+    /// Place `new_len` words for `entry`. Returns `Some(off)` with the
+    /// (possibly relocated) slot offset, or `None` if the buffer must
+    /// grow + repack. On relocation the old block is pushed to the free
+    /// list; an in-place fit returns the unchanged offset.
+    fn place(&mut self, entry: usize, new_len: u32) -> Option<u32> {
+        let cur = self.slots[entry];
+        if new_len <= cur.cap {
+            self.slots[entry] = ColorSlot {
+                len: new_len,
+                ..cur
+            };
+            return Some(cur.off);
+        }
+        let old = (cur.off, cur.cap);
+        // First-fit a freed block big enough for the live data.
+        if let Some(i) = self.free.iter().position(|&(_, c)| c >= new_len) {
+            let (off, cap) = self.free.remove(i);
+            self.free.push(old);
+            self.slots[entry] = ColorSlot {
+                off,
+                cap,
+                len: new_len,
+            };
+            return Some(off);
+        }
+        // Bump the tail if there's room.
+        let want = slot_cap(new_len);
+        if self.tail + want <= self.cap_total {
+            let off = self.tail;
+            self.tail += want;
+            self.free.push(old);
+            self.slots[entry] = ColorSlot {
+                off,
+                cap: want,
+                len: new_len,
+            };
+            return Some(off);
+        }
+        None
+    }
+}
+
 /// Create a STORAGE buffer of u32s; pads empty input (wgpu rejects
 /// zero-sized storage bindings).
+#[allow(dead_code)]
 fn storage_u32(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
     let bytes: &[u8] = if data.is_empty() {
@@ -943,8 +1238,58 @@ fn storage_dst_u32(device: &wgpu::Device, label: &str, cap: u32) -> wgpu::Buffer
     })
 }
 
+/// Create a `STORAGE | COPY_DST` `u32` buffer of `cap` words (≥ data
+/// length, ≥ 1), initialised with `data` at offset 0 and the tail left
+/// zeroed. Unlike [`storage_u32`] (STORAGE-only, exact-size) this both
+/// reserves spare capacity and is `COPY_DST`, so the incremental
+/// [`SpriteRegistryResident::update_model`] can `write_buffer` a growing
+/// `colors`/`dirs` array in place. Filled via `mapped_at_creation` so no
+/// queue is needed at upload time.
+fn storage_dst_u32_cap(device: &wgpu::Device, label: &str, data: &[u32], cap: u32) -> wgpu::Buffer {
+    let cap = cap.max(data.len() as u32).max(1);
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: u64::from(cap) * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: true,
+    });
+    if !data.is_empty() {
+        buf.slice(..(data.len() as u64 * 4))
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(data));
+    }
+    buf.unmap();
+    buf
+}
+
+/// Create a `STORAGE | COPY_DST` buffer of Pod records, exact-size
+/// (≥ 1, zero-padded), so individual records can be rewritten in place
+/// by [`SpriteRegistryResident::update_model`] on a relocation. The
+/// record *count* never changes on an incremental edit (no model is
+/// added/removed), so no slack is needed here.
+fn storage_dst_pod<T: Pod + Zeroable>(
+    device: &wgpu::Device,
+    label: &str,
+    data: &[T],
+) -> wgpu::Buffer {
+    let one = [T::zeroed()];
+    let src: &[T] = if data.is_empty() { &one } else { data };
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: std::mem::size_of_val(src) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: true,
+    });
+    buf.slice(..)
+        .get_mapped_range_mut()
+        .copy_from_slice(bytemuck::cast_slice(src));
+    buf.unmap();
+    buf
+}
+
 /// Create a STORAGE buffer of Pod records; pads empty input with one
 /// zeroed `T`.
+#[allow(dead_code)]
 fn storage_pod<T: Pod + Zeroable>(device: &wgpu::Device, label: &str, data: &[T]) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
     let one = [T::zeroed()];
@@ -1167,5 +1512,135 @@ mod tests {
             .colors
             .iter()
             .all(|&c| c == 0x0000_2000));
+    }
+
+    // ---- GPU.12 incremental: colors/dirs suballocator -----------------
+
+    /// Every slot fits its data, has slack, doesn't overlap the next, and
+    /// the buffer reserves tail headroom past the last slot.
+    fn alloc_invariants(a: &ColorsAllocator, lens: &[u32]) {
+        let mut prev_end = 0u32;
+        for (e, &len) in lens.iter().enumerate() {
+            let s = a.slot(e);
+            assert_eq!(s.len, len, "slot {e} len");
+            assert!(s.cap >= s.len, "slot {e} cap >= len");
+            // In a freshly repacked layout slots are in entry order.
+            assert!(s.off >= prev_end, "slot {e} overlaps previous");
+            assert!(s.off + s.cap <= a.cap_total(), "slot {e} past cap_total");
+            prev_end = s.off + s.cap;
+        }
+        assert!(a.cap_total() >= prev_end, "tail headroom");
+    }
+
+    #[test]
+    fn allocator_new_lays_out_with_slack_and_headroom() {
+        let lens = [10u32, 0, 64, 7];
+        let a = ColorsAllocator::new(&lens);
+        alloc_invariants(&a, &lens);
+        // Slack: a 64-word slot has cap > 64 so a small carve-grow fits.
+        assert!(a.slot(2).cap > 64);
+        // Headroom past the bump tail for early growth.
+        assert!(a.cap_total() > a.slot(3).off + a.slot(3).cap);
+    }
+
+    #[test]
+    fn allocator_place_in_place_when_within_cap() {
+        let mut a = ColorsAllocator::new(&[10, 20]);
+        let off0 = a.slot(0).off;
+        let cap0 = a.slot(0).cap;
+        // Shrink: still the same slot.
+        assert_eq!(a.place(0, 5), Some(off0));
+        assert_eq!(a.slot(0).len, 5);
+        assert_eq!(a.slot(0).cap, cap0);
+        // Grow within slack: same offset, no relocation.
+        assert_eq!(a.place(0, cap0), Some(off0));
+        assert_eq!(a.slot(0).off, off0);
+        assert!(a.free.is_empty(), "no relocation should free anything");
+    }
+
+    #[test]
+    fn allocator_place_relocates_to_tail_and_frees_old() {
+        let mut a = ColorsAllocator::new(&[10, 20]);
+        let old0 = (a.slot(0).off, a.slot(0).cap);
+        let tail_before = a.tail;
+        // Overgrow entry 0 past its cap → relocate to the bump tail.
+        let new_len = a.slot(0).cap + 5;
+        let off = a.place(0, new_len).expect("fits in headroom");
+        assert_eq!(off, tail_before, "relocated to old tail");
+        assert_eq!(a.slot(0).off, off);
+        assert_eq!(a.slot(0).len, new_len);
+        assert!(a.free.contains(&old0), "old slot freed");
+    }
+
+    #[test]
+    fn allocator_reuses_freed_block_first_fit() {
+        // Entry 0 has a large slot; entry 1 a tiny one, so growing 1 must
+        // relocate (it can't fit in place) and lands in 0's freed block.
+        let mut a = ColorsAllocator::new(&[10, 2]);
+        let old0 = (a.slot(0).off, a.slot(0).cap);
+        // Relocate entry 0 to the tail, freeing its original block.
+        let _ = a.place(0, a.slot(0).cap + 5).unwrap();
+        assert!(a.free.contains(&old0));
+        // Grow entry 1 past its (tiny) cap but ≤ the freed block's cap →
+        // first-fit reuses that block rather than bumping the tail.
+        let new1 = a.slot(1).cap + 1;
+        assert!(new1 <= old0.1, "freed block big enough");
+        let off = a.place(1, new1).expect("reuses freed block");
+        assert_eq!(off, old0.0, "first-fit reused the freed slot offset");
+        assert!(!a.free.contains(&old0), "freed block consumed");
+    }
+
+    #[test]
+    fn allocator_signals_grow_then_repack_restores() {
+        let mut a = ColorsAllocator::new(&[8, 8]);
+        // Force overflow: ask for far more than cap_total.
+        let huge = a.cap_total() + 100;
+        assert_eq!(a.place(0, huge), None, "overflow must signal grow");
+        // Repack with the new lengths compacts + grows the buffer.
+        a.repack(&[huge, 8]);
+        alloc_invariants(&a, &[huge, 8]);
+        assert!(a.cap_total() > huge);
+        // After repack the entry now fits in place.
+        assert_eq!(a.place(0, huge), Some(a.slot(0).off));
+    }
+
+    /// Drive the allocator like a real carve loop (mirroring
+    /// `update_model`): one model's colour count drifts up and down
+    /// across many edits while two neighbours stay put. Growth is
+    /// absorbed in place / via the free list / by the bump tail, and on
+    /// the rare overflow we repack (as `update_model` does). After every
+    /// edit the live `[off, off+len)` windows must stay disjoint.
+    #[test]
+    fn allocator_carve_loop_keeps_live_windows_disjoint() {
+        let mut a = ColorsAllocator::new(&[40, 12, 40]);
+        let mut lens = [40u32, 12, 40];
+        // A deterministic up/down walk of entry 1's length, incl. a jump
+        // that forces at least one grow+repack.
+        let walk = [13u32, 30, 60, 18, 9, 80, 80, 25, 200, 7];
+        let mut grew = false;
+        for &len in &walk {
+            lens[1] = len;
+            // Entry 1 re-placed; on overflow, repack the whole set.
+            if a.place(1, len).is_none() {
+                grew = true;
+                a.repack(&lens);
+            } else {
+                // Neighbours fit in place every time.
+                assert_eq!(a.place(0, 40), Some(a.slot(0).off));
+                assert_eq!(a.place(2, 40), Some(a.slot(2).off));
+            }
+            assert_eq!(a.slot(1).len, len);
+
+            // No two entries' live windows overlap.
+            let mut wins: Vec<(u32, u32)> =
+                (0..3).map(|e| (a.slot(e).off, a.slot(e).len)).collect();
+            wins.sort_by_key(|w| w.0);
+            for pair in wins.windows(2) {
+                let (o0, l0) = pair[0];
+                let (o1, _) = pair[1];
+                assert!(o0 + l0 <= o1, "live windows overlap: {pair:?}");
+            }
+        }
+        assert!(grew, "the 200-word jump should have forced a repack");
     }
 }

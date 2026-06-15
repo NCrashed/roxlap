@@ -437,6 +437,24 @@ impl SceneRenderer {
         }
     }
 
+    /// GPU.12 incremental — re-register a single sprite model's geometry
+    /// after an in-place edit (carve / recolour of `sprite.kv6`), without
+    /// rebuilding the whole sprite field. `model_index` is the index into
+    /// the [`SpriteSet::models`] last passed to
+    /// [`set_sprites`](Self::set_sprites); the instance set is left
+    /// untouched (an edit never moves or adds an instance). On the GPU
+    /// backend this re-uploads only that model's voxel data through a
+    /// slack-backed suballocator (one model's bytes, not the registry);
+    /// on the CPU backend it swaps the cached `kv6` of every instance of
+    /// that model. Use [`set_sprites`](Self::set_sprites) to add/remove
+    /// models or change the instance set.
+    pub fn update_sprite_model(&mut self, model_index: usize, sprite: &Sprite) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.update_sprite_model(model_index, sprite),
+            BackendImpl::Gpu(g) => g.update_sprite_model(model_index, sprite),
+        }
+    }
+
     /// Register animated KFA sprites (one or more bone hierarchies).
     /// The GPU backend uploads each limb's kv6 as an instanced model
     /// **once** (appended to the sprite registry) and seeds the limb

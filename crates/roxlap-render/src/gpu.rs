@@ -72,6 +72,11 @@ pub(crate) struct GpuBackend {
     /// Index into [`sprite_instances`] where the KFA limb instances
     /// begin (static [`SpriteSet`] instances occupy `[0, kfa_base)`).
     kfa_base: usize,
+    /// GPU.12 incremental — registry LOD-chain id per static
+    /// [`SpriteSet::models`] index (built in [`set_sprites`]), so
+    /// [`update_sprite_model`](Self::update_sprite_model) can map a host
+    /// model index to its chain for a single-model re-upload.
+    sprite_model_ids: Vec<u32>,
     /// Registry model id the `G`-carve edits + its next z-layer.
     carve_model_id: Option<u32>,
     carve_z: u32,
@@ -101,6 +106,7 @@ impl GpuBackend {
             sprite_basis: Vec::new(),
             kfa_limb_models: Vec::new(),
             kfa_base: 0,
+            sprite_model_ids: Vec::new(),
             carve_model_id: None,
             carve_z: 0,
             host_sky_set: false,
@@ -164,6 +170,7 @@ impl GpuBackend {
         }
         self.gpu.set_sprite_instances(&registry, &instances);
         self.carve_model_id = set.carve_model.and_then(|i| model_ids.get(i).copied());
+        self.sprite_model_ids = model_ids;
         self.carve_z = 0;
         // Static instances reset the KFA region; re-register if needed.
         self.kfa_base = instances.len();
@@ -263,8 +270,28 @@ impl GpuBackend {
         }
         reg.rebuild_lod(id);
         self.carve_z = z + 1;
-        self.gpu.set_sprite_instances(reg, &self.sprite_instances);
+        // GPU.12 incremental: re-upload only this model's chain, not the
+        // whole registry (instances/cull/bounds are unchanged by a carve).
+        self.gpu.update_sprite_model(reg, id);
         removed
+    }
+
+    /// GPU.12 incremental — re-register host model `model_index`'s
+    /// geometry from the (already-edited) `sprite.kv6`, refreshing only
+    /// that LOD chain's GPU data. The instance set is untouched. No-op if
+    /// no registry is resident or `model_index` is unknown.
+    pub(crate) fn update_sprite_model(&mut self, model_index: usize, sprite: &Sprite) {
+        let Some(&chain_id) = self.sprite_model_ids.get(model_index) else {
+            return;
+        };
+        let Some(reg) = self.sprite_registry.as_mut() else {
+            return;
+        };
+        // Rebuild mip-0 from the edited kv6, then refresh the coarse mips
+        // so every LOD level matches before the single-chain re-upload.
+        *reg.model_mut(chain_id) = build_sprite_model(&sprite.kv6);
+        reg.rebuild_lod(chain_id);
+        self.gpu.update_sprite_model(reg, chain_id);
     }
 
     pub(crate) fn adapter_info(&self) -> &str {

@@ -109,6 +109,11 @@ pub(crate) struct CpuBackend {
     /// model KV6 cloned once at `set_sprites`), drawn each frame after
     /// the world via `draw_sprite`.
     sprites: Vec<Sprite>,
+    /// GPU.12 incremental — source [`SpriteSet::models`] index per entry
+    /// in [`sprites`](Self::sprites), so
+    /// [`update_sprite_model`](Self::update_sprite_model) can swap one
+    /// model's `kv6` into every instance of it without a full rebuild.
+    sprite_models: Vec<usize>,
     /// Posed KFA limbs (flattened across all registered KFA sprites),
     /// refreshed by [`Self::update_kfa_poses`] and drawn after the
     /// static sprites each frame via `draw_sprite`.
@@ -153,6 +158,7 @@ impl CpuBackend {
             n_threads,
             clear_sky: opts.clear_sky,
             sprites: Vec::new(),
+            sprite_models: Vec::new(),
             kfa_limbs: Vec::new(),
             capture_next: false,
             captured: None,
@@ -245,14 +251,31 @@ impl CpuBackend {
     /// instance position applied) so per-frame drawing never re-clones.
     pub(crate) fn set_sprites(&mut self, set: &SpriteSet) {
         let mut sprites = Vec::with_capacity(set.instances.len());
+        let mut sprite_models = Vec::with_capacity(set.instances.len());
         for inst in &set.instances {
             if let Some(model) = set.models.get(inst.model) {
                 let mut s = model.clone();
                 s.p = inst.pos;
                 sprites.push(s);
+                sprite_models.push(inst.model);
             }
         }
         self.sprites = sprites;
+        self.sprite_models = sprite_models;
+    }
+
+    /// GPU.12 incremental — swap the edited `sprite.kv6` into every cached
+    /// instance of host model `model_index`, keeping each instance's
+    /// world position. Mirrors the GPU backend's single-model update on
+    /// the software path (where "rebuild" is just a kv6 clone per
+    /// instance, so the win is parity rather than bandwidth). No-op if no
+    /// instance references `model_index`.
+    pub(crate) fn update_sprite_model(&mut self, model_index: usize, sprite: &Sprite) {
+        for (s, &m) in self.sprites.iter_mut().zip(&self.sprite_models) {
+            if m == model_index {
+                s.kv6 = sprite.kv6.clone();
+            }
+        }
     }
 
     /// Register KFA sprites — for the CPU backend this is the same as a

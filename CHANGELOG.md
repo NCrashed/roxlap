@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Incremental single-sprite GPU update — `SceneRenderer::update_sprite_model`.**
+  Editing one sprite model's geometry (a carve or recolour of its `kv6`)
+  no longer re-uploads the **whole** sprite registry. `update_sprite_model(model_index,
+  &Sprite)` re-registers just that model's voxel data, leaving every other
+  model and the entire instance set untouched (an edit never moves or adds
+  an instance). On the GPU backend the model's `colors`/`dirs` arrays are
+  written through a slack-backed **suballocator**: in place when they fit,
+  relocated (with a `model_meta` rewrite) when a carve grows the
+  surface-voxel count past the slot's slack, and only on a buffer-tail
+  overflow are the colour/dir buffers grown + the registry repacked. The
+  dims-fixed `occupancy`/`color_offsets` arrays are always written in
+  place. The CPU backend mirrors the single-model edit by swapping the
+  edited `kv6` into each instance of that model. The `G`-carve hotkey and
+  the scene-demo shoot-to-carve both move onto this path, so a shot
+  re-uploads ~one model's bytes instead of the full 256-instance field.
+  The sprite registry's GPU buffers are now `STORAGE | COPY_DST` with
+  over-allocation to back the in-place writes. `set_sprites` remains the
+  bulk/setup path for adding/removing models or changing instances.
+
 ## [0.9.0] — 2026-06-15
 
 The GPU renderer reaches the browser. `roxlap-gpu` and the `roxlap-render`

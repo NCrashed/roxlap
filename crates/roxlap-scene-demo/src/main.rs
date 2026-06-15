@@ -999,6 +999,15 @@ impl App {
     /// N×N field (`ROXLAP_SPRITE_GRID`, default 16 ⇒ 256 instances).
     /// The red model is the `G`-carve target. Content only — the
     /// renderer builds the CPU draws + GPU registry from this.
+    /// The [`SpriteSet::models`] index of the shoot-to-carve target —
+    /// kept in sync with [`build_sprite_set`](Self::build_sprite_set),
+    /// which appends the target as the last model (after the green + red
+    /// `coco` variants, when `coco.kv6` loaded). Used by
+    /// [`fire`](Self::fire) to re-upload only that model incrementally.
+    fn carve_target_model_index(&self) -> usize {
+        usize::from(!self.sprites.is_empty()) * 2
+    }
+
     fn build_sprite_set(&self) -> Option<SpriteSet> {
         let mut models = Vec::new();
         let mut instances = Vec::new();
@@ -1089,10 +1098,12 @@ impl App {
             "hit target at local ({}, {}, {}) — carved {removed} voxels",
             hit[0], hit[1], hit[2],
         );
-        // Re-upload (compute the set before borrowing the renderer).
-        let set = self.build_sprite_set();
-        if let (Some(renderer), Some(set)) = (self.renderer.as_mut(), set) {
-            renderer.set_sprites(&set);
+        // GPU.12 incremental: re-upload ONLY the carve target's model, not
+        // the whole 256-instance sprite field. The instance set and every
+        // other model are untouched.
+        let idx = self.carve_target_model_index();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.update_sprite_model(idx, &self.carve_target.sprite);
         }
     }
 

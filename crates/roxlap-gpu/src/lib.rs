@@ -2693,6 +2693,21 @@ impl GpuRenderer {
         }
     }
 
+    /// GPU.12 incremental — re-upload only LOD chain `chain_id`'s entries
+    /// after an in-place edit of `registry` (carve / recolour), without
+    /// rebuilding the whole sprite registry. `registry` must be the one
+    /// last passed to [`Self::set_sprite_instances`] with chain
+    /// `chain_id` already edited. No-op if no registry is resident.
+    pub fn update_sprite_model(
+        &mut self,
+        registry: &sprite_model::SpriteModelRegistry,
+        chain_id: u32,
+    ) {
+        if let Some(reg) = self.sprite_registry.as_mut() {
+            reg.update_model(&self.device, &self.queue, registry, chain_id);
+        }
+    }
+
     /// Set the per-instance `kv6colmul[256]` lighting tables (voxlap's
     /// `update_reflects` output, e.g. via `roxlap_core::sprite::
     /// sprite_colmul`), in the same order/length as the last
