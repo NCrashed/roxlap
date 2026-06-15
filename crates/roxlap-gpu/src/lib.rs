@@ -146,6 +146,172 @@ impl From<wgpu::RequestDeviceError> for GpuInitError {
 /// The window is consumed only at construction — `wgpu`'s
 /// `Surface<'static>` keeps its own `Arc` clone of the handle, so
 /// the renderer holds no window field of its own.
+/// A world-space line segment for [`GpuRenderer::draw_lines_deferred`].
+/// `color` is straight RGBA in `0..=1` (the alpha drives the over-blend);
+/// `width_px` is the screen-space thickness; `depth_test` occludes the
+/// segment behind nearer marched geometry.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuLine {
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub color: [f32; 4],
+    pub width_px: f32,
+    pub depth_test: bool,
+}
+
+/// World camera basis for projecting [`GpuLine`] endpoints — the same
+/// pinhole the scene-DDA pass marches with (`right`/`down`/`forward`
+/// orthonormal, `pos` in world voxel units).
+#[derive(Clone, Copy, Debug)]
+pub struct GpuLineCamera {
+    pub pos: [f32; 3],
+    pub right: [f32; 3],
+    pub down: [f32; 3],
+    pub forward: [f32; 3],
+}
+
+/// Near plane (camera-forward distance) below which a [`GpuLine`] endpoint
+/// is clipped, so the pinhole divide stays finite.
+const LINE_NEAR_Z: f32 = 0.0625;
+/// Depth-test slack (euclidean world distance) so a line resting on the
+/// surface it traces doesn't z-fight the marched geometry.
+const LINE_DEPTH_BIAS: f32 = 0.5;
+
+/// One expanded-quad vertex (`build_line_vertices` output). `pos` is NDC;
+/// `depth` is the euclidean world distance of the source endpoint (the
+/// marcher's `best_t` metric); `depth_test` is `1.0`/`0.0`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LineVertex {
+    pos: [f32; 2],
+    depth: f32,
+    depth_test: f32,
+    color: [f32; 4],
+}
+
+/// `line.wgsl` fragment uniform (std140; 16 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LineParams {
+    screen_w: u32,
+    screen_h: u32,
+    depth_bias: f32,
+    no_depth: u32,
+}
+
+/// Lazy-built debug-line pipeline (L3.2). The bind group is rebuilt each
+/// draw (it references the current `scene_dda.depth_buffer`, which the
+/// swapchain resize recreates); the pipeline / layout / uniform persist.
+struct LineResources {
+    pipeline: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    uniform_buf: wgpu::Buffer,
+    /// 1-word stand-in bound when no scene depth exists (sprite-only /
+    /// empty scene); `no_depth = 1` keeps the shader from indexing it.
+    dummy_depth: wgpu::Buffer,
+}
+
+/// Project + expand world-space [`GpuLine`]s into screen-space quad
+/// vertices (6 per visible segment) for `line.wgsl`. Mirrors the
+/// scene-DDA pinhole (`forward + ndc_x·half_w·right − ndc_y·half_h·down`)
+/// so lines land on the marched geometry, carrying each endpoint's
+/// euclidean world distance as the depth-test key (= the marcher's
+/// `best_t`). Segments fully behind the near plane are dropped; the rest
+/// are clipped to it.
+fn build_line_vertices(
+    cam: &GpuLineCamera,
+    lines: &[GpuLine],
+    w: u32,
+    h: u32,
+    fov_y: f32,
+) -> Vec<LineVertex> {
+    let aspect = w as f32 / h as f32;
+    let half_h = (fov_y * 0.5).tan();
+    let half_w = half_h * aspect;
+    let (wf, hf) = (w as f32, h as f32);
+
+    let cam_coords = |p: [f32; 3]| -> [f32; 3] {
+        let d = [p[0] - cam.pos[0], p[1] - cam.pos[1], p[2] - cam.pos[2]];
+        [
+            cam.right[0] * d[0] + cam.right[1] * d[1] + cam.right[2] * d[2],
+            cam.down[0] * d[0] + cam.down[1] * d[1] + cam.down[2] * d[2],
+            cam.forward[0] * d[0] + cam.forward[1] * d[1] + cam.forward[2] * d[2],
+        ]
+    };
+    // Camera-space point → (NDC xy, euclidean depth). NDC y is up (+1 top),
+    // matching WebGPU clip space; depth is the marcher's world-t metric.
+    let project = |q: [f32; 3]| -> ([f32; 2], f32) {
+        let inv = 1.0 / q[2];
+        let nx = q[0] * inv / half_w;
+        let ny = -q[1] * inv / half_h;
+        let depth = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt();
+        ([nx, ny], depth)
+    };
+
+    let mut out = Vec::with_capacity(lines.len() * 6);
+    for line in lines {
+        let ca = cam_coords(line.a);
+        let cb = cam_coords(line.b);
+        let (cfa, cfb) = (ca[2], cb[2]);
+        if cfa < LINE_NEAR_Z && cfb < LINE_NEAR_Z {
+            continue;
+        }
+        // Near-clip in segment-parameter space on the forward component.
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        let dz = cfb - cfa;
+        if dz.abs() > f32::EPSILON {
+            let tn = (LINE_NEAR_Z - cfa) / dz;
+            if dz > 0.0 {
+                t0 = t0.max(tn);
+            } else {
+                t1 = t1.min(tn);
+            }
+        }
+        if t0 > t1 {
+            continue;
+        }
+        let lerp3 = |t: f32| {
+            [
+                ca[0] + (cb[0] - ca[0]) * t,
+                ca[1] + (cb[1] - ca[1]) * t,
+                ca[2] + (cb[2] - ca[2]) * t,
+            ]
+        };
+        let (n0, d0) = project(lerp3(t0));
+        let (n1, d1) = project(lerp3(t1));
+
+        // Expand in pixel space for a uniform screen-space thickness.
+        let to_px = |n: [f32; 2]| [(n[0] * 0.5 + 0.5) * wf, (0.5 - n[1] * 0.5) * hf];
+        let to_ndc = |p: [f32; 2]| [p[0] / wf * 2.0 - 1.0, 1.0 - p[1] / hf * 2.0];
+        let p0 = to_px(n0);
+        let p1 = to_px(n1);
+        let (dx, dy) = (p1[0] - p0[0], p1[1] - p0[1]);
+        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+        let half = line.width_px.max(1.0) * 0.5;
+        let (ex, ey) = (-dy / len * half, dx / len * half);
+
+        let c0a = to_ndc([p0[0] + ex, p0[1] + ey]);
+        let c0b = to_ndc([p0[0] - ex, p0[1] - ey]);
+        let c1a = to_ndc([p1[0] + ex, p1[1] + ey]);
+        let c1b = to_ndc([p1[0] - ex, p1[1] - ey]);
+        let dt = if line.depth_test { 1.0 } else { 0.0 };
+        let vert = |pos: [f32; 2], depth: f32| LineVertex {
+            pos,
+            depth,
+            depth_test: dt,
+            color: line.color,
+        };
+        // Two triangles, cull disabled so winding is irrelevant.
+        out.push(vert(c0a, d0));
+        out.push(vert(c0b, d0));
+        out.push(vert(c1a, d1));
+        out.push(vert(c1a, d1));
+        out.push(vert(c0b, d0));
+        out.push(vert(c1b, d1));
+    }
+    out
+}
+
 pub struct GpuRenderer {
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
@@ -214,6 +380,9 @@ pub struct GpuRenderer {
     /// UI pass between the marcher and present. `None` between present
     /// and the next render.
     pending_frame: Option<(wgpu::SurfaceTexture, wgpu::TextureView)>,
+    /// Lazy-built debug-line pipeline (L3.2) — built on the first
+    /// [`Self::draw_lines_deferred`] call.
+    line_resources: Option<LineResources>,
     /// Lazy-built `egui-wgpu` paint pipeline; created on the first
     /// [`Self::paint_egui`] call (`hud` feature).
     #[cfg(feature = "hud")]
@@ -680,6 +849,7 @@ impl GpuRenderer {
             scene_side_shades: [[0; 4]; 2],
             last_fov_y_rad: 0.0,
             pending_frame: None,
+            line_resources: None,
             #[cfg(feature = "hud")]
             egui_renderer: None,
         }
@@ -1597,7 +1767,10 @@ impl GpuRenderer {
                 self.fog_near,
             ],
             fog_far: self.fog_far,
-            write_depth: u32::from(self.sprite_registry.is_some()),
+            // L3.1: always write scene depth. Costs one storage store per
+            // pixel, and the depth is needed for sprite z-test, sprite-less
+            // `pick_depth`, and `draw_lines` occlusion alike.
+            write_depth: 1,
             occ_page_words: scene.occupancy_page_words,
             occ_num_pages: scene.occupancy_num_pages,
             mip_scan_dist: self.scene_mip_scan_dist,
@@ -1876,6 +2049,213 @@ impl GpuRenderer {
         if let Some((surf_tex, _view)) = self.pending_frame.take() {
             surf_tex.present();
         }
+    }
+
+    /// Draw depth-tested world-space [`GpuLine`]s over the pending frame
+    /// (L3.2). Projects each endpoint with `cam` (the marcher's pinhole) +
+    /// the last frame's FOV / surface size, expands to screen-space quads,
+    /// and runs a `LoadOp::Load` pass into the pending swapchain view — so
+    /// the lines land on the marched frame and a later `present` /
+    /// `paint_egui` still finishes it (the pending frame is left intact).
+    /// Depth-tested lines are occluded by nearer marched geometry (compared
+    /// against the scene-DDA depth buffer's `best_t`); call after `render`,
+    /// before `present` / `paint_egui`. No-op if no frame is pending.
+    pub fn draw_lines_deferred(&mut self, cam: &GpuLineCamera, lines: &[GpuLine]) {
+        if self.pending_frame.is_none() || lines.is_empty() {
+            return;
+        }
+        let (w, h) = (self.surface_config.width, self.surface_config.height);
+        let fov = self.last_fov_y_rad;
+        if w == 0 || h == 0 || fov <= 0.0 {
+            return; // no frame marched yet — no projection to reuse
+        }
+        let verts = build_line_vertices(cam, lines, w, h, fov);
+        if verts.is_empty() {
+            return;
+        }
+        self.ensure_line_resources();
+        let res = self.line_resources.as_ref().expect("just built");
+
+        // Skip the depth test when there's no scene depth buffer to read
+        // (sprite-only / empty scene) — bind the 1-word dummy so the layout
+        // is satisfied; `no_depth = 1` keeps the shader from indexing it.
+        let no_depth = u32::from(self.scene_dda.is_none());
+        let params = LineParams {
+            screen_w: w,
+            screen_h: h,
+            depth_bias: LINE_DEPTH_BIAS,
+            no_depth,
+        };
+        self.queue
+            .write_buffer(&res.uniform_buf, 0, bytemuck::bytes_of(&params));
+
+        let depth_resource = match &self.scene_dda {
+            Some(dda) => dda.depth_buffer.as_entire_binding(),
+            None => res.dummy_depth.as_entire_binding(),
+        };
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("roxlap-gpu line.bg"),
+            layout: &res.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: res.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: depth_resource,
+                },
+            ],
+        });
+
+        let vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu line.vbuf"),
+            size: std::mem::size_of_val(verts.as_slice()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&vbuf, 0, bytemuck::cast_slice(&verts));
+
+        let view = &self.pending_frame.as_ref().expect("checked above").1;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("roxlap-gpu lines"),
+            });
+        {
+            // `LoadOp::Load` keeps the marcher's frame; the lines draw over
+            // it. Manual depth test in the FS (no depth-stencil attachment).
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("roxlap-gpu line paint"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&res.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.set_vertex_buffer(0, vbuf.slice(..));
+            pass.draw(0..verts.len() as u32, 0..1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        // pending_frame left intact — present/paint_egui finishes the frame.
+    }
+
+    /// Lazy-build the [`LineResources`] (`line.wgsl` pipeline + uniform +
+    /// dummy depth buffer). The colour target uses the surface format with
+    /// straight-alpha over-blending; no depth-stencil attachment (the depth
+    /// test is manual in the fragment shader against the scene depth buffer).
+    fn ensure_line_resources(&mut self) {
+        if self.line_resources.is_some() {
+            return;
+        }
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("line.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/line.wgsl").into()),
+            });
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("roxlap-gpu line.bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("roxlap-gpu line.layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("roxlap-gpu line.pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<LineVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x2, // pos (NDC)
+                            1 => Float32,   // depth
+                            2 => Float32,   // depth_test
+                            3 => Float32x4, // color
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.surface_config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu line.uniform"),
+            size: std::mem::size_of::<LineParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dummy_depth = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu line.dummy_depth"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        self.line_resources = Some(LineResources {
+            pipeline,
+            bgl,
+            uniform_buf,
+            dummy_depth,
+        });
     }
 
     /// Overlay an `egui` UI on the pending frame, then present it
@@ -2932,6 +3312,11 @@ mod pixel_ray_tests {
             ("blit.wgsl", include_str!("../shaders/blit.wgsl")),
             ("chunk_dda.wgsl", include_str!("../shaders/chunk_dda.wgsl")),
             ("grid_dda.wgsl", include_str!("../shaders/grid_dda.wgsl")),
+            (
+                "scene_blit.wgsl",
+                include_str!("../shaders/scene_blit.wgsl"),
+            ),
+            ("line.wgsl", include_str!("../shaders/line.wgsl")),
         ];
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),

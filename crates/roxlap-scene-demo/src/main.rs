@@ -24,7 +24,7 @@ use roxlap_core::Engine;
 use roxlap_formats::kfa::{Hinge, Point3, Seq};
 use roxlap_formats::sprite::Sprite;
 use roxlap_render::{
-    FrameParams, KfaSprite, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet,
+    FrameParams, KfaSprite, Line3, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -313,6 +313,112 @@ fn hud_panel(
         });
 }
 
+/// L3.0 occlusion gate: a depth-tested debug overlay — a floor reference
+/// grid laid on the terrain surface (`z ≈ 200`), a wire box rising out of
+/// the hills, and always-on-top RGB origin axes that show through the
+/// terrain. The grid/box are `depth_test = true` (hills in front occlude
+/// them); the axes are `depth_test = false`. Placed in front of the spawn
+/// camera (`(0, -120, 50)` looking `+y`).
+fn debug_overlay_lines() -> Vec<Line3> {
+    const GROUND_Z: f64 = 199.0; // just above the surface (smaller z = up)
+    let mut lines = Vec::new();
+
+    // Floor grid spanning x∈[-80,80], y∈[0,240], 20-voxel cells, sitting on
+    // the terrain. Cyan, depth-tested so it's hidden behind hill silhouettes.
+    let grid_color = 0xC0_30_C0_FF;
+    let (x0, x1, y0, y1, step) = (-80, 80, 0, 240, 20);
+    let mut x = x0;
+    while x <= x1 {
+        lines.push(Line3 {
+            a: [x as f64, y0 as f64, GROUND_Z],
+            b: [x as f64, y1 as f64, GROUND_Z],
+            color: grid_color,
+            width_px: 1.0,
+            depth_test: true,
+        });
+        x += step;
+    }
+    let mut y = y0;
+    while y <= y1 {
+        lines.push(Line3 {
+            a: [x0 as f64, y as f64, GROUND_Z],
+            b: [x1 as f64, y as f64, GROUND_Z],
+            color: grid_color,
+            width_px: 1.0,
+            depth_test: true,
+        });
+        y += step;
+    }
+
+    // Wire box: 40³ cube centred at (0, 120), rising from the surface
+    // (z=200) up to z=160. Yellow, depth-tested.
+    push_box_edges(
+        &mut lines,
+        [-20.0, 100.0, 160.0],
+        [20.0, 140.0, 200.0],
+        0xFF_FF_D0_00,
+        2.0,
+        true,
+    );
+
+    // Origin axes from (0, 0, 195): +X red, +Y green, +Z(down) blue.
+    // Always-on-top (depth_test = false) — visible through the hills.
+    let origin = [0.0, 0.0, 195.0];
+    for (axis, color) in [
+        ([60.0, 0.0, 0.0], 0xFF_FF_30_30u32),
+        ([0.0, 60.0, 0.0], 0xFF_30_FF_30),
+        ([0.0, 0.0, 60.0], 0xFF_30_30_FF),
+    ] {
+        lines.push(Line3 {
+            a: origin,
+            b: [
+                origin[0] + axis[0],
+                origin[1] + axis[1],
+                origin[2] + axis[2],
+            ],
+            color,
+            width_px: 3.0,
+            depth_test: false,
+        });
+    }
+
+    lines
+}
+
+/// Push the 12 edges of the axis-aligned box `[lo, hi]` as [`Line3`]s.
+fn push_box_edges(
+    out: &mut Vec<Line3>,
+    lo: [f64; 3],
+    hi: [f64; 3],
+    color: u32,
+    width_px: f32,
+    depth_test: bool,
+) {
+    // 8 corners by bit-picking lo/hi per axis.
+    let corner = |i: usize| {
+        [
+            if i & 1 == 0 { lo[0] } else { hi[0] },
+            if i & 2 == 0 { lo[1] } else { hi[1] },
+            if i & 4 == 0 { lo[2] } else { hi[2] },
+        ]
+    };
+    // Edges connect corners differing in exactly one axis bit.
+    for i in 0..8usize {
+        for bit in [1usize, 2, 4] {
+            let j = i | bit;
+            if j != i && (i & bit) == 0 {
+                out.push(Line3 {
+                    a: corner(i),
+                    b: corner(j),
+                    color,
+                    width_px,
+                    depth_test,
+                });
+            }
+        }
+    }
+}
+
 fn plane_hit(pos: [f64; 3], dir: [f64; 3], ground_z: f64) -> Option<[f32; 3]> {
     if dir[2].abs() < 1e-9 {
         return None; // ray parallel to the ground plane
@@ -434,6 +540,10 @@ struct App {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     hud_on: bool,
+    /// `L` toggles a depth-tested debug overlay (a wire box + floor grid +
+    /// always-on-top origin axes) drawn via `SceneRenderer::draw_lines` —
+    /// the L3.0 occlusion gate.
+    lines_on: bool,
     /// Last FPS computed in `tick_fps`, shown in the HUD.
     last_fps: f64,
 }
@@ -488,6 +598,7 @@ impl App {
             egui_ctx: egui::Context::default(),
             egui_state: None,
             hud_on: true,
+            lines_on: true,
             last_fps: 0.0,
         }
     }
@@ -647,6 +758,15 @@ impl App {
         }
         let camera = self.scene.camera; // Camera is Copy
         renderer.render(&mut self.scene.scene, &camera, &frame);
+
+        // L3.0: depth-tested debug overlay. Lands in the framebuffer
+        // after the world pass, before present/paint_egui (egui still
+        // paints panels on top). The grid + box are occluded by terrain
+        // they sit behind; the origin axes are always-on-top.
+        if self.lines_on {
+            let lines = debug_overlay_lines();
+            renderer.draw_lines(&camera, &lines);
+        }
 
         // RF: render no longer presents — finish the frame. With the HUD
         // on, overlay an egui panel via `paint_egui`; otherwise a plain
@@ -1089,6 +1209,11 @@ impl ApplicationHandler for App {
                     // Pick demo: top-down camera + mouse-driven cursor
                     // placement (screen→world unproject prototype).
                     KeyCode::KeyC if pressed => self.toggle_pick_mode(),
+                    // L3.0: toggle the depth-tested debug line overlay.
+                    KeyCode::KeyL if pressed => {
+                        self.lines_on = !self.lines_on;
+                        eprintln!("debug lines = {}", self.lines_on);
+                    }
                     // S7.6: `T` (telemetry) prints chunk count +
                     // pending count for each streaming-enabled
                     // grid. No-op when not in streaming mode.

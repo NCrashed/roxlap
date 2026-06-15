@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use crate::{FrameParams, KfaSprite, RenderOptions, Sprite, SpriteSet};
+use crate::{FrameParams, KfaSprite, Line3, RenderOptions, Sprite, SpriteSet};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
@@ -418,6 +418,42 @@ impl GpuBackend {
     /// Present the frame `render` composited, with no UI overlay.
     pub(crate) fn present(&mut self) {
         self.gpu.present();
+    }
+
+    /// Draw depth-tested world-space line segments over the pending frame
+    /// (L3.2). Converts the facade [`Line3`]s + world `camera` to the GPU
+    /// line types and runs the `roxlap-gpu` line pipeline, which projects
+    /// the endpoints (marcher pinhole), expands them to screen quads, and
+    /// composites with a `LoadOp::Load` pass. Depth-tested lines are
+    /// occluded by nearer marched geometry (euclidean `best_t`).
+    pub(crate) fn draw_lines(&mut self, camera: &Camera, lines: &[Line3]) {
+        if lines.is_empty() {
+            return;
+        }
+        let cam = roxlap_gpu::GpuLineCamera {
+            pos: camera.pos.map(|v| v as f32),
+            right: camera.right.map(|v| v as f32),
+            down: camera.down.map(|v| v as f32),
+            forward: camera.forward.map(|v| v as f32),
+        };
+        let glines: Vec<roxlap_gpu::GpuLine> = lines
+            .iter()
+            .map(|l| {
+                // 0xAARRGGBB → straight RGBA in 0..=1 (alpha = over-blend).
+                let a = ((l.color >> 24) & 0xff) as f32 / 255.0;
+                let r = ((l.color >> 16) & 0xff) as f32 / 255.0;
+                let g = ((l.color >> 8) & 0xff) as f32 / 255.0;
+                let b = (l.color & 0xff) as f32 / 255.0;
+                roxlap_gpu::GpuLine {
+                    a: [l.a[0] as f32, l.a[1] as f32, l.a[2] as f32],
+                    b: [l.b[0] as f32, l.b[1] as f32, l.b[2] as f32],
+                    color: [r, g, b, a],
+                    width_px: l.width_px,
+                    depth_test: l.depth_test,
+                }
+            })
+            .collect();
+        self.gpu.draw_lines_deferred(&cam, &glines);
     }
 
     /// Overlay egui on the pending frame, then present (`hud` feature).

@@ -21,7 +21,29 @@ use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{DynDisplay, DynWindow, HasDisplayHandle, HasWindowHandle};
-use crate::{FrameParams, KfaSprite, RenderOptions, SpriteSet};
+use crate::{FrameParams, KfaSprite, Line3, RenderOptions, SpriteSet};
+
+/// Near plane (camera-forward distance, voxel units) below which a
+/// [`Line3`] endpoint is clipped — keeps the pinhole divide finite and
+/// stops points behind the camera from wrapping onto the screen.
+const NEAR_Z: f32 = 0.0625;
+
+/// Depth-test slack (perpendicular distance) so a line resting on the
+/// surface it traces doesn't z-fight against that surface.
+const DEPTH_BIAS: f32 = 0.5;
+
+/// Alpha-blend `rgb` (`0x__RRGGBB`) over `dst` (`0x00RRGGBB`) by `alpha`
+/// (`0..=255`). Returns `0x00RRGGBB`, matching the framebuffer packing.
+fn blend_rgb(dst: u32, rgb: u32, alpha: u32) -> u32 {
+    if alpha >= 255 {
+        return rgb & 0x00ff_ffff;
+    }
+    let ia = 255 - alpha;
+    let r = (((rgb >> 16) & 0xff) * alpha + ((dst >> 16) & 0xff) * ia) / 255;
+    let g = (((rgb >> 8) & 0xff) * alpha + ((dst >> 8) & 0xff) * ia) / 255;
+    let b = ((rgb & 0xff) * alpha + (dst & 0xff) * ia) / 255;
+    (r << 16) | (g << 8) | b
+}
 
 /// The CPU backend's framebuffer presenter. Native blits into a
 /// `softbuffer` window surface; wasm uploads to a WebGL2 texture +
@@ -367,6 +389,122 @@ impl CpuBackend {
         self.blit_and_present(self.last_dims);
     }
 
+    /// Rasterise depth-tested world-space [`Line3`] segments over the
+    /// framebuffer the last [`render`](Self::render) composited. Uses that
+    /// frame's pinhole projection (`last_hxyz` / `last_dims`) and z-buffer
+    /// (perpendicular distance, smaller = closer, sky = `+inf`), so the
+    /// rendered terrain occludes lines behind it. Call after `render`,
+    /// before `present` / `paint_egui`.
+    pub(crate) fn draw_lines(&mut self, camera: &Camera, lines: &[Line3]) {
+        let (w, h) = self.last_dims;
+        let (hx, hy, hz) = self.last_hxyz;
+        if w == 0 || h == 0 || hz <= 0.0 {
+            return; // nothing rendered yet — no projection to reuse
+        }
+        let pixel_count = (w as usize) * (h as usize);
+        if self.framebuffer.len() < pixel_count || self.zbuffer.len() < pixel_count {
+            return;
+        }
+        let cam = camera_math::derive(camera, w, h, hx, hy, hz);
+        // World point → camera-relative (right, down, forward) coords.
+        // The forward component is the CPU z-buffer metric (perpendicular
+        // distance); right/down drive the pinhole screen projection.
+        let cam_coords = |p: [f32; 3]| -> [f32; 3] {
+            let d = [p[0] - cam.pos[0], p[1] - cam.pos[1], p[2] - cam.pos[2]];
+            [
+                cam.right[0] * d[0] + cam.right[1] * d[1] + cam.right[2] * d[2],
+                cam.down[0] * d[0] + cam.down[1] * d[1] + cam.down[2] * d[2],
+                cam.forward[0] * d[0] + cam.forward[1] * d[1] + cam.forward[2] * d[2],
+            ]
+        };
+
+        let fb = &mut self.framebuffer[..pixel_count];
+        let zb = &self.zbuffer[..pixel_count];
+        let (wi, hi) = (w as i32, h as i32);
+
+        for line in lines {
+            let a = [line.a[0] as f32, line.a[1] as f32, line.a[2] as f32];
+            let b = [line.b[0] as f32, line.b[1] as f32, line.b[2] as f32];
+            let ca = cam_coords(a);
+            let cb = cam_coords(b);
+
+            // Near-plane clip in segment-parameter space (forward depth
+            // `cz >= NEAR_Z`) so the pinhole divide stays finite and points
+            // behind the camera don't wrap. Both behind → invisible.
+            let (cza, czb) = (ca[2], cb[2]);
+            if cza < NEAR_Z && czb < NEAR_Z {
+                continue;
+            }
+            let (mut t0, mut t1) = (0.0f32, 1.0f32);
+            let dz = czb - cza;
+            if dz.abs() > f32::EPSILON {
+                let t_near = (NEAR_Z - cza) / dz;
+                if dz > 0.0 {
+                    t0 = t0.max(t_near); // a is behind: enter at the near plane
+                } else {
+                    t1 = t1.min(t_near); // b is behind: leave at the near plane
+                }
+            }
+            if t0 > t1 {
+                continue;
+            }
+            let lerp3 = |t: f32| {
+                [
+                    ca[0] + (cb[0] - ca[0]) * t,
+                    ca[1] + (cb[1] - ca[1]) * t,
+                    ca[2] + (cb[2] - ca[2]) * t,
+                ]
+            };
+            let p0 = lerp3(t0);
+            let p1 = lerp3(t1);
+
+            // Pinhole project; carry 1/cz for perspective-correct depth
+            // (1/cz is linear in screen space, cz is not).
+            let inv0 = 1.0 / p0[2];
+            let inv1 = 1.0 / p1[2];
+            let sx0 = hx + p0[0] * hz * inv0;
+            let sy0 = hy + p0[1] * hz * inv0;
+            let sx1 = hx + p1[0] * hz * inv1;
+            let sy1 = hy + p1[1] * hz * inv1;
+
+            let alpha = (line.color >> 24) & 0xff;
+            if alpha == 0 {
+                continue; // fully transparent
+            }
+            let rgb = line.color & 0x00ff_ffff;
+
+            // DDA along the dominant screen axis, stamping `width_px`
+            // pixels perpendicular to the segment.
+            let dx = sx1 - sx0;
+            let dy = sy1 - sy0;
+            let steps = dx.abs().max(dy.abs()).ceil().max(1.0);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let (perp_x, perp_y) = (-dy / len, dx / len);
+            let half = ((line.width_px - 1.0).max(0.0) * 0.5).round() as i32;
+
+            let nsteps = steps as i32;
+            for s in 0..=nsteps {
+                let t = s as f32 / steps;
+                let inv_z = inv0 + (inv1 - inv0) * t;
+                let depth = 1.0 / inv_z; // perpendicular distance at this pixel
+                let cx = sx0 + dx * t;
+                let cy = sy0 + dy * t;
+                for woff in -half..=half {
+                    let px = (cx + perp_x * woff as f32).round() as i32;
+                    let py = (cy + perp_y * woff as f32).round() as i32;
+                    if px < 0 || py < 0 || px >= wi || py >= hi {
+                        continue;
+                    }
+                    let idx = (py as usize) * (w as usize) + (px as usize);
+                    if line.depth_test && depth > zb[idx] + DEPTH_BIAS {
+                        continue; // occluded by nearer rendered geometry
+                    }
+                    fb[idx] = blend_rgb(fb[idx], rgb, alpha);
+                }
+            }
+        }
+    }
+
     /// Shared tail of `present` / `paint_egui`: copy the framebuffer to
     /// the window surface at `(width, height)` and present.
     #[cfg(not(target_arch = "wasm32"))]
@@ -452,5 +590,39 @@ mod cpu_ray_tests {
     fn offcentre_pixel_tilts_linearly() {
         let d = setcamera_pixel_ray(RIGHT, DOWN, FWD, 384.0, 272.0, 320.0, 240.0, 320.0);
         assert_eq!(d, [64.0, 32.0, 320.0]);
+    }
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::blend_rgb;
+
+    #[test]
+    fn opaque_replaces_destination() {
+        // alpha = 255 → source colour, ignoring the destination.
+        assert_eq!(blend_rgb(0x00_12_34_56, 0xAA_BB_CC, 255), 0x00_AA_BB_CC);
+    }
+
+    #[test]
+    fn zero_alpha_keeps_destination() {
+        // alpha = 0 → 100% destination (the caller skips alpha==0, but
+        // the blend itself must still be a no-op).
+        assert_eq!(blend_rgb(0x00_12_34_56, 0xAA_BB_CC, 0), 0x00_12_34_56);
+    }
+
+    #[test]
+    fn half_alpha_is_midpoint() {
+        // white over black at ~50% → mid grey, per channel (255*128/255).
+        let out = blend_rgb(0x00_00_00_00, 0x00_FF_FF_FF, 128);
+        assert_eq!(out, 0x00_80_80_80);
+    }
+
+    #[test]
+    fn result_has_no_high_byte() {
+        // Output must stay 0x00RRGGBB to match the framebuffer packing.
+        assert_eq!(
+            blend_rgb(0x00_FF_FF_FF, 0xFF_FF_FF_FF, 200) & 0xFF00_0000,
+            0
+        );
     }
 }

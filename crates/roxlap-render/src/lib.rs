@@ -151,6 +151,26 @@ pub struct Ray {
     pub dir: glam::DVec3,
 }
 
+/// A world-space line segment to draw over a rendered frame via
+/// [`SceneRenderer::draw_lines`] — editor gizmos (bounding boxes, floor
+/// grids, axes, hover wireframes), debug paths, etc.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Line3 {
+    /// World-space endpoints (voxel units), in the same frame the
+    /// rendered scene + `camera` use.
+    pub a: [f64; 3],
+    pub b: [f64; 3],
+    /// `0xAARRGGBB` — the high byte is an alpha blend factor (`0xFF`
+    /// opaque, `0x00` invisible), the low 24 bits the RGB colour.
+    pub color: u32,
+    /// Screen-space thickness in pixels (`<= 1.0` draws a 1px line).
+    pub width_px: f32,
+    /// `true`: the segment is occluded by nearer rendered geometry
+    /// (depth-tested against the frame's z-buffer). `false`: always on
+    /// top (e.g. a hover highlight that should show through the model).
+    pub depth_test: bool,
+}
+
 /// Which renderer a [`SceneRenderer`] resolved to at construction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
@@ -342,6 +362,26 @@ impl SceneRenderer {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.render(scene, camera, frame),
             BackendImpl::Gpu(g) => g.render(scene, camera, frame),
+        }
+    }
+
+    /// Draw world-space [`Line3`] segments over the frame
+    /// [`render`](Self::render) composited, using that frame's camera +
+    /// projection + depth buffer. Call **after** [`render`](Self::render)
+    /// and **before** [`present`](Self::present) /
+    /// [`paint_egui`](Self::paint_egui) — the lines land in the
+    /// framebuffer, so a subsequent `paint_egui` still draws its panels
+    /// on top.
+    ///
+    /// `camera` must be the one the last frame rendered with (the
+    /// projection is taken from that frame). Depth-tested segments
+    /// (`Line3::depth_test`) are occluded by nearer rendered geometry;
+    /// always-on-top segments ignore depth. See [`Line3`] for colour /
+    /// width / blend semantics.
+    pub fn draw_lines(&mut self, camera: &Camera, lines: &[Line3]) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.draw_lines(camera, lines),
+            BackendImpl::Gpu(g) => g.draw_lines(camera, lines),
         }
     }
 
