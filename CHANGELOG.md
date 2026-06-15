@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-06-15
+
+A small, additive release: editing a single registered sprite model no
+longer re-uploads the whole sprite field. The renderer keeps a slack-backed
+suballocator for each model's variable-length colour/normal data, so a
+carve or recolour touches only that one model's GPU bytes — and the edit
+API is keyed by a stable `SpriteModelId` handle rather than a positional
+index. No published crate's existing call breaks: `set_sprites` simply
+gains a return value (handles) and `Kv6` is newly re-exported from
+`roxlap-render`.
+
 ### Added
 
 - **Incremental single-sprite refresh — `SceneRenderer::refresh_sprite_model`.**
