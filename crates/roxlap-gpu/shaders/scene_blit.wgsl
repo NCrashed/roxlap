@@ -21,6 +21,8 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
 struct Dims {
     size: vec2<u32>,
+    flip_x: u32,
+    _pad: u32,
 };
 
 @group(0) @binding(0) var<storage, read> fb: array<u32>;
@@ -29,9 +31,13 @@ struct Dims {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // `in.clip.xy` is the framebuffer pixel centre (px + 0.5). The
-    // compute pass wrote `fb[py * width + px]`, so read the same texel.
-    let px = u32(in.clip.x);
+    // compute pass wrote `fb[py * width + px]`, so read the same texel —
+    // mirrored to `width-1-px` when the horizontal flip is on.
+    var px = u32(in.clip.x);
     let py = u32(in.clip.y);
+    if dims.flip_x != 0u {
+        px = dims.size.x - 1u - px;
+    }
     let idx = py * dims.size.x + px;
     return unpack4x8unorm(fb[idx]);
 }

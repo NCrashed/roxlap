@@ -546,9 +546,11 @@ impl GpuBackend {
         self.gpu.present();
     }
 
-    /// Horizontal scene flip — not yet implemented on the GPU present path
-    /// (the CPU backend handles it). No-op so the facade dispatches cleanly.
-    pub(crate) fn set_flip_x(&mut self, _flip: bool) {}
+    /// Horizontal scene flip — mirrors the marched scene + line/image
+    /// overlays on present, leaving egui upright.
+    pub(crate) fn set_flip_x(&mut self, flip: bool) {
+        self.gpu.set_flip_x(flip);
+    }
 
     /// Draw depth-tested world-space line segments over the pending frame
     /// (L3.2). Converts the facade [`Line3`]s + world `camera` to the GPU

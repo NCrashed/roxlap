@@ -898,11 +898,12 @@ impl SceneRenderer {
     }
 
     /// Mirror the rendered 3D scene horizontally before display. The flip is
-    /// applied to the scene framebuffer *before* any egui overlay, so the UI
-    /// stays upright while the viewport un-mirrors — a fix for the engine's
-    /// left-handed render. **CPU backend only** for now (the GPU path ignores
-    /// it). Picking/projection are unchanged, so a host that flips must
-    /// mirror its cursor X (`width - x`) for ray casts.
+    /// applied *before* any egui overlay, so the UI stays upright while the
+    /// viewport un-mirrors — a fix for the engine's left-handed render.
+    /// Supported on both backends (CPU reverses the framebuffer rows; GPU
+    /// mirrors the scene blit + line/image overlays). Picking/projection are
+    /// unchanged, so a host that flips must mirror its cursor X (`width - x`)
+    /// for ray casts.
     pub fn set_flip_x(&mut self, flip: bool) {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.set_flip_x(flip),

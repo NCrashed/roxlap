@@ -223,6 +223,7 @@ fn build_line_vertices(
     w: u32,
     h: u32,
     fov_y: f32,
+    flip_x: bool,
 ) -> Vec<LineVertex> {
     let aspect = w as f32 / h as f32;
     let half_h = (fov_y * 0.5).tan();
@@ -294,8 +295,9 @@ fn build_line_vertices(
         let c1a = to_ndc([p1[0] + ex, p1[1] + ey]);
         let c1b = to_ndc([p1[0] - ex, p1[1] - ey]);
         let dt = if line.depth_test { 1.0 } else { 0.0 };
+        // Mirror the overlay's NDC x to match the flipped scene blit.
         let vert = |pos: [f32; 2], depth: f32| LineVertex {
-            pos,
+            pos: [if flip_x { -pos[0] } else { pos[0] }, pos[1]],
             depth,
             depth_test: dt,
             color: line.color,
@@ -415,6 +417,7 @@ fn build_image_vertices(
     w: u32,
     h: u32,
     fov_y: f32,
+    flip_x: bool,
 ) -> Vec<ImageVertex> {
     let aspect = w as f32 / h as f32;
     let half_h = (fov_y * 0.5).tan();
@@ -431,8 +434,10 @@ fn build_image_vertices(
     };
     let project = |v: ImgClipV| -> ImageVertex {
         let (cx, cy, cz) = (v.cam[0], v.cam[1], v.cam[2]);
+        let nx = cx / (cz * half_w);
         ImageVertex {
-            ndc: [cx / (cz * half_w), -cy / (cz * half_h)],
+            // Mirror NDC x to match the flipped scene blit.
+            ndc: [if flip_x { -nx } else { nx }, -cy / (cz * half_h)],
             w: cz,
             depth: (cx * cx + cy * cy + cz * cz).sqrt(),
             depth_test: dt,
@@ -478,6 +483,10 @@ pub struct GpuRenderer {
     adapter_info: String,
     clear_colour: [f64; 3],
     frame_count: u32,
+    /// Mirror the marched scene horizontally on present (the scene blit
+    /// samples `width-1-x`, and line/image overlays mirror their NDC x).
+    /// The egui pass is unaffected. See [`Self::set_flip_x`].
+    flip_x: bool,
     /// Lazy-built on first [`Self::render_chunk`] call; rebuilt when
     /// the swapchain resizes (storage texture must match).
     chunk_dda: Option<ChunkDdaResources>,
@@ -604,6 +613,9 @@ struct SceneDdaResources {
     pipeline_dda: wgpu::ComputePipeline,
     blit_bg: wgpu::BindGroup,
     pipeline_blit: wgpu::RenderPipeline,
+    /// Blit uniform: `[width, height, flip_x, _pad]`. Retained so the flip
+    /// flag (offset 8) can be re-written per frame.
+    blit_dims: wgpu::Buffer,
     /// GPU.9 — per-pixel world-t depth (f32 bits as u32), sized
     /// `width * height * 4`. The scene pass writes it when sprites
     /// are present; the sprite model-DDA pass reads + composites
@@ -1014,6 +1026,7 @@ impl GpuRenderer {
             adapter_info,
             clear_colour: settings.clear_colour,
             frame_count: 0,
+            flip_x: false,
             chunk_dda: None,
             grid_dda: None,
             scene_dda: None,
@@ -1092,6 +1105,12 @@ impl GpuRenderer {
     /// `v = acos(-dir.z) / π` (elevation), matching standard
     /// equirectangular layout (top of image = zenith for voxlap's
     /// `+z = down` basis).
+    /// Mirror the marched scene (and its line/image overlays) horizontally
+    /// on present, leaving the egui overlay upright. See [`Self::flip_x`].
+    pub fn set_flip_x(&mut self, flip: bool) {
+        self.flip_x = flip;
+    }
+
     ///
     /// # Panics
     /// If `rgba.len() != (width * height * 4) as usize`.
@@ -1926,6 +1945,14 @@ impl GpuRenderer {
         };
         let dda = self.scene_dda.as_ref().expect("just built");
 
+        // Refresh the blit's flip flag each frame (offset 8, after the
+        // width/height), so toggling the flip applies without a resize.
+        self.queue.write_buffer(
+            &dda.blit_dims,
+            8,
+            bytemuck::bytes_of(&[u32::from(self.flip_x), 0u32]),
+        );
+
         // Pack per-grid cameras into a runtime-sized storage buffer
         // (binding 15) — no fixed cap on grid count.
         let cam_vec: Vec<SceneDdaPerGridCamera> = cameras
@@ -2253,7 +2280,7 @@ impl GpuRenderer {
         if w == 0 || h == 0 || fov <= 0.0 {
             return; // no frame marched yet — no projection to reuse
         }
-        let verts = build_line_vertices(cam, lines, w, h, fov);
+        let verts = build_line_vertices(cam, lines, w, h, fov, self.flip_x);
         if verts.is_empty() {
             return;
         }
@@ -2542,7 +2569,7 @@ impl GpuRenderer {
             if !matches!(self.images.get(quad.image), Some(Some(_))) {
                 continue; // dropped / never-uploaded id
             }
-            let v = build_image_vertices(cam, quad, w, h, fov);
+            let v = build_image_vertices(cam, quad, w, h, fov, self.flip_x);
             if v.is_empty() {
                 continue;
             }
@@ -2923,15 +2950,20 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        // Screen size for the blit's pixel→index math (`vec2<u32>`).
+        // Screen size + flip flag for the blit's pixel→index math
+        // (`vec2<u32>` size, then `flip_x` + pad). Re-written per frame in
+        // `render_scene` so a flip toggle takes effect without a resize.
         let blit_dims = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.blit_dims"),
-            size: 8,
+            size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue
-            .write_buffer(&blit_dims, 0, bytemuck::bytes_of(&[width, height]));
+        self.queue.write_buffer(
+            &blit_dims,
+            0,
+            bytemuck::bytes_of(&[width, height, u32::from(self.flip_x), 0u32]),
+        );
 
         let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.uniform"),
@@ -3118,6 +3150,7 @@ impl GpuRenderer {
             pipeline_dda,
             blit_bg,
             pipeline_blit,
+            blit_dims,
             depth_buffer,
             depth_readback,
         }
@@ -4073,7 +4106,7 @@ mod pixel_ray_tests {
             depth_test: true,
             alpha_cutoff: 0.0,
         };
-        let verts = crate::build_image_vertices(&cam, &quad, 800, 600, 60_f32.to_radians());
+        let verts = crate::build_image_vertices(&cam, &quad, 800, 600, 60_f32.to_radians(), false);
         assert_eq!(verts.len(), 6, "two triangles, no near-clip");
         for v in &verts {
             assert!((v.w - 10.0).abs() < 1e-4, "w == forward distance");
