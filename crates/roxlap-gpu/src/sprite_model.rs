@@ -513,6 +513,40 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// Build one CPU cull record from a user [`SpriteInstance`]: pack the
+/// transform, seed the bounding sphere from the chain's finest model, and
+/// start `colmul` at identity. Shared by the full
+/// [`SpriteRegistryResident::upload`] and the incremental
+/// [`SpriteRegistryResident::append_instances`].
+fn make_cull(registry: &SpriteModelRegistry, i: &SpriteInstance) -> CullInstance {
+    CullInstance {
+        gpu: SpriteInstanceGpu {
+            inv_rot0: i.transform.inv_rot[0],
+            inv_rot1: i.transform.inv_rot[1],
+            inv_rot2: i.transform.inv_rot[2],
+            pos: i.transform.pos,
+            model_id: i.model_id, // placeholder; cull rewrites per frame
+        },
+        chain_id: i.model_id,
+        center: i.transform.pos,
+        radius: registry.model(i.model_id).bound_radius(),
+        colmul: identity_colmul(),
+    }
+}
+
+/// Allocate the `instances` capacity buffer (`STORAGE | COPY_DST`) sized
+/// for `cap` records (≥1). Left uninitialised — `cull_bin_upload`
+/// rewrites it (offset 0) each frame, and `append_instances` seeds the
+/// live records after a grow.
+fn instances_buffer(device: &wgpu::Device, cap: u32) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("roxlap-gpu sprite_reg.instances"),
+        size: u64::from(cap.max(1)) * std::mem::size_of::<SpriteInstanceGpu>() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
 /// One sprite instance: a model reference + world pose.
 #[derive(Debug, Clone, Copy)]
 pub struct SpriteInstance {
@@ -690,22 +724,7 @@ impl SpriteRegistryResident {
         // position, radius from the chain's finest (mip-0) model.
         // `colmul` starts at identity (unshaded) until the facade sets
         // per-instance lighting via `set_instance_colmul`.
-        let cull: Vec<CullInstance> = instances
-            .iter()
-            .map(|i| CullInstance {
-                gpu: SpriteInstanceGpu {
-                    inv_rot0: i.transform.inv_rot[0],
-                    inv_rot1: i.transform.inv_rot[1],
-                    inv_rot2: i.transform.inv_rot[2],
-                    pos: i.transform.pos,
-                    model_id: i.model_id, // placeholder; cull rewrites
-                },
-                chain_id: i.model_id,
-                center: i.transform.pos,
-                radius: registry.model(i.model_id).bound_radius(),
-                colmul: identity_colmul(),
-            })
-            .collect();
+        let cull: Vec<CullInstance> = instances.iter().map(|i| make_cull(registry, i)).collect();
 
         // Capacity buffer (COPY_DST so cull can rewrite it each frame),
         // seeded with the full set so frame 0 is valid pre-cull.
@@ -763,6 +782,88 @@ impl SpriteRegistryResident {
             occ_lens,
             coloff_lens,
         }
+    }
+
+    /// Number of resident instances (the cull set length).
+    #[must_use]
+    pub fn instance_count(&self) -> usize {
+        self.cull.len()
+    }
+
+    /// Append new instances **without** re-uploading any model volume —
+    /// the incremental counterpart to [`Self::upload`], for streaming
+    /// spawns (asteroids, projectiles, …). Returns the index of the first
+    /// appended instance; the block occupies `[base, base + N)`.
+    ///
+    /// The model volumes are untouched, so every appended instance must
+    /// reference a `model_id` (LOD chain) that was already present in the
+    /// `registry` passed to [`Self::upload`]. Registering a *new* model
+    /// still requires a full [`Self::upload`] (its voxels must be laid
+    /// into the shared buffers). `registry` here is only read for the new
+    /// instances' bound-sphere radii and must be the resident one.
+    ///
+    /// The `instances` GPU buffer grows by powers of two (amortised O(1)
+    /// per append, like the per-frame tile/colmul buffers); `colmul`
+    /// grows lazily in [`Self::cull_bin_upload`]. After a removal the
+    /// capacity is not shrunk, so a spawn/despawn churn reuses it.
+    pub fn append_instances(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        registry: &SpriteModelRegistry,
+        instances: &[SpriteInstance],
+    ) -> u32 {
+        let base = self.cull.len() as u32;
+        if instances.is_empty() {
+            return base;
+        }
+        for i in instances {
+            debug_assert!(
+                (i.model_id as usize) < self.chains.len(),
+                "append_instances: model_id {} not resident (run upload to register new models)",
+                i.model_id
+            );
+            self.cull.push(make_cull(registry, i));
+        }
+        let need = self.cull.len() as u32;
+        let stride = std::mem::size_of::<SpriteInstanceGpu>() as u64;
+        if need > self.instance_capacity {
+            // Grow power-of-two, recreate the buffer, and re-seed the full
+            // set so it's valid before the next cull (matches upload).
+            self.instance_capacity = need.next_power_of_two();
+            self.instances = instances_buffer(device, self.instance_capacity);
+            let seed: Vec<SpriteInstanceGpu> = self.cull.iter().map(|c| c.gpu).collect();
+            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&seed));
+        } else {
+            // Fits — write just the appended tail at its offset.
+            let tail: Vec<SpriteInstanceGpu> =
+                self.cull[base as usize..].iter().map(|c| c.gpu).collect();
+            queue.write_buffer(
+                &self.instances,
+                u64::from(base) * stride,
+                bytemuck::cast_slice(&tail),
+            );
+        }
+        base
+    }
+
+    /// Remove the instance at `index` by swap-remove — O(1), no GPU work
+    /// (the next [`Self::cull_bin_upload`] repacks the visible set from
+    /// the shrunk cull list). Capacity is retained for reuse.
+    ///
+    /// Returns `Some(old_last)` when a different instance was moved into
+    /// `index` to fill the hole (its index changed from `old_last` to
+    /// `index` — callers holding instance handles must fix up that one),
+    /// or `None` if `index` was the last element or out of range. Because
+    /// this reorders, any [`Self::set_instance_colmul`] table set by
+    /// position should be re-applied after a removal.
+    pub fn remove_instance(&mut self, index: usize) -> Option<usize> {
+        if index >= self.cull.len() {
+            return None;
+        }
+        let last = self.cull.len() - 1;
+        self.cull.swap_remove(index);
+        (index != last).then_some(last)
     }
 
     /// Set the per-instance `kv6colmul[256]` lighting tables (voxlap's
@@ -1642,5 +1743,92 @@ mod tests {
             }
         }
         assert!(grew, "the 200-word jump should have forced a repack");
+    }
+
+    // --- incremental instance path (device-backed; skips w/o adapter) ---
+
+    fn headless() -> Option<crate::HeadlessGpu> {
+        match crate::HeadlessGpu::new_blocking(crate::GpuRendererSettings::default()) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("[skip] no GPU adapter reachable: {e}");
+                None
+            }
+        }
+    }
+
+    fn one_model_registry() -> (SpriteModelRegistry, u32) {
+        let mut reg = SpriteModelRegistry::new();
+        let id = reg.add(build_sprite_model(&kv6_unsorted()));
+        (reg, id)
+    }
+
+    fn inst(model_id: u32, pos: [f32; 3]) -> SpriteInstance {
+        use roxlap_formats::sprite::Sprite;
+        SpriteInstance {
+            model_id,
+            transform: SpriteInstanceTransform::from_sprite(&Sprite::axis_aligned(
+                kv6_unsorted(),
+                pos,
+            )),
+        }
+    }
+
+    #[test]
+    fn append_grows_count_and_capacity_pow2() {
+        let Some(h) = headless() else { return };
+        let (reg, m) = one_model_registry();
+        let mut res = SpriteRegistryResident::upload(&h.device, &reg, &[inst(m, [0.0; 3])]);
+        assert_eq!(res.instance_count(), 1);
+        assert_eq!(res.instance_capacity, 1);
+
+        // Append 4 → count 5, capacity grows to next_pow2(5) = 8.
+        let more: Vec<_> = (1..=4).map(|i| inst(m, [i as f32, 0.0, 0.0])).collect();
+        let base = res.append_instances(&h.device, &h.queue, &reg, &more);
+        assert_eq!(base, 1, "first appended index follows the seed instance");
+        assert_eq!(res.instance_count(), 5);
+        assert_eq!(res.instance_capacity, 8, "power-of-two growth");
+
+        // A second append that still fits keeps the same capacity (no realloc).
+        let base2 = res.append_instances(&h.device, &h.queue, &reg, &[inst(m, [9.0, 0.0, 0.0])]);
+        assert_eq!(base2, 5);
+        assert_eq!(res.instance_count(), 6);
+        assert_eq!(res.instance_capacity, 8, "fits existing capacity, no grow");
+    }
+
+    #[test]
+    fn append_empty_is_noop() {
+        let Some(h) = headless() else { return };
+        let (reg, m) = one_model_registry();
+        let mut res = SpriteRegistryResident::upload(&h.device, &reg, &[inst(m, [0.0; 3])]);
+        let base = res.append_instances(&h.device, &h.queue, &reg, &[]);
+        assert_eq!(base, 1);
+        assert_eq!(res.instance_count(), 1);
+        assert_eq!(res.instance_capacity, 1);
+    }
+
+    #[test]
+    fn remove_swap_semantics_and_capacity_retained() {
+        let Some(h) = headless() else { return };
+        let (reg, m) = one_model_registry();
+        let seed: Vec<_> = (0..4).map(|i| inst(m, [i as f32, 0.0, 0.0])).collect();
+        let mut res = SpriteRegistryResident::upload(&h.device, &reg, &seed);
+        assert_eq!(res.instance_count(), 4);
+        let cap = res.instance_capacity;
+
+        // Remove a middle element → the previous last (idx 3) moved into it.
+        assert_eq!(res.remove_instance(1), Some(3));
+        assert_eq!(res.instance_count(), 3);
+
+        // Remove the current last (idx 2) → nothing moved.
+        assert_eq!(res.remove_instance(2), None);
+        assert_eq!(res.instance_count(), 2);
+
+        // Out of range → None.
+        assert_eq!(res.remove_instance(99), None);
+        assert_eq!(res.instance_count(), 2);
+
+        // Capacity is retained for reuse (no shrink).
+        assert_eq!(res.instance_capacity, cap);
     }
 }

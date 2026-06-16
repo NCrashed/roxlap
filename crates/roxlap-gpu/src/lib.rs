@@ -3236,6 +3236,54 @@ impl GpuRenderer {
         ));
     }
 
+    /// Incrementally append sprite instances **without** rebuilding the
+    /// registry — the cheap streaming-spawn path (asteroids, projectiles).
+    /// Returns the index of the first appended instance (`[base, base+N)`).
+    ///
+    /// Every appended instance must reference a model already registered
+    /// by the [`Self::set_sprite_instances`] that established residency
+    /// (model volumes are not re-uploaded here — build the full
+    /// `SpriteModelRegistry` up front and seed it once, then stream
+    /// instances). If no registry is resident yet, this performs the
+    /// initial full upload and returns `0`.
+    ///
+    /// Cost is amortised O(1) per instance (the GPU instance buffer grows
+    /// by powers of two), versus the full volume + buffer rebuild of
+    /// [`Self::set_sprite_instances`].
+    pub fn append_sprite_instances(
+        &mut self,
+        registry: &sprite_model::SpriteModelRegistry,
+        instances: &[sprite_model::SpriteInstance],
+    ) -> u32 {
+        match self.sprite_registry.as_mut() {
+            Some(reg) => reg.append_instances(&self.device, &self.queue, registry, instances),
+            None => {
+                self.set_sprite_instances(registry, instances);
+                0
+            }
+        }
+    }
+
+    /// Remove the sprite instance at `index` (swap-remove, O(1), no model
+    /// re-upload). Returns `Some(old_last)` if a different instance was
+    /// moved into `index` to fill the hole — its index changed from
+    /// `old_last` to `index`, so a caller tracking instance handles must
+    /// update that one. Returns `None` if `index` was the last element /
+    /// out of range, or no registry is resident.
+    pub fn remove_sprite_instance(&mut self, index: usize) -> Option<usize> {
+        self.sprite_registry
+            .as_mut()
+            .and_then(|reg| reg.remove_instance(index))
+    }
+
+    /// Number of resident sprite instances (0 if none uploaded).
+    #[must_use]
+    pub fn sprite_instance_count(&self) -> usize {
+        self.sprite_registry
+            .as_ref()
+            .map_or(0, sprite_model::SpriteRegistryResident::instance_count)
+    }
+
     /// Re-pose the already-resident sprite instances in place (no model
     /// volume re-upload) — the cheap per-frame path for animated KFA
     /// limbs. `instances` must match the last [`Self::set_sprite_instances`]
