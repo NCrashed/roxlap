@@ -3313,6 +3313,51 @@ impl GpuRenderer {
         }
     }
 
+    /// Remove a model (tombstone its LOD chain) from the resident sprite
+    /// registry — the counterpart to [`Self::add_sprite_model`]. Frees its
+    /// `colors`/`dirs` space for reuse by a later add; the smaller
+    /// `occupancy`/`color_offsets` holes are reclaimed by
+    /// [`Self::compact_sprite_models`]. Entry / chain ids stay stable, so
+    /// other models' `chain_id`s remain valid.
+    ///
+    /// Instances of the removed model keep their slots but draw as nothing
+    /// until the caller drops them via [`Self::remove_sprite_instance`].
+    /// No-op if `chain_id` is unknown / already removed / no registry.
+    pub fn remove_sprite_model(&mut self, chain_id: u32) {
+        if let Some(reg) = self.sprite_registry.as_mut() {
+            reg.remove_model(chain_id);
+        }
+    }
+
+    /// Reclaim the holes left by [`Self::remove_sprite_model`] by rebuilding
+    /// the shared volume buffers from the live models only. `registry` must
+    /// be the resident one. Cost is O(live volume) — call it when
+    /// [`Self::dead_sprite_model_count`] is high (e.g. exceeds the live
+    /// count), not every frame. No-op if no registry is resident.
+    pub fn compact_sprite_models(&mut self, registry: &sprite_model::SpriteModelRegistry) {
+        if let Some(reg) = self.sprite_registry.as_mut() {
+            reg.compact(&self.device, &self.queue, registry);
+        }
+    }
+
+    /// Number of live (non-removed) sprite models (0 if none uploaded).
+    #[must_use]
+    pub fn sprite_model_count(&self) -> usize {
+        self.sprite_registry
+            .as_ref()
+            .map_or(0, sprite_model::SpriteRegistryResident::live_model_count)
+    }
+
+    /// Number of removed-but-not-yet-compacted sprite models — the
+    /// fragmentation signal for deciding when to call
+    /// [`Self::compact_sprite_models`].
+    #[must_use]
+    pub fn dead_sprite_model_count(&self) -> usize {
+        self.sprite_registry
+            .as_ref()
+            .map_or(0, sprite_model::SpriteRegistryResident::dead_model_count)
+    }
+
     /// Number of resident sprite instances (0 if none uploaded).
     #[must_use]
     pub fn sprite_instance_count(&self) -> usize {

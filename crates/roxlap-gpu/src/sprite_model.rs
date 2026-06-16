@@ -678,6 +678,12 @@ pub struct SpriteRegistryResident {
     /// Allocated record count of the `model_meta` buffer; `add_model`
     /// grows it (with slack) when the entry count passes it.
     meta_cap: u32,
+    /// Per-entry tombstone: `true` once its model was removed
+    /// ([`Self::remove_model`]). Dead entries keep their `meta` slot (so
+    /// entry ids — and the caller's `chain_id`s — stay stable) but their
+    /// colours are freed for reuse and they contribute nothing to a
+    /// repack / [`Self::compact`]. Parallel to `meta`.
+    dead: Vec<bool>,
 }
 
 /// Which tightly-concatenated registry buffer [`SpriteRegistryResident::
@@ -812,6 +818,7 @@ impl SpriteRegistryResident {
             coloff_used: all_offsets.len() as u32,
             coloff_cap: all_offsets.len() as u32,
             meta_cap: meta.len() as u32,
+            dead: vec![false; meta.len()],
             meta,
             colors_alloc,
             occ_lens,
@@ -1049,10 +1056,19 @@ impl SpriteRegistryResident {
     /// are placed). O(registry) but rare — logged so a growth burst is
     /// visible.
     fn repack_colors_dirs(&mut self, device: &wgpu::Device, registry: &SpriteModelRegistry) {
+        // Dead (removed) entries collapse to 0 length so they reclaim no
+        // space; live entries keep their colours.
         let new_lens: Vec<u32> = registry
             .entries
             .iter()
-            .map(|m| m.colors.len() as u32)
+            .enumerate()
+            .map(|(e, m)| {
+                if self.dead[e] {
+                    0
+                } else {
+                    m.colors.len() as u32
+                }
+            })
             .collect();
         self.colors_alloc.repack(&new_lens);
         let cap_total = self.colors_alloc.cap_total();
@@ -1060,6 +1076,10 @@ impl SpriteRegistryResident {
         let mut all_colors = vec![0u32; cap_total as usize];
         let mut all_dirs = vec![0u32; cap_total as usize];
         for (e, m) in registry.entries.iter().enumerate() {
+            if self.dead[e] {
+                self.meta[e].colors_offset = 0;
+                continue;
+            }
             let off = self.colors_alloc.slot(e).off as usize;
             all_colors[off..off + m.colors.len()].copy_from_slice(&m.colors);
             all_dirs[off..off + m.dirs.len()].copy_from_slice(&m.dirs);
@@ -1141,6 +1161,7 @@ impl SpriteRegistryResident {
             });
             self.occ_lens.push(m.occupancy.len() as u32);
             self.coloff_lens.push(m.color_offsets.len() as u32);
+            self.dead.push(false);
         }
         self.chains.push(entries.clone());
 
@@ -1239,6 +1260,122 @@ impl SpriteRegistryResident {
         }
     }
 
+    /// Number of removed-but-not-yet-compacted models (tombstoned chains).
+    /// A caller streams `add_model` / `remove_model` and calls
+    /// [`Self::compact`] once this (relative to [`Self::live_model_count`])
+    /// crosses a threshold.
+    #[must_use]
+    pub fn dead_model_count(&self) -> usize {
+        self.chains.iter().filter(|c| c.is_empty()).count()
+    }
+
+    /// Number of live (non-removed) models.
+    #[must_use]
+    pub fn live_model_count(&self) -> usize {
+        self.chains.iter().filter(|c| !c.is_empty()).count()
+    }
+
+    /// Remove a model (tombstone its LOD chain) — the counterpart to
+    /// [`Self::add_model`]. O(chain length): marks the chain's entries
+    /// dead and frees their `colors`/`dirs` slots for reuse by a later
+    /// `add_model`. The `occupancy` / `color_offsets` holes are **not**
+    /// reclaimed until [`Self::compact`]; entry ids (and the caller's other
+    /// `chain_id`s) stay stable.
+    ///
+    /// Instances of the removed chain are **not** dropped here — they
+    /// linger in the cull set but draw as nothing (skipped in
+    /// [`Self::cull_bin_upload`]); the caller removes them via
+    /// [`Self::remove_instance`] when convenient. A no-op if `chain_id` is
+    /// out of range or already removed.
+    pub fn remove_model(&mut self, chain_id: u32) {
+        let Some(entries) = self.chains.get(chain_id as usize).cloned() else {
+            return;
+        };
+        if entries.is_empty() {
+            return; // already removed
+        }
+        for &e in &entries {
+            let e = e as usize;
+            self.dead[e] = true;
+            self.colors_alloc.free(e);
+        }
+        self.chains[chain_id as usize] = Vec::new(); // tombstone
+    }
+
+    /// Reclaim the holes left by [`Self::remove_model`]: rebuild the shared
+    /// volume buffers from the live entries only, dropping every dead
+    /// entry's data. Entry ids and `chain_id`s are preserved (dead entries
+    /// keep a zero-length `meta` tombstone), so the caller's handles stay
+    /// valid and no remap is needed.
+    ///
+    /// `registry` must be the resident one (entry ids 1:1, as for
+    /// [`Self::add_model`] / [`Self::update_model`]). O(live volume) —
+    /// call it when [`Self::dead_model_count`] is high, not every frame.
+    pub fn compact(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        registry: &SpriteModelRegistry,
+    ) {
+        // occupancy + color_offsets: re-pack live entries tightly, rewrite
+        // each live entry's meta offset, zero the dead ones.
+        self.compact_concat(device, registry, ConcatBuf::Occupancy);
+        self.compact_concat(device, registry, ConcatBuf::ColorOffsets);
+        // colors/dirs: the dead-aware repack already drops dead entries.
+        self.repack_colors_dirs(device, registry);
+        // model_meta: rewrite the (unchanged-length) table with the new
+        // offsets. Buffer count didn't change, so no grow needed.
+        queue.write_buffer(&self.model_meta, 0, bytemuck::cast_slice(&self.meta));
+    }
+
+    /// Rebuild one tightly-concatenated buffer from live entries only
+    /// (used by [`Self::compact`]): assign each live entry a fresh tight
+    /// offset, zero dead entries' offset, and recreate the buffer with
+    /// slack.
+    fn compact_concat(
+        &mut self,
+        device: &wgpu::Device,
+        registry: &SpriteModelRegistry,
+        which: ConcatBuf,
+    ) {
+        let mut all: Vec<u32> = Vec::new();
+        for e in 0..self.meta.len() {
+            if self.dead[e] {
+                match which {
+                    ConcatBuf::Occupancy => self.meta[e].occupancy_offset = 0,
+                    ConcatBuf::ColorOffsets => self.meta[e].color_offsets_offset = 0,
+                }
+                continue;
+            }
+            let off = all.len() as u32;
+            match which {
+                ConcatBuf::Occupancy => self.meta[e].occupancy_offset = off,
+                ConcatBuf::ColorOffsets => self.meta[e].color_offsets_offset = off,
+            }
+            all.extend_from_slice(concat_data(&registry.entries[e], which));
+        }
+        let used = all.len() as u32;
+        let cap = grow_words(used);
+        let (label, buf) = match which {
+            ConcatBuf::Occupancy => ("roxlap-gpu sprite_reg.occupancy", &mut self.occupancy),
+            ConcatBuf::ColorOffsets => (
+                "roxlap-gpu sprite_reg.color_offsets",
+                &mut self.color_offsets,
+            ),
+        };
+        *buf = storage_dst_u32_cap(device, label, &all, cap);
+        match which {
+            ConcatBuf::Occupancy => {
+                self.occ_used = used;
+                self.occ_cap = cap;
+            }
+            ConcatBuf::ColorOffsets => {
+                self.coloff_used = used;
+                self.coloff_cap = cap;
+            }
+        }
+    }
+
     /// GPU.10.3 — frustum-cull, pack the visible subset into the
     /// instance buffer, then bin those instances into screen tiles:
     /// project each visible bounding sphere to a screen AABB and append
@@ -1280,6 +1417,12 @@ impl SpriteRegistryResident {
         let mut counts = vec![0u32; n_tiles];
 
         for ci in &self.cull {
+            // Skip instances of a removed model (tombstoned chain) — they
+            // linger in `cull` until the caller drops them, but draw as
+            // nothing.
+            if self.chains[ci.chain_id as usize].is_empty() {
+                continue;
+            }
             let rel = [
                 ci.center[0] - f.pos[0],
                 ci.center[1] - f.pos[1],
@@ -1481,7 +1624,9 @@ impl ColorsAllocator {
         let mut off = 0u32;
         let mut slots = Vec::with_capacity(new_lens.len());
         for &len in new_lens {
-            let cap = slot_cap(len);
+            // A 0-length (dead / removed) entry takes no space — keeps a
+            // tombstone slot so entry ids stay positional.
+            let cap = if len == 0 { 0 } else { slot_cap(len) };
             slots.push(ColorSlot { off, cap, len });
             off += cap;
         }
@@ -1559,6 +1704,22 @@ impl ColorsAllocator {
             return Some(off);
         }
         None
+    }
+
+    /// Free `entry`'s slot back to the pool ([`SpriteRegistryResident::
+    /// remove_model`]). Its `(off, cap)` block joins the free list for
+    /// first-fit reuse by a later [`Self::push`]; the slot is zeroed so a
+    /// repack treats it as a 0-length tombstone.
+    fn free(&mut self, entry: usize) {
+        let s = self.slots[entry];
+        if s.cap > 0 {
+            self.free.push((s.off, s.cap));
+        }
+        self.slots[entry] = ColorSlot {
+            off: 0,
+            cap: 0,
+            len: 0,
+        };
     }
 }
 
@@ -2231,6 +2392,112 @@ mod tests {
                 "colors entry {e}"
             );
         }
+    }
+
+    fn test_frustum() -> ViewFrustum {
+        ViewFrustum {
+            pos: [0.0, 0.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+            half_w: 1.0,
+            half_h: 1.0,
+            far: 10_000.0,
+        }
+    }
+
+    #[test]
+    fn remove_model_tombstones_frees_and_reuses() {
+        let Some(h) = headless() else { return };
+        // Residency with models A and B, one instance each.
+        let mut reg = SpriteModelRegistry::new();
+        let a = reg.add(build_sprite_model(&kv6_unsorted()));
+        let b = reg.add(build_sprite_model(&kv6_other()));
+        let mut res = SpriteRegistryResident::upload(
+            &h.device,
+            &reg,
+            &[inst(a, [0.0; 3]), inst(b, [1.0, 0.0, 0.0])],
+        );
+        assert_eq!(res.live_model_count(), 2);
+        assert_eq!(res.dead_model_count(), 0);
+
+        // Remove B → tombstoned, its colours freed into the pool.
+        res.remove_model(b);
+        assert_eq!(res.live_model_count(), 1);
+        assert_eq!(res.dead_model_count(), 1);
+        assert_eq!(res.dead.iter().filter(|&&d| d).count(), 1, "one entry dead");
+        assert!(!res.colors_alloc.free.is_empty(), "B's colour slot freed");
+
+        // Adding C reuses the freed slot (free-list first-fit).
+        let c = reg.add(build_sprite_model(&kv6_other()));
+        res.add_model(&h.device, &h.queue, &reg, c);
+        assert_eq!(res.live_model_count(), 2);
+
+        // A and C read back correctly; B is dead (skipped).
+        let cols = read_u32(&h, &res.colors, u64::from(res.colors_alloc.cap_total()));
+        for e in [a as usize, c as usize] {
+            let m = &reg.entries[e];
+            let cc = res.meta[e].colors_offset as usize;
+            assert_eq!(
+                &cols[cc..cc + m.colors.len()],
+                &m.colors[..],
+                "colors entry {e}"
+            );
+        }
+
+        // The lingering instance of removed B is skipped without panic.
+        let f = test_frustum();
+        let _ = res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0);
+    }
+
+    #[test]
+    fn compact_reclaims_holes_keeps_ids_stable() {
+        let Some(h) = headless() else { return };
+        let mut reg = SpriteModelRegistry::new();
+        let a = reg.add(build_sprite_model(&kv6_unsorted()));
+        let b = reg.add(build_sprite_model(&kv6_other()));
+        let c = reg.add(build_sprite_model(&kv6_other()));
+        let mut res = SpriteRegistryResident::upload(
+            &h.device,
+            &reg,
+            &[inst(a, [0.0; 3]), inst(b, [1.0; 3]), inst(c, [2.0; 3])],
+        );
+        let occ_used_full = res.occ_used;
+
+        // Remove the middle model, then compact.
+        res.remove_model(b);
+        res.compact(&h.device, &h.queue, &reg);
+
+        // Holes reclaimed: occupancy now only covers A + C.
+        let live_occ: u32 = [a, c]
+            .iter()
+            .map(|&e| reg.entries[e as usize].occupancy.len() as u32)
+            .sum();
+        assert_eq!(res.occ_used, live_occ);
+        assert!(res.occ_used < occ_used_full, "compaction shrank occupancy");
+        // Dead entry keeps a zeroed tombstone; ids unchanged.
+        assert_eq!(res.meta[b as usize].occupancy_offset, 0);
+        assert_eq!(res.live_model_count(), 2);
+        assert_eq!(res.dead_model_count(), 1);
+
+        // Live entries read back correctly at their new offsets.
+        let occ = read_u32(&h, &res.occupancy, u64::from(res.occ_cap));
+        let cols = read_u32(&h, &res.colors, u64::from(res.colors_alloc.cap_total()));
+        for &e in &[a as usize, c as usize] {
+            let m = &reg.entries[e];
+            let oo = res.meta[e].occupancy_offset as usize;
+            assert_eq!(
+                &occ[oo..oo + m.occupancy.len()],
+                &m.occupancy[..],
+                "occ {e}"
+            );
+            let cc = res.meta[e].colors_offset as usize;
+            assert_eq!(&cols[cc..cc + m.colors.len()], &m.colors[..], "cols {e}");
+        }
+
+        // Chain ids still valid: C's chain still resolves; B's is empty.
+        assert!(!res.chains[c as usize].is_empty());
+        assert!(res.chains[b as usize].is_empty());
     }
 
     #[test]
