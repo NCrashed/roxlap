@@ -296,6 +296,17 @@ pub(crate) struct CpuBackend {
     /// [`update_sprite_model`](Self::update_sprite_model) can swap one
     /// model's `kv6` into every instance of it without a full rebuild.
     sprite_models: Vec<usize>,
+    /// Model templates from the last [`SpriteSet`] (`set.models`), kept so
+    /// [`Self::add_dyn_instance`] can clone a model by id. The GPU backend
+    /// keeps the analogous `sprite_models_tpl`.
+    models: Vec<Sprite>,
+    /// Dynamically added instances (see [`Self::add_dyn_instance`]) — a
+    /// swap-removable tail sublist drawn after the static sprites, the CPU
+    /// analogue of the GPU registry's appended instances.
+    dyn_sprites: Vec<Sprite>,
+    /// Source model index per entry in [`dyn_sprites`](Self::dyn_sprites),
+    /// so [`Self::update_sprite_model`] refreshes dynamic instances too.
+    dyn_models: Vec<usize>,
     /// Posed KFA limbs (flattened across all registered KFA sprites),
     /// refreshed by [`Self::update_kfa_poses`] and drawn after the
     /// static sprites each frame via `draw_sprite`.
@@ -344,6 +355,9 @@ impl CpuBackend {
             clear_sky: opts.clear_sky,
             sprites: Vec::new(),
             sprite_models: Vec::new(),
+            models: Vec::new(),
+            dyn_sprites: Vec::new(),
+            dyn_models: Vec::new(),
             kfa_limbs: Vec::new(),
             capture_next: false,
             captured: None,
@@ -448,6 +462,39 @@ impl CpuBackend {
         }
         self.sprites = sprites;
         self.sprite_models = sprite_models;
+        // Retain templates for dynamic adds; a new set drops old dynamics.
+        self.models.clone_from(&set.models);
+        self.dyn_sprites.clear();
+        self.dyn_models.clear();
+    }
+
+    /// Append one dynamic instance of `model_index` at `pos`; returns its
+    /// dynamic-sublist index (always the new last). The facade wraps this
+    /// in a stable handle. No-op-ish (returns the current count) if the
+    /// model id is unknown.
+    pub(crate) fn add_dyn_instance(&mut self, model_index: usize, pos: [f32; 3]) -> usize {
+        let idx = self.dyn_sprites.len();
+        if let Some(model) = self.models.get(model_index) {
+            let mut s = model.clone();
+            s.p = pos;
+            self.dyn_sprites.push(s);
+            self.dyn_models.push(model_index);
+        }
+        idx
+    }
+
+    /// Remove the dynamic instance at `idx` by swap-remove. Returns
+    /// `Some(old_last)` when a different instance was moved into `idx`, or
+    /// `None` if `idx` was the last / out of range — matching the GPU
+    /// backend so the facade's handle fixup is identical.
+    pub(crate) fn remove_dyn_instance(&mut self, idx: usize) -> Option<usize> {
+        if idx >= self.dyn_sprites.len() {
+            return None;
+        }
+        let last = self.dyn_sprites.len() - 1;
+        self.dyn_sprites.swap_remove(idx);
+        self.dyn_models.swap_remove(idx);
+        (idx != last).then_some(last)
     }
 
     /// GPU.12 incremental — swap the edited `kv6` into every cached
@@ -461,6 +508,16 @@ impl CpuBackend {
             if m == model_index {
                 s.kv6 = kv6.clone();
             }
+        }
+        // Dynamic instances of the same model refresh too.
+        for (s, &m) in self.dyn_sprites.iter_mut().zip(&self.dyn_models) {
+            if m == model_index {
+                s.kv6 = kv6.clone();
+            }
+        }
+        // Keep the stored template current so future dynamic adds use it.
+        if let Some(t) = self.models.get_mut(model_index) {
+            t.kv6 = kv6.clone();
         }
     }
 
@@ -558,7 +615,10 @@ impl CpuBackend {
         // the same z-buffer (camera-facing voxel splat). Needs the
         // host-built lighting; skipped if absent or no sprites.
         if let Some(lighting) = frame.sprite_lighting {
-            if !self.sprites.is_empty() || !self.kfa_limbs.is_empty() {
+            if !self.sprites.is_empty()
+                || !self.dyn_sprites.is_empty()
+                || !self.kfa_limbs.is_empty()
+            {
                 let cam_state = camera_math::derive(
                     camera,
                     width,
@@ -577,7 +637,12 @@ impl CpuBackend {
                 // Static sprites, then the posed KFA limbs (already
                 // solved by `update_kfa_poses`); both z-test against the
                 // shared buffer so order doesn't affect the result.
-                for sprite in self.sprites.iter().chain(self.kfa_limbs.iter()) {
+                for sprite in self
+                    .sprites
+                    .iter()
+                    .chain(self.dyn_sprites.iter())
+                    .chain(self.kfa_limbs.iter())
+                {
                     let _written =
                         draw_sprite(&mut target, &cam_state, frame.settings, lighting, sprite);
                 }

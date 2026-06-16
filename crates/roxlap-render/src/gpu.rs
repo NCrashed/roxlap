@@ -74,6 +74,15 @@ pub(crate) struct GpuBackend {
     /// Index into [`sprite_instances`] where the KFA limb instances
     /// begin (static [`SpriteSet`] instances occupy `[0, kfa_base)`).
     kfa_base: usize,
+    /// Model templates from the last [`SpriteSet`] (`set.models`), kept so
+    /// [`Self::add_dyn_instance`] can clone a model's base pose/kv6 for the
+    /// per-instance lighting basis. The CPU backend keeps the analogous
+    /// `models`.
+    sprite_models_tpl: Vec<Sprite>,
+    /// Count of dynamically added instances (see [`Self::add_dyn_instance`]),
+    /// which occupy the tail of [`sprite_instances`] after the static set +
+    /// KFA limbs. Their base index is `sprite_instances.len() - dyn_count`.
+    dyn_count: usize,
     /// GPU.12 incremental — registry LOD-chain id per static
     /// [`SpriteSet::models`] index (built in [`set_sprites`]), so
     /// [`update_sprite_model`](Self::update_sprite_model) can map a host
@@ -113,6 +122,8 @@ impl GpuBackend {
             sprite_basis: Vec::new(),
             kfa_limb_models: Vec::new(),
             kfa_base: 0,
+            sprite_models_tpl: Vec::new(),
+            dyn_count: 0,
             sprite_model_ids: Vec::new(),
             carve_model_id: None,
             carve_z: 0,
@@ -186,6 +197,56 @@ impl GpuBackend {
         self.sprite_registry = Some(registry);
         self.sprite_instances = instances;
         self.sprite_basis = basis;
+        // Retain model templates for dynamic adds; a new set drops dynamics.
+        self.sprite_models_tpl.clone_from(&set.models);
+        self.dyn_count = 0;
+    }
+
+    /// Append one dynamic instance of `model_index` at `pos`; returns its
+    /// dynamic-sublist index (the new last). Uses the incremental
+    /// `append_sprite_instances` (no registry rebuild) and mirrors the
+    /// instance into the parallel `sprite_instances`/`sprite_basis` so the
+    /// per-frame lighting + transform updates keep covering it.
+    pub(crate) fn add_dyn_instance(&mut self, model_index: usize, pos: [f32; 3]) -> usize {
+        let idx = self.dyn_count;
+        let (Some(&chain_id), Some(model), Some(registry)) = (
+            self.sprite_model_ids.get(model_index),
+            self.sprite_models_tpl.get(model_index),
+            self.sprite_registry.as_ref(),
+        ) else {
+            return idx;
+        };
+        let mut s = model.clone();
+        s.p = pos;
+        let inst = SpriteInstance {
+            model_id: chain_id,
+            transform: SpriteInstanceTransform::from_sprite(&s),
+        };
+        self.gpu.append_sprite_instances(registry, &[inst]);
+        self.sprite_instances.push(inst);
+        self.sprite_basis.push(s);
+        self.dyn_count += 1;
+        idx
+    }
+
+    /// Remove the dynamic instance at dynamic-sublist index `idx` by
+    /// swap-remove. Returns `Some(old_last)` (dynamic-local) if a
+    /// different instance filled the hole, else `None` — matching the CPU
+    /// backend so the facade's handle fixup is identical.
+    pub(crate) fn remove_dyn_instance(&mut self, idx: usize) -> Option<usize> {
+        if idx >= self.dyn_count {
+            return None;
+        }
+        let base = self.sprite_instances.len() - self.dyn_count;
+        let gpu_index = base + idx;
+        let moved = self.gpu.remove_sprite_instance(gpu_index);
+        // Mirror the swap-remove on the parallel arrays (swap_remove on a
+        // Vec swaps with the last element — the last dynamic instance,
+        // since dynamics are the tail — exactly as the GPU cull does).
+        self.sprite_instances.swap_remove(gpu_index);
+        self.sprite_basis.swap_remove(gpu_index);
+        self.dyn_count -= 1;
+        moved.map(|m| m - base)
     }
 
     /// Register KFA sprites: append each limb's kv6 as an instanced

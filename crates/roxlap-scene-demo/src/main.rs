@@ -27,7 +27,7 @@ use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
 use roxlap_render::{
     FrameParams, ImageFacing, ImageId, ImageSprite, KfaSprite, Line3, RenderOptions, SceneRenderer,
-    SpriteInstanceDesc, SpriteModelId, SpriteSet,
+    SpriteInstanceDesc, SpriteInstanceId, SpriteModelId, SpriteSet,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -765,6 +765,125 @@ impl InputState {
     }
 }
 
+// --- sprite spinner (incremental add/remove demo) -----------------------
+
+/// Number of distinct colour sphere models the spinner cycles through.
+const SPINNER_COLORS: usize = 6;
+/// World centre of the spinner ring (in front of the spawn camera at
+/// `[0, -120, 50]` looking +y), and its radius in voxels.
+const SPINNER_CENTER: [f32; 3] = [0.0, -45.0, 38.0];
+const SPINNER_RADIUS: f32 = 36.0;
+
+/// Build the spinner's colour sphere models — one small solid sphere per
+/// palette entry. Pivot is centred by `from_fn_shaded`, so an instance's
+/// position places the sphere's centre.
+fn build_spinner_models() -> Vec<Sprite> {
+    // voxlap-packed 0x80RRGGBB (high bit set = shaded).
+    const PALETTE: [u32; SPINNER_COLORS] = [
+        0x80FF_4040, // red
+        0x80FF_A030, // orange
+        0x80F0_F040, // yellow
+        0x8040_E060, // green
+        0x8040_A0FF, // blue
+        0x80C0_60FF, // violet
+    ];
+    let n: u32 = 9;
+    #[allow(clippy::cast_precision_loss)]
+    let c = n as f32 * 0.5;
+    let r = c - 0.5;
+    PALETTE
+        .iter()
+        .map(|&col| {
+            let kv6 = Kv6::from_fn_shaded(n, n, n, |x, y, z| {
+                #[allow(clippy::cast_precision_loss)]
+                let (dx, dy, dz) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c, z as f32 + 0.5 - c);
+                (dx * dx + dy * dy + dz * dz <= r * r).then_some(col)
+            });
+            Sprite::axis_aligned(kv6, SPINNER_CENTER)
+        })
+        .collect()
+}
+
+/// Where the carve target + spinner models landed in a [`SpriteSet`], so
+/// the demo can map [`SceneRenderer::set_sprites`]'s positional ids back
+/// to the right handles.
+struct SpriteLayout {
+    /// Model index of the `G`-carve target, if present.
+    carve_model: Option<usize>,
+    /// `[start, start+SPINNER_COLORS)` are the spinner colour models.
+    spinner_start: usize,
+}
+
+/// A rotating ring of coloured sphere sprites: every tick it appends one
+/// sphere at the advancing head angle and drops the oldest once the trail
+/// is full — driving the facade's incremental add/remove each frame on
+/// whichever backend is active.
+#[derive(Default)]
+struct Spinner {
+    /// One [`SpriteModelId`] per palette colour (empty until models are
+    /// registered, e.g. `ROXLAP_GPU_NO_SPRITES`).
+    models: Vec<SpriteModelId>,
+    /// Live instances oldest→newest; the front is dropped when full.
+    ring: std::collections::VecDeque<SpriteInstanceId>,
+    /// Head angle (radians), advanced one step per appended sphere.
+    angle: f64,
+    /// Seconds accumulated toward the next append.
+    accum: f64,
+    /// Next palette colour to use.
+    next_color: usize,
+}
+
+impl Spinner {
+    /// Seconds between appends (≈ append rate).
+    const ADD_PERIOD: f64 = 0.12;
+    /// Head-angle advance per appended sphere (radians) → visual spin
+    /// speed `ANGLE_STEP / ADD_PERIOD` rad/s. Wide spacing so the few
+    /// spheres are clearly separated around the ring.
+    const ANGLE_STEP: f64 = 0.5;
+    /// Trail length — spheres are dropped once the ring exceeds this.
+    const MAX: usize = 12;
+
+    /// Point the spinner at a freshly registered set of colour models and
+    /// drop any prior handles (a `set_sprites` wiped the dynamic layer).
+    fn reset_models(&mut self, models: Vec<SpriteModelId>) {
+        self.models = models;
+        self.ring.clear();
+        self.angle = 0.0;
+        self.accum = 0.0;
+        self.next_color = 0;
+    }
+
+    /// Advance by `dt` seconds: append spheres at the head and drop the
+    /// tail, exercising the renderer's incremental sprite API.
+    fn update(&mut self, renderer: &mut SceneRenderer, dt: f64) {
+        if self.models.is_empty() {
+            return;
+        }
+        // Clamp so a long stall (e.g. window drag) doesn't burst-spawn.
+        self.accum = (self.accum + dt).min(0.5);
+        while self.accum >= Self::ADD_PERIOD {
+            self.accum -= Self::ADD_PERIOD;
+            #[allow(clippy::cast_possible_truncation)]
+            let a = self.angle as f32;
+            let pos = [
+                SPINNER_CENTER[0] + SPINNER_RADIUS * a.cos(),
+                SPINNER_CENTER[1],
+                SPINNER_CENTER[2] + SPINNER_RADIUS * a.sin(),
+            ];
+            let model = self.models[self.next_color % self.models.len()];
+            self.next_color += 1;
+            self.angle += Self::ANGLE_STEP;
+            self.ring
+                .push_back(renderer.add_sprite_instance(model, pos));
+            if self.ring.len() > Self::MAX {
+                if let Some(old) = self.ring.pop_front() {
+                    renderer.remove_sprite_instance(old);
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct App {
     window: Option<Arc<Window>>,
@@ -861,6 +980,9 @@ struct App {
     /// instead of re-deriving a positional index. `None` until the first
     /// registration (or when sprites are disabled).
     carve_target_id: Option<SpriteModelId>,
+    /// Rotating ring of coloured spheres exercising the incremental
+    /// add/remove sprite API each frame (see [`Spinner`]).
+    spinner: Spinner,
 }
 
 impl App {
@@ -919,6 +1041,7 @@ impl App {
             last_fps: 0.0,
             carve_target: CarveTarget::new(),
             carve_target_id: None,
+            spinner: Spinner::default(),
         }
     }
 
@@ -1016,6 +1139,13 @@ impl App {
                 k.animsprite(dt_ms);
             }
             renderer.update_kfa_poses(&mut self.kfa);
+        }
+
+        // Spinner: stream coloured spheres in/out around the ring each
+        // frame via the incremental add/remove API (paused in pick mode,
+        // which rebuilds the whole sprite set per frame).
+        if !self.pick_mode {
+            self.spinner.update(renderer, dt);
         }
 
         // Per-frame opticast settings (host owns scan distance).
@@ -1162,7 +1292,7 @@ impl App {
     /// N×N field (`ROXLAP_SPRITE_GRID`, default 16 ⇒ 256 instances).
     /// The red model is the `G`-carve target. Content only — the
     /// renderer builds the CPU draws + GPU registry from this.
-    fn build_sprite_set(&self) -> Option<SpriteSet> {
+    fn build_sprite_set(&self) -> Option<(SpriteSet, SpriteLayout)> {
         let mut models = Vec::new();
         let mut instances = Vec::new();
         let mut carve_model = None;
@@ -1180,8 +1310,8 @@ impl App {
             instances.extend(Self::coco_field_instances());
         }
 
-        // Shoot-to-carve target: always present, as the last model, so
-        // it renders even if `coco.kv6` failed to load.
+        // Shoot-to-carve target (the dense blob): its model id is kept in
+        // `carve_target_id` for the incremental shoot-to-carve refresh.
         let target_model = models.len();
         models.push(self.carve_target.sprite.clone());
         instances.push(SpriteInstanceDesc {
@@ -1189,14 +1319,35 @@ impl App {
             pos: TARGET_WORLD,
         });
 
+        // Spinner colour sphere models last (zero static instances — the
+        // spinner adds/removes their instances dynamically each frame).
+        let spinner_start = models.len();
+        models.extend(build_spinner_models());
+
         if models.is_empty() {
             return None;
         }
-        Some(SpriteSet {
-            models,
-            instances,
-            carve_model,
-        })
+        Some((
+            SpriteSet {
+                models,
+                instances,
+                carve_model,
+            },
+            SpriteLayout {
+                carve_model: Some(target_model),
+                spinner_start,
+            },
+        ))
+    }
+
+    /// Map the positional ids from a [`SceneRenderer::set_sprites`] back
+    /// into the carve-target handle + the spinner's colour models.
+    fn map_sprite_ids(&mut self, ids: &[SpriteModelId], layout: &SpriteLayout) {
+        self.carve_target_id = layout.carve_model.and_then(|i| ids.get(i).copied());
+        let end = layout.spinner_start + SPINNER_COLORS;
+        if let Some(slice) = ids.get(layout.spinner_start..end) {
+            self.spinner.reset_models(slice.to_vec());
+        }
     }
 
     /// The checkerboarded green/red `coco` field (model indices 0/1).
@@ -1204,7 +1355,7 @@ impl App {
         let n: i32 = std::env::var("ROXLAP_SPRITE_GRID")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(16);
+            .unwrap_or(4);
         let spacing = 40.0_f32;
         let mut instances = Vec::new();
         for iy in 0..n {
@@ -1373,12 +1524,12 @@ impl App {
                 self.scene.refresh_camera();
             }
             // Restore the normal sprite field (compute before borrowing
-            // the renderer to keep the borrows disjoint). The carve
-            // target is the last model, so its handle is the last id.
-            let restore = self.build_sprite_set();
-            if let (Some(renderer), Some(set)) = (self.renderer.as_mut(), restore) {
-                let ids = renderer.set_sprites(&set);
-                self.carve_target_id = ids.last().copied();
+            // the renderer to keep the borrows disjoint), then remap the
+            // carve-target + spinner model handles.
+            if let Some((set, layout)) = self.build_sprite_set() {
+                if let Some(ids) = self.renderer.as_mut().map(|r| r.set_sprites(&set)) {
+                    self.map_sprite_ids(&ids, &layout);
+                }
             }
             eprintln!("pick mode OFF");
         }
@@ -1445,17 +1596,16 @@ impl ApplicationHandler for App {
         let no_sprites = std::env::var_os("ROXLAP_GPU_NO_SPRITES").is_some_and(|v| v != "0");
         if no_sprites {
             eprintln!("roxlap-render: ROXLAP_GPU_NO_SPRITES — sprites disabled");
-        } else if let Some(set) = self.build_sprite_set() {
+        } else if let Some((set, layout)) = self.build_sprite_set() {
             eprintln!(
                 "roxlap-render: {} sprite instances, {} models \
                  (click to grab, then left-click shoots spheres out of the blob ahead; \
-                 'G' carves the red model)",
+                 'G' carves the red model; a colour-sphere spinner streams in/out each frame)",
                 set.instances.len(),
                 set.models.len(),
             );
-            // The carve target is the last model — keep its handle for
-            // the incremental shoot-to-carve refresh in `fire`.
-            self.carve_target_id = renderer.set_sprites(&set).last().copied();
+            let ids = renderer.set_sprites(&set);
+            self.map_sprite_ids(&ids, &layout);
         }
 
         // Animated KFA sprite (the swinging arm) — registered once;

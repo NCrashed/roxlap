@@ -88,6 +88,73 @@ pub struct SpriteInstanceDesc {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SpriteModelId(pub(crate) usize);
 
+/// Stable handle to a **dynamically added** sprite instance — the result
+/// of [`SceneRenderer::add_sprite_instance`], passed to
+/// [`remove_sprite_instance`](SceneRenderer::remove_sprite_instance).
+///
+/// Backends remove instances by swap (O(1)), which moves another instance
+/// into the freed slot; this handle survives that because the facade keeps
+/// the id↔slot mapping up to date. The generation guards against a stale
+/// handle aliasing a recycled slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SpriteInstanceId {
+    slot: u32,
+    gen: u32,
+}
+
+/// Facade-side slotmap that turns the backends' swap-remove indexing into
+/// stable [`SpriteInstanceId`] handles. Both backends keep their dynamic
+/// instances as a tail sublist indexed `0..n`; `order[dyn_index]` is the
+/// owning slot, and a removal fixes up the one slot whose instance was
+/// swapped into the hole.
+#[derive(Default)]
+struct DynInstanceMap {
+    /// Per slot: `(generation, Some(dyn_index) while live)`.
+    slots: Vec<(u32, Option<u32>)>,
+    /// Per live `dyn_index`: the owning slot. Parallel to the backends'
+    /// dynamic sublist (so `order.len()` == the dynamic instance count).
+    order: Vec<u32>,
+    free: Vec<u32>,
+}
+
+impl DynInstanceMap {
+    /// Register a freshly appended instance (always at `dyn_index ==
+    /// order.len()`); returns its stable handle.
+    fn alloc(&mut self, dyn_index: u32) -> SpriteInstanceId {
+        debug_assert_eq!(self.order.len() as u32, dyn_index);
+        let slot = self.free.pop().unwrap_or_else(|| {
+            self.slots.push((0, None));
+            (self.slots.len() - 1) as u32
+        });
+        let gen = self.slots[slot as usize].0;
+        self.slots[slot as usize].1 = Some(dyn_index);
+        self.order.push(slot);
+        SpriteInstanceId { slot, gen }
+    }
+
+    /// Resolve a handle to its current backend `dyn_index`, or `None` if
+    /// it's stale / already removed.
+    fn dyn_index(&self, id: SpriteInstanceId) -> Option<u32> {
+        let (gen, idx) = *self.slots.get(id.slot as usize)?;
+        (gen == id.gen).then_some(idx).flatten()
+    }
+
+    /// Apply a removal: the backend swap-removed `removed` and reported
+    /// `moved` (the old-last `dyn_index` that slid into `removed`, or
+    /// `None` if `removed` was itself the last).
+    fn remove(&mut self, id: SpriteInstanceId, removed: u32, moved: Option<u32>) {
+        self.slots[id.slot as usize].1 = None;
+        self.slots[id.slot as usize].0 += 1; // bump generation
+        self.free.push(id.slot);
+        if let Some(last) = moved {
+            let moved_slot = self.order[last as usize];
+            self.slots[moved_slot as usize].1 = Some(removed);
+            self.order[removed as usize] = moved_slot;
+        }
+        self.order.pop();
+    }
+}
+
 /// Backend-agnostic sprite description. The facade builds the CPU
 /// per-instance draw list and the GPU instanced registry from the
 /// same data, so both backends show identical sprites. The host owns
@@ -486,6 +553,9 @@ enum BackendImpl {
 /// Unified renderer over the CPU and GPU paths. See the crate docs.
 pub struct SceneRenderer {
     inner: BackendImpl,
+    /// Handles for dynamically added sprite instances (see
+    /// [`Self::add_sprite_instance`]). Reset by [`Self::set_sprites`].
+    dyn_map: DynInstanceMap,
 }
 
 impl SceneRenderer {
@@ -513,6 +583,7 @@ impl SceneRenderer {
                 Ok(g) => {
                     return Self {
                         inner: BackendImpl::Gpu(Box::new(g)),
+                        dyn_map: DynInstanceMap::default(),
                     };
                 }
                 Err(e) => {
@@ -524,6 +595,7 @@ impl SceneRenderer {
         }
         Self {
             inner: BackendImpl::Cpu(Box::new(CpuBackend::new(window, size, opts))),
+            dyn_map: DynInstanceMap::default(),
         }
     }
 
@@ -552,6 +624,7 @@ impl SceneRenderer {
                 Ok(g) => {
                     return Self {
                         inner: BackendImpl::Gpu(Box::new(g)),
+                        dyn_map: DynInstanceMap::default(),
                     };
                 }
                 Err(e) => {
@@ -564,6 +637,7 @@ impl SceneRenderer {
         }
         Self {
             inner: BackendImpl::Cpu(Box::new(CpuBackend::new_from_canvas(canvas, size, opts))),
+            dyn_map: DynInstanceMap::default(),
         }
     }
 
@@ -865,6 +939,9 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.set_sprites(set),
             BackendImpl::Gpu(g) => g.set_sprites(set),
         }
+        // A fresh sprite set replaces the instance world, so any
+        // previously added dynamic instances are gone — drop their handles.
+        self.dyn_map = DynInstanceMap::default();
         // Handles are positional by construction (model index = chain id
         // on both backends), so the facade hands them out directly —
         // callers keep the handle instead of re-deriving the index.
@@ -892,6 +969,47 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.update_sprite_model(model.0, kv6),
             BackendImpl::Gpu(g) => g.update_sprite_model(model.0, kv6),
         }
+    }
+
+    /// Add one sprite instance of an already-registered `model` at world
+    /// `pos`, **incrementally** — the cheap streaming-spawn path that both
+    /// backends now share (GPU: append to the instance buffer, growing by
+    /// powers of two; CPU: push one pre-posed [`Sprite`]). Returns a
+    /// stable [`SpriteInstanceId`] for later removal.
+    ///
+    /// `model` must be a [`SpriteModelId`] from the current
+    /// [`set_sprites`](Self::set_sprites) (a model registered there, even
+    /// with zero initial instances). Dynamic instances live *after* the
+    /// static set + any KFA limbs, so register those first.
+    pub fn add_sprite_instance(&mut self, model: SpriteModelId, pos: [f32; 3]) -> SpriteInstanceId {
+        let dyn_index = match &mut self.inner {
+            BackendImpl::Cpu(c) => c.add_dyn_instance(model.0, pos),
+            BackendImpl::Gpu(g) => g.add_dyn_instance(model.0, pos),
+        };
+        self.dyn_map.alloc(dyn_index as u32)
+    }
+
+    /// Remove a dynamic sprite instance added by
+    /// [`add_sprite_instance`](Self::add_sprite_instance). O(1) on both
+    /// backends (swap-remove); other dynamic handles stay valid. Returns
+    /// `false` if the handle is stale / already removed.
+    pub fn remove_sprite_instance(&mut self, id: SpriteInstanceId) -> bool {
+        let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+            return false;
+        };
+        let moved = match &mut self.inner {
+            BackendImpl::Cpu(c) => c.remove_dyn_instance(dyn_index as usize),
+            BackendImpl::Gpu(g) => g.remove_dyn_instance(dyn_index as usize),
+        };
+        self.dyn_map.remove(id, dyn_index, moved.map(|m| m as u32));
+        true
+    }
+
+    /// Number of live dynamic sprite instances (those added via
+    /// [`add_sprite_instance`](Self::add_sprite_instance)).
+    #[must_use]
+    pub fn dynamic_sprite_count(&self) -> usize {
+        self.dyn_map.order.len()
     }
 
     /// Register animated KFA sprites (one or more bone hierarchies).
@@ -1054,6 +1172,64 @@ impl SceneRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handle map must survive the backends' swap-remove indexing:
+    /// drive a model `DynInstanceMap` against a `Vec` "backend" that
+    /// swap-removes, and check every live handle keeps resolving to its
+    /// own payload through a sequence of adds + removes.
+    #[test]
+    fn dyn_instance_map_survives_swap_removes() {
+        let mut map = DynInstanceMap::default();
+        // The "backend": payload per dynamic index; swap_remove mirrors
+        // both backends' remove_dyn_instance.
+        let mut backend: Vec<u32> = Vec::new();
+        // Our bookkeeping: handle -> the payload we expect it to address.
+        let mut expect: Vec<(SpriteInstanceId, u32)> = Vec::new();
+
+        let add = |map: &mut DynInstanceMap,
+                   backend: &mut Vec<u32>,
+                   expect: &mut Vec<(SpriteInstanceId, u32)>,
+                   payload: u32| {
+            let dyn_index = backend.len() as u32;
+            backend.push(payload);
+            let id = map.alloc(dyn_index);
+            expect.push((id, payload));
+        };
+
+        for p in 0..6 {
+            add(&mut map, &mut backend, &mut expect, p);
+        }
+
+        // Remove a middle handle (payload 2) and a later one (payload 4),
+        // plus the current last — covering swap and no-swap paths.
+        for victim_payload in [2u32, 4, 5] {
+            let pos = expect
+                .iter()
+                .position(|&(_, p)| p == victim_payload)
+                .unwrap();
+            let (id, _) = expect.remove(pos);
+            let dyn_index = map.dyn_index(id).expect("live handle resolves");
+            // Backend swap-remove + report moved index (old last), exactly
+            // like remove_dyn_instance on both backends.
+            let last = backend.len() - 1;
+            backend.swap_remove(dyn_index as usize);
+            let moved = (dyn_index as usize != last).then_some(last as u32);
+            map.remove(id, dyn_index, moved);
+            // The removed handle is now stale.
+            assert!(map.dyn_index(id).is_none(), "removed handle is stale");
+        }
+
+        // Every surviving handle still resolves to its own payload.
+        for &(id, payload) in &expect {
+            let idx = map.dyn_index(id).expect("survivor resolves");
+            assert_eq!(
+                backend[idx as usize], payload,
+                "handle addresses its payload"
+            );
+        }
+        assert_eq!(map.order.len(), backend.len());
+        assert_eq!(backend.len(), expect.len());
+    }
 
     #[test]
     fn options_default_is_cpu_intent() {
