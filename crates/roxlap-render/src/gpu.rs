@@ -100,6 +100,13 @@ pub(crate) struct GpuBackend {
     /// Last `sky_color` auto-uploaded under the parity path above —
     /// re-uploads the 1×1 texture only when it changes.
     auto_sky_color: Option<u32>,
+    /// Max dirty chunks installed per frame in [`Self::refresh_dirty`].
+    /// Bounds the streaming upload spike: a frame that would otherwise
+    /// decompress + upload a whole batch of newly-streamed chunks at once
+    /// (a multi-hundred-ms freeze) installs at most this many and lets the
+    /// rest ride the next frames (refresh runs every frame). `u32::MAX`
+    /// (env `ROXLAP_GPU_CHUNK_BUDGET=0`) restores the old unbounded path.
+    chunk_upload_budget: u32,
     /// CPU shadow copy of each uploaded image (`rgba`, `w`, `h`), keyed by
     /// the [`ImageId`] `roxlap-gpu` hands back. The GPU texture isn't read
     /// back, so `pick_image`'s alpha test samples this instead. Indexed by
@@ -129,7 +136,21 @@ impl GpuBackend {
             carve_z: 0,
             host_sky_set: false,
             auto_sky_color: None,
+            chunk_upload_budget: Self::chunk_upload_budget_from_env(),
             image_pixels: Vec::new(),
+        }
+    }
+
+    /// Per-frame dirty-chunk install budget — default 4, overridable via
+    /// `ROXLAP_GPU_CHUNK_BUDGET` (`0` = unbounded, the old behaviour).
+    fn chunk_upload_budget_from_env() -> u32 {
+        match std::env::var("ROXLAP_GPU_CHUNK_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            Some(0) => u32::MAX,
+            Some(n) => n,
+            None => 4,
         }
     }
 
@@ -754,11 +775,17 @@ impl GpuBackend {
             };
             let tracker = &mut self.versions[scene_idx];
 
-            // Install / refresh current chunks.
+            // Install / refresh current chunks, up to the per-frame
+            // budget — the rest stay dirty and ride the next frames, so a
+            // big streamed-in batch spreads its upload cost instead of
+            // freezing one frame.
             for (chunk_ivec3, vxl) in &grid.chunks {
                 let cur = grid.chunk_version(*chunk_ivec3);
                 if tracker.get(chunk_ivec3).copied() == Some(cur) {
                     continue;
+                }
+                if decompressed >= self.chunk_upload_budget {
+                    break;
                 }
                 let upload = roxlap_gpu::decompress_chunk(vxl);
                 let outcome = resident.refresh_chunk(
