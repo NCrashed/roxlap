@@ -844,14 +844,18 @@ impl SpriteRegistryResident {
     /// into the shared buffers). `registry` here is only read for the new
     /// instances' bound-sphere radii and must be the resident one.
     ///
-    /// The `instances` GPU buffer grows by powers of two (amortised O(1)
-    /// per append, like the per-frame tile/colmul buffers); `colmul`
-    /// grows lazily in [`Self::cull_bin_upload`]. After a removal the
-    /// capacity is not shrunk, so a spawn/despawn churn reuses it.
+    /// The `instances` GPU buffer is only *grown* here (power-of-two,
+    /// amortised O(1)); its contents are **not** written. [`Self::
+    /// cull_bin_upload`] rewrites the whole visible range from `cull` every
+    /// frame before the sprite pass reads it — exactly as for the static
+    /// instances — so appending only needs to extend `cull` and ensure
+    /// capacity. Writing the buffer here too caused a mid-frame
+    /// write-while-in-flight hazard on some drivers (a stray full-screen
+    /// flash on append). `colmul` likewise grows lazily in
+    /// `cull_bin_upload`. After a removal the capacity is not shrunk.
     pub fn append_instances(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         registry: &SpriteModelRegistry,
         instances: &[SpriteInstance],
     ) -> u32 {
@@ -868,23 +872,12 @@ impl SpriteRegistryResident {
             self.cull.push(make_cull(registry, i));
         }
         let need = self.cull.len() as u32;
-        let stride = std::mem::size_of::<SpriteInstanceGpu>() as u64;
         if need > self.instance_capacity {
-            // Grow power-of-two, recreate the buffer, and re-seed the full
-            // set so it's valid before the next cull (matches upload).
+            // Grow power-of-two and recreate the buffer (the next frame's
+            // bind group picks up the new handle). No seed write — the
+            // per-frame cull_bin_upload populates it.
             self.instance_capacity = need.next_power_of_two();
             self.instances = instances_buffer(device, self.instance_capacity);
-            let seed: Vec<SpriteInstanceGpu> = self.cull.iter().map(|c| c.gpu).collect();
-            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&seed));
-        } else {
-            // Fits — write just the appended tail at its offset.
-            let tail: Vec<SpriteInstanceGpu> =
-                self.cull[base as usize..].iter().map(|c| c.gpu).collect();
-            queue.write_buffer(
-                &self.instances,
-                u64::from(base) * stride,
-                bytemuck::cast_slice(&tail),
-            );
         }
         base
     }
@@ -1454,7 +1447,6 @@ impl SpriteRegistryResident {
                     (((sy + sr) / ts).floor() as i32).clamp(0, ty_max),
                 )
             } else {
-                // Sphere crosses the camera plane — cover all tiles.
                 (0, tx_max, 0, ty_max)
             };
             // GPU.10.4 — pick the LOD level by projected voxel size:
@@ -2229,13 +2221,13 @@ mod tests {
 
         // Append 4 → count 5, capacity grows to next_pow2(5) = 8.
         let more: Vec<_> = (1..=4).map(|i| inst(m, [i as f32, 0.0, 0.0])).collect();
-        let base = res.append_instances(&h.device, &h.queue, &reg, &more);
+        let base = res.append_instances(&h.device, &reg, &more);
         assert_eq!(base, 1, "first appended index follows the seed instance");
         assert_eq!(res.instance_count(), 5);
         assert_eq!(res.instance_capacity, 8, "power-of-two growth");
 
         // A second append that still fits keeps the same capacity (no realloc).
-        let base2 = res.append_instances(&h.device, &h.queue, &reg, &[inst(m, [9.0, 0.0, 0.0])]);
+        let base2 = res.append_instances(&h.device, &reg, &[inst(m, [9.0, 0.0, 0.0])]);
         assert_eq!(base2, 5);
         assert_eq!(res.instance_count(), 6);
         assert_eq!(res.instance_capacity, 8, "fits existing capacity, no grow");
@@ -2246,7 +2238,7 @@ mod tests {
         let Some(h) = headless() else { return };
         let (reg, m) = one_model_registry();
         let mut res = SpriteRegistryResident::upload(&h.device, &reg, &[inst(m, [0.0; 3])]);
-        let base = res.append_instances(&h.device, &h.queue, &reg, &[]);
+        let base = res.append_instances(&h.device, &reg, &[]);
         assert_eq!(base, 1);
         assert_eq!(res.instance_count(), 1);
         assert_eq!(res.instance_capacity, 1);
@@ -2350,7 +2342,7 @@ mod tests {
         }
 
         // And an instance of the freshly-added model can now be appended.
-        let base = res.append_instances(&h.device, &h.queue, &reg, &[inst(b, [5.0, 0.0, 0.0])]);
+        let base = res.append_instances(&h.device, &reg, &[inst(b, [5.0, 0.0, 0.0])]);
         assert_eq!(base, 1);
         assert_eq!(res.instance_count(), 2);
     }

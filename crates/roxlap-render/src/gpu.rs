@@ -141,8 +141,17 @@ impl GpuBackend {
         }
     }
 
-    /// Per-frame dirty-chunk install budget — default 4, overridable via
+    /// Per-frame dirty-chunk install budget — default 2, overridable via
     /// `ROXLAP_GPU_CHUNK_BUDGET` (`0` = unbounded, the old behaviour).
+    ///
+    /// Each chunk install issues several `queue.write_buffer` calls
+    /// (occupancy pages, colours, offsets, …); a big batch in one frame
+    /// can exhaust the device staging pool, which then makes egui's own
+    /// `write_buffer_with` fail (a hard panic in egui-wgpu) — seen while
+    /// flying fast on the Mesa/NVK Vulkan driver. A small budget keeps the
+    /// per-frame write volume bounded; the trade-off is slower chunk fill
+    /// (more terrain pop-in) when moving quickly. Raise it on a driver
+    /// that tolerates the bursts.
     fn chunk_upload_budget_from_env() -> u32 {
         match std::env::var("ROXLAP_GPU_CHUNK_BUDGET")
             .ok()
@@ -150,7 +159,7 @@ impl GpuBackend {
         {
             Some(0) => u32::MAX,
             Some(n) => n,
-            None => 4,
+            None => 2,
         }
     }
 
@@ -536,6 +545,10 @@ impl GpuBackend {
     pub(crate) fn present(&mut self) {
         self.gpu.present();
     }
+
+    /// Horizontal scene flip — not yet implemented on the GPU present path
+    /// (the CPU backend handles it). No-op so the facade dispatches cleanly.
+    pub(crate) fn set_flip_x(&mut self, _flip: bool) {}
 
     /// Draw depth-tested world-space line segments over the pending frame
     /// (L3.2). Converts the facade [`Line3`]s + world `camera` to the GPU

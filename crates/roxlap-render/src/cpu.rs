@@ -322,6 +322,11 @@ pub(crate) struct CpuBackend {
     /// rasterises egui over it first. Decoupling the composite from the
     /// present lets a host slot a UI pass between them.
     framebuffer: Vec<u32>,
+    /// Mirror the composited scene horizontally just before display (set via
+    /// [`SceneRenderer::set_flip_x`](crate::SceneRenderer::set_flip_x)). The
+    /// flip is applied to the scene framebuffer *before* the egui overlay, so
+    /// the 3D view un-mirrors while the UI stays upright.
+    flip_x: bool,
     /// Retained image-sprite textures, indexed by [`ImageId`]. A dropped
     /// slot is `None` and may be re-used by a later `upload_image`.
     images: Vec<Option<CpuImage>>,
@@ -362,9 +367,27 @@ impl CpuBackend {
             capture_next: false,
             captured: None,
             framebuffer,
+            flip_x: false,
             images: Vec::new(),
             #[cfg(feature = "hud")]
             egui_raster: crate::cpu_egui::EguiRaster::default(),
+        }
+    }
+
+    /// Toggle the horizontal scene flip (see [`Self::flip_x`]).
+    pub(crate) fn set_flip_x(&mut self, flip: bool) {
+        self.flip_x = flip;
+    }
+
+    /// Reverse each framebuffer row in place — a horizontal mirror of the
+    /// composited scene. Called before display, before any egui overlay.
+    fn flip_framebuffer(&mut self) {
+        let w = self.last_dims.0 as usize;
+        if w == 0 {
+            return;
+        }
+        for row in self.framebuffer.chunks_mut(w) {
+            row.reverse();
         }
     }
 
@@ -660,6 +683,9 @@ impl CpuBackend {
     /// surface and present it. The no-UI counterpart to
     /// [`Self::paint_egui`]; both finish the frame `render` started.
     pub(crate) fn present(&mut self) {
+        if self.flip_x {
+            self.flip_framebuffer();
+        }
         self.blit_and_present(self.last_dims);
     }
 
@@ -984,6 +1010,11 @@ impl CpuBackend {
         let pixel_count = (width as usize) * (height as usize);
         if self.framebuffer.len() < pixel_count {
             return;
+        }
+        // Mirror the 3D scene before the UI is drawn over it, so the egui
+        // overlay stays upright.
+        if self.flip_x {
+            self.flip_framebuffer();
         }
         self.egui_raster
             .update_textures(&textures.set, &textures.free);

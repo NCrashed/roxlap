@@ -771,8 +771,12 @@ impl InputState {
 const SPINNER_COLORS: usize = 6;
 /// World centre of the spinner ring (in front of the spawn camera at
 /// `[0, -120, 50]` looking +y), and its radius in voxels.
-const SPINNER_CENTER: [f32; 3] = [0.0, -45.0, 38.0];
-const SPINNER_RADIUS: f32 = 36.0;
+// z is voxlap-down (smaller = higher); the streaming hills crest near
+// z≈72, so centre the ring well above that and keep its radius small
+// enough that the bottom (z = centre.z + radius) stays clear of terrain —
+// otherwise the lower spheres z-fight the hills and flicker.
+const SPINNER_CENTER: [f32; 3] = [0.0, -45.0, 28.0];
+const SPINNER_RADIUS: f32 = 26.0;
 
 /// Build the spinner's colour sphere models — one small solid sphere per
 /// palette entry. Pivot is centred by `from_fn_shaded`, so an instance's
@@ -1112,6 +1116,16 @@ impl App {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f64();
         self.last_frame = now;
+        // DEBUG: ROXLAP_AUTOFLY=1 drives the camera forward in a slow
+        // turn to churn chunk streaming (repro for the fly-around crash).
+        if std::env::var_os("ROXLAP_AUTOFLY").is_some() {
+            self.input.forward = true;
+            self.input.fast = true;
+            self.scene.yaw += 0.9 * dt;
+            // Oscillate pitch to fly up/down (exercise chunk z-stacking).
+            self.scene.pitch = 0.45 * (self.scene.yaw * 0.7).sin();
+            self.scene.refresh_camera();
+        }
         self.tick_camera(dt);
         self.scene.tick_ship_spin(dt);
         // Streaming pump (no-op unless `build_streaming_demo` is
@@ -1144,7 +1158,7 @@ impl App {
         // Spinner: stream coloured spheres in/out around the ring each
         // frame via the incremental add/remove API (paused in pick mode,
         // which rebuilds the whole sprite set per frame).
-        if !self.pick_mode {
+        if !self.pick_mode && std::env::var_os("ROXLAP_NO_SPINNER").is_none() {
             self.spinner.update(renderer, dt);
         }
 

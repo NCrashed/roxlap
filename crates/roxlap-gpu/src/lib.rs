@@ -3256,7 +3256,7 @@ impl GpuRenderer {
         instances: &[sprite_model::SpriteInstance],
     ) -> u32 {
         match self.sprite_registry.as_mut() {
-            Some(reg) => reg.append_instances(&self.device, &self.queue, registry, instances),
+            Some(reg) => reg.append_instances(&self.device, registry, instances),
             None => {
                 self.set_sprite_instances(registry, instances);
                 0
