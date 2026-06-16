@@ -665,6 +665,36 @@ pub struct SpriteRegistryResident {
     /// writes — growing dims is out of scope, handled by a full re-upload).
     occ_lens: Vec<u32>,
     coloff_lens: Vec<u32>,
+    /// Used / allocated words of the tightly-concatenated `occupancy`
+    /// buffer. `add_model` bump-appends at `occ_used`; when it would pass
+    /// `occ_cap` the buffer is grown (with slack) and rebuilt from the
+    /// registry. (`colors`/`dirs` track theirs in [`ColorsAllocator`].)
+    occ_used: u32,
+    occ_cap: u32,
+    /// Used / allocated words of the tightly-concatenated `color_offsets`
+    /// buffer — same growth scheme as `occ_*`.
+    coloff_used: u32,
+    coloff_cap: u32,
+    /// Allocated record count of the `model_meta` buffer; `add_model`
+    /// grows it (with slack) when the entry count passes it.
+    meta_cap: u32,
+}
+
+/// Which tightly-concatenated registry buffer [`SpriteRegistryResident::
+/// sync_concat`] is operating on.
+#[derive(Clone, Copy)]
+enum ConcatBuf {
+    Occupancy,
+    ColorOffsets,
+}
+
+/// The model's source array for a given [`ConcatBuf`] — a free fn (not a
+/// closure) so the returned borrow keeps `m`'s lifetime.
+fn concat_data(m: &SpriteModel, which: ConcatBuf) -> &[u32] {
+    match which {
+        ConcatBuf::Occupancy => &m.occupancy,
+        ConcatBuf::ColorOffsets => &m.color_offsets,
+    }
 }
 
 impl SpriteRegistryResident {
@@ -777,6 +807,11 @@ impl SpriteRegistryResident {
             tile_instances_cap: 1,
             cull,
             chains: registry.chains.clone(),
+            occ_used: all_occ.len() as u32,
+            occ_cap: all_occ.len() as u32,
+            coloff_used: all_offsets.len() as u32,
+            coloff_cap: all_offsets.len() as u32,
+            meta_cap: meta.len() as u32,
             meta,
             colors_alloc,
             occ_lens,
@@ -1001,6 +1036,19 @@ impl SpriteRegistryResident {
         queue: &wgpu::Queue,
         registry: &SpriteModelRegistry,
     ) {
+        self.repack_colors_dirs(device, registry);
+        // Every entry's colors_offset moved → rewrite the whole meta table.
+        queue.write_buffer(&self.model_meta, 0, bytemuck::cast_slice(&self.meta));
+    }
+
+    /// Repack `colors`/`dirs` compactly (with fresh slack) from the full
+    /// `registry`, recreating both buffers and updating every CPU
+    /// `meta[e].colors_offset`. Does **not** touch the GPU `model_meta`
+    /// buffer — the caller writes it ([`Self::grow_and_repack`] writes the
+    /// whole table; [`Self::add_model`] writes it once after all entries
+    /// are placed). O(registry) but rare — logged so a growth burst is
+    /// visible.
+    fn repack_colors_dirs(&mut self, device: &wgpu::Device, registry: &SpriteModelRegistry) {
         let new_lens: Vec<u32> = registry
             .entries
             .iter()
@@ -1024,9 +1072,171 @@ impl SpriteRegistryResident {
             cap_total,
         );
         self.dirs = storage_dst_u32_cap(device, "roxlap-gpu sprite_reg.dirs", &all_dirs, cap_total);
-        // Every entry's colors_offset moved → rewrite the whole meta table.
-        queue.write_buffer(&self.model_meta, 0, bytemuck::cast_slice(&self.meta));
         eprintln!("roxlap-gpu: sprite registry colors/dirs grew + repacked to {cap_total} words");
+    }
+
+    /// Append a new model (its full LOD chain) to the resident registry
+    /// **without** re-uploading the existing models' volumes — the
+    /// incremental counterpart to a full [`Self::upload`], for streaming
+    /// in new geometry (unique asteroids, generated meshes).
+    ///
+    /// Contract (mirrors [`Self::update_model`]): the caller owns the
+    /// `SpriteModelRegistry`, has just appended this chain to it (e.g. via
+    /// [`SpriteModelRegistry::add_lod`]), and passes the resulting
+    /// `chain_id`. The chain's entries must be the registry's newest (ids
+    /// `>= ` the resident entry count) — entries are append-only.
+    ///
+    /// The large `colors`/`dirs`/`occupancy`/`color_offsets` buffers carry
+    /// slack and bump-append the new entries in place; a buffer that
+    /// overflows is grown (with slack) and rebuilt once from the registry
+    /// (amortised O(1) per add). The small `model_meta` table is rewritten
+    /// each call. After this, [`Self::append_instances`] can reference the
+    /// new `chain_id`.
+    pub fn add_model(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        registry: &SpriteModelRegistry,
+        chain_id: u32,
+    ) {
+        let entries = registry.chains[chain_id as usize].clone();
+        debug_assert_eq!(
+            chain_id as usize,
+            self.chains.len(),
+            "add_model: chains must be appended in order"
+        );
+
+        // CPU bookkeeping: assign each new entry a tight occ/coloff offset
+        // and an allocator slot for colors/dirs. `need_colors_grow` marks
+        // a slot that didn't fit → a colors/dirs repack below.
+        let mut need_colors_grow = false;
+        for &e in &entries {
+            let e = e as usize;
+            debug_assert_eq!(
+                e,
+                self.meta.len(),
+                "add_model: entries must be appended in order"
+            );
+            let m = &registry.entries[e];
+            let occ_off = self.occ_used;
+            let coloff_off = self.coloff_used;
+            self.occ_used += m.occupancy.len() as u32;
+            self.coloff_used += m.color_offsets.len() as u32;
+            let colors_off = match self.colors_alloc.push(m.colors.len() as u32) {
+                Some(off) => off,
+                None => {
+                    need_colors_grow = true;
+                    0 // placeholder; repack assigns the real offset
+                }
+            };
+            self.meta.push(SpriteModelMeta {
+                occupancy_offset: occ_off,
+                colors_offset: colors_off,
+                color_offsets_offset: coloff_off,
+                occ_words_per_col: m.occ_words_per_col,
+                dims: m.dims,
+                _pad0: 0,
+                pivot: m.pivot,
+                voxel_world_size: m.voxel_world_size,
+            });
+            self.occ_lens.push(m.occupancy.len() as u32);
+            self.coloff_lens.push(m.color_offsets.len() as u32);
+        }
+        self.chains.push(entries.clone());
+
+        // occupancy + color_offsets: grow+rebuild on overflow, else write
+        // the new tails in place.
+        self.sync_concat(device, queue, registry, &entries, ConcatBuf::Occupancy);
+        self.sync_concat(device, queue, registry, &entries, ConcatBuf::ColorOffsets);
+
+        // colors/dirs: repack on overflow (rebuilds both + every CPU
+        // colors_offset), else write the new entries at their slots.
+        if need_colors_grow {
+            self.repack_colors_dirs(device, registry);
+        } else {
+            for &e in &entries {
+                let e = e as usize;
+                let m = &registry.entries[e];
+                let off = u64::from(self.meta[e].colors_offset) * 4;
+                queue.write_buffer(&self.colors, off, bytemuck::cast_slice(&m.colors));
+                queue.write_buffer(&self.dirs, off, bytemuck::cast_slice(&m.dirs));
+            }
+        }
+
+        // model_meta: grow the record buffer if needed, then rewrite the
+        // whole (small) table — covers both new records and any
+        // colors_offset relocations from a repack.
+        let count = self.meta.len() as u32;
+        if count > self.meta_cap {
+            self.meta_cap = grow_records(count);
+            self.model_meta = storage_dst_pod_cap(
+                device,
+                "roxlap-gpu sprite_reg.model_meta",
+                &self.meta,
+                self.meta_cap,
+            );
+        } else {
+            queue.write_buffer(&self.model_meta, 0, bytemuck::cast_slice(&self.meta));
+        }
+    }
+
+    /// Sync one tightly-concatenated buffer (`occupancy` or
+    /// `color_offsets`) after `add_model` appended `new_entries`: if the
+    /// used length now exceeds capacity, grow (with slack) and rebuild the
+    /// whole buffer from the registry; otherwise write just the appended
+    /// tails at their offsets.
+    fn sync_concat(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        registry: &SpriteModelRegistry,
+        new_entries: &[u32],
+        which: ConcatBuf,
+    ) {
+        let (used, cap) = match which {
+            ConcatBuf::Occupancy => (self.occ_used, self.occ_cap),
+            ConcatBuf::ColorOffsets => (self.coloff_used, self.coloff_cap),
+        };
+        if used > cap {
+            let new_cap = grow_words(used);
+            let all: Vec<u32> = registry
+                .entries
+                .iter()
+                .flat_map(|m| concat_data(m, which).iter().copied())
+                .collect();
+            let label = match which {
+                ConcatBuf::Occupancy => "roxlap-gpu sprite_reg.occupancy",
+                ConcatBuf::ColorOffsets => "roxlap-gpu sprite_reg.color_offsets",
+            };
+            let buf = storage_dst_u32_cap(device, label, &all, new_cap);
+            match which {
+                ConcatBuf::Occupancy => {
+                    self.occupancy = buf;
+                    self.occ_cap = new_cap;
+                }
+                ConcatBuf::ColorOffsets => {
+                    self.color_offsets = buf;
+                    self.coloff_cap = new_cap;
+                }
+            }
+        } else {
+            let target = match which {
+                ConcatBuf::Occupancy => &self.occupancy,
+                ConcatBuf::ColorOffsets => &self.color_offsets,
+            };
+            for &e in new_entries {
+                let e = e as usize;
+                let off = match which {
+                    ConcatBuf::Occupancy => self.meta[e].occupancy_offset,
+                    ConcatBuf::ColorOffsets => self.meta[e].color_offsets_offset,
+                };
+                queue.write_buffer(
+                    target,
+                    u64::from(off) * 4,
+                    bytemuck::cast_slice(concat_data(&registry.entries[e], which)),
+                );
+            }
+        }
     }
 
     /// GPU.10.3 — frustum-cull, pack the visible subset into the
@@ -1233,6 +1443,18 @@ fn slot_cap(len: u32) -> u32 {
     len + len / 4 + 16
 }
 
+/// Slack capacity (words) for a grown concatenated buffer: +50% + 256, so
+/// a burst of `add_model` calls bump-appends rather than re-growing every
+/// time. Matches [`ColorsAllocator`]'s `cap_total` headroom.
+fn grow_words(used: u32) -> u32 {
+    used + used / 2 + 256
+}
+
+/// Slack capacity (records) for a grown `model_meta` buffer: +50% + 8.
+fn grow_records(count: u32) -> u32 {
+    count + count / 2 + 8
+}
+
 impl ColorsAllocator {
     /// Lay every entry out contiguously (with per-slot slack) and add a
     /// global tail headroom so early growth bump-allocates rather than
@@ -1309,6 +1531,35 @@ impl ColorsAllocator {
         }
         None
     }
+
+    /// Append a slot for a brand-new entry of `new_len` words (used by
+    /// [`SpriteRegistryResident::add_model`]). Returns `Some(off)` placed
+    /// via the free list or the bump tail, or `None` if the buffer must
+    /// grow + repack — in which case **no** slot is pushed (the caller's
+    /// repack rebuilds every slot from scratch).
+    fn push(&mut self, new_len: u32) -> Option<u32> {
+        if let Some(i) = self.free.iter().position(|&(_, c)| c >= new_len) {
+            let (off, cap) = self.free.remove(i);
+            self.slots.push(ColorSlot {
+                off,
+                cap,
+                len: new_len,
+            });
+            return Some(off);
+        }
+        let want = slot_cap(new_len);
+        if self.tail + want <= self.cap_total {
+            let off = self.tail;
+            self.tail += want;
+            self.slots.push(ColorSlot {
+                off,
+                cap: want,
+                len: new_len,
+            });
+            return Some(off);
+        }
+        None
+    }
 }
 
 /// Create a STORAGE buffer of u32s; pads empty input (wgpu rejects
@@ -1351,7 +1602,9 @@ fn storage_dst_u32_cap(device: &wgpu::Device, label: &str, data: &[u32], cap: u3
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: u64::from(cap) * 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: true,
     });
     if !data.is_empty() {
@@ -1378,12 +1631,43 @@ fn storage_dst_pod<T: Pod + Zeroable>(
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: std::mem::size_of_val(src) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: true,
     });
     buf.slice(..)
         .get_mapped_range_mut()
         .copy_from_slice(bytemuck::cast_slice(src));
+    buf.unmap();
+    buf
+}
+
+/// Create a `STORAGE | COPY_DST` Pod buffer holding `cap` records
+/// (≥ `data.len()`, ≥ 1), initialised with `data` at record 0 and the
+/// tail zeroed. The slack lets [`SpriteRegistryResident::add_model`] grow
+/// the `model_meta` table without re-growing on every add.
+fn storage_dst_pod_cap<T: Pod + Zeroable>(
+    device: &wgpu::Device,
+    label: &str,
+    data: &[T],
+    cap: u32,
+) -> wgpu::Buffer {
+    let rec = std::mem::size_of::<T>() as u64;
+    let cap = u64::from(cap.max(data.len() as u32).max(1));
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: cap * rec,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: true,
+    });
+    if !data.is_empty() {
+        buf.slice(..(data.len() as u64 * rec))
+            .get_mapped_range_mut()
+            .copy_from_slice(bytemuck::cast_slice(data));
+    }
     buf.unmap();
     buf
 }
@@ -1805,6 +2089,148 @@ mod tests {
         assert_eq!(base, 1);
         assert_eq!(res.instance_count(), 1);
         assert_eq!(res.instance_capacity, 1);
+    }
+
+    /// Read `words` u32s back from a GPU buffer (needs COPY_SRC).
+    fn read_u32(h: &crate::HeadlessGpu, buf: &wgpu::Buffer, words: u64) -> Vec<u32> {
+        let bytes = words * 4;
+        let staging = h.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = h
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, bytes);
+        h.queue.submit(std::iter::once(enc.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        h.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let out = bytemuck::cast_slice::<u8, u32>(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        out
+    }
+
+    /// A second distinct model so add_model has real new geometry to lay
+    /// down (different dims + colours from `kv6_unsorted`).
+    fn kv6_other() -> Kv6 {
+        let mk = |z, col| Voxel {
+            col,
+            z,
+            vis: 0,
+            dir: 0,
+        };
+        Kv6 {
+            xsiz: 1,
+            ysiz: 1,
+            zsiz: 4,
+            xpiv: 0.0,
+            ypiv: 0.0,
+            zpiv: 0.0,
+            voxels: vec![mk(0, 0x11), mk(2, 0x22)],
+            xlen: vec![2],
+            ylen: vec![vec![2]],
+            palette: None,
+        }
+    }
+
+    /// add_model lays the new model's volume on the GPU at the offsets its
+    /// meta record claims — verified by reading the shared buffers back
+    /// and matching each entry against its source SpriteModel.
+    #[test]
+    fn add_model_uploads_new_volume_incrementally() {
+        let Some(h) = headless() else { return };
+
+        // Residency starts with model A only.
+        let mut reg = SpriteModelRegistry::new();
+        let a = reg.add(build_sprite_model(&kv6_unsorted()));
+        let mut res = SpriteRegistryResident::upload(&h.device, &reg, &[inst(a, [0.0; 3])]);
+        assert_eq!(res.chains.len(), 1);
+        let entries_before = res.meta.len();
+
+        // Append model B (single-level) to the registry, then sync it.
+        let b = reg.add(build_sprite_model(&kv6_other()));
+        res.add_model(&h.device, &h.queue, &reg, b);
+        assert_eq!(res.chains.len(), 2);
+        assert_eq!(res.meta.len(), entries_before + 1, "one new entry");
+
+        // Read the shared buffers back and check EVERY entry's data sits
+        // where its meta record points — both the pre-existing A and the
+        // newly streamed B.
+        let occ = read_u32(&h, &res.occupancy, u64::from(res.occ_cap));
+        let coloff = read_u32(&h, &res.color_offsets, u64::from(res.coloff_cap));
+        let cols = read_u32(&h, &res.colors, u64::from(res.colors_alloc.cap_total()));
+        for (e, m) in reg.entries.iter().enumerate() {
+            let meta = res.meta[e];
+            let oo = meta.occupancy_offset as usize;
+            assert_eq!(
+                &occ[oo..oo + m.occupancy.len()],
+                &m.occupancy[..],
+                "occ entry {e}"
+            );
+            let co = meta.color_offsets_offset as usize;
+            assert_eq!(
+                &coloff[co..co + m.color_offsets.len()],
+                &m.color_offsets[..],
+                "color_offsets entry {e}"
+            );
+            let cc = meta.colors_offset as usize;
+            assert_eq!(
+                &cols[cc..cc + m.colors.len()],
+                &m.colors[..],
+                "colors entry {e}"
+            );
+        }
+
+        // And an instance of the freshly-added model can now be appended.
+        let base = res.append_instances(&h.device, &h.queue, &reg, &[inst(b, [5.0, 0.0, 0.0])]);
+        assert_eq!(base, 1);
+        assert_eq!(res.instance_count(), 2);
+    }
+
+    /// Adding many small models forces the volume buffers to grow + rebuild
+    /// at least once; every entry must still read back correctly across the
+    /// grow boundary.
+    #[test]
+    fn add_model_survives_buffer_growth() {
+        let Some(h) = headless() else { return };
+        let mut reg = SpriteModelRegistry::new();
+        let a = reg.add(build_sprite_model(&kv6_unsorted()));
+        let mut res = SpriteRegistryResident::upload(&h.device, &reg, &[inst(a, [0.0; 3])]);
+        let occ_cap0 = res.occ_cap;
+
+        // 40 adds — occupancy starts exact-sized (cap == used), so the very
+        // first add overflows and grows; later ones ride the slack.
+        for _ in 0..40 {
+            let id = reg.add(build_sprite_model(&kv6_other()));
+            res.add_model(&h.device, &h.queue, &reg, id);
+        }
+        assert_eq!(res.chains.len(), 41);
+        assert!(res.occ_cap > occ_cap0, "occupancy buffer grew");
+
+        let occ = read_u32(&h, &res.occupancy, u64::from(res.occ_cap));
+        let cols = read_u32(&h, &res.colors, u64::from(res.colors_alloc.cap_total()));
+        for (e, m) in reg.entries.iter().enumerate() {
+            let meta = res.meta[e];
+            let oo = meta.occupancy_offset as usize;
+            assert_eq!(
+                &occ[oo..oo + m.occupancy.len()],
+                &m.occupancy[..],
+                "occ entry {e}"
+            );
+            let cc = meta.colors_offset as usize;
+            assert_eq!(
+                &cols[cc..cc + m.colors.len()],
+                &m.colors[..],
+                "colors entry {e}"
+            );
+        }
     }
 
     #[test]

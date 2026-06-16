@@ -3276,6 +3276,43 @@ impl GpuRenderer {
             .and_then(|reg| reg.remove_instance(index))
     }
 
+    /// Incrementally add a new model (its full LOD chain) to the resident
+    /// sprite registry **without** re-uploading the existing models — the
+    /// counterpart to [`Self::append_sprite_instances`] for streaming in
+    /// new geometry (unique asteroids, generated meshes).
+    ///
+    /// Usage mirrors `update_sprite_model`: you own the
+    /// [`SpriteModelRegistry`](sprite_model::SpriteModelRegistry), append
+    /// the model with [`add_lod`](sprite_model::SpriteModelRegistry::add_lod)
+    /// (or `add`), then pass the returned `chain_id` here to sync that one
+    /// chain to the GPU. Afterwards [`Self::append_sprite_instances`] may
+    /// reference it.
+    ///
+    /// If no registry is resident yet, this performs the initial full
+    /// upload of `registry` (all its current models, zero instances) to
+    /// establish residency — so call it for your *first* model; only
+    /// chains appended *after* residency exists are added incrementally.
+    ///
+    /// Cost is amortised O(new model voxels): the shared volume buffers
+    /// carry slack and bump-append, growing (and rebuilding once from the
+    /// registry) only on overflow.
+    pub fn add_sprite_model(
+        &mut self,
+        registry: &sprite_model::SpriteModelRegistry,
+        chain_id: u32,
+    ) {
+        match self.sprite_registry.as_mut() {
+            Some(reg) => reg.add_model(&self.device, &self.queue, registry, chain_id),
+            None => {
+                self.sprite_registry = Some(sprite_model::SpriteRegistryResident::upload(
+                    &self.device,
+                    registry,
+                    &[],
+                ));
+            }
+        }
+    }
+
     /// Number of resident sprite instances (0 if none uploaded).
     #[must_use]
     pub fn sprite_instance_count(&self) -> usize {
