@@ -344,19 +344,18 @@ impl CarveTarget {
     }
 }
 
-/// Build the demo's animated KFA sprite: a two-bone hierarchy (a static
-/// "body" + a hinged "arm", both `coco.kv6`) carrying a baked swing
-/// curve. The curve is played back per frame by
-/// [`KfaSprite::animsprite`] — the faithful port of voxlap's animation
-/// playback — so the arm sweeps ±~88° and loops, on **both** render
-/// backends (GPU: cheap per-frame transform update; CPU: re-solve).
+/// Author the demo's character as an `.rkc` [`Character`]: a two-bone
+/// hierarchy (a static "body" + a hinged "arm", both sharing the single
+/// `coco.kv6` mesh at `mesh_id` 0) carrying a baked swing clip.
 ///
-/// Returns an empty `Vec` if the embedded KV6 fails to parse, so the
-/// demo keeps booting.
-fn build_kfa() -> Vec<KfaSprite> {
-    let Ok(kv6) = kv6_sprite::load_coco_kv6() else {
-        return Vec::new();
-    };
+/// The arm angle (the second per-frame value; the first is the ignored
+/// root bone) swings 0 → +16000 → 0 → -16000 and loops; the trailing seq
+/// entry is a `!0` jump back to entry 0 (a 2 s cycle), exercising
+/// animsprite's loop-jump path.
+///
+/// Returns `None` if the embedded KV6 fails to parse.
+fn authored_character() -> Option<Character> {
+    let kv6 = kv6_sprite::load_coco_kv6().ok()?;
     // Placed beside the static sprite, at spawn eye level.
     let root_pos = [70.0, -75.0, 50.0];
 
@@ -399,15 +398,7 @@ fn build_kfa() -> Vec<KfaSprite> {
         filler: [0; 7],
     };
 
-    // Author the whole character as an `.rkc` container, then load it the
-    // way monada will at runtime: serialize → parse → to_kfa_sprite. This
-    // dogfoods roxlap_formats::character end-to-end in the live demo. Both
-    // bones share the single coco mesh (referenced by `mesh_id` 0).
-    // Baked curve: arm angle (the second per-frame value; the first is
-    // the ignored root bone) swings 0 → +16000 → 0 → -16000 and loops.
-    // The trailing seq entry is a `!0` jump back to entry 0 (a 2 s cycle),
-    // exercising animsprite's loop-jump path.
-    let character = Character {
+    Some(Character {
         name: "coco".to_string(),
         root: root_pos,
         meshes: vec![kv6],
@@ -437,10 +428,83 @@ fn build_kfa() -> Vec<KfaSprite> {
             },
         }],
         extra_chunks: Vec::new(),
+    })
+}
+
+/// Build the demo's animated KFA sprite from an `.rkc` character, played
+/// back per frame by [`KfaSprite::animsprite`] (voxlap's animation
+/// playback) on **both** render backends (GPU: cheap per-frame transform
+/// update; CPU: re-solve), so the arm sweeps ±~88° and loops.
+///
+/// Source selection mirrors how **monada** will load a character at
+/// runtime, exercising the disk path when asked:
+/// - `ROXLAP_RKC=<path>` — load + parse that `.rkc` file instead of the
+///   built-in character. On a read/parse failure the demo logs and falls
+///   back to the authored character so it keeps booting.
+/// - `ROXLAP_RKC_DUMP=<path>` — write the authored character to `<path>`
+///   (a quick way to mint a sample `.rkc` to then load via `ROXLAP_RKC`).
+/// - `ROXLAP_KFA_DUMP=<path>` — write the **lossy** voxlap-toolchain
+///   `.kfa` export (skeleton + clip 0 + `coco.kv6` filename).
+///
+/// Returns an empty `Vec` if the embedded KV6 fails to parse, so the demo
+/// keeps booting.
+fn build_kfa() -> Vec<KfaSprite> {
+    let Some(authored) = authored_character() else {
+        return Vec::new();
     };
-    let bytes = character::serialize(&character);
-    let loaded = character::parse(&bytes).expect("round-trip authored .rkc character");
-    vec![loaded.to_kfa_sprite(Some(0))]
+
+    // Optional side exports for the toolchain / loader testing.
+    if let Some(path) = std::env::var_os("ROXLAP_RKC_DUMP") {
+        let bytes = character::serialize(&authored);
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => eprintln!("wrote {} ({} bytes)", path.to_string_lossy(), bytes.len()),
+            Err(e) => eprintln!(
+                "ROXLAP_RKC_DUMP: failed to write {}: {e}",
+                path.to_string_lossy()
+            ),
+        }
+    }
+    if let Some(path) = std::env::var_os("ROXLAP_KFA_DUMP") {
+        let bytes = roxlap_formats::kfa::serialize(&authored.to_kfa(Some(0), "coco.kv6"));
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => eprintln!("wrote {} ({} bytes)", path.to_string_lossy(), bytes.len()),
+            Err(e) => eprintln!(
+                "ROXLAP_KFA_DUMP: failed to write {}: {e}",
+                path.to_string_lossy()
+            ),
+        }
+    }
+
+    // Load from disk if asked, else round-trip the authored character
+    // through serialize/parse (dogfooding the container either way).
+    let character = match std::env::var_os("ROXLAP_RKC") {
+        Some(path) => match std::fs::read(&path).map(|b| character::parse(&b)) {
+            Ok(Ok(c)) => {
+                eprintln!("loaded character from {}", path.to_string_lossy());
+                c
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "ROXLAP_RKC: parse failed for {}: {e} — using built-in character",
+                    path.to_string_lossy()
+                );
+                authored
+            }
+            Err(e) => {
+                eprintln!(
+                    "ROXLAP_RKC: read failed for {}: {e} — using built-in character",
+                    path.to_string_lossy()
+                );
+                authored
+            }
+        },
+        None => {
+            let bytes = character::serialize(&authored);
+            character::parse(&bytes).expect("round-trip authored .rkc character")
+        }
+    };
+
+    vec![character.to_kfa_sprite(Some(0))]
 }
 
 const FAST_MULT: f64 = 4.0;
@@ -1738,6 +1802,53 @@ fn write_capture(
     let mut f = std::fs::File::create("roxlap-scene-capture.ppm")?;
     f.write_all(&bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod character_tests {
+    use super::{authored_character, build_kfa};
+    use roxlap_formats::character;
+
+    // The authored character writes to disk and reloads byte-equal — the
+    // path `ROXLAP_RKC_DUMP` then `ROXLAP_RKC` exercise.
+    #[test]
+    fn rkc_disk_round_trip() {
+        let c = authored_character().expect("coco.kv6 parses");
+        let bytes = character::serialize(&c);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("roxlap-demo-{}.rkc", std::process::id()));
+        std::fs::write(&path, &bytes).expect("write .rkc");
+        let read = std::fs::read(&path).expect("read .rkc");
+        let parsed = character::parse(&read).expect("parse .rkc from disk");
+        assert_eq!(
+            character::serialize(&parsed),
+            bytes,
+            "disk round-trip byte-equal"
+        );
+        let sprite = parsed.to_kfa_sprite(Some(0));
+        assert_eq!(sprite.limbs.len(), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // The lossy .kfa export keeps the skeleton + the selected clip.
+    #[test]
+    fn kfa_export_keeps_skeleton_and_clip() {
+        let c = authored_character().expect("coco.kv6 parses");
+        let kfa = c.to_kfa(Some(0), "coco.kv6");
+        assert_eq!(kfa.kv6_name, b"coco.kv6");
+        assert_eq!(kfa.hinges.len(), 2);
+        assert!(!kfa.frmval.is_empty());
+        // It's a valid .kfa on disk.
+        let bytes = roxlap_formats::kfa::serialize(&kfa);
+        assert!(roxlap_formats::kfa::parse(&bytes).is_ok());
+    }
+
+    // The default (no env vars) build path produces one animated sprite.
+    #[test]
+    fn build_kfa_default_builds_one_sprite() {
+        let sprites = build_kfa();
+        assert_eq!(sprites.len(), 1);
+    }
 }
 
 #[cfg(test)]

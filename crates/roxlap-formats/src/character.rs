@@ -39,7 +39,7 @@
 use core::fmt;
 
 use crate::bytes::{Cursor, OutOfBounds};
-use crate::kfa::{Hinge, KfaSprite, Point3, Seq};
+use crate::kfa::{Hinge, Kfa, KfaSprite, Point3, Seq};
 use crate::kv6::{self, Kv6};
 use crate::sprite::Sprite;
 
@@ -332,6 +332,42 @@ impl Character {
             }
         }
         k
+    }
+
+    /// Export a **lossy** voxlap-toolchain [`Kfa`] (`.kfa`): the skeleton
+    /// plus one clip, referencing a single kv6 by filename.
+    ///
+    /// voxlap's `.kfa` is fundamentally narrower than this container — it
+    /// stores the hinge skeleton and one animation, but points at just
+    /// *one* kv6 file (voxlap rigs a single mesh with a per-voxel limb
+    /// index, which roxlap deliberately doesn't model). So this export
+    /// drops, by design:
+    /// - every embedded [`Character::meshes`] mesh — only `kv6_name` (the
+    ///   filename voxlap should load) is written. Export the bone meshes
+    ///   separately via [`kv6::serialize`] if a tool needs them.
+    /// - every clip except `clip`.
+    ///
+    /// `clip` selects the [`ClipData::Skeletal`] clip whose `frmval` /
+    /// `seq` to bake in. `None`, an out-of-range index, or a
+    /// non-`Skeletal` clip yields an empty animation table (a posable rig
+    /// with no baked motion). Serialise the result with
+    /// [`kfa::serialize`](crate::kfa::serialize).
+    #[must_use]
+    pub fn to_kfa(&self, clip: Option<usize>, kv6_name: impl Into<Vec<u8>>) -> Kfa {
+        let hinges = self.bones.iter().map(|b| b.hinge).collect();
+        let (frmval, seq) = match clip.and_then(|ci| self.clips.get(ci)) {
+            Some(Clip {
+                data: ClipData::Skeletal { frmval, seq },
+                ..
+            }) => (frmval.clone(), seq.clone()),
+            _ => (Vec::new(), Vec::new()),
+        };
+        Kfa {
+            kv6_name: kv6_name.into(),
+            hinges,
+            frmval,
+            seq,
+        }
     }
 }
 
@@ -707,6 +743,42 @@ mod tests {
         let mut rest = c.to_kfa_sprite(None);
         rest.animsprite(500);
         assert_eq!(rest.kfaval[1], 0);
+    }
+
+    #[test]
+    fn to_kfa_export_is_lossy_but_valid() {
+        let c = synthetic_character();
+        let kfa = c.to_kfa(Some(0), "coco.kv6");
+        // Skeleton + the selected clip survive; the filename is set.
+        assert_eq!(kfa.kv6_name, b"coco.kv6");
+        assert_eq!(kfa.hinges.len(), 2);
+        assert_eq!(kfa.hinges[1].parent, 0);
+        if let ClipData::Skeletal { frmval, seq } = &c.clips[0].data {
+            assert_eq!(&kfa.frmval, frmval);
+            assert_eq!(&kfa.seq, seq);
+        } else {
+            panic!("clip 0 should be skeletal");
+        }
+        // The embedded meshes are dropped (lossy) — only the name remains.
+        // The result is a well-formed .kfa: serialise + re-parse round-trips.
+        let bytes = crate::kfa::serialize(&kfa);
+        let reparsed = crate::kfa::parse(&bytes).expect("export round-trips through kfa");
+        assert_eq!(reparsed.kv6_name, kfa.kv6_name);
+        assert_eq!(reparsed.frmval, kfa.frmval);
+        assert_eq!(reparsed.seq, kfa.seq);
+    }
+
+    #[test]
+    fn to_kfa_without_clip_is_posable() {
+        let c = synthetic_character();
+        // No clip / out-of-range / Unknown → empty animation table.
+        let kfa = c.to_kfa(None, b"x.kv6".to_vec());
+        assert_eq!(kfa.hinges.len(), 2);
+        assert!(kfa.frmval.is_empty());
+        assert!(kfa.seq.is_empty());
+        // Still a valid .kfa.
+        let bytes = crate::kfa::serialize(&kfa);
+        assert!(crate::kfa::parse(&bytes).is_ok());
     }
 
     #[test]
