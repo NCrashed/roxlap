@@ -16,6 +16,10 @@
 
 mod bytes;
 
+/// Rigged-character container (`.rkc`) — meshes + skeleton + clips, the
+/// on-disk form of a complete animated voxel character. Built on
+/// [`kfa`] / [`kv6`] / [`sprite`].
+pub mod character;
 pub mod edit;
 /// Voxlap's `univec[256]` surface-normal direction table + the
 /// `normal → dir` quantiser ([`equivec::nearest_dir`]). Lives here (not

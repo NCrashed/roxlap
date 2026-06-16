@@ -21,6 +21,7 @@ use std::time::Instant;
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::Engine;
+use roxlap_formats::character::{self, Bone, Character, Clip, ClipData, MeshRef};
 use roxlap_formats::kfa::{Hinge, Point3, Seq};
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
@@ -358,8 +359,6 @@ fn build_kfa() -> Vec<KfaSprite> {
     };
     // Placed beside the static sprite, at spawn eye level.
     let root_pos = [70.0, -75.0, 50.0];
-    let body = Sprite::axis_aligned(kv6.clone(), root_pos);
-    let arm = Sprite::axis_aligned(kv6, root_pos); // setlimb overwrites
 
     let zero = Point3 {
         x: 0.0,
@@ -400,21 +399,48 @@ fn build_kfa() -> Vec<KfaSprite> {
         filler: [0; 7],
     };
 
-    let mut kfa = KfaSprite::new(vec![body, arm], vec![body_hinge, arm_hinge], root_pos);
+    // Author the whole character as an `.rkc` container, then load it the
+    // way monada will at runtime: serialize → parse → to_kfa_sprite. This
+    // dogfoods roxlap_formats::character end-to-end in the live demo. Both
+    // bones share the single coco mesh (referenced by `mesh_id` 0).
     // Baked curve: arm angle (the second per-frame value; the first is
     // the ignored root bone) swings 0 → +16000 → 0 → -16000 and loops.
-    // The trailing seq entry is a `!0` jump back to entry 0 (a 2 s
-    // cycle), exercising animsprite's loop-jump path.
-    let frmval = vec![vec![0, 0], vec![0, 16000], vec![0, 0], vec![0, -16000]];
-    let seq = vec![
-        Seq { tim: 0, frm: 0 },
-        Seq { tim: 500, frm: 1 },
-        Seq { tim: 1000, frm: 2 },
-        Seq { tim: 1500, frm: 3 },
-        Seq { tim: 2000, frm: !0 },
-    ];
-    kfa.set_animation(frmval, seq);
-    vec![kfa]
+    // The trailing seq entry is a `!0` jump back to entry 0 (a 2 s cycle),
+    // exercising animsprite's loop-jump path.
+    let character = Character {
+        name: "coco".to_string(),
+        root: root_pos,
+        meshes: vec![kv6],
+        bones: vec![
+            Bone {
+                name: "body".to_string(),
+                mesh: MeshRef::Static(0),
+                hinge: body_hinge,
+            },
+            Bone {
+                name: "arm".to_string(),
+                mesh: MeshRef::Static(0),
+                hinge: arm_hinge,
+            },
+        ],
+        clips: vec![Clip {
+            name: "swing".to_string(),
+            data: ClipData::Skeletal {
+                frmval: vec![vec![0, 0], vec![0, 16000], vec![0, 0], vec![0, -16000]],
+                seq: vec![
+                    Seq { tim: 0, frm: 0 },
+                    Seq { tim: 500, frm: 1 },
+                    Seq { tim: 1000, frm: 2 },
+                    Seq { tim: 1500, frm: 3 },
+                    Seq { tim: 2000, frm: !0 },
+                ],
+            },
+        }],
+        extra_chunks: Vec::new(),
+    };
+    let bytes = character::serialize(&character);
+    let loaded = character::parse(&bytes).expect("round-trip authored .rkc character");
+    vec![loaded.to_kfa_sprite(Some(0))]
 }
 
 const FAST_MULT: f64 = 4.0;
