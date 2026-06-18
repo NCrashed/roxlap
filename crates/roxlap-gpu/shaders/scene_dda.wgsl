@@ -400,6 +400,12 @@ fn march_grid(
     );
 
     var t_enter: f32 = 0.0;
+    // Axis crossed to enter the current chunk (= the face normal of a
+    // voxel that is already solid at the chunk-entry point). Seeds
+    // `hit_axis` for the `iv==0` case so a surface flush with the chunk
+    // boundary gets its real face axis, not a hardcoded z. Defaults to z
+    // only for the first chunk (t_enter==0, ray starts inside it).
+    var entry_axis: i32 = 2;
     var out: GridHit;
     out.hit = false;
     out.t = T_INF;
@@ -451,10 +457,11 @@ fn march_grid(
             let t_delta_voxel = abs(vsize / ray_dir);
             var t_hit: f32 = t_enter;
             // Axis of the last voxel step = the hit face normal (for
-            // side-shading). Defaults to z for an iv==0 hit (camera
-            // embedded in solid — a 1-voxel edge case); surfaces hit
-            // after any travel use the real last-stepped axis.
-            var hit_axis: i32 = 2;
+            // side-shading). An iv==0 hit (solid at the chunk-entry point)
+            // takes no inner step, so seed with the chunk-entry axis — the
+            // face the ray crossed to enter this chunk. Surfaces hit after
+            // any inner travel overwrite this with the real stepped axis.
+            var hit_axis: i32 = entry_axis;
 
             for (var iv: u32 = 0u; iv < MAX_INNER_STEPS; iv = iv + 1u) {
                 if (voxel_solid_in(g, slot_id, mip, p_voxel)) {
@@ -503,14 +510,17 @@ fn march_grid(
             t_enter = t_max_chunk.x;
             p_chunk.x = p_chunk.x + step_chunk.x;
             t_max_chunk.x = t_max_chunk.x + t_delta_chunk.x;
+            entry_axis = 0;
         } else if (t_max_chunk.y < t_max_chunk.z) {
             t_enter = t_max_chunk.y;
             p_chunk.y = p_chunk.y + step_chunk.y;
             t_max_chunk.y = t_max_chunk.y + t_delta_chunk.y;
+            entry_axis = 1;
         } else {
             t_enter = t_max_chunk.z;
             p_chunk.z = p_chunk.z + step_chunk.z;
             t_max_chunk.z = t_max_chunk.z + t_delta_chunk.z;
+            entry_axis = 2;
         }
     }
     return out;
