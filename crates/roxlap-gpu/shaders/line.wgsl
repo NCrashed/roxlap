@@ -22,6 +22,10 @@ struct Params {
     // 1 = no scene depth buffer bound (sprite-only / empty scene) →
     // skip the test so the dummy 1-word buffer is never indexed.
     no_depth: u32,
+    // 1 = viewport flip on. The depth buffer is stored unflipped (the blit
+    // mirrors at read time), but our vertices carry the flipped NDC X, so
+    // the fragment must mirror its lookup back to the unflipped column.
+    flip_x: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -57,9 +61,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // `clip` is the framebuffer pixel coordinate in the fragment
         // stage (origin top-left) — matches the depth buffer's row-major
         // `gid.y * screen_w + gid.x` layout.
-        let px = u32(in.clip.x);
+        var px = u32(in.clip.x);
         let py = u32(in.clip.y);
         if (px < params.screen_w && py < params.screen_h) {
+            // Mirror back to the unflipped column the marcher wrote.
+            if (params.flip_x != 0u) {
+                px = params.screen_w - 1u - px;
+            }
             let scene_t = bitcast<f32>(depth_buf[py * params.screen_w + px]);
             if (in.depth > scene_t + params.depth_bias) {
                 discard;

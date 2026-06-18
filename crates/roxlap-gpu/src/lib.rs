@@ -188,7 +188,8 @@ struct LineVertex {
     color: [f32; 4],
 }
 
-/// `line.wgsl` fragment uniform (std140; 16 bytes).
+/// `line.wgsl` / `image.wgsl` fragment uniform (std140; padded to 32 bytes
+/// so the uniform's struct stride is a 16-byte multiple).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LineParams {
@@ -196,6 +197,11 @@ struct LineParams {
     screen_h: u32,
     depth_bias: f32,
     no_depth: u32,
+    /// 1 when the viewport flip is on. The depth buffer is written
+    /// unflipped (the blit mirrors at read time), but these passes flip the
+    /// vertex NDC X, so the fragment must mirror its depth lookup to match.
+    flip_x: u32,
+    _pad: [u32; 3],
 }
 
 /// Lazy-built debug-line pipeline (L3.2). The bind group is rebuilt each
@@ -2296,6 +2302,8 @@ impl GpuRenderer {
             screen_h: h,
             depth_bias: LINE_DEPTH_BIAS,
             no_depth,
+            flip_x: u32::from(self.flip_x),
+            _pad: [0; 3],
         };
         self.queue
             .write_buffer(&res.uniform_buf, 0, bytemuck::bytes_of(&params));
@@ -2588,6 +2596,8 @@ impl GpuRenderer {
             screen_h: h,
             depth_bias: LINE_DEPTH_BIAS,
             no_depth,
+            flip_x: u32::from(self.flip_x),
+            _pad: [0; 3],
         };
         {
             let res = self.image_resources.as_ref().expect("just built");
