@@ -467,7 +467,7 @@ fn snapshot_settings(resolution: u32, d: f64, r: f64, max_scan_dist: i32) -> Opt
         hx: half_n,
         hy: half_n,
         hz,
-        anginc: 1,
+        anginc: 1.0,
         mip_levels: 1,
         mip_scan_dist: 4,
         max_scan_dist,

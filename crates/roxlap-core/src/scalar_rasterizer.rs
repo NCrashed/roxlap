@@ -1288,7 +1288,7 @@ mod tests {
             forward: [0.0, 0.0, 1.0],
         };
         let cs = crate::camera_math::derive(&cam, 64, 64, 32.0, 32.0, 32.0);
-        let proj = crate::projection::derive_projection(&cs, 64, 64, 32.0, 32.0, 32.0, 1);
+        let proj = crate::projection::derive_projection(&cs, 64, 64, 32.0, 32.0, 32.0, 1.0);
         let rs = crate::ray_step::derive_ray_step(&cs, proj.cx, proj.cy, 32.0);
         let prelude = crate::opticast_prelude::derive_prelude(&cs, 2048, 1, 4, 1024, 1);
         (cs, proj, rs, prelude)
@@ -1309,7 +1309,7 @@ mod tests {
             xres: 64,
             y_start: 0,
             y_end: 64,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1345,7 +1345,7 @@ mod tests {
             xres: 64,
             y_start: 0,
             y_end: 64,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1454,7 +1454,7 @@ mod tests {
             xres: 64,
             y_start: 0,
             y_end: 64,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1594,7 +1594,7 @@ mod tests {
             xres: 64,
             y_start: 0,
             y_end: 64,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1654,7 +1654,7 @@ mod tests {
             xres: 64,
             y_start: 0,
             y_end: 64,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,

@@ -89,7 +89,7 @@ fn render_and_hash(vxl: &vxl::Vxl, mip_levels: u32) -> u64 {
         hx: half_w,
         hy: half_h,
         hz: half_w,
-        anginc: 1,
+        anginc: 1.0,
         mip_levels,
         mip_scan_dist: 4,
         max_scan_dist: 1024,

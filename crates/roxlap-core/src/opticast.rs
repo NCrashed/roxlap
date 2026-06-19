@@ -58,7 +58,7 @@ pub struct OpticastSettings {
     pub hx: f32,
     pub hy: f32,
     pub hz: f32,
-    pub anginc: i32,
+    pub anginc: f32,
     pub mip_levels: u32,
     pub mip_scan_dist: i32,
     pub max_scan_dist: i32,
@@ -85,7 +85,7 @@ impl OpticastSettings {
             hx: half_w,
             hy: half_h,
             hz: half_w,
-            anginc: 1,
+            anginc: 1.0,
             mip_levels: 1,
             mip_scan_dist: 4,
             max_scan_dist: 1024,
@@ -579,7 +579,7 @@ mod tests {
         assert!((s.hx - 320.0).abs() < f32::EPSILON);
         assert!((s.hy - 240.0).abs() < f32::EPSILON);
         assert!((s.hz - 320.0).abs() < f32::EPSILON);
-        assert_eq!(s.anginc, 1);
+        assert_eq!(s.anginc, 1.0);
         assert_eq!(s.mip_levels, 1);
         assert_eq!(s.max_scan_dist, 1024);
     }

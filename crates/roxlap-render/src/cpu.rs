@@ -585,9 +585,15 @@ impl CpuBackend {
         if self.zbuffer.len() < pixel_count {
             self.zbuffer.resize(pixel_count, f32::INFINITY);
         }
-        if self.pool.slot(0).uurend_half_stride < width as usize {
-            self.pool =
-                ScratchPool::new_parallel(width, height, self.max_grid_vsid, self.n_threads);
+        // anginc < 1 supersamples the angular fan (~1/anginc more rays than
+        // pixels), so the radar / angstart scratch must be sized for the
+        // inflated ray count or hrend indexes out of bounds. Clamp the
+        // oversample so the buffers stay bounded; the pool only grows.
+        let pool_xres = (width as f32 / frame.settings.anginc.clamp(0.125, 1.0)).ceil() as usize;
+        if self.pool.slot(0).uurend_half_stride < pool_xres {
+            #[allow(clippy::cast_possible_truncation)]
+            let px = pool_xres as u32;
+            self.pool = ScratchPool::new_parallel(px, height, self.max_grid_vsid, self.n_threads);
         }
 
         // Per-frame pool config (engine sky/fog → rasterizer). The

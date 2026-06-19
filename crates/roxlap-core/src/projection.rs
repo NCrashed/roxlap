@@ -89,7 +89,7 @@ pub fn derive_projection(
     hx: f32,
     hy: f32,
     hz: f32,
-    anginc: i32,
+    anginc: f32,
 ) -> ProjectionRect {
     derive_projection_with_y_range(camera_state, xres, yres, 0, yres, hx, hy, hz, anginc)
 }
@@ -132,7 +132,7 @@ pub fn derive_projection_with_y_range(
     hx: f32,
     hy: f32,
     hz: f32,
-    anginc: i32,
+    anginc: f32,
 ) -> ProjectionRect {
     // Project camera-forward onto the screen plane → centre point.
     let forward_z = camera_state.forward[2];
@@ -147,7 +147,7 @@ pub fn derive_projection_with_y_range(
     // anginc-padded viewport, with the strip's y-range substituted
     // for the full-frame `0..yres`. wx0 / wx1 are unaffected — strips
     // are full-x.
-    let anginc_f = anginc as f32;
+    let anginc_f = anginc;
     let wx0 = -anginc_f;
     let wx1 = (xres as i32 - 1) as f32 + anginc_f;
     let wy0 = (y_start as i32) as f32 - anginc_f;
@@ -308,7 +308,7 @@ mod tests {
         // gifor.z == 0 → f = 32000 unconditionally, regardless of clamp.
         // gistr.z == 0 → cx = hx. gihei.z == 1 → cy = 32000 + hy.
         let s = level_north_camera_state();
-        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1);
+        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1.0);
         assert_eq!(bit(p.cx), bit(320.0));
         assert_eq!(bit(p.cy), bit(32000.0 + 240.0));
     }
@@ -318,7 +318,7 @@ mod tests {
         // gifor.z == 1 → f = 320 (= hz/1). gistr.z == 0 → cx = 320.
         // gihei.z == 0 → cy = 240. Centre point at viewport centre.
         let s = looking_down_camera_state();
-        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1);
+        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1.0);
         assert_eq!(bit(p.cx), bit(320.0));
         assert_eq!(bit(p.cy), bit(240.0));
     }
@@ -327,7 +327,7 @@ mod tests {
     fn viewport_bounds_with_anginc() {
         // anginc = 1 padding: wx0 = -1, wx1 = 640, wy0 = -1, wy1 = 480.
         let s = looking_down_camera_state();
-        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1);
+        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1.0);
         assert_eq!(bit(p.wx0), bit(-1.0));
         assert_eq!(bit(p.wx1), bit(640.0));
         assert_eq!(bit(p.wy0), bit(-1.0));
@@ -337,7 +337,7 @@ mod tests {
         assert_eq!(p.iwy0, -1);
         assert_eq!(p.iwy1, 480);
         // anginc = 4 widens by 3 each side.
-        let q = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 4);
+        let q = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 4.0);
         assert_eq!(bit(q.wx0), bit(-4.0));
         assert_eq!(bit(q.wx1), bit(643.0));
         assert_eq!(q.iwx0, -4);
@@ -350,7 +350,7 @@ mod tests {
         // viewport; fx / fy negative (top-left below centre), gx / gy
         // positive (bottom-right above centre).
         let s = looking_down_camera_state();
-        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1);
+        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1.0);
         // wx0 = -1, cx = 320 → fx = -321.
         assert_eq!(bit(p.fx), bit(-1.0 - 320.0));
         // wy0 = -1, cy = 240 → fy = -241.
@@ -367,7 +367,7 @@ mod tests {
         // Looking-down camera: all four corner-cuts engage, each
         // moves a corner along a 45° fan from (cx, cy).
         let s = looking_down_camera_state();
-        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1);
+        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1.0);
         // Corner 0 (top-left): x0 = cx - sqrt(fx*fy) - 0.01,
         // y0 = cy - sqrt(fx*fy) - 0.01 (final bias applied).
         let s_topleft = ((-321.0_f32) * (-241.0_f32)).sqrt();
@@ -391,7 +391,7 @@ mod tests {
             forward: [0.0, 0.99999, 0.001],
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
-        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1);
+        let p = derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1.0);
         // gistr.z = 0 → cx = hx. gihei.z = 1 → cy = 32000 + hy.
         // (Even though forward.z is non-zero now, the clamp keeps f at 32000.)
         assert_eq!(bit(p.cx), bit(320.0));

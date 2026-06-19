@@ -41,7 +41,7 @@ pub struct ScanContext<'a> {
     /// One past the last sy (exclusive). Equals the framebuffer's
     /// `yres` for full-frame opticast.
     pub y_end: i32,
-    pub anginc: i32,
+    pub anginc: f32,
     /// Camera basis + frustum corners. Concrete rasterizers' real
     /// `gline` (R4.3a-rewire-3b) projects per-ray endpoints through
     /// `camera_state.right` / `down` / `corn[0]` to derive the
@@ -184,7 +184,7 @@ pub fn top_quadrant<R: Rasterizer>(
     let rs = ctx.rs;
     let forward_z_sign = ctx.prelude.forward_z_sign;
 
-    let j_count = ((p.x1 - p.x0) / ctx.anginc as f32).round_ties_even() as i32;
+    let j_count = ((p.x1 - p.x0) / ctx.anginc).round_ties_even() as i32;
     if p.fy >= 0.0 || j_count <= 0 {
         return;
     }
@@ -325,7 +325,7 @@ pub fn bottom_quadrant<R: Rasterizer>(
     let rs = ctx.rs;
     let forward_z_sign = ctx.prelude.forward_z_sign;
 
-    let j_count = ((p.x2 - p.x3) / ctx.anginc as f32).round_ties_even() as i32;
+    let j_count = ((p.x2 - p.x3) / ctx.anginc).round_ties_even() as i32;
     if p.gy <= 0.0 || j_count <= 0 {
         return;
     }
@@ -441,7 +441,7 @@ pub fn right_quadrant<R: Rasterizer>(
     let rs = ctx.rs;
     let forward_z_sign = ctx.prelude.forward_z_sign;
 
-    let j_count = ((p.y2 - p.y1) / ctx.anginc as f32).round_ties_even() as i32;
+    let j_count = ((p.y2 - p.y1) / ctx.anginc).round_ties_even() as i32;
     if p.gx <= 0.0 || j_count <= 0 {
         return;
     }
@@ -576,7 +576,7 @@ pub fn left_quadrant<R: Rasterizer>(
     let rs = ctx.rs;
     let forward_z_sign = ctx.prelude.forward_z_sign;
 
-    let j_count = ((p.y3 - p.y0) / ctx.anginc as f32).round_ties_even() as i32;
+    let j_count = ((p.y3 - p.y0) / ctx.anginc).round_ties_even() as i32;
     if p.fx >= 0.0 || j_count <= 0 {
         return;
     }
@@ -688,7 +688,7 @@ mod tests {
             forward: [0.0, 0.0, 1.0],
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
-        projection::derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1)
+        projection::derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1.0)
     }
 
     #[test]
@@ -857,7 +857,7 @@ mod tests {
             forward: [0.0, 0.0, 1.0],
         };
         let s = camera_math::derive(&cam, 640, 480, 320.0, 240.0, 320.0);
-        let proj = crate::projection::derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1);
+        let proj = crate::projection::derive_projection(&s, 640, 480, 320.0, 240.0, 320.0, 1.0);
         let rs = ray_step::derive_ray_step(&s, proj.cx, proj.cy, 320.0);
         let prelude = opticast_prelude::derive_prelude(&s, 2048, 1, 4, 1024, 1);
         (s, proj, rs, prelude)
@@ -883,7 +883,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -912,7 +912,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -940,7 +940,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -971,7 +971,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -999,7 +999,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1023,7 +1023,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1053,7 +1053,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1079,7 +1079,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1103,7 +1103,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1128,7 +1128,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1151,7 +1151,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
@@ -1188,7 +1188,7 @@ mod tests {
             xres: 640,
             y_start: 0,
             y_end: 480,
-            anginc: 1,
+            anginc: 1.0,
             camera_state: &cs,
             camera_gstartz0: 0,
             camera_gstartz1: 0,
