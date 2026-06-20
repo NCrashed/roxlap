@@ -275,9 +275,12 @@ fn single_voxel_silhouette_is_convex() {
         }
     }
 
+    // TODO(cpu-renderer): expected-red. Goes green when the grouscan
+    // thin-geometry miss is fixed; do not silence it before then.
     assert!(
         failures.is_empty(),
-        "single-voxel silhouette is not convex (CPU marcher artifact):\n  {}",
+        "TODO(cpu-renderer): single-voxel silhouette is not convex \
+         (known grouscan marcher artifact, fix pending):\n  {}",
         failures.join("\n  ")
     );
 }

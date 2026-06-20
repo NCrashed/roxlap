@@ -1049,6 +1049,30 @@ pub enum Phase {
     Done,
 }
 
+/// Unconditional upper bound on phase-machine steps per ray. Real
+/// rendering finishes in at most tens of thousands of steps: the
+/// column walk is bounded by the grid traversal (≤ ~vsid columns) and
+/// the PREC-scaled depth step (`gpz += gdz`, ~2²⁰ per column) reaches
+/// `gxmax` in a few thousand columns, ~7-10 phases each. The bound is
+/// set far above that (and above the ~1.05M-step synthetic prologue
+/// unit-test fixtures, which use a tiny non-PREC `gdz` with
+/// `gxmax=999_999`) so it never trips on legitimate work, while still
+/// converting a degenerate-cf spin from an unbounded hang into a
+/// bounded, loudly-reported bail-out (a true spin makes no forward
+/// progress, so it reaches the bound in well under a second). See
+/// [`run_phases`].
+///
+/// Such a spin is reachable when a `do_slab_split` emits a degenerate
+/// empty `[i0, i0-1]` cf entry and the deletez/afterdelete unwind
+/// pops it but decrements `c` only back to the seed (never below it),
+/// so the column never advances and `intoslabloop` re-splits the same
+/// slab forever. voxlap's goto-based unwind escapes by advancing the
+/// slab pointer; roxlap's Phase-enum port can re-enter. This cap is
+/// the backstop (no degenerate currently reaches it in-tree, but a
+/// future precision/geometry change could — see
+/// `project_single_voxel_silhouette_rootcause`).
+const MAX_PHASE_STEPS: u32 = 100_000_000;
+
 /// Drive grouscan's state machine starting at `entry`.
 ///
 /// Each phase function reads / mutates `scratch` and returns the
@@ -1065,11 +1089,36 @@ fn run_phases(state: &mut GrouscanState<'_>, entry: Phase) {
                 "  phase {step_count:4}: {current:?} c={} ce={} z0={} z1={} cx1={} cy1={} ogx={} gx={}",
                 state.c_idx, state.ce_idx, state.z0, state.z1, state.cx1, state.cy1, state.ogx, state.gx,
             );
-            step_count += 1;
             if step_count > 200 {
                 eprintln!("  (truncated)");
                 break;
             }
+        }
+        // Unconditional production safety net. Before this the only
+        // step bound was the trace-gated `> 200` break above, so a
+        // degenerate cf entry could spin the unwind forever — a true
+        // CI hang with no diagnostic. Surface it loudly and bail the
+        // ray to whatever it has drawn so far.
+        step_count += 1;
+        if step_count >= MAX_PHASE_STEPS {
+            eprintln!(
+                "grouscan: run_phases hit MAX_PHASE_STEPS ({MAX_PHASE_STEPS}) — \
+                 degenerate cf spin at {current:?} c={} ce={} z0={} z1={} \
+                 i0={} i1={} vptr={}",
+                state.c_idx,
+                state.ce_idx,
+                state.z0,
+                state.z1,
+                state.scratch.cf[state.c_idx].i0,
+                state.scratch.cf[state.c_idx].i1,
+                state.vptr_offset,
+            );
+            debug_assert!(
+                false,
+                "grouscan run_phases exceeded {MAX_PHASE_STEPS} steps \
+                 (degenerate cf spin at {current:?})"
+            );
+            break;
         }
         current = match current {
             Phase::DrawFwall => phase_draw_fwall(state),
