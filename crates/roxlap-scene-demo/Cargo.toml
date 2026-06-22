@@ -17,14 +17,14 @@ path = "src/main.rs"
 [dependencies]
 glam = { workspace = true }
 png = "0.17"
-roxlap-core = { path = "../roxlap-core", version = "0.12" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.12" }
+roxlap-core = { path = "../roxlap-core", version = "0.13" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.13" }
 # RF: unified CPU/GPU renderer facade. Owns presentation + the
 # Scene→GPU bridge + the CPU compositor; `ROXLAP_GPU=1` selects the
 # GPU backend with automatic CPU fallback. The demo no longer touches
 # roxlap-gpu or softbuffer directly.
 roxlap-render = { path = "../roxlap-render", features = ["hud"] }
-roxlap-scene = { path = "../roxlap-scene", version = "0.12" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.13" }
 winit = "0.30"
 # HUD overlay: the host runs egui itself and feeds the tessellated
 # output to `SceneRenderer::paint_egui`. egui-winit translates winit

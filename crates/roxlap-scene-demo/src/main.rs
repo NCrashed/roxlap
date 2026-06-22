@@ -25,6 +25,7 @@ use roxlap_formats::character::{self, Bone, Character, Clip, ClipData, MeshRef};
 use roxlap_formats::kfa::{Hinge, Point3, Seq};
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
+use roxlap_formats::xform::BoneXform;
 use roxlap_render::{
     FrameParams, ImageFacing, ImageId, ImageSprite, KfaSprite, Line3, RenderOptions, SceneRenderer,
     SpriteInstanceDesc, SpriteInstanceId, SpriteModelId, SpriteSet,
@@ -417,7 +418,20 @@ fn authored_character() -> Option<Character> {
         clips: vec![Clip {
             name: "swing".to_string(),
             data: ClipData::Skeletal {
-                frmval: vec![vec![0, 0], vec![0, 16000], vec![0, 0], vec![0, -16000]],
+                // Per-frame, per-bone (body, arm) Q15 hinge angles about the
+                // bones' shared z-axis, lifted to rotation-only `BoneXform`s
+                // (behaviour-preserving — `from_hinge_angle` reproduces the
+                // legacy hinge rotation exactly).
+                frmval: {
+                    let axis = [0.0, 0.0, 1.0];
+                    let frame = |a: i16, b: i16| {
+                        vec![
+                            BoneXform::from_hinge_angle(axis, a),
+                            BoneXform::from_hinge_angle(axis, b),
+                        ]
+                    };
+                    vec![frame(0, 0), frame(0, 16000), frame(0, 0), frame(0, -16000)]
+                },
                 seq: vec![
                     Seq { tim: 0, frm: 0 },
                     Seq { tim: 500, frm: 1 },

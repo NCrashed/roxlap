@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-06-22
+
+This release lands two larger threads — a full **rigged-character pipeline**
+(an on-disk `.rkc` container plus a TRS/quaternion bone rig replacing the
+legacy single-angle hinge) and an **incremental GPU sprite path** (stream
+models and instances in and out without rebuilding the resident registry) —
+alongside a horizontal scene-flip primitive, image-sprite alpha cutoff +
+picking, and a handful of render/GPU correctness fixes. One small breaking
+change: `OpticastSettings`/`ScanContext.anginc` is now `f32`.
+
+### Added
+
+- **`.rkc` rigged-character container (`roxlap-formats::character`).** The
+  on-disk form of a whole animated voxel character — `RKCH` magic, chunked
+  `META`/`MSHS`/`BONS`/`CLPS`, reusing kv6 mesh blobs and the kfa
+  `Hinge`/`Seq` layout. Forward-compat by construction: unknown top-level
+  chunks and unknown clip kinds are preserved verbatim on resave, and typed
+  `mesh_kind`/clip-kind discriminants leave room for voxel-video.
+  `to_kfa_sprite` builds a renderable `KfaSprite`. `scene-demo`'s `build_kfa`
+  authors a `Character` and round-trips it through serialize/parse,
+  dogfooding the format end to end.
+- **`.rkc` disk loader + lossy `.kfa` export.** `Character::to_kfa(clip,
+  kv6_name)` writes a voxlap-toolchain `.kfa` (skeleton + one clip + a single
+  kv6 filename), the interop writer scoped out of the format itself.
+  `scene-demo` gains a runtime source selector mirroring how a host loads
+  characters: `ROXLAP_RKC=<path>` loads + parses an `.rkc` from disk (falling
+  back to the built-in character on failure), `ROXLAP_RKC_DUMP` /
+  `ROXLAP_KFA_DUMP` write the authored character as `.rkc` or the lossy `.kfa`.
+- **TRS bone rig + quaternion math (`roxlap-formats::xform`).** A `Quat`
+  (axis-angle, normalize, rotate, `Mul`, `nlerp`, `from_euler`/`to_euler`
+  intrinsic ZYX, `from_basis` via Shepperd's method, `conjugate`) and a
+  `BoneXform { t, r, s }` local transform with `blend`,
+  `from_hinge_angle`/`hinge_angle`. `setlimb` now composes TRS (rotate the
+  velcro frame by the quaternion, offset the child anchor, scale the basis),
+  with the math split into a pure `limb_xform` helper. Round-trip tested.
+- **Incremental GPU sprite lifecycle (`roxlap-gpu`).** Stream sprites in and
+  out without the full volume + buffer rebuild of `set_sprite_instances`:
+  `append_sprite_instances`/`remove_sprite_instance`/`sprite_instance_count`
+  (amortised O(1) push + power-of-two grow / O(1) swap_remove),
+  `add_sprite_model` (amortised O(new model voxels) LOD-chain upload),
+  `remove_sprite_model` + `compact_sprite_models` (tombstone + free-list reuse
+  + buffer compaction, all without remapping caller ids), and
+  `dead_sprite_model_count` as the fragmentation signal. Device-backed tests
+  readback-verify free-list reuse, grow boundaries, and post-compaction
+  offsets.
+- **Unified incremental sprite-instance API (`SceneRenderer::{add,remove}_sprite_instance`).**
+  Both backends get a cheap add/remove path with stable `SpriteInstanceId`
+  handles (a gen-guarded slotmap absorbs the backends' swap-remove indexing).
+  The `scene-demo` gains a streamed spinner (a rotating ring of colour-sphere
+  sprites added/removed each frame) exercising the path on whichever backend
+  is active.
+- **Horizontal scene flip (`SceneRenderer::set_flip_x`).** Mirrors the scene
+  in X right before display on both backends (CPU framebuffer flip; GPU
+  `scene_blit.wgsl` X-mirror gated by a per-frame uniform flag), so a host can
+  correct a left-handed render while the egui overlay stays upright. Line and
+  image overlays mirror their NDC X and depth lookup to match.
+- **Image-sprite alpha cutoff + screen→sprite picking.** `ImageSprite::alpha_cutoff`
+  discards (does not blend) texels below the threshold on both backends, for
+  crisp pixel-art edges; `SceneRenderer::pick_image` resolves the nearest image
+  sprite under a pixel to its hit `uv`/texel (`ImagePickHit`), alpha-aware
+  (transparent texels see through) and occlusion-aware (depth-tested sprites
+  behind geometry are rejected). Geometry factored into the unit-tested
+  `ray_quad_uv`; the GPU backend keeps a CPU shadow copy of each upload.
+
+### Changed
+
+- **`OpticastSettings`/`ScanContext.anginc` is now `f32`** (was `i32`).
+  `anginc < 1` supersamples the angular ray fan (more ray planes), masking the
+  thin-geometry silhouette holes the grouscan marcher drops on isolated voxels
+  — a density knob, not a fix. `anginc = 1.0` is byte-identical to the old
+  integer `1`, so all goldens are unchanged.
+- **`.kfa` runtime poser now carries full TRS.** `KfaSprite::{kfaval, frmval}`,
+  `set_animation`, and the `.rkc` clip store (`ClipData::Skeletal::frmval`,
+  container `VERSION` 2) hold `BoneXform` instead of one Q15 hinge angle per
+  bone; `animsprite` Phase 3 blends with `BoneXform::blend` (lerp
+  translation/scale, nlerp rotation). Keyframes pose identically; in-between
+  interpolation moves from linear-angle to nlerp (exact at the midpoint for
+  same-axis rotations). The lossy `.kfa` export collapses each frame to its
+  hinge angle about the bone axis.
+
+### Fixed
+
+- **GPU streaming no longer freezes on a batch of newly-streamed chunks.**
+  `refresh_dirty` now caps per-frame chunk installs to a budget (default 4,
+  `ROXLAP_GPU_CHUNK_BUDGET`, 0 = unbounded); leftover dirty chunks ride
+  subsequent frames. Evictions stay unbounded.
+- **GPU side-shade at a chunk-boundary-flush surface.** `march_grid` now seeds
+  `hit_axis` from the face the ray crossed to enter each chunk, so a voxel
+  solid at the chunk-entry point gets its real face normal instead of the
+  hardcoded z pair (which split the surface bright/dark at the horizon).
+- **GPU depth test for mirrored lines/images.** `line.wgsl`/`image.wgsl` now
+  mirror their depth-buffer lookup back to `width-1-px` under `flip_x`, so
+  overlays depth-test against the correct column instead of the mirror
+  position.
+- **`grouscan::run_phases` degenerate-cf hang.** An unconditional
+  `MAX_PHASE_STEPS` (100M) cap converts a degenerate slab-split spin into a
+  bounded, loudly-reported bail-out instead of a silent CI hang. The bound
+  sits far above real rendering and the synthetic-prologue fixtures.
+
 ## [0.12.0] — 2026-06-16
 
 Two additive features, no breaking changes. The renderer gains a
