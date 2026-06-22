@@ -328,7 +328,23 @@ impl Character {
         let mut k = KfaSprite::new(limbs, hinges, self.root);
         if let Some(ci) = clip {
             if let ClipData::Skeletal { frmval, seq } = &self.clips[ci].data {
-                k.set_animation(frmval.clone(), seq.clone());
+                // The on-disk clip still stores one Q15 hinge angle per bone;
+                // migrate each to a rotation-only `BoneXform` about that bone's
+                // hinge axis (the runtime poser is TRS now). A later slice
+                // stores TRS directly.
+                let xforms = frmval
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(bone, &a)| {
+                                let v = self.bones[bone].hinge.v[0];
+                                crate::xform::BoneXform::from_hinge_angle([v.x, v.y, v.z], a)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                k.set_animation(xforms, seq.clone());
             }
         }
         k
@@ -737,12 +753,16 @@ mod tests {
         assert_eq!(k.p, c.root);
         // Baked clip advances the child bone away from rest.
         k.animsprite(500);
-        assert_ne!(k.kfaval[1], 0, "baked clip should move the arm bone");
+        assert_ne!(
+            k.kfaval[1],
+            crate::xform::BoneXform::IDENTITY,
+            "baked clip should move the arm bone"
+        );
 
         // Rest pose: no curve attached → animsprite is a no-op.
         let mut rest = c.to_kfa_sprite(None);
         rest.animsprite(500);
-        assert_eq!(rest.kfaval[1], 0);
+        assert_eq!(rest.kfaval[1], crate::xform::BoneXform::IDENTITY);
     }
 
     #[test]

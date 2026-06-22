@@ -146,6 +146,42 @@ impl BoneXform {
             s: [1.0, 1.0, 1.0],
         }
     }
+
+    /// Recover the legacy Q15 hinge angle about `axis` — the inverse of
+    /// [`Self::from_hinge_angle`]. Projects the rotation onto `axis`, so it's
+    /// exact for a rotation-only xform about that axis and an approximation for
+    /// a free rotation (used to bridge to the i16 storage that doesn't yet hold
+    /// translation / scale / off-axis rotation).
+    #[must_use]
+    pub fn hinge_angle(self, axis: [f32; 3]) -> i16 {
+        let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        if len < 1e-12 {
+            return 0;
+        }
+        let s = (self.r.x * axis[0] + self.r.y * axis[1] + self.r.z * axis[2]) / len;
+        let phi = 2.0 * s.atan2(self.r.w); // signed rotation about `axis`
+        let val = -phi * (65536.0 / (core::f32::consts::PI * 2.0));
+        // Wrap into i16 range the same way voxlap's `short` assignment does.
+        val.round() as i32 as i16
+    }
+
+    /// Blend toward `b` by `t ∈ [0, 1]`: lerp translation / scale, nlerp
+    /// rotation. Used to interpolate keyframes during playback.
+    #[must_use]
+    pub fn blend(self, b: BoneXform, t: f32) -> BoneXform {
+        let lerp3 = |x: [f32; 3], y: [f32; 3]| {
+            [
+                x[0] + (y[0] - x[0]) * t,
+                x[1] + (y[1] - x[1]) * t,
+                x[2] + (y[2] - x[2]) * t,
+            ]
+        };
+        BoneXform {
+            t: lerp3(self.t, b.t),
+            r: self.r.nlerp(b.r, t),
+            s: lerp3(self.s, b.s),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +224,18 @@ mod tests {
         assert!((a.nlerp(b, 0.0).w - a.w).abs() < 1e-6);
         let end = a.nlerp(b, 1.0);
         assert!((end.w - b.w).abs() < 1e-6 && (end.y - b.y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hinge_angle_inverts_from_hinge_angle() {
+        let axis = [0.0, 0.0, 1.0];
+        for val in [0i16, 1000, 16384, -16384, 30000, -30000] {
+            let got = BoneXform::from_hinge_angle(axis, val).hinge_angle(axis);
+            assert!(
+                (i32::from(got) - i32::from(val)).abs() <= 1,
+                "{val} -> {got}"
+            );
+        }
     }
 
     #[test]

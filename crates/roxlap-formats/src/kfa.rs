@@ -40,6 +40,7 @@
 use core::fmt;
 
 use crate::bytes::{Cursor, OutOfBounds};
+use crate::xform::BoneXform;
 
 const MAGIC: u32 = 0x6b6c_774b; // "Kwlk" little-endian
 const HINGE_SIZE: usize = 64;
@@ -308,9 +309,11 @@ pub struct KfaSprite {
     /// Topological sort of bone indices — populated once at
     /// construction, used by the renderer's per-frame loop.
     pub hinge_sort: Vec<usize>,
-    /// Per-bone animation value. Voxlap's `vx5.kfaval[]`. Q15
-    /// angle (full circle = 65536). Host updates per frame.
-    pub kfaval: Vec<i16>,
+    /// Per-bone resolved local transform for the current frame (translation,
+    /// quaternion rotation, scale). Generalises voxlap's `vx5.kfaval[]` (which
+    /// was a single Q15 hinge angle) to full TRS. Updated per frame by
+    /// [`Self::animsprite`], or poked directly by the host.
+    pub kfaval: Vec<BoneXform>,
     /// World-space anchor of the root limb's `hinge.p[0]`. The
     /// root limb is positioned so `hinge.p[0]` lands at this
     /// point given the world basis below.
@@ -320,11 +323,11 @@ pub struct KfaSprite {
     pub s: [f32; 3],
     pub h: [f32; 3],
     pub f: [f32; 3],
-    /// Animation keyframe table — `frmval[frame][hinge]`, Q15 angles.
-    /// Mirror of `kfatype.frmval`. Empty until [`Self::set_animation`];
-    /// an empty table makes [`Self::animsprite`] a no-op so hosts that
-    /// poke [`kfaval`](Self::kfaval) directly keep working.
-    pub frmval: Vec<Vec<i16>>,
+    /// Animation keyframe table — `frmval[frame][hinge]` local transforms.
+    /// Empty until [`Self::set_animation`]; an empty table makes
+    /// [`Self::animsprite`] a no-op so hosts that poke [`kfaval`](Self::kfaval)
+    /// directly keep working.
+    pub frmval: Vec<Vec<BoneXform>>,
     /// Animation sequence — ordered `(tim, frm)` keyframes. Mirror of
     /// `kfatype.seq`. `tim` is an absolute timestamp (ms); `frm` is a
     /// frame index into [`frmval`](Self::frmval), or `!target`
@@ -367,7 +370,7 @@ impl KfaSprite {
             limbs,
             hinges,
             hinge_sort,
-            kfaval: vec![0i16; n],
+            kfaval: vec![BoneXform::IDENTITY; n],
             p: root_pos,
             s: [1.0, 0.0, 0.0],
             h: [0.0, 1.0, 0.0],
@@ -383,7 +386,7 @@ impl KfaSprite {
     /// from a [`Kfa`]. After this, [`Self::animsprite`] drives
     /// [`kfaval`](Self::kfaval) from playback time instead of the host
     /// poking individual bones.
-    pub fn set_animation(&mut self, frmval: Vec<Vec<i16>>, seq: Vec<Seq>) {
+    pub fn set_animation(&mut self, frmval: Vec<Vec<BoneXform>>, seq: Vec<Seq>) {
         self.frmval = frmval;
         self.seq = seq;
     }
@@ -499,40 +502,28 @@ impl KfaSprite {
         // Phase 3 — per-hinge interpolation into kfaval
         // (voxlap5.c:11169-11195). Root bones (parent < 0) keep their
         // value untouched, exactly as voxlap's `continue`.
+        // `trat` / `trat2` are 16.16 fixed-point blend ratios; `/ 65536` gives
+        // the `[0, 1]` factor for the TRS blend.
         for i in (0..numhin).rev() {
             if self.hinges[i].parent < 0 {
                 continue;
             }
-            let vmin = i32::from(self.hinges[i].vmin);
-            let vmax = i32::from(self.hinges[i].vmax);
-
-            let mut frm0: i32 = if trat2 < 0 {
-                i32::from(self.frmval[z_frm as usize][i])
+            let mut x = if trat2 < 0 {
+                self.frmval[z_frm as usize][i]
             } else {
-                let mut base = i32::from(self.frmval[z0_frm as usize][i]);
+                let base = self.frmval[z0_frm as usize][i];
                 if trat2 > 0 {
-                    let target = i32::from(self.frmval[zz0_frm as usize][i]);
-                    base += interp_delta(base, target, vmin, vmax, trat2);
+                    base.blend(self.frmval[zz0_frm as usize][i], trat2 as f32 / 65536.0)
+                } else {
+                    base
                 }
-                base
             };
             if trat > 0 {
-                let target = i32::from(self.frmval[zz_frm as usize][i]);
-                frm0 += interp_delta(frm0, target, vmin, vmax, trat);
+                x = x.blend(self.frmval[zz_frm as usize][i], trat as f32 / 65536.0);
             }
-            // `vx5.kfaval[]` is `short`; the assignment truncates to the
-            // low 16 bits, which `as i16` reproduces.
-            self.kfaval[i] = frm0 as i16;
+            self.kfaval[i] = x;
         }
     }
-}
-
-/// 16.16 fixed-point signed multiply-shift — voxlap's `mulshr16`
-/// (`voxlap5.c:276`): `((i64)a * d) >> 16`, low 32 bits.
-#[inline]
-#[allow(clippy::cast_possible_truncation)]
-fn mulshr16(a: i32, d: i32) -> i32 {
-    ((i64::from(a) * i64::from(d)) >> 16) as i32
 }
 
 /// 16.16 fixed-point signed shift-divide — voxlap's `shldiv16`
@@ -565,23 +556,6 @@ fn kfatime2seq(seq: &[Seq], tim: i32) -> usize {
         }
     }
     a as usize
-}
-
-/// One keyframe-pair angular interpolation step — the shared body of
-/// voxlap's two interp blocks in `animsprite`. Returns the delta to add
-/// to `from` to step `trat`/65536 of the way toward `to`, choosing the
-/// winding direction the way voxlap does: shortest path for a free
-/// hinge (`vmin == vmax`), else winding consistent with `vmin`.
-#[inline]
-fn interp_delta(from: i32, to: i32, vmin: i32, vmax: i32, trat: i32) -> i32 {
-    let mut x = (to - from) & 65535;
-    if vmin == vmax {
-        // Sign-extend the 16-bit delta → shortest angular path.
-        x = (x << 16) >> 16;
-    } else if ((to - vmin) & 65535) < ((from - vmin) & 65535) {
-        x -= 65536;
-    }
-    mulshr16(x, trat)
 }
 
 /// Build the hinge-sort order — voxlap's `kfasorthinge`
@@ -861,10 +835,24 @@ mod tests {
                 filler: [0; 7],
             },
         ];
+        // Tests author keyframes as Q15 angles; migrate them to rotation-only
+        // BoneXforms about each bone's hinge axis (the runtime model is TRS).
+        let frmval: Vec<Vec<BoneXform>> = frmval
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .map(|(b, &a)| {
+                        let v = hinges[b].v[0];
+                        BoneXform::from_hinge_angle([v.x, v.y, v.z], a)
+                    })
+                    .collect()
+            })
+            .collect();
         KfaSprite {
             limbs: Vec::new(),
             hinge_sort: sort_hinges(&hinges),
-            kfaval: vec![0i16; hinges.len()],
+            kfaval: vec![BoneXform::IDENTITY; hinges.len()],
             hinges,
             p: [0.0; 3],
             s: [1.0, 0.0, 0.0],
@@ -875,6 +863,12 @@ mod tests {
             kfatim: 0,
             okfatim: 0,
         }
+    }
+
+    /// Recover bone `i`'s Q15 hinge angle about the test axis (`+x`) from its
+    /// resolved `kfaval` — the inverse of how the helper builds keyframes.
+    fn angle_of(kfa: &KfaSprite, i: usize) -> i16 {
+        kfa.kfaval[i].hinge_angle([1.0, 0.0, 0.0])
     }
 
     /// Half-way through a single 0→16384 segment a free hinge sits at
@@ -890,8 +884,13 @@ mod tests {
         );
         kfa.animsprite(500);
         assert_eq!(kfa.kfatim, 500, "time cursor advanced by ti");
-        assert_eq!(kfa.kfaval[0], 0, "root bone untouched");
-        assert_eq!(kfa.kfaval[1], 8192, "child at segment midpoint");
+        assert_eq!(angle_of(&kfa, 0), 0, "root bone untouched");
+        // nlerp at t=0.5 of two same-axis rotations is exact, so the midpoint
+        // is still 8192 (45°).
+        assert!(
+            (i32::from(angle_of(&kfa, 1)) - 8192).abs() <= 2,
+            "child at midpoint"
+        );
     }
 
     /// A free hinge interpolating 30000 → -30000 takes the *short* way
@@ -906,8 +905,12 @@ mod tests {
             vec![Seq { tim: 0, frm: 0 }, Seq { tim: 1000, frm: 1 }],
         );
         kfa.animsprite(500);
-        // 30000 + (5536 short-path delta)/2 = 32768 ≡ -32768 as i16.
-        assert_eq!(kfa.kfaval[1], -32768);
+        // nlerp takes the short arc (the quaternions are flipped to the same
+        // hemisphere), so the midpoint lands at the ±180° wrap, not near 0.
+        assert!(
+            i32::from(angle_of(&kfa, 1)).abs() >= 32000,
+            "midpoint at the wrap"
+        );
     }
 
     /// `seq[].frm < 0` is a `!target` jump: advancing time past the
@@ -936,9 +939,9 @@ mod tests {
     #[test]
     fn animsprite_no_curve_is_noop() {
         let mut kfa = anim_sprite(0, 0, Vec::new(), Vec::new());
-        kfa.kfaval[1] = 1234;
+        kfa.kfaval[1] = BoneXform::from_hinge_angle([1.0, 0.0, 0.0], 1234);
         kfa.animsprite(500);
-        assert_eq!(kfa.kfaval[1], 1234);
+        assert_eq!(angle_of(&kfa, 1), 1234);
         assert_eq!(kfa.kfatim, 0);
     }
 

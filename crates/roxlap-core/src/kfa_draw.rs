@@ -254,13 +254,12 @@ pub fn solve_kfa_limbs(kfa: &mut KfaSprite) {
         let j = kfa.hinge_sort[k];
         let parent = kfa.hinges[j].parent;
         if parent >= 0 {
-            // Child bone: derive transform from parent. Build the bone's local
-            // TRS — currently a rotation-only hinge from the Q15 `kfaval` angle
-            // about `hinge.v[0]` (the legacy 1-DOF case); a non-zero `htype`
-            // means "no rotation", matching voxlap.
+            // Child bone: derive transform from parent using the bone's
+            // resolved local TRS (`kfaval`). A non-zero `htype` means "no
+            // rotation/transform", matching voxlap.
             let htype = kfa.hinges[j].htype;
             let xform = if htype == 0 {
-                BoneXform::from_hinge_angle(pt(kfa.hinges[j].v[0]), kfa.kfaval[j])
+                kfa.kfaval[j]
             } else {
                 BoneXform::IDENTITY
             };

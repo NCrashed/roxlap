@@ -698,7 +698,10 @@ impl App {
             // 4-second period.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let spin = (self.spawn_time.elapsed().as_secs_f32() * 16384.0) as i32;
-            self.kfa_demo.kfaval[1] = (spin & 0xffff) as i16;
+            let spin_angle = (spin & 0xffff) as i16;
+            let ax = self.kfa_demo.hinges[1].v[0];
+            self.kfa_demo.kfaval[1] =
+                roxlap_formats::xform::BoneXform::from_hinge_angle([ax.x, ax.y, ax.z], spin_angle);
             let kfa_written = draw_kfa_sprite(
                 &mut target,
                 &cam_state,
@@ -708,11 +711,11 @@ impl App {
             );
             if debug {
                 eprintln!(
-                    "kfa_demo: pos=({:.1}, {:.1}, {:.1}) kfaval[1]={} → wrote {} pixels",
+                    "kfa_demo: pos=({:.1}, {:.1}, {:.1}) spin={} → wrote {} pixels",
                     self.kfa_demo.p[0],
                     self.kfa_demo.p[1],
                     self.kfa_demo.p[2],
-                    self.kfa_demo.kfaval[1],
+                    spin_angle,
                     kfa_written
                 );
             }
