@@ -99,6 +99,61 @@ impl Quat {
         .normalize()
     }
 
+    /// The conjugate `(-x, -y, -z, w)` — the inverse for a unit quaternion.
+    #[must_use]
+    pub fn conjugate(self) -> Quat {
+        Quat {
+            x: -self.x,
+            y: -self.y,
+            z: -self.z,
+            w: self.w,
+        }
+    }
+
+    /// Build a rotation from an orthonormal basis whose columns are the world
+    /// directions of local +x (`s`), +y (`h`), +z (`f`) — i.e. the matrix
+    /// `[s | h | f]`. Shepperd's method; the result is normalized. Used to read
+    /// a bone's world orientation (its `Sprite` basis) back as a quaternion.
+    #[must_use]
+    pub fn from_basis(s: [f32; 3], h: [f32; 3], f: [f32; 3]) -> Quat {
+        let (m00, m11, m22) = (s[0], h[1], f[2]);
+        let trace = m00 + m11 + m22;
+        let q = if trace > 0.0 {
+            let d = (trace + 1.0).sqrt() * 2.0; // d = 4w
+            Quat {
+                w: 0.25 * d,
+                x: (h[2] - f[1]) / d,
+                y: (f[0] - s[2]) / d,
+                z: (s[1] - h[0]) / d,
+            }
+        } else if m00 > m11 && m00 > m22 {
+            let d = (1.0 + m00 - m11 - m22).sqrt() * 2.0; // d = 4x
+            Quat {
+                w: (h[2] - f[1]) / d,
+                x: 0.25 * d,
+                y: (h[0] + s[1]) / d,
+                z: (f[0] + s[2]) / d,
+            }
+        } else if m11 > m22 {
+            let d = (1.0 + m11 - m00 - m22).sqrt() * 2.0; // d = 4y
+            Quat {
+                w: (f[0] - s[2]) / d,
+                x: (h[0] + s[1]) / d,
+                y: 0.25 * d,
+                z: (f[1] + h[2]) / d,
+            }
+        } else {
+            let d = (1.0 + m22 - m00 - m11).sqrt() * 2.0; // d = 4z
+            Quat {
+                w: (s[1] - h[0]) / d,
+                x: (f[0] + s[2]) / d,
+                y: (f[1] + h[2]) / d,
+                z: 0.25 * d,
+            }
+        };
+        q.normalize()
+    }
+
     /// Build a rotation from intrinsic ZYX Euler angles (radians): roll about
     /// X, then pitch about Y, then yaw about Z (`R = Rz·Ry·Rx`). The inverse of
     /// [`Self::to_euler`]. For free 3-DOF authoring from three numeric fields.
@@ -274,6 +329,27 @@ mod tests {
         // from_euler about a single axis matches a plain axis-angle.
         let qz = Quat::from_euler(0.0, 0.0, core::f32::consts::FRAC_PI_2);
         assert!(approx(qz.rotate([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn from_basis_recovers_the_rotation() {
+        // Build a basis by rotating the world axes, then recover the quaternion.
+        let q = Quat::from_axis_angle([0.3, 0.5, 0.8], 1.2);
+        let s = q.rotate([1.0, 0.0, 0.0]);
+        let h = q.rotate([0.0, 1.0, 0.0]);
+        let f = q.rotate([0.0, 0.0, 1.0]);
+        let got = Quat::from_basis(s, h, f);
+        // Same rotation (quaternion double-cover: q and -q are equal rotations),
+        // so compare by action on a test vector.
+        let v = [0.2, -0.9, 0.4];
+        assert!(approx(got.rotate(v), q.rotate(v)));
+    }
+
+    #[test]
+    fn conjugate_inverts() {
+        let q = Quat::from_axis_angle([0.0, 1.0, 0.0], 0.9);
+        let id = q * q.conjugate();
+        assert!(approx(id.rotate([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]));
     }
 
     #[test]
