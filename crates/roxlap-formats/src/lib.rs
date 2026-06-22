@@ -32,5 +32,6 @@ pub mod kvx;
 pub mod palette;
 pub mod sprite;
 pub mod vxl;
+pub mod xform;
 
 pub use palette::Rgb6;
