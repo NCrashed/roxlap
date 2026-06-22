@@ -98,6 +98,30 @@ impl Quat {
         }
         .normalize()
     }
+
+    /// Build a rotation from intrinsic ZYX Euler angles (radians): roll about
+    /// X, then pitch about Y, then yaw about Z (`R = Rz·Ry·Rx`). The inverse of
+    /// [`Self::to_euler`]. For free 3-DOF authoring from three numeric fields.
+    #[must_use]
+    pub fn from_euler(roll_x: f32, pitch_y: f32, yaw_z: f32) -> Quat {
+        Quat::from_axis_angle([0.0, 0.0, 1.0], yaw_z)
+            * Quat::from_axis_angle([0.0, 1.0, 0.0], pitch_y)
+            * Quat::from_axis_angle([1.0, 0.0, 0.0], roll_x)
+    }
+
+    /// Decompose to intrinsic ZYX Euler angles `[roll_x, pitch_y, yaw_z]`
+    /// (radians) — the inverse of [`Self::from_euler`]. At a pitch of ±90° the
+    /// X/Z split is ambiguous (gimbal lock); the result still rebuilds the same
+    /// rotation.
+    #[must_use]
+    pub fn to_euler(self) -> [f32; 3] {
+        let Quat { x, y, z, w } = self;
+        let roll = (2.0 * (w * x + y * z)).atan2(1.0 - 2.0 * (x * x + y * y));
+        let sin_pitch = (2.0 * (w * y - z * x)).clamp(-1.0, 1.0);
+        let pitch = sin_pitch.asin();
+        let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
+        [roll, pitch, yaw]
+    }
 }
 
 /// Hamilton product `self * rhs` (apply `rhs` first, then `self`).
@@ -236,6 +260,20 @@ mod tests {
                 "{val} -> {got}"
             );
         }
+    }
+
+    #[test]
+    fn euler_round_trips_away_from_gimbal_lock() {
+        // A generic orientation (pitch well clear of ±90°) round-trips.
+        let e = [0.3_f32, -0.7, 1.1];
+        let got = Quat::from_euler(e[0], e[1], e[2]).to_euler();
+        assert!(
+            (0..3).all(|i| (got[i] - e[i]).abs() < 1e-4),
+            "{got:?} vs {e:?}"
+        );
+        // from_euler about a single axis matches a plain axis-angle.
+        let qz = Quat::from_euler(0.0, 0.0, core::f32::consts::FRAC_PI_2);
+        assert!(approx(qz.rotate([1.0, 0.0, 0.0]), [0.0, 1.0, 0.0]));
     }
 
     #[test]
