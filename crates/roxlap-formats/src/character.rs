@@ -42,9 +42,12 @@ use crate::bytes::{Cursor, OutOfBounds};
 use crate::kfa::{Hinge, Kfa, KfaSprite, Point3, Seq};
 use crate::kv6::{self, Kv6};
 use crate::sprite::Sprite;
+use crate::xform::{BoneXform, Quat};
 
 const MAGIC: [u8; 4] = *b"RKCH";
-const VERSION: u16 = 1;
+// v2: skeletal clips store a per-bone `BoneXform` (TRS) instead of a single
+// Q15 hinge angle. v1 files (i16 frmval) are rejected — regenerate them.
+const VERSION: u16 = 2;
 
 const TAG_META: [u8; 4] = *b"META";
 const TAG_MSHS: [u8; 4] = *b"MSHS";
@@ -121,12 +124,12 @@ pub struct Clip {
 /// A clip's payload, discriminated by the on-disk `kind`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClipData {
-    /// `kind 0` — the `frmval` + `seq` pair, byte-identical to
-    /// [`Kfa::frmval`](crate::kfa::Kfa::frmval) /
-    /// [`Kfa::seq`](crate::kfa::Kfa::seq). `frmval[frame][bone]`, Q15
-    /// angles; the inner length equals [`Character::bones`]`.len()`.
+    /// `kind 0` — the `frmval` + `seq` pair. `frmval[frame][bone]` is the
+    /// bone's local [`BoneXform`] (translation, quaternion rotation, scale);
+    /// the inner length equals [`Character::bones`]`.len()`. `seq` matches
+    /// [`Kfa::seq`](crate::kfa::Kfa::seq).
     Skeletal {
-        frmval: Vec<Vec<i16>>,
+        frmval: Vec<Vec<BoneXform>>,
         seq: Vec<Seq>,
     },
     /// A clip `kind` this build doesn't model — preserved verbatim so it
@@ -328,23 +331,9 @@ impl Character {
         let mut k = KfaSprite::new(limbs, hinges, self.root);
         if let Some(ci) = clip {
             if let ClipData::Skeletal { frmval, seq } = &self.clips[ci].data {
-                // The on-disk clip still stores one Q15 hinge angle per bone;
-                // migrate each to a rotation-only `BoneXform` about that bone's
-                // hinge axis (the runtime poser is TRS now). A later slice
-                // stores TRS directly.
-                let xforms = frmval
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .enumerate()
-                            .map(|(bone, &a)| {
-                                let v = self.bones[bone].hinge.v[0];
-                                crate::xform::BoneXform::from_hinge_angle([v.x, v.y, v.z], a)
-                            })
-                            .collect()
-                    })
-                    .collect();
-                k.set_animation(xforms, seq.clone());
+                // Clip frames are already per-bone TRS — hand them straight to
+                // the poser.
+                k.set_animation(frmval.clone(), seq.clone());
             }
         }
         k
@@ -371,11 +360,28 @@ impl Character {
     #[must_use]
     pub fn to_kfa(&self, clip: Option<usize>, kv6_name: impl Into<Vec<u8>>) -> Kfa {
         let hinges = self.bones.iter().map(|b| b.hinge).collect();
+        // The `.kfa` file stores one Q15 angle per bone; collapse each TRS to
+        // its rotation about the bone's hinge axis (translation / scale /
+        // off-axis rotation are dropped — this export is documented as lossy).
         let (frmval, seq) = match clip.and_then(|ci| self.clips.get(ci)) {
             Some(Clip {
                 data: ClipData::Skeletal { frmval, seq },
                 ..
-            }) => (frmval.clone(), seq.clone()),
+            }) => {
+                let angles = frmval
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(bone, x)| {
+                                let v = self.bones[bone].hinge.v[0];
+                                x.hinge_angle([v.x, v.y, v.z])
+                            })
+                            .collect()
+                    })
+                    .collect();
+                (angles, seq.clone())
+            }
             _ => (Vec::new(), Vec::new()),
         };
         Kfa {
@@ -462,7 +468,7 @@ fn parse_skeletal(body: &[u8], numbone: usize) -> Result<ClipData, ParseError> {
     for _ in 0..numfrm {
         let mut row = Vec::with_capacity(numhin);
         for _ in 0..numhin {
-            row.push(cur.read_i16()?);
+            row.push(read_bonexform(&mut cur)?);
         }
         frmval.push(row);
     }
@@ -505,6 +511,28 @@ fn read_point3(cur: &mut Cursor<'_>) -> Result<Point3, OutOfBounds> {
         y: cur.read_f32()?,
         z: cur.read_f32()?,
     })
+}
+
+/// One per-bone keyframe transform: translation (3), rotation quaternion
+/// (x, y, z, w), scale (3) — ten little-endian `f32`s, 40 bytes.
+fn read_bonexform(cur: &mut Cursor<'_>) -> Result<BoneXform, OutOfBounds> {
+    let t = [cur.read_f32()?, cur.read_f32()?, cur.read_f32()?];
+    let r = Quat {
+        x: cur.read_f32()?,
+        y: cur.read_f32()?,
+        z: cur.read_f32()?,
+        w: cur.read_f32()?,
+    };
+    let s = [cur.read_f32()?, cur.read_f32()?, cur.read_f32()?];
+    Ok(BoneXform { t, r, s })
+}
+
+fn write_bonexform(out: &mut Vec<u8>, x: &BoneXform) {
+    for v in [
+        x.t[0], x.t[1], x.t[2], x.r.x, x.r.y, x.r.z, x.r.w, x.s[0], x.s[1], x.s[2],
+    ] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
 }
 
 // --- chunk payload writers ----------------------------------------------
@@ -594,7 +622,7 @@ fn write_chunk_body(out: &mut Vec<u8>, body: impl FnOnce(&mut Vec<u8>)) {
     out[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
 }
 
-fn write_skeletal(out: &mut Vec<u8>, frmval: &[Vec<i16>], seq: &[Seq]) {
+fn write_skeletal(out: &mut Vec<u8>, frmval: &[Vec<BoneXform>], seq: &[Seq]) {
     let numhin = frmval.first().map_or(0, Vec::len);
     for (i, row) in frmval.iter().enumerate() {
         assert!(
@@ -609,7 +637,7 @@ fn write_skeletal(out: &mut Vec<u8>, frmval: &[Vec<i16>], seq: &[Seq]) {
     out.extend_from_slice(&numhin_u32.to_le_bytes());
     for row in frmval {
         for v in row {
-            out.extend_from_slice(&v.to_le_bytes());
+            write_bonexform(out, v);
         }
     }
     let seqcount = u32::try_from(seq.len()).expect("seqcount must fit in u32");
@@ -711,8 +739,19 @@ mod tests {
             ],
             clips: vec![Clip {
                 name: "wave".to_string(),
+                // Bones rotate about +z; build rotation-only TRS frames from
+                // the wave's Q15 angles.
                 data: ClipData::Skeletal {
-                    frmval: vec![vec![0, 0], vec![0, 16000], vec![0, 0], vec![0, -16000]],
+                    frmval: [[0i16, 0], [0, 16000], [0, 0], [0, -16000]]
+                        .iter()
+                        .map(|[r, a]| {
+                            let z = [0.0, 0.0, 1.0];
+                            vec![
+                                BoneXform::from_hinge_angle(z, *r),
+                                BoneXform::from_hinge_angle(z, *a),
+                            ]
+                        })
+                        .collect(),
                     seq: vec![
                         Seq { tim: 0, frm: 0 },
                         Seq { tim: 500, frm: 1 },
@@ -774,7 +813,14 @@ mod tests {
         assert_eq!(kfa.hinges.len(), 2);
         assert_eq!(kfa.hinges[1].parent, 0);
         if let ClipData::Skeletal { frmval, seq } = &c.clips[0].data {
-            assert_eq!(&kfa.frmval, frmval);
+            // The .kfa export collapses each TRS to its hinge angle about +z;
+            // assert it recovers the angles the frames were built from.
+            let z = [0.0, 0.0, 1.0];
+            let expected: Vec<Vec<i16>> = frmval
+                .iter()
+                .map(|row| row.iter().map(|x| x.hinge_angle(z)).collect())
+                .collect();
+            assert_eq!(kfa.frmval, expected);
             assert_eq!(&kfa.seq, seq);
         } else {
             panic!("clip 0 should be skeletal");
