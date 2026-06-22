@@ -103,9 +103,7 @@ fn render_voxel(
     let mut pool = ScratchPool::new(XRES, YRES, vxl.vsid);
 
     let sky = engine.sky_color();
-    for px in framebuffer.iter_mut() {
-        *px = sky;
-    }
+    framebuffer.fill(sky);
     pool.set_skycast(i32::from_ne_bytes(sky.to_ne_bytes()), 0);
     pool.set_fog(
         i32::from_ne_bytes(engine.fog_color().to_ne_bytes()),

@@ -838,11 +838,11 @@ mod tests {
         // Tests author keyframes as Q15 angles; migrate them to rotation-only
         // BoneXforms about each bone's hinge axis (the runtime model is TRS).
         let frmval: Vec<Vec<BoneXform>> = frmval
-            .iter()
+            .into_iter()
             .map(|row| {
-                row.iter()
+                row.into_iter()
                     .enumerate()
-                    .map(|(b, &a)| {
+                    .map(|(b, a)| {
                         let v = hinges[b].v[0];
                         BoneXform::from_hinge_angle([v.x, v.y, v.z], a)
                     })
