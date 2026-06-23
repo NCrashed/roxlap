@@ -8,15 +8,15 @@
 //! mip beams, cross-chunk virtual-column complexity). See
 //! `PORTING-DDA.md` for the full stage plan.
 //!
-//! **Stage status — DDA.2 (sky + camera poses).** Each pixel casts one
-//! ray and walks unit voxels of the active chunk via a 3D-DDA
-//! (Amanatides–Woo), sampling [`GridView::voxel_color`] until the first
-//! textured cell. Misses leave the destination untouched, so the
-//! caller's sky pre-fill shows through (the scene composed path
-//! pre-fills `sky_color` + `INFINITY`). A camera inside solid material
-//! hits its own voxel immediately (no skip). Flat voxel colour, no
-//! brickmap, no cross-chunk step, no shading/fog yet (DDA.3 / DDA.4 /
-//! DDA.5 — fog + textured sky land with shading in DDA.5).
+//! **Stage status — DDA.3 (brickmap empty-space skip).** Each pixel
+//! casts one ray and walks unit voxels of the active chunk via a 3D-DDA
+//! (Amanatides–Woo), resolving solidity + colour via
+//! [`GridView::surface_color`]. A per-frame [`BrickMap`] (one bit per
+//! `BRICK³` block) gates the per-voxel slab walk so open air is crossed
+//! with cheap integer stepping only — bit-identical to the dense walk.
+//! Misses leave the destination untouched, so the caller's sky pre-fill
+//! shows through. Single chunk only; no cross-chunk step, no
+//! shading/fog yet (DDA.4 / DDA.5 — fog + textured sky land in DDA.5).
 //!
 //! Buffer conventions match the rest of the engine so this backend is
 //! a drop-in for `opticast`: colour is packed `0x80RRGGBB`; depth is
@@ -151,60 +151,89 @@ fn intersect_aabb(o: [f32; 3], dir: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> Opt
     Some((t0, t1))
 }
 
-/// Cast one ray into the grid and return the first solid hit.
+/// Brick edge length in voxels — one occupancy bit per `BRICK³` block.
+const BRICK: i32 = 8;
+
+/// Per-chunk brick occupancy map for two-level DDA empty-space skip
+/// (Substage DDA.3).
 ///
-/// **DDA.1:** single-chunk dense 3D-DDA (Amanatides–Woo "A Fast Voxel
-/// Traversal Algorithm", 1987) over the active chunk's `[0, vsid) ×
-/// [0, vsid) × [0, CHUNK_SIZE_Z)` voxel box. Walks unit voxels along
-/// the ray, sampling [`GridView::voxel_color`] at each; the first
-/// textured cell is the hit. No brickmap (DDA.3), no cross-chunk step
-/// (DDA.4), no shading (DDA.5) yet — flat voxel colour.
+/// One bit per `BRICK³` block of the active chunk, set iff any voxel in
+/// the block is solid. The ray steps the coarse brick grid (8× longer
+/// strides) and only descends into a per-voxel walk inside occupied
+/// bricks, so a ray through open air crosses ~`length / 8` empty bricks
+/// instead of `length` air voxels — each of which would otherwise walk
+/// the column slab chain via `surface_color`.
 ///
-/// `forward` is the camera forward axis; the returned [`Hit::dist`] is
-/// the hit's perpendicular (forward-projected) distance, matching the
-/// engine's z-buffer convention (smaller = closer).
-fn cast_ray(
+/// Built per frame from a [`GridView`] in [`render_dda`]. A persistent
+/// per-chunk cache with edit-driven invalidation (locked decision #2 in
+/// `PORTING-DDA.md`) is a later perf refinement.
+pub(crate) struct BrickMap {
+    /// Brick counts along x / y / z.
+    nb: [i32; 3],
+    /// Occupancy bitset; brick `(bx, by, bz)` is bit
+    /// `(bz * nb[1] + by) * nb[0] + bx`.
+    bits: Vec<u64>,
+}
+
+impl BrickMap {
+    /// Scan every column of `grid` once, marking the brick of each
+    /// solid run. `O(vsid² · slabs)` — amortised across all pixels of
+    /// the frame.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    fn build(grid: &GridView<'_>) -> Self {
+        let vsid = grid.vsid as i32;
+        let nb = [
+            (vsid + BRICK - 1) / BRICK,
+            (vsid + BRICK - 1) / BRICK,
+            (crate::grid_view::CHUNK_SIZE_Z as i32 + BRICK - 1) / BRICK,
+        ];
+        let count = (nb[0] * nb[1] * nb[2]) as usize;
+        let mut bits = vec![0u64; count.div_ceil(64)];
+        for y in 0..vsid {
+            for x in 0..vsid {
+                let (bx, by) = (x / BRICK, y / BRICK);
+                grid.for_each_run(x as u32, y as u32, |top, bot| {
+                    let bz0 = top / BRICK;
+                    let bz1 = (bot - 1) / BRICK;
+                    for bz in bz0..=bz1 {
+                        let idx = ((bz * nb[1] + by) * nb[0] + bx) as usize;
+                        bits[idx / 64] |= 1u64 << (idx % 64);
+                    }
+                });
+            }
+        }
+        Self { nb, bits }
+    }
+
+    /// Whether brick `b` is in range and holds any solid voxel.
+    #[inline]
+    #[allow(clippy::cast_sign_loss)]
+    fn occupied(&self, b: [i32; 3]) -> bool {
+        if b[0] < 0
+            || b[0] >= self.nb[0]
+            || b[1] < 0
+            || b[1] >= self.nb[1]
+            || b[2] < 0
+            || b[2] >= self.nb[2]
+        {
+            return false;
+        }
+        let idx = ((b[2] * self.nb[1] + b[1]) * self.nb[0] + b[0]) as usize;
+        (self.bits[idx / 64] >> (idx % 64)) & 1 != 0
+    }
+}
+
+/// Per-axis 3D-DDA stepping state for a cell size of `cell` voxels.
+/// `t_max[a]` is the ray parameter at which the next `a`-boundary is
+/// crossed; `t_delta[a]` is the parameter increment per cell. An
+/// axis-parallel component gets `t_max = t_delta = +inf` so it's never
+/// chosen as the stepping axis.
+fn dda_setup(
     origin: [f32; 3],
     dir: [f32; 3],
-    forward: [f32; 3],
-    grid: &GridView<'_>,
-    settings: &OpticastSettings,
-) -> Option<Hit> {
-    // u32 → f32 / i32 are exact for realistic chunk dimensions.
-    #[allow(clippy::cast_precision_loss)]
-    let nx = grid.vsid as f32;
-    #[allow(clippy::cast_precision_loss)]
-    let nz = f32::from(u16::try_from(crate::grid_view::CHUNK_SIZE_Z).unwrap_or(256));
-    let n = [nx, nx, nz];
-    let n_i = [
-        grid.vsid as i32,
-        grid.vsid as i32,
-        crate::grid_view::CHUNK_SIZE_Z as i32,
-    ];
-
-    let (t_enter, t_exit) = intersect_aabb(origin, dir, [0.0; 3], n)?;
-
-    // Entry point, nudged a hair past the face so floor() lands inside
-    // the first cell rather than on the boundary.
-    let eps = (t_exit - t_enter) * 1e-4 + 1e-4;
-    let p = [
-        origin[0] + dir[0] * (t_enter + eps),
-        origin[1] + dir[1] * (t_enter + eps),
-        origin[2] + dir[2] * (t_enter + eps),
-    ];
-
-    // Current voxel, clamped into range against floating-point slop on
-    // the entry face.
-    #[allow(clippy::cast_possible_truncation)]
-    let mut voxel = [
-        (p[0].floor() as i32).clamp(0, n_i[0] - 1),
-        (p[1].floor() as i32).clamp(0, n_i[1] - 1),
-        (p[2].floor() as i32).clamp(0, n_i[2] - 1),
-    ];
-
-    // Per-axis step direction, the t to the first crossing, and the t
-    // increment per voxel. Axis-parallel rays get `t_max = +inf` so
-    // they're never chosen as the stepping axis.
+    cell: [i32; 3],
+    cell_size: f32,
+) -> ([i32; 3], [f32; 3], [f32; 3]) {
     let mut step = [0i32; 3];
     let mut t_max = [f32::INFINITY; 3];
     let mut t_delta = [f32::INFINITY; 3];
@@ -212,62 +241,161 @@ fn cast_ray(
         if dir[a] > 1e-9 {
             step[a] = 1;
             #[allow(clippy::cast_precision_loss)]
-            let boundary = (voxel[a] + 1) as f32;
+            let boundary = (cell[a] + 1) as f32 * cell_size;
             t_max[a] = (boundary - origin[a]) / dir[a];
-            t_delta[a] = 1.0 / dir[a];
+            t_delta[a] = cell_size / dir[a];
         } else if dir[a] < -1e-9 {
             step[a] = -1;
             #[allow(clippy::cast_precision_loss)]
-            let boundary = voxel[a] as f32;
+            let boundary = cell[a] as f32 * cell_size;
             t_max[a] = (boundary - origin[a]) / dir[a];
-            t_delta[a] = -1.0 / dir[a];
+            t_delta[a] = -cell_size / dir[a];
         }
     }
+    (step, t_max, t_delta)
+}
 
-    #[allow(clippy::cast_precision_loss)]
-    let max_dist = settings.max_scan_dist.max(1) as f32;
-    let mut t_curr = t_enter;
-    // Hard iteration cap: a ray can cross at most this many voxel
-    // boundaries inside the box. Guards against floating-point stalls.
-    let max_steps = (n_i[0] + n_i[1] + n_i[2]) as usize + 8;
+/// Index of the axis with the smallest `t_max` (the next boundary the
+/// ray crosses).
+#[inline]
+fn min_axis(t_max: [f32; 3]) -> usize {
+    if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
+        0
+    } else if t_max[1] <= t_max[2] {
+        1
+    } else {
+        2
+    }
+}
 
+/// Walk unit voxels of `grid` along the ray within the half-open voxel
+/// box `[lo, hi)`, between ray parameters `t_lo` (box entry) and `t_hi`
+/// (box exit). Returns the first solid + renderable cell (via
+/// [`GridView::surface_color`]) as a [`Hit`], or `None` if the ray
+/// leaves the box / t-range / `max_dist` first. `fwd_dot = dir·forward`
+/// converts a ray parameter to perpendicular depth.
+///
+/// When `bricks` is `Some`, the expensive [`GridView::surface_color`]
+/// slab walk is **gated** on the voxel's brick being occupied — empty
+/// bricks are stepped over with just integer DDA arithmetic and an O(1)
+/// bit test, never touching the column slabs. This is the DDA.3
+/// empty-space skip; it produces a bit-identical voxel sequence to the
+/// ungated (`None`) dense walk, so results match exactly (the brick map
+/// is conservative — every solid voxel lives in an occupied brick).
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn voxel_walk(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    fwd_dot: f32,
+    grid: &GridView<'_>,
+    lo: [i32; 3],
+    hi: [i32; 3],
+    t_lo: f32,
+    t_hi: f32,
+    max_dist: f32,
+    bricks: Option<&BrickMap>,
+) -> Option<Hit> {
+    let start = t_lo + 1e-4;
+    let p = [
+        origin[0] + dir[0] * start,
+        origin[1] + dir[1] * start,
+        origin[2] + dir[2] * start,
+    ];
+    let mut voxel = [
+        (p[0].floor() as i32).clamp(lo[0], hi[0] - 1),
+        (p[1].floor() as i32).clamp(lo[1], hi[1] - 1),
+        (p[2].floor() as i32).clamp(lo[2], hi[2] - 1),
+    ];
+    let (step, mut t_max, t_delta) = dda_setup(origin, dir, voxel, 1.0);
+    let mut t_curr = t_lo;
+    let max_steps = ((hi[0] - lo[0]) + (hi[1] - lo[1]) + (hi[2] - lo[2])) as usize + 8;
     for _ in 0..max_steps {
-        if voxel[0] < 0
-            || voxel[0] >= n_i[0]
-            || voxel[1] < 0
-            || voxel[1] >= n_i[1]
-            || voxel[2] < 0
-            || voxel[2] >= n_i[2]
+        if voxel[0] < lo[0]
+            || voxel[0] >= hi[0]
+            || voxel[1] < lo[1]
+            || voxel[1] >= hi[1]
+            || voxel[2] < lo[2]
+            || voxel[2] >= hi[2]
         {
-            return None; // walked out of the chunk
-        }
-        // `t_curr` is the entry distance of `voxel`; bound the scan by
-        // forward-projected distance (the z-buffer metric).
-        let depth = t_curr * (dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2]);
-        if depth > max_dist {
             return None;
         }
-        #[allow(clippy::cast_sign_loss)]
-        if let Some(color) = grid.surface_color(voxel[0] as u32, voxel[1] as u32, voxel[2] as u32) {
-            return Some(Hit {
-                color,
-                dist: depth.max(0.0),
-            });
+        let depth = t_curr * fwd_dot;
+        if depth > max_dist || t_curr > t_hi {
+            return None;
         }
-
-        // Advance to the next voxel across the nearest axis boundary.
-        let axis = if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
-            0
-        } else if t_max[1] <= t_max[2] {
-            1
-        } else {
-            2
-        };
+        // Skip the slab walk entirely in empty bricks.
+        let occupied = bricks.map_or(true, |b| {
+            b.occupied([voxel[0] / BRICK, voxel[1] / BRICK, voxel[2] / BRICK])
+        });
+        if occupied {
+            if let Some(color) =
+                grid.surface_color(voxel[0] as u32, voxel[1] as u32, voxel[2] as u32)
+            {
+                return Some(Hit {
+                    color,
+                    dist: depth.max(0.0),
+                });
+            }
+        }
+        let axis = min_axis(t_max);
         t_curr = t_max[axis];
         voxel[axis] += step[axis];
         t_max[axis] += t_delta[axis];
     }
     None
+}
+
+/// Box extents of the active single chunk in voxel units: `(f32 hi,
+/// i32 hi)`.
+fn chunk_extents(grid: &GridView<'_>) -> ([f32; 3], [i32; 3]) {
+    #[allow(clippy::cast_precision_loss)]
+    let nx = grid.vsid as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let nz = f32::from(u16::try_from(crate::grid_view::CHUNK_SIZE_Z).unwrap_or(256));
+    #[allow(clippy::cast_possible_wrap)]
+    let n_i = [
+        grid.vsid as i32,
+        grid.vsid as i32,
+        crate::grid_view::CHUNK_SIZE_Z as i32,
+    ];
+    ([nx, nx, nz], n_i)
+}
+
+/// Cast one ray into the grid and return the first solid hit.
+///
+/// **DDA.3:** dense per-pixel 3D-DDA over the active chunk box, with
+/// the [`BrickMap`] gating the per-voxel `surface_color` slab walk so
+/// open air is crossed with cheap integer stepping only. Bit-identical
+/// to the ungated dense walk ([`cast_ray_reference`] in tests).
+fn cast_ray(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    forward: [f32; 3],
+    grid: &GridView<'_>,
+    bricks: &BrickMap,
+    settings: &OpticastSettings,
+) -> Option<Hit> {
+    let (n, n_i) = chunk_extents(grid);
+    let (t_enter, t_exit) = intersect_aabb(origin, dir, [0.0; 3], n)?;
+    let fwd_dot = dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2];
+    #[allow(clippy::cast_precision_loss)]
+    let max_dist = settings.max_scan_dist.max(1) as f32;
+    voxel_walk(
+        origin,
+        dir,
+        fwd_dot,
+        grid,
+        [0, 0, 0],
+        n_i,
+        t_enter,
+        t_exit,
+        max_dist,
+        Some(bricks),
+    )
 }
 
 /// Render one grid into `sink` with per-pixel 3D-DDA.
@@ -296,15 +424,47 @@ pub fn render_dda(
         settings.hz,
     );
 
+    // Build the brick occupancy once per frame; every ray shares it.
+    let bricks = BrickMap::build(&grid);
+
     for py in settings.y_start..settings.y_end {
         let row = py as usize * pitch_pixels;
         for px in 0..settings.xres {
             let (origin, dir) = pixel_ray(&cs, settings, px, py);
-            if let Some(hit) = cast_ray(origin, dir, cs.forward, &grid, settings) {
+            if let Some(hit) = cast_ray(origin, dir, cs.forward, &grid, &bricks, settings) {
                 sink.put(row + px as usize, hit.color, hit.dist);
             }
         }
     }
+}
+
+/// Dense per-voxel reference cast (no brickmap) — the DDA.2 traversal,
+/// kept as the equivalence oracle for the brickmap [`cast_ray`].
+#[cfg(test)]
+fn cast_ray_reference(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    forward: [f32; 3],
+    grid: &GridView<'_>,
+    settings: &OpticastSettings,
+) -> Option<Hit> {
+    let (n, n_i) = chunk_extents(grid);
+    let (t_enter, t_exit) = intersect_aabb(origin, dir, [0.0; 3], n)?;
+    let fwd_dot = dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2];
+    #[allow(clippy::cast_precision_loss)]
+    let max_dist = settings.max_scan_dist.max(1) as f32;
+    voxel_walk(
+        origin,
+        dir,
+        fwd_dot,
+        grid,
+        [0, 0, 0],
+        n_i,
+        t_enter,
+        t_exit,
+        max_dist,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -525,6 +685,86 @@ mod tests {
             bottom > top,
             "bottom band ({bottom}) should hit more floor than top band ({top})"
         );
+    }
+
+    /// Render `grid` from `camera` with the dense reference cast (no
+    /// brickmap), returning `(colour, depth)` buffers.
+    fn render_reference(
+        grid: GridView<'_>,
+        camera: &Camera,
+        w: u32,
+        h: u32,
+    ) -> (Vec<u32>, Vec<f32>) {
+        let n = (w as usize) * (h as usize);
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let settings = OpticastSettings::for_oracle_framebuffer(w, h);
+        let cs = camera_math::derive(camera, w, h, settings.hx, settings.hy, settings.hz);
+        for py in 0..h {
+            for px in 0..w {
+                let (o, d) = pixel_ray(&cs, &settings, px, py);
+                if let Some(hit) = cast_ray_reference(o, d, cs.forward, &grid, &settings) {
+                    let i = (py * w + px) as usize;
+                    fb[i] = hit.color;
+                    zb[i] = hit.dist;
+                }
+            }
+        }
+        (fb, zb)
+    }
+
+    /// Render `grid` from `camera` via the production brickmap path.
+    fn render_brickmap(
+        grid: GridView<'_>,
+        camera: &Camera,
+        w: u32,
+        h: u32,
+    ) -> (Vec<u32>, Vec<f32>) {
+        let n = (w as usize) * (h as usize);
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let settings = OpticastSettings::for_oracle_framebuffer(w, h);
+        {
+            let mut sink = RasterSink::new(&mut fb, &mut zb);
+            render_dda(camera, &settings, grid, w as usize, &mut sink);
+        }
+        (fb, zb)
+    }
+
+    /// The brickmap two-level cast must be bit-identical to the dense
+    /// per-voxel reference — empty-space skip is a speed optimisation,
+    /// not a result change. Exercised over varied terrain (hills + a
+    /// floating block + an air gap) from several oblique poses.
+    #[test]
+    fn brickmap_matches_dense_reference() {
+        // Rolling heightmap + a floating block (air above and below).
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
+            let surf = 30 + ((x / 5 + y / 7) % 11);
+            let ground = z >= surf;
+            let block = (20..=24).contains(&z) && (10..20).contains(&x) && (40..50).contains(&y);
+            (ground || block).then_some(0x80_30_50_70 + (x ^ y) % 0x40)
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+
+        let (w, h) = (80u32, 80u32);
+        let poses = [
+            Camera::orbit(0.6, 0.5, 90.0, [32.0, 32.0, 40.0]),
+            Camera::orbit(2.1, 0.2, 70.0, [32.0, 32.0, 35.0]),
+            Camera::orbit(-1.0, 0.9, 120.0, [32.0, 32.0, 45.0]),
+        ];
+        for (i, cam) in poses.iter().enumerate() {
+            let (fb_b, zb_b) = render_brickmap(grid, cam, w, h);
+            let (fb_r, zb_r) = render_reference(grid, cam, w, h);
+            assert!(fb_b == fb_r, "colour mismatch vs reference at pose {i}");
+            assert!(
+                zb_b.iter()
+                    .zip(&zb_r)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "depth mismatch vs reference at pose {i}"
+            );
+            // Sanity: the scene is actually visible.
+            assert!(fb_b.iter().any(|&c| c != 0), "pose {i} rendered empty");
+        }
     }
 
     /// DDA.2 correctness: a heightmap column's interior is solid even

@@ -281,6 +281,36 @@ impl<'a> GridView<'a> {
         }
     }
 
+    /// Call `f(top, bot)` for each solid run `[top, bot)` of column
+    /// `(x, y)`, top-to-bottom (the same decomposition
+    /// [`Self::voxel_run_top`] tests against, and
+    /// [`roxlap_formats::edit::expandrle`] produces). No-op for an
+    /// out-of-range / unbacked column. The brickmap builder
+    /// ([`crate::dda`]) uses this to mark occupied bricks.
+    pub fn for_each_run(&self, x: u32, y: u32, mut f: impl FnMut(i32, i32)) {
+        let Some(slab) = self.column_slab(x, y) else {
+            return;
+        };
+        let maxz = CHUNK_SIZE_Z as i32;
+        let mut top = i32::from(slab[1]);
+        let mut v = 0usize;
+        loop {
+            let nextptr = usize::from(slab[v]);
+            if nextptr == 0 {
+                f(top, maxz); // last run extends to bedrock
+                return;
+            }
+            v += nextptr * 4;
+            let ze = i32::from(slab[v + 3]);
+            let z1 = i32::from(slab[v + 1]);
+            if ze >= z1 {
+                continue; // degenerate slab — run continues
+            }
+            f(top, ze);
+            top = z1;
+        }
+    }
+
     /// DDA hit colour for voxel `(x, y, z)`: the display colour if the
     /// voxel is **solid and renderable**, or `None` for air or an
     /// uncoloured bedrock-placeholder run (which DDA steps through as if
