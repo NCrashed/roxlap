@@ -135,6 +135,29 @@ struct Hit {
     dist: f32,
 }
 
+/// Test-only per-thread traversal counters for the perf bench.
+#[cfg(test)]
+pub(crate) mod prof {
+    use std::cell::Cell;
+    thread_local! {
+        pub static CELLS: Cell<u64> = const { Cell::new(0) };
+        pub static BRICKS: Cell<u64> = const { Cell::new(0) };
+        pub static SURF: Cell<u64> = const { Cell::new(0) };
+    }
+    pub fn reset() {
+        CELLS.with(|x| x.set(0));
+        BRICKS.with(|x| x.set(0));
+        SURF.with(|x| x.set(0));
+    }
+    pub fn read() -> (u64, u64, u64) {
+        (
+            CELLS.with(Cell::get),
+            BRICKS.with(Cell::get),
+            SURF.with(Cell::get),
+        )
+    }
+}
+
 /// Apply the voxel's baked directional brightness (Substage DDA.5).
 ///
 /// Voxlap (and the GPU marcher, `grid_dda.wgsl`) store per-voxel
@@ -303,18 +326,27 @@ const BRICK: i32 = 8;
 /// `PORTING-DDA.md`) is a later perf refinement.
 #[derive(Debug)]
 pub(crate) struct BrickMap {
-    /// Brick counts along x / y / z.
+    /// Brick counts along x / y / z (one entry per `BRICK³` cells).
     nb: [i32; 3],
-    /// Occupancy bitset; brick `(bx, by, bz)` is bit
+    /// Brick occupancy bitset; brick `(bx, by, bz)` is bit
     /// `(bz * nb[1] + by) * nb[0] + bx`.
     bits: Vec<u64>,
+    /// Super-brick counts (one entry per `BRICK³` *bricks* = `SUPER³`
+    /// cells), `ceil(nb / BRICK)`.
+    ns: [i32; 3],
+    /// Super-brick occupancy (DDA.7 perf): a coarse level so a ray
+    /// through open air above the terrain skips `SUPER` cells per outer
+    /// step instead of `BRICK`. A super-brick is set iff any child brick
+    /// is set.
+    super_bits: Vec<u64>,
 }
 
+/// Super-brick edge in cells (`BRICK` bricks per axis).
+const SUPER: i32 = BRICK * BRICK;
+
 impl BrickMap {
-    /// Scan every mip-`mip` column of `grid` once, marking the brick of
-    /// each solid run. Brick cells are `BRICK³` mip-`mip` cells, so the
-    /// map matches the mip-`mip` traversal grid. `mip` must be `<
-    /// grid.mip_count()`.
+    /// Scan every mip-`mip` column of `grid`, building brick + super-
+    /// brick occupancy. `mip` must be `< grid.mip_count()`.
     #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     fn build(grid: &GridView<'_>, mip: u32) -> Self {
         let vsid_m = (grid.vsid >> mip).max(1) as i32;
@@ -324,22 +356,35 @@ impl BrickMap {
             (vsid_m + BRICK - 1) / BRICK,
             (z_m + BRICK - 1) / BRICK,
         ];
+        let ns = [
+            (nb[0] + BRICK - 1) / BRICK,
+            (nb[1] + BRICK - 1) / BRICK,
+            (nb[2] + BRICK - 1) / BRICK,
+        ];
         let count = (nb[0] * nb[1] * nb[2]) as usize;
+        let scount = (ns[0] * ns[1] * ns[2]) as usize;
         let mut bits = vec![0u64; count.div_ceil(64)];
+        let mut super_bits = vec![0u64; scount.div_ceil(64)];
         for y in 0..vsid_m {
             for x in 0..vsid_m {
                 let (bx, by) = (x / BRICK, y / BRICK);
                 grid.for_each_run_mip(x as u32, y as u32, mip, |top, bot| {
-                    let bz0 = top / BRICK;
-                    let bz1 = (bot - 1) / BRICK;
-                    for bz in bz0..=bz1 {
+                    for bz in (top / BRICK)..=((bot - 1) / BRICK) {
                         let idx = ((bz * nb[1] + by) * nb[0] + bx) as usize;
                         bits[idx / 64] |= 1u64 << (idx % 64);
+                        let sidx =
+                            (((bz / BRICK) * ns[1] + by / BRICK) * ns[0] + bx / BRICK) as usize;
+                        super_bits[sidx / 64] |= 1u64 << (sidx % 64);
                     }
                 });
             }
         }
-        Self { nb, bits }
+        Self {
+            nb,
+            bits,
+            ns,
+            super_bits,
+        }
     }
 
     /// Whether brick `b` is in range and holds any solid voxel.
@@ -357,6 +402,23 @@ impl BrickMap {
         }
         let idx = ((b[2] * self.nb[1] + b[1]) * self.nb[0] + b[0]) as usize;
         (self.bits[idx / 64] >> (idx % 64)) & 1 != 0
+    }
+
+    /// Whether super-brick `s` is in range and holds any solid voxel.
+    #[inline]
+    #[allow(clippy::cast_sign_loss)]
+    fn occupied_super(&self, s: [i32; 3]) -> bool {
+        if s[0] < 0
+            || s[0] >= self.ns[0]
+            || s[1] < 0
+            || s[1] >= self.ns[1]
+            || s[2] < 0
+            || s[2] >= self.ns[2]
+        {
+            return false;
+        }
+        let idx = ((s[2] * self.ns[1] + s[1]) * self.ns[0] + s[0]) as usize;
+        (self.super_bits[idx / 64] >> (idx % 64)) & 1 != 0
     }
 }
 
@@ -595,6 +657,8 @@ impl<'a> Sampler<'a> {
     /// chunk costs only a bit test, not a slab walk.
     #[allow(clippy::cast_possible_wrap)]
     fn hit(&mut self, c: [i32; 3]) -> Option<u32> {
+        #[cfg(test)]
+        prof::SURF.with(|x| x.set(x.get() + 1));
         let (ch, loc) = self.locate(c);
         self.select_chunk(ch);
         let occupied = self.cur_brick.is_some_and(|bm| {
@@ -643,6 +707,29 @@ impl<'a> Sampler<'a> {
             ])
         })
     }
+
+    /// Whether the super-brick at super-index `s` (in `SUPER`-mip-cell
+    /// units) holds any solid voxel. Outer-most empty-space skip (steps
+    /// `SUPER` cells). Assumes super-bricks nest in chunks (caller gates
+    /// on `cells_per_chunk >= SUPER`).
+    #[allow(clippy::cast_sign_loss)]
+    fn super_occupied(&mut self, s: [i32; 3]) -> bool {
+        // First mip-cell of the super-brick (SUPER = 64 → `<< 6`).
+        let c0 = [s[0] << 6, s[1] << 6, s[2] << 6];
+        let ch = [
+            c0[0] >> self.xy_shift,
+            c0[1] >> self.xy_shift,
+            c0[2] >> self.z_shift,
+        ];
+        self.select_chunk(ch);
+        self.cur_brick.is_some_and(|bm| {
+            bm.occupied_super([
+                (c0[0] & self.xy_mask) >> 6,
+                (c0[1] & self.xy_mask) >> 6,
+                (c0[2] & self.z_mask) >> 6,
+            ])
+        })
+    }
 }
 
 /// Walk mip-cells along the ray within the half-open mip-cell box
@@ -688,6 +775,8 @@ fn cell_walk(
     let mut last_axis = seed_axis;
     let max_steps = ((hi_c[0] - lo_c[0]) + (hi_c[1] - lo_c[1]) + (hi_c[2] - lo_c[2])) as usize + 8;
     for _ in 0..max_steps {
+        #[cfg(test)]
+        prof::CELLS.with(|x| x.set(x.get() + 1));
         if cellc[0] < lo_c[0]
             || cellc[0] >= hi_c[0]
             || cellc[1] < lo_c[1]
@@ -796,6 +885,8 @@ fn voxel_walk(
     let mut last_axis = 3usize;
     let max_steps = ((hi_b[0] - lo_b[0]) + (hi_b[1] - lo_b[1]) + (hi_b[2] - lo_b[2])) as usize + 8;
     for _ in 0..max_steps {
+        #[cfg(test)]
+        prof::BRICKS.with(|x| x.set(x.get() + 1));
         if brick[0] < lo_b[0]
             || brick[0] >= hi_b[0]
             || brick[1] < lo_b[1]
@@ -832,6 +923,96 @@ fn voxel_walk(
         last_axis = axis;
         t_curr = t_max[axis];
         brick[axis] += step[axis];
+        t_max[axis] += t_delta[axis];
+    }
+    None
+}
+
+/// Outermost empty-space skip (DDA.7): step `SUPER`-cell super-bricks,
+/// skipping empty ones in one stride, and descend into [`voxel_walk`]
+/// (brick + cell) only inside occupied super-bricks. A ray crossing open
+/// air above the terrain skips ~`SUPER` cells per step. Caller gates on
+/// super-bricks nesting in chunks (`cells_per_chunk >= SUPER`).
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn super_walk(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    fwd_dot: f32,
+    sampler: &mut Sampler<'_>,
+    lo: [i32; 3],
+    hi: [i32; 3],
+    t_lo: f32,
+    t_hi: f32,
+    max_dist: f32,
+    env: &DdaEnv<'_>,
+) -> Option<Hit> {
+    let mip = sampler.mip;
+    let cell = 1i32 << mip;
+    let sw_i = SUPER * cell; // super-brick edge in mip-0 voxels
+    let super_world = sw_i as f32;
+    let lo_s = [
+        lo[0].div_euclid(sw_i),
+        lo[1].div_euclid(sw_i),
+        lo[2].div_euclid(sw_i),
+    ];
+    let hi_s = [
+        (hi[0] + sw_i - 1).div_euclid(sw_i),
+        (hi[1] + sw_i - 1).div_euclid(sw_i),
+        (hi[2] + sw_i - 1).div_euclid(sw_i),
+    ];
+    let p = [
+        origin[0] + dir[0] * (t_lo + 1e-4),
+        origin[1] + dir[1] * (t_lo + 1e-4),
+        origin[2] + dir[2] * (t_lo + 1e-4),
+    ];
+    let mut s = [
+        ((p[0] / super_world).floor() as i32).clamp(lo_s[0], hi_s[0] - 1),
+        ((p[1] / super_world).floor() as i32).clamp(lo_s[1], hi_s[1] - 1),
+        ((p[2] / super_world).floor() as i32).clamp(lo_s[2], hi_s[2] - 1),
+    ];
+    let (step, mut t_max, t_delta) = dda_setup(origin, dir, s, super_world);
+    let mut t_curr = t_lo;
+    let max_steps = ((hi_s[0] - lo_s[0]) + (hi_s[1] - lo_s[1]) + (hi_s[2] - lo_s[2])) as usize + 8;
+    for _ in 0..max_steps {
+        if s[0] < lo_s[0]
+            || s[0] >= hi_s[0]
+            || s[1] < lo_s[1]
+            || s[1] >= hi_s[1]
+            || s[2] < lo_s[2]
+            || s[2] >= hi_s[2]
+        {
+            return None;
+        }
+        if t_curr * fwd_dot > max_dist || t_curr > t_hi {
+            return None;
+        }
+        if sampler.super_occupied(s) {
+            // Descend: brick+cell walk over this super-brick's mip-0 box.
+            let slo = [
+                (s[0] * sw_i).max(lo[0]),
+                (s[1] * sw_i).max(lo[1]),
+                (s[2] * sw_i).max(lo[2]),
+            ];
+            let shi = [
+                ((s[0] + 1) * sw_i).min(hi[0]),
+                ((s[1] + 1) * sw_i).min(hi[1]),
+                ((s[2] + 1) * sw_i).min(hi[2]),
+            ];
+            let s_exit = t_max[0].min(t_max[1]).min(t_max[2]).min(t_hi);
+            if let Some(hit) = voxel_walk(
+                origin, dir, fwd_dot, sampler, slo, shi, t_curr, s_exit, max_dist, env,
+            ) {
+                return Some(hit);
+            }
+        }
+        let axis = min_axis(t_max);
+        t_curr = t_max[axis];
+        s[axis] += step[axis];
         t_max[axis] += t_delta[axis];
     }
     None
@@ -876,9 +1057,17 @@ fn cast_ray(
     let fwd_dot = dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2];
     #[allow(clippy::cast_precision_loss)]
     let max_dist = settings.max_scan_dist.max(1) as f32;
-    voxel_walk(
-        origin, dir, fwd_dot, sampler, lo_i, hi_i, t_enter, t_exit, max_dist, env,
-    )
+    // Three-level empty-space skip when super-bricks nest in chunks
+    // (`chunk >= SUPER` cells); else the two-level brick/cell walk.
+    if sampler.cells_per_chunk_xy() >= SUPER && sampler.cells_per_chunk_z() >= SUPER {
+        super_walk(
+            origin, dir, fwd_dot, sampler, lo_i, hi_i, t_enter, t_exit, max_dist, env,
+        )
+    } else {
+        voxel_walk(
+            origin, dir, fwd_dot, sampler, lo_i, hi_i, t_enter, t_exit, max_dist, env,
+        )
+    }
 }
 
 /// Render one grid into `sink` with per-pixel 3D-DDA.
@@ -1708,6 +1897,103 @@ mod tests {
             (0.7..1.4).contains(&ratio),
             "mip-2 coverage {c2} vs mip-0 {c0} (ratio {ratio:.2}) diverged"
         );
+    }
+
+    /// Headless perf bench (run: `cargo test -p roxlap-core --release
+    /// dda::tests::bench_terrain -- --ignored --nocapture`). Single-
+    /// thread `render_dda` over a hilly chunk at a horizon pose; prints
+    /// ms/frame + per-frame traversal counters (cells / bricks /
+    /// surface_color calls) to locate the bottleneck.
+    #[test]
+    #[ignore]
+    fn bench_terrain() {
+        use std::time::Instant;
+        // Multi-chunk grid like the demo: NC×NC chunks of 128, hills.
+        const NC: i32 = 6;
+        let cs = crate::grid_view::CHUNK_SIZE_Z; // 256, but vsid is 128
+        let _ = cs;
+        let mut vxls: Vec<roxlap_formats::vxl::Vxl> = Vec::new();
+        for cy in 0..NC {
+            for cx in 0..NC {
+                let (ox, oy) = (cx * 128, cy * 128);
+                let mut v = roxlap_formats::vxl::Vxl::from_dense(128, |x, y, z| {
+                    let (gx, gy) = (ox + x as i32, oy + y as i32);
+                    let surf = 90 + ((gx / 7 + gy / 9).rem_euclid(40)) + ((gx / 23).rem_euclid(20));
+                    (z as i32 >= surf).then_some(0x80_50_70_90 + (x ^ y) % 0x30)
+                });
+                v.generate_mips(4);
+                vxls.push(v);
+            }
+        }
+        let views: Vec<Option<GridView>> = vxls
+            .iter()
+            .map(|v| Some(GridView::from_single_vxl(v)))
+            .collect();
+        let cg = crate::ChunkGrid {
+            chunks: &views,
+            origin_chunk_xy: [0, 0],
+            origin_chunk_z: 0,
+            chunks_x: NC as u32,
+            chunks_y: NC as u32,
+            chunks_z: 1,
+        };
+        let grid = GridView::from_chunk_grid(&cg, 128);
+
+        let (w, h) = (960u32, 600u32);
+        let mut settings = OpticastSettings::for_oracle_framebuffer(w, h);
+        settings.max_scan_dist = 512;
+        let n = (w * h) as usize;
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let centre = [f64::from(NC * 128) / 2.0, f64::from(NC * 128) / 2.0, 60.0];
+
+        // Two poses: eye-level toward horizon (long rays) + looking down
+        // at nearby terrain (short rays, demo-typical).
+        let poses = [
+            (
+                "horizon",
+                Camera::from_yaw_pitch([20.0, 20.0, 40.0], 0.6, 0.15),
+            ),
+            ("down", Camera::orbit(0.7, 1.0, 130.0, centre)),
+        ];
+        for (name, cam) in poses {
+            {
+                let mut sink = RasterSink::new(&mut fb, &mut zb);
+                prof::reset();
+                render_dda(
+                    &cam,
+                    &settings,
+                    grid,
+                    w as usize,
+                    &DdaEnv::default(),
+                    0,
+                    &mut sink,
+                );
+            }
+            let (cells, bricks, surf) = prof::read();
+            let iters = 6;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let mut sink = RasterSink::new(&mut fb, &mut zb);
+                render_dda(
+                    &cam,
+                    &settings,
+                    grid,
+                    w as usize,
+                    &DdaEnv::default(),
+                    0,
+                    &mut sink,
+                );
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1000.0 / f64::from(iters);
+            let hits = fb.iter().filter(|&&c| c != 0).count();
+            eprintln!(
+                "[{name}] {w}x{h} 1-thread: {ms:.1} ms | hits={hits}/{n} | per-px: cells={:.1} bricks={:.1} surf={:.1}",
+                cells as f64 / n as f64,
+                bricks as f64 / n as f64,
+                surf as f64 / n as f64,
+            );
+        }
     }
 
     /// DDA.7: the tile-parallel driver is bit-identical to the

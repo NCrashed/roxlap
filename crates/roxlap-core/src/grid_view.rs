@@ -252,9 +252,13 @@ impl<'a> GridView<'a> {
         let base = self.mip_base_offsets[mip as usize];
         let col_idx = base + (y * vsid_m + x) as usize;
         let start = *self.column_offsets.get(col_idx)? as usize;
-        let slab = self.slab_buf.get(start..)?;
-        let len = roxlap_formats::vxl::slng(slab);
-        slab.get(..len)
+        // Return the unbounded tail from the column's start (not a
+        // `slng`-bounded slice): the slab-chain decoders self-terminate
+        // at `nextptr == 0`, so computing the exact length up front is a
+        // redundant full-chain walk — the dominant cost when
+        // `surface_color` is called per cell. `.get()` inside the
+        // decoders still guards the buffer end against malformed data.
+        self.slab_buf.get(start..)
     }
 
     /// Top z of the solid run containing voxel `(x, y, z)` at mip 0, or

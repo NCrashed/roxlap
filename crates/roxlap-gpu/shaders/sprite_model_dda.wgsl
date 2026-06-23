@@ -65,7 +65,8 @@ struct Uniform {
 
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     let fog_near = u.fog_color.w;
-    let factor = smoothstep(fog_near, u.fog_far, t);
+    // Linear ramp matching the CPU / DDA fog (see scene_dda.wgsl).
+    let factor = clamp((t - fog_near) / max(u.fog_far - fog_near, 1e-6), 0.0, 1.0);
     return mix(hit_color, u.fog_color.rgb, factor);
 }
 

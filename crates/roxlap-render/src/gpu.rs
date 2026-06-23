@@ -445,22 +445,25 @@ impl GpuBackend {
             self.auto_sky_color = Some(frame.sky_color);
         }
 
-        // CPU `set_fog` ramps hits to `fog_color` from t=0 to
-        // `fog_max_scan_dist`, and is off when that distance is ≤ 0.
-        // Match it: near = 0, far = the scan distance (a huge far ≈
-        // "no fog" when disabled). The GPU uses a smoothstep where the
-        // CPU LUT is linear — same endpoints, slightly different curve.
-        let [r, g, b] = unpack_rgb(frame.fog_color);
+        // Match the DDA terrain fog (roxlap-scene `render_scene_composed`
+        // env): a linear ramp from t=0 to `max_scan_dist`, fogging toward
+        // the sky colour so terrain fades into the sky with no hard
+        // far-plane pop. An explicit host fog (`fog_max_scan_dist > 0`
+        // via `Engine::set_fog`) overrides both colour and distance.
+        #[allow(clippy::cast_precision_loss)]
+        let (fog_u32, far) = if frame.fog_max_scan_dist > 0 {
+            (frame.fog_color, frame.fog_max_scan_dist as f32)
+        } else {
+            (frame.sky_color, frame.settings.max_scan_dist.max(1) as f32)
+        };
+        let [r, g, b] = unpack_rgb(fog_u32);
         let color = [
             f32::from(r) / 255.0,
             f32::from(g) / 255.0,
             f32::from(b) / 255.0,
         ];
-        let far = if frame.fog_max_scan_dist > 0 {
-            frame.fog_max_scan_dist as f32
-        } else {
-            1.0e30
-        };
+        // near = 0 + linear curve (matched in the shader) = the CPU LUT
+        // / DDA `clamp(t / far)` blend.
         self.gpu.set_fog(color, 0.0, far);
     }
 
