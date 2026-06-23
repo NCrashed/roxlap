@@ -8,18 +8,21 @@
 //! mip beams, cross-chunk virtual-column complexity). See
 //! `PORTING-DDA.md` for the full stage plan.
 //!
-//! **Stage status — DDA.5 (shading complete).** Each pixel casts one
-//! ray and walks unit voxels over the grid's full voxel box
-//! ([`GridView::voxel_bounds`], spanning every chunk in XY **and** Z)
-//! via a 3D-DDA (Amanatides–Woo). A [`Sampler`] resolves each voxel to
-//! its chunk ([`GridView::chunk_at_xyz`]) and brick-gates the
-//! [`GridView::surface_color`] slab walk. Hits are shaded by the
-//! voxel's baked directional brightness ([`shade`]), darkened on the
-//! hit face by [`DdaEnv::side_shades`], then blended toward
-//! [`DdaEnv::fog_color`] by distance ([`apply_fog`]). Misses sample the
-//! [`DdaEnv::sky`] panorama per direction ([`sample_sky`]) or, with no
-//! textured sky, leave the caller's solid pre-fill. Editor relight is
-//! free (the renderer only reads the baked brightness byte).
+//! **Stage status — DDA.7 (tile parallelism + shared brick cache).**
+//! Each pixel casts one ray and walks unit voxels over the grid's full
+//! voxel box ([`GridView::voxel_bounds`], spanning every chunk in XY
+//! **and** Z) via a 3D-DDA (Amanatides–Woo). [`BrickMaps`] are built
+//! once per frame (one occupancy map per populated chunk) and shared
+//! immutably; a [`Sampler`] resolves each voxel to its chunk
+//! ([`GridView::chunk_at_xyz`]) and brick-gates the
+//! [`GridView::surface_color`] slab walk, caching the current chunk's
+//! view + brick map so air costs an O(1) bit test (no hashing).
+//! [`render_dda_parallel`] splits the frame into disjoint bands rendered
+//! concurrently (rayon) — bit-identical to the sequential render since
+//! pixels are independent. Hits are shaded by baked brightness
+//! ([`shade`]) + [`DdaEnv::side_shades`] face tint, fogged toward
+//! [`DdaEnv::fog_color`] ([`apply_fog`]); misses sample the
+//! [`DdaEnv::sky`] panorama ([`sample_sky`]) or keep the solid pre-fill.
 //!
 //! Buffer conventions match the rest of the engine so this backend is
 //! a drop-in for `opticast`: colour is packed `0x80RRGGBB`; depth is
@@ -28,6 +31,8 @@
 //! unchanged).
 
 use std::collections::HashMap;
+
+use rayon::prelude::*;
 
 use crate::camera_math::{self, CameraState};
 use crate::grid_view::GridView;
@@ -389,58 +394,98 @@ fn min_axis(t_max: [f32; 3]) -> usize {
     }
 }
 
-/// Cross-chunk voxel sampler (Substage DDA.4).
+/// Per-frame brick occupancy maps for every populated chunk of a grid,
+/// keyed by chunk index (Substage DDA.7).
+///
+/// Built **once** per frame ([`BrickMaps::build`]) and shared
+/// **immutably** across the parallel render bands — so the per-pixel
+/// hot loop only reads. Replaces the DDA.4 lazy per-`Sampler` cache,
+/// which couldn't be shared across threads.
+pub(crate) struct BrickMaps {
+    maps: HashMap<[i32; 3], BrickMap>,
+}
+
+impl BrickMaps {
+    /// Build a brick map for every populated chunk in `grid`. Single-
+    /// chunk grids get one entry at `[0, 0, 0]`.
+    #[allow(clippy::cast_possible_wrap)]
+    fn build(grid: &GridView<'_>) -> Self {
+        let mut maps = HashMap::new();
+        if let Some(cg) = grid.chunk_grid {
+            for dz in 0..cg.chunks_z as i32 {
+                for dy in 0..cg.chunks_y as i32 {
+                    for dx in 0..cg.chunks_x as i32 {
+                        let slot =
+                            ((dz * cg.chunks_y as i32 + dy) * cg.chunks_x as i32 + dx) as usize;
+                        if let Some(Some(view)) = cg.chunks.get(slot) {
+                            let ch = [
+                                cg.origin_chunk_xy[0] + dx,
+                                cg.origin_chunk_xy[1] + dy,
+                                cg.origin_chunk_z + dz,
+                            ];
+                            maps.insert(ch, BrickMap::build(view));
+                        }
+                    }
+                }
+            }
+        } else {
+            maps.insert([0, 0, 0], BrickMap::build(grid));
+        }
+        Self { maps }
+    }
+}
+
+/// Cross-chunk voxel sampler (Substage DDA.4 / DDA.7).
 ///
 /// Resolves a grid-local voxel coordinate to the chunk that owns it
 /// (via [`GridView::chunk_at_xyz`]) and answers the DDA's per-voxel hit
-/// query — brick-gated [`GridView::surface_color`]. Two caches keep the
-/// hot loop cheap:
-///
-/// * the **current chunk** (`cur_*`) — a ray usually stays in one chunk
-///   for many voxels, so chunk resolution is a single compare;
-/// * a **per-frame brick cache** (`bricks`) keyed by chunk index, built
-///   lazily on first touch and reused across every ray of the frame.
+/// query — brick-gated [`GridView::surface_color`]. It borrows the
+/// shared immutable [`BrickMaps`] and caches the **current chunk**
+/// (`cur_*`: view + brick-map reference): a ray usually stays in one
+/// chunk for many voxels, so the per-voxel cost is a single index
+/// compare + an O(1) brick bit test — no hashing, no mutation. Holding
+/// only shared borrows, a `Sampler` is cheap to spin up per render band.
 ///
 /// Single-chunk grids are the degenerate case: every voxel maps to
-/// chunk `[0, 0, 0]` (= the view itself), so the path is identical to
-/// the DDA.3 single-chunk render.
+/// chunk `[0, 0, 0]` (= the view itself).
 struct Sampler<'a> {
     grid: GridView<'a>,
+    bricks: &'a BrickMaps,
     cs_xy: i32,
     cs_z: i32,
     cur_ch: [i32; 3],
     cur_view: Option<GridView<'a>>,
+    cur_brick: Option<&'a BrickMap>,
     has_cur: bool,
-    bricks: HashMap<[i32; 3], BrickMap>,
 }
 
 impl<'a> Sampler<'a> {
-    fn new(grid: GridView<'a>) -> Self {
+    fn new(grid: GridView<'a>, bricks: &'a BrickMaps) -> Self {
         #[allow(clippy::cast_possible_wrap)]
         let cs_xy = grid.chunk_size_xy as i32;
         #[allow(clippy::cast_possible_wrap)]
         let cs_z = crate::grid_view::CHUNK_SIZE_Z as i32;
         Self {
             grid,
+            bricks,
             cs_xy,
             cs_z,
             cur_ch: [0; 3],
             cur_view: None,
+            cur_brick: None,
             has_cur: false,
-            bricks: HashMap::new(),
         }
     }
 
-    /// Resolve a chunk index to its view, caching the last lookup.
-    fn chunk_view(&mut self, ch: [i32; 3]) -> Option<GridView<'a>> {
+    /// Refresh the current-chunk cache (view + brick map) for `ch`.
+    fn select_chunk(&mut self, ch: [i32; 3]) {
         if self.has_cur && self.cur_ch == ch {
-            return self.cur_view;
+            return;
         }
-        let v = self.grid.chunk_at_xyz(ch);
+        self.cur_view = self.grid.chunk_at_xyz(ch);
+        self.cur_brick = self.bricks.maps.get(&ch);
         self.cur_ch = ch;
-        self.cur_view = v;
         self.has_cur = true;
-        v
     }
 
     /// Split a grid-local voxel into `(chunk index, in-chunk local)`.
@@ -465,20 +510,18 @@ impl<'a> Sampler<'a> {
     #[allow(clippy::cast_possible_wrap)]
     fn hit(&mut self, g: [i32; 3]) -> Option<u32> {
         let (ch, loc) = self.locate(g);
-        let view = self.chunk_view(ch)?;
-        let occupied = {
-            let bricks = &mut self.bricks;
-            let bm = bricks.entry(ch).or_insert_with(|| BrickMap::build(&view));
+        self.select_chunk(ch);
+        let occupied = self.cur_brick.is_some_and(|bm| {
             bm.occupied([
                 loc[0] as i32 / BRICK,
                 loc[1] as i32 / BRICK,
                 loc[2] as i32 / BRICK,
             ])
-        };
+        });
         if !occupied {
             return None;
         }
-        view.surface_color(loc[0], loc[1], loc[2])
+        self.cur_view?.surface_color(loc[0], loc[1], loc[2])
     }
 }
 
@@ -631,21 +674,107 @@ pub fn render_dda(
         settings.hz,
     );
 
-    // One sampler per frame: caches resolved chunks + per-chunk brick
-    // maps, reused across every ray.
-    let mut sampler = Sampler::new(grid);
+    // Brick maps built once for the frame; sampler caches the current
+    // chunk's view + brick map across a ray.
+    let bricks = BrickMaps::build(&grid);
+    let mut sampler = Sampler::new(grid, &bricks);
 
     for py in settings.y_start..settings.y_end {
         let row = py as usize * pitch_pixels;
         for px in 0..settings.xres {
-            let (origin, dir) = pixel_ray(&cs, settings, px, py);
-            if let Some(hit) = cast_ray(origin, dir, cs.forward, &mut sampler, settings, env) {
-                sink.put(row + px as usize, hit.color, hit.dist);
-            } else if let Some(sky) = env.sky {
-                sink.put(row + px as usize, sample_sky(sky, dir), f32::INFINITY);
+            if let Some((color, dist)) = pixel_result(&cs, settings, &mut sampler, env, px, py) {
+                sink.put(row + px as usize, color, dist);
             }
         }
     }
+}
+
+/// Resolve one pixel: a shaded + fogged hit colour, a sampled textured
+/// sky on a miss, or `None` (miss with no textured sky → caller's
+/// pre-fill stands). Shared by the sequential ([`render_dda`]) and
+/// parallel ([`render_dda_parallel`]) drivers.
+#[inline]
+fn pixel_result(
+    cs: &CameraState,
+    settings: &OpticastSettings,
+    sampler: &mut Sampler<'_>,
+    env: &DdaEnv<'_>,
+    px: u32,
+    py: u32,
+) -> Option<(u32, f32)> {
+    let (origin, dir) = pixel_ray(cs, settings, px, py);
+    if let Some(hit) = cast_ray(origin, dir, cs.forward, sampler, settings, env) {
+        Some((hit.color, hit.dist))
+    } else {
+        env.sky.map(|sky| (sample_sky(sky, dir), f32::INFINITY))
+    }
+}
+
+/// Tile-parallel [`render_dda`] writing straight into `(fb, zb)`.
+///
+/// DDA pixels are independent, so the framebuffer splits into disjoint
+/// horizontal bands rendered concurrently (rayon) — **bit-identical**
+/// to the sequential render regardless of thread count, unlike voxlap's
+/// per-strip discretisation. Brick maps are built once and shared
+/// immutably; each band spins up its own lightweight [`Sampler`].
+///
+/// `(fb, zb)` use the standard conventions (`0x80RRGGBB`; z = perp
+/// distance, smaller = closer); a miss writes nothing unless
+/// [`DdaEnv::sky`] is set. `pitch_pixels` is the row stride.
+#[allow(clippy::cast_possible_truncation)]
+pub fn render_dda_parallel(
+    camera: &Camera,
+    settings: &OpticastSettings,
+    grid: GridView<'_>,
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    env: &DdaEnv<'_>,
+) {
+    debug_assert_eq!(fb.len(), zb.len());
+    let (y0, y1) = (settings.y_start, settings.y_end);
+    if y1 <= y0 {
+        return;
+    }
+    let cs = camera_math::derive(
+        camera,
+        settings.xres,
+        settings.yres,
+        settings.hx,
+        settings.hy,
+        settings.hz,
+    );
+    let bricks = BrickMaps::build(&grid);
+    let target = RasterTarget::new(fb, zb);
+
+    // Split the y-range into ~one band per worker thread.
+    let nthreads = rayon::current_num_threads().max(1);
+    let rows = (y1 - y0) as usize;
+    let band = rows.div_ceil(nthreads).max(1) as u32;
+    let bands: Vec<(u32, u32)> = (y0..y1)
+        .step_by(band as usize)
+        .map(|s| (s, (s + band).min(y1)))
+        .collect();
+
+    bands.par_iter().for_each(|&(by0, by1)| {
+        let mut sampler = Sampler::new(grid, &bricks);
+        for py in by0..by1 {
+            let row = py as usize * pitch_pixels;
+            for px in 0..settings.xres {
+                if let Some((color, dist)) = pixel_result(&cs, settings, &mut sampler, env, px, py)
+                {
+                    let idx = row + px as usize;
+                    // SAFETY: bands cover disjoint row ranges, so writes
+                    // never alias across threads; `idx` is in-bounds for
+                    // a `pitch * height`-sized buffer.
+                    unsafe {
+                        target.write_color(idx, color);
+                        target.write_depth(idx, dist);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Dense per-voxel reference cast for a **single-chunk** grid: walks
@@ -1260,6 +1389,50 @@ mod tests {
         assert!(
             left > 5 && right > 5,
             "seam not continuous: left={left} right={right}"
+        );
+    }
+
+    /// DDA.7: the tile-parallel driver is bit-identical to the
+    /// sequential one — DDA pixels are independent, so banding can't
+    /// change a pixel.
+    #[test]
+    fn parallel_matches_sequential() {
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
+            let surf = 28 + ((x / 4 + y / 6) % 13);
+            (z >= surf).then_some(0x80_40_60_80 + (x ^ y) % 0x30)
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+        let (w, h) = (96u32, 96u32);
+        let cam = Camera::orbit(0.8, 0.55, 100.0, [32.0, 32.0, 40.0]);
+        let env = DdaEnv {
+            sky: None,
+            fog_color: 0x00_20_30_40,
+            fog_max_dist: 120.0,
+            side_shades: [0, 0, 0, 0, 0x30, 0x10],
+        };
+
+        let (seq_fb, seq_zb) = render_brickmap_env(grid, &cam, w, h, &env);
+
+        let n = (w * h) as usize;
+        let mut par_fb = vec![0u32; n];
+        let mut par_zb = vec![f32::INFINITY; n];
+        let settings = OpticastSettings::for_oracle_framebuffer(w, h);
+        render_dda_parallel(
+            &cam,
+            &settings,
+            grid,
+            &mut par_fb,
+            &mut par_zb,
+            w as usize,
+            &env,
+        );
+        assert!(par_fb == seq_fb, "parallel colour differs from sequential");
+        assert!(
+            par_zb
+                .iter()
+                .zip(&seq_zb)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "parallel depth differs from sequential"
         );
     }
 

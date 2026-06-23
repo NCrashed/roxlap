@@ -37,7 +37,7 @@
 #![allow(clippy::similar_names)]
 
 use glam::DVec3;
-use roxlap_core::dda::{render_dda, DdaEnv, RasterSink};
+use roxlap_core::dda::{render_dda_parallel, DdaEnv};
 use roxlap_core::opticast::{opticast, OpticastOutcome, OpticastSettings};
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
@@ -219,14 +219,14 @@ pub fn render_scene(
             for d in zb.iter_mut() {
                 *d = f32::INFINITY;
             }
-            let mut sink = RasterSink::new(fb, zb);
-            render_dda(
+            render_dda_parallel(
                 &local_cam,
                 settings,
                 grid_view,
+                fb,
+                zb,
                 pitch_pixels,
                 &DdaEnv::default(),
-                &mut sink,
             );
             OpticastOutcome::Rendered
         } else {
@@ -741,14 +741,14 @@ fn render_scene_composed_scissored(
                 fog_max_dist: scissored.max_scan_dist.max(1) as f32,
                 side_shades: [0; 6],
             };
-            let mut sink = RasterSink::new(&mut temp_fb, &mut temp_zb);
-            render_dda(
+            render_dda_parallel(
                 &local_cam,
                 &scissored,
                 grid_view,
+                &mut temp_fb,
+                &mut temp_zb,
                 pitch_pixels,
                 &env,
-                &mut sink,
             );
             OpticastOutcome::Rendered
         } else {

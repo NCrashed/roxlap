@@ -80,7 +80,7 @@ pub mod world_lighting;
 pub mod world_query;
 
 pub use camera::Camera;
-pub use dda::{pixel_ray, render_dda, DdaEnv, PixelSink, RasterSink};
+pub use dda::{pixel_ray, render_dda, render_dda_parallel, DdaEnv, PixelSink, RasterSink};
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
 pub use grid_view::{ChunkGrid, GridView};
 pub use opticast::{opticast, OpticastOutcome, OpticastSettings};
