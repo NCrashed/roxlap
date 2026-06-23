@@ -227,6 +227,7 @@ pub fn render_scene(
                 zb,
                 pitch_pixels,
                 &DdaEnv::default(),
+                0,
             );
             OpticastOutcome::Rendered
         } else {
@@ -741,6 +742,17 @@ fn render_scene_composed_scissored(
                 fog_max_dist: scissored.max_scan_dist.max(1) as f32,
                 side_shades: [0; 6],
             };
+            // DDA.6: uniform per-grid render mip by LOD tier. Near =
+            // full detail; Mid coarsens to a built mip (clamped to what
+            // every chunk actually has). Far never reaches here (the
+            // billboard branch handled it above).
+            let dda_mip = match lod {
+                Lod::Mid => grid
+                    .lod_thresholds
+                    .mid_mip_levels
+                    .map_or(2, |n| n.saturating_sub(1)),
+                Lod::Near | Lod::Far => 0,
+            };
             render_dda_parallel(
                 &local_cam,
                 &scissored,
@@ -749,6 +761,7 @@ fn render_scene_composed_scissored(
                 &mut temp_zb,
                 pitch_pixels,
                 &env,
+                dda_mip,
             );
             OpticastOutcome::Rendered
         } else {

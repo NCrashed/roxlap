@@ -8,17 +8,20 @@
 //! mip beams, cross-chunk virtual-column complexity). See
 //! `PORTING-DDA.md` for the full stage plan.
 //!
-//! **Stage status — DDA.7 (tile parallelism + shared brick cache).**
-//! Each pixel casts one ray and walks unit voxels over the grid's full
-//! voxel box ([`GridView::voxel_bounds`], spanning every chunk in XY
-//! **and** Z) via a 3D-DDA (Amanatides–Woo). [`BrickMaps`] are built
-//! once per frame (one occupancy map per populated chunk) and shared
-//! immutably; a [`Sampler`] resolves each voxel to its chunk
+//! **Stage status — DDA.6 (per-grid distance mip) + DDA.7 (tile
+//! parallelism).** Each pixel casts one ray over the grid's full voxel
+//! box ([`GridView::voxel_bounds`], spanning every chunk in XY **and**
+//! Z) via a 3D-DDA (Amanatides–Woo). A uniform render mip (chosen per
+//! grid by LOD distance, clamped by [`effective_mip`] to a level every
+//! chunk has built) coarsens the cell size to `2^mip` mip-0 voxels and
+//! samples mip-`mip` data — the ray stays in mip-0 units so depth and
+//! fog are exact. [`BrickMaps`] (one occupancy map per populated chunk,
+//! at the render mip) are built once per frame and shared immutably; a
+//! [`Sampler`] resolves each cell to its chunk
 //! ([`GridView::chunk_at_xyz`]) and brick-gates the
-//! [`GridView::surface_color`] slab walk, caching the current chunk's
-//! view + brick map so air costs an O(1) bit test (no hashing).
-//! [`render_dda_parallel`] splits the frame into disjoint bands rendered
-//! concurrently (rayon) — bit-identical to the sequential render since
+//! [`GridView::surface_color_mip`] slab walk, caching the current chunk
+//! so air costs an O(1) bit test. [`render_dda_parallel`] splits the
+//! frame into disjoint rayon bands — bit-identical to sequential since
 //! pixels are independent. Hits are shaded by baked brightness
 //! ([`shade`]) + [`DdaEnv::side_shades`] face tint, fogged toward
 //! [`DdaEnv::fog_color`] ([`apply_fog`]); misses sample the
@@ -302,23 +305,25 @@ pub(crate) struct BrickMap {
 }
 
 impl BrickMap {
-    /// Scan every column of `grid` once, marking the brick of each
-    /// solid run. `O(vsid² · slabs)` — amortised across all pixels of
-    /// the frame.
+    /// Scan every mip-`mip` column of `grid` once, marking the brick of
+    /// each solid run. Brick cells are `BRICK³` mip-`mip` cells, so the
+    /// map matches the mip-`mip` traversal grid. `mip` must be `<
+    /// grid.mip_count()`.
     #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-    fn build(grid: &GridView<'_>) -> Self {
-        let vsid = grid.vsid as i32;
+    fn build(grid: &GridView<'_>, mip: u32) -> Self {
+        let vsid_m = (grid.vsid >> mip).max(1) as i32;
+        let z_m = (crate::grid_view::CHUNK_SIZE_Z >> mip).max(1) as i32;
         let nb = [
-            (vsid + BRICK - 1) / BRICK,
-            (vsid + BRICK - 1) / BRICK,
-            (crate::grid_view::CHUNK_SIZE_Z as i32 + BRICK - 1) / BRICK,
+            (vsid_m + BRICK - 1) / BRICK,
+            (vsid_m + BRICK - 1) / BRICK,
+            (z_m + BRICK - 1) / BRICK,
         ];
         let count = (nb[0] * nb[1] * nb[2]) as usize;
         let mut bits = vec![0u64; count.div_ceil(64)];
-        for y in 0..vsid {
-            for x in 0..vsid {
+        for y in 0..vsid_m {
+            for x in 0..vsid_m {
                 let (bx, by) = (x / BRICK, y / BRICK);
-                grid.for_each_run(x as u32, y as u32, |top, bot| {
+                grid.for_each_run_mip(x as u32, y as u32, mip, |top, bot| {
                     let bz0 = top / BRICK;
                     let bz1 = (bot - 1) / BRICK;
                     for bz in bz0..=bz1 {
@@ -406,10 +411,11 @@ pub(crate) struct BrickMaps {
 }
 
 impl BrickMaps {
-    /// Build a brick map for every populated chunk in `grid`. Single-
-    /// chunk grids get one entry at `[0, 0, 0]`.
+    /// Build a mip-`mip` brick map for every populated chunk in `grid`.
+    /// Single-chunk grids get one entry at `[0, 0, 0]`. `mip` is the
+    /// effective (already-clamped) render mip — see [`effective_mip`].
     #[allow(clippy::cast_possible_wrap)]
-    fn build(grid: &GridView<'_>) -> Self {
+    fn build(grid: &GridView<'_>, mip: u32) -> Self {
         let mut maps = HashMap::new();
         if let Some(cg) = grid.chunk_grid {
             for dz in 0..cg.chunks_z as i32 {
@@ -423,16 +429,35 @@ impl BrickMaps {
                                 cg.origin_chunk_xy[1] + dy,
                                 cg.origin_chunk_z + dz,
                             ];
-                            maps.insert(ch, BrickMap::build(view));
+                            maps.insert(ch, BrickMap::build(view, mip));
                         }
                     }
                 }
             }
         } else {
-            maps.insert([0, 0, 0], BrickMap::build(grid));
+            maps.insert([0, 0, 0], BrickMap::build(grid, mip));
         }
         Self { maps }
     }
+}
+
+/// Clamp a requested render mip to one every populated chunk actually
+/// has built — so the uniform-mip traversal never under-samples a chunk
+/// that lacks the requested level (which would punch holes). `0` short-
+/// circuits (always available).
+fn effective_mip(grid: &GridView<'_>, requested: u32) -> u32 {
+    if requested == 0 {
+        return 0;
+    }
+    let mut m = requested;
+    if let Some(cg) = grid.chunk_grid {
+        for c in cg.chunks.iter().flatten() {
+            m = m.min(c.mip_count().saturating_sub(1));
+        }
+    } else {
+        m = m.min(grid.mip_count().saturating_sub(1));
+    }
+    m
 }
 
 /// Cross-chunk voxel sampler (Substage DDA.4 / DDA.7).
@@ -451,6 +476,10 @@ impl BrickMaps {
 struct Sampler<'a> {
     grid: GridView<'a>,
     bricks: &'a BrickMaps,
+    /// Effective render mip (DDA.6). Traversal cells are mip-`mip`
+    /// cells; sampling reads mip-`mip` data.
+    mip: u32,
+    /// Chunk size in mip-`mip` cells (`chunk_size_xy >> mip` etc).
     cs_xy: i32,
     cs_z: i32,
     cur_ch: [i32; 3],
@@ -460,14 +489,15 @@ struct Sampler<'a> {
 }
 
 impl<'a> Sampler<'a> {
-    fn new(grid: GridView<'a>, bricks: &'a BrickMaps) -> Self {
+    fn new(grid: GridView<'a>, bricks: &'a BrickMaps, mip: u32) -> Self {
         #[allow(clippy::cast_possible_wrap)]
-        let cs_xy = grid.chunk_size_xy as i32;
+        let cs_xy = (grid.chunk_size_xy >> mip).max(1) as i32;
         #[allow(clippy::cast_possible_wrap)]
-        let cs_z = crate::grid_view::CHUNK_SIZE_Z as i32;
+        let cs_z = (crate::grid_view::CHUNK_SIZE_Z >> mip).max(1) as i32;
         Self {
             grid,
             bricks,
+            mip,
             cs_xy,
             cs_z,
             cur_ch: [0; 3],
@@ -488,28 +518,30 @@ impl<'a> Sampler<'a> {
         self.has_cur = true;
     }
 
-    /// Split a grid-local voxel into `(chunk index, in-chunk local)`.
+    /// Split a grid-local **mip-`mip` cell** index into `(chunk index,
+    /// in-chunk mip-cell)`. Chunk indices are mip-independent; only the
+    /// per-chunk resolution shrinks with mip.
     #[allow(clippy::cast_sign_loss)]
-    fn locate(&self, g: [i32; 3]) -> ([i32; 3], [u32; 3]) {
+    fn locate(&self, c: [i32; 3]) -> ([i32; 3], [u32; 3]) {
         let ch = [
-            g[0].div_euclid(self.cs_xy),
-            g[1].div_euclid(self.cs_xy),
-            g[2].div_euclid(self.cs_z),
+            c[0].div_euclid(self.cs_xy),
+            c[1].div_euclid(self.cs_xy),
+            c[2].div_euclid(self.cs_z),
         ];
         let loc = [
-            g[0].rem_euclid(self.cs_xy) as u32,
-            g[1].rem_euclid(self.cs_xy) as u32,
-            g[2].rem_euclid(self.cs_z) as u32,
+            c[0].rem_euclid(self.cs_xy) as u32,
+            c[1].rem_euclid(self.cs_xy) as u32,
+            c[2].rem_euclid(self.cs_z) as u32,
         ];
         (ch, loc)
     }
 
-    /// Hit colour for grid-local voxel `g`, or `None` for air / empty
+    /// Hit colour for grid-local mip-cell `c`, or `None` for air / empty
     /// chunk / uncoloured bedrock. Brick-gated so air inside a populated
     /// chunk costs only a bit test, not a slab walk.
     #[allow(clippy::cast_possible_wrap)]
-    fn hit(&mut self, g: [i32; 3]) -> Option<u32> {
-        let (ch, loc) = self.locate(g);
+    fn hit(&mut self, c: [i32; 3]) -> Option<u32> {
+        let (ch, loc) = self.locate(c);
         self.select_chunk(ch);
         let occupied = self.cur_brick.is_some_and(|bm| {
             bm.occupied([
@@ -521,7 +553,8 @@ impl<'a> Sampler<'a> {
         if !occupied {
             return None;
         }
-        self.cur_view?.surface_color(loc[0], loc[1], loc[2])
+        self.cur_view?
+            .surface_color_mip(loc[0], loc[1], loc[2], self.mip)
     }
 }
 
@@ -552,31 +585,51 @@ fn voxel_walk(
     max_dist: f32,
     env: &DdaEnv<'_>,
 ) -> Option<Hit> {
+    // DDA.6: traverse mip-`mip` cells of size `cell` mip-0 voxels. The
+    // ray (`origin` / `dir`) and `t` stay in mip-0 units, so depth is
+    // correct; only the cell grid is coarsened. `lo` / `hi` are the
+    // mip-0 box → divide into cell bounds (mip-0 box dims are multiples
+    // of the chunk size, hence of `cell`).
+    let mip = sampler.mip;
+    let cell = 1i32 << mip;
+    #[allow(clippy::cast_precision_loss)]
+    let cell_size = cell as f32;
+    let lo_c = [
+        lo[0].div_euclid(cell),
+        lo[1].div_euclid(cell),
+        lo[2].div_euclid(cell),
+    ];
+    let hi_c = [
+        hi[0].div_euclid(cell),
+        hi[1].div_euclid(cell),
+        hi[2].div_euclid(cell),
+    ];
+
     let start = t_lo + 1e-4;
     let p = [
         origin[0] + dir[0] * start,
         origin[1] + dir[1] * start,
         origin[2] + dir[2] * start,
     ];
-    let mut voxel = [
-        (p[0].floor() as i32).clamp(lo[0], hi[0] - 1),
-        (p[1].floor() as i32).clamp(lo[1], hi[1] - 1),
-        (p[2].floor() as i32).clamp(lo[2], hi[2] - 1),
+    let mut cellc = [
+        ((p[0] / cell_size).floor() as i32).clamp(lo_c[0], hi_c[0] - 1),
+        ((p[1] / cell_size).floor() as i32).clamp(lo_c[1], hi_c[1] - 1),
+        ((p[2] / cell_size).floor() as i32).clamp(lo_c[2], hi_c[2] - 1),
     ];
-    let (step, mut t_max, t_delta) = dda_setup(origin, dir, voxel, 1.0);
+    let (step, mut t_max, t_delta) = dda_setup(origin, dir, cellc, cell_size);
     let mut t_curr = t_lo;
-    // Axis the ray most recently crossed into the current voxel — the
+    // Axis the ray most recently crossed into the current cell — the
     // hit face for side shading. `3` (none) until the first step, so the
-    // entry voxel gets no side shade.
+    // entry cell gets no side shade.
     let mut last_axis = 3usize;
-    let max_steps = ((hi[0] - lo[0]) + (hi[1] - lo[1]) + (hi[2] - lo[2])) as usize + 8;
+    let max_steps = ((hi_c[0] - lo_c[0]) + (hi_c[1] - lo_c[1]) + (hi_c[2] - lo_c[2])) as usize + 8;
     for _ in 0..max_steps {
-        if voxel[0] < lo[0]
-            || voxel[0] >= hi[0]
-            || voxel[1] < lo[1]
-            || voxel[1] >= hi[1]
-            || voxel[2] < lo[2]
-            || voxel[2] >= hi[2]
+        if cellc[0] < lo_c[0]
+            || cellc[0] >= hi_c[0]
+            || cellc[1] < lo_c[1]
+            || cellc[1] >= hi_c[1]
+            || cellc[2] < lo_c[2]
+            || cellc[2] >= hi_c[2]
         {
             return None;
         }
@@ -584,7 +637,7 @@ fn voxel_walk(
         if depth > max_dist || t_curr > t_hi {
             return None;
         }
-        if let Some(color) = sampler.hit(voxel) {
+        if let Some(color) = sampler.hit(cellc) {
             let bright_sub = side_shade_sub(env, last_axis, step);
             let lit = shade(color, bright_sub);
             return Some(Hit {
@@ -595,7 +648,7 @@ fn voxel_walk(
         let axis = min_axis(t_max);
         last_axis = axis;
         t_curr = t_max[axis];
-        voxel[axis] += step[axis];
+        cellc[axis] += step[axis];
         t_max[axis] += t_delta[axis];
     }
     None
@@ -663,6 +716,7 @@ pub fn render_dda(
     grid: GridView<'_>,
     pitch_pixels: usize,
     env: &DdaEnv<'_>,
+    mip: u32,
     sink: &mut impl PixelSink,
 ) {
     let cs = camera_math::derive(
@@ -674,10 +728,11 @@ pub fn render_dda(
         settings.hz,
     );
 
-    // Brick maps built once for the frame; sampler caches the current
-    // chunk's view + brick map across a ray.
-    let bricks = BrickMaps::build(&grid);
-    let mut sampler = Sampler::new(grid, &bricks);
+    // Brick maps built once for the frame at the effective render mip;
+    // sampler caches the current chunk's view + brick map across a ray.
+    let mip = effective_mip(&grid, mip);
+    let bricks = BrickMaps::build(&grid, mip);
+    let mut sampler = Sampler::new(grid, &bricks, mip);
 
     for py in settings.y_start..settings.y_end {
         let row = py as usize * pitch_pixels;
@@ -730,6 +785,7 @@ pub fn render_dda_parallel(
     zb: &mut [f32],
     pitch_pixels: usize,
     env: &DdaEnv<'_>,
+    mip: u32,
 ) {
     debug_assert_eq!(fb.len(), zb.len());
     let (y0, y1) = (settings.y_start, settings.y_end);
@@ -744,7 +800,8 @@ pub fn render_dda_parallel(
         settings.hy,
         settings.hz,
     );
-    let bricks = BrickMaps::build(&grid);
+    let mip = effective_mip(&grid, mip);
+    let bricks = BrickMaps::build(&grid, mip);
     let target = RasterTarget::new(fb, zb);
 
     // Split the y-range into ~one band per worker thread.
@@ -757,7 +814,7 @@ pub fn render_dda_parallel(
         .collect();
 
     bands.par_iter().for_each(|&(by0, by1)| {
-        let mut sampler = Sampler::new(grid, &bricks);
+        let mut sampler = Sampler::new(grid, &bricks, mip);
         for py in by0..by1 {
             let row = py as usize * pitch_pixels;
             for px in 0..settings.xres {
@@ -886,6 +943,7 @@ mod tests {
                 grid,
                 w as usize,
                 &DdaEnv::default(),
+                0,
                 &mut sink,
             );
         }
@@ -996,6 +1054,7 @@ mod tests {
             grid,
             64,
             &DdaEnv::default(),
+            0,
             &mut rec,
         );
         assert!(rec.puts.is_empty(), "all-air grid must produce no hits");
@@ -1021,7 +1080,7 @@ mod tests {
         };
         let settings = OpticastSettings::for_oracle_framebuffer(48, 48);
         let mut rec = Recorder::default();
-        render_dda(&cam, &settings, grid, 48, &DdaEnv::default(), &mut rec);
+        render_dda(&cam, &settings, grid, 48, &DdaEnv::default(), 0, &mut rec);
 
         assert!(!rec.puts.is_empty(), "floor must be visible");
         // Centre pixel looks straight down → depth ≈ FLOOR_Z - eye_z.
@@ -1131,7 +1190,7 @@ mod tests {
         let settings = OpticastSettings::for_oracle_framebuffer(w, h);
         {
             let mut sink = RasterSink::new(&mut fb, &mut zb);
-            render_dda(camera, &settings, grid, w as usize, env, &mut sink);
+            render_dda(camera, &settings, grid, w as usize, env, 0, &mut sink);
         }
         (fb, zb)
     }
@@ -1392,6 +1451,63 @@ mod tests {
         );
     }
 
+    /// Render `grid` from `camera` at render `mip` and return the hit
+    /// mask.
+    fn render_mask_mip(grid: GridView<'_>, camera: &Camera, w: u32, h: u32, mip: u32) -> Vec<bool> {
+        let n = (w as usize) * (h as usize);
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let settings = OpticastSettings::for_oracle_framebuffer(w, h);
+        {
+            let mut sink = RasterSink::new(&mut fb, &mut zb);
+            render_dda(
+                camera,
+                &settings,
+                grid,
+                w as usize,
+                &DdaEnv::default(),
+                mip,
+                &mut sink,
+            );
+        }
+        fb.iter().map(|&c| c != 0).collect()
+    }
+
+    /// DDA.6: rendering a mip-built grid at a coarse mip stays complete
+    /// (hole-free silhouette) with roughly the same screen coverage as
+    /// mip 0 — LOD coarsens detail, it doesn't punch holes or shrink the
+    /// shape. (DDA has no axis-aligned mip beam — the artifact is
+    /// structurally impossible with honest per-cell traversal.)
+    #[test]
+    fn mip_render_is_coarse_but_complete() {
+        let mut vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
+            let surf = 24 + ((x / 3 + y / 5) % 17);
+            (z >= surf).then_some(0x80_50_70_90)
+        });
+        vxl.generate_mips(4);
+        assert!(vxl.mip_count() >= 3, "need mips built for this test");
+        let grid = GridView::from_single_vxl(&vxl);
+        let (w, h) = (96u32, 96u32);
+        let cam = Camera::orbit(0.7, 0.6, 110.0, [32.0, 32.0, 36.0]);
+
+        let m0 = render_mask_mip(grid, &cam, w, h, 0);
+        let m2 = render_mask_mip(grid, &cam, w, h, 2);
+
+        let c0 = m0.iter().filter(|&&b| b).count();
+        let c2 = m2.iter().filter(|&&b| b).count();
+        assert!(c0 > 200 && c2 > 200, "both mips visible (c0={c0} c2={c2})");
+        // Coverage within ~30 % — a coarse-mip silhouette closely tracks
+        // the fine one (LOD coarsens detail, it doesn't lose the shape).
+        // (Terrain silhouettes are non-convex — sky shows through
+        // valleys — so a hole-free invariant doesn't apply here; that's
+        // the convex single-voxel test's job.)
+        let ratio = c2 as f32 / c0 as f32;
+        assert!(
+            (0.7..1.4).contains(&ratio),
+            "mip-2 coverage {c2} vs mip-0 {c0} (ratio {ratio:.2}) diverged"
+        );
+    }
+
     /// DDA.7: the tile-parallel driver is bit-identical to the
     /// sequential one — DDA pixels are independent, so banding can't
     /// change a pixel.
@@ -1425,6 +1541,7 @@ mod tests {
             &mut par_zb,
             w as usize,
             &env,
+            0,
         );
         assert!(par_fb == seq_fb, "parallel colour differs from sequential");
         assert!(
