@@ -193,6 +193,13 @@ pub fn render_scene(
         // built by `world_camera_to_grid_local` — translation +
         // inverse-rotation of the basis. Identity rotation keeps
         // this byte-identical to the pre-S5 translate-only form.
+        // DDA.7: refresh the cross-frame brick cache (needs `&mut grid`)
+        // before borrowing the grid immutably for `backing`.
+        let dda_mip = if dda_enabled() {
+            Some(grid.ensure_dda_bricks(0))
+        } else {
+            None
+        };
         let Some(backing) = grid.chunk_xyz_backing() else {
             // Empty grid (no populated chz=0 chunks) — skip.
             continue;
@@ -207,7 +214,7 @@ pub fn render_scene(
             chunks_z: backing.chunks_z,
         };
         let grid_view = single_chunk_fast_path(&backing, &cg);
-        let outcome = if dda_enabled() {
+        let outcome = if let Some(mip) = dda_mip {
             // DDA backend (Substage DDA). Behind `ROXLAP_DDA=1` while
             // the per-pixel 3D-DDA renderer is built up; the voxlap
             // opticast path stays the default until DDA.9. The direct
@@ -227,7 +234,8 @@ pub fn render_scene(
                 zb,
                 pitch_pixels,
                 &DdaEnv::default(),
-                0,
+                &grid.dda_brick_cache,
+                mip,
             );
             OpticastOutcome::Rendered
         } else {
@@ -555,6 +563,22 @@ fn render_scene_composed_scissored(
         // commentary; the only difference is this writes to
         // (temp_fb, temp_zb) and composes via `compose_into`.
         // S5.0: per-grid rotation flows via the shared helper.
+        //
+        // DDA.7: refresh the cross-frame brick cache (needs `&mut grid`)
+        // before the immutable `backing` borrow. Render mip by LOD tier:
+        // Near = full detail, Mid = coarser (clamped to built mips).
+        let dda_eff_mip = if dda_enabled() {
+            let req = match lod {
+                Lod::Mid => grid
+                    .lod_thresholds
+                    .mid_mip_levels
+                    .map_or(2, |n| n.saturating_sub(1)),
+                Lod::Near | Lod::Far => 0,
+            };
+            Some(grid.ensure_dda_bricks(req))
+        } else {
+            None
+        };
         let Some(backing) = grid.chunk_xyz_backing() else {
             continue;
         };
@@ -742,17 +766,8 @@ fn render_scene_composed_scissored(
                 fog_max_dist: scissored.max_scan_dist.max(1) as f32,
                 side_shades: [0; 6],
             };
-            // DDA.6: uniform per-grid render mip by LOD tier. Near =
-            // full detail; Mid coarsens to a built mip (clamped to what
-            // every chunk actually has). Far never reaches here (the
-            // billboard branch handled it above).
-            let dda_mip = match lod {
-                Lod::Mid => grid
-                    .lod_thresholds
-                    .mid_mip_levels
-                    .map_or(2, |n| n.saturating_sub(1)),
-                Lod::Near | Lod::Far => 0,
-            };
+            // Effective render mip + brick cache were prepared above
+            // (DDA.6 uniform per-grid mip, DDA.7 cross-frame cache).
             render_dda_parallel(
                 &local_cam,
                 &scissored,
@@ -761,7 +776,8 @@ fn render_scene_composed_scissored(
                 &mut temp_zb,
                 pitch_pixels,
                 &env,
-                dda_mip,
+                &grid.dda_brick_cache,
+                dda_eff_mip.unwrap_or(0),
             );
             OpticastOutcome::Rendered
         } else {

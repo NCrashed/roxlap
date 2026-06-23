@@ -81,7 +81,10 @@ pub mod world_lighting;
 pub mod world_query;
 
 pub use camera::Camera;
-pub use dda::{pixel_ray, render_dda, render_dda_parallel, DdaEnv, PixelSink, RasterSink};
+pub use dda::{
+    effective_mip, pixel_ray, render_dda, render_dda_parallel, BrickCache, DdaEnv, PixelSink,
+    RasterSink,
+};
 pub use dda_sprite::draw_sprite_dda;
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
 pub use grid_view::{ChunkGrid, GridView};
