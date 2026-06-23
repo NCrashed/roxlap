@@ -8,17 +8,18 @@
 //! mip beams, cross-chunk virtual-column complexity). See
 //! `PORTING-DDA.md` for the full stage plan.
 //!
-//! **Stage status — DDA.5 (baked brightness shading).** Each pixel
-//! casts one ray and walks unit voxels over the grid's full voxel box
+//! **Stage status — DDA.5 (shading complete).** Each pixel casts one
+//! ray and walks unit voxels over the grid's full voxel box
 //! ([`GridView::voxel_bounds`], spanning every chunk in XY **and** Z)
 //! via a 3D-DDA (Amanatides–Woo). A [`Sampler`] resolves each voxel to
 //! its chunk ([`GridView::chunk_at_xyz`]) and brick-gates the
-//! [`GridView::surface_color`] slab walk. The hit colour is shaded by
-//! the voxel's baked directional brightness ([`shade`]) — matching the
-//! GPU marcher — so lit scenes render correctly and editor relight is
-//! free. Misses leave the destination untouched, so the caller's sky
-//! pre-fill shows through. Remaining DDA.5 polish: distance fog,
-//! textured sky panorama, `side_shades` face tint.
+//! [`GridView::surface_color`] slab walk. Hits are shaded by the
+//! voxel's baked directional brightness ([`shade`]), darkened on the
+//! hit face by [`DdaEnv::side_shades`], then blended toward
+//! [`DdaEnv::fog_color`] by distance ([`apply_fog`]). Misses sample the
+//! [`DdaEnv::sky`] panorama per direction ([`sample_sky`]) or, with no
+//! textured sky, leave the caller's solid pre-fill. Editor relight is
+//! free (the renderer only reads the baked brightness byte).
 //!
 //! Buffer conventions match the rest of the engine so this backend is
 //! a drop-in for `opticast`: colour is packed `0x80RRGGBB`; depth is
@@ -32,7 +33,40 @@ use crate::camera_math::{self, CameraState};
 use crate::grid_view::GridView;
 use crate::opticast::OpticastSettings;
 use crate::scalar_rasterizer::RasterTarget;
+use crate::sky::Sky;
 use crate::Camera;
+
+/// Per-frame environment for DDA shading (Substage DDA.5): a textured
+/// sky panorama, distance fog, and per-face side shading.
+///
+/// [`DdaEnv::default`] disables all three — flat baked-brightness hits
+/// and a caller-pre-filled solid sky — so the brickmap/dense equivalence
+/// tests run against an unchanged pipeline.
+#[derive(Clone, Copy)]
+pub struct DdaEnv<'a> {
+    /// Textured sky sampled per-ray-direction on a miss. `None` leaves
+    /// the destination untouched (caller's solid sky pre-fill shows).
+    pub sky: Option<&'a Sky>,
+    /// Fog target colour (`0x__RRGGBB`); hits blend toward it with
+    /// distance. Typically the sky colour so terrain fades into the sky.
+    pub fog_color: u32,
+    /// Depth at which fog is fully opaque. `<= 0` disables fog.
+    pub fog_max_dist: f32,
+    /// Per-face brightness reduction `[x-, x+, y-, y+, z-, z+]`, applied
+    /// to the hit face (voxlap `setsideshades`). All-zero = off.
+    pub side_shades: [i8; 6],
+}
+
+impl Default for DdaEnv<'_> {
+    fn default() -> Self {
+        Self {
+            sky: None,
+            fog_color: 0,
+            fog_max_dist: 0.0,
+            side_shades: [0; 6],
+        }
+    }
+}
 
 /// Per-pixel output target for the DDA renderer.
 ///
@@ -107,11 +141,73 @@ struct Hit {
 /// itself, so per-impact relight is free (re-bake the chunk and the
 /// byte updates). The estnorm bake that produces the byte is the
 /// voxlap-derived piece slated for a clean-room rewrite in DDA.10.
+///
+/// `bright_sub` is the per-face `side_shades` reduction (DDA.5): voxlap
+/// subtracts it from the brightness byte before the multiply, so a
+/// shaded face is uniformly darker. `0` = no side shading.
 #[inline]
-fn shade(color: u32) -> u32 {
-    let a = (color >> 24) & 0xff;
+fn shade(color: u32, bright_sub: u32) -> u32 {
+    let a = ((color >> 24) & 0xff).saturating_sub(bright_sub);
     let ch = |shift: u32| -> u32 { ((((color >> shift) & 0xff) * a) >> 7).min(255) };
     0x8000_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// Blend `color` toward `env.fog_color` by perpendicular `depth`
+/// (linear, fully fogged at `env.fog_max_dist`). No-op when fog is
+/// disabled (`fog_max_dist <= 0`).
+#[inline]
+fn apply_fog(color: u32, depth: f32, env: &DdaEnv<'_>) -> u32 {
+    if env.fog_max_dist <= 0.0 {
+        return color;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let f = ((depth / env.fog_max_dist).clamp(0.0, 1.0) * 256.0) as u32; // 0..256
+    let g = 256 - f;
+    let fog = env.fog_color;
+    let mix = |shift: u32| -> u32 {
+        let src = (color >> shift) & 0xff;
+        let dst = (fog >> shift) & 0xff;
+        ((src * g + dst * f) >> 8).min(255)
+    };
+    0x8000_0000 | (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+/// Sample the sky panorama in ray direction `dir` (need not be
+/// normalised), returning a packed `0x80RRGGBB` colour.
+///
+/// Clean-room equirectangular mapping (not voxlap's `lng`/`lat` asm
+/// search): the texture's x axis is elevation (`asin` of the vertical
+/// component), the y axis is azimuth (`atan2` around the vertical). A
+/// `ysiz == 1` panorama (e.g. [`Sky::blue_gradient`]) is a pure
+/// horizon→zenith gradient.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn sample_sky(sky: &Sky, dir: [f32; 3]) -> u32 {
+    let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    if len < 1e-9 {
+        return 0x8000_0000;
+    }
+    let d = [dir[0] / len, dir[1] / len, dir[2] / len];
+    let xsiz_full = sky.lat.len().max(1) as i32; // original column count
+    let pi = std::f32::consts::PI;
+    // Elevation → x. z is down; looking up (z<0) → larger x (zenith).
+    let elev = (-d[2]).clamp(-1.0, 1.0).asin(); // -pi/2..pi/2
+    let x = (((elev / pi) + 0.5) * xsiz_full as f32) as i32;
+    let x = x.clamp(0, xsiz_full - 1);
+    // Azimuth → y (wrapped).
+    let y = if sky.ysiz <= 1 {
+        0
+    } else {
+        let az = d[1].atan2(d[0]); // -pi..pi
+        let yf = ((az / (pi * 2.0)) + 0.5) * sky.ysiz as f32;
+        (yf as i32).rem_euclid(sky.ysiz)
+    };
+    let idx = (y * xsiz_full + x) as usize;
+    let px = sky.pixels.get(idx).copied().unwrap_or(0) as u32;
+    0x8000_0000 | (px & 0x00ff_ffff)
 }
 
 /// World-space ray for screen pixel `(px, py)` under opticast's
@@ -411,6 +507,7 @@ fn voxel_walk(
     t_lo: f32,
     t_hi: f32,
     max_dist: f32,
+    env: &DdaEnv<'_>,
 ) -> Option<Hit> {
     let start = t_lo + 1e-4;
     let p = [
@@ -425,6 +522,10 @@ fn voxel_walk(
     ];
     let (step, mut t_max, t_delta) = dda_setup(origin, dir, voxel, 1.0);
     let mut t_curr = t_lo;
+    // Axis the ray most recently crossed into the current voxel — the
+    // hit face for side shading. `3` (none) until the first step, so the
+    // entry voxel gets no side shade.
+    let mut last_axis = 3usize;
     let max_steps = ((hi[0] - lo[0]) + (hi[1] - lo[1]) + (hi[2] - lo[2])) as usize + 8;
     for _ in 0..max_steps {
         if voxel[0] < lo[0]
@@ -441,17 +542,34 @@ fn voxel_walk(
             return None;
         }
         if let Some(color) = sampler.hit(voxel) {
+            let bright_sub = side_shade_sub(env, last_axis, step);
+            let lit = shade(color, bright_sub);
             return Some(Hit {
-                color: shade(color),
+                color: apply_fog(lit, depth.max(0.0), env),
                 dist: depth.max(0.0),
             });
         }
         let axis = min_axis(t_max);
+        last_axis = axis;
         t_curr = t_max[axis];
         voxel[axis] += step[axis];
         t_max[axis] += t_delta[axis];
     }
     None
+}
+
+/// Per-face brightness reduction for the hit face. `axis` is the axis
+/// the ray crossed to enter the hit voxel (`3` = entry voxel, no face);
+/// `step[axis]` gives the crossing direction. Maps to the
+/// `[x-, x+, y-, y+, z-, z+]` `side_shades` entry of the face the ray
+/// looks at (a `+step` crossing enters through the low / `-` face).
+#[inline]
+fn side_shade_sub(env: &DdaEnv<'_>, axis: usize, step: [i32; 3]) -> u32 {
+    if axis >= 3 {
+        return 0;
+    }
+    let face = axis * 2 + usize::from(step[axis] < 0);
+    env.side_shades[face].max(0) as u32
 }
 
 /// Cast one ray into the grid and return the first solid hit.
@@ -468,6 +586,7 @@ fn cast_ray(
     forward: [f32; 3],
     sampler: &mut Sampler<'_>,
     settings: &OpticastSettings,
+    env: &DdaEnv<'_>,
 ) -> Option<Hit> {
     let (lo_i, hi_i) = sampler.grid.voxel_bounds();
     #[allow(clippy::cast_precision_loss)]
@@ -479,7 +598,7 @@ fn cast_ray(
     #[allow(clippy::cast_precision_loss)]
     let max_dist = settings.max_scan_dist.max(1) as f32;
     voxel_walk(
-        origin, dir, fwd_dot, sampler, lo_i, hi_i, t_enter, t_exit, max_dist,
+        origin, dir, fwd_dot, sampler, lo_i, hi_i, t_enter, t_exit, max_dist, env,
     )
 }
 
@@ -491,13 +610,16 @@ fn cast_ray(
 /// per-frame [`GridView`] borrow. `pitch_pixels` is the framebuffer
 /// row stride in pixels (matches `ScalarRasterizer::new`'s argument).
 ///
-/// Misses write nothing, so the caller must pre-fill the framebuffer
-/// with sky (the `render_scene_composed` path already does).
+/// On a miss, a textured sky ([`DdaEnv::sky`]) is sampled per ray
+/// direction and written at `+inf` depth; with no textured sky the miss
+/// writes nothing, so the caller's solid sky pre-fill shows (the
+/// `render_scene_composed` path pre-fills it).
 pub fn render_dda(
     camera: &Camera,
     settings: &OpticastSettings,
     grid: GridView<'_>,
     pitch_pixels: usize,
+    env: &DdaEnv<'_>,
     sink: &mut impl PixelSink,
 ) {
     let cs = camera_math::derive(
@@ -517,8 +639,10 @@ pub fn render_dda(
         let row = py as usize * pitch_pixels;
         for px in 0..settings.xres {
             let (origin, dir) = pixel_ray(&cs, settings, px, py);
-            if let Some(hit) = cast_ray(origin, dir, cs.forward, &mut sampler, settings) {
+            if let Some(hit) = cast_ray(origin, dir, cs.forward, &mut sampler, settings, env) {
                 sink.put(row + px as usize, hit.color, hit.dist);
+            } else if let Some(sky) = env.sky {
+                sink.put(row + px as usize, sample_sky(sky, dir), f32::INFINITY);
             }
         }
     }
@@ -581,7 +705,7 @@ fn cast_ray_reference(
         #[allow(clippy::cast_sign_loss)]
         if let Some(color) = grid.surface_color(voxel[0] as u32, voxel[1] as u32, voxel[2] as u32) {
             return Some(Hit {
-                color: shade(color),
+                color: shade(color, 0),
                 dist: depth.max(0.0),
             });
         }
@@ -627,7 +751,14 @@ mod tests {
         let settings = OpticastSettings::for_oracle_framebuffer(w, h);
         {
             let mut sink = RasterSink::new(&mut fb, &mut zb);
-            render_dda(camera, &settings, grid, w as usize, &mut sink);
+            render_dda(
+                camera,
+                &settings,
+                grid,
+                w as usize,
+                &DdaEnv::default(),
+                &mut sink,
+            );
         }
         fb.iter().map(|&c| c != 0).collect()
     }
@@ -730,7 +861,14 @@ mod tests {
         let grid = GridView::from_single_vxl(&vxl);
         let settings = OpticastSettings::for_oracle_framebuffer(64, 48);
         let mut rec = Recorder::default();
-        render_dda(&oracle_camera(), &settings, grid, 64, &mut rec);
+        render_dda(
+            &oracle_camera(),
+            &settings,
+            grid,
+            64,
+            &DdaEnv::default(),
+            &mut rec,
+        );
         assert!(rec.puts.is_empty(), "all-air grid must produce no hits");
     }
 
@@ -754,7 +892,7 @@ mod tests {
         };
         let settings = OpticastSettings::for_oracle_framebuffer(48, 48);
         let mut rec = Recorder::default();
-        render_dda(&cam, &settings, grid, 48, &mut rec);
+        render_dda(&cam, &settings, grid, 48, &DdaEnv::default(), &mut rec);
 
         assert!(!rec.puts.is_empty(), "floor must be visible");
         // Centre pixel looks straight down → depth ≈ FLOOR_Z - eye_z.
@@ -846,15 +984,123 @@ mod tests {
         w: u32,
         h: u32,
     ) -> (Vec<u32>, Vec<f32>) {
+        render_brickmap_env(grid, camera, w, h, &DdaEnv::default())
+    }
+
+    /// As [`render_brickmap`] but with an explicit [`DdaEnv`] (fog /
+    /// textured sky / side shades).
+    fn render_brickmap_env(
+        grid: GridView<'_>,
+        camera: &Camera,
+        w: u32,
+        h: u32,
+        env: &DdaEnv<'_>,
+    ) -> (Vec<u32>, Vec<f32>) {
         let n = (w as usize) * (h as usize);
         let mut fb = vec![0u32; n];
         let mut zb = vec![f32::INFINITY; n];
         let settings = OpticastSettings::for_oracle_framebuffer(w, h);
         {
             let mut sink = RasterSink::new(&mut fb, &mut zb);
-            render_dda(camera, &settings, grid, w as usize, &mut sink);
+            render_dda(camera, &settings, grid, w as usize, env, &mut sink);
         }
         (fb, zb)
+    }
+
+    /// DDA.5: distance fog blends a hit toward the fog colour. A far
+    /// floor pixel is closer to the fog colour than a near one.
+    #[test]
+    fn distance_fog_blends_toward_fog_color() {
+        let vxl =
+            roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| (z >= 40).then_some(0x80_FF_FF_FF));
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [32.0, 2.0, 38.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let env = DdaEnv {
+            sky: None,
+            fog_color: 0x00_00_00_00, // black fog → distance darkens
+            fog_max_dist: 64.0,
+            side_shades: [0; 6],
+        };
+        let (w, h) = (64u32, 64u32);
+        let (fog, _) = render_brickmap_env(grid, &cam, w, h, &env);
+        let (nofog, zb) = render_brickmap(grid, &cam, w, h);
+        let (idx, depth) = zb.iter().enumerate().filter(|(_, z)| z.is_finite()).fold(
+            (0usize, 0.0f32),
+            |acc, (i, &z)| {
+                if z > acc.1 {
+                    (i, z)
+                } else {
+                    acc
+                }
+            },
+        );
+        assert!(depth > 20.0, "need a deep pixel to test fog (got {depth})");
+        let lum = |c: u32| (c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff);
+        assert!(
+            lum(fog[idx]) < lum(nofog[idx]),
+            "fogged pixel {:08x} not darker than {:08x}",
+            fog[idx],
+            nofog[idx]
+        );
+    }
+
+    /// DDA.5: with a textured sky, miss pixels are filled from the sky
+    /// panorama (direction-dependent) instead of left at the pre-fill.
+    #[test]
+    fn textured_sky_fills_misses() {
+        let sky = crate::sky::Sky::blue_gradient();
+        let vxl = roxlap_formats::vxl::Vxl::empty(32); // all air → all miss
+        let grid = GridView::from_single_vxl(&vxl);
+        let env = DdaEnv {
+            sky: Some(&sky),
+            fog_color: 0,
+            fog_max_dist: 0.0,
+            side_shades: [0; 6],
+        };
+        let cam = Camera::from_yaw_pitch([16.0, 16.0, 128.0], 0.3, -0.4);
+        let (w, h) = (48u32, 48u32);
+        let (fb, _) = render_brickmap_env(grid, &cam, w, h, &env);
+        assert!(fb.iter().all(|&c| c >> 24 == 0x80), "all misses sky-filled");
+        let top = fb[0];
+        let bottom = fb[(h - 1) as usize * w as usize];
+        assert_ne!(top, bottom, "sky gradient should vary with elevation");
+    }
+
+    /// DDA.5: side shading darkens the hit face by its `side_shades`
+    /// entry. A top-facing floor (ray crosses +z to enter) gets the
+    /// `z-` face reduction (index 4).
+    #[test]
+    fn side_shades_darken_hit_face() {
+        let vxl =
+            roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| (z >= 8).then_some(0x80_FF_FF_FF));
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [8.0, 8.0, 2.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let centre = 16 * 32 + 16;
+        let (plain, _) = render_brickmap(grid, &cam, 32, 32);
+        let env = DdaEnv {
+            sky: None,
+            fog_color: 0,
+            fog_max_dist: 0.0,
+            side_shades: [0, 0, 0, 0, 0x40, 0],
+        };
+        let (shaded, _) = render_brickmap_env(grid, &cam, 32, 32, &env);
+        let lum = |c: u32| (c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff);
+        assert!(
+            lum(shaded[centre]) < lum(plain[centre]),
+            "side-shaded face {:08x} not darker than {:08x}",
+            shaded[centre],
+            plain[centre]
+        );
     }
 
     /// The brickmap two-level cast must be bit-identical to the dense

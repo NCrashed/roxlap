@@ -37,7 +37,7 @@
 #![allow(clippy::similar_names)]
 
 use glam::DVec3;
-use roxlap_core::dda::{render_dda, RasterSink};
+use roxlap_core::dda::{render_dda, DdaEnv, RasterSink};
 use roxlap_core::opticast::{opticast, OpticastOutcome, OpticastSettings};
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
@@ -220,7 +220,14 @@ pub fn render_scene(
                 *d = f32::INFINITY;
             }
             let mut sink = RasterSink::new(fb, zb);
-            render_dda(&local_cam, settings, grid_view, pitch_pixels, &mut sink);
+            render_dda(
+                &local_cam,
+                settings,
+                grid_view,
+                pitch_pixels,
+                &DdaEnv::default(),
+                &mut sink,
+            );
             OpticastOutcome::Rendered
         } else {
             let mut rasterizer = ScalarRasterizer::new(fb, zb, pitch_pixels, grid_view);
@@ -722,10 +729,27 @@ fn render_scene_composed_scissored(
         let scissored = (*active_settings).with_y_range(rect.y0, rect.y1);
         let outcome = if dda_enabled() {
             // DDA backend (Substage DDA). temp_fb / temp_zb are already
-            // pre-filled with sky / INFINITY for this grid's rect, so
-            // DDA's miss-leaves-untouched contract yields correct sky.
+            // pre-filled with sky / INFINITY for this grid's rect, so a
+            // miss with no textured sky yields the correct solid sky.
+            // Distance fog blends hits toward the sky colour (no hard
+            // cutoff at max_scan_dist); textured sky (if any) is sampled
+            // per-direction on a miss, but only for sky-owning grids.
+            #[allow(clippy::cast_precision_loss)]
+            let env = DdaEnv {
+                sky: if owns_sky { sky } else { None },
+                fog_color: sky_color,
+                fog_max_dist: scissored.max_scan_dist.max(1) as f32,
+                side_shades: [0; 6],
+            };
             let mut sink = RasterSink::new(&mut temp_fb, &mut temp_zb);
-            render_dda(&local_cam, &scissored, grid_view, pitch_pixels, &mut sink);
+            render_dda(
+                &local_cam,
+                &scissored,
+                grid_view,
+                pitch_pixels,
+                &env,
+                &mut sink,
+            );
             OpticastOutcome::Rendered
         } else {
             let mut rasterizer =
