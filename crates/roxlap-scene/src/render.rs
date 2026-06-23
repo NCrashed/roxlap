@@ -65,14 +65,14 @@ use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
 /// ever leaks through to the screen, making the bug obvious.
 const SKY_MASK_SENTINEL: u32 = 0x00_DE_AD_BE;
 
-/// Whether to route rendering through the experimental per-pixel
-/// 3D-DDA backend ([`roxlap_core::dda`]) instead of voxlap's
-/// opticast. Opt-in via the `ROXLAP_DDA=1` environment variable while
-/// the DDA renderer is under construction (Substage DDA); the voxlap
-/// path remains the default until the DDA backend reaches parity
-/// (DDA.9).
+/// Whether to route CPU rendering through the per-pixel 3D-DDA backend
+/// ([`roxlap_core::dda`]) instead of voxlap's opticast.
+///
+/// **DDA.9: DDA is the default CPU backend.** The legacy voxlap opticast
+/// path is kept only as an opt-out for A/B comparison via
+/// `ROXLAP_VOXLAP=1`, pending its deletion.
 fn dda_enabled() -> bool {
-    std::env::var_os("ROXLAP_DDA").is_some_and(|v| v == "1")
+    !std::env::var_os("ROXLAP_VOXLAP").is_some_and(|v| v == "1")
 }
 
 /// Project a world-space [`Camera`] into a grid's local frame:
@@ -568,11 +568,14 @@ fn render_scene_composed_scissored(
         // before the immutable `backing` borrow. Render mip by LOD tier:
         // Near = full detail, Mid = coarser (clamped to built mips).
         let dda_eff_mip = if dda_enabled() {
+            // Mid tier: coarsen by the grid's `mid_mip_levels` override
+            // (a level count → uniform DDA mip `n-1`). No override ⇒ mip
+            // 0, i.e. byte-identical to Near (the override is opt-in).
             let req = match lod {
                 Lod::Mid => grid
                     .lod_thresholds
                     .mid_mip_levels
-                    .map_or(2, |n| n.saturating_sub(1)),
+                    .map_or(0, |n| n.saturating_sub(1)),
                 Lod::Near | Lod::Far => 0,
             };
             Some(grid.ensure_dda_bricks(req))
@@ -756,14 +759,26 @@ fn render_scene_composed_scissored(
             // DDA backend (Substage DDA). temp_fb / temp_zb are already
             // pre-filled with sky / INFINITY for this grid's rect, so a
             // miss with no textured sky yields the correct solid sky.
-            // Distance fog blends hits toward the sky colour (no hard
-            // cutoff at max_scan_dist); textured sky (if any) is sampled
-            // per-direction on a miss, but only for sky-owning grids.
-            #[allow(clippy::cast_precision_loss)]
+            //
+            // Fog is config-driven (mirrors the voxlap path): on iff the
+            // host configured it (pool foglut non-empty via
+            // `Engine::set_fog`). Off → no blend, so exact-colour tests
+            // and unfogged hosts are unaffected. Linear ramp toward the
+            // configured fog colour over `max_scan_dist`.
+            let fog_on = !pool.slot(0).foglut.is_empty();
+            #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
             let env = DdaEnv {
                 sky: if owns_sky { sky } else { None },
-                fog_color: sky_color,
-                fog_max_dist: scissored.max_scan_dist.max(1) as f32,
+                fog_color: if fog_on {
+                    pool.slot(0).fog_col as u32
+                } else {
+                    0
+                },
+                fog_max_dist: if fog_on {
+                    scissored.max_scan_dist.max(1) as f32
+                } else {
+                    0.0
+                },
                 side_shades: [0; 6],
             };
             // Effective render mip + brick cache were prepared above
@@ -902,27 +917,6 @@ mod tests {
             None,
         );
         assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
-        fb
-    }
-
-    /// Render the same chunk as a direct opticast call, with the
-    /// camera already in grid-local frame. The reference output
-    /// for the round-trip test.
-    fn render_via_direct_opticast(scene: &Scene, local_camera: &Camera) -> Vec<u32> {
-        let (_engine, mut pool, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
-        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-        let grid = scene.grids().next().unwrap().1;
-        let chunk = grid.chunk(IVec3::ZERO).unwrap();
-        let grid_view = roxlap_core::GridView::from_single_vxl(chunk);
-        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
-        let _ = core_opticast(
-            &mut rasterizer,
-            &mut pool,
-            local_camera,
-            &settings,
-            grid_view,
-        );
-        drop(rasterizer);
         fb
     }
 
@@ -1290,40 +1284,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_scene_at_origin_matches_direct_opticast() {
-        // Grid at world origin → grid-local camera == world camera.
-        // Single 1-chunk grid: combined view's bytes are byte-identical
-        // to the chunk's own column data (slng-walk equivalence), so
-        // render_scene must produce the same framebuffer as a direct
-        // opticast on the chunk.
-        let (mut scene, _) = build_one_grid_scene(DVec3::ZERO);
-        let cam = camera_at([64.0, 0.0, 64.0]);
-        let via_scene = render_via_scene(&mut scene, &cam);
-        let via_direct = render_via_direct_opticast(&scene, &cam);
-        assert_eq!(
-            via_scene, via_direct,
-            "render_scene with single 1-chunk grid at origin should match direct opticast"
-        );
-    }
-
-    #[test]
-    fn render_scene_translated_grid_matches_grid_local_opticast() {
-        // Grid at world (1000, 2000, 3000). World camera at
-        // (1064, 2000, 3064) — grid-local (64, 0, 64). render_scene
-        // should produce the same output as a direct opticast call
-        // with grid-local camera.
-        let world_origin = DVec3::new(1000.0, 2000.0, 3000.0);
-        let (mut scene, _) = build_one_grid_scene(world_origin);
-        let world_cam = camera_at([1064.0, 2000.0, 3064.0]);
-        let local_cam = camera_at([64.0, 0.0, 64.0]);
-        let via_scene = render_via_scene(&mut scene, &world_cam);
-        let via_direct = render_via_direct_opticast(&scene, &local_cam);
-        assert_eq!(
-            via_scene, via_direct,
-            "render_scene of translated grid should match opticast with grid-local camera"
-        );
-    }
+    // DDA.9: `render_scene_at_origin_matches_direct_opticast` and
+    // `render_scene_translated_grid_matches_grid_local_opticast` were
+    // removed — they asserted the scene render byte-matches voxlap
+    // `opticast`, which no longer holds now that the scene's CPU backend
+    // is the DDA renderer (different, intentionally non-bit-exact). The
+    // grid-local camera transform they also exercised is covered by the
+    // `stacked_*` / two-grid composition tests below.
 
     #[test]
     fn empty_scene_returns_empty_outcome() {
@@ -1645,18 +1612,6 @@ mod tests {
         (scene, id)
     }
 
-    /// FNV-1a 64-bit hash of the framebuffer bytes.
-    fn fb_hash(fb: &[u32]) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for px in fb {
-            for b in px.to_le_bytes() {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        h
-    }
-
     /// Render `scene` via composed path with `mip_levels = 3,
     /// mip_scan_dist = 32` — same values the working
     /// `vxl_generate_mips_on_set_voxel_chunk_renders` test uses.
@@ -1685,64 +1640,14 @@ mod tests {
         fb
     }
 
-    /// Mid-tier with explicit mip overrides must produce a different
-    /// framebuffer than Near-tier rendering of the same scene. Loose
-    /// test — checks hash inequality and that the Mid render still
-    /// has some non-sky pixels (sanity that the renderer didn't bail).
-    #[test]
-    fn s6_1_mid_overrides_produce_different_framebuffer_than_near() {
-        // Camera at grid origin + a bit inside the chunk, looking +y.
-        let camera = camera_at([64.0, 0.0, 64.0]);
-
-        // Scene A: default thresholds → Near tier → renderer uses
-        // base settings (mip_levels=3, mip_scan_dist=32).
-        let (mut scene_a, _) = build_mip_visible_grid(DVec3::ZERO);
-        let fb_near = render_with_multi_mip(&mut scene_a, &camera);
-
-        // Scene B: thresholds force Mid tier + mip overrides. We
-        // cap mip_levels at 1 (no multi-mip) to guarantee a visible
-        // pixel difference vs Near's mip-1/2 transitions. This is
-        // the inverse of the typical "Mid = coarser" use case but
-        // is the most reliable way to demonstrate that the override
-        // path actually fires; production callers would more
-        // commonly leave mip_levels at base and lower mip_scan_dist.
-        let (mut scene_b, b_id) = build_mip_visible_grid(DVec3::ZERO);
-        scene_b.grid_mut(b_id).unwrap().lod_thresholds = crate::LodThresholds {
-            // r_near = 0 → any nonzero distance lands in Mid or Far.
-            r_near: 0.0,
-            r_mid: f64::INFINITY,
-            mid_mip_levels: Some(1),
-            mid_mip_scan_dist: None,
-        };
-        // Sanity: confirm the picker actually returns Mid for this pose.
-        let lod = scene_b
-            .grid(b_id)
-            .unwrap()
-            .select_lod(DVec3::from_array(camera.pos));
-        assert_eq!(lod, Lod::Mid, "expected Mid tier for forced thresholds");
-        let fb_mid = render_with_multi_mip(&mut scene_b, &camera);
-
-        // Both renders must contain non-sky pixels (the override
-        // didn't bust the renderer).
-        let (_engine, _, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
-        let non_sky_near = fb_near.iter().filter(|&&p| p != sky_color).count();
-        let non_sky_mid = fb_mid.iter().filter(|&&p| p != sky_color).count();
-        assert!(
-            non_sky_near > 100,
-            "Near render too sparse ({non_sky_near})"
-        );
-        assert!(non_sky_mid > 100, "Mid render too sparse ({non_sky_mid})");
-
-        // Hash must differ — the Mid override changed mip_levels
-        // from 3 to 1, which changes mip transitions and so changes
-        // pixels.
-        let h_near = fb_hash(&fb_near);
-        let h_mid = fb_hash(&fb_mid);
-        assert_ne!(
-            h_near, h_mid,
-            "Mid tier with mid_mip_levels=Some(1) must differ from Near (h_near={h_near:016x})"
-        );
-    }
+    // DDA.9: `s6_1_mid_overrides_produce_different_framebuffer_than_near`
+    // was removed. It encoded voxlap's mip-*transition* semantics
+    // (mid_mip_levels=Some(1) caps in-grid mip transitions, differing
+    // from Near's mip0→1→2 distance ramp). The DDA renderer uses a
+    // *uniform* per-grid mip (no in-grid transition), so Some(1) → mip 0
+    // = identical to Near. DDA mip coarsening is covered by
+    // `roxlap_core::dda` `mip_render_is_coarse_but_complete`; the LOD-Mid
+    // wiring by `s6_1_mid_without_overrides_byte_identical_to_near`.
 
     /// Mid tier with `mid_mip_levels = None` AND
     /// `mid_mip_scan_dist = None` must produce a byte-identical
@@ -1779,46 +1684,12 @@ mod tests {
         );
     }
 
-    /// `mip_levels_override` (the global per-grid cap) must compose
-    /// with the Mid override: the effective `mip_levels` should be
-    /// `min(mid_override, global_cap)`. Tests that the ship
-    /// anti-axis-aligned-beam workaround survives Mid tier.
-    ///
-    /// We pin this by checking that a grid with `mip_levels_override
-    /// = Some(1)` (mip-0 only — ship workaround) AND Mid-tier
-    /// `mid_mip_levels = Some(4)` renders the same as a grid with
-    /// just `mip_levels_override = Some(1)` at Near tier. Both
-    /// resolve to `mip_levels = 1` (no multi-mip), so both must
-    /// produce the same framebuffer.
-    #[test]
-    fn s6_1_global_mip_cap_survives_mid_tier() {
-        let camera = camera_at([64.0, 0.0, 64.0]);
-
-        // Scene A: Near tier + global cap=1.
-        let (mut scene_a, a_id) = build_mip_visible_grid(DVec3::ZERO);
-        scene_a.grid_mut(a_id).unwrap().mip_levels_override = Some(1);
-        let fb_a = render_with_multi_mip(&mut scene_a, &camera);
-
-        // Scene B: Mid tier + global cap=1 + Mid override=4. Global
-        // cap (1) should win since it's the tighter floor on
-        // `min(global_cap, mid_override)`.
-        let (mut scene_b, b_id) = build_mip_visible_grid(DVec3::ZERO);
-        scene_b.grid_mut(b_id).unwrap().mip_levels_override = Some(1);
-        scene_b.grid_mut(b_id).unwrap().lod_thresholds = crate::LodThresholds {
-            r_near: 0.0,
-            r_mid: f64::INFINITY,
-            mid_mip_levels: Some(4),
-            // mip_scan_dist override left None so we isolate the
-            // mip_levels resolution path.
-            mid_mip_scan_dist: None,
-        };
-        let fb_b = render_with_multi_mip(&mut scene_b, &camera);
-
-        assert_eq!(
-            fb_a, fb_b,
-            "global mip_levels_override should clamp Mid override (ship workaround survives Mid tier)"
-        );
-    }
+    // DDA.9: `s6_1_global_mip_cap_survives_mid_tier` was removed. It
+    // pinned voxlap's `mip_levels_override` global cap composing with the
+    // Mid override — the ship anti-axis-aligned-beam workaround. The DDA
+    // renderer has no axis-aligned mip beam (honest per-cell traversal),
+    // so the workaround / global cap is obsolete and the DDA path doesn't
+    // consult `mip_levels_override`.
 
     // ---- S6.3: Far-tier billboard blit ----
 
@@ -2388,7 +2259,9 @@ mod tests {
     #[test]
     fn render_scene_two_chunk_x_grid_hash_is_stable() {
         // Frozen 2026-05-10 at S4.0 landing on x86_64.
-        const GOLDEN: u64 = 0x215e_d66d_7359_4725;
+        // DDA.9: re-frozen to the DDA renderer's output (was the
+        // voxlap-opticast golden 0x215e_d66d_7359_4725).
+        const GOLDEN: u64 = 0x492e_c4bb_718f_d7e5;
         // Same scene shape as `render_scene_two_chunk_x_grid_no_seam`
         // — kept distinct so the hash assertion doesn't share its
         // setup with the structural seam check.
