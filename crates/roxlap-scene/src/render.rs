@@ -37,6 +37,7 @@
 #![allow(clippy::similar_names)]
 
 use glam::DVec3;
+use roxlap_core::dda::{render_dda, RasterSink};
 use roxlap_core::opticast::{opticast, OpticastOutcome, OpticastSettings};
 use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::scalar_rasterizer::ScalarRasterizer;
@@ -63,6 +64,16 @@ use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
 /// pattern is also visually distinct (cyan-ish neon) if anything
 /// ever leaks through to the screen, making the bug obvious.
 const SKY_MASK_SENTINEL: u32 = 0x00_DE_AD_BE;
+
+/// Whether to route rendering through the experimental per-pixel
+/// 3D-DDA backend ([`roxlap_core::dda`]) instead of voxlap's
+/// opticast. Opt-in via the `ROXLAP_DDA=1` environment variable while
+/// the DDA renderer is under construction (Substage DDA); the voxlap
+/// path remains the default until the DDA backend reaches parity
+/// (DDA.9).
+fn dda_enabled() -> bool {
+    std::env::var_os("ROXLAP_DDA").is_some_and(|v| v == "1")
+}
 
 /// Project a world-space [`Camera`] into a grid's local frame:
 /// translate by `-transform.origin`, then apply
@@ -196,7 +207,14 @@ pub fn render_scene(
             chunks_z: backing.chunks_z,
         };
         let grid_view = single_chunk_fast_path(&backing, &cg);
-        let outcome = {
+        let outcome = if dda_enabled() {
+            // DDA backend (Substage DDA). Behind `ROXLAP_DDA=1` while
+            // the per-pixel 3D-DDA renderer is built up; the voxlap
+            // opticast path stays the default until DDA.9.
+            let mut sink = RasterSink::new(fb, zb);
+            render_dda(&local_cam, settings, grid_view, pitch_pixels, &mut sink);
+            OpticastOutcome::Rendered
+        } else {
             let mut rasterizer = ScalarRasterizer::new(fb, zb, pitch_pixels, grid_view);
             if let Some(sky_ref) = sky {
                 rasterizer = rasterizer.with_sky(sky_ref);
