@@ -1189,8 +1189,21 @@ impl App {
             settings: &settings,
             sky_color: self.engine.sky_color(),
             sky: self.engine.sky(),
-            fog_color: self.engine.fog_color(),
-            fog_max_scan_dist: self.engine.fog_max_scan_dist(),
+            // DDA.9: fog is config-driven across all backends. Drive it
+            // from the sky colour + the live scan distance so terrain
+            // fades into the sky (matches the DDA/GPU look) and tracks
+            // the +/- scan-distance keys. (An explicit `Engine::set_fog`
+            // would override this.)
+            fog_color: if self.engine.fog_max_scan_dist() > 0 {
+                self.engine.fog_color()
+            } else {
+                self.engine.sky_color()
+            },
+            fog_max_scan_dist: if self.engine.fog_max_scan_dist() > 0 {
+                self.engine.fog_max_scan_dist()
+            } else {
+                self.scan_dist
+            },
             treat_z_max_as_air: true,
             gpu_mip_scan_dist: self.gpu_mip_scan_dist,
             gpu_max_outer_steps: chunks_visible,

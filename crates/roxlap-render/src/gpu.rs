@@ -445,18 +445,18 @@ impl GpuBackend {
             self.auto_sky_color = Some(frame.sky_color);
         }
 
-        // Match the DDA terrain fog (roxlap-scene `render_scene_composed`
-        // env): a linear ramp from t=0 to `max_scan_dist`, fogging toward
-        // the sky colour so terrain fades into the sky with no hard
-        // far-plane pop. An explicit host fog (`fog_max_scan_dist > 0`
-        // via `Engine::set_fog`) overrides both colour and distance.
+        // Config-driven fog, matching the CPU/DDA path (which reads the
+        // pool's fog state): on iff `fog_max_scan_dist > 0`, a linear
+        // ramp from t=0 to that distance toward `fog_color`. Off ⇒ a huge
+        // far ≈ no fog. The host (e.g. the scene demo) drives the fog
+        // colour/distance via `FrameParams`.
         #[allow(clippy::cast_precision_loss)]
-        let (fog_u32, far) = if frame.fog_max_scan_dist > 0 {
-            (frame.fog_color, frame.fog_max_scan_dist as f32)
+        let far = if frame.fog_max_scan_dist > 0 {
+            frame.fog_max_scan_dist as f32
         } else {
-            (frame.sky_color, frame.settings.max_scan_dist.max(1) as f32)
+            1.0e30
         };
-        let [r, g, b] = unpack_rgb(fog_u32);
+        let [r, g, b] = unpack_rgb(frame.fog_color);
         let color = [
             f32::from(r) / 255.0,
             f32::from(g) / 255.0,
