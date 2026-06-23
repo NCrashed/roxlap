@@ -228,6 +228,70 @@ impl<'a> GridView<'a> {
         self
     }
 
+    /// Surface colour of voxel `(x, y, z)` in this view's active chunk
+    /// at mip 0, or `None` for an empty / out-of-range cell.
+    ///
+    /// The DDA renderer's per-voxel sampler (Substage DDA). Decodes
+    /// the column's slab chain directly from [`Self::slab_buf`] /
+    /// [`Self::column_offsets`] — the same `vbuf` floor + ceiling list
+    /// walk [`roxlap_formats::vxl::Vxl::voxel_color`] performs, but
+    /// reading through the per-frame [`GridView`] borrow instead of an
+    /// owned `Vxl`, so it works for any chunk a multi-chunk view
+    /// resolves via [`Self::chunk_at_xyz`].
+    ///
+    /// Coordinates are chunk-local: `x, y ∈ [0, vsid)`, `z ∈
+    /// [0, CHUNK_SIZE_Z)`. The returned `u32` is packed `0xAARRGGBB`
+    /// (low 24 bits = RGB; `A` carries voxlap brightness). A zero-RGB
+    /// cell (the empty-chunk placeholder) reads as `None`.
+    #[must_use]
+    pub fn voxel_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
+        if x >= self.vsid || y >= self.vsid || z >= CHUNK_SIZE_Z {
+            return None;
+        }
+        if self.mip_base_offsets.is_empty() {
+            return None;
+        }
+        let base0 = self.mip_base_offsets[0];
+        let col_idx = base0 + (y * self.vsid + x) as usize;
+        let start = *self.column_offsets.get(col_idx)? as usize;
+        let slab = self.slab_buf.get(start..)?;
+        let len = roxlap_formats::vxl::slng(slab);
+        let slab = slab.get(..len)?;
+
+        let zi = i32::from(u8::try_from(z).ok()?);
+        let texel = |b: &[u8]| -> Option<u32> {
+            let rgb = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            // Zero RGB = empty-chunk placeholder → untextured.
+            (rgb & 0x00ff_ffff != 0).then_some(rgb)
+        };
+        let mut v = 0usize;
+        loop {
+            // Floor colour list of the current slab: z ∈ [z1, z1c].
+            let z_start = i32::from(slab[v + 1]);
+            let z1c = i32::from(slab[v + 2]);
+            if zi >= z_start && zi <= z1c {
+                let off = v + 4 + ((zi - z_start) as usize) * 4;
+                return texel(slab.get(off..off + 4)?);
+            }
+            let nextptr = slab[v];
+            if nextptr == 0 {
+                return None; // last slab, z not in its floor list
+            }
+            let (prev_z1, prev_z1c, prev_nextptr) = (z_start, z1c, i32::from(nextptr));
+            v += usize::from(nextptr) * 4;
+            // Ceiling colour list for the NEW slab — stored in the tail
+            // of the previous slab's bytes (voxlap `vbuf` convention).
+            let ze = i32::from(slab[v + 3]);
+            let ceil_z_start = ze + prev_z1c - prev_z1 - prev_nextptr + 2;
+            if zi >= ceil_z_start && zi < ze {
+                let ceil_n = (ze - ceil_z_start) as usize;
+                let ceil_start = v - ceil_n * 4;
+                let off = ceil_start + ((zi - ceil_z_start) as usize) * 4;
+                return texel(slab.get(off..off + 4)?);
+            }
+        }
+    }
+
     /// S4B.2.d: voxel-space XY axis-aligned bounding box of the
     /// grid. Returns `([xmin, ymin], [xmax, ymax])` in voxel units;
     /// the grid contains voxels with coordinates in
