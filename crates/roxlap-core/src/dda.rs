@@ -154,7 +154,7 @@ struct Hit {
 /// subtracts it from the brightness byte before the multiply, so a
 /// shaded face is uniformly darker. `0` = no side shading.
 #[inline]
-fn shade(color: u32, bright_sub: u32) -> u32 {
+pub(crate) fn shade(color: u32, bright_sub: u32) -> u32 {
     let a = ((color >> 24) & 0xff).saturating_sub(bright_sub);
     let ch = |shift: u32| -> u32 { ((((color >> shift) & 0xff) * a) >> 7).min(255) };
     0x8000_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0)
@@ -254,7 +254,12 @@ pub fn pixel_ray(
 /// so `t_enter >= 0`, i.e. a camera inside the box starts at `t = 0`),
 /// or `None` if the ray misses the box. `dir` need not be normalised —
 /// `t` is in units of `|dir|`.
-fn intersect_aabb(o: [f32; 3], dir: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> Option<(f32, f32)> {
+pub(crate) fn intersect_aabb(
+    o: [f32; 3],
+    dir: [f32; 3],
+    lo: [f32; 3],
+    hi: [f32; 3],
+) -> Option<(f32, f32)> {
     let mut t0 = 0.0f32;
     let mut t1 = f32::INFINITY;
     for a in 0..3 {
@@ -359,7 +364,7 @@ impl BrickMap {
 /// crossed; `t_delta[a]` is the parameter increment per cell. An
 /// axis-parallel component gets `t_max = t_delta = +inf` so it's never
 /// chosen as the stepping axis.
-fn dda_setup(
+pub(crate) fn dda_setup(
     origin: [f32; 3],
     dir: [f32; 3],
     cell: [i32; 3],
@@ -389,7 +394,7 @@ fn dda_setup(
 /// Index of the axis with the smallest `t_max` (the next boundary the
 /// ray crosses).
 #[inline]
-fn min_axis(t_max: [f32; 3]) -> usize {
+pub(crate) fn min_axis(t_max: [f32; 3]) -> usize {
     if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
         0
     } else if t_max[1] <= t_max[2] {

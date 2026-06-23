@@ -52,6 +52,7 @@ mod camera;
 pub mod camera_math;
 pub(crate) mod column_walk;
 pub mod dda;
+pub mod dda_sprite;
 pub mod drawtile;
 mod engine;
 // `equivec` (voxlap's normal table) moved to roxlap-formats so kv6
@@ -81,6 +82,7 @@ pub mod world_query;
 
 pub use camera::Camera;
 pub use dda::{pixel_ray, render_dda, render_dda_parallel, DdaEnv, PixelSink, RasterSink};
+pub use dda_sprite::draw_sprite_dda;
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
 pub use grid_view::{ChunkGrid, GridView};
 pub use opticast::{opticast, OpticastOutcome, OpticastSettings};

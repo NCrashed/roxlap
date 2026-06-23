@@ -154,6 +154,28 @@ impl<'a> RasterTarget<'a> {
         // SAFETY: caller asserts in-bounds + disjoint-from-other-threads.
         unsafe { self.zb_ptr.add(idx).write(z) };
     }
+
+    /// Depth-tested write: store `(color, z)` only if `z` is strictly
+    /// closer (smaller) than the current z-buffer entry. Returns whether
+    /// the pixel was written. The compositing primitive the DDA sprite
+    /// raycaster uses to occlude sprites against terrain.
+    ///
+    /// # Safety
+    /// `idx < self.fb_len()`, plus the parallel-use invariant.
+    #[must_use]
+    pub unsafe fn z_test_write(self, idx: usize, color: u32, z: f32) -> bool {
+        debug_assert!(idx < self.zb_len, "zb idx {} >= len {}", idx, self.zb_len);
+        // SAFETY: caller asserts in-bounds + disjoint-from-other-threads.
+        unsafe {
+            if z < *self.zb_ptr.add(idx) {
+                self.fb_ptr.add(idx).write(color);
+                self.zb_ptr.add(idx).write(z);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 // gcsub now lives on `ScanScratch::gcsub`; the host pokes it via
