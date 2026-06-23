@@ -8,16 +8,17 @@
 //! mip beams, cross-chunk virtual-column complexity). See
 //! `PORTING-DDA.md` for the full stage plan.
 //!
-//! **Stage status — DDA.4 (cross-chunk traversal).** Each pixel casts
-//! one ray and walks unit voxels over the grid's full voxel box
+//! **Stage status — DDA.5 (baked brightness shading).** Each pixel
+//! casts one ray and walks unit voxels over the grid's full voxel box
 //! ([`GridView::voxel_bounds`], spanning every chunk in XY **and** Z)
 //! via a 3D-DDA (Amanatides–Woo). A [`Sampler`] resolves each voxel to
 //! its chunk ([`GridView::chunk_at_xyz`]) and brick-gates the
-//! [`GridView::surface_color`] slab walk (per-frame [`BrickMap`] cache
-//! keyed by chunk). Cross-chunk look-down — the case voxlap needed the
-//! virtual-column stack for — falls out of the box spanning `chunks_z`.
-//! Misses leave the destination untouched, so the caller's sky pre-fill
-//! shows through. No shading/fog yet (DDA.5 — fog + textured sky).
+//! [`GridView::surface_color`] slab walk. The hit colour is shaded by
+//! the voxel's baked directional brightness ([`shade`]) — matching the
+//! GPU marcher — so lit scenes render correctly and editor relight is
+//! free. Misses leave the destination untouched, so the caller's sky
+//! pre-fill shows through. Remaining DDA.5 polish: distance fog,
+//! textured sky panorama, `side_shades` face tint.
 //!
 //! Buffer conventions match the rest of the engine so this backend is
 //! a drop-in for `opticast`: colour is packed `0x80RRGGBB`; depth is
@@ -90,6 +91,27 @@ impl PixelSink for RasterSink<'_> {
 struct Hit {
     color: u32,
     dist: f32,
+}
+
+/// Apply the voxel's baked directional brightness (Substage DDA.5).
+///
+/// Voxlap (and the GPU marcher, `grid_dda.wgsl`) store per-voxel
+/// brightness in the colour's high byte on a `0..128` scale — `0x80`
+/// is full brightness — written by `Grid::bake_lightmode` (estnorm
+/// directional shading). The shaded channel is `c · a / 128`, so the
+/// DDA matches the GPU look; an unbaked / full-bright voxel (`a =
+/// 0x80`) passes through unchanged. Output alpha is normalised to
+/// `0x80` (the standard "lit" flag; the present blit ignores it).
+///
+/// The renderer only *reads* the baked byte — it computes no normals
+/// itself, so per-impact relight is free (re-bake the chunk and the
+/// byte updates). The estnorm bake that produces the byte is the
+/// voxlap-derived piece slated for a clean-room rewrite in DDA.10.
+#[inline]
+fn shade(color: u32) -> u32 {
+    let a = (color >> 24) & 0xff;
+    let ch = |shift: u32| -> u32 { ((((color >> shift) & 0xff) * a) >> 7).min(255) };
+    0x8000_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 /// World-space ray for screen pixel `(px, py)` under opticast's
@@ -420,7 +442,7 @@ fn voxel_walk(
         }
         if let Some(color) = sampler.hit(voxel) {
             return Some(Hit {
-                color,
+                color: shade(color),
                 dist: depth.max(0.0),
             });
         }
@@ -559,7 +581,7 @@ fn cast_ray_reference(
         #[allow(clippy::cast_sign_loss)]
         if let Some(color) = grid.surface_color(voxel[0] as u32, voxel[1] as u32, voxel[2] as u32) {
             return Some(Hit {
-                color,
+                color: shade(color),
                 dist: depth.max(0.0),
             });
         }
@@ -869,6 +891,34 @@ mod tests {
             // Sanity: the scene is actually visible.
             assert!(fb_b.iter().any(|&c| c != 0), "pose {i} rendered empty");
         }
+    }
+
+    /// DDA.5: a voxel's baked brightness byte darkens its colour. A
+    /// half-bright voxel (`a = 0x40`) renders at roughly half RGB; a
+    /// full-bright one (`a = 0x80`) is unchanged.
+    #[test]
+    fn baked_brightness_darkens_color() {
+        // Half brightness: alpha 0x40 (64/128). White RGB → ~mid grey.
+        let dim =
+            roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| (z >= 8).then_some(0x40_FF_FF_FF));
+        let grid = GridView::from_single_vxl(&dim);
+        let cam = Camera {
+            pos: [8.0, 8.0, 2.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (fb, _) = render_brickmap(grid, &cam, 32, 32);
+        let centre = 16 * 32 + 16;
+        // 0xFF * 64 >> 7 = 127 per channel; alpha normalised to 0x80.
+        assert_eq!(fb[centre], 0x80_7F_7F_7F, "got {:08x}", fb[centre]);
+
+        // Full brightness passes RGB through unchanged.
+        let full =
+            roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| (z >= 8).then_some(0x80_FF_FF_FF));
+        let gridf = GridView::from_single_vxl(&full);
+        let (fbf, _) = render_brickmap(gridf, &cam, 32, 32);
+        assert_eq!(fbf[centre], 0x80_FF_FF_FF, "got {:08x}", fbf[centre]);
     }
 
     /// DDA.4 headline gate: cross-chunk look-down. A camera in an
