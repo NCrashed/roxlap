@@ -210,7 +210,15 @@ pub fn render_scene(
         let outcome = if dda_enabled() {
             // DDA backend (Substage DDA). Behind `ROXLAP_DDA=1` while
             // the per-pixel 3D-DDA renderer is built up; the voxlap
-            // opticast path stays the default until DDA.9.
+            // opticast path stays the default until DDA.9. The direct
+            // path doesn't pre-fill, so seed sky (black) + far depth
+            // here — DDA leaves misses untouched.
+            for px in fb.iter_mut() {
+                *px = 0;
+            }
+            for d in zb.iter_mut() {
+                *d = f32::INFINITY;
+            }
             let mut sink = RasterSink::new(fb, zb);
             render_dda(&local_cam, settings, grid_view, pitch_pixels, &mut sink);
             OpticastOutcome::Rendered
@@ -702,7 +710,24 @@ fn render_scene_composed_scissored(
             }
         };
 
-        let outcome = {
+        // Vertical scissor: restrict the render to the grid's screen
+        // y-band (full width). `rect` is always full-width here (see
+        // the rect computation), so this is the proven `y_start /
+        // y_end` strip path — byte-identical to the full frame when
+        // the band is `0..height`. The lateral cull happened above;
+        // a horizontal opticast scissor is unsafe (the radar's
+        // column-indexed `angstart` isn't reset per grid, so column
+        // clipping reads stale entries at extreme poses — see the
+        // `cpu-grid-scissor` memo).
+        let scissored = (*active_settings).with_y_range(rect.y0, rect.y1);
+        let outcome = if dda_enabled() {
+            // DDA backend (Substage DDA). temp_fb / temp_zb are already
+            // pre-filled with sky / INFINITY for this grid's rect, so
+            // DDA's miss-leaves-untouched contract yields correct sky.
+            let mut sink = RasterSink::new(&mut temp_fb, &mut temp_zb);
+            render_dda(&local_cam, &scissored, grid_view, pitch_pixels, &mut sink);
+            OpticastOutcome::Rendered
+        } else {
             let mut rasterizer =
                 ScalarRasterizer::new(&mut temp_fb, &mut temp_zb, pitch_pixels, grid_view);
             // Sky texture is suppressed for `!owns_sky` grids so
@@ -713,16 +738,6 @@ fn render_scene_composed_scissored(
                     rasterizer = rasterizer.with_sky(sky_ref);
                 }
             }
-            // Vertical scissor: restrict opticast to the grid's screen
-            // y-band (full width). `rect` is always full-width here (see
-            // the rect computation), so this is the proven `y_start /
-            // y_end` strip path — byte-identical to the full frame when
-            // the band is `0..height`. The lateral cull happened above;
-            // a horizontal opticast scissor is unsafe (the radar's
-            // column-indexed `angstart` isn't reset per grid, so column
-            // clipping reads stale entries at extreme poses — see the
-            // `cpu-grid-scissor` memo).
-            let scissored = (*active_settings).with_y_range(rect.y0, rect.y1);
             opticast(&mut rasterizer, pool, &local_cam, &scissored, grid_view)
         };
 

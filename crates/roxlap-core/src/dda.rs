@@ -8,12 +8,15 @@
 //! mip beams, cross-chunk virtual-column complexity). See
 //! `PORTING-DDA.md` for the full stage plan.
 //!
-//! **Stage status — DDA.1 (single-chunk dense traversal).** Each pixel
-//! casts one ray and walks unit voxels of the active chunk via a 3D-DDA
+//! **Stage status — DDA.2 (sky + camera poses).** Each pixel casts one
+//! ray and walks unit voxels of the active chunk via a 3D-DDA
 //! (Amanatides–Woo), sampling [`GridView::voxel_color`] until the first
-//! textured cell. Flat voxel colour, no brickmap, no cross-chunk step,
-//! no shading yet (DDA.3 / DDA.4 / DDA.5). The framebuffer keeps
-//! whatever the caller pre-filled (sky) wherever a ray misses.
+//! textured cell. Misses leave the destination untouched, so the
+//! caller's sky pre-fill shows through (the scene composed path
+//! pre-fills `sky_color` + `INFINITY`). A camera inside solid material
+//! hits its own voxel immediately (no skip). Flat voxel colour, no
+//! brickmap, no cross-chunk step, no shading/fog yet (DDA.3 / DDA.4 /
+//! DDA.5 — fog + textured sky land with shading in DDA.5).
 //!
 //! Buffer conventions match the rest of the engine so this backend is
 //! a drop-in for `opticast`: colour is packed `0x80RRGGBB`; depth is
@@ -245,7 +248,7 @@ fn cast_ray(
             return None;
         }
         #[allow(clippy::cast_sign_loss)]
-        if let Some(color) = grid.voxel_color(voxel[0] as u32, voxel[1] as u32, voxel[2] as u32) {
+        if let Some(color) = grid.surface_color(voxel[0] as u32, voxel[1] as u32, voxel[2] as u32) {
             return Some(Hit {
                 color,
                 dist: depth.max(0.0),
@@ -482,6 +485,88 @@ mod tests {
             "centre depth {} not ≈ {}",
             hit.2,
             expected
+        );
+    }
+
+    /// DDA.2: a camera looking at the horizon splits the frame into
+    /// sky (upward rays miss → no write) and floor (downward rays hit).
+    /// The top of the frame must be mostly sky, the bottom mostly
+    /// floor.
+    #[test]
+    fn horizon_splits_sky_and_floor() {
+        const FLOOR_Z: u32 = 40;
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| {
+            (z >= FLOOR_Z).then_some(0x80_44_66_88)
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+
+        // At z=30 (above the z=40 floor), looking +y horizontally,
+        // down = +z. Upward rays (low py) escape through the box top
+        // (z=0) → sky; downward rays (high py) strike the floor.
+        let cam = Camera {
+            pos: [32.0, 4.0, 30.0],
+            right: [-1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let (w, h) = (64u32, 64u32);
+        let mask = render_mask(grid, &cam, w, h);
+
+        let count_band = |y0: usize, y1: usize| -> usize {
+            (y0 * w as usize..y1 * w as usize)
+                .filter(|&i| mask[i])
+                .count()
+        };
+        let top = count_band(0, h as usize / 4);
+        let bottom = count_band(3 * h as usize / 4, h as usize);
+        assert!(mask.iter().any(|&b| b), "floor must be visible");
+        assert!(mask.iter().any(|&b| !b), "sky must be visible");
+        assert!(
+            bottom > top,
+            "bottom band ({bottom}) should hit more floor than top band ({top})"
+        );
+    }
+
+    /// DDA.2 correctness: a heightmap column's interior is solid even
+    /// though voxlap only stores a colour for its surface. `voxel_color`
+    /// returns `None` for an interior voxel, but `surface_color` must
+    /// return the run's surface colour — otherwise oblique rays striking
+    /// a cliff *side* would pass straight through (see-through terrain).
+    #[test]
+    fn cliff_side_is_solid_not_see_through() {
+        const TOP_Z: u32 = 50;
+        const COL: u32 = 0x80_77_88_99;
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(8, |_, _, z| (z >= TOP_Z).then_some(COL));
+        let grid = GridView::from_single_vxl(&vxl);
+
+        // Surface voxel: coloured directly.
+        assert_eq!(grid.voxel_color(4, 4, TOP_Z), Some(COL));
+        // Interior voxel: voxlap stores no colour …
+        assert_eq!(grid.voxel_color(4, 4, 150), None);
+        // … but it is solid, and surface_color bleeds the run-top colour
+        // down the cliff face → a real hit, not see-through.
+        assert_eq!(grid.surface_color(4, 4, 150), Some(COL));
+        // Bedrock-style air above the surface stays air.
+        assert_eq!(grid.surface_color(4, 4, 10), None);
+    }
+
+    /// DDA.2: a camera embedded in solid material hits its own voxel
+    /// immediately — every ray reports a hit (no skip / no garbage).
+    #[test]
+    fn camera_inside_solid_hits_everywhere() {
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, _| Some(0x80_55_55_55));
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [8.0, 8.0, 128.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (w, h) = (32u32, 32u32);
+        let mask = render_mask(grid, &cam, w, h);
+        assert!(
+            mask.iter().all(|&b| b),
+            "every ray must hit when the camera is inside solid"
         );
     }
 

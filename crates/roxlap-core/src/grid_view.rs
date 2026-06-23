@@ -228,12 +228,83 @@ impl<'a> GridView<'a> {
         self
     }
 
+    /// Raw slab-chain bytes for the column `(x, y)` in this view's
+    /// active chunk at mip 0, or `None` if out of range / unbacked.
+    fn column_slab(&self, x: u32, y: u32) -> Option<&'a [u8]> {
+        if x >= self.vsid || y >= self.vsid || self.mip_base_offsets.is_empty() {
+            return None;
+        }
+        let base0 = self.mip_base_offsets[0];
+        let col_idx = base0 + (y * self.vsid + x) as usize;
+        let start = *self.column_offsets.get(col_idx)? as usize;
+        let slab = self.slab_buf.get(start..)?;
+        let len = roxlap_formats::vxl::slng(slab);
+        slab.get(..len)
+    }
+
+    /// Top z of the solid run containing voxel `(x, y, z)`, or `None`
+    /// if the voxel is air.
+    ///
+    /// Mirrors [`roxlap_formats::edit::expandrle`]'s run decomposition
+    /// (the same `[top, bot)` solid runs [`crate::world_query`] and the
+    /// scene's `voxel_solid` use), walking the slab chain in place. The
+    /// returned top is always a colour-list voxel, so callers can shade
+    /// an interior / side-face hit with `voxel_color(x, y, top)`.
+    #[must_use]
+    pub fn voxel_run_top(&self, x: u32, y: u32, z: u32) -> Option<i32> {
+        if z >= CHUNK_SIZE_Z {
+            return None;
+        }
+        let slab = self.column_slab(x, y)?;
+        let zi = i32::from(u8::try_from(z).ok()?);
+        let maxz = CHUNK_SIZE_Z as i32;
+        // First run opens at the first slab's z1 (`expandrle uind[0]`).
+        let mut top = i32::from(slab[1]);
+        let mut v = 0usize;
+        loop {
+            let nextptr = usize::from(slab[v]);
+            if nextptr == 0 {
+                // Last run extends to bedrock: [top, MAXZDIM).
+                return (zi >= top && zi < maxz).then_some(top);
+            }
+            v += nextptr * 4;
+            let ze = i32::from(slab[v + 3]);
+            let z1 = i32::from(slab[v + 1]);
+            if ze >= z1 {
+                continue; // degenerate slab — run continues
+            }
+            // Current run closes at `ze`; the next opens at `z1`.
+            if zi >= top && zi < ze {
+                return Some(top);
+            }
+            top = z1;
+        }
+    }
+
+    /// DDA hit colour for voxel `(x, y, z)`: the display colour if the
+    /// voxel is **solid and renderable**, or `None` for air or an
+    /// uncoloured bedrock-placeholder run (which DDA steps through as if
+    /// transparent).
+    ///
+    /// Exact colour-list cells (top / bottom faces) return their own
+    /// colour; interior / side-face cells fall back to the colour of
+    /// their run's top voxel (the surface colour "bleeds" down a cliff
+    /// face). This is the per-voxel hit test the DDA renderer uses —
+    /// [`Self::voxel_color`] alone is insufficient because voxlap only
+    /// stores colours for surface voxels, not solid interiors.
+    #[must_use]
+    pub fn surface_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
+        let top = self.voxel_run_top(x, y, z)?;
+        self.voxel_color(x, y, z)
+            .or_else(|| self.voxel_color(x, y, u32::try_from(top).ok()?))
+    }
+
     /// Surface colour of voxel `(x, y, z)` in this view's active chunk
     /// at mip 0, or `None` for an empty / out-of-range cell.
     ///
-    /// The DDA renderer's per-voxel sampler (Substage DDA). Decodes
-    /// the column's slab chain directly from [`Self::slab_buf`] /
-    /// [`Self::column_offsets`] — the same `vbuf` floor + ceiling list
+    /// The DDA renderer's per-voxel colour sampler (Substage DDA).
+    /// Decodes the column's slab chain directly from [`Self::slab_buf`]
+    /// / [`Self::column_offsets`] — the same `vbuf` floor + ceiling list
     /// walk [`roxlap_formats::vxl::Vxl::voxel_color`] performs, but
     /// reading through the per-frame [`GridView`] borrow instead of an
     /// owned `Vxl`, so it works for any chunk a multi-chunk view
@@ -242,22 +313,15 @@ impl<'a> GridView<'a> {
     /// Coordinates are chunk-local: `x, y ∈ [0, vsid)`, `z ∈
     /// [0, CHUNK_SIZE_Z)`. The returned `u32` is packed `0xAARRGGBB`
     /// (low 24 bits = RGB; `A` carries voxlap brightness). A zero-RGB
-    /// cell (the empty-chunk placeholder) reads as `None`.
+    /// cell (the empty-chunk placeholder) reads as `None`. Returns a
+    /// colour only for surface voxels — use [`Self::surface_color`] for
+    /// the full solid-cell hit test.
     #[must_use]
     pub fn voxel_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
-        if x >= self.vsid || y >= self.vsid || z >= CHUNK_SIZE_Z {
+        if z >= CHUNK_SIZE_Z {
             return None;
         }
-        if self.mip_base_offsets.is_empty() {
-            return None;
-        }
-        let base0 = self.mip_base_offsets[0];
-        let col_idx = base0 + (y * self.vsid + x) as usize;
-        let start = *self.column_offsets.get(col_idx)? as usize;
-        let slab = self.slab_buf.get(start..)?;
-        let len = roxlap_formats::vxl::slng(slab);
-        let slab = slab.get(..len)?;
-
+        let slab = self.column_slab(x, y)?;
         let zi = i32::from(u8::try_from(z).ok()?);
         let texel = |b: &[u8]| -> Option<u32> {
             let rgb = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
