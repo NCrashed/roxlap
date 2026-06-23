@@ -26,11 +26,9 @@ use std::time::Instant;
 
 use flate2::read::GzDecoder;
 use roxlap_core::camera_math;
-use roxlap_core::kfa_draw::draw_kfa_sprite;
-use roxlap_core::opticast;
-use roxlap_core::rasterizer::ScratchPool;
-use roxlap_core::scalar_rasterizer::ScalarRasterizer;
-use roxlap_core::sprite::{draw_sprite, DrawTarget, SpriteLighting};
+use roxlap_core::dda::{render_dda_parallel, BrickCache, DdaEnv};
+use roxlap_core::dda_sprite::draw_sprite_dda;
+use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::world_query::{getcube, Cube};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
@@ -272,11 +270,10 @@ struct App {
     /// f32 z-buffer, allocated lazily / re-sized on first redraw and
     /// resized on window-resize.
     zbuffer: Vec<f32>,
-    /// Per-thread `ScanScratch` pool (radar / angstart / lastx /
-    /// uurend), reused across frames. Sized at app construction for
-    /// the initial window resolution; resized on window-resize.
-    /// Single slot until R12.2's per-quadrant fan-out lands.
-    pool: ScratchPool,
+    /// DDA brick-occupancy cache for the single world chunk. Built once
+    /// (occupancy is independent of the lighting bake, which only edits
+    /// colours), reused every frame.
+    bricks: BrickCache,
     /// World loaded from `oracle.vxl.gz`. `vxl.data` is the flat
     /// slab buffer, `vxl.column_offset` the per-column byte offsets;
     /// `vxl.vsid` the world dimension; `vxl.ipo`/`ist`/`ihe`/`ifo`
@@ -561,70 +558,56 @@ impl App {
         if self.zbuffer.len() < pixel_count {
             self.zbuffer.resize(pixel_count, 0.0);
         }
-        if self.pool.slot(0).uurend_half_stride < size.width as usize {
-            self.pool = ScratchPool::new(size.width, size.height, self.vxl.vsid);
-        }
-
-        // Wire engine sky colour onto every pool slot so grouscan's
-        // startsky has the right (col, dist) for any radar slot it
-        // drains. The `dist` seeded here is overwritten per-ray by
-        // gline based on the frustum-edge clip outcome. u32 → i32
-        // reinterpret (preserves bits; `cast_signed` is 1.87+, beyond
-        // the workspace MSRV).
-        let sky_col_i = i32::from_ne_bytes(self.engine.sky_color().to_ne_bytes());
-        self.pool.set_skycast(sky_col_i, 0);
-
-        // Engine fog → foglut on every slot. Rebuilds the 2048-entry
-        // table only when fog params change.
-        let fog_col_i = i32::from_ne_bytes(self.engine.fog_color().to_ne_bytes());
-        self.pool
-            .set_fog(fog_col_i, self.engine.fog_max_scan_dist());
-
-        // Engine side-shades → gcsub on every slot. Default is
-        // `[0; 6]` (no shading); the host bumps it to a moderate
-        // value at startup so faces facing each direction read
-        // visibly different.
-        let s = self.engine.side_shades();
-        self.pool
-            .set_side_shades(s[0], s[1], s[2], s[3], s[4], s[5]);
-
-        // S1.W: render voxlap's z=MAXZDIM-1 bedrock voxel as if it
-        // were air, so OOB-camera rays under the world's footprint
-        // continue to startsky and pick up the textured/solid sky
-        // instead of the bedrock's BLACK placeholder color. See
-        // `ScanScratch::treat_z_max_as_air`.
-        self.pool.set_treat_z_max_as_air(true);
-
         let cam = self.camera();
         let sky = self.engine.sky_color();
         let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
         let pitch_pixels = size.width as usize;
+
+        // DDA shading environment from the engine: textured sky panorama
+        // (if any), distance fog, and per-face side shading. The bedrock
+        // placeholder reads as transparent in the DDA sampler, so no
+        // `treat_z_max_as_air` flag is needed (OOB rays fall through to
+        // sky on their own).
+        #[allow(clippy::cast_precision_loss)]
+        let env = DdaEnv {
+            sky: self.engine.sky(),
+            fog_color: self.engine.fog_color(),
+            fog_max_dist: self.engine.fog_max_scan_dist().max(0) as f32,
+            side_shades: self.engine.side_shades(),
+        };
+
+        // The world is one chunk; its brick occupancy is independent of
+        // the lighting bake (colours only), so build once and reuse.
+        let grid = roxlap_core::GridView::from_single_vxl(&self.vxl);
+        self.bricks.ensure([0, 0, 0], 0, 0, &grid);
 
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
         surface.resize(w_nz, h_nz).expect("softbuffer: resize");
         let mut buffer = surface.buffer_mut().expect("softbuffer: buffer_mut");
-        // Pre-fill with sky so any pixel opticast leaves untouched
-        // reads as sky.
+        // Pre-fill sky + reset the z-buffer; the DDA leaves a miss
+        // untouched (sky) and writes hits with perpendicular depth.
         for px in buffer.iter_mut() {
             *px = sky;
         }
+        for z in &mut self.zbuffer[..pixel_count] {
+            *z = f32::INFINITY;
+        }
 
-        // Scope the rasterizer so its &mut buffer borrow ends before
-        // we present the buffer.
+        // Scope the buffer borrow so it ends before present.
         {
-            let grid = roxlap_core::GridView::from_single_vxl(&self.vxl);
-            let rasterizer =
-                ScalarRasterizer::new(&mut buffer, &mut self.zbuffer, pitch_pixels, grid);
-            // Bind the sky if the engine has one — opts the
-            // rasterizer into the textured-startsky path.
-            let mut rasterizer = if let Some(sky) = self.engine.sky() {
-                rasterizer.with_sky(sky)
-            } else {
-                rasterizer
-            };
-            let _ = opticast(&mut rasterizer, &mut self.pool, &cam, &settings, grid);
+            render_dda_parallel(
+                &cam,
+                &settings,
+                grid,
+                &mut buffer,
+                &mut self.zbuffer[..pixel_count],
+                pitch_pixels,
+                &env,
+                &self.bricks,
+                0,
+            );
         }
 
         // R6.4 sprite render: cull + setup + per-voxel rasterizer
@@ -652,71 +635,66 @@ impl App {
         }
 
         {
-            // Debug: ROXLAP_HOST_SPRITE_NO_Z=1 wipes the zbuffer
-            // back to +∞ before sprite render. Sprites then draw
-            // unconditionally on top of opticast output. Lets us
-            // distinguish "sprite z-test is rejecting" from
-            // "sprite geometry is broken".
+            // Debug: ROXLAP_HOST_SPRITE_NO_Z=1 wipes the zbuffer back to
+            // +∞ before sprite render, so sprites draw unconditionally on
+            // top of the terrain — separates "z-test rejecting" from
+            // "geometry broken".
             if std::env::var("ROXLAP_HOST_SPRITE_NO_Z").is_ok() {
-                for z in &mut self.zbuffer {
+                for z in &mut self.zbuffer[..pixel_count] {
                     *z = f32::INFINITY;
                 }
             }
-
-            let mut target = DrawTarget::new(
-                &mut buffer,
-                &mut self.zbuffer,
-                pitch_pixels,
-                size.width,
-                size.height,
-            );
-            // Snapshot the engine's lighting state once per frame.
-            // Cheap to build (it's just three field reads + a slice
-            // borrow) and lets sprite shading respond to runtime
-            // setter calls (e.g. moving the demo torch).
-            let lighting = SpriteLighting::from_engine(&self.engine);
-
-            // Debug: count pixels written per sprite. Gated on an
-            // env var so the noise stays out of normal interactive
-            // runs. Set ROXLAP_HOST_SPRITE_DEBUG=1 to see counts.
             let debug = std::env::var("ROXLAP_HOST_SPRITE_DEBUG").is_ok();
+
+            // DDA.8 clean-room sprite raycaster — composites against the
+            // shared z-buffer just like the terrain pass.
             for (i, sprite) in self.sprites.iter().enumerate() {
-                let written = draw_sprite(&mut target, &cam_state, &settings, &lighting, sprite);
+                let written = draw_sprite_dda(
+                    &mut buffer,
+                    &mut self.zbuffer[..pixel_count],
+                    pitch_pixels,
+                    size.width,
+                    size.height,
+                    &cam_state,
+                    &settings,
+                    sprite,
+                );
                 if debug {
                     eprintln!(
-                        "sprite[{i}]: pos=({:.1}, {:.1}, {:.1}) basis_s=({:.2},{:.2},{:.2}) → wrote {} pixels",
+                        "sprite[{i}]: pos=({:.1}, {:.1}, {:.1}) → wrote {written} pixels",
                         sprite.p[0], sprite.p[1], sprite.p[2],
-                        sprite.s[0], sprite.s[1], sprite.s[2],
-                        written
                     );
                 }
             }
 
-            // Animate the KFA demo: spin bone 1 around its hinge
-            // axis once per ~4 seconds. kfaval is a Q15 angle —
-            // full circle = 65536 ticks, so 16384 ticks/sec gives
-            // 4-second period.
+            // Animate the KFA demo: spin bone 1 around its hinge axis
+            // once per ~4 seconds (Q15 angle; 16384 ticks/sec).
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let spin = (self.spawn_time.elapsed().as_secs_f32() * 16384.0) as i32;
             let spin_angle = (spin & 0xffff) as i16;
             let ax = self.kfa_demo.hinges[1].v[0];
             self.kfa_demo.kfaval[1] =
                 roxlap_formats::xform::BoneXform::from_hinge_angle([ax.x, ax.y, ax.z], spin_angle);
-            let kfa_written = draw_kfa_sprite(
-                &mut target,
-                &cam_state,
-                &settings,
-                &lighting,
-                &mut self.kfa_demo,
-            );
+            // Pose the bone hierarchy into world-space limb sprites, then
+            // draw each limb as an ordinary DDA sprite (KFA = posed KV6s).
+            solve_kfa_limbs(&mut self.kfa_demo);
+            let mut kfa_written = 0u32;
+            for limb in &self.kfa_demo.limbs {
+                kfa_written += draw_sprite_dda(
+                    &mut buffer,
+                    &mut self.zbuffer[..pixel_count],
+                    pitch_pixels,
+                    size.width,
+                    size.height,
+                    &cam_state,
+                    &settings,
+                    limb,
+                );
+            }
             if debug {
                 eprintln!(
-                    "kfa_demo: pos=({:.1}, {:.1}, {:.1}) spin={} → wrote {} pixels",
-                    self.kfa_demo.p[0],
-                    self.kfa_demo.p[1],
-                    self.kfa_demo.p[2],
-                    spin_angle,
-                    kfa_written
+                    "kfa_demo: pos=({:.1}, {:.1}, {:.1}) spin={spin_angle} → wrote {kfa_written} pixels",
+                    self.kfa_demo.p[0], self.kfa_demo.p[1], self.kfa_demo.p[2],
                 );
             }
         }
@@ -1236,7 +1214,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "loaded world: vsid={}, ipo=({:.1}, {:.1}, {:.1})",
         vxl_world.vsid, vxl_world.ipo[0], vxl_world.ipo[1], vxl_world.ipo[2],
     );
-    let initial_pool = ScratchPool::new(WIDTH, HEIGHT, vxl_world.vsid);
     let cam_pos = vxl_world.ipo;
 
     // Voxlap's classic per-side darkening (top, bot, left, right,
@@ -1388,7 +1365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         surface: None,
         engine,
         zbuffer: Vec::new(),
-        pool: initial_pool,
+        bricks: BrickCache::new(),
         vxl: vxl_world,
         cam_pos,
         yaw: 0.0,
