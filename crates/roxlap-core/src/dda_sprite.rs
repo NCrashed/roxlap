@@ -62,7 +62,14 @@ impl Kv6Dense {
                     if z >= 0 && z < dims[2] {
                         let idx = ((x as i32 * dims[1] + y as i32) * dims[2] + z) as usize;
                         occ[idx] = true;
-                        col[idx] = v.col;
+                        // KV6's colour high byte is voxlap's `dir`/shading
+                        // slot, NOT the 0..128 brightness `shade` expects:
+                        // some models store `0x80` (coco), others `0x00`
+                        // (meltsphere → all-black under `shade`). Force full
+                        // brightness so both render at their authored RGB
+                        // (sprites are flat-lit in the clean-room path; the
+                        // voxlap `dir`-LUT reflection shading is not ported).
+                        col[idx] = (v.col & 0x00ff_ffff) | 0x8000_0000;
                     }
                 }
             }
@@ -380,6 +387,40 @@ mod tests {
             (zb[centre] - 36.0).abs() < 3.0,
             "centre depth {} not ≈ 36",
             zb[centre]
+        );
+    }
+
+    /// A KV6 whose voxel colours store a `0x00` high byte (voxlap's
+    /// unused `dir` slot, e.g. `sprite_meltsphere.kv6`) must still
+    /// render its authored RGB, not black — the brightness byte is
+    /// normalised to full on decode.
+    #[test]
+    fn zero_high_byte_sprite_not_black() {
+        let kv6 = Kv6::solid_cube(8, 0x00_C0_40_20);
+        let sprite = Sprite::axis_aligned(kv6, [0.0, 40.0, 0.0]);
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let cam = cam_looking_y();
+        let cs = camera_math::derive(&cam, w, h, 32.0, 32.0, 32.0);
+        let wrote = draw_sprite_dda(
+            &mut fb,
+            &mut zb,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &settings(w, h),
+            &sprite,
+        );
+        assert!(wrote > 20, "cube should cover many pixels (got {wrote})");
+        let centre = (h / 2 * w + w / 2) as usize;
+        assert_eq!(
+            fb[centre] & 0x00ff_ffff,
+            0x00_C0_40_20,
+            "zero-high-byte sprite rendered as {:08x} (black bug)",
+            fb[centre]
         );
     }
 
