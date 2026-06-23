@@ -421,6 +421,29 @@ impl<'a> GridView<'a> {
         }
     }
 
+    /// Full voxel-space bounding box of the grid: `([x0, y0, z0],
+    /// [x1, y1, z1])` half-open in grid-local voxel coordinates. XY
+    /// comes from [`Self::aabb_xy`]; Z spans the chunk grid's
+    /// `chunks_z` layers (`origin_chunk_z * CHUNK_SIZE_Z` upward), or a
+    /// single `[0, CHUNK_SIZE_Z)` chunk when un-stacked. The DDA
+    /// renderer ([`crate::dda`]) uses this as the outer traversal box.
+    #[must_use]
+    pub fn voxel_bounds(&self) -> ([i32; 3], [i32; 3]) {
+        let ([x0, y0], [x1, y1]) = self.aabb_xy();
+        let csz = CHUNK_SIZE_Z as i32;
+        let (z0, z1) = if let Some(cg) = self.chunk_grid {
+            #[allow(clippy::cast_possible_wrap)]
+            let chunks_z = cg.chunks_z as i32;
+            (
+                cg.origin_chunk_z * csz,
+                (cg.origin_chunk_z + chunks_z) * csz,
+            )
+        } else {
+            (0, csz)
+        };
+        ([x0, y0, z0], [x1, y1, z1])
+    }
+
     /// S4B.2.a: chunk lookup for the cross-chunk-XY DDA.
     ///
     /// Returns the [`GridView`] for the chunk at XY index
