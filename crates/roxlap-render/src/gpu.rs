@@ -23,7 +23,6 @@ use crate::{
 use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
-use roxlap_core::sprite::sprite_colmul;
 use roxlap_core::Camera;
 use roxlap_gpu::{
     build_sprite_model, GpuInitError, GpuRenderer, GpuSceneResident, SpriteInstance,
@@ -488,21 +487,9 @@ impl GpuBackend {
         // stacks, exactly as voxlap does. Default [0;6] = no shading.
         self.gpu.set_scene_side_shades(frame.side_shades);
 
-        // GPU.10 sprite lighting: rebuild each instance's voxlap
-        // `kv6colmul` table from its current pose + the frame's lighting,
-        // so the GPU sprite pass shades exactly like the CPU rasteriser
-        // (directional, normal-based). Cheap for the demo's handful of
-        // instances; recomputed every frame because KFA limbs rotate.
-        if let Some(lighting) = frame.sprite_lighting {
-            if !self.sprite_basis.is_empty() {
-                let tables: Vec<[u64; 256]> = self
-                    .sprite_basis
-                    .iter()
-                    .map(|s| sprite_colmul(s, lighting).0)
-                    .collect();
-                self.gpu.set_sprite_instance_colmul(&tables);
-            }
-        }
+        // Sprites render flat-lit (identity `kv6colmul`, the GPU default)
+        // to match the CPU backend's clean-room DDA sprite raycaster —
+        // the voxlap directional `sprite_colmul` shading is not used.
 
         let cameras = self.grid_cameras(scene, camera);
         // Sprites are world-space, so they project through the world

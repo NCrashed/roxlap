@@ -121,11 +121,9 @@ pub fn build_demo() -> SceneAndCamera {
         // and rotated orientations are visually clean.
     }
 
-    // GPU.9 KV6 sprite — the actual sprite is drawn in `redraw`
-    // via `roxlap_core::sprite::draw_sprite`, NOT inserted as a
-    // Grid. Voxlap's traditional KV6 rendering is camera-facing
-    // voxel splatter; doing it through the heightmap-based opticast
-    // (= what a Grid would do) loses that aesthetic.
+    // GPU.9 KV6 sprite — the actual sprite is drawn by the renderer
+    // via the DDA sprite raycaster (`draw_sprite_dda`), NOT inserted
+    // as a Grid: a KV6 model is a free-standing object, not terrain.
 
     // Bake lightmode-1 directional shading into every chunk's slab
     // alpha bytes. Pure surface-normal-based gradient — voxlap's

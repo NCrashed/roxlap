@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use roxlap_core::opticast::OpticastSettings;
-use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::Engine;
 use roxlap_formats::character::{self, Bone, Character, Clip, ClipData, MeshRef};
 use roxlap_formats::kfa::{Hinge, Point3, Seq};
@@ -1180,7 +1179,6 @@ impl App {
         #[allow(clippy::cast_sign_loss)]
         let chunks_visible = (self.scan_dist.max(1) as u32) / roxlap_scene::CHUNK_SIZE_XY + 4;
 
-        let lighting = SpriteLighting::from_engine(&self.engine);
         let frame = FrameParams {
             settings: &settings,
             sky_color: self.engine.sky_color(),
@@ -1204,7 +1202,7 @@ impl App {
             gpu_mip_scan_dist: self.gpu_mip_scan_dist,
             gpu_max_outer_steps: chunks_visible,
             gpu_fov_y_rad: (GPU_FOV_Y_DEG as f32).to_radians(),
-            sprite_lighting: Some(&lighting),
+            draw_sprites: true,
             side_shades: self.engine.side_shades(),
         };
 

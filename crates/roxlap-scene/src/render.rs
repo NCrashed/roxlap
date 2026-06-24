@@ -38,9 +38,7 @@
 
 use glam::DVec3;
 use roxlap_core::dda::{render_dda_parallel, DdaEnv};
-use roxlap_core::opticast::{opticast, OpticastOutcome, OpticastSettings};
-use roxlap_core::rasterizer::ScratchPool;
-use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
 
@@ -65,14 +63,22 @@ use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
 /// ever leaks through to the screen, making the bug obvious.
 const SKY_MASK_SENTINEL: u32 = 0x00_DE_AD_BE;
 
-/// Whether to route CPU rendering through the per-pixel 3D-DDA backend
-/// ([`roxlap_core::dda`]) instead of voxlap's opticast.
+/// CPU fog + per-face shading config for the DDA backend, passed by
+/// value into the scene render entry points (replaces the old
+/// `&mut ScratchPool` parameter the voxlap path threaded fog through).
 ///
-/// **DDA.9: DDA is the default CPU backend.** The legacy voxlap opticast
-/// path is kept only as an opt-out for A/B comparison via
-/// `ROXLAP_VOXLAP=1`, pending its deletion.
-fn dda_enabled() -> bool {
-    !std::env::var_os("ROXLAP_VOXLAP").is_some_and(|v| v == "1")
+/// `max_scan_dist <= 0` disables fog (no distance blend). Otherwise the
+/// DDA renderer linearly ramps a hit's colour toward [`Self::color`]
+/// over `max_scan_dist` voxels. `side_shades` darkens each of the six
+/// voxel faces — `[x-, x+, y-, y+, z-, z+]`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CpuFog {
+    /// Low-24-bit RGB fog colour.
+    pub color: u32,
+    /// Distance (voxels) at which fog is fully opaque; `<= 0` ⇒ fog OFF.
+    pub max_scan_dist: i32,
+    /// Per-face brightness reduction `[x-, x+, y-, y+, z-, z+]`.
+    pub side_shades: [i8; 6],
 }
 
 /// Project a world-space [`Camera`] into a grid's local frame:
@@ -107,13 +113,10 @@ fn world_camera_to_grid_local(camera: &Camera, transform: &GridTransform) -> Cam
 pub enum RenderOutcome {
     /// At least one grid produced a render.
     Rendered {
-        /// Number of grids whose opticast pass returned
-        /// [`OpticastOutcome::Rendered`].
+        /// Number of grids that were drawn.
         grids_drawn: usize,
     },
-    /// No grid rendered. Either the scene was empty or every
-    /// per-grid opticast call returned
-    /// [`OpticastOutcome::SkippedCameraInSolid`].
+    /// No grid rendered — the scene was empty (no populated grids).
     Empty,
 }
 
@@ -171,7 +174,7 @@ pub fn render_scene(
     pitch_pixels: usize,
     width: u32,
     height: u32,
-    pool: &mut ScratchPool,
+    fog: CpuFog,
     scene: &mut Scene,
     camera: &Camera,
     settings: &OpticastSettings,
@@ -195,11 +198,7 @@ pub fn render_scene(
         // this byte-identical to the pre-S5 translate-only form.
         // DDA.7: refresh the cross-frame brick cache (needs `&mut grid`)
         // before borrowing the grid immutably for `backing`.
-        let dda_mip = if dda_enabled() {
-            Some(grid.ensure_dda_bricks(0))
-        } else {
-            None
-        };
+        let dda_mip = grid.ensure_dda_bricks(0);
         let Some(backing) = grid.chunk_xyz_backing() else {
             // Empty grid (no populated chz=0 chunks) — skip.
             continue;
@@ -214,40 +213,38 @@ pub fn render_scene(
             chunks_z: backing.chunks_z,
         };
         let grid_view = single_chunk_fast_path(&backing, &cg);
-        let outcome = if let Some(mip) = dda_mip {
-            // DDA backend (Substage DDA). Behind `ROXLAP_DDA=1` while
-            // the per-pixel 3D-DDA renderer is built up; the voxlap
-            // opticast path stays the default until DDA.9. The direct
-            // path doesn't pre-fill, so seed sky (black) + far depth
-            // here — DDA leaves misses untouched.
-            for px in fb.iter_mut() {
-                *px = 0;
-            }
-            for d in zb.iter_mut() {
-                *d = f32::INFINITY;
-            }
-            render_dda_parallel(
-                &local_cam,
-                settings,
-                grid_view,
-                fb,
-                zb,
-                pitch_pixels,
-                &DdaEnv::default(),
-                &grid.dda_brick_cache,
-                mip,
-            );
-            OpticastOutcome::Rendered
-        } else {
-            let mut rasterizer = ScalarRasterizer::new(fb, zb, pitch_pixels, grid_view);
-            if let Some(sky_ref) = sky {
-                rasterizer = rasterizer.with_sky(sky_ref);
-            }
-            opticast(&mut rasterizer, pool, &local_cam, settings, grid_view)
-        };
-        if outcome == OpticastOutcome::Rendered {
-            grids_drawn += 1;
+        // DDA backend. The direct path doesn't pre-fill, so seed sky
+        // (black) + far depth here — DDA leaves misses untouched.
+        for px in fb.iter_mut() {
+            *px = 0;
         }
+        for d in zb.iter_mut() {
+            *d = f32::INFINITY;
+        }
+        let fog_on = fog.max_scan_dist > 0;
+        #[allow(clippy::cast_precision_loss)]
+        let env = DdaEnv {
+            sky,
+            fog_color: if fog_on { fog.color } else { 0 },
+            fog_max_dist: if fog_on {
+                fog.max_scan_dist.max(1) as f32
+            } else {
+                0.0
+            },
+            side_shades: fog.side_shades,
+        };
+        render_dda_parallel(
+            &local_cam,
+            settings,
+            grid_view,
+            fb,
+            zb,
+            pitch_pixels,
+            &env,
+            &grid.dda_brick_cache,
+            dda_mip,
+        );
+        grids_drawn += 1;
     }
     if grids_drawn == 0 {
         RenderOutcome::Empty
@@ -428,7 +425,7 @@ pub fn render_scene_composed(
     pitch_pixels: usize,
     width: u32,
     height: u32,
-    pool: &mut ScratchPool,
+    fog: CpuFog,
     scene: &mut Scene,
     camera: &Camera,
     settings: &OpticastSettings,
@@ -441,7 +438,7 @@ pub fn render_scene_composed(
         pitch_pixels,
         width,
         height,
-        pool,
+        fog,
         scene,
         camera,
         settings,
@@ -464,7 +461,7 @@ fn render_scene_composed_scissored(
     pitch_pixels: usize,
     width: u32,
     height: u32,
-    pool: &mut ScratchPool,
+    fog: CpuFog,
     scene: &mut Scene,
     camera: &Camera,
     settings: &OpticastSettings,
@@ -567,10 +564,10 @@ fn render_scene_composed_scissored(
         // DDA.7: refresh the cross-frame brick cache (needs `&mut grid`)
         // before the immutable `backing` borrow. Render mip by LOD tier:
         // Near = full detail, Mid = coarser (clamped to built mips).
-        let dda_eff_mip = if dda_enabled() {
-            // Mid tier: coarsen by the grid's `mid_mip_levels` override
-            // (a level count → uniform DDA mip `n-1`). No override ⇒ mip
-            // 0, i.e. byte-identical to Near (the override is opt-in).
+        // Mid tier: coarsen by the grid's `mid_mip_levels` override
+        // (a level count → uniform DDA mip `n-1`). No override ⇒ mip
+        // 0, i.e. byte-identical to Near (the override is opt-in).
+        let dda_eff_mip = {
             let req = match lod {
                 Lod::Mid => grid
                     .lod_thresholds
@@ -578,9 +575,7 @@ fn render_scene_composed_scissored(
                     .map_or(0, |n| n.saturating_sub(1)),
                 Lod::Near | Lod::Far => 0,
             };
-            Some(grid.ensure_dda_bricks(req))
-        } else {
-            None
+            grid.ensure_dda_bricks(req)
         };
         let Some(backing) = grid.chunk_xyz_backing() else {
             continue;
@@ -659,15 +654,6 @@ fn render_scene_composed_scissored(
         } else {
             SKY_MASK_SENTINEL
         };
-        if !owns_sky {
-            // Override the pool's skycast colour just for this
-            // grid so the solid-fill sky path stamps the sentinel.
-            // Restored after the grid's compose. `dist = 0` mirrors
-            // the caller's typical setup; the rasterizer's prelude
-            // overwrites the dist field with `gxmax` or `i32::MAX`
-            // anyway, so the dist arg is cosmetic here.
-            pool.set_skycast(SKY_MASK_SENTINEL as i32, 0);
-        }
 
         // Reset temp to sky / INFINITY so each grid starts fresh —
         // only within the grid's screen rect (opticast writes nothing
@@ -755,59 +741,41 @@ fn render_scene_composed_scissored(
         // clipping reads stale entries at extreme poses — see the
         // `cpu-grid-scissor` memo).
         let scissored = (*active_settings).with_y_range(rect.y0, rect.y1);
-        let outcome = if dda_enabled() {
-            // DDA backend (Substage DDA). temp_fb / temp_zb are already
-            // pre-filled with sky / INFINITY for this grid's rect, so a
-            // miss with no textured sky yields the correct solid sky.
-            //
-            // Fog is config-driven (mirrors the voxlap path): on iff the
-            // host configured it (pool foglut non-empty via
-            // `Engine::set_fog`). Off → no blend, so exact-colour tests
-            // and unfogged hosts are unaffected. Linear ramp toward the
-            // configured fog colour over `max_scan_dist`.
-            let fog_on = !pool.slot(0).foglut.is_empty();
-            #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]
-            let env = DdaEnv {
-                sky: if owns_sky { sky } else { None },
-                fog_color: if fog_on {
-                    pool.slot(0).fog_col as u32
-                } else {
-                    0
-                },
-                fog_max_dist: if fog_on {
-                    scissored.max_scan_dist.max(1) as f32
-                } else {
-                    0.0
-                },
-                side_shades: [0; 6],
-            };
-            // Effective render mip + brick cache were prepared above
-            // (DDA.6 uniform per-grid mip, DDA.7 cross-frame cache).
-            render_dda_parallel(
-                &local_cam,
-                &scissored,
-                grid_view,
-                &mut temp_fb,
-                &mut temp_zb,
-                pitch_pixels,
-                &env,
-                &grid.dda_brick_cache,
-                dda_eff_mip.unwrap_or(0),
-            );
-            OpticastOutcome::Rendered
-        } else {
-            let mut rasterizer =
-                ScalarRasterizer::new(&mut temp_fb, &mut temp_zb, pitch_pixels, grid_view);
-            // Sky texture is suppressed for `!owns_sky` grids so
-            // the textured-sky branch doesn't bypass the sentinel;
-            // only the solid-fill path stamps `skycast.col`.
-            if owns_sky {
-                if let Some(sky_ref) = sky {
-                    rasterizer = rasterizer.with_sky(sky_ref);
-                }
-            }
-            opticast(&mut rasterizer, pool, &local_cam, &scissored, grid_view)
+        // DDA backend. temp_fb / temp_zb are already pre-filled with
+        // sky / INFINITY for this grid's rect, so a miss with no
+        // textured sky yields the correct solid sky.
+        //
+        // Fog is config-driven: on iff the caller set `max_scan_dist > 0`
+        // in `fog`. Off → no blend, so exact-colour tests and unfogged
+        // hosts are unaffected. Linear ramp toward the configured fog
+        // colour over `max_scan_dist`. Sky texture is suppressed for
+        // `!owns_sky` grids so the textured-sky branch doesn't bypass
+        // the sentinel.
+        let fog_on = fog.max_scan_dist > 0;
+        #[allow(clippy::cast_precision_loss)]
+        let env = DdaEnv {
+            sky: if owns_sky { sky } else { None },
+            fog_color: if fog_on { fog.color } else { 0 },
+            fog_max_dist: if fog_on {
+                fog.max_scan_dist.max(1) as f32
+            } else {
+                0.0
+            },
+            side_shades: fog.side_shades,
         };
+        // Effective render mip + brick cache were prepared above
+        // (DDA.6 uniform per-grid mip, DDA.7 cross-frame cache).
+        render_dda_parallel(
+            &local_cam,
+            &scissored,
+            grid_view,
+            &mut temp_fb,
+            &mut temp_zb,
+            pitch_pixels,
+            &env,
+            &grid.dda_brick_cache,
+            dda_eff_mip,
+        );
 
         if !owns_sky {
             // Mask sentinel pixels so compose drops them — only within
@@ -820,15 +788,10 @@ fn render_scene_composed_scissored(
                     }
                 }
             }
-            // Restore the pool's sky colour so subsequent grids
-            // (and the next frame) see the caller's value.
-            pool.set_skycast(sky_color as i32, 0);
         }
 
-        if outcome == OpticastOutcome::Rendered {
-            compose_rect(fb, zb, &temp_fb, &temp_zb, pitch_pixels, rect);
-            grids_drawn += 1;
-        }
+        compose_rect(fb, zb, &temp_fb, &temp_zb, pitch_pixels, rect);
+        grids_drawn += 1;
     }
 
     if grids_drawn == 0 {
@@ -844,9 +807,7 @@ mod tests {
     use super::*;
     use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
     use glam::{DVec3, IVec3};
-    use roxlap_core::opticast::{opticast as core_opticast, OpticastSettings};
-    use roxlap_core::rasterizer::ScratchPool;
-    use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+    use roxlap_core::opticast::OpticastSettings;
     use roxlap_core::{Camera, Engine};
 
     const XRES: u32 = 320;
@@ -881,28 +842,22 @@ mod tests {
         }
     }
 
-    /// Spin up an engine + `ScratchPool` + framebuffers ready for
-    /// one `opticast` / `render_scene` pass. `pool_vsid` should
-    /// cover the largest grid's combined vsid.
-    fn render_setup(pool_vsid: u32) -> (Engine, ScratchPool, Vec<u32>, Vec<f32>) {
+    /// Spin up an engine + framebuffers ready for one `render_scene`
+    /// pass. `_pool_vsid` is retained for call-site compatibility but
+    /// the DDA backend needs no pre-sized scratch pool.
+    fn render_setup(_pool_vsid: u32) -> (Engine, Vec<u32>, Vec<f32>) {
         let engine = Engine::new();
-        let mut pool = ScratchPool::new(XRES, YRES, pool_vsid);
         let sky = engine.sky_color();
-        let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-        pool.set_skycast(sky_col_i, 0);
-        let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-        pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-        pool.set_treat_z_max_as_air(true);
         let pixel_count = (XRES as usize) * (YRES as usize);
         let framebuffer = vec![sky; pixel_count];
         let zbuffer = vec![0.0f32; pixel_count];
-        (engine, pool, framebuffer, zbuffer)
+        (engine, framebuffer, zbuffer)
     }
 
     /// Render `scene` via [`render_scene`] (single-grid no-compose
     /// path) and return the resulting framebuffer.
     fn render_via_scene(scene: &mut Scene, camera: &Camera) -> Vec<u32> {
-        let (_engine, mut pool, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
+        let (_engine, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         let outcome = render_scene(
             &mut fb,
@@ -910,7 +865,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            CpuFog::default(),
             scene,
             camera,
             &settings,
@@ -1134,7 +1089,8 @@ mod tests {
             forward: [0.0, 1.0, 0.0],
         };
 
-        let (_engine, mut pool, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
+        let (_engine, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
+        let fog = CpuFog::default();
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         let outcome = render_scene(
             &mut fb,
@@ -1142,7 +1098,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1196,7 +1152,7 @@ mod tests {
         scene.grid_mut(a_id).unwrap().render_sky = false;
 
         let unique_sky: u32 = 0xFF_AB_CD_EF;
-        let (_engine, mut pool, _) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, _) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![unique_sky; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let camera = camera_at([64.0, 0.0, 100.0]);
@@ -1207,7 +1163,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1251,7 +1207,7 @@ mod tests {
         let (mut scene, id, _) = build_one_grid_marker_scene(GridTransform::identity());
         scene.grid_mut(id).unwrap().render_sky = false;
         let unique_sky: u32 = 0xFF_12_34_56;
-        let (_engine, mut pool, _) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, _) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![unique_sky; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let camera = camera_at([64.0, 0.0, 64.0]);
@@ -1262,7 +1218,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1295,7 +1251,8 @@ mod tests {
     #[test]
     fn empty_scene_returns_empty_outcome() {
         let mut scene = Scene::new();
-        let (_engine, mut pool, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
+        let (_engine, mut fb, mut zb) = render_setup(CHUNK_SIZE_XY);
+        let fog = CpuFog::default();
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         let outcome = render_scene(
             &mut fb,
@@ -1303,7 +1260,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera_at([0.0, 0.0, 0.0]),
             &settings,
@@ -1345,16 +1302,13 @@ mod tests {
         (scene, 0x80_88_22_22, 0x80_22_22_88)
     }
 
-    fn make_composed_pool(pool_vsid: u32) -> (Engine, ScratchPool, u32) {
+    /// Engine + default (off) fog config + sky colour for the
+    /// composed-render tests. `_pool_vsid` retained for call-site
+    /// compatibility; the DDA backend needs no scratch pool.
+    fn make_composed_pool(_pool_vsid: u32) -> (Engine, CpuFog, u32) {
         let engine = Engine::new();
-        let mut pool = ScratchPool::new(XRES, YRES, pool_vsid);
         let sky_color = engine.sky_color();
-        let sky_col_i = i32::from_ne_bytes(sky_color.to_ne_bytes());
-        pool.set_skycast(sky_col_i, 0);
-        let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-        pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-        pool.set_treat_z_max_as_air(true);
-        (engine, pool, sky_color)
+        (engine, CpuFog::default(), sky_color)
     }
 
     fn pixel_count(width: u32, height: u32) -> usize {
@@ -1387,7 +1341,7 @@ mod tests {
         // (~264, ~264, ~100). Camera at world (160, 100, 100)
         // looking +y centres both in view.
         let (mut scene, red, blue) = build_two_grid_side_by_side();
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
 
@@ -1399,7 +1353,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1452,7 +1406,7 @@ mod tests {
 
         let camera = camera_at([160.0, 100.0, 100.0]);
         let render = |scene: &mut Scene, scissor: bool| -> Vec<u32> {
-            let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+            let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
             let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
             let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
             let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
@@ -1462,7 +1416,7 @@ mod tests {
                 XRES as usize,
                 XRES,
                 YRES,
-                &mut pool,
+                fog,
                 scene,
                 &camera,
                 &settings,
@@ -1513,7 +1467,7 @@ mod tests {
             Some(0x80_00_00_aa), // blue
         );
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
 
@@ -1527,7 +1481,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1569,7 +1523,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene2,
             &camera,
             &settings,
@@ -1617,7 +1571,7 @@ mod tests {
     /// `vxl_generate_mips_on_set_voxel_chunk_renders` test uses.
     /// Returns the framebuffer.
     fn render_with_multi_mip(scene: &mut Scene, camera: &Camera) -> Vec<u32> {
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
@@ -1629,7 +1583,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             scene,
             camera,
             &settings,
@@ -1709,7 +1663,7 @@ mod tests {
         };
 
         let camera = camera_at([64.0, 0.0, 100.0]);
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
@@ -1719,7 +1673,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1757,7 +1711,7 @@ mod tests {
         assert!(scene.grid(id).unwrap().billboards.is_none());
 
         let camera = camera_at([64.0, 0.0, 100.0]);
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
@@ -1767,7 +1721,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1794,7 +1748,7 @@ mod tests {
             mid_mip_scan_dist: None,
         };
         let camera = camera_at([64.0, 0.0, 100.0]);
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
 
         // First Far render → cache built.
@@ -1806,7 +1760,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1831,7 +1785,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1887,7 +1841,7 @@ mod tests {
             Lod::Far
         );
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
@@ -1897,7 +1851,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1928,7 +1882,7 @@ mod tests {
         };
 
         let camera = camera_at([0.0, 0.0, 100.0]);
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
@@ -1938,7 +1892,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -1966,7 +1920,7 @@ mod tests {
         // Scene A: default thresholds (always_near).
         let (mut scene_a, _a_id) = build_one_grid_scene(DVec3::new(0.0, 200.0, 0.0));
         let cam = camera_at([64.0, 0.0, 100.0]);
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb_a = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb_a = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
@@ -1976,7 +1930,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene_a,
             &cam,
             &settings,
@@ -2016,7 +1970,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene_b,
             &cam,
             &settings,
@@ -2036,7 +1990,7 @@ mod tests {
     #[test]
     fn render_scene_composed_empty_scene_returns_empty() {
         let mut scene = Scene::new();
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let camera = camera_at([0.0, 0.0, 0.0]);
@@ -2047,7 +2001,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2098,7 +2052,7 @@ mod tests {
         // Render with a camera positioned to look at the stripe
         // straight on. Stripe at world (120..136, 260..268, 200..215).
         // Camera at (128, 100, 207) looking +y centres on it.
-        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let camera = camera_at([128.0, 100.0, 207.0]);
@@ -2109,7 +2063,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2158,50 +2112,13 @@ mod tests {
         );
     }
 
-    /// Pin the byte-exact FNV-1a64 of a 2-chunk render. Catches
-    /// any drift in the cross-chunk stitch / opticast path.
-    /// S4B.5: regression test for the cf-halving + column-step
-    /// interaction at chunk-vsid (=128) under multi-mip rendering.
-    /// Prior to the fix in `grouscan.rs:phase_after_delete_kept_presync`
-    /// the single-chunk column-step recomputed `ixy_sptr_col_idx`
-    /// from `cy * vsid + cx`, mapping the post-remiporend mip-N
-    /// sub-table index back into mip-0's range. The next mip
-    /// transition then underflowed at
-    /// `state.ixy_sptr_col_idx - mip_base_offsets[old_mip]`.
-    ///
-    /// `mip_scan_dist=32` chosen so the 3-mip depth ladder
-    /// (32→64→128 PREC scan budgets) reaches the floor 36 voxels
-    /// away at mip-1 or mip-2 — exercising the post-transition
-    /// rendering path that was broken pre-fix.
-    #[test]
-    fn vxl_generate_mips_on_set_voxel_chunk_renders() {
-        let mut grid = crate::Grid::new(GridTransform::identity());
-        // Solid floor at z=100..254 across the entire chunk —
-        // looks like the oracle test's terrain.
-        grid.set_rect(
-            IVec3::new(0, 0, 100),
-            IVec3::new(127, 127, 254),
-            Some(0x80_88_88_88),
-        );
-        let chunk = grid.chunks.get_mut(&IVec3::ZERO).unwrap();
-        chunk.generate_mips(3);
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
-        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
-        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
-        let camera = camera_at([64.0, 0.0, 64.0]);
-        let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-        settings.mip_levels = 3;
-        settings.mip_scan_dist = 32;
-        let grid_view = roxlap_core::GridView::from_single_vxl(chunk);
-        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
-        let _ = core_opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
-        drop(rasterizer);
-        let non_sky = fb.iter().filter(|&&p| p != sky_color).count();
-        assert!(
-            non_sky > 0,
-            "Vxl::generate_mips on a set_voxel-built chunk should render to something non-sky (got {non_sky})"
-        );
-    }
+    // DDA.9: the voxlap-era mip regression tests here
+    // (`vxl_generate_mips_on_set_voxel_chunk_renders` + the byte-exact
+    // 2-chunk opticast pin) were removed — they drove voxlap `opticast` +
+    // `ScalarRasterizer` directly, a path no longer reachable from this
+    // consumer crate. The DDA mip ladder + multi-mip render is covered by
+    // `render_with_mips_present_still_renders_mip0` and the
+    // `stacked_*_multi_mip` tests below.
 
     /// Mip-0 preservation when mips are generated on the combined
     /// view but `mip_levels = 1` in the rasterizer's settings.
@@ -2227,7 +2144,7 @@ mod tests {
             chunk.generate_mips(3);
         }
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let camera = camera_at([64.0, 0.0, 64.0]);
@@ -2241,7 +2158,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2272,7 +2189,7 @@ mod tests {
             IVec3::new(136, 67, 215),
             Some(0x80_aa_55_22),
         );
-        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let camera = camera_at([128.0, 100.0, 207.0]);
@@ -2283,7 +2200,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2311,184 +2228,6 @@ mod tests {
     /// `GOLDEN`'s definition with the printed value once captured.
     const SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 
-    /// S4B.2.c.3: render a 2-chunk x-stripe scene via Approach B
-    /// (multi-chunk GridView + direct opticast). Validates the full
-    /// chain — `Grid::chunk_xy_backing` → `ChunkGrid` →
-    /// `GridView::from_chunk_grid` → opticast prelude
-    /// `recompute_camera_chunk` → `camera_chunk_air_gap` lookup →
-    /// gline's chunk-aware seed → grouscan's chunk-swap column-step.
-    ///
-    /// Geometry: a floor in chunk (0, 0) at grid-local
-    /// `(0..127, 0..127, 200..205)` plus a recognisable box in
-    /// chunk (1, 0) at `(160..170, 50..60, 150..165)`. Camera in
-    /// chunk (0, 0) looking +x so rays cross into chunk (1, 0) and
-    /// must trigger the cross-chunk DDA. (Camera in chunk (1, 0) is
-    /// blocked by the in_bounds_xy check that still uses the per-
-    /// chunk vsid; full grid-AABB in_bounds gets revisited later.)
-    ///
-    /// Hash-pinned. Non-sky pixel count is the primary correctness
-    /// signal — if the cross-chunk DDA were broken, only the floor
-    /// in chunk (0, 0) would render.
-    #[test]
-    fn approach_b_renders_two_chunk_x_stripe_via_chunk_grid() {
-        const SENTINEL_B: u64 = 0xDEAD_BEEF_DEAD_BEEF;
-        // Frozen 2026-05-11 on x86_64 — Approach B's first
-        // multi-chunk render (S4B.2.c.3). Refreeze when changing
-        // the rasterizer; the cross-chunk DDA stays validated by
-        // the `floor_count` + `box_count` assertions above.
-        const GOLDEN_B: u64 = 0x5ee1_e81c_66a8_d1f1;
-
-        let mut scene = Scene::new();
-        let id = scene.add_grid(GridTransform::identity());
-        let g = scene.grid_mut(id).unwrap();
-        // Floor across chunk (0, 0) so rays looking +x always have
-        // a hit before they exit the grid AABB.
-        g.set_rect(
-            IVec3::new(0, 0, 200),
-            IVec3::new(127, 127, 205),
-            Some(0x80_44_44_aa),
-        );
-        // Recognisable box deep in chunk (1, 0) — only visible if
-        // the cross-chunk DDA fires.
-        g.set_rect(
-            IVec3::new(160, 50, 150),
-            IVec3::new(170, 60, 165),
-            Some(0x80_aa_55_22),
-        );
-        assert_eq!(g.chunk_count(), 2);
-
-        // Build the multi-chunk GridView.
-        let backing = g.chunk_xyz_backing().expect("at least one chunk populated");
-        assert_eq!(backing.chunks_x, 2);
-        assert_eq!(backing.chunks_y, 1);
-        assert_eq!(backing.origin_chunk_xy, [0, 0]);
-        let cg = roxlap_core::ChunkGrid {
-            chunks: &backing.chunks,
-            origin_chunk_xy: backing.origin_chunk_xy,
-            origin_chunk_z: backing.origin_chunk_z,
-            chunks_x: backing.chunks_x,
-            chunks_y: backing.chunks_y,
-            chunks_z: backing.chunks_z,
-        };
-        let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
-
-        // Camera in chunk (0, 0) looking +x toward chunk (1, 0).
-        // Voxlap z-down basis: right × down == forward.
-        let camera = Camera {
-            pos: [10.0, 64.0, 160.0],
-            right: [0.0, 1.0, 0.0],
-            down: [0.0, 0.0, 1.0],
-            forward: [1.0, 0.0, 0.0],
-        };
-        let (_engine, mut pool, mut fb, mut zb) = render_setup(2 * CHUNK_SIZE_XY);
-        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
-        let outcome = core_opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
-        drop(rasterizer);
-        assert_eq!(outcome, OpticastOutcome::Rendered);
-
-        // Hits BOTH the floor (chunk 0, 0) AND the box (chunk 1, 0).
-        let floor_count = fb.iter().filter(|&&p| p == 0x80_44_44_aa).count();
-        let box_count = fb.iter().filter(|&&p| p == 0x80_aa_55_22).count();
-        assert!(
-            floor_count > 1000,
-            "floor not visible — only {floor_count} floor pixels (single-chunk path?)"
-        );
-        assert!(
-            box_count > 50,
-            "box in chunk (1, 0) not visible — only {box_count} box pixels — cross-chunk DDA may have failed to fire"
-        );
-
-        // Hash-pin the output. Refreeze when changing the rasterizer.
-        let bytes: Vec<u8> = fb.iter().flat_map(|p| p.to_ne_bytes()).collect();
-        let hash = fnv1a64(&bytes);
-        if GOLDEN_B == SENTINEL_B {
-            eprintln!("approach_b_renders_two_chunk_x_stripe_via_chunk_grid: capture hash = 0x{hash:016x}");
-            panic!(
-                "GOLDEN_B is the SENTINEL placeholder — paste 0x{hash:016x} into GOLDEN_B above"
-            );
-        }
-        assert_eq!(
-            hash, GOLDEN_B,
-            "Approach B 2-chunk render hash drifted: expected 0x{GOLDEN_B:016x}, got 0x{hash:016x}"
-        );
-    }
-
-    /// S4B.2.d: multi-chunk camera that sits **past** the first
-    /// chunk's vsid (i.e., inside chunk (1, 0)). Validates that
-    /// `recompute_in_bounds_xy` against the grid AABB recognises
-    /// the camera as in-bounds — and that the seed path looks up
-    /// chunk (1, 0)'s column via `chunk_at_xy(camera_chunk_idx)`
-    /// instead of returning the OOB-XY bedrock placeholder.
-    ///
-    /// Scene shape: a 2-chunk x-stripe with a floor in chunk (1, 0)
-    /// (where the camera sits) and the recognisable box in chunk
-    /// (0, 0). The camera looks `-x` so rays cross from chunk
-    /// (1, 0) back into chunk (0, 0). Tests the OTHER direction of
-    /// cross-chunk DDA + the in-bounds AABB fix together.
-    #[test]
-    fn approach_b_camera_in_chunk_1_0_renders_neighbour() {
-        let mut scene = Scene::new();
-        let id = scene.add_grid(GridTransform::identity());
-        let g = scene.grid_mut(id).unwrap();
-        // Floor under the camera in chunk (1, 0).
-        g.set_rect(
-            IVec3::new(128, 0, 200),
-            IVec3::new(255, 127, 205),
-            Some(0x80_44_44_aa),
-        );
-        // Box deep in chunk (0, 0) — only visible if the camera in
-        // chunk (1, 0) is recognised as in-bounds AND the
-        // cross-chunk DDA fires westward.
-        g.set_rect(
-            IVec3::new(20, 50, 150),
-            IVec3::new(30, 60, 165),
-            Some(0x80_aa_55_22),
-        );
-        assert_eq!(g.chunk_count(), 2);
-
-        let backing = g.chunk_xyz_backing().expect("populated");
-        let cg = roxlap_core::ChunkGrid {
-            chunks: &backing.chunks,
-            origin_chunk_xy: backing.origin_chunk_xy,
-            origin_chunk_z: backing.origin_chunk_z,
-            chunks_x: backing.chunks_x,
-            chunks_y: backing.chunks_y,
-            chunks_z: backing.chunks_z,
-        };
-        let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
-        let (aabb_min, aabb_max) = grid_view.aabb_xy();
-        assert_eq!(aabb_min, [0, 0]);
-        assert_eq!(aabb_max, [256, 128]);
-
-        // Camera deep in chunk (1, 0): world (200, 64, 160). Past
-        // the single-chunk vsid=128 OOB cutoff but inside the
-        // multi-chunk AABB. Look -x toward chunk (0, 0).
-        let camera = Camera {
-            pos: [200.0, 64.0, 160.0],
-            right: [0.0, -1.0, 0.0],
-            down: [0.0, 0.0, 1.0],
-            forward: [-1.0, 0.0, 0.0],
-        };
-        let (_engine, mut pool, mut fb, mut zb) = render_setup(2 * CHUNK_SIZE_XY);
-        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-        let mut rasterizer = ScalarRasterizer::new(&mut fb, &mut zb, XRES as usize, grid_view);
-        let outcome = core_opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view);
-        drop(rasterizer);
-        assert_eq!(outcome, OpticastOutcome::Rendered);
-
-        let floor_count = fb.iter().filter(|&&p| p == 0x80_44_44_aa).count();
-        let box_count = fb.iter().filter(|&&p| p == 0x80_aa_55_22).count();
-        assert!(
-            floor_count > 1000,
-            "floor under camera in chunk (1, 0) not visible — only {floor_count} floor pixels — in_bounds_xy fix may not have taken effect"
-        );
-        assert!(
-            box_count > 50,
-            "box in chunk (0, 0) not visible — only {box_count} box pixels — westward cross-chunk DDA failed"
-        );
-    }
-
     /// S4B.6.c: stacked-grid scaffold — camera in chz=1 (= world
     /// z=256..511) of a 2-chunk-tall grid should render its own
     /// chunk's terrain. Verifies cf seed + slab-byte reads + chunk-
@@ -2512,10 +2251,9 @@ mod tests {
         );
         assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
-        pool.set_treat_z_max_as_air(true);
         // Camera at world (66, 66, 280) — directly above the
         // floor at world z=306. Look STRAIGHT DOWN (z increases =
         // down in voxlap z-down).
@@ -2532,7 +2270,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2571,10 +2309,9 @@ mod tests {
         );
         assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
-        pool.set_treat_z_max_as_air(true);
         // Camera at world (66, 66, 100) — in chz=0's all-air
         // chunk. Look STRAIGHT DOWN (z+) toward chz=1's floor at
         // world z=306.
@@ -2591,7 +2328,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2644,10 +2381,9 @@ mod tests {
         assert!(g.chunk(IVec3::new(0, 0, 0)).is_some());
         assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
-        pool.set_treat_z_max_as_air(true);
         // Camera at (40, 40, 60) — chz=0 air, FAR from the mountain
         // XY (100..124, 100..124). Yaw=π/4 (look toward +x+y =
         // mountain direction), pitch=0.72 rad (≈ 41° down) so the
@@ -2668,7 +2404,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2728,10 +2464,9 @@ mod tests {
         assert!(g.chunk(IVec3::new(0, 0, 0)).is_some());
         assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
-        pool.set_treat_z_max_as_air(true);
         // Camera at world (66, 66, 100) — directly above the
         // mountain peak (at z=150). Camera column has the
         // mountain in chz=0. Look straight down.
@@ -2748,7 +2483,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2810,10 +2545,9 @@ mod tests {
         );
         assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
-        pool.set_treat_z_max_as_air(true);
         let camera = Camera {
             pos: [66.0, 66.0, 100.0],
             right: [1.0, 0.0, 0.0],
@@ -2829,7 +2563,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2868,10 +2602,9 @@ mod tests {
         );
         assert!(g.chunk(IVec3::new(0, 0, 2)).is_some());
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
-        pool.set_treat_z_max_as_air(true);
         let camera = Camera {
             pos: [66.0, 66.0, 540.0],
             right: [1.0, 0.0, 0.0],
@@ -2888,7 +2621,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2948,7 +2681,7 @@ mod tests {
         g.stream_radius = crate::StreamRadius::new(300.0, 600.0);
         assert!(g.chunks.is_empty(), "no pump yet → no chunks");
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         // Camera at (64, -100, 200) looking +y so it would see
@@ -2961,7 +2694,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -2990,7 +2723,7 @@ mod tests {
         g.stream_radius = crate::StreamRadius::new(300.0, 600.0);
 
         // Render BEFORE pump: zero floor pixels.
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         let camera = camera_at([64.0, -100.0, 200.0]);
@@ -3001,7 +2734,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -3030,7 +2763,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -3072,7 +2805,7 @@ mod tests {
         assert!(g.chunk(IVec3::new(0, 1, 0)).is_none());
         assert!(g.chunk(IVec3::new(0, 2, 0)).is_none());
 
-        let (_engine, mut pool, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
         let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
         // Camera inside chunk (0, 0, 0); looking +y means the
@@ -3087,7 +2820,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,
@@ -3115,7 +2848,7 @@ mod tests {
             XRES as usize,
             XRES,
             YRES,
-            &mut pool,
+            fog,
             &mut scene,
             &camera,
             &settings,

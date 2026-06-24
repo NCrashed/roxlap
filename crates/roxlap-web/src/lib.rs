@@ -308,7 +308,7 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, perf: &web_sys::Performance, now_ms
             gpu_mip_scan_dist: 64.0,
             gpu_max_outer_steps: chunks_visible,
             gpu_fov_y_rad: GPU_FOV_Y_DEG.to_radians(),
-            sprite_lighting: None,
+            draw_sprites: false,
             side_shades: [0; 6],
         };
         renderer.render(scene, &cam, &frame);

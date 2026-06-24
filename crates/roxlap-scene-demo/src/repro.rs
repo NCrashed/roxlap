@@ -20,9 +20,9 @@
 
 use glam::DVec3;
 use roxlap_core::opticast::OpticastSettings;
-use roxlap_core::rasterizer::ScratchPool;
 use roxlap_core::{Camera, Engine};
 use roxlap_scene::render::render_scene_composed;
+use roxlap_scene::render::CpuFog;
 use roxlap_scene::{GridTransform, Scene};
 
 use crate::terrain;
@@ -49,20 +49,19 @@ fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
 /// S4.0's 2-chunk-wide ground (combined vsid = 256).
 fn render_pose(scene: &mut Scene, camera: &Camera) -> Vec<u32> {
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 2 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
     let mut zb = vec![f32::INFINITY; pixel_count];
     let settings = OpticastSettings::for_oracle_framebuffer(W, H);
     let _ = render_scene_composed(
-        &mut fb, &mut zb, W as usize, W, H, &mut pool, scene, camera, &settings, sky, None,
+        &mut fb, &mut zb, W as usize, W, H, fog, scene, camera, &settings, sky, None,
     );
     fb
 }
@@ -168,13 +167,12 @@ fn chunk_edge_streaking_bug_is_fixed() {
 fn full_demo_scene_renders_without_panic() {
     let mut scene_and_camera = crate::scene::build_demo();
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -191,7 +189,7 @@ fn full_demo_scene_renders_without_panic() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut scene_and_camera.scene,
         &scene_and_camera.camera,
         &settings,
@@ -221,13 +219,12 @@ fn stacked_demo_scene_renders_terrain_from_chz0() {
     let mut scene_and_camera = crate::scene::build_demo();
     std::env::remove_var("ROXLAP_STACKED_GROUND");
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -241,7 +238,7 @@ fn stacked_demo_scene_renders_terrain_from_chz0() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut scene_and_camera.scene,
         &scene_and_camera.camera,
         &settings,
@@ -303,13 +300,12 @@ fn stacked_demo_renders_full_mountain_at_user_capture_pose() {
     scene_and_camera.refresh_camera();
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -323,7 +319,7 @@ fn stacked_demo_renders_full_mountain_at_user_capture_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut scene_and_camera.scene,
         &scene_and_camera.camera,
         &settings,
@@ -396,13 +392,12 @@ fn stacked_demo_diagnostic_three_capture_poses() {
     let mut scene_and_camera = crate::scene::build_demo();
     std::env::remove_var("ROXLAP_STACKED_GROUND");
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
@@ -431,7 +426,7 @@ fn stacked_demo_diagnostic_three_capture_poses() {
             W as usize,
             W,
             H,
-            &mut pool,
+            fog,
             &mut scene_and_camera.scene,
             &scene_and_camera.camera,
             &settings,
@@ -512,13 +507,12 @@ fn pose_d_mip_ablation() {
     scene_and_cam.refresh_camera();
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
 
@@ -541,7 +535,7 @@ fn pose_d_mip_ablation() {
             W as usize,
             W,
             H,
-            &mut pool,
+            fog,
             &mut scene_and_cam.scene,
             &scene_and_cam.camera,
             &settings,
@@ -602,16 +596,12 @@ fn bench_full_demo_render_fps() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEMO_RENDER_THREADS)
         .max(1);
-    let mut pool = ScratchPool::new_parallel(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY, n_threads);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    let treat_z_max_as_air = std::env::var("BENCH_TREAT_Z_MAX_AS_AIR")
-        .ok()
-        .map_or(true, |v| v == "1");
-    pool.set_treat_z_max_as_air(treat_z_max_as_air);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -640,7 +630,7 @@ fn bench_full_demo_render_fps() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut scene_and_cam.scene,
         &scene_and_cam.camera,
         &settings,
@@ -658,7 +648,7 @@ fn bench_full_demo_render_fps() {
             W as usize,
             W,
             H,
-            &mut pool,
+            fog,
             &mut scene_and_cam.scene,
             &scene_and_cam.camera,
             &settings,
@@ -718,13 +708,12 @@ fn dump_ship_black_wall_pose_at_mip(mip_levels: u32, mip_scan_dist: i32, tag: &s
     );
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -739,7 +728,7 @@ fn dump_ship_black_wall_pose_at_mip(mip_levels: u32, mip_scan_dist: i32, tag: &s
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -774,13 +763,12 @@ fn dump_ship_black_wall_pose_ground_only() {
     );
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -790,7 +778,7 @@ fn dump_ship_black_wall_pose_ground_only() {
     settings.mip_scan_dist = 64;
     settings.max_scan_dist = 512;
     let _ = render_scene_composed(
-        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+        &mut fb, &mut zb, W as usize, W, H, fog, &mut scene, &cam, &settings, sky, None,
     );
     let n_pure_black = fb.iter().filter(|&&p| (p & 0x00_ff_ff_ff) == 0).count();
     write_ppm("/tmp/ship_black_wall_pose_ground_only.ppm", &fb);
@@ -822,18 +810,19 @@ fn camera_above_unstacked_ground_renders() {
     let cam = camera_for_yaw_pitch([0.0, 0.0, -12.0], 0.0, 1.0);
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 2 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
     let mut zb = vec![f32::INFINITY; pixel_count];
     let settings = OpticastSettings::for_oracle_framebuffer(W, H);
     let _ = render_scene_composed(
-        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+        &mut fb, &mut zb, W as usize, W, H, fog, &mut scene, &cam, &settings, sky, None,
     );
     let non_sky = fb.iter().filter(|&&p| p != sky).count();
     eprintln!("camera_above_unstacked_ground: {non_sky}/{pixel_count} non-sky");
@@ -864,18 +853,19 @@ fn camera_above_multi_chunk_ground_renders() {
     let cam = camera_for_yaw_pitch([200.0, 50.0, -12.0], 2.1, 1.05);
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 4 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
     let mut zb = vec![f32::INFINITY; pixel_count];
     let settings = OpticastSettings::for_oracle_framebuffer(W, H);
     let _ = render_scene_composed(
-        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+        &mut fb, &mut zb, W as usize, W, H, fog, &mut scene, &cam, &settings, sky, None,
     );
     let non_sky = fb.iter().filter(|&&p| p != sky).count();
     eprintln!("camera_above_multi_chunk_ground: {non_sky}/{pixel_count} non-sky");
@@ -916,13 +906,12 @@ fn dump_ship_black_wall_pose_ship_only_mips() {
     );
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -932,7 +921,7 @@ fn dump_ship_black_wall_pose_ship_only_mips() {
     settings.mip_scan_dist = 64;
     settings.max_scan_dist = 512;
     let _ = render_scene_composed(
-        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+        &mut fb, &mut zb, W as usize, W, H, fog, &mut scene, &cam, &settings, sky, None,
     );
     let n_pure_black = fb.iter().filter(|&&p| (p & 0x00_ff_ff_ff) == 0).count();
     write_ppm("/tmp/ship_black_wall_pose_ship_only_mips.ppm", &fb);
@@ -967,13 +956,12 @@ fn dump_ship_black_wall_pose_ship_only() {
     );
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -983,7 +971,7 @@ fn dump_ship_black_wall_pose_ship_only() {
     settings.mip_scan_dist = 64;
     settings.max_scan_dist = 512;
     let _ = render_scene_composed(
-        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+        &mut fb, &mut zb, W as usize, W, H, fog, &mut scene, &cam, &settings, sky, None,
     );
     let n_pure_black = fb.iter().filter(|&&p| (p & 0x00_ff_ff_ff) == 0).count();
     write_ppm("/tmp/ship_black_wall_pose_ship_only.ppm", &fb);
@@ -1022,20 +1010,17 @@ const SHIP_BEDROCK_PITCH: f64 = 0.162_500_000_000_000_1;
 #[test]
 #[ignore = "expensive: builds full demo; dumps PPM for visual inspection of bedrock-mip-leak"]
 fn dump_bedrock_mip_leak_pose() {
-    use roxlap_scene::CHUNK_SIZE_XY;
-
     let mut sc = crate::scene::build_demo();
     let cam = camera_for_yaw_pitch(SHIP_BEDROCK_POS, SHIP_BEDROCK_YAW, SHIP_BEDROCK_PITCH);
 
     let mut engine = Engine::new();
     engine.set_fog(engine.sky_color(), 512);
-    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
@@ -1051,7 +1036,7 @@ fn dump_bedrock_mip_leak_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1076,7 +1061,7 @@ fn dump_bedrock_mip_leak_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1116,8 +1101,6 @@ fn dump_bedrock_mip_leak_pose() {
 #[test]
 #[ignore = "expensive: builds full 32×32 demo (~3-5 s); use --ignored to dump capture pose"]
 fn dump_chunk_tearing_capture_pose() {
-    use roxlap_scene::CHUNK_SIZE_XY;
-
     const CAP_POS: [f64; 3] = [
         -474.287_937_724_851_3,
         -464.324_076_691_379_5,
@@ -1134,13 +1117,12 @@ fn dump_chunk_tearing_capture_pose() {
 
     let mut engine = Engine::new();
     engine.set_fog(engine.sky_color(), 512);
-    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -1156,7 +1138,7 @@ fn dump_chunk_tearing_capture_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1181,7 +1163,7 @@ fn dump_chunk_tearing_capture_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1211,7 +1193,7 @@ fn dump_chunk_tearing_capture_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &spawn_cam,
         &settings,
@@ -1226,7 +1208,7 @@ fn dump_chunk_tearing_capture_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &spawn_cam,
         &settings,
@@ -1270,7 +1252,6 @@ const BEAM_PITCH: f64 = -0.490_000_000_000_002_6;
 #[ignore = "expensive: builds full demo; dumps green-beam-artifact PPMs"]
 fn dump_green_beam_pose() {
     use roxlap_core::sky::Sky;
-    use roxlap_scene::CHUNK_SIZE_XY;
 
     fn blue_sky() -> Sky {
         Sky::blue_gradient()
@@ -1280,11 +1261,12 @@ fn dump_green_beam_pose() {
     let cam = camera_for_yaw_pitch(BEAM_POS, BEAM_YAW, BEAM_PITCH);
     let engine = Engine::new();
     let sky_tex = blue_sky();
-    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
@@ -1308,7 +1290,7 @@ fn dump_green_beam_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut ground_only,
         &cam,
         &settings,
@@ -1339,7 +1321,7 @@ fn dump_green_beam_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut ship_only,
         &cam,
         &settings,
@@ -1372,7 +1354,7 @@ fn dump_green_beam_pose() {
             W as usize,
             W,
             H,
-            &mut pool,
+            fog,
             &mut sc.scene,
             &cam,
             &settings,
@@ -1405,16 +1387,15 @@ fn dump_green_beam_pose() {
 #[test]
 #[ignore = "expensive: builds full demo; reports beam pixel coords at spawn"]
 fn dump_spawn_pose_diff() {
-    use roxlap_scene::CHUNK_SIZE_XY;
-
     let mut sc = crate::scene::build_demo();
     let cam = sc.camera;
     let engine = Engine::new();
-    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
@@ -1430,7 +1411,7 @@ fn dump_spawn_pose_diff() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1448,7 +1429,7 @@ fn dump_spawn_pose_diff() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1499,16 +1480,15 @@ fn dump_spawn_pose_diff() {
 #[test]
 #[ignore = "expensive: builds full demo; reports beam pixel coords"]
 fn dump_green_beam_pose_diff() {
-    use roxlap_scene::CHUNK_SIZE_XY;
-
     let mut sc = crate::scene::build_demo();
     let cam = camera_for_yaw_pitch(BEAM_POS, BEAM_YAW, BEAM_PITCH);
     let engine = Engine::new();
-    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
@@ -1533,7 +1513,7 @@ fn dump_green_beam_pose_diff() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1553,7 +1533,7 @@ fn dump_green_beam_pose_diff() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1647,7 +1627,6 @@ fn dump_green_beam_pose_diff() {
 #[ignore = "expensive: builds full demo; dumps showcase PPM"]
 fn dump_showcase_pose_with_skybox() {
     use roxlap_core::sky::Sky;
-    use roxlap_scene::CHUNK_SIZE_XY;
 
     // Checkerboard sky helper — duplicated from main.rs because the
     // bin's helper isn't reachable from the test crate.
@@ -1690,12 +1669,13 @@ fn dump_showcase_pose_with_skybox() {
     let cam = sc.camera;
     let engine = Engine::new();
     let sky_tex = checker_sky();
-    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
     // No fog.
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut fb = vec![sky; pixel_count];
@@ -1710,7 +1690,7 @@ fn dump_showcase_pose_with_skybox() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1744,20 +1724,17 @@ const RING_PITCH: f64 = 0.879_999_999_999_993_2;
 #[test]
 #[ignore = "expensive: builds full demo; dumps PPMs for thin-black-ring inspection"]
 fn dump_ring_artifact_pose() {
-    use roxlap_scene::CHUNK_SIZE_XY;
-
     let mut sc = crate::scene::build_demo();
     let cam = camera_for_yaw_pitch(RING_POS, RING_YAW, RING_PITCH);
 
     let mut engine = Engine::new();
     engine.set_fog(engine.sky_color(), 512);
-    let mut pool = ScratchPool::new_parallel(W, H, 32 * CHUNK_SIZE_XY, 4);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let pixel_count = (W as usize) * (H as usize);
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
@@ -1774,7 +1751,7 @@ fn dump_ring_artifact_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1796,7 +1773,7 @@ fn dump_ring_artifact_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut sc.scene,
         &cam,
         &settings,
@@ -1848,7 +1825,7 @@ fn dump_ring_artifact_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut ground_only,
         &cam,
         &settings,
@@ -1866,7 +1843,7 @@ fn dump_ring_artifact_pose() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut ship_only,
         &cam,
         &settings,
@@ -1956,13 +1933,12 @@ fn ship_disappears_at_captured_rotation() {
     let cam = camera_for_yaw_pitch(SHIP_GONE_CAM_POS, SHIP_GONE_YAW, SHIP_GONE_PITCH);
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 4 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     // Live-demo settings — multi-mip is the path the demo runs in.
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
@@ -1971,12 +1947,12 @@ fn ship_disappears_at_captured_rotation() {
     settings.max_scan_dist = 1500;
 
     let pixel_count = (W as usize) * (H as usize);
-    let mut render_count = |angles: [f64; 3], dump_path: &str| -> usize {
+    let render_count = |angles: [f64; 3], dump_path: &str| -> usize {
         let mut scene = build_ship_only_at_rotation(angles);
         let mut fb = vec![sky; pixel_count];
         let mut zb = vec![f32::INFINITY; pixel_count];
         let _ = render_scene_composed(
-            &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+            &mut fb, &mut zb, W as usize, W, H, fog, &mut scene, &cam, &settings, sky, None,
         );
         let non_sky = fb.iter().filter(|&&p| p != sky).count();
         write_ppm(dump_path, &fb);
@@ -2041,13 +2017,12 @@ fn ship_grey_screen_at_captured_pose() {
     let cam = camera_for_yaw_pitch(SHIP_GREY_CAM_POS, SHIP_GREY_YAW, SHIP_GREY_PITCH);
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 4 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
     settings.mip_levels = 4;
@@ -2055,12 +2030,12 @@ fn ship_grey_screen_at_captured_pose() {
     settings.max_scan_dist = 1500;
 
     let pixel_count = (W as usize) * (H as usize);
-    let mut render = |angles: [f64; 3], dump_path: &str| -> Vec<u32> {
+    let render = |angles: [f64; 3], dump_path: &str| -> Vec<u32> {
         let mut scene = build_ship_only_at_rotation(angles);
         let mut fb = vec![sky; pixel_count];
         let mut zb = vec![f32::INFINITY; pixel_count];
         let _ = render_scene_composed(
-            &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+            &mut fb, &mut zb, W as usize, W, H, fog, &mut scene, &cam, &settings, sky, None,
         );
         write_ppm(dump_path, &fb);
         fb
@@ -2147,13 +2122,12 @@ fn ship_fake_column_glitch_diag() {
     // per-strip rendering produces slightly different pixels at
     // strip boundaries than single-strip, so the artifact may be
     // strip-edge specific.
-    let mut pool = ScratchPool::new_parallel(W, H, 32 * roxlap_scene::CHUNK_SIZE_XY, 4);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
     // Bisect: single-mip first to test the multi-mip hypothesis.
@@ -2219,7 +2193,7 @@ fn ship_fake_column_glitch_diag() {
         W as usize,
         W,
         H,
-        &mut pool,
+        fog,
         &mut scene_and_camera.scene,
         &cam,
         &settings,
@@ -2298,13 +2272,12 @@ fn ship_fake_column_glitch_ship_only() {
     let cam = camera_for_yaw_pitch(SHIP_GLITCH_CAM_POS, SHIP_GLITCH_YAW, SHIP_GLITCH_PITCH);
 
     let engine = Engine::new();
-    let mut pool = ScratchPool::new(W, H, 4 * roxlap_scene::CHUNK_SIZE_XY);
+    let fog = CpuFog {
+        color: engine.fog_color(),
+        max_scan_dist: engine.fog_max_scan_dist(),
+        side_shades: engine.side_shades(),
+    };
     let sky = engine.sky_color();
-    let sky_col_i = i32::from_ne_bytes(sky.to_ne_bytes());
-    pool.set_skycast(sky_col_i, 0);
-    let fog_col_i = i32::from_ne_bytes(engine.fog_color().to_ne_bytes());
-    pool.set_fog(fog_col_i, engine.fog_max_scan_dist());
-    pool.set_treat_z_max_as_air(true);
 
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
     settings.mip_levels = 4;
@@ -2316,7 +2289,7 @@ fn ship_fake_column_glitch_ship_only() {
     let mut fb = vec![sky; pixel_count];
     let mut zb = vec![f32::INFINITY; pixel_count];
     let _ = render_scene_composed(
-        &mut fb, &mut zb, W as usize, W, H, &mut pool, &mut scene, &cam, &settings, sky, None,
+        &mut fb, &mut zb, W as usize, W, H, fog, &mut scene, &cam, &settings, sky, None,
     );
     write_ppm("/tmp/scene-demo-ship-fake-column.ppm", &fb);
 

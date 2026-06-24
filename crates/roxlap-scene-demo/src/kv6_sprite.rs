@@ -1,12 +1,8 @@
 //! GPU.9 — KV6 voxel sprite loader. Returns the parsed `Kv6` so the
-//! caller wraps it into a `roxlap_formats::sprite::Sprite` for the
-//! sprite-splatter renderer (`roxlap_core::sprite::draw_sprite`).
-//!
-//! voxlap's traditional KV6 rendering is camera-facing voxel
-//! splatter (one small quad per voxel, drawn with the world
-//! z-buffer); doing it through the heightmap-based opticast loses
-//! that aesthetic. The Grid-based prototype from the previous
-//! commit has been reverted in favour of the proper splatter path.
+//! caller wraps it into a `roxlap_formats::sprite::Sprite`, which the
+//! renderer draws via the clean-room DDA sprite raycaster
+//! (`roxlap_core::dda_sprite::draw_sprite_dda`) — a per-pixel ray cast
+//! through the KV6 that depth-composites against the shared z-buffer.
 
 #![allow(dead_code)]
 
