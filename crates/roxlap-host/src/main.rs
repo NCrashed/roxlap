@@ -11,8 +11,7 @@
 //! - Hold `LCtrl` for fast-fly (≈4× speed).
 //! - Mouse motion → yaw + pitch while grabbed.
 //! - `F` → capture current camera state + frame to
-//!   `roxlap-capture.{txt,ppm}` for off-line repro (e.g. via
-//!   `roxlap-oracle find-hairlines`).
+//!   `roxlap-capture.{txt,ppm}` for off-line repro.
 //! - `L` → toggle the demo point light on/off (lightmode 2 ↔ 0)
 //!   for an A/B comparison of sprite shading. Off → uniform
 //!   ambient; on → directional shadowing from the demo torch.

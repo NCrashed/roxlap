@@ -7,13 +7,9 @@ mod kv6_sprite;
 mod markers;
 #[cfg(test)]
 mod repro;
-#[cfg(test)]
-mod repro_vc;
 mod scene;
 mod ship;
 mod terrain;
-#[cfg(test)]
-mod vc6_repro;
 
 use std::sync::Arc;
 use std::time::Instant;

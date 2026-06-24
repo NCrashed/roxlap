@@ -2,7 +2,7 @@
 //!
 //! GW.3: rendered through the `roxlap-render` [`SceneRenderer`] facade
 //! — the WebGPU compute marcher when the browser has WebGPU, else the
-//! CPU opticast path presented via the facade's WebGL2 blit. The cave
+//! CPU DDA path presented via the facade's WebGL2 blit. The cave
 //! is generated into a single-chunk `roxlap_scene::Scene` grid;
 //! flying, per-voxel collision, and runtime carving all run against
 //! the scene. Plasma bullets are facade **sprites** (small glowing
