@@ -2,7 +2,7 @@
 //!
 //! Generates a [`BlueCaveGenerator`] world on startup, opens a
 //! winit + softbuffer window, and renders the cave via the roxlap
-//! engine's `opticast` rasterizer. Fly through with WASD + mouse-
+//! per-pixel DDA renderer (`render_dda_parallel`). Fly through with WASD + mouse-
 //! look; click in the window to grab the cursor.
 //!
 //! Controls:
@@ -25,9 +25,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use roxlap_cavegen::{BlueCaveGenerator, CaveParams, Generator, MagCaveGenerator, MAXZDIM};
-use roxlap_core::opticast;
-use roxlap_core::rasterizer::ScratchPool;
-use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::dda::{render_dda_parallel, BrickCache, DdaEnv};
 use roxlap_core::update_lighting;
 use roxlap_core::world_query::{getcube, Cube};
 use roxlap_core::Camera;
@@ -128,10 +126,9 @@ const SPAWN_BUBBLE_RADIUS: u32 = 6;
 /// `update_lighting` recomputes surface normals after the edit.
 const LIGHTMODE: u32 = 1;
 
-/// Fog colour (BGR low-24-bit; brightness bit MUST be 0 per
-/// `project_oracle_fog_disabled.md` — `set_fogcol(BR(rgb))` with
-/// the brightness bit set silently disables fog because
-/// `vx5.fogcol < 0` short-circuits opticast's fog-enabled path).
+/// Fog colour (RGB low-24-bit). The DDA renderer's `apply_fog`
+/// blends each channel toward this colour by `depth / fog_max_dist`,
+/// reading only the low 24 bits, so the high byte is irrelevant.
 const FOG_COLOR: u32 = 0x0090_98B0;
 
 /// Fog "max scan distance" in voxels. At this distance pixels
@@ -229,7 +226,13 @@ struct App {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     engine: Engine,
     zbuffer: Vec<f32>,
-    pool: ScratchPool,
+    /// Cross-frame brick-occupancy cache for the DDA renderer. The
+    /// world is a single chunk; `world_version` invalidates it on
+    /// every edit (bullet carve) or regeneration.
+    bricks: BrickCache,
+    /// Bumped whenever `vxl` voxel occupancy changes (carve /
+    /// regenerate) so `BrickCache::ensure` rebuilds the brick map.
+    world_version: u64,
     vxl: vxl::Vxl,
     cam_pos: [f64; 3],
     yaw: f64,
@@ -278,8 +281,6 @@ impl App {
         engine.set_lightmode(LIGHTMODE);
         relight_world(&mut vxl, &engine);
 
-        let pool = ScratchPool::new(WIDTH, HEIGHT, VSID);
-
         // Spawn the camera at the carved bubble's centre.
         let cam_pos = [
             f64::from(VSID) * 0.5,
@@ -292,7 +293,8 @@ impl App {
             surface: None,
             engine,
             zbuffer: Vec::new(),
-            pool,
+            bricks: BrickCache::new(),
+            world_version: 0,
             vxl,
             cam_pos,
             yaw: 0.0,
@@ -326,6 +328,7 @@ impl App {
         // only the voxel data does.
         relight_world(&mut vxl, &self.engine);
         self.vxl = vxl;
+        self.world_version += 1;
         self.cam_pos = [
             f64::from(VSID) * 0.5,
             f64::from(VSID) * 0.5,
@@ -520,6 +523,8 @@ impl App {
             // internally, so we only need the geometric edit
             // bounds here.
             relight_bbox(&mut self.vxl, &self.engine, hit, FIRE_RADIUS);
+            // Occupancy changed → invalidate the DDA brick cache.
+            self.world_version += 1;
         }
     }
 
@@ -543,43 +548,59 @@ impl App {
         self.integrate(dt);
         self.step_bullets(dt);
 
-        // Resize zbuffer + scratch if window changed.
+        // Resize the zbuffer if the window changed.
         let pixel_count = (size.width as usize) * (size.height as usize);
         if self.zbuffer.len() < pixel_count {
             self.zbuffer.resize(pixel_count, 0.0);
         }
-        if self.pool.slot(0).uurend_half_stride < size.width as usize {
-            self.pool = ScratchPool::new(size.width, size.height, self.vxl.vsid);
-        }
-
-        let sky_col_i = i32::from_ne_bytes(self.engine.sky_color().to_ne_bytes());
-        self.pool.set_skycast(sky_col_i, 0);
-        let fog_col_i = i32::from_ne_bytes(self.engine.fog_color().to_ne_bytes());
-        self.pool
-            .set_fog(fog_col_i, self.engine.fog_max_scan_dist());
-        let s = self.engine.side_shades();
-        self.pool
-            .set_side_shades(s[0], s[1], s[2], s[3], s[4], s[5]);
 
         let cam = self.camera();
         let sky = self.engine.sky_color();
         let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
         let pitch_pixels = size.width as usize;
 
+        // DDA shading environment from the engine: distance fog +
+        // per-face side shading (no textured sky panorama — the
+        // buffer prefill below paints the flat sky colour).
+        #[allow(clippy::cast_precision_loss)]
+        let env = DdaEnv {
+            sky: self.engine.sky(),
+            fog_color: self.engine.fog_color(),
+            fog_max_dist: self.engine.fog_max_scan_dist().max(0) as f32,
+            side_shades: self.engine.side_shades(),
+        };
+
+        // Single-chunk world; `world_version` invalidates the brick
+        // cache when a bullet carve or regeneration changed occupancy.
+        let grid = roxlap_core::GridView::from_single_vxl(&self.vxl);
+        self.bricks.ensure([0, 0, 0], 0, self.world_version, &grid);
+
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
         surface.resize(w_nz, h_nz).expect("softbuffer: resize");
         let mut buffer = surface.buffer_mut().expect("softbuffer: buffer_mut");
+        // Prefill sky + reset depth; DDA leaves misses untouched (sky)
+        // and writes hits with perpendicular depth.
         for px in buffer.iter_mut() {
             *px = sky;
         }
+        for z in &mut self.zbuffer[..pixel_count] {
+            *z = f32::INFINITY;
+        }
 
         {
-            let grid = roxlap_core::GridView::from_single_vxl(&self.vxl);
-            let mut rasterizer =
-                ScalarRasterizer::new(&mut buffer, &mut self.zbuffer, pitch_pixels, grid);
-            let _ = opticast(&mut rasterizer, &mut self.pool, &cam, &settings, grid);
+            render_dda_parallel(
+                &cam,
+                &settings,
+                grid,
+                &mut buffer,
+                &mut self.zbuffer[..pixel_count],
+                pitch_pixels,
+                &env,
+                &self.bricks,
+                0,
+            );
         }
 
         // Plasma-bullet billboards on top of the rasterized scene.
