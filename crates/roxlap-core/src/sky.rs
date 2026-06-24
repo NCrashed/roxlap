@@ -1,28 +1,12 @@
-//! Sky-texture resource for the textured-sky `startsky` path.
+//! Sky-texture resource for the textured-sky path.
 //!
-//! Mirror of voxlap's `skypic` / `skylng[]` / `skylat[]` / `skybpl`
-//! / `skyxsiz` / `skyysiz` / `skylngmul` globals (`voxlap5.c:220-
-//! 234`). Built once when a host calls `Engine::set_sky`; the
-//! per-frame search state (`sky_curlng` / `sky_curdir` / `sky_off`)
-//! lives on [`ScanScratch`](crate::rasterizer::ScanScratch) and
-//! gets reset before each frame's opticast.
-//!
-//! Voxlap loads the sky from a `.png` (`loadsky`), then builds two
-//! lookup tables:
-//! - `lng[y]` for `y in 0..ysiz`: `(cos, sin)` of the row's latitude
-//!   angle. Drives the per-ray search in `gline`'s frustum prep.
-//! - `lat[x]` for `x in 0..xsiz`: packed `(xoff << 16) | (-yoff &
-//!   0xffff)` where `xoff = cos(...)·32767`, `yoff = sin(...)·32767`.
-//!   Used by `phase_startsky` to find the texel column for each
-//!   pixel ray.
-//!
-//! After table init, voxlap **decrements** `xsiz` by one
-//! ("skyxsiz--; //Hack for assembly code", voxlap5.c:3968). The
-//! `lat[]` table still has `original_xsiz` entries; the search
-//! starts from index `xsiz` (= post-decrement value, originally an
-//! out-of-range index, used as the initial `edi` cursor).
-//!
-//! [`ScanScratch`]: crate::rasterizer::ScanScratch
+//! Holds the equirectangular sky panorama (`pixels` + `xsiz`/`ysiz`)
+//! the renderer samples on a ray miss (see
+//! [`crate::dda`]'s `sample_sky`). Built once when a host calls
+//! `Engine::set_sky`. The `lng[]` / `lat[]` / `bpl` / `lng_mul` fields
+//! are a carryover from voxlap's per-ray longitude/latitude search
+//! tables; the DDA renderer instead samples directly via `asin`/`atan2`
+//! and does not need them.
 
 #![allow(
     clippy::cast_possible_truncation,

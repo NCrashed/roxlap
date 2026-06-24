@@ -1,11 +1,10 @@
 //! roxlap engine core.
 //!
-//! A pure-Rust port of Ken Silverman's Voxlap voxel engine. See
-//! `PORTING-RUST.md` at the workspace root for the substage roadmap.
-//!
-//! Stage R3 lands the public [`Engine`] / [`Camera`] surface with a
-//! sky-fill stub renderer. R4 replaces the stub with the full
-//! opticast + grouscan algorithm.
+//! A Rust voxel engine. The CPU renderer is a clean-room per-pixel
+//! 3D-DDA over an 8³ brickmap ([`dda`] + [`dda_sprite`]); it reads the
+//! voxlap-compatible `.vxl` / KV6 / KFA formats from `roxlap-formats`
+//! but the rendering algorithm is not voxlap-derived. See
+//! `PORTING-RUST.md` at the workspace root for the project history.
 //!
 //! # World handedness and the horizontal mirror
 //!
@@ -50,33 +49,17 @@
 
 mod camera;
 pub mod camera_math;
-pub(crate) mod column_walk;
 pub mod dda;
 pub mod dda_sprite;
-pub mod drawtile;
 mod engine;
-// `equivec` (voxlap's normal table) moved to roxlap-formats so kv6
-// model builders can fill per-voxel `dir` without a circular dep;
-// re-exported here so in-crate `crate::equivec::…` paths (the sprite
-// `kv6colmul` build) keep resolving.
-pub(crate) use roxlap_formats::equivec;
 pub(crate) mod fixed;
-pub mod gline;
 pub mod grid_view;
-pub(crate) mod grouscan;
 pub mod kfa_draw;
 pub mod meltsphere;
 pub mod opticast;
-pub mod opticast_prelude;
-pub(crate) mod projection;
-pub(crate) mod ptfaces16;
-pub mod rasterizer;
+pub mod raster_target;
 pub mod ray_aabb;
-pub(crate) mod ray_step;
-pub mod scalar_rasterizer;
-pub(crate) mod scan_loops;
 pub mod sky;
-pub mod sprite;
 pub mod world_lighting;
 pub mod world_query;
 
@@ -88,7 +71,7 @@ pub use dda::{
 pub use dda_sprite::draw_sprite_dda;
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
 pub use grid_view::{ChunkGrid, GridView};
-pub use opticast::{opticast, OpticastOutcome, OpticastSettings};
+pub use opticast::OpticastSettings;
 pub use world_lighting::{
     apply_lighting_with_cache, update_lighting, update_lighting_chunk, EstNormCache,
 };

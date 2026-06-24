@@ -28,10 +28,9 @@
 //! [`DdaEnv::sky`] panorama ([`sample_sky`]) or keep the solid pre-fill.
 //!
 //! Buffer conventions match the rest of the engine so this backend is
-//! a drop-in for `opticast`: colour is packed `0x80RRGGBB`; depth is
-//! perpendicular distance from the camera with **smaller = closer**
-//! (so [`crate::scalar_rasterizer`]'s `compose_into` min-z merge works
-//! unchanged).
+//! colour is packed `0x80RRGGBB`; depth is perpendicular distance from
+//! the camera with **smaller = closer** (so the scene compositor's
+//! min-z merge works directly on the z-buffer this writes).
 
 use std::collections::HashMap;
 
@@ -40,7 +39,7 @@ use rayon::prelude::*;
 use crate::camera_math::{self, CameraState};
 use crate::grid_view::GridView;
 use crate::opticast::OpticastSettings;
-use crate::scalar_rasterizer::RasterTarget;
+use crate::raster_target::RasterTarget;
 use crate::sky::Sky;
 use crate::Camera;
 
@@ -990,10 +989,10 @@ fn cast_ray(
 
 /// Render one grid into `sink` with per-pixel 3D-DDA.
 ///
-/// Mirrors [`crate::opticast::opticast`]'s contract: `camera` is the
-/// grid-local pose, `settings` carries the projection + viewport
-/// (including the `y_start..y_end` strip bound), and `grid` is the
-/// per-frame [`GridView`] borrow. `pitch_pixels` is the framebuffer
+/// `camera` is the grid-local pose, `settings`
+/// ([`OpticastSettings`]) carries the projection + viewport (including
+/// the `y_start..y_end` strip bound), and `grid` is the per-frame
+/// [`GridView`] borrow. `pitch_pixels` is the framebuffer
 /// row stride in pixels (matches `ScalarRasterizer::new`'s argument).
 ///
 /// On a miss, a textured sky ([`DdaEnv::sky`]) is sampled per ray
@@ -1854,7 +1853,7 @@ mod tests {
     /// ms/frame + per-frame traversal counters (cells / bricks /
     /// surface_color calls) to locate the bottleneck.
     #[test]
-    #[ignore]
+    #[ignore = "perf benchmark — run explicitly with --ignored"]
     fn bench_terrain() {
         use std::time::Instant;
         // Multi-chunk grid like the demo: NC×NC chunks of 128, hills.

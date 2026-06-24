@@ -1,16 +1,13 @@
-//! KFA (animated kv6) sprite renderer — voxlap's `kfadraw`
-//! (`voxlap5.c:9759`) plus the bone-transform helpers
-//! `genperp` (voxlap5.c:9546), `mat0` (voxlap5.c:9568), and
-//! `setlimb` (voxlap5.c:9643).
+//! KFA (animated kv6) bone solver — the bone-transform helpers
+//! `genperp`, `mat0`, and `setlimb`.
 //!
 //! A KFA sprite is a hierarchy of bones; each bone carries an
 //! optional [`Sprite`] (= one kv6 limb) plus a hinge tying it to
 //! its parent. Per frame, the user updates `kfaval[i]` (a 16-bit
-//! angle) for each animated bone; this module walks the hinge
-//! tree in topological order and computes each limb's world
-//! transform from the parent's, then dispatches the existing
-//! [`crate::sprite::draw_sprite`] per limb to rasterise the kv6
-//! data.
+//! angle) for each animated bone; [`solve_kfa_limbs`] walks the hinge
+//! tree in topological order and computes each limb's world transform
+//! from its parent's. The caller then draws each posed limb via
+//! [`crate::dda_sprite::draw_sprite_dda`].
 //!
 //! Voxlap's animation-curve playback (`animsprite` + `seq[]` +
 //! `frmval[]` interpolation) lives in
@@ -42,9 +39,44 @@ use roxlap_formats::kfa::{Hinge, KfaSprite, Point3};
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::xform::BoneXform;
 
-use crate::camera_math::CameraState;
-use crate::opticast::OpticastSettings;
-use crate::sprite::{draw_sprite, mat2, DrawTarget, SpriteLighting};
+/// 3×3 + translation matrix multiply. Composes transform
+/// `(a_s, a_h, a_f, a_o)` with `(b_s, b_h, b_f, b_o)` into
+/// `(c_s, c_h, c_f, c_o)`: `c_* = a_s·b_*.x + a_h·b_*.y + a_f·b_*.z`,
+/// and `c_o` adds `a_o`. Used by [`setlimb`] to chain a child bone's
+/// world transform onto its parent's.
+#[allow(clippy::too_many_arguments)]
+fn mat2(
+    a_s: [f32; 3],
+    a_h: [f32; 3],
+    a_f: [f32; 3],
+    a_o: [f32; 3],
+    b_s: [f32; 3],
+    b_h: [f32; 3],
+    b_f: [f32; 3],
+    b_o: [f32; 3],
+) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
+    let c_s = [
+        a_s[0] * b_s[0] + a_h[0] * b_s[1] + a_f[0] * b_s[2],
+        a_s[1] * b_s[0] + a_h[1] * b_s[1] + a_f[1] * b_s[2],
+        a_s[2] * b_s[0] + a_h[2] * b_s[1] + a_f[2] * b_s[2],
+    ];
+    let c_h = [
+        a_s[0] * b_h[0] + a_h[0] * b_h[1] + a_f[0] * b_h[2],
+        a_s[1] * b_h[0] + a_h[1] * b_h[1] + a_f[1] * b_h[2],
+        a_s[2] * b_h[0] + a_h[2] * b_h[1] + a_f[2] * b_h[2],
+    ];
+    let c_f = [
+        a_s[0] * b_f[0] + a_h[0] * b_f[1] + a_f[0] * b_f[2],
+        a_s[1] * b_f[0] + a_h[1] * b_f[1] + a_f[1] * b_f[2],
+        a_s[2] * b_f[0] + a_h[2] * b_f[1] + a_f[2] * b_f[2],
+    ];
+    let c_o = [
+        a_s[0] * b_o[0] + a_h[0] * b_o[1] + a_f[0] * b_o[2] + a_o[0],
+        a_s[1] * b_o[0] + a_h[1] * b_o[1] + a_f[1] * b_o[2] + a_o[1],
+        a_s[2] * b_o[0] + a_h[2] * b_o[1] + a_f[2] * b_o[2] + a_o[2],
+    ];
+    (c_s, c_h, c_f, c_o)
+}
 
 /// Voxlap's `genperp` — given a non-zero axis vector `a`, build
 /// two orthonormal vectors `b`, `c` such that `(a, b, c)` form a
@@ -204,37 +236,7 @@ fn limb_xform(
     )
 }
 
-/// Render an animated KFA sprite — voxlap's `kfadraw`
-/// (voxlap5.c:9759). Walks the bone tree in topological order
-/// (parents first), computes each limb's world transform from
-/// the parent's via the per-limb `setlimb` walk, then dispatches
-/// [`crate::sprite::draw_sprite`] per limb to rasterise its kv6.
-///
-/// Returns the total number of pixels written across all limbs.
-pub fn draw_kfa_sprite(
-    target: &mut DrawTarget<'_>,
-    cam: &CameraState,
-    settings: &OpticastSettings,
-    lighting: &SpriteLighting<'_>,
-    kfa: &mut KfaSprite,
-) -> u32 {
-    // Pose first, then rasterise. Voxlap interleaves the two in one
-    // descending loop, but a limb's transform depends only on its
-    // (already-posed) parent — never on drawing — so a full solve pass
-    // followed by a full draw pass is identical, and lets non-CPU
-    // backends reuse `solve_kfa_limbs` verbatim.
-    solve_kfa_limbs(kfa);
-    let n = kfa.hinge_sort.len();
-    let mut total: u32 = 0;
-    for k in (0..n).rev() {
-        let j = kfa.hinge_sort[k];
-        total += draw_sprite(target, cam, settings, lighting, &kfa.limbs[j]);
-    }
-    total
-}
-
-/// Pose every limb of a KFA sprite — the bone-transform half of
-/// [`draw_kfa_sprite`], without rasterising. Walks the hinge tree in
+/// Pose every limb of a KFA sprite. Walks the hinge tree in
 /// topological order (parents first) and writes each limb's world
 /// `(s, h, f, p)` from its parent's via the per-limb `setlimb` math,
 /// reading the current [`KfaSprite::kfaval`] angles. Mirror of the
@@ -242,7 +244,8 @@ pub fn draw_kfa_sprite(
 ///
 /// Split out so non-CPU backends (e.g. the GPU instanced-sprite pass)
 /// can run the exact same posing and then consume `kfa.limbs[*]`
-/// transforms however they need. The host typically calls
+/// transforms however they need (e.g. the renderer draws each limb via
+/// [`crate::dda_sprite::draw_sprite_dda`]). The host typically calls
 /// [`KfaSprite::animsprite`](roxlap_formats::kfa::KfaSprite::animsprite)
 /// to advance `kfaval[]` first, then this to resolve world transforms.
 pub fn solve_kfa_limbs(kfa: &mut KfaSprite) {

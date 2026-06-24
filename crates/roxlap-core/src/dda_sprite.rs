@@ -1,15 +1,12 @@
 //! Clean-room KV6 sprite raycaster for the DDA backend (Substage
 //! DDA.8).
 //!
-//! The voxlap-path sprite rasteriser ([`crate::sprite::draw_sprite`])
-//! splats each KV6 voxel as a projected screen-space cube — a faithful
-//! but voxlap-derived port (`drawboundcubesse`, `update_reflects`). This
-//! module renders the same KV6 sprites by **per-pixel ray casting**
-//! instead: for every screen pixel the sprite covers, transform the
-//! camera ray into the sprite's local voxel space, 3D-DDA through the
-//! KV6, and depth-composite the first solid voxel against the shared
-//! z-buffer. No voxlap code, so it can stand in once the opticast path
-//! is deleted (DDA.9 / DDA.10).
+//! Renders KV6 sprites by **per-pixel ray casting**: for every screen
+//! pixel the sprite covers, transform the camera ray into the sprite's
+//! local voxel space, 3D-DDA through the KV6, and depth-composite the
+//! first solid voxel against the shared z-buffer. Clean-room (no voxlap
+//! code), the sprite counterpart to the terrain renderer in
+//! [`crate::dda`].
 //!
 //! **Depth parity.** Transforming the ray by the inverse sprite basis
 //! leaves the ray parameter unchanged in world units — a hit at local
@@ -28,7 +25,7 @@ use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_INVISIBLE, SPRITE_FLAG_NO_Z};
 use crate::camera_math::CameraState;
 use crate::dda::{dda_setup, intersect_aabb, min_axis, pixel_ray, shade};
 use crate::opticast::OpticastSettings;
-use crate::scalar_rasterizer::RasterTarget;
+use crate::raster_target::RasterTarget;
 
 /// Near-plane parameter: voxels nearer than this (camera-forward) are
 /// dropped, keeping the pinhole divide finite.

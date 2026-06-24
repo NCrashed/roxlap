@@ -1,11 +1,9 @@
 //! Per-frame voxel-world borrow shape.
 //!
 //! Wraps the `(vsid, slab_buf, column_offsets, mip_base_offsets)`
-//! tuple that [`crate::opticast`] and
-//! [`crate::scalar_rasterizer::ScalarRasterizer`] both need. Today
-//! always represents a single chunk so callers building from a
-//! [`roxlap_formats::vxl::Vxl`] keep the existing flat-world
-//! semantics byte-identically.
+//! tuple the renderer ([`crate::dda`]) reads. A single
+//! [`roxlap_formats::vxl::Vxl`] is one chunk; a [`ChunkGrid`] composes
+//! many chunks behind the same borrow shape.
 //!
 //! Substage S4B.0 introduced the shape as a pure rename — opticast
 //! drove a single flat world behind a typed borrow. Subsequent
@@ -434,9 +432,8 @@ impl<'a> GridView<'a> {
     /// - Multi-chunk (`chunk_grid: Some(&cg)`): derived from
     ///   `cg.origin_chunk_xy + cg.chunks_x/y * chunk_size_xy`.
     ///
-    /// Consumed by [`crate::opticast_prelude::recompute_in_bounds_xy`]
-    /// (camera-inside-grid check) and the rasterizer's gline
-    /// world-edge gxmax clip.
+    /// Used as the renderer's outer DDA bounds (the world-edge box the
+    /// per-pixel ray is clipped to).
     #[must_use]
     pub fn aabb_xy(&self) -> ([i32; 2], [i32; 2]) {
         if let Some(cg) = self.chunk_grid {
