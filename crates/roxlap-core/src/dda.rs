@@ -732,20 +732,33 @@ impl<'a> Sampler<'a> {
     }
 }
 
-/// Walk mip-cells along the ray within the half-open mip-cell box
-/// `[lo_c, hi_c)`, between ray parameters `t_lo` and `t_hi`. Returns the
-/// first solid + renderable cell (via [`Sampler::hit`]) as a [`Hit`], or
-/// `None` if the ray leaves the box / t-range / `max_dist` first.
+/// Walk mip-cells along the ray within `[lo_c, hi_c)` and return the
+/// first solid hit, with leak-free empty-space skipping (DDA.7 redux).
+///
+/// **Why one continuous DDA, not nested level-walks.** The previous
+/// design ran an outer brick/super DDA that *jumped* whole bricks and
+/// only descended into occupied ones. Stepping a coarse cell at a time
+/// lets the ray slip diagonally **past an occupied coarse cell it only
+/// touches at a shared edge/corner** — a leak that showed as bright
+/// sky seams across thin diagonal walls (the cave-demo report). Here a
+/// *single* cell-granularity DDA carries the exact `(cellc, t_max)`
+/// state for the whole ray; it only ever **fast-forwards across an
+/// empty super-brick / brick**, where skipping cannot miss anything.
+/// The exit axis lands on the integer box-boundary cell (no float
+/// re-floor on the critical axis), so the entry cell of the next —
+/// possibly occupied — box is always visited densely. Result: hits are
+/// bit-identical to the dense per-cell reference, with the empty-space
+/// speed-up retained.
+///
 /// `cell_size` is the mip-cell edge in mip-0 voxels (`1 << mip`);
-/// `seed_axis` is the face the ray entered the box through (for side
-/// shading), `3` for none. `fwd_dot = dir·forward` → perpendicular
-/// depth.
+/// `fwd_dot = dir·forward` → perpendicular depth.
 #[allow(
     clippy::too_many_arguments,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
 )]
-fn cell_walk(
+fn cell_walk_skip(
     origin: [f32; 3],
     dir: [f32; 3],
     fwd_dot: f32,
@@ -753,13 +766,15 @@ fn cell_walk(
     lo_c: [i32; 3],
     hi_c: [i32; 3],
     cell_size: f32,
-    t_lo: f32,
-    t_hi: f32,
+    t_enter: f32,
+    t_exit: f32,
     max_dist: f32,
-    seed_axis: usize,
     env: &DdaEnv<'_>,
 ) -> Option<Hit> {
-    let start = t_lo + 1e-4;
+    let has_super = sampler.cells_per_chunk_xy() >= SUPER && sampler.cells_per_chunk_z() >= SUPER;
+    let has_brick = sampler.cells_per_chunk_xy() >= BRICK && sampler.cells_per_chunk_z() >= BRICK;
+
+    let start = t_enter + 1e-4;
     let p = [
         origin[0] + dir[0] * start,
         origin[1] + dir[1] * start,
@@ -771,12 +786,22 @@ fn cell_walk(
         ((p[2] / cell_size).floor() as i32).clamp(lo_c[2], hi_c[2] - 1),
     ];
     let (step, mut t_max, t_delta) = dda_setup(origin, dir, cellc, cell_size);
-    let mut t_curr = t_lo;
-    let mut last_axis = seed_axis;
-    let max_steps = ((hi_c[0] - lo_c[0]) + (hi_c[1] - lo_c[1]) + (hi_c[2] - lo_c[2])) as usize + 8;
+    // Reciprocal direction → the per-skip box-boundary t and the t_max
+    // refresh use multiplies instead of divisions (the dominant skip
+    // cost). `0.0` where `step == 0` (that axis' t_max stays +∞).
+    let inv = [
+        if step[0] != 0 { 1.0 / dir[0] } else { 0.0 },
+        if step[1] != 0 { 1.0 / dir[1] } else { 0.0 },
+        if step[2] != 0 { 1.0 / dir[2] } else { 0.0 },
+    ];
+    let mut t_curr = t_enter;
+    let mut last_axis = 3usize;
+
+    // Each iteration either advances ≥1 cell (dense) or ≥1 box (skip),
+    // so the total cell span bounds the loop.
+    let span = (hi_c[0] - lo_c[0]) + (hi_c[1] - lo_c[1]) + (hi_c[2] - lo_c[2]);
+    let max_steps = span.max(0) as usize + 16;
     for _ in 0..max_steps {
-        #[cfg(test)]
-        prof::CELLS.with(|x| x.set(x.get() + 1));
         if cellc[0] < lo_c[0]
             || cellc[0] >= hi_c[0]
             || cellc[1] < lo_c[1]
@@ -787,9 +812,109 @@ fn cell_walk(
             return None;
         }
         let depth = t_curr * fwd_dot;
-        if depth > max_dist || t_curr > t_hi {
+        if depth > max_dist || t_curr > t_exit {
             return None;
         }
+        // Fog is fully opaque at `fog_max_dist`: nothing beyond is
+        // visible, so stop the ray there and return the fog colour
+        // rather than traversing (and skip/step-counting) to the far box
+        // wall. Both correct and the dominant perf win for foggy worlds —
+        // it caps every ray's length at the fog distance.
+        if env.fog_max_dist > 0.0 && depth >= env.fog_max_dist {
+            return Some(Hit {
+                color: 0x8000_0000 | (env.fog_color & 0x00ff_ffff),
+                dist: env.fog_max_dist,
+            });
+        }
+
+        // Empty-space skip: a whole empty super-brick, else an empty
+        // brick. Skipping only empty boxes can never miss a surface.
+        let skip_shift = if has_super
+            && !sampler.super_occupied([cellc[0] >> 6, cellc[1] >> 6, cellc[2] >> 6])
+        {
+            Some(6u32)
+        } else if has_brick
+            && !sampler.brick_occupied([cellc[0] >> 3, cellc[1] >> 3, cellc[2] >> 3])
+        {
+            Some(3u32)
+        } else {
+            None
+        };
+        if let Some(sh) = skip_shift {
+            #[cfg(test)]
+            prof::BRICKS.with(|x| x.set(x.get() + 1));
+            // Nearest box boundary along the ray (in cell units).
+            let mut best_t = f32::INFINITY;
+            let mut best_axis = 3usize;
+            let mut plane = [0i32; 3];
+            for a in 0..3 {
+                if step[a] == 0 {
+                    continue;
+                }
+                let idx = cellc[a] >> sh;
+                plane[a] = if step[a] > 0 {
+                    (idx + 1) << sh
+                } else {
+                    idx << sh
+                };
+                let tb = (plane[a] as f32 * cell_size - origin[a]) * inv[a];
+                if tb < best_t {
+                    best_t = tb;
+                    best_axis = a;
+                }
+            }
+            if best_axis == 3 {
+                return None;
+            }
+            // Land just across the boundary; pin the exit axis to the
+            // integer boundary cell so float error can't skip the next
+            // box's entry cell. Other axes haven't crossed their box
+            // boundary (best_t is the min), so the point's floor is safe.
+            let pb = [
+                origin[0] + dir[0] * (best_t + 1e-4),
+                origin[1] + dir[1] * (best_t + 1e-4),
+                origin[2] + dir[2] * (best_t + 1e-4),
+            ];
+            let mut nc = [
+                (pb[0] / cell_size).floor() as i32,
+                (pb[1] / cell_size).floor() as i32,
+                (pb[2] / cell_size).floor() as i32,
+            ];
+            nc[best_axis] = if step[best_axis] > 0 {
+                plane[best_axis]
+            } else {
+                plane[best_axis] - 1
+            };
+            // The skip crossed a box boundary; if that takes the ray out
+            // of the grid box it has exited (sky) — return rather than
+            // clamping back in-bounds, which would spin at the edge.
+            if nc[0] < lo_c[0]
+                || nc[0] >= hi_c[0]
+                || nc[1] < lo_c[1]
+                || nc[1] >= hi_c[1]
+                || nc[2] < lo_c[2]
+                || nc[2] >= hi_c[2]
+            {
+                return None;
+            }
+            cellc = nc;
+            // Refresh t_max for the new cell (dir unchanged → t_delta and
+            // step constant; axes with step==0 keep their +∞).
+            for a in 0..3 {
+                if step[a] > 0 {
+                    t_max[a] = ((cellc[a] + 1) as f32 * cell_size - origin[a]) * inv[a];
+                } else if step[a] < 0 {
+                    t_max[a] = (cellc[a] as f32 * cell_size - origin[a]) * inv[a];
+                }
+            }
+            t_curr = best_t.max(t_curr);
+            last_axis = best_axis;
+            continue;
+        }
+
+        // Occupied brick: dense per-cell surface test.
+        #[cfg(test)]
+        prof::CELLS.with(|x| x.set(x.get() + 1));
         if let Some(color) = sampler.hit(cellc) {
             let bright_sub = side_shade_sub(env, last_axis, step);
             let lit = shade(color, bright_sub);
@@ -802,217 +927,6 @@ fn cell_walk(
         last_axis = axis;
         t_curr = t_max[axis];
         cellc[axis] += step[axis];
-        t_max[axis] += t_delta[axis];
-    }
-    None
-}
-
-/// Walk the ray through `[lo, hi)` (mip-0 box) and return the first
-/// solid hit.
-///
-/// **DDA.6/.7:** traverses mip-`mip` cells (size `1 << mip` mip-0
-/// voxels); the ray + `t` stay in mip-0 units so depth is exact.
-/// **Two-level empty-space skip:** an outer DDA steps `BRICK`-cell
-/// bricks, skipping empty ones in one stride, and only descends into a
-/// per-cell [`cell_walk`] inside occupied bricks — cutting long air-ray
-/// step counts ~`BRICK`×. Falls back to a single `cell_walk` when bricks
-/// don't nest in chunks (very coarse mips, `chunk < BRICK` cells).
-#[allow(
-    clippy::too_many_arguments,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
-fn voxel_walk(
-    origin: [f32; 3],
-    dir: [f32; 3],
-    fwd_dot: f32,
-    sampler: &mut Sampler<'_>,
-    lo: [i32; 3],
-    hi: [i32; 3],
-    t_lo: f32,
-    t_hi: f32,
-    max_dist: f32,
-    env: &DdaEnv<'_>,
-) -> Option<Hit> {
-    let mip = sampler.mip;
-    let cell = 1i32 << mip;
-    let cell_size = cell as f32;
-    let lo_c = [
-        lo[0].div_euclid(cell),
-        lo[1].div_euclid(cell),
-        lo[2].div_euclid(cell),
-    ];
-    let hi_c = [
-        hi[0].div_euclid(cell),
-        hi[1].div_euclid(cell),
-        hi[2].div_euclid(cell),
-    ];
-
-    // Fallback: bricks must nest in chunks for the per-brick occupancy
-    // lookup to be exact.
-    if sampler.cells_per_chunk_xy() < BRICK || sampler.cells_per_chunk_z() < BRICK {
-        return cell_walk(
-            origin, dir, fwd_dot, sampler, lo_c, hi_c, cell_size, t_lo, t_hi, max_dist, 3, env,
-        );
-    }
-
-    // Outer brick DDA: cells grouped into BRICK³ bricks (brick edge =
-    // BRICK mip-cells = BRICK*cell mip-0 voxels).
-    let brick_world = (BRICK * cell) as f32;
-    let lo_b = [
-        lo_c[0].div_euclid(BRICK),
-        lo_c[1].div_euclid(BRICK),
-        lo_c[2].div_euclid(BRICK),
-    ];
-    let hi_b = [
-        (hi_c[0] + BRICK - 1).div_euclid(BRICK),
-        (hi_c[1] + BRICK - 1).div_euclid(BRICK),
-        (hi_c[2] + BRICK - 1).div_euclid(BRICK),
-    ];
-    let p = [
-        origin[0] + dir[0] * (t_lo + 1e-4),
-        origin[1] + dir[1] * (t_lo + 1e-4),
-        origin[2] + dir[2] * (t_lo + 1e-4),
-    ];
-    let mut brick = [
-        ((p[0] / brick_world).floor() as i32).clamp(lo_b[0], hi_b[0] - 1),
-        ((p[1] / brick_world).floor() as i32).clamp(lo_b[1], hi_b[1] - 1),
-        ((p[2] / brick_world).floor() as i32).clamp(lo_b[2], hi_b[2] - 1),
-    ];
-    let (step, mut t_max, t_delta) = dda_setup(origin, dir, brick, brick_world);
-    let mut t_curr = t_lo;
-    let mut last_axis = 3usize;
-    let max_steps = ((hi_b[0] - lo_b[0]) + (hi_b[1] - lo_b[1]) + (hi_b[2] - lo_b[2])) as usize + 8;
-    for _ in 0..max_steps {
-        #[cfg(test)]
-        prof::BRICKS.with(|x| x.set(x.get() + 1));
-        if brick[0] < lo_b[0]
-            || brick[0] >= hi_b[0]
-            || brick[1] < lo_b[1]
-            || brick[1] >= hi_b[1]
-            || brick[2] < lo_b[2]
-            || brick[2] >= hi_b[2]
-        {
-            return None;
-        }
-        if t_curr * fwd_dot > max_dist || t_curr > t_hi {
-            return None;
-        }
-        if sampler.brick_occupied(brick) {
-            // Inner per-cell walk over this brick's cell sub-box.
-            let blo = [
-                (brick[0] * BRICK).max(lo_c[0]),
-                (brick[1] * BRICK).max(lo_c[1]),
-                (brick[2] * BRICK).max(lo_c[2]),
-            ];
-            let bhi = [
-                ((brick[0] + 1) * BRICK).min(hi_c[0]),
-                ((brick[1] + 1) * BRICK).min(hi_c[1]),
-                ((brick[2] + 1) * BRICK).min(hi_c[2]),
-            ];
-            let brick_exit = t_max[0].min(t_max[1]).min(t_max[2]).min(t_hi);
-            if let Some(hit) = cell_walk(
-                origin, dir, fwd_dot, sampler, blo, bhi, cell_size, t_curr, brick_exit, max_dist,
-                last_axis, env,
-            ) {
-                return Some(hit);
-            }
-        }
-        let axis = min_axis(t_max);
-        last_axis = axis;
-        t_curr = t_max[axis];
-        brick[axis] += step[axis];
-        t_max[axis] += t_delta[axis];
-    }
-    None
-}
-
-/// Outermost empty-space skip (DDA.7): step `SUPER`-cell super-bricks,
-/// skipping empty ones in one stride, and descend into [`voxel_walk`]
-/// (brick + cell) only inside occupied super-bricks. A ray crossing open
-/// air above the terrain skips ~`SUPER` cells per step. Caller gates on
-/// super-bricks nesting in chunks (`cells_per_chunk >= SUPER`).
-#[allow(
-    clippy::too_many_arguments,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
-fn super_walk(
-    origin: [f32; 3],
-    dir: [f32; 3],
-    fwd_dot: f32,
-    sampler: &mut Sampler<'_>,
-    lo: [i32; 3],
-    hi: [i32; 3],
-    t_lo: f32,
-    t_hi: f32,
-    max_dist: f32,
-    env: &DdaEnv<'_>,
-) -> Option<Hit> {
-    let mip = sampler.mip;
-    let cell = 1i32 << mip;
-    let sw_i = SUPER * cell; // super-brick edge in mip-0 voxels
-    let super_world = sw_i as f32;
-    let lo_s = [
-        lo[0].div_euclid(sw_i),
-        lo[1].div_euclid(sw_i),
-        lo[2].div_euclid(sw_i),
-    ];
-    let hi_s = [
-        (hi[0] + sw_i - 1).div_euclid(sw_i),
-        (hi[1] + sw_i - 1).div_euclid(sw_i),
-        (hi[2] + sw_i - 1).div_euclid(sw_i),
-    ];
-    let p = [
-        origin[0] + dir[0] * (t_lo + 1e-4),
-        origin[1] + dir[1] * (t_lo + 1e-4),
-        origin[2] + dir[2] * (t_lo + 1e-4),
-    ];
-    let mut s = [
-        ((p[0] / super_world).floor() as i32).clamp(lo_s[0], hi_s[0] - 1),
-        ((p[1] / super_world).floor() as i32).clamp(lo_s[1], hi_s[1] - 1),
-        ((p[2] / super_world).floor() as i32).clamp(lo_s[2], hi_s[2] - 1),
-    ];
-    let (step, mut t_max, t_delta) = dda_setup(origin, dir, s, super_world);
-    let mut t_curr = t_lo;
-    let max_steps = ((hi_s[0] - lo_s[0]) + (hi_s[1] - lo_s[1]) + (hi_s[2] - lo_s[2])) as usize + 8;
-    for _ in 0..max_steps {
-        if s[0] < lo_s[0]
-            || s[0] >= hi_s[0]
-            || s[1] < lo_s[1]
-            || s[1] >= hi_s[1]
-            || s[2] < lo_s[2]
-            || s[2] >= hi_s[2]
-        {
-            return None;
-        }
-        if t_curr * fwd_dot > max_dist || t_curr > t_hi {
-            return None;
-        }
-        if sampler.super_occupied(s) {
-            // Descend: brick+cell walk over this super-brick's mip-0 box.
-            let slo = [
-                (s[0] * sw_i).max(lo[0]),
-                (s[1] * sw_i).max(lo[1]),
-                (s[2] * sw_i).max(lo[2]),
-            ];
-            let shi = [
-                ((s[0] + 1) * sw_i).min(hi[0]),
-                ((s[1] + 1) * sw_i).min(hi[1]),
-                ((s[2] + 1) * sw_i).min(hi[2]),
-            ];
-            let s_exit = t_max[0].min(t_max[1]).min(t_max[2]).min(t_hi);
-            if let Some(hit) = voxel_walk(
-                origin, dir, fwd_dot, sampler, slo, shi, t_curr, s_exit, max_dist, env,
-            ) {
-                return Some(hit);
-            }
-        }
-        let axis = min_axis(t_max);
-        t_curr = t_max[axis];
-        s[axis] += step[axis];
         t_max[axis] += t_delta[axis];
     }
     None
@@ -1057,17 +971,21 @@ fn cast_ray(
     let fwd_dot = dir[0] * forward[0] + dir[1] * forward[1] + dir[2] * forward[2];
     #[allow(clippy::cast_precision_loss)]
     let max_dist = settings.max_scan_dist.max(1) as f32;
-    // Three-level empty-space skip when super-bricks nest in chunks
-    // (`chunk >= SUPER` cells); else the two-level brick/cell walk.
-    if sampler.cells_per_chunk_xy() >= SUPER && sampler.cells_per_chunk_z() >= SUPER {
-        super_walk(
-            origin, dir, fwd_dot, sampler, lo_i, hi_i, t_enter, t_exit, max_dist, env,
-        )
-    } else {
-        voxel_walk(
-            origin, dir, fwd_dot, sampler, lo_i, hi_i, t_enter, t_exit, max_dist, env,
-        )
-    }
+    let cell = 1i32 << sampler.mip;
+    let cell_size = cell as f32;
+    let lo_c = [
+        lo_i[0].div_euclid(cell),
+        lo_i[1].div_euclid(cell),
+        lo_i[2].div_euclid(cell),
+    ];
+    let hi_c = [
+        hi_i[0].div_euclid(cell),
+        hi_i[1].div_euclid(cell),
+        hi_i[2].div_euclid(cell),
+    ];
+    cell_walk_skip(
+        origin, dir, fwd_dot, sampler, lo_c, hi_c, cell_size, t_enter, t_exit, max_dist, env,
+    )
 }
 
 /// Render one grid into `sink` with per-pixel 3D-DDA.
@@ -1566,6 +1484,37 @@ mod tests {
             render_dda(camera, &settings, grid, w as usize, env, 0, &mut sink);
         }
         (fb, zb)
+    }
+
+    /// Regression for the cave-demo "bright sky seams" report: the
+    /// empty-space-skip walk must not leak past an occupied box the ray
+    /// only grazes at a shared edge/corner. A 1-voxel-thick diagonal
+    /// wall (`x+y==64`, voxels edge-connected) with air on both sides is
+    /// the canonical case. The production skip walk must hit exactly the
+    /// same pixels as the dense per-cell reference — zero divergence.
+    #[test]
+    fn no_sky_leak_through_diagonal_wall() {
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
+            ((x + y == 64) && (2..62).contains(&z)).then_some(0x80_40_80_60)
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+        let (w, h) = (160u32, 160u32);
+        let c = [10.0, 10.0, 32.0];
+        let poses = [
+            Camera::from_yaw_pitch(c, 0.785, 0.0),
+            Camera::from_yaw_pitch(c, 0.6, 0.1),
+            Camera::from_yaw_pitch(c, 0.95, -0.1),
+            Camera::from_yaw_pitch(c, 0.785, 0.3),
+            Camera::from_yaw_pitch(c, 0.5, 0.0),
+        ];
+        for (i, cam) in poses.iter().enumerate() {
+            let (fb_b, _) = render_brickmap(grid, cam, w, h);
+            let (fb_r, _) = render_reference(grid, cam, w, h);
+            let leak = (0..(w * h) as usize)
+                .filter(|&k| (fb_b[k] != 0) != (fb_r[k] != 0))
+                .count();
+            assert_eq!(leak, 0, "pose {i}: {leak} px diverge from dense reference");
+        }
     }
 
     /// DDA.5: distance fog blends a hit toward the fog colour. A far
