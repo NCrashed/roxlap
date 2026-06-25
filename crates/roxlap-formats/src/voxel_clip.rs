@@ -112,7 +112,9 @@ impl VoxelFrame {
         if self.color_offsets.len() != cols + 1 {
             return Err(FrameError::OffsetsLen);
         }
-        if self.color_offsets[0] != 0 || *self.color_offsets.last().unwrap() as usize != self.colors.len() {
+        if self.color_offsets[0] != 0
+            || *self.color_offsets.last().unwrap() as usize != self.colors.len()
+        {
             return Err(FrameError::OffsetsBounds);
         }
         for col in 0..cols {
@@ -579,7 +581,14 @@ fn parse_meta(payload: &[u8]) -> Result<([u32; 3], [f32; 3], f32, LoopMode, u32,
     let loop_mode = LoopMode::from_u8(cur.read_u8()?).ok_or(ParseError::BadLoopMode)?;
     let default_frame_ms = cur.read_u32()?;
     let frame_count = cur.read_u32()?;
-    Ok((dims, pivot, voxel_world_size, loop_mode, default_frame_ms, frame_count))
+    Ok((
+        dims,
+        pivot,
+        voxel_world_size,
+        loop_mode,
+        default_frame_ms,
+        frame_count,
+    ))
 }
 
 fn parse_frms(
@@ -678,10 +687,7 @@ mod tests {
 
     /// Build a full frame from a dense `solid(x,y,z) -> Option<color>`
     /// closure (the authoring shape demiurg / the encoder will use).
-    fn frame_from_fn(
-        dims: [u32; 3],
-        fill: impl Fn(u32, u32, u32) -> Option<u32>,
-    ) -> VoxelFrame {
+    fn frame_from_fn(dims: [u32; 3], fill: impl Fn(u32, u32, u32) -> Option<u32>) -> VoxelFrame {
         let owpc = occ_words_per_col(dims) as usize;
         let cols = (dims[0] as usize) * (dims[1] as usize);
         let mut occupancy = vec![0u32; cols * owpc];
@@ -710,7 +716,11 @@ mod tests {
     /// A small flame-ish clip: a flickering blob whose top voxel toggles
     /// per frame (so most columns are static, a few change — the diff
     /// codec's target).
-    fn flame_clip(dims: [u32; 3], n_frames: u32, keyframe_interval: u32) -> (VoxelClip, Vec<VoxelFrame>) {
+    fn flame_clip(
+        dims: [u32; 3],
+        n_frames: u32,
+        keyframe_interval: u32,
+    ) -> (VoxelClip, Vec<VoxelFrame>) {
         let frames: Vec<VoxelFrame> = (0..n_frames)
             .map(|fi| {
                 frame_from_fn(dims, |x, y, z| {
@@ -730,7 +740,11 @@ mod tests {
             .collect();
         let clip = VoxelClip::from_frames(
             dims,
-            [dims[0] as f32 * 0.5, dims[1] as f32 * 0.5, dims[2] as f32 * 0.5],
+            [
+                dims[0] as f32 * 0.5,
+                dims[1] as f32 * 0.5,
+                dims[2] as f32 * 0.5,
+            ],
             1.0,
             LoopMode::Loop,
             &frames,
@@ -752,7 +766,9 @@ mod tests {
     #[test]
     fn frame_validate_catches_mismatch() {
         let dims = [4, 4, 8];
-        let mut f = frame_from_fn(dims, |x, y, z| (x == 0 && y == 0 && z < 3).then_some(0x8000_00FF));
+        let mut f = frame_from_fn(dims, |x, y, z| {
+            (x == 0 && y == 0 && z < 3).then_some(0x8000_00FF)
+        });
         assert!(f.validate(dims).is_ok());
         // Corrupt column 0: clear one occupancy bit but keep its colour run
         // (popcount 2 ≠ run 3).
@@ -772,7 +788,11 @@ mod tests {
         for (i, (got, want)) in decoded.frames.iter().zip(&original).enumerate() {
             assert_eq!(got, want, "frame {i} mismatch");
             // dirs are parallel to colours.
-            assert_eq!(decoded.dirs[i].len(), got.colors.len(), "frame {i} dirs len");
+            assert_eq!(
+                decoded.dirs[i].len(),
+                got.colors.len(),
+                "frame {i} dirs len"
+            );
         }
     }
 
@@ -828,7 +848,11 @@ mod tests {
     fn explicit_durations_round_trip() {
         let dims = [4, 4, 8];
         let frames: Vec<VoxelFrame> = (0..3)
-            .map(|fi| frame_from_fn(dims, move |x, y, z| (x == 0 && y == 0 && z == fi).then_some(0x8011_2233)))
+            .map(|fi| {
+                frame_from_fn(dims, move |x, y, z| {
+                    (x == 0 && y == 0 && z == fi).then_some(0x8011_2233)
+                })
+            })
             .collect();
         let clip = VoxelClip::from_frames(
             dims,
@@ -862,7 +886,10 @@ mod tests {
         let mut bytes = clip.serialize();
         let good = bytes.clone();
         bytes[0] = b'X';
-        assert!(matches!(VoxelClip::parse(&bytes), Err(ParseError::BadMagic { .. })));
+        assert!(matches!(
+            VoxelClip::parse(&bytes),
+            Err(ParseError::BadMagic { .. })
+        ));
         let mut v = good.clone();
         v[4] = 9; // version low byte
         assert!(matches!(
