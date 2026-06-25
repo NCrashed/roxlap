@@ -21,6 +21,7 @@
 
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_INVISIBLE, SPRITE_FLAG_NO_Z};
+use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 
 use crate::camera_math::CameraState;
 use crate::dda::{dda_setup, intersect_aabb, min_axis, pixel_ray, shade};
@@ -31,19 +32,36 @@ use crate::raster_target::RasterTarget;
 /// dropped, keeping the pinhole divide finite.
 const NEAR_Z: f32 = 1.0;
 
-/// Dense occupancy + colour grid decoded from a KV6's surface-voxel run
-/// tables. KV6 stores only surface voxels (no interior), which is
-/// exactly what a from-air ray hits, so first-occupied is the visible
-/// surface.
-struct Kv6Dense {
+/// Force a packed voxel colour to full brightness for the flat-lit
+/// clean-room sprite path. KV6 / voxel-clip colours carry voxlap's
+/// `dir`/shading slot in the high byte (some `0x80`, some `0x00`), not
+/// the 0..128 brightness [`shade`] expects, so a raw value can render
+/// black; we render every sprite voxel at its authored RGB.
+#[inline]
+fn full_bright(col: u32) -> u32 {
+    (col & 0x00ff_ffff) | 0x8000_0000
+}
+
+/// Dense occupancy + colour grid for one sprite frame, plus its pivot —
+/// the decoded form the per-pixel raycaster marches. Built once from a
+/// [`Kv6`] ([`SpriteDense::from_kv6`]) or a voxel-clip [`VoxelFrame`]
+/// ([`SpriteDense::from_voxel_frame`]); the latter lets an animated clip
+/// cache every frame's grid up front instead of rebuilding per frame.
+///
+/// Both sources store only **surface** voxels (a from-air ray's first
+/// hit is the visible surface), so the grid is the visible hull.
+pub struct SpriteDense {
     dims: [i32; 3],
     occ: Vec<bool>,
     col: Vec<u32>,
+    pivot: [f32; 3],
 }
 
-impl Kv6Dense {
+impl SpriteDense {
+    /// Decode a [`Kv6`]'s surface-voxel run tables into a dense grid.
+    #[must_use]
     #[allow(clippy::cast_possible_wrap)]
-    fn build(kv6: &Kv6) -> Self {
+    pub fn from_kv6(kv6: &Kv6) -> Self {
         let dims = [kv6.xsiz as i32, kv6.ysiz as i32, kv6.zsiz as i32];
         let n = (dims[0].max(0) * dims[1].max(0) * dims[2].max(0)) as usize;
         let mut occ = vec![false; n];
@@ -59,19 +77,53 @@ impl Kv6Dense {
                     if z >= 0 && z < dims[2] {
                         let idx = ((x as i32 * dims[1] + y as i32) * dims[2] + z) as usize;
                         occ[idx] = true;
-                        // KV6's colour high byte is voxlap's `dir`/shading
-                        // slot, NOT the 0..128 brightness `shade` expects:
-                        // some models store `0x80` (coco), others `0x00`
-                        // (meltsphere → all-black under `shade`). Force full
-                        // brightness so both render at their authored RGB
-                        // (sprites are flat-lit in the clean-room path; the
-                        // voxlap `dir`-LUT reflection shading is not ported).
-                        col[idx] = (v.col & 0x00ff_ffff) | 0x8000_0000;
+                        col[idx] = full_bright(v.col);
                     }
                 }
             }
         }
-        Self { dims, occ, col }
+        Self {
+            dims,
+            occ,
+            col,
+            pivot: [kv6.xpiv, kv6.ypiv, kv6.zpiv],
+        }
+    }
+
+    /// Decode a voxel-clip [`VoxelFrame`] (dense-column layout) into the
+    /// dense grid, given the clip's `dims` + `pivot`. The frame's columns
+    /// are `col = x + y*dims[0]`, each a per-column occupancy bitmask with
+    /// an ascending-z colour run — walked here into the raycaster's
+    /// `(x·my + y)·mz + z` grid.
+    #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn from_voxel_frame(frame: &VoxelFrame, dims: [u32; 3], pivot: [f32; 3]) -> Self {
+        let (mx, my, mz) = (dims[0], dims[1], dims[2]);
+        let owpc = mz.div_ceil(32).max(1) as usize;
+        let n = (mx * my * mz) as usize;
+        let mut occ = vec![false; n];
+        let mut col = vec![0u32; n];
+        for col_idx in 0..(mx * my) as usize {
+            let x = col_idx as u32 % mx;
+            let y = col_idx as u32 / mx;
+            let run_start = frame.color_offsets[col_idx] as usize;
+            let mut k = 0usize;
+            for z in 0..mz {
+                let word = frame.occupancy[col_idx * owpc + (z >> 5) as usize];
+                if (word >> (z & 31)) & 1 != 0 {
+                    let idx = (((x * my + y) * mz) + z) as usize;
+                    occ[idx] = true;
+                    col[idx] = full_bright(frame.colors[run_start + k]);
+                    k += 1;
+                }
+            }
+        }
+        Self {
+            dims: [mx as i32, my as i32, mz as i32],
+            occ,
+            col,
+            pivot,
+        }
     }
 
     #[inline]
@@ -123,7 +175,7 @@ fn mat_apply(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
 /// dense KV6 and return `(colour, t)` of the first solid voxel — `t` is
 /// the world-units ray parameter (shared with the world ray).
 #[allow(clippy::cast_possible_truncation)]
-fn cast_local(dense: &Kv6Dense, origin: [f32; 3], dir: [f32; 3]) -> Option<(u32, f32)> {
+fn cast_local(dense: &SpriteDense, origin: [f32; 3], dir: [f32; 3]) -> Option<(u32, f32)> {
     #[allow(clippy::cast_precision_loss)]
     let hi = [
         dense.dims[0] as f32,
@@ -195,18 +247,63 @@ pub fn draw_sprite_dda(
     if sprite.flags & SPRITE_FLAG_INVISIBLE != 0 {
         return 0;
     }
-    let dense = Kv6Dense::build(&sprite.kv6);
-    if dense.occ.is_empty() {
+    // Decodes the KV6 to a dense grid each call (the per-frame cost an
+    // animated clip avoids via [`ClipFlipbook`]'s cached grids).
+    let dense = SpriteDense::from_kv6(&sprite.kv6);
+    draw_sprite_dense(
+        fb,
+        zb,
+        pitch_pixels,
+        width,
+        height,
+        cam,
+        settings,
+        &dense,
+        sprite.p,
+        sprite.s,
+        sprite.h,
+        sprite.f,
+        sprite.flags,
+    )
+}
+
+/// Draw a pre-decoded [`SpriteDense`] at a world pose — the generalised
+/// core of [`draw_sprite_dda`], shared by the KV6 path and animated
+/// [`ClipFlipbook`] frames. `pos` is the world pivot; `s`/`h`/`f` are the
+/// model→world basis columns (local +x/+y/+z); `flags` honours
+/// [`SPRITE_FLAG_INVISIBLE`] / [`SPRITE_FLAG_NO_Z`]. Returns pixels written.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+#[must_use]
+pub fn draw_sprite_dense(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
+    cam: &CameraState,
+    settings: &OpticastSettings,
+    dense: &SpriteDense,
+    pos: [f32; 3],
+    s: [f32; 3],
+    h: [f32; 3],
+    f: [f32; 3],
+    flags: u32,
+) -> u32 {
+    if flags & SPRITE_FLAG_INVISIBLE != 0 || dense.occ.is_empty() {
         return 0;
     }
-    let Some(minv) = invert_basis(sprite.s, sprite.h, sprite.f) else {
+    let Some(minv) = invert_basis(s, h, f) else {
         return 0;
     };
-    let pivot = [sprite.kv6.xpiv, sprite.kv6.ypiv, sprite.kv6.zpiv];
-    let no_z = sprite.flags & SPRITE_FLAG_NO_Z != 0;
+    let pivot = dense.pivot;
+    let no_z = flags & SPRITE_FLAG_NO_Z != 0;
 
     // Screen bounding box from the 8 corners of the local voxel box.
-    let Some(rect) = project_screen_rect(sprite, cam, settings, width, height) else {
+    let Some(rect) = project_screen_rect(dense, pos, s, h, f, cam, settings, width, height) else {
         return 0;
     };
 
@@ -218,15 +315,11 @@ pub fn draw_sprite_dda(
         for px in rect.0..rect.2 {
             let (origin, dir) = pixel_ray(cam, settings, px, py);
             // World ray → sprite-local voxel space.
-            let rel = [
-                origin[0] - sprite.p[0],
-                origin[1] - sprite.p[1],
-                origin[2] - sprite.p[2],
-            ];
+            let rel = [origin[0] - pos[0], origin[1] - pos[1], origin[2] - pos[2]];
             let ol = mat_apply(&minv, rel);
             let origin_local = [ol[0] + pivot[0], ol[1] + pivot[1], ol[2] + pivot[2]];
             let dir_local = mat_apply(&minv, dir);
-            let Some((color, t)) = cast_local(&dense, origin_local, dir_local) else {
+            let Some((color, t)) = cast_local(dense, origin_local, dir_local) else {
                 continue;
             };
             let fwd_dot =
@@ -263,15 +356,22 @@ pub fn draw_sprite_dda(
     clippy::cast_precision_loss
 )]
 fn project_screen_rect(
-    sprite: &Sprite,
+    dense: &SpriteDense,
+    pos: [f32; 3],
+    s: [f32; 3],
+    h: [f32; 3],
+    f: [f32; 3],
     cam: &CameraState,
     settings: &OpticastSettings,
     width: u32,
     height: u32,
 ) -> Option<(u32, u32, u32, u32)> {
-    let kv6 = &sprite.kv6;
-    let (xs, ys, zs) = (kv6.xsiz as f32, kv6.ysiz as f32, kv6.zsiz as f32);
-    let (xp, yp, zp) = (kv6.xpiv, kv6.ypiv, kv6.zpiv);
+    let (xs, ys, zs) = (
+        dense.dims[0] as f32,
+        dense.dims[1] as f32,
+        dense.dims[2] as f32,
+    );
+    let (xp, yp, zp) = (dense.pivot[0], dense.pivot[1], dense.pivot[2]);
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     let mut all_front = true;
     for &cx in &[0.0, xs] {
@@ -282,9 +382,9 @@ fn project_screen_rect(
                 let ly = cy - yp;
                 let lz = cz - zp;
                 let world = [
-                    sprite.p[0] + lx * sprite.s[0] + ly * sprite.h[0] + lz * sprite.f[0],
-                    sprite.p[1] + lx * sprite.s[1] + ly * sprite.h[1] + lz * sprite.f[1],
-                    sprite.p[2] + lx * sprite.s[2] + ly * sprite.h[2] + lz * sprite.f[2],
+                    pos[0] + lx * s[0] + ly * h[0] + lz * f[0],
+                    pos[1] + lx * s[1] + ly * h[1] + lz * f[1],
+                    pos[2] + lx * s[2] + ly * h[2] + lz * f[2],
                 ];
                 let rel = [
                     world[0] - cam.pos[0],
@@ -326,6 +426,81 @@ fn project_screen_rect(
     Some((rx0 as u32, ry0 as u32, rx1.ceil() as u32, ry1.ceil() as u32))
 }
 
+/// CPU-side decoded animated voxel clip: every frame's [`SpriteDense`]
+/// is cached at construction, so per-frame playback is a grid **select**
+/// — not the per-frame voxel-volume decode [`draw_sprite_dda`] pays each
+/// call. The CPU counterpart to the GPU flipbook (VCL.2). Build once from
+/// a [`DecodedClip`], then [`draw_frame`](ClipFlipbook::draw_frame) the
+/// active frame each render.
+pub struct ClipFlipbook {
+    frames: Vec<SpriteDense>,
+}
+
+impl ClipFlipbook {
+    /// Decode + cache every frame of `clip` (one [`SpriteDense`] each).
+    #[must_use]
+    pub fn from_decoded(clip: &DecodedClip) -> Self {
+        let frames = clip
+            .frames
+            .iter()
+            .map(|frame| SpriteDense::from_voxel_frame(frame, clip.dims, clip.pivot))
+            .collect();
+        Self { frames }
+    }
+
+    #[must_use]
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Borrow frame `frame`'s cached dense grid, if in range.
+    #[must_use]
+    pub fn frame(&self, frame: usize) -> Option<&SpriteDense> {
+        self.frames.get(frame)
+    }
+
+    /// Draw frame `frame` at a world pose via [`draw_sprite_dense`] —
+    /// `pos` is the world pivot, `s`/`h`/`f` the model→world basis columns.
+    /// Returns pixels written (0 if `frame` is out of range).
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn draw_frame(
+        &self,
+        fb: &mut [u32],
+        zb: &mut [f32],
+        pitch_pixels: usize,
+        width: u32,
+        height: u32,
+        cam: &CameraState,
+        settings: &OpticastSettings,
+        frame: usize,
+        pos: [f32; 3],
+        s: [f32; 3],
+        h: [f32; 3],
+        f: [f32; 3],
+        flags: u32,
+    ) -> u32 {
+        let Some(dense) = self.frames.get(frame) else {
+            return 0;
+        };
+        draw_sprite_dense(
+            fb,
+            zb,
+            pitch_pixels,
+            width,
+            height,
+            cam,
+            settings,
+            dense,
+            pos,
+            s,
+            h,
+            f,
+            flags,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +508,7 @@ mod tests {
     use crate::Camera;
     use roxlap_formats::kv6::Kv6;
     use roxlap_formats::sprite::Sprite;
+    use roxlap_formats::voxel_clip::{LoopMode, VoxelClip, VoxelFrame};
 
     fn settings(w: u32, h: u32) -> OpticastSettings {
         OpticastSettings::for_oracle_framebuffer(w, h)
@@ -346,6 +522,90 @@ mod tests {
             down: [0.0, 0.0, 1.0],
             forward: [0.0, 1.0, 0.0],
         }
+    }
+
+    /// Build a [`VoxelFrame`] from a dense `fill(x,y,z) -> Option<color>`.
+    fn clip_frame(dims: [u32; 3], fill: impl Fn(u32, u32, u32) -> Option<u32>) -> VoxelFrame {
+        let owpc = dims[2].div_ceil(32).max(1) as usize;
+        let cols = (dims[0] * dims[1]) as usize;
+        let mut occupancy = vec![0u32; cols * owpc];
+        let mut color_offsets = vec![0u32; cols + 1];
+        let mut colors = Vec::new();
+        for y in 0..dims[1] {
+            for x in 0..dims[0] {
+                let col = (x + y * dims[0]) as usize;
+                color_offsets[col] = colors.len() as u32;
+                for z in 0..dims[2] {
+                    if let Some(c) = fill(x, y, z) {
+                        occupancy[col * owpc + (z >> 5) as usize] |= 1u32 << (z & 31);
+                        colors.push(c);
+                    }
+                }
+            }
+        }
+        color_offsets[cols] = colors.len() as u32;
+        VoxelFrame {
+            occupancy,
+            colors,
+            color_offsets,
+        }
+    }
+
+    /// A cached [`ClipFlipbook`] draws distinct frames distinctly — the
+    /// CPU flipbook select. Frame 0 fills the bottom half (red), frame 1
+    /// the top half (green); rendered at the same pose they cover
+    /// different screen pixels in different colours.
+    #[test]
+    fn clip_flipbook_frames_render_differently() {
+        let dims = [8u32, 8, 8];
+        let f0 = clip_frame(dims, |_x, _y, z| (z < 4).then_some(0x00FF_0000)); // red, low z
+        let f1 = clip_frame(dims, |_x, _y, z| (z >= 4).then_some(0x0000_FF00)); // green, high z
+        let clip = VoxelClip::from_frames(
+            dims,
+            [4.0, 4.0, 4.0],
+            1.0,
+            LoopMode::Loop,
+            &[f0, f1],
+            &[],
+            33,
+            0,
+        );
+        let decoded = clip.decode().expect("decode");
+        let book = ClipFlipbook::from_decoded(&decoded);
+        assert_eq!(book.frame_count(), 2);
+        assert!(book.frame(0).is_some() && book.frame(2).is_none());
+
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let cam = cam_looking_y();
+        let cs = camera_math::derive(&cam, w, h, 32.0, 32.0, 32.0);
+        let cfg = settings(w, h);
+        let pose = [0.0, 40.0, 0.0];
+        let (s, hh, f) = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+
+        let render = |frame: usize| -> Vec<u32> {
+            let mut fb = vec![0u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            let wrote = book.draw_frame(
+                &mut fb, &mut zb, w as usize, w, h, &cs, &cfg, frame, pose, s, hh, f, 0,
+            );
+            assert!(wrote > 0, "frame {frame} should draw some pixels");
+            fb
+        };
+        let fb0 = render(0);
+        let fb1 = render(1);
+        assert_ne!(fb0, fb1, "distinct frames must render distinct pixels");
+        // Each frame shows its own channel: red present in frame 0, green
+        // present in frame 1.
+        assert!(fb0.iter().any(|&p| (p & 0x00FF_0000) != 0));
+        assert!(fb1.iter().any(|&p| (p & 0x0000_FF00) != 0));
+        // Out-of-range frame draws nothing.
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        assert_eq!(
+            book.draw_frame(&mut fb, &mut zb, w as usize, w, h, &cs, &cfg, 9, pose, s, hh, f, 0),
+            0
+        );
     }
 
     /// A solid cube sprite in front of the camera is drawn, with the
