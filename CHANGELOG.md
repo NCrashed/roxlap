@@ -7,33 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> Work in progress — version not yet cut. Covers the **DDA** macro-stage
+> (DDA.0–DDA.10): a clean-room CPU renderer replacing voxlap's, removal
+> of the voxlap-derived renderer, and the resulting license change.
+
+### Added
+
+- **Clean-room CPU renderer** `roxlap_core::dda`: per-pixel 3D-DDA over
+  an 8³ brickmap. Public API: `render_dda`, `render_dda_parallel`
+  (rayon tile bands), `DdaEnv` (sky / fog / side-shades), `BrickCache`
+  (cross-frame occupancy cache), `RasterSink`, `pixel_ray`,
+  `effective_mip`.
+- **Clean-room KV6 sprite raycaster** `roxlap_core::dda_sprite::draw_sprite_dda`
+  — per-pixel ray cast through a sprite's KV6, depth-composited against
+  the shared z-buffer.
+- `roxlap_core::raster_target::RasterTarget` — the framebuffer/z-buffer
+  compositing primitive shared by the DDA terrain + sprite passes.
+- `roxlap_scene::render::CpuFog { color, max_scan_dist, side_shades }`
+  — the CPU fog/side-shade config passed into the scene render entry
+  points.
+
 ### Changed
 
-- **New CPU renderer (DDA).** The voxlap-derived column-coherent
-  `opticast` renderer is replaced by a clean-room per-pixel 3D-DDA over
-  an 8³ brickmap (`roxlap_core::dda`), with a matching clean-room KV6
-  sprite raycaster (`dda_sprite`). The renderer is the default and only
-  CPU backend; it fixes the long-standing voxlap-inherent artifact
-  classes (silhouette notch, floor hairlines, axis-aligned mip beams).
-- **Voxlap renderer removed from `roxlap-core`** (~14k LOC): `opticast`,
-  `grouscan`, `scan_loops`, `scalar_rasterizer`, `sprite`, `drawtile`,
-  `rasterizer`, `gline`, `column_walk`, `opticast_prelude`, `projection`,
-  `ray_step`, `ptfaces16`. `OpticastSettings` is kept (renamed role:
-  projection/scan settings). The `roxlap-oracle` crate (voxlap-C hash
-  diff) is removed.
-- **Remaining engine math reimplemented independently** for a clean
-  license: lighting bake (`world_lighting`), camera projection
-  (`camera_math`), and the KFA bone solver (`kfa_draw`) are rewritten
-  from first principles; the `.vxl` slab editor (`roxlap-formats::edit`)
-  is de-ported (independent expression, byte-compatible with the
-  format). `meltsphere` removed.
+- **DDA is the default and only CPU renderer.** It fixes the
+  long-standing voxlap-inherent artifact classes (silhouette notch,
+  floor hairlines, axis-aligned mip beams). `render_scene` /
+  `render_scene_composed` take a `CpuFog` value where they previously
+  took `&mut ScratchPool`.
+- `FrameParams::sprite_lighting: Option<&SpriteLighting>` → a plain
+  `draw_sprites: bool` (both backends now draw sprites flat-lit; the GPU
+  sprite pass uses its identity colour table to match the CPU path).
+- **Engine math reimplemented independently** for a clean license:
+  lighting bake (`world_lighting`), camera projection (`camera_math`),
+  and the KFA bone solver (`kfa_draw`) rewritten from first principles;
+  the `.vxl` slab editor (`roxlap-formats::edit`) de-ported (independent
+  expression, byte-compatible with the format — existing assets and
+  outputs are unchanged).
+- README / crate descriptions reframed: roxlap is an independent engine
+  that interoperates with Voxlap's file formats, not a line-by-line port.
+
+### Removed
+
+- **Breaking:** the voxlap renderer and its public API are gone from
+  `roxlap-core` (~14k LOC): `opticast()`, `OpticastOutcome`,
+  `rasterizer::ScratchPool`, `scalar_rasterizer::ScalarRasterizer`,
+  `sprite::{draw_sprite, DrawTarget, SpriteLighting, sprite_colmul}`,
+  `kfa_draw::draw_kfa_sprite`, and the `grouscan` / `scan_loops` /
+  `drawtile` / `gline` / `column_walk` / `opticast_prelude` /
+  `projection` / `ray_step` / `ptfaces16` modules. `OpticastSettings`
+  is kept (now just projection + scan-distance settings).
+  `solve_kfa_limbs` is kept (pose the limbs, then draw via
+  `draw_sprite_dda`).
+- `roxlap_core::meltsphere` removed (unused voxlap-derived sphere-carve).
+- The `roxlap-oracle` crate (voxlap-C render-hash diff harness) removed.
 
 ### License
 
 - **Dropped the Ken-Silverman commercial-use caveat.** roxlap is now an
   independent implementation containing no Voxlap C source; dual
   MIT/Apache-2.0 now applies to commercial use as well. The crates still
-  interoperate with Voxlap's on-disk formats (not copyrightable).
+  interoperate with Voxlap's on-disk formats (`.vxl` / `.kv6` / `.kvx` /
+  `.kfa`), which are not subject to copyright.
 
 ## [0.13.0] — 2026-06-22
 
