@@ -529,7 +529,8 @@ impl CpuBackend {
     /// [`Self::add_dyn_instance_posed`] for unique generated geometry.
     pub(crate) fn add_model(&mut self, kv6: &Kv6) -> usize {
         let idx = self.models.len();
-        self.models.push(Sprite::axis_aligned(kv6.clone(), [0.0, 0.0, 0.0]));
+        self.models
+            .push(Sprite::axis_aligned(kv6.clone(), [0.0, 0.0, 0.0]));
         idx
     }
 

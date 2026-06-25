@@ -507,10 +507,22 @@ mod tests {
         let aa = Sprite::axis_aligned(kv6.clone(), [0.0, 40.0, 0.0]);
         let mut fb = vec![0u32; n];
         let mut zb = vec![f32::INFINITY; n];
-        let _ = draw_sprite_dda(&mut fb, &mut zb, w as usize, w, h, &cs, &settings(w, h), &aa);
+        let _ = draw_sprite_dda(
+            &mut fb,
+            &mut zb,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &settings(w, h),
+            &aa,
+        );
         let (ax0, ay0, ax1, ay1) = covered_rect(&fb, w, h);
         let aa_wide = (ax1 - ax0) as i32 - (ay1 - ay0) as i32;
-        assert!(aa_wide > 4, "axis-aligned box should be wider than tall (got w-h={aa_wide})");
+        assert!(
+            aa_wide > 4,
+            "axis-aligned box should be wider than tall (got w-h={aa_wide})"
+        );
 
         // Posed: map local +x onto world +z and local +z onto world +x
         // (det = -1 ≠ 0). Same box now reads tall on screen.
@@ -520,10 +532,22 @@ mod tests {
         posed.f = [1.0, 0.0, 0.0]; // local +z ↦ world +x (screen right)
         let mut fb2 = vec![0u32; n];
         let mut zb2 = vec![f32::INFINITY; n];
-        let _ = draw_sprite_dda(&mut fb2, &mut zb2, w as usize, w, h, &cs, &settings(w, h), &posed);
+        let _ = draw_sprite_dda(
+            &mut fb2,
+            &mut zb2,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &settings(w, h),
+            &posed,
+        );
         let (bx0, by0, bx1, by1) = covered_rect(&fb2, w, h);
         let posed_tall = (by1 - by0) as i32 - (bx1 - bx0) as i32;
-        assert!(posed_tall > 4, "posed box should be taller than wide (got h-w={posed_tall})");
+        assert!(
+            posed_tall > 4,
+            "posed box should be taller than wide (got h-w={posed_tall})"
+        );
     }
 
     /// A degenerate (singular) basis — `det == 0` — makes the sprite
@@ -539,7 +563,16 @@ mod tests {
         let mut zb = vec![f32::INFINITY; n];
         let cam = cam_looking_y();
         let cs = camera_math::derive(&cam, w, h, 16.0, 16.0, 16.0);
-        let wrote = draw_sprite_dda(&mut fb, &mut zb, w as usize, w, h, &cs, &settings(w, h), &sprite);
+        let wrote = draw_sprite_dda(
+            &mut fb,
+            &mut zb,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &settings(w, h),
+            &sprite,
+        );
         assert_eq!(wrote, 0, "singular basis must skip, not panic");
     }
 

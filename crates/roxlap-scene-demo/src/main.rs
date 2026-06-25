@@ -894,8 +894,8 @@ impl Spinner {
         let (s, c) = (phase.sin() as f32, phase.cos() as f32);
         DynSpriteTransform {
             pos,
-            right: [c, s, 0.0],   // local +x in world (xy-plane rotation)
-            up: [-s, c, 0.0],     // local +y in world
+            right: [c, s, 0.0],       // local +x in world (xy-plane rotation)
+            up: [-s, c, 0.0],         // local +y in world
             forward: [0.0, 0.0, 1.0], // local +z stays world +z
         }
     }

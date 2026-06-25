@@ -1540,10 +1540,7 @@ mod tests {
         assert!(!map.remove(ids[1]));
 
         // A bogus / out-of-range handle resolves to nothing, no panic.
-        let bogus = SpriteModelId {
-            slot: 999,
-            gen: 0,
-        };
+        let bogus = SpriteModelId { slot: 999, gen: 0 };
         assert_eq!(map.model_index(bogus), None);
         assert!(!map.remove(bogus));
 
