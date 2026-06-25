@@ -31,15 +31,19 @@
 //! Movement is collision-checked: the camera slides along walls instead
 //! of clipping through them.
 
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
 use glam::IVec3;
 use roxlap_cavegen::{BlueCaveGenerator, CaveParams, MagCaveGenerator, MAXZDIM};
+use roxlap_core::update_lighting;
 use roxlap_core::world_query::{getcube, Cube};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::OpticastSettings;
+use roxlap_formats::edit::set_sphere_with_colfunc;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::vxl::Vxl;
 use roxlap_render::{
@@ -131,6 +135,14 @@ const FOG_MAX_SCAN_DIST: i32 = 128;
 /// Edit headroom reserved on the cave chunk so runtime carves (spawn
 /// bubble + thousands of bullet impacts) don't overflow the slab pool.
 const EDIT_HEADROOM_BYTES: usize = 4 * 1024 * 1024;
+
+/// GPU mip-ladder depth to keep baked into the cave chunk. Mirrors the
+/// GPU backend's `GPU_MAX_MIPS` (`roxlap-gpu`): the facade re-decompresses
+/// an edited chunk each frame, and a chunk that already carries this many
+/// mips takes the cheap read path (~6 ms) instead of regenerating the
+/// whole ladder (~45 ms — the per-impact hitch this exists to avoid). The
+/// background carve worker keeps the ladder fresh after every carve.
+const GPU_MIP_LEVELS: u32 = 6;
 
 /// Effective camera "skin" radius in voxel units. Movement is blocked
 /// when any voxel intersected by a ±`PLAYER_RADIUS` cube around the
@@ -238,6 +250,10 @@ struct App {
     /// integrated each frame, removed on impact / out-of-bounds / past
     /// `BULLET_MAX_DIST`.
     bullets: Vec<Bullet>,
+    /// Background carve pipeline — applies bullet-impact carves +
+    /// relight + mip rebuild off the main thread, swapping the result in
+    /// when ready so impacts don't hitch the frame.
+    carve: CarveWorker,
 }
 
 impl App {
@@ -275,6 +291,7 @@ impl App {
             preset,
             seed,
             bullets: Vec::new(),
+            carve: CarveWorker::new(),
         }
     }
 
@@ -290,6 +307,10 @@ impl App {
             }
         }
         self.bullets.clear();
+
+        // Drop any in-flight background carve so its result (carved into
+        // the OLD world) can't clobber the fresh chunk.
+        self.carve.invalidate();
 
         install_cave_chunk(&mut self.scene, self.grid_id, self.preset, self.seed);
 
@@ -485,10 +506,10 @@ impl App {
             });
         }
 
-        // Apply impact carves + relight (CR.2: through the grid).
-        for hit in impacts {
-            carve_sphere(&mut self.scene, grid_id, hit, FIRE_RADIUS, CARVE_COLOR);
-        }
+        // Hand impact carves to the background worker; it carves +
+        // relights + re-mips a chunk clone off-thread, and `pump_carves`
+        // swaps the result in when ready (no per-impact frame hitch).
+        self.carve.enqueue(impacts);
 
         // Drop the despawned sprite instances, then re-pose the
         // survivors (one batched upload).
@@ -502,6 +523,23 @@ impl App {
                 .map(|b| (b.inst, bullet_pose(b.pos)))
                 .collect();
             renderer.set_sprite_instance_transforms(&updates);
+        }
+    }
+
+    /// Swap in any finished background carve: poll the worker, and if a
+    /// carved chunk is ready, replace chunk `(0, 0, 0)` with it + bump
+    /// the version so the renderer re-uploads (cheap mip read-path).
+    fn pump_carves(&mut self) {
+        let current = self.scene.grid(self.grid_id).and_then(|g| g.chunk(IVec3::ZERO));
+        let Some(current) = current else {
+            return;
+        };
+        let new_chunk = self.carve.pump(current);
+        if let Some(new_chunk) = new_chunk {
+            if let Some(grid) = self.scene.grid_mut(self.grid_id) {
+                *grid.ensure_chunk(IVec3::ZERO) = new_chunk;
+                grid.bump_chunk_version(IVec3::ZERO);
+            }
         }
     }
 
@@ -523,6 +561,7 @@ impl App {
         self.last_tick = Some(now);
         self.integrate(dt);
         self.step_bullets(dt);
+        self.pump_carves();
 
         let cam = self.camera();
         let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
@@ -732,25 +771,181 @@ fn install_cave_chunk(scene: &mut Scene, grid_id: GridId, preset: Preset, seed: 
         |_, _, _| SPAWN_BUBBLE_COLOR,
     );
 
-    // Directional sun-style bake over the whole (single) chunk, then a
-    // final version bump so the GPU backend re-uploads the baked
-    // brightness bytes.
+    // Directional sun-style bake over the whole (single) chunk.
     grid.bake_lightmode(LIGHTMODE);
+
+    // Build the GPU mip ladder up front so the renderer's first upload —
+    // and every per-impact re-upload — takes the cheap mip read-path. The
+    // background carve worker rebuilds it after each carve. (Whole-chunk
+    // mip build ~30 ms; acceptable at load / on a deliberate F/R regen.)
+    if let Some(vxl) = grid.chunk_mut(IVec3::ZERO) {
+        vxl.generate_mips(GPU_MIP_LEVELS);
+    }
+
+    // Final version bump so the renderer re-uploads the baked brightness
+    // + fresh mips.
     grid.bump_chunk_version(IVec3::ZERO);
 }
 
-/// Carve a `radius` sphere of `color` at grid-local `centre`, then
-/// re-bake lighting over the chunk + bump its version so the GPU
-/// re-uploads. The world is one chunk, so a whole-chunk bake is cheap
-/// enough and keeps dynamic carves correctly lit (CR.2).
-fn carve_sphere(scene: &mut Scene, grid_id: GridId, centre: IVec3, radius: u32, color: i32) {
-    let Some(grid) = scene.grid_mut(grid_id) else {
+/// A batch of bullet-impact carve centres to apply to a cloned cave
+/// chunk on the worker thread. `epoch` tags the world generation the
+/// clone came from, so a result that lands after a regenerate (F/R) is
+/// dropped instead of clobbering the fresh world.
+struct CarveJob {
+    chunk: Vxl,
+    impacts: Vec<IVec3>,
+    epoch: u64,
+}
+
+/// A finished carve: the carved + relit + re-mipped chunk, ready to swap
+/// into the grid.
+struct CarveDone {
+    chunk: Vxl,
+    epoch: u64,
+}
+
+/// Background carve pipeline. The heavy per-impact work — carve, local
+/// relight, and (the expensive part, ~45 ms on the GPU path) rebuilding
+/// the mip ladder — runs on a worker thread against a **clone** of the
+/// cave chunk, so the main thread never stalls. The main thread keeps
+/// rendering the un-carved chunk and **swaps** the finished one in when
+/// it arrives (double-buffer swap), bumping the chunk version so the
+/// renderer re-uploads it — which is now the cheap mip read-path because
+/// the worker kept the ladder fresh.
+struct CarveWorker {
+    job_tx: Sender<CarveJob>,
+    done_rx: Receiver<CarveDone>,
+    /// A job is in flight on the worker thread.
+    busy: bool,
+    /// Impact centres queued since the last dispatch (and while busy).
+    pending: Vec<IVec3>,
+    /// World generation; bumped on regenerate so stale results are dropped.
+    epoch: u64,
+}
+
+impl CarveWorker {
+    fn new() -> Self {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<CarveJob>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<CarveDone>();
+        thread::Builder::new()
+            .name("cave-carve".to_string())
+            .spawn(move || carve_worker_loop(&job_rx, &done_tx))
+            .expect("spawn cave carve worker");
+        Self {
+            job_tx,
+            done_rx,
+            busy: false,
+            pending: Vec::new(),
+            epoch: 0,
+        }
+    }
+
+    /// Queue bullet-impact centres for background carving.
+    fn enqueue(&mut self, impacts: impl IntoIterator<Item = IVec3>) {
+        self.pending.extend(impacts);
+    }
+
+    /// Drop any in-flight job (the world was regenerated). Its result
+    /// carries the old `epoch` and is discarded on arrival.
+    fn invalidate(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.pending.clear();
+        self.busy = false;
+    }
+
+    /// Collect a finished carve (if any) and dispatch the next batch.
+    /// `current` is the grid's live chunk — the base the next job carves
+    /// from (or the just-finished result, so queued-while-busy impacts
+    /// stack correctly). Returns the chunk to swap into the grid, if one
+    /// is ready this frame.
+    fn pump(&mut self, current: &Vxl) -> Option<Vxl> {
+        let mut ready: Option<Vxl> = None;
+        while let Ok(done) = self.done_rx.try_recv() {
+            self.busy = false;
+            // Keep only a result from the current world generation.
+            if done.epoch == self.epoch {
+                ready = Some(done.chunk);
+            }
+        }
+        if !self.busy && !self.pending.is_empty() {
+            // Carve from the freshest state: the result we're about to
+            // swap in, else the live grid chunk.
+            let base = ready.as_ref().unwrap_or(current).clone();
+            let impacts = std::mem::take(&mut self.pending);
+            if self
+                .job_tx
+                .send(CarveJob {
+                    chunk: base,
+                    impacts,
+                    epoch: self.epoch,
+                })
+                .is_ok()
+            {
+                self.busy = true;
+            }
+        }
+        ready
+    }
+}
+
+/// Worker-thread loop: apply each job's carves + local relight to its
+/// cloned chunk, rebuild the mip ladder once for the batch, and send it
+/// back. Exits when the main thread drops the job sender.
+fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
+    while let Ok(CarveJob {
+        mut chunk,
+        impacts,
+        epoch,
+    }) = job_rx.recv()
+    {
+        for hit in impacts {
+            // Newly-exposed crater walls (previously buried solid) take
+            // CARVE_COLOR; a plain carve would leave them black.
+            set_sphere_with_colfunc(&mut chunk, hit.into(), FIRE_RADIUS, SpanOp::Carve, |_, _, _| {
+                CARVE_COLOR
+            });
+            relight_bbox(&mut chunk, hit, FIRE_RADIUS);
+        }
+        // Rebuild the GPU mip ladder so the facade's re-decompress stays
+        // on the cheap read-path. This is the ~45 ms cost moved off the
+        // main thread.
+        chunk.generate_mips(GPU_MIP_LEVELS);
+        if done_tx.send(CarveDone { chunk, epoch }).is_err() {
+            break; // main thread gone
+        }
+    }
+}
+
+/// Re-bake directional lighting over just the bounding box of a `radius`
+/// sphere edit at `centre`, clamped to chunk bounds. `update_lighting`
+/// pads by `ESTNORMRAD` internally, so only the geometric edit extent is
+/// needed here — a ~0.04 ms relight vs a ~4 ms whole-chunk bake. The cave
+/// is a single chunk with no neighbours, so the world-bounds clamp gives
+/// the same result as the grid's neighbour-aware `bake_lightmode`.
+fn relight_bbox(chunk: &mut Vxl, centre: IVec3, radius: u32) {
+    let r = radius as i32;
+    let x0 = (centre.x - r).max(0);
+    let y0 = (centre.y - r).max(0);
+    let z0 = (centre.z - r).max(0);
+    let x1 = (centre.x + r + 1).min(VSID as i32);
+    let y1 = (centre.y + r + 1).min(VSID as i32);
+    let z1 = (centre.z + r + 1).min(MAXZDIM);
+    if x0 >= x1 || y0 >= y1 || z0 >= z1 {
         return;
-    };
-    // Newly-exposed crater walls (previously buried solid) take `color`.
-    grid.set_sphere_with_colfunc(centre, radius, SpanOp::Carve, |_x, _y, _z| color);
-    grid.bake_lightmode(LIGHTMODE);
-    grid.bump_chunk_version(IVec3::ZERO);
+    }
+    update_lighting(
+        &mut chunk.data,
+        &chunk.column_offset,
+        chunk.vsid,
+        x0,
+        y0,
+        z0,
+        x1,
+        y1,
+        z1,
+        LIGHTMODE,
+        &[],
+    );
 }
 
 /// Construct the cave generator for `preset` with `seed` as the base
