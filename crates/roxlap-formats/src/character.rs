@@ -3,8 +3,11 @@
 //!
 //! Where [`kfa`](crate::kfa) stores only a skeleton, one clip, and a
 //! *single* kv6 filename, this container stores a whole character: N
-//! per-bone KV6 meshes, the hinge skeleton, and any number of named
-//! animation clips. It is the build target of the **demiurg** editor and
+//! KV6 meshes, the hinge skeleton, any number of named animation clips,
+//! and (v3) embedded animated voxel clips. Each bone carries a **list of
+//! attachments** — static meshes and/or animated clips, each with its own
+//! local offset — so e.g. a flame can hang off a hand. It is the build
+//! target of the **demiurg** editor and
 //! the load source for **monada** at runtime; both sides go through
 //! [`parse`] / [`serialize`], and [`Character::to_kfa_sprite`] turns a
 //! parsed character into a renderable [`KfaSprite`].
@@ -21,7 +24,7 @@
 //! ```text
 //! File:
 //!     magic   [u8;4]   = b"RKCH"
-//!     version u16      = 1
+//!     version u16      = 3
 //!     chunks  [Chunk]  until EOF
 //!
 //! Chunk:
@@ -30,9 +33,9 @@
 //!     payload [u8; len]
 //! ```
 //!
-//! The canonical writer emits `META`, `MSHS`, `BONS`, `CLPS` in that
-//! order, followed by any preserved unknown chunks; a reader must accept
-//! any order and ignore unknown tags. See the module-level handoff doc
+//! The canonical writer emits `META`, `MSHS`, `BONS`, `CLPS`, `VCLP` in
+//! that order, followed by any preserved unknown chunks; a reader must
+//! accept any order and ignore unknown tags. See the module-level handoff doc
 //! (`docs/handoff-character-container.md`) for the full byte spec and the
 //! forward-compat rationale.
 
@@ -42,25 +45,30 @@ use crate::bytes::{Cursor, OutOfBounds};
 use crate::kfa::{Hinge, Kfa, KfaSprite, Point3, Seq};
 use crate::kv6::{self, Kv6};
 use crate::sprite::Sprite;
+use crate::voxel_clip::{self, VoxelClip};
 use crate::xform::{BoneXform, Quat};
 
 const MAGIC: [u8; 4] = *b"RKCH";
-// v2: skeletal clips store a per-bone `BoneXform` (TRS) instead of a single
-// Q15 hinge angle. v1 files (i16 frmval) are rejected — regenerate them.
-const VERSION: u16 = 2;
+// v3 (VCL.5): a bone carries a *list* of attachments (each a static KV6
+// mesh or an animated voxel clip, with a local offset + playback), and the
+// character gains a `VCLP` chunk of embedded clips. v2 (single mesh per
+// bone) and v1 (i16 frmval) files are rejected — regenerate them.
+const VERSION: u16 = 3;
 
 const TAG_META: [u8; 4] = *b"META";
 const TAG_MSHS: [u8; 4] = *b"MSHS";
 const TAG_BONS: [u8; 4] = *b"BONS";
 const TAG_CLPS: [u8; 4] = *b"CLPS";
+/// Embedded animated voxel clips (VCL.5), referenced by [`MeshRef::Clip`].
+const TAG_VCLP: [u8; 4] = *b"VCLP";
 
 const HINGE_SIZE: usize = 64;
 
 /// `mesh_kind` discriminant for a static KV6 mesh (index into `MSHS`).
-/// The only kind any current build can render. Future kinds (e.g. a
-/// voxel-video source) get their own value and are added as new
-/// [`MeshRef`] variants.
 const MESH_KIND_STATIC: u16 = 0;
+/// `mesh_kind` discriminant for an animated voxel clip (index into
+/// [`Character::voxel_clips`]) — VCL.5.
+const MESH_KIND_CLIP: u16 = 1;
 
 /// `kind` discriminant for a skeletal animation clip. Future clip types
 /// (e.g. voxel-video) get their own value; an old reader keeps them as
@@ -87,31 +95,100 @@ pub struct Character {
     /// Named animation clips (`CLPS`). May be empty (a posable rig with
     /// no baked animation).
     pub clips: Vec<Clip>,
+    /// Embedded animated voxel clips (`VCLP`, VCL.5), indexed by
+    /// [`MeshRef::Clip`]. May be empty.
+    pub voxel_clips: Vec<VoxelClip>,
     /// Unknown top-level chunks preserved verbatim so re-saving with an
     /// older build doesn't strip newer data. Re-emitted after the known
     /// chunks in encounter order. Empty for canonically-written files.
     pub extra_chunks: Vec<([u8; 4], Vec<u8>)>,
 }
 
-/// One bone: a name, a typed mesh reference, and its hinge.
+/// One bone: a name, a list of attachments, and its hinge (VCL.5). A bone
+/// may carry several attachments (static meshes and/or animated clips),
+/// each positioned by its own `local_offset` relative to the bone — so a
+/// flame can hang off a hand alongside the hand mesh. v2 had exactly one
+/// mesh per bone; that is now a single [`MeshRef::Static`] attachment at
+/// the identity offset.
 #[derive(Debug, Clone)]
 pub struct Bone {
     pub name: String,
-    /// Typed reference to the bone's mesh source (see [`MeshRef`]).
-    pub mesh: MeshRef,
+    /// What this bone draws (see [`Attachment`]). May be empty (a pure
+    /// transform bone).
+    pub attachments: Vec<Attachment>,
     /// Packed hinge, reused from [`kfa`](crate::kfa). `hinge.parent`
     /// references bone indices in [`Character::bones`]; `-1` = root.
     pub hinge: Hinge,
 }
 
-/// Typed reference to a bone's mesh source. The on-disk `mesh_kind`
-/// discriminant has one defined value today; new variants map to new
-/// discriminants without changing the `Bone` layout.
+/// One thing a bone draws: a mesh/clip reference, a local offset placing
+/// it on the bone, and (for clips) playback parameters (VCL.5).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Attachment {
+    /// The drawn source — a static KV6 mesh or an animated voxel clip.
+    pub target: MeshRef,
+    /// Transform applied **on top of** the bone's solved world transform,
+    /// positioning/orienting/scaling this attachment relative to the bone.
+    /// Identity = sit at the bone origin.
+    pub local_offset: BoneXform,
+    /// Playback parameters; ignored for a [`MeshRef::Static`] target.
+    pub playback: ClipPlayback,
+}
+
+impl Attachment {
+    /// A static mesh attachment at the identity offset — the v2-equivalent
+    /// "one mesh per bone".
+    #[must_use]
+    pub fn static_mesh(mesh_id: usize) -> Self {
+        Self {
+            target: MeshRef::Static(mesh_id),
+            local_offset: BoneXform::IDENTITY,
+            playback: ClipPlayback::default(),
+        }
+    }
+
+    /// An animated-clip attachment at the identity offset, default playback.
+    #[must_use]
+    pub fn clip(clip_id: usize) -> Self {
+        Self {
+            target: MeshRef::Clip(clip_id),
+            local_offset: BoneXform::IDENTITY,
+            playback: ClipPlayback::default(),
+        }
+    }
+}
+
+/// Playback parameters for a [`MeshRef::Clip`] attachment. The clip's own
+/// [`LoopMode`](crate::voxel_clip::LoopMode) governs looping; these only
+/// control rate + phase, so the same clip can run fast on one attachment
+/// and slow/offset on another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipPlayback {
+    /// Playback speed as Q8 fixed point (`256` = 1.0×). Drives how fast the
+    /// clip clock advances.
+    pub speed_q8: i32,
+    /// Initial clock offset (ms) so several instances of one clip don't
+    /// play in lockstep.
+    pub start_phase_ms: u32,
+}
+
+impl Default for ClipPlayback {
+    fn default() -> Self {
+        Self {
+            speed_q8: 256,
+            start_phase_ms: 0,
+        }
+    }
+}
+
+/// Typed reference to what a bone attachment draws. The on-disk
+/// `mesh_kind` discriminant selects the variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshRef {
     /// `mesh_kind 0` — index into [`Character::meshes`].
     Static(usize),
-    // future: Video(usize), … — a new variant, a new mesh_kind on disk
+    /// `mesh_kind 1` — index into [`Character::voxel_clips`] (VCL.5).
+    Clip(usize),
 }
 
 /// One named animation clip.
@@ -155,6 +232,8 @@ pub enum ParseError {
     MissingChunk([u8; 4]),
     /// An embedded `MSHS` mesh blob failed to parse as a KV6.
     BadMesh(kv6::ParseError),
+    /// An embedded `VCLP` clip blob failed to parse as a voxel clip (VCL.5).
+    BadClip(voxel_clip::ParseError),
 }
 
 impl fmt::Display for ParseError {
@@ -189,6 +268,7 @@ impl fmt::Display for ParseError {
                 )
             }
             Self::BadMesh(e) => write!(f, "character embedded kv6 mesh: {e}"),
+            Self::BadClip(e) => write!(f, "character embedded voxel clip: {e:?}"),
         }
     }
 }
@@ -238,6 +318,7 @@ pub fn parse(bytes: &[u8]) -> Result<Character, ParseError> {
     let mut mshs: Option<&[u8]> = None;
     let mut bons: Option<&[u8]> = None;
     let mut clps: Option<&[u8]> = None;
+    let mut vclp: Option<&[u8]> = None;
     let mut extra_chunks = Vec::new();
     while cur.remaining() > 0 {
         let tag_buf = cur.read_bytes(4)?;
@@ -249,6 +330,7 @@ pub fn parse(bytes: &[u8]) -> Result<Character, ParseError> {
             TAG_MSHS => mshs = Some(payload),
             TAG_BONS => bons = Some(payload),
             TAG_CLPS => clps = Some(payload),
+            TAG_VCLP => vclp = Some(payload),
             _ => extra_chunks.push((tag, payload.to_vec())),
         }
     }
@@ -264,6 +346,10 @@ pub fn parse(bytes: &[u8]) -> Result<Character, ParseError> {
         Some(p) => parse_clps(p, bones.len())?,
         None => Vec::new(),
     };
+    let voxel_clips = match vclp {
+        Some(p) => parse_vclp(p)?,
+        None => Vec::new(),
+    };
 
     Ok(Character {
         name,
@@ -271,6 +357,7 @@ pub fn parse(bytes: &[u8]) -> Result<Character, ParseError> {
         meshes,
         bones,
         clips,
+        voxel_clips,
         extra_chunks,
     })
 }
@@ -295,6 +382,7 @@ pub fn serialize(c: &Character) -> Vec<u8> {
     write_chunk(&mut out, TAG_MSHS, |b| write_mshs(b, c));
     write_chunk(&mut out, TAG_BONS, |b| write_bons(b, c));
     write_chunk(&mut out, TAG_CLPS, |b| write_clps(b, c));
+    write_chunk(&mut out, TAG_VCLP, |b| write_vclp(b, c));
 
     for (tag, payload) in &c.extra_chunks {
         write_chunk(&mut out, *tag, |b| b.extend_from_slice(payload));
@@ -320,11 +408,26 @@ impl Character {
     /// values from [`parse`] keep mesh indices in range.
     #[must_use]
     pub fn to_kfa_sprite(&self, clip: Option<usize>) -> KfaSprite {
+        // The hinge solver needs exactly one limb per bone, so this legacy
+        // path draws each bone's **first `Static` attachment** (the
+        // v2-equivalent single mesh), at the bone's transform. Extra
+        // attachments, per-attachment `local_offset`s, and `Clip`
+        // attachments are handled by the richer attachment runtime (VCL.6),
+        // not by `KfaSprite`. A bone with no static mesh gets an empty limb
+        // (draws nothing) to keep the 1:1 bone↔limb mapping.
         let limbs = self
             .bones
             .iter()
-            .map(|b| match b.mesh {
-                MeshRef::Static(i) => Sprite::axis_aligned(self.meshes[i].clone(), self.root),
+            .map(|b| {
+                let kv6 = b
+                    .attachments
+                    .iter()
+                    .find_map(|a| match a.target {
+                        MeshRef::Static(i) => Some(self.meshes[i].clone()),
+                        MeshRef::Clip(_) => None,
+                    })
+                    .unwrap_or_else(|| Kv6::from_fn(1, 1, 1, |_, _, _| None));
+                Sprite::axis_aligned(kv6, self.root)
             })
             .collect();
         let hinges = self.bones.iter().map(|b| b.hinge).collect();
@@ -422,16 +525,54 @@ fn parse_bons(payload: &[u8]) -> Result<Vec<Bone>, ParseError> {
     for _ in 0..count {
         let name_len = cur.read_u16()? as usize;
         let name = String::from_utf8_lossy(cur.read_bytes(name_len)?).into_owned();
-        let mesh_kind = cur.read_u16()?;
-        let mesh_id = cur.read_u32()? as usize;
+        let attach_count = cur.read_u32()? as usize;
+        let mut attachments = Vec::with_capacity(attach_count);
+        for _ in 0..attach_count {
+            attachments.push(read_attachment(&mut cur)?);
+        }
         let hinge = read_hinge(&mut cur)?;
-        let mesh = match mesh_kind {
-            MESH_KIND_STATIC => MeshRef::Static(mesh_id),
-            other => return Err(ParseError::UnsupportedMeshKind(other)),
-        };
-        bones.push(Bone { name, mesh, hinge });
+        bones.push(Bone {
+            name,
+            attachments,
+            hinge,
+        });
     }
     Ok(bones)
+}
+
+/// One attachment: `mesh_kind u16`, `index u32`, `local_offset` (40-byte
+/// `BoneXform`), then playback (`speed_q8 i32`, `start_phase_ms u32`).
+fn read_attachment(cur: &mut Cursor<'_>) -> Result<Attachment, ParseError> {
+    let mesh_kind = cur.read_u16()?;
+    let index = cur.read_u32()? as usize;
+    let target = match mesh_kind {
+        MESH_KIND_STATIC => MeshRef::Static(index),
+        MESH_KIND_CLIP => MeshRef::Clip(index),
+        other => return Err(ParseError::UnsupportedMeshKind(other)),
+    };
+    let local_offset = read_bonexform(cur)?;
+    let speed_q8 = cur.read_i32()?;
+    let start_phase_ms = cur.read_u32()?;
+    Ok(Attachment {
+        target,
+        local_offset,
+        playback: ClipPlayback {
+            speed_q8,
+            start_phase_ms,
+        },
+    })
+}
+
+fn parse_vclp(payload: &[u8]) -> Result<Vec<VoxelClip>, ParseError> {
+    let mut cur = Cursor::new(payload);
+    let count = cur.read_u32()? as usize;
+    let mut clips = Vec::with_capacity(count);
+    for _ in 0..count {
+        let blob_len = cur.read_u32()? as usize;
+        let blob = cur.read_bytes(blob_len)?;
+        clips.push(VoxelClip::parse(blob).map_err(ParseError::BadClip)?);
+    }
+    Ok(clips)
 }
 
 fn parse_clps(payload: &[u8], numbone: usize) -> Result<Vec<Clip>, ParseError> {
@@ -577,15 +718,37 @@ fn write_bons(out: &mut Vec<u8>, c: &Character) {
         let name_len = u16::try_from(name.len()).expect("bone name length must fit in u16");
         out.extend_from_slice(&name_len.to_le_bytes());
         out.extend_from_slice(name);
-        let (kind, mesh_id) = match bone.mesh {
-            MeshRef::Static(i) => (
-                MESH_KIND_STATIC,
-                u32::try_from(i).expect("mesh_id must fit in u32"),
-            ),
-        };
-        out.extend_from_slice(&kind.to_le_bytes());
-        out.extend_from_slice(&mesh_id.to_le_bytes());
+        let attach_count =
+            u32::try_from(bone.attachments.len()).expect("attachment count must fit in u32");
+        out.extend_from_slice(&attach_count.to_le_bytes());
+        for a in &bone.attachments {
+            write_attachment(out, a);
+        }
         write_hinge(out, &bone.hinge);
+    }
+}
+
+fn write_attachment(out: &mut Vec<u8>, a: &Attachment) {
+    let (kind, index) = match a.target {
+        MeshRef::Static(i) => (MESH_KIND_STATIC, i),
+        MeshRef::Clip(i) => (MESH_KIND_CLIP, i),
+    };
+    out.extend_from_slice(&kind.to_le_bytes());
+    let idx = u32::try_from(index).expect("attachment index must fit in u32");
+    out.extend_from_slice(&idx.to_le_bytes());
+    write_bonexform(out, &a.local_offset);
+    out.extend_from_slice(&a.playback.speed_q8.to_le_bytes());
+    out.extend_from_slice(&a.playback.start_phase_ms.to_le_bytes());
+}
+
+fn write_vclp(out: &mut Vec<u8>, c: &Character) {
+    let count = u32::try_from(c.voxel_clips.len()).expect("voxel clip count must fit in u32");
+    out.extend_from_slice(&count.to_le_bytes());
+    for clip in &c.voxel_clips {
+        let blob = clip.serialize();
+        let blob_len = u32::try_from(blob.len()).expect("voxel clip blob length must fit in u32");
+        out.extend_from_slice(&blob_len.to_le_bytes());
+        out.extend_from_slice(&blob);
     }
 }
 
@@ -728,12 +891,12 @@ mod tests {
             bones: vec![
                 Bone {
                     name: "body".to_string(),
-                    mesh: MeshRef::Static(0),
+                    attachments: vec![Attachment::static_mesh(0)],
                     hinge: hinge(-1),
                 },
                 Bone {
                     name: "arm".to_string(),
-                    mesh: MeshRef::Static(1),
+                    attachments: vec![Attachment::static_mesh(1)],
                     hinge: hinge(0),
                 },
             ],
@@ -761,6 +924,7 @@ mod tests {
                     ],
                 },
             }],
+            voxel_clips: Vec::new(),
             extra_chunks: Vec::new(),
         }
     }
@@ -777,10 +941,75 @@ mod tests {
         assert_eq!(parsed.meshes.len(), c.meshes.len());
         assert_eq!(parsed.bones.len(), c.bones.len());
         assert_eq!(parsed.bones[1].name, "arm");
-        assert_eq!(parsed.bones[1].mesh, MeshRef::Static(1));
+        assert_eq!(parsed.bones[1].attachments[0].target, MeshRef::Static(1));
         assert_eq!(parsed.bones[1].hinge.parent, 0);
         assert_eq!(parsed.clips.len(), 1);
         assert_eq!(parsed.clips[0].data, c.clips[0].data);
+        assert!(parsed.voxel_clips.is_empty());
+    }
+
+    #[test]
+    fn roundtrips_with_clips_and_multi_attachment() {
+        use crate::voxel_clip::{LoopMode, VoxelClip, VoxelFrame};
+        // A tiny 1-frame clip (1×1×4, one voxel at z=0).
+        let frame = VoxelFrame {
+            occupancy: vec![1u32],
+            colors: vec![0x8011_2233],
+            color_offsets: vec![0, 1],
+        };
+        let clip = VoxelClip::from_frames(
+            [1, 1, 4],
+            [0.5, 0.5, 2.0],
+            1.0,
+            LoopMode::Loop,
+            &[frame],
+            &[],
+            33,
+            0,
+        );
+
+        let mut c = synthetic_character();
+        c.voxel_clips = vec![clip];
+        // Give the body bone a SECOND attachment: the clip, at a non-identity
+        // offset + non-default playback — so a flame hangs off it.
+        c.bones[0].attachments.push(Attachment {
+            target: MeshRef::Clip(0),
+            local_offset: BoneXform {
+                t: [1.0, 2.0, 3.0],
+                r: Quat::IDENTITY,
+                s: [1.0, 1.0, 1.0],
+            },
+            playback: ClipPlayback {
+                speed_q8: 512,
+                start_phase_ms: 100,
+            },
+        });
+
+        let bytes = serialize(&c);
+        let parsed = parse(&bytes).expect("parse v3 with clips");
+        assert_eq!(serialize(&parsed), bytes, "byte round-trip");
+
+        assert_eq!(parsed.voxel_clips.len(), 1);
+        assert_eq!(parsed.voxel_clips[0], c.voxel_clips[0]);
+
+        // body bone: static mesh 0 + clip 0 (multi-attachment).
+        let body = &parsed.bones[0].attachments;
+        assert_eq!(body.len(), 2);
+        assert_eq!(body[0].target, MeshRef::Static(0));
+        assert_eq!(body[1].target, MeshRef::Clip(0));
+        assert_eq!(body[1].local_offset.t, [1.0, 2.0, 3.0]);
+        assert_eq!(
+            body[1].playback,
+            ClipPlayback {
+                speed_q8: 512,
+                start_phase_ms: 100,
+            }
+        );
+
+        // to_kfa_sprite keeps one limb per bone (first static attachment;
+        // the clip is the attachment runtime's job).
+        let k = parsed.to_kfa_sprite(None);
+        assert_eq!(k.limbs.len(), parsed.bones.len());
     }
 
     #[test]
@@ -945,17 +1174,17 @@ mod tests {
     #[test]
     fn unsupported_mesh_kind_errors() {
         let mut bytes = serialize(&synthetic_character());
-        // Flip the first bone's mesh_kind to 1. The BONS payload begins:
-        //   tag(4) len(4) count(4) name_len(2) name("body"=4) kind(2)...
-        // Locate the BONS tag and step into its payload.
+        // Flip the first attachment's mesh_kind to an undefined value (2;
+        // 0 = Static, 1 = Clip are both valid). The BONS payload begins:
+        //   tag(4) len(4) count(4) name_len(2) name("body"=4) attach_count(4)
+        //   kind(2)...
         let pos = find_tag(&bytes, *b"BONS");
-        // payload: +8 to skip tag+len, +4 count, +2 name_len, +4 "body"
-        let kind_off = pos + 8 + 4 + 2 + 4;
-        bytes[kind_off] = 1;
+        let kind_off = pos + 8 + 4 + 2 + 4 + 4;
+        bytes[kind_off] = 2;
         bytes[kind_off + 1] = 0;
         assert!(matches!(
             parse(&bytes),
-            Err(ParseError::UnsupportedMeshKind(1))
+            Err(ParseError::UnsupportedMeshKind(2))
         ));
     }
 
@@ -965,7 +1194,7 @@ mod tests {
         // by hand-serialising bones=1 but clip numhin=2.
         let mut c = synthetic_character();
         c.bones.pop(); // now 1 bone
-        c.bones[0].mesh = MeshRef::Static(0);
+        c.bones[0].attachments = vec![Attachment::static_mesh(0)];
         // frmval rows still have width 2 → numhin 2 != bones 1.
         let bytes = serialize(&c);
         assert!(matches!(

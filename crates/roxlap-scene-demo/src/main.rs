@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Engine;
-use roxlap_formats::character::{self, Bone, Character, Clip, ClipData, MeshRef};
+use roxlap_formats::character::{self, Attachment, Bone, Character, Clip, ClipData};
 use roxlap_formats::kfa::{Hinge, Point3, Seq};
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
@@ -401,12 +401,12 @@ fn authored_character() -> Option<Character> {
         bones: vec![
             Bone {
                 name: "body".to_string(),
-                mesh: MeshRef::Static(0),
+                attachments: vec![Attachment::static_mesh(0)],
                 hinge: body_hinge,
             },
             Bone {
                 name: "arm".to_string(),
-                mesh: MeshRef::Static(0),
+                attachments: vec![Attachment::static_mesh(0)],
                 hinge: arm_hinge,
             },
         ],
@@ -436,6 +436,7 @@ fn authored_character() -> Option<Character> {
                 ],
             },
         }],
+        voxel_clips: Vec::new(),
         extra_chunks: Vec::new(),
     })
 }
