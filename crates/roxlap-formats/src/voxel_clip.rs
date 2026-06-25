@@ -223,38 +223,52 @@ impl DecodedClip {
     /// - [`LoopMode::PingPong`]: bounces `0→N-1→0` over `2·total`.
     #[must_use]
     pub fn frame_at(&self, elapsed_ms: u32) -> usize {
-        let n = self.frames.len();
-        if n <= 1 {
-            return 0;
-        }
-        let total = self.total_ms();
-        if total == 0 {
-            return 0;
-        }
-        // Position within one forward pass (after applying the loop mode).
-        let t = match self.loop_mode {
-            LoopMode::Loop => elapsed_ms % total,
-            LoopMode::Once => elapsed_ms.min(total - 1),
-            LoopMode::PingPong => {
-                let p = elapsed_ms % (2 * total);
-                if p < total {
-                    p
-                } else {
-                    // Mirror the second half back: 2·total-1 → ~0.
-                    2 * total - 1 - p
-                }
-            }
-        };
-        // Walk the duration prefix sums to find the frame holding `t`.
-        let mut acc = 0u32;
-        for (i, &d) in self.durations.iter().enumerate() {
-            acc += d;
-            if t < acc {
-                return i;
-            }
-        }
-        n - 1
+        frame_at(&self.durations, self.loop_mode, elapsed_ms)
     }
+}
+
+/// The frame index to show after `elapsed_ms` of playback, given per-frame
+/// `durations` (ms) + a [`LoopMode`] — the pure playback math behind
+/// [`DecodedClip::frame_at`], usable on its own so a per-instance clock
+/// (e.g. a character clip attachment, VCL.6) can resolve a frame without
+/// holding the whole [`DecodedClip`]. Empty / single-frame ⇒ `0`.
+///
+/// - [`LoopMode::Loop`]: wraps modulo the total length.
+/// - [`LoopMode::Once`]: holds the last frame past the end.
+/// - [`LoopMode::PingPong`]: bounces `0→N-1→0` over `2·total`.
+#[must_use]
+pub fn frame_at(durations: &[u32], loop_mode: LoopMode, elapsed_ms: u32) -> usize {
+    let n = durations.len();
+    if n <= 1 {
+        return 0;
+    }
+    let total: u32 = durations.iter().copied().sum();
+    if total == 0 {
+        return 0;
+    }
+    // Position within one forward pass (after applying the loop mode).
+    let t = match loop_mode {
+        LoopMode::Loop => elapsed_ms % total,
+        LoopMode::Once => elapsed_ms.min(total - 1),
+        LoopMode::PingPong => {
+            let p = elapsed_ms % (2 * total);
+            if p < total {
+                p
+            } else {
+                // Mirror the second half back: 2·total-1 → ~0.
+                2 * total - 1 - p
+            }
+        }
+    };
+    // Walk the duration prefix sums to find the frame holding `t`.
+    let mut acc = 0u32;
+    for (i, &d) in durations.iter().enumerate() {
+        acc += d;
+        if t < acc {
+            return i;
+        }
+    }
+    n - 1
 }
 
 /// u32 occupancy words per `(x, y)` column for a clip of `dims`.

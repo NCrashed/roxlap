@@ -39,11 +39,14 @@ mod gpu;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
+use roxlap_core::kfa_draw::{compose_attachment, solve_kfa_limbs};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
+use roxlap_formats::voxel_clip::frame_at;
 use roxlap_scene::Scene;
 
+pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::kv6::Kv6;
 pub use roxlap_formats::sprite::Sprite;
@@ -273,6 +276,79 @@ impl DynClipMap {
     fn reset(&mut self) {
         self.slots.clear();
     }
+}
+
+/// Stable handle to a registered animated character (VCL.6) — the result
+/// of [`SceneRenderer::add_character`], advanced each frame with
+/// [`advance_character`](SceneRenderer::advance_character) and dropped with
+/// [`remove_character`](SceneRenderer::remove_character). Reset by
+/// [`set_sprites`](SceneRenderer::set_sprites).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CharacterId {
+    slot: u32,
+    gen: u32,
+}
+
+/// Facade-side slotmap for registered characters (mirrors [`DynClipMap`]).
+#[derive(Default)]
+struct CharMap {
+    slots: Vec<(u32, bool)>,
+}
+
+impl CharMap {
+    fn alloc(&mut self, index: u32) -> CharacterId {
+        debug_assert_eq!(self.slots.len() as u32, index);
+        self.slots.push((0, true));
+        CharacterId {
+            slot: index,
+            gen: 0,
+        }
+    }
+    fn index(&self, id: CharacterId) -> Option<usize> {
+        let (gen, live) = *self.slots.get(id.slot as usize)?;
+        (gen == id.gen && live).then_some(id.slot as usize)
+    }
+    fn remove(&mut self, id: CharacterId) -> bool {
+        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
+            return false;
+        };
+        if slot.0 != id.gen || !slot.1 {
+            return false;
+        }
+        slot.1 = false;
+        true
+    }
+    fn reset(&mut self) {
+        self.slots.clear();
+    }
+}
+
+/// Per-clip-attachment playback clock (VCL.6): the timing it needs to
+/// resolve a frame, plus its own accumulating clock.
+struct ClipClock {
+    durations: Vec<u32>,
+    loop_mode: LoopMode,
+    /// Playback rate, Q8 (256 = 1×).
+    speed_q8: i32,
+    /// Accumulated playback time (ms), seeded from the attachment's
+    /// `start_phase_ms`.
+    clock_ms: f64,
+}
+
+/// One live bone attachment: which bone drives it, its local offset, the
+/// renderer instance it owns, and (for a clip target) its playback clock.
+struct AttachInst {
+    bone: usize,
+    local_offset: roxlap_formats::xform::BoneXform,
+    inst: SpriteInstanceId,
+    clip: Option<ClipClock>,
+}
+
+/// A live animated character: the hinge skeleton (the bone-transform
+/// solver) + one [`AttachInst`] per bone attachment.
+struct CharInstance {
+    skeleton: KfaSprite,
+    attaches: Vec<AttachInst>,
 }
 
 /// Orientation + position for a dynamic sprite instance — the per-frame
@@ -732,6 +808,11 @@ pub struct SceneRenderer {
     /// Handles for registered animated voxel clips (see
     /// [`Self::add_voxel_clip`]). Reset by [`Self::set_sprites`].
     clip_map: DynClipMap,
+    /// Handles for registered animated characters (see
+    /// [`Self::add_character`]). Reset by [`Self::set_sprites`].
+    char_map: CharMap,
+    /// Live character runtimes, parallel to `char_map` slots (VCL.6).
+    char_instances: Vec<CharInstance>,
 }
 
 impl SceneRenderer {
@@ -762,6 +843,8 @@ impl SceneRenderer {
                         dyn_map: DynInstanceMap::default(),
                         model_map: DynModelMap::default(),
                         clip_map: DynClipMap::default(),
+                        char_map: CharMap::default(),
+                        char_instances: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -776,6 +859,8 @@ impl SceneRenderer {
             dyn_map: DynInstanceMap::default(),
             model_map: DynModelMap::default(),
             clip_map: DynClipMap::default(),
+            char_map: CharMap::default(),
+            char_instances: Vec::new(),
         }
     }
 
@@ -807,6 +892,8 @@ impl SceneRenderer {
                         dyn_map: DynInstanceMap::default(),
                         model_map: DynModelMap::default(),
                         clip_map: DynClipMap::default(),
+                        char_map: CharMap::default(),
+                        char_instances: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -822,6 +909,8 @@ impl SceneRenderer {
             dyn_map: DynInstanceMap::default(),
             model_map: DynModelMap::default(),
             clip_map: DynClipMap::default(),
+            char_map: CharMap::default(),
+            char_instances: Vec::new(),
         }
     }
 
@@ -1144,8 +1233,11 @@ impl SceneRenderer {
         self.dyn_map = DynInstanceMap::default();
         self.model_map.reset(set.models.len());
         // A full sprite rebuild drops the dynamic + clip layers on both
-        // backends (the GPU registry is replaced), so reset the clip map.
+        // backends (the GPU registry is replaced), so reset the clip +
+        // character maps too.
         self.clip_map.reset();
+        self.char_map.reset();
+        self.char_instances.clear();
         (0..set.models.len() as u32)
             .map(|slot| SpriteModelId { slot, gen: 0 })
             .collect()
@@ -1432,6 +1524,151 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.set_clip_frame(dyn_index as usize, frame as usize),
             BackendImpl::Gpu(g) => g.set_clip_frame(dyn_index as usize, frame as usize),
         }
+    }
+
+    // ---- animated characters (VCL.6) -------------------------------------
+
+    /// Register an animated character (RKC v3): upload its meshes as sprite
+    /// models + its embedded voxel clips as flipbooks, then spawn one
+    /// renderer instance **per bone attachment** — a static mesh sits at
+    /// its bone, a clip attachment plays back on its own clock. `clip`
+    /// selects a skeletal animation clip to drive the bones (`None` =
+    /// rest pose). Returns a [`CharacterId`]; advance it each frame with
+    /// [`advance_character`](Self::advance_character).
+    ///
+    /// Like clips, this works before any [`set_sprites`](Self::set_sprites);
+    /// a later `set_sprites` drops all registered characters.
+    pub fn add_character(&mut self, ch: &Character, clip: Option<usize>) -> CharacterId {
+        // 1. Meshes → sprite models.
+        let model_ids: Vec<SpriteModelId> =
+            ch.meshes.iter().map(|m| self.add_sprite_model(m)).collect();
+        // 2. Voxel clips → flipbooks; keep each one's timing for the clocks.
+        let clip_regs: Vec<Option<(VoxelClipId, Vec<u32>, LoopMode)>> = ch
+            .voxel_clips
+            .iter()
+            .map(|vc| {
+                vc.decode().ok().map(|d| {
+                    let id = self.add_voxel_clip(&d);
+                    (id, d.durations, d.loop_mode)
+                })
+            })
+            .collect();
+        // 3. Build + solve the skeleton (rest pose → bone transforms).
+        let mut skeleton = ch.to_kfa_sprite(clip);
+        solve_kfa_limbs(&mut skeleton);
+        // 4. One instance per attachment, posed by bone × local_offset.
+        let mut attaches = Vec::new();
+        for (bi, bone) in ch.bones.iter().enumerate() {
+            let limb = &skeleton.limbs[bi];
+            for att in &bone.attachments {
+                let (s, h, f, p) =
+                    compose_attachment(limb.s, limb.h, limb.f, limb.p, &att.local_offset);
+                let xf = DynSpriteTransform {
+                    pos: p,
+                    right: s,
+                    up: h,
+                    forward: f,
+                };
+                match att.target {
+                    MeshRef::Static(mi) => {
+                        if let Some(&mid) = model_ids.get(mi) {
+                            let inst = self.add_sprite_instance_posed(mid, xf);
+                            attaches.push(AttachInst {
+                                bone: bi,
+                                local_offset: att.local_offset,
+                                inst,
+                                clip: None,
+                            });
+                        }
+                    }
+                    MeshRef::Clip(ci) => {
+                        if let Some(Some((cid, durations, loop_mode))) = clip_regs.get(ci) {
+                            let inst = self.add_clip_instance_posed(*cid, xf);
+                            attaches.push(AttachInst {
+                                bone: bi,
+                                local_offset: att.local_offset,
+                                inst,
+                                clip: Some(ClipClock {
+                                    durations: durations.clone(),
+                                    loop_mode: *loop_mode,
+                                    speed_q8: att.playback.speed_q8,
+                                    clock_ms: f64::from(att.playback.start_phase_ms),
+                                }),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let idx = self.char_instances.len();
+        self.char_instances
+            .push(CharInstance { skeleton, attaches });
+        self.char_map.alloc(idx as u32)
+    }
+
+    /// Advance a character by `dt` seconds: tick its skeletal animation +
+    /// each clip attachment's clock, then re-pose every attachment
+    /// (bone × local_offset) and select each clip's current frame. No-op on
+    /// a stale id.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn advance_character(&mut self, id: CharacterId, dt: f64) {
+        let Some(idx) = self.char_map.index(id) else {
+            return;
+        };
+        // Phase 1: solve the skeleton + compute each attachment's update,
+        // borrowing only `char_instances[idx]`.
+        let updates: Vec<(SpriteInstanceId, DynSpriteTransform, Option<u32>)> = {
+            let CharInstance { skeleton, attaches } = &mut self.char_instances[idx];
+            skeleton.animsprite((dt * 1000.0) as i32);
+            solve_kfa_limbs(skeleton);
+            attaches
+                .iter_mut()
+                .map(|a| {
+                    let limb = &skeleton.limbs[a.bone];
+                    let (s, h, f, p) =
+                        compose_attachment(limb.s, limb.h, limb.f, limb.p, &a.local_offset);
+                    let xf = DynSpriteTransform {
+                        pos: p,
+                        right: s,
+                        up: h,
+                        forward: f,
+                    };
+                    let frame = a.clip.as_mut().map(|c| {
+                        c.clock_ms += dt * 1000.0 * f64::from(c.speed_q8) / 256.0;
+                        frame_at(&c.durations, c.loop_mode, c.clock_ms.max(0.0) as u32) as u32
+                    });
+                    (a.inst, xf, frame)
+                })
+                .collect()
+        };
+        // Phase 2: apply via the facade primitives (disjoint from
+        // `char_instances`).
+        for (inst, xf, frame) in updates {
+            self.set_sprite_instance_transform(inst, xf);
+            if let Some(f) = frame {
+                self.set_clip_instance_frame(inst, f);
+            }
+        }
+    }
+
+    /// Remove a character, dropping all its attachment instances. Its
+    /// registered models/clips linger (tombstoned like
+    /// [`remove_sprite_model`](Self::remove_sprite_model)) until the next
+    /// `set_sprites`. Returns `false` if `id` is stale.
+    pub fn remove_character(&mut self, id: CharacterId) -> bool {
+        let Some(idx) = self.char_map.index(id) else {
+            return false;
+        };
+        let insts: Vec<SpriteInstanceId> = self.char_instances[idx]
+            .attaches
+            .iter()
+            .map(|a| a.inst)
+            .collect();
+        for inst in insts {
+            self.remove_sprite_instance(inst);
+        }
+        self.char_instances[idx].attaches.clear();
+        self.char_map.remove(id)
     }
 
     /// Register animated KFA sprites (one or more bone hierarchies).
@@ -1721,6 +1958,29 @@ mod tests {
         let again = map.alloc(0);
         assert_eq!(again, VoxelClipId { slot: 0, gen: 0 });
         assert_eq!(map.clip_index(again), Some(0));
+    }
+
+    /// The character slotmap (VCL.6) mints stable ids, resolves only live
+    /// handles, tombstones in place, and `reset` clears it.
+    #[test]
+    fn char_map_lifecycle() {
+        let mut map = CharMap::default();
+        let a = map.alloc(0);
+        let b = map.alloc(1);
+        assert_eq!(a, CharacterId { slot: 0, gen: 0 });
+        assert_eq!(map.index(a), Some(0));
+        assert_eq!(map.index(b), Some(1));
+
+        assert!(map.remove(a));
+        assert_eq!(map.index(a), None);
+        assert_eq!(map.index(b), Some(1));
+        assert!(!map.remove(a)); // double remove is a no-op
+        assert!(!map.remove(CharacterId { slot: 9, gen: 0 }));
+        assert_eq!(map.index(CharacterId { slot: 1, gen: 7 }), None);
+
+        map.reset();
+        assert_eq!(map.index(b), None);
+        assert_eq!(map.alloc(0), CharacterId { slot: 0, gen: 0 });
     }
 
     #[test]

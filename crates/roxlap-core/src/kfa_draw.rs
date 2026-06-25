@@ -278,9 +278,95 @@ pub fn solve_kfa_limbs(kfa: &mut KfaSprite) {
     }
 }
 
+/// Compose a bone's solved world transform with an attachment's
+/// `local_offset` (VCL.6), giving the attachment's world pose `(s, h, f,
+/// p)` — the basis columns + position to hand a sprite/clip instance.
+///
+/// `(bs, bh, bf, bp)` are the bone's world basis columns + position (e.g.
+/// `solve_kfa_limbs` output `limbs[bone].{s, h, f, p}`); `off` is the
+/// attachment's local TRS in the bone's frame. The offset's rotation +
+/// scale build the attachment's local basis, then the bone basis maps it
+/// (and the offset translation) into world space. An identity `off`
+/// returns the bone transform unchanged.
+#[must_use]
+pub fn compose_attachment(
+    bs: [f32; 3],
+    bh: [f32; 3],
+    bf: [f32; 3],
+    bp: [f32; 3],
+    off: &BoneXform,
+) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
+    // Map a bone-local vector into world space via the bone basis columns.
+    let mbone = |v: [f32; 3]| {
+        [
+            bs[0] * v[0] + bh[0] * v[1] + bf[0] * v[2],
+            bs[1] * v[0] + bh[1] * v[1] + bf[1] * v[2],
+            bs[2] * v[0] + bh[2] * v[1] + bf[2] * v[2],
+        ]
+    };
+    // Attachment local basis = rotation · scale, in the bone frame.
+    let lx = off.r.rotate([off.s[0], 0.0, 0.0]);
+    let ly = off.r.rotate([0.0, off.s[1], 0.0]);
+    let lz = off.r.rotate([0.0, 0.0, off.s[2]]);
+    let s = mbone(lx);
+    let h = mbone(ly);
+    let f = mbone(lz);
+    let tp = mbone(off.t);
+    let p = [bp[0] + tp[0], bp[1] + tp[1], bp[2] + tp[2]];
+    (s, h, f, p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roxlap_formats::xform::Quat;
+
+    #[test]
+    fn compose_attachment_identity_and_offset() {
+        let (bs, bh, bf, bp) = (
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [10.0, 20.0, 30.0],
+        );
+
+        // Identity offset → the attachment IS the bone transform.
+        let r = compose_attachment(bs, bh, bf, bp, &BoneXform::IDENTITY);
+        assert_eq!(r, (bs, bh, bf, bp));
+
+        // Pure translation, identity bone basis → p + t.
+        let off = BoneXform {
+            t: [1.0, 2.0, 3.0],
+            r: Quat::IDENTITY,
+            s: [1.0, 1.0, 1.0],
+        };
+        let (_, _, _, p) = compose_attachment(bs, bh, bf, bp, &off);
+        assert_eq!(p, [11.0, 22.0, 33.0]);
+    }
+
+    #[test]
+    fn compose_attachment_offset_is_in_bone_space() {
+        // Bone basis rotated 90° about world z: local +x ↦ world +y.
+        let (bs, bh, bf, bp) = (
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+        );
+        let off = BoneXform {
+            t: [2.0, 0.0, 0.0], // 2 along the bone's local +x
+            r: Quat::IDENTITY,
+            s: [1.0, 1.0, 1.0],
+        };
+        let (s, _, _, p) = compose_attachment(bs, bh, bf, bp, &off);
+        // The offset translation lands along world +y (the bone's local +x).
+        assert!((p[0]).abs() < 1e-6 && (p[1] - 2.0).abs() < 1e-6 && p[2].abs() < 1e-6);
+        // And the attachment basis inherits the bone basis (identity offset rot).
+        assert!(
+            (s[1] - 1.0).abs() < 1e-6,
+            "local +x stays the bone's +x (world +y)"
+        );
+    }
 
     /// genperp produces an orthonormal basis with the input axis
     /// as the dominant direction.
