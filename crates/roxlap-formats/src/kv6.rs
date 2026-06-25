@@ -59,7 +59,12 @@ const VIS_NEG_Z: u8 = 0x10;
 /// ([`crate::equivec::nearest_dir`]) to the outward surface normal,
 /// estimated as the gradient of occupancy over the 3³ neighbourhood
 /// (summing the offsets to *empty* cells points away from the solid).
-fn compute_vis_dir(occ: &impl Fn(i64, i64, i64) -> bool, x: i64, y: i64, z: i64) -> (u8, u8) {
+pub(crate) fn compute_vis_dir(
+    occ: &impl Fn(i64, i64, i64) -> bool,
+    x: i64,
+    y: i64,
+    z: i64,
+) -> (u8, u8) {
     let mut vis = 0u8;
     if !occ(x - 1, y, z) {
         vis |= VIS_NEG_X;

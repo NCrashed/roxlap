@@ -530,7 +530,10 @@ impl App {
     /// carved chunk is ready, replace chunk `(0, 0, 0)` with it + bump
     /// the version so the renderer re-uploads (cheap mip read-path).
     fn pump_carves(&mut self) {
-        let current = self.scene.grid(self.grid_id).and_then(|g| g.chunk(IVec3::ZERO));
+        let current = self
+            .scene
+            .grid(self.grid_id)
+            .and_then(|g| g.chunk(IVec3::ZERO));
         let Some(current) = current else {
             return;
         };
@@ -901,9 +904,13 @@ fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
         for hit in impacts {
             // Newly-exposed crater walls (previously buried solid) take
             // CARVE_COLOR; a plain carve would leave them black.
-            set_sphere_with_colfunc(&mut chunk, hit.into(), FIRE_RADIUS, SpanOp::Carve, |_, _, _| {
-                CARVE_COLOR
-            });
+            set_sphere_with_colfunc(
+                &mut chunk,
+                hit.into(),
+                FIRE_RADIUS,
+                SpanOp::Carve,
+                |_, _, _| CARVE_COLOR,
+            );
             relight_bbox(&mut chunk, hit, FIRE_RADIUS);
         }
         // Rebuild the GPU mip ladder so the facade's re-decompress stays
