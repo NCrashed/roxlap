@@ -1,14 +1,16 @@
 # roxlap
 
-A pure-Rust port of [Ken Silverman's Voxlap](http://advsys.net/ken/voxlap.htm)
-voxel engine — a 3D voxel renderer from the Build-engine era — grown into a
-small **voxel-scene engine**. The heritage CPU raycaster runs anywhere with
-no GPU and no C dependency; an **optional WGPU compute-shader renderer**
-sits alongside it behind one unified facade with automatic CPU fallback. On
-top is a **multi-grid scene graph** — f64 world placement + quaternion
-rotation, chunk streaming + procedural generation, serde snapshots, and
-real-time edit + screen→world picking APIs. One Cargo workspace, Linux /
-macOS / Windows + wasm, idiomatic safe Rust with per-architecture SIMD.
+An independent Rust voxel engine that reads
+[Ken Silverman's Voxlap](http://advsys.net/ken/voxlap.htm) file formats,
+grown into a small **voxel-scene engine**. The CPU renderer is a
+clean-room per-pixel 3D-DDA over a brickmap — it runs anywhere with no
+GPU and no C dependency; an **optional WGPU compute-shader renderer**
+sits alongside it behind one unified facade with automatic CPU fallback.
+On top is a **multi-grid scene graph** — f64 world placement +
+quaternion rotation, chunk streaming + procedural generation, serde
+snapshots, and real-time edit + screen→world picking APIs. One Cargo
+workspace, Linux / macOS / Windows + wasm, idiomatic safe Rust with
+per-architecture SIMD. Dual MIT/Apache-2.0, commercial use included.
 
 ![sample render from roxlap](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/screenshot.png)
 
@@ -23,12 +25,14 @@ algorithm — no GPU, no shaders. Cult-favourite games like
 [Ace of Spades](https://en.wikipedia.org/wiki/Ace_of_Spades_\(video_game\)),
 and Ken's own *Slab6* / *Voxed* shipped on top of it.
 
-roxlap is that engine, reimplemented from scratch in Rust. It reads the
-same `.vxl` (worlds) / `.kv6` / `.kvx` (sprite voxels) / `.kfa` (sprite
-animation rigs) files Ken's engine reads, renders them with the same
-algorithms, and is **bit-exact** against the reference C engine
-([voxlaptest](https://github.com/NCrashed/voxlaptest)) on every test
-pose where the underlying SIMD allows.
+roxlap reads the same `.vxl` (worlds) / `.kv6` / `.kvx` (sprite voxels)
+/ `.kfa` (sprite animation rigs) files Ken's engine reads, so existing
+Voxlap assets load directly. The rendering, lighting, editing and
+animation code is an independent Rust implementation — it contains no
+Voxlap C source. (The CPU renderer began as a faithful port of Voxlap's
+column raycaster; that has since been replaced by a clean-room
+per-pixel 3D-DDA, which also retires the old raycaster's silhouette and
+hairline artifacts.)
 
 It then grows past Ken's single-world engine: a multi-grid **scene graph**
 (`roxlap-scene`) places many independently-rotating chunked voxel grids in
@@ -254,15 +258,19 @@ Dual-licensed under either of:
 - Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/NCrashed/roxlap/blob/master/LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](https://github.com/NCrashed/roxlap/blob/master/LICENSE-MIT))
 
-at your option.
+at your option — including commercial use.
 
-The Voxlap engine algorithms and on-disk data formats this crate
-implements were originally created by Ken Silverman. Voxlap's
-original C source is distributed under separate terms: royalty-free
-for non-commercial use; commercial use requires a license from Ken
-Silverman directly. roxlap is an independent Rust port that does not
-contain Ken's original C source, but its observable behaviour mirrors
-his engine's. If you intend to use roxlap or any derived work
-commercially, contact Ken Silverman about Voxlap commercial
-licensing — see [advsys.net/ken](http://advsys.net/ken/) for
-current contact information.
+roxlap is an independent Rust implementation that contains none of Ken
+Silverman's original Voxlap C source. Its renderer is a clean-room
+per-pixel 3D-DDA over a brickmap — not Voxlap's column-coherent
+raycaster — and the remaining engine math (lighting, voxel editing,
+bone solving, projection) is independently implemented. The crates
+interoperate with Voxlap's on-disk file formats (`.vxl`, `.kv6`,
+`.kvx`, `.kfa`); file formats are not themselves subject to copyright,
+and the parsers here are independent implementations written to read
+those formats.
+
+Credit where due: the `.vxl`/`.kv6`/`.kvx`/`.kfa` formats and the
+original Voxlap engine that inspired this project are
+[Ken Silverman's](http://advsys.net/ken/) — see
+[advsys.net/ken/voxlap.htm](http://advsys.net/ken/voxlap.htm).

@@ -55,7 +55,6 @@ mod engine;
 pub(crate) mod fixed;
 pub mod grid_view;
 pub mod kfa_draw;
-pub mod meltsphere;
 pub mod opticast;
 pub mod raster_target;
 pub mod ray_aabb;

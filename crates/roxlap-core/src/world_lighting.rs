@@ -1,25 +1,23 @@
-//! Voxlap's world-voxel lighting bake (`updatelighting`,
-//! voxlap5.c:10539).
+//! World-voxel lighting bake.
 //!
-//! Walks every visible voxel inside a 3D bounding box and rewrites
-//! its alpha byte (the per-voxel "brightness" channel that the
-//! rendering path mulhi'es against `kv6colmul`-style modulators)
-//! based on the engine's current `LightSrc` set + lightmode.
+//! Walks every visible voxel inside a 3D bounding box and writes its
+//! per-voxel brightness byte (the high byte of the packed colour, which
+//! the renderer multiplies into the RGB — see [`crate::dda`]'s `shade`)
+//! from the engine's current `LightSrc` set + lightmode.
 //!
 //! Two modes:
 //! - `lightmode == 1`: cheap directional bake — every voxel gets
-//!   shading from a single hardcoded sun direction
-//!   `(tp.y * 0.5 + tp.z) * 64 + 103.5` clamped to `[0, 255]`.
-//! - `lightmode == 2`: per-light Lambertian bake — for each light
-//!   in range, subtract `g * h * sc` where `g = 1/(d·d²) -
-//!   1/(r·r²)` (cube-falloff with hard cutoff at radius `r`),
-//!   `h = surface_normal · light_delta` (negative ⇒ face front-
-//!   lit, contributes; positive ⇒ self-shadowed, skipped). Result
-//!   subtracts from a base `(tp.y * 0.5 + tp.z) * 16 + 47.5`.
+//!   shading from a single fixed sun direction:
+//!   `(n.y * 0.5 + n.z) * 64 + 103.5` clamped to `[0, 255]`.
+//! - `lightmode == 2`: per-light point-light bake — for each light in
+//!   range, subtract `g * h * sc`, where `g = 1/(d·d²) - 1/(r·r²)`
+//!   (cube-falloff with a hard cutoff at radius `r`) and
+//!   `h = surface_normal · light_delta` (front-lit faces contribute;
+//!   back faces are skipped). Subtracted from a base
+//!   `(n.y * 0.5 + n.z) * 16 + 47.5`.
 //!
-//! The surface normal `tp` for each voxel comes from `estnorm` —
-//! a 5×5×5 voxel-solid neighbourhood vote (`ESTNORMRAD == 2` in
-//! voxlap, the production path).
+//! The surface normal `n` comes from [`EstNormCache::estnorm`] — the
+//! occupancy gradient of a voxel's 5×5×5 neighbourhood.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -45,40 +43,17 @@ use rayon::prelude::*;
 
 use crate::engine::LightSrc;
 
-/// Voxlap's `MAXZDIM` (`voxlap5.c`). World z runs `0..MAXZDIM`.
+/// World z is one byte → `0..MAXZDIM` (256) voxels tall.
 pub(crate) const MAXZDIM: i32 = 256;
 
-/// Voxlap's `ESTNORMRAD == 2` cache window radius. The estnorm
-/// neighbourhood is `(2*RAD+1)³ = 5×5×5` voxels.
+/// Estnorm neighbourhood radius. The surface normal at a voxel is
+/// estimated from the solid/air pattern in the surrounding
+/// `(2*RAD+1)³ = 5×5×5` cube.
 pub(crate) const ESTNORMRAD: i32 = 2;
 
-/// Per-byte popcount table. Voxlap's `bitnum[32]` (voxlap5.c:1477)
-/// — number of set bits in the low 5 bits of each index. Used by
-/// estnorm's neighbourhood-vote reduction.
-pub(crate) const BITNUM: [i8; 32] = [
-    0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
-];
-
-/// Per-byte signed-symmetric popcount. Voxlap's `bitsnum[32]`
-/// (voxlap5.c:1487) — packs `popcount` into the low i16 lane and
-/// `popcount - 2·popcount_negative_axis` into the high i16 lane.
-/// The exact derivation is in voxlap's comment block; values
-/// reproduced verbatim.
-#[rustfmt::skip]
-pub(crate) const BITSNUM: [i32; 32] = [
-    0,           1 - (2 << 16), 1 - (1 << 16), 2 - (3 << 16),
-    1,           2 - (2 << 16), 2 - (1 << 16), 3 - (3 << 16),
-    1 + (1 << 16), 2 - (1 << 16), 2,           3 - (2 << 16),
-    2 + (1 << 16), 3 - (1 << 16), 3,           4 - (2 << 16),
-    1 + (2 << 16), 2,           2 + (1 << 16), 3 - (1 << 16),
-    2 + (2 << 16), 3,           3 + (1 << 16), 4 - (1 << 16),
-    2 + (3 << 16), 3 + (1 << 16), 3 + (2 << 16), 4,
-    3 + (3 << 16), 4 + (1 << 16), 4 + (2 << 16), 5,
-];
-
-/// `xbsflor[k] = -1i32 << k` — bits `k..31` set, low `k` bits
-/// clear. Used by `expandbit256` to splat air→solid transitions
-/// onto a partial 32-bit word.
+/// `bits k..31 set, low k bits clear` (`!0 << k`). Used by
+/// [`expandbit256`] to fill from an air→solid transition up to the
+/// top of a 32-bit word.
 pub(crate) const fn xbsflor(k: usize) -> u32 {
     if k >= 32 {
         0
@@ -87,26 +62,24 @@ pub(crate) const fn xbsflor(k: usize) -> u32 {
     }
 }
 
-/// `xbsceil[k] = ~xbsflor[k]` — low `k` bits set. Solid→air
-/// transitions.
+/// `~xbsflor[k]` — low `k` bits set. Fills from the bottom of a word
+/// up to a solid→air transition.
 pub(crate) const fn xbsceil(k: usize) -> u32 {
     !xbsflor(k)
 }
 
-/// `expandbit256` — slab structure → 256-bit "voxel solid" bit
-/// array (low-bit-first, low-z-first). Mirror of voxlap5.c:1059.
+/// Decode a `.vxl` slab column into a 256-bit "voxel solid" bitset,
+/// low-bit-first / low-z-first.
 ///
 /// The output `bits` is a `[u32; 8]` (= 256 bits = `MAXZDIM` z
-/// levels). Bit `z` is set iff voxel at column `(x, y)`, depth `z`
-/// is solid (= part of any slab body, including hidden interiors
-/// between slabs).
-///
-/// Walks the slab linked list, alternating between `v[1]`
-/// (air→solid transition at top of slab) and `v[3]` (solid→air
-/// transition at bottom of next slab). Each transition flushes
-/// pending whole-words (full air `0` or full solid `-1`) until
-/// it lands inside the partial word containing the transition,
-/// then OR/ANDs the partial mask via `xbsflor` / `xbsceil`.
+/// levels); bit `z` is set iff the voxel at depth `z` in this column is
+/// solid (including the hidden interior between a slab's coloured top
+/// and the next slab). This is a straight read of the `.vxl` column
+/// layout: each slab record's byte 1 is its top z (air→solid) and byte
+/// 3 the next slab's bottom (solid→air). Whole 32-bit words between
+/// transitions are flushed as all-air (`0`) or all-solid (`!0`); the
+/// word holding a transition gets a partial mask via
+/// [`xbsflor`] / [`xbsceil`].
 pub(crate) fn expandbit256(column: &[u8], bits: &mut [u32; 8]) {
     let mut src_idx: usize = 0;
     let mut dst_idx: usize = 0;
@@ -177,22 +150,15 @@ pub(crate) fn expandbit256(column: &[u8], bits: &mut [u32; 8]) {
     }
 }
 
-/// Pre-built `expandbit256` grid covering a 2D bounding region —
-/// `(x1 - x0 + 2*RAD) × (y1 - y0 + 2*RAD)` columns. Trades 32
-/// bytes per column of memory for O(1) bit-window lookups during
-/// the estnorm 5×5 neighbourhood vote.
-///
-/// This is the conceptual equivalent of voxlap's `xbsbuf` cache —
-/// just batch-pre-built rather than rotated row-by-row through
-/// the bake. Memory cost stays manageable: a 448×448 bake (the
-/// `diag_down_lit` oracle scope, which extends to 452×452 with
+/// Per-column solid/air bitset grid covering a 2D bounding region —
+/// `(x1 - x0 + 2*RAD) × (y1 - y0 + 2*RAD)` columns. Decoding each
+/// column to a bitset once turns the estnorm 5×5×5 neighbourhood query
+/// into O(1) bit tests. A 448×448 bake (extending to 452×452 with
 /// padding) needs about 6.4 MB.
-#[allow(dead_code)] // vsid field/method preserved for voxlap-parity inspection
+#[allow(dead_code)] // vsid field/method preserved for inspection
 pub struct EstNormCache {
-    /// Per-column bit arrays. `bits[(yidx) * width + (xidx)]` is
-    /// the slab bit-mask of column `(origin_x + xidx, origin_y +
-    /// yidx)`. `xidx ∈ 0..width`, mapping abs-x into
-    /// `[origin_x - RAD, origin_x + (x1 - x0) - 1 + RAD]`.
+    /// Per-column bit arrays. `bits[yidx * width + xidx]` is the
+    /// solid/air bitset of column `(origin_x + xidx, origin_y + yidx)`.
     bits: Vec<[u32; 8]>,
     /// Top-left of the cache window in world coords (= original
     /// `x0 - RAD`).
@@ -204,52 +170,8 @@ pub struct EstNormCache {
     /// can be inspected without recomputing from `bits.len()`.
     #[allow(dead_code)]
     height: usize,
-    /// Inverse-square-root LUT — `fsqrecip[k] = 1 / sqrt(k)` for
-    /// `k ∈ 0..=5859`. Voxlap's `fsqrecip` table; same precision
-    /// as the C build (no Newton refinement for k > 22).
-    fsqrecip: Vec<f32>,
     /// Voxel-grid limit (= `vsid`) used for out-of-bounds clamps.
     vsid: i32,
-}
-
-/// Voxlap's `fsqrecip[5860]` table init (voxlap5.c:12240-12256).
-/// Mirror of the C calculation including the asymmetric Newton-
-/// refinement schedule for indices ≤ 22.
-fn build_fsqrecip() -> Vec<f32> {
-    const N: usize = 5860;
-    let mut t = vec![0.0_f32; N];
-    t[0] = 0.0;
-    t[1] = 1.0;
-    t[2] = (1.0_f32 / 2.0_f32.sqrt()) as f32;
-    t[3] = 1.0 / 3.0_f32.sqrt();
-    let mut i = 3usize;
-    let mut z = 4usize;
-    while z < N {
-        if z + 5 >= N {
-            // Safety stop — cycle increment by 6 may overshoot.
-            break;
-        }
-        t[z] = t[z >> 1] * t[2];
-        t[z + 2] = t[(z + 2) >> 1] * t[2];
-        t[z + 4] = t[(z + 4) >> 1] * t[2];
-        t[z + 5] = t[i] * t[3];
-        i += 2;
-
-        let mut f = (t[z] + t[z + 2]) * 0.5_f32;
-        if z <= 22 {
-            f = (1.5 - 0.5 * ((z + 1) as f32) * f * f) * f;
-        }
-        t[z + 1] = (1.5 - 0.5 * ((z + 1) as f32) * f * f) * f;
-
-        let mut f = (t[z + 2] + t[z + 4]) * 0.5_f32;
-        if z <= 22 {
-            f = (1.5 - 0.5 * ((z + 3) as f32) * f * f) * f;
-        }
-        t[z + 3] = (1.5 - 0.5 * ((z + 3) as f32) * f * f) * f;
-
-        z += 6;
-    }
-    t
 }
 
 impl EstNormCache {
@@ -298,7 +220,7 @@ impl EstNormCache {
     ///
     /// The cache's [`Self::vsid`] field is left at `0` for chunk-
     /// aware builds — the field is dead-code anyway, preserved
-    /// only for voxlap-parity inspection.
+    /// only for inspection.
     #[must_use]
     pub fn build_with_reader<'r>(
         column_reader: impl Fn(i32, i32) -> Option<&'r [u8]>,
@@ -334,127 +256,84 @@ impl EstNormCache {
             origin_y: pad_y0,
             width,
             height,
-            fsqrecip: build_fsqrecip(),
             vsid: 0,
         }
     }
 
-    /// Read 5 consecutive bits starting at z-position `z` from the
-    /// column at `(xi, yi)` cache index. Returns `0..=31`.
-    /// Out-of-range positions:
-    /// - `z < -2`: returns 0 (air above world — though voxlap's
-    ///   convention is "above is sky", same effect).
-    /// - `z >= MAXZDIM`: returns `0x1f` (solid below world).
+    /// Whether the voxel at cache-column `(xi, yi)`, depth `z` is solid.
+    /// Out of the `[0, MAXZDIM)` z range: everything above the world is
+    /// air, everything below is solid (bedrock).
     #[inline]
-    fn extract_bits5(&self, xi: usize, yi: usize, z: i32) -> u32 {
-        let col = &self.bits[yi * self.width + xi];
+    fn solid(&self, xi: usize, yi: usize, z: i32) -> bool {
+        if z < 0 {
+            return false;
+        }
         if z >= MAXZDIM {
-            return 0x1f;
+            return true;
         }
-        if z + 5 <= 0 {
-            return 0;
-        }
-        // Combine adjacent words to handle the case where the 5-bit
-        // window straddles a word boundary.
-        let z_bit = z;
-        let word_idx = z_bit.div_euclid(32);
-        let bit_off = z_bit.rem_euclid(32) as u32;
-        let lo = if (0..8).contains(&word_idx) {
-            col[word_idx as usize]
-        } else if word_idx < 0 {
-            0 // air above world
-        } else {
-            u32::MAX // solid below world
-        };
-        let hi = if word_idx + 1 < 8 && word_idx >= -1 {
-            col[(word_idx + 1) as usize]
-        } else if word_idx + 1 < 0 {
-            0
-        } else {
-            u32::MAX
-        };
-        let combined = u64::from(lo) | (u64::from(hi) << 32);
-        ((combined >> bit_off) & 0x1f) as u32
+        let col = &self.bits[yi * self.width + xi];
+        let z = z as usize;
+        (col[z >> 5] >> (z & 31)) & 1 != 0
     }
 
-    /// Estimate the surface normal at `(x, y, z)` from a 5×5×5
-    /// voxel-solid neighbourhood vote. Mirror of voxlap5.c:1501
-    /// (`estnorm`, `ESTNORMRAD == 2` branch).
+    /// Estimate the surface orientation at solid voxel `(x, y, z)` as
+    /// the **occupancy gradient** of its 5×5×5 neighbourhood:
     ///
-    /// `(x, y)` must lie inside the cache's `[x0..x1) × [y0..y1)`
-    /// region (panics otherwise — caller guarantees this via the
-    /// bounding-box iteration). `z` is unconstrained (handled via
-    /// air/solid clamping).
+    /// ```text
+    /// n = Σ_{solid neighbours} offset,   normal = n / |n|
+    /// ```
+    ///
+    /// (the sum runs over `offset ∈ [-2, 2]³`). `n` points toward the
+    /// denser (solid) side; the lighting formulas in [`update_lighting`]
+    /// are calibrated to that orientation. On a flat surface the solid
+    /// half-space cancels laterally and leaves `n` along the inward
+    /// axis. An all-solid or all-air neighbourhood gives `n = 0` →
+    /// `(0, 0, 0)`, which the lighting math treats as unlit.
+    ///
+    /// `(x, y)` must lie inside the cache's `[x0..x1) × [y0..y1)` region
+    /// (the padded border supplies the ±2 neighbours); `z` is
+    /// unconstrained.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn estnorm(&self, x: i32, y: i32, z: i32) -> [f32; 3] {
-        let center_xi = (x - self.origin_x) as usize;
-        let center_yi = (y - self.origin_y) as usize;
+        let cx = (x - self.origin_x) as i32;
+        let cy = (y - self.origin_y) as i32;
 
-        let mut nx: i32 = 0;
-        let mut ny: i32 = 0;
-        let mut nz: i32 = 0;
-        let z_window = z - ESTNORMRAD; // top of the 5-bit z window
-
-        for yy in -ESTNORMRAD..=ESTNORMRAD {
-            let yi = (center_yi as i32 + yy) as usize;
-            // Read 5 columns at this yy row (xx = -2..=+2).
-            let b0 = self.extract_bits5(center_xi - 2, yi, z_window) as usize;
-            let b1 = self.extract_bits5(center_xi - 1, yi, z_window) as usize;
-            let b2 = self.extract_bits5(center_xi, yi, z_window) as usize;
-            let b3 = self.extract_bits5(center_xi + 1, yi, z_window) as usize;
-            let b4 = self.extract_bits5(center_xi + 2, yi, z_window) as usize;
-
-            // Per-column popcount differences give x-axis normal
-            // contributions. Voxlap weights:
-            //   2*(N(xx=+2) - N(xx=-2)) + N(xx=+1) - N(xx=-1)
-            // = `n.x` from this row (full normal sum is over yy).
-            nx += ((i32::from(BITNUM[b4]) - i32::from(BITNUM[b0])) << 1) + i32::from(BITNUM[b3])
-                - i32::from(BITNUM[b1]);
-
-            // Sum bitsnum across all 5 columns: `j` is the total
-            // signed-i16-packed contribution. Low 16 bits = number
-            // of solid voxels in this row across all 5 columns and
-            // 5 z levels. High 16 bits = z-axis contribution
-            // (positive bits from upper z, negative from lower).
-            let j = BITSNUM[b0]
-                .wrapping_add(BITSNUM[b1])
-                .wrapping_add(BITSNUM[b2])
-                .wrapping_add(BITSNUM[b3])
-                .wrapping_add(BITSNUM[b4]);
-            nz = nz.wrapping_add(j);
-            // n.y picks only the LOW i16 of `j` (= total solid
-            // count), scaled by yy. The high i16 (z contribution)
-            // doesn't enter n.y.
-            let j_lo16 = (j as i16) as i32;
-            ny = ny.wrapping_add(j_lo16 * yy);
+        let mut nx = 0i32;
+        let mut ny = 0i32;
+        let mut nz = 0i32;
+        for dy in -ESTNORMRAD..=ESTNORMRAD {
+            let yi = (cy + dy) as usize;
+            for dx in -ESTNORMRAD..=ESTNORMRAD {
+                let xi = (cx + dx) as usize;
+                for dz in -ESTNORMRAD..=ESTNORMRAD {
+                    if self.solid(xi, yi, z + dz) {
+                        nx += dx;
+                        ny += dy;
+                        nz += dz;
+                    }
+                }
+            }
         }
-        nz >>= 16;
 
-        // Normalise via fsqrecip[len_sq]. Voxlap's table peaks at
-        // 5*5*5 box max = 75² + 15² + 3² = 5859 — within
-        // `fsqrecip`'s 5860-entry range. Out-of-range len_sq values
-        // (e.g. all-zero neighbourhood) get `fsqrecip[0] = 0` ⇒
-        // returns `(0, 0, 0)` which downstream lighting math
-        // tolerates.
-        let len_sq = (nx * nx + ny * ny + nz * nz) as usize;
-        let f = if len_sq < self.fsqrecip.len() {
-            self.fsqrecip[len_sq]
-        } else {
-            0.0
-        };
-        [(nx as f32) * f, (ny as f32) * f, (nz as f32) * f]
+        let len_sq = nx * nx + ny * ny + nz * nz;
+        if len_sq == 0 {
+            return [0.0, 0.0, 0.0];
+        }
+        let inv = 1.0 / (len_sq as f32).sqrt();
+        [nx as f32 * inv, ny as f32 * inv, nz as f32 * inv]
     }
 
     /// Voxel-grid limit; used by callers to bound their iteration.
     #[must_use]
-    #[allow(dead_code)] // preserved for voxlap-parity inspection
+    #[allow(dead_code)]
     pub(crate) fn vsid(&self) -> i32 {
         self.vsid
     }
 }
 
 /// Bake per-voxel lighting into the world's brightness bytes.
-/// Mirror of voxlap's `updatelighting` (`voxlap5.c:10539`).
+/// Bakes per-voxel brightness over a 3D bounding box.
 ///
 /// Walks every visible voxel inside `[x0..x1) × [y0..y1) ×
 /// [z0..z1)` and rewrites its alpha byte (the brightness channel
@@ -471,7 +350,7 @@ impl EstNormCache {
 ///   `g = 1/(d·d²) - 1/(r·r²)` (cube falloff with hard radius
 ///   cutoff) and `h = tp · light_delta`.
 ///
-/// Voxlap pads the bbox by `ESTNORMRAD` on each side internally
+/// The bbox is padded by `ESTNORMRAD` on each side internally
 /// to give estnorm enough neighbourhood; that's done here too.
 /// `lights` should match the engine's full `vx5.lightsrc[]` —
 /// the function does its own per-tile range filtering.
@@ -506,7 +385,7 @@ pub fn update_lighting(
     }
 
     // Build the cache once for the whole padded bake region.
-    // Voxlap tiles the bake into 64×64 chunks with a per-tile
+    // The bake is tiled into 64×64 chunks with a per-tile
     // `lightlst` filter; for our (one-shot bake) use case the
     // full-region filter computed inside the per-voxel loop is
     // simpler and not measurably slower at oracle bake sizes.
@@ -533,7 +412,7 @@ pub fn update_lighting(
     // edits (e.g. cave-gen's heavy `set_spans` carve, or runtime
     // bullet-impact carves), columns are scattered in the slab
     // pool, so `column_offsets[i+1]` is NOT column `i`'s end byte
-    // — voxlap walks each column's slab chain via `slng()` to
+    // — walk each column's slab chain via `slng()` to
     // recover length. We pre-compute extents here serially before
     // moving `world_data` into the parallel mutable view; the
     // slng walk is O(slab_count) per column, typically 1-3 slabs.
@@ -780,7 +659,7 @@ impl<'a> WorldDataMutView<'a> {
 
 /// Walk one column's slab chain and shade every visible voxel
 /// inside `[z_lo, z_hi)`. Mirror of the inner loop in
-/// voxlap5.c:10588-10650.
+/// the per-voxel bake loop.
 #[allow(clippy::cast_lossless)]
 fn shade_column(
     column: &mut [u8],
@@ -804,7 +683,7 @@ fn shade_column(
             // Floor colours of the current slab. Voxel z=v[1]..=v[2].
             // Alpha byte at offset (z - v[1]) * 4 + 7 from header
             // (header is 4 bytes, voxel record is 4 bytes BGRA, +3
-            // for alpha). The voxlap formula encodes this as
+            // for alpha). The formula encodes this as
             // `(z << 2) + offs` with `offs = 7 - (v[1] << 2)`.
             if v_off + 2 >= column.len() {
                 break;
@@ -852,9 +731,9 @@ fn shade_column(
     }
 }
 
-/// Voxlap's per-voxel brightness math. Computes the `[0, 255]`
+/// Per-voxel brightness math. Computes the `[0, 255]`
 /// alpha byte for one voxel from its surface normal `tp` + the
-/// light list. Mirror of voxlap5.c:10605-10646.
+/// light list.
 fn compute_brightness(
     x: i32,
     y: i32,
@@ -865,13 +744,13 @@ fn compute_brightness(
     lightsub: &[f32],
 ) -> u8 {
     if lightmode < 2 {
-        // Directional path (voxlap5.c:10607-10612): single sun
+        // Directional path: single fixed sun direction
         // direction baked into a hardcoded coefficient pair.
         // i = (tp.y * 0.5 + tp.z) * 64 + 103.5, clamped to [0, 255].
         let f = (tp[1] * 0.5 + tp[2]) * 64.0 + 103.5;
         clamp_to_byte(f)
     } else {
-        // Point-light path (voxlap5.c:10614-10645). Base brightness
+        // Point-light path. Base brightness
         // 47.5..63.5 + per-light front-face contribution.
         let mut f = (tp[1] * 0.5 + tp[2]) * 16.0 + 47.5;
         let xf = x as f32;
@@ -892,16 +771,9 @@ fn compute_brightness(
             if g_sq >= light.r2 {
                 continue;
             }
-            // Voxlap's SSE rcpss/rsqrtss sequence:
-            //   g = (1/g_sq) * rsqrt(g_sq) - lightsub[i]
-            //     = 1/(g_sq * sqrt(g_sq)) - 1/(r2 * sqrt(r2))
-            //     = 1/d³ - 1/r³
-            // The `_mm_rcp_ss` / `_mm_rsqrt_ss` are 12-bit
-            // approximations; the exact `f32::sqrt`-based form
-            // here is more precise but may drift from voxlap C.
-            // Bit-exactness will require switching to the
-            // intrinsic versions on x86_64; deferred until
-            // diag_down_lit oracle convergence demands it.
+            // Cube-law falloff with a hard cutoff at the light radius:
+            //   g = 1/d³ - 1/r³   (d = distance, r = radius)
+            // so the contribution fades to exactly zero at `r`.
             let g = 1.0 / (g_sq * g_sq.sqrt()) - lightsub[i];
             f -= g * h * light.sc;
         }
@@ -911,9 +783,7 @@ fn compute_brightness(
 
 #[inline]
 fn clamp_to_byte(f: f32) -> u8 {
-    // Voxlap's `if (*(int32_t *)&f > 0x437f0000) f = 255` is the
-    // bit-trick form of `if (f > 255.0) f = 255.0`. Negatives wrap
-    // through `ftol` / cast; we clamp explicitly for safety.
+    // Clamp the brightness into the `[0, 255]` byte range.
     if f >= 255.0 {
         255
     } else if f <= 0.0 {
@@ -946,7 +816,7 @@ mod tests {
     /// records]. Voxels exist at z = 10..15 (sz0..=sz1). After
     /// expandbit256, bits 10..15 should be set, all others
     /// (0..10 and 15..256) should reflect: air above (0..10) and
-    /// solid below (15..256), since voxlap treats z > sz1 of last
+    /// solid below (15..256): z past the last slab's bottom reads
     /// slab as solid.
     #[test]
     fn single_slab_z10_to_14_sets_correct_bits() {
@@ -973,29 +843,6 @@ mod tests {
         // Words 1..7 should all be 0xffff_ffff (fully solid).
         for (i, w) in bits.iter().enumerate().skip(1) {
             assert_eq!(*w, 0xffff_ffff, "word {i} want -1 got 0x{:08x}", *w);
-        }
-    }
-
-    /// fsqrecip[N] should match `1/sqrt(N)` to a reasonable
-    /// tolerance for the values estnorm actually produces.
-    #[test]
-    fn fsqrecip_matches_1_over_sqrt() {
-        let t = build_fsqrecip();
-        for k in 1..=100 {
-            let want = 1.0_f32 / (k as f32).sqrt();
-            let got = t[k];
-            let err = (got - want).abs();
-            assert!(err < 1e-3, "fsqrecip[{k}] = {got}, want {want}, err {err}");
-        }
-        // Spot-check higher values (less precise but still close).
-        for k in [500, 1000, 2000, 5000] {
-            let want = 1.0_f32 / (k as f32).sqrt();
-            let got = t[k];
-            let rel = (got / want - 1.0).abs();
-            assert!(
-                rel < 0.01,
-                "fsqrecip[{k}] = {got}, want {want}, rel-err {rel}"
-            );
         }
     }
 

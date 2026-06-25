@@ -1,6 +1,6 @@
 //! KV6 sprite — a parsed [`Kv6`] paired with a world-space pose.
 //!
-//! Mirror of voxlap's `vx5sprite` (`voxlap5.h:63-79`) for the kv6
+//! Mirror of voxlap's `vx5sprite` (``) for the kv6
 //! case (`flags & SPRITE_FLAG_KFA == 0`). Pure data — owns the
 //! [`Kv6`] voxel grid plus the four `point3d` fields voxlap calls
 //! `p` (pivot position), `s` (x-basis), `h` (y-basis), `f`

@@ -54,9 +54,8 @@ pub struct Sky {
 }
 
 impl Sky {
-    /// Build a [`Sky`] from a row-major BGRA pixel grid. Computes
-    /// the `lng` / `lat` lookup tables; mirror of voxlap5.c:3946-
-    /// 3970 (the post-`kpzload` table init in `loadsky`).
+    /// Build a [`Sky`] from a row-major BGRA pixel grid, computing the
+    /// `lng` / `lat` angle lookup tables.
     ///
     /// `pixels.len()` must equal `original_xsiz * ysiz`.
     /// `original_xsiz` is the **pre-decrement** column count
@@ -86,7 +85,7 @@ impl Sky {
         let ysiz_i = ysiz as i32;
         let original_xsiz_i = original_xsiz as i32;
 
-        // skylng — voxlap5.c:3946-3954.
+        // Per-row (cos, sin) of the longitude angle.
         let mut lng = vec![[0.0_f32; 2]; ysiz as usize];
         let f = std::f32::consts::PI * 2.0 / (ysiz as f32);
         for y in 0..ysiz {
@@ -100,7 +99,7 @@ impl Sky {
         }
         let lng_mul = (ysiz as f32) / (std::f32::consts::PI * 2.0);
 
-        // skylat — voxlap5.c:3956-3967. lat[] has `original_xsiz`
+        // lat[] has `original_xsiz`
         // entries; lat[0] = 0 is the lower-bound sentinel.
         let mut lat = vec![0i32; original_xsiz as usize];
         let f = std::f32::consts::PI * 0.5 / (original_xsiz as f32);
@@ -129,7 +128,7 @@ impl Sky {
         }
     }
 
-    /// Voxlap's "BLUE" fallback sky (voxlap5.c:3920-3944). A
+    /// Voxlap's "BLUE" fallback sky. A
     /// 512×1 horizon-gradient texture: dark blue at the horizon
     /// fading up to lighter blue, then to a pale top. Useful as a
     /// default when no `.png` is loaded.

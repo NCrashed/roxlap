@@ -18,7 +18,7 @@
 use roxlap_formats::edit::{set_spans_with_colfunc, SpanOp, Vspan};
 use roxlap_formats::vxl::Vxl;
 
-/// Voxlap's `MAXZDIM` (`voxlap5.h:10`) — world height, one byte
+/// Voxlap's `MAXZDIM` (``) — world height, one byte
 /// per z value → 256 voxels.
 pub const MAXZDIM: i32 = 256;
 

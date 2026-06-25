@@ -1,8 +1,8 @@
 //! `.kfa` kv6 hinge / animation transform data.
 //!
-//! Reference: voxlaptest's `getkfa` (`voxlap5.c:9454`) and the
+//! Reference: voxlaptest's `getkfa` (``) and the
 //! `hingetype` / `seqtyp` / `kfatype` declarations in
-//! `voxlap5.h:38..59`. File layout (all multi-byte fields are little-
+//! `..59`. File layout (all multi-byte fields are little-
 //! endian; structs are tightly packed because `voxlap5.h` opens with
 //! `#pragma pack(push, 1)` before declaring them):
 //!
@@ -393,7 +393,7 @@ impl KfaSprite {
 
     /// Advance the animation by `ti` milliseconds and recompute every
     /// child bone's [`kfaval`](Self::kfaval) — a faithful port of
-    /// voxlap's `animsprite` (`voxlap5.c:11125`).
+    /// voxlap's `animsprite` (``).
     ///
     /// Walks the sequence forward from the current
     /// [`kfatim`](Self::kfatim) (honouring `!target` jump/loop
@@ -420,7 +420,7 @@ impl KfaSprite {
         let seqnum = self.seq.len();
 
         // Phase 1 — advance kfatim by `ti` ms through the sequence,
-        // following `!target` jump entries (voxlap5.c:11133-11143).
+        // following `!target` jump entries.
         let mut z = kfatime2seq(&self.seq, self.kfatim) as i32;
         while ti > 0 {
             z += 1;
@@ -447,7 +447,7 @@ impl KfaSprite {
         }
 
         // Phase 2 — resolve the bracketing frames + 16.16 blend ratios
-        // for the current segment (voxlap5.c:11147-11167).
+        // for the current segment.
         let z_seq = kfatime2seq(&self.seq, self.kfatim);
         let zz_idx = z_seq + 1;
         let (trat, zz_frm) = if zz_idx < seqnum && self.seq[zz_idx].frm != !(zz_idx as i32) {
@@ -500,7 +500,7 @@ impl KfaSprite {
         }
 
         // Phase 3 — per-hinge interpolation into kfaval
-        // (voxlap5.c:11169-11195). Root bones (parent < 0) keep their
+        //. Root bones (parent < 0) keep their
         // value untouched, exactly as voxlap's `continue`.
         // `trat` / `trat2` are 16.16 fixed-point blend ratios; `/ 65536` gives
         // the `[0, 1]` factor for the TRS blend.
@@ -527,7 +527,7 @@ impl KfaSprite {
 }
 
 /// 16.16 fixed-point signed shift-divide — voxlap's `shldiv16`
-/// (`voxlap5.c:296`): `((i64)a << 16) / b`, truncating toward zero
+/// (``): `((i64)a << 16) / b`, truncating toward zero
 /// (matching x86 `idiv`).
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
@@ -559,7 +559,7 @@ fn kfatime2seq(seq: &[Seq], tim: i32) -> usize {
 }
 
 /// Build the hinge-sort order — voxlap's `kfasorthinge`
-/// (`voxlap5.c:9427-9450`). The result is an array of hinge
+/// (``). The result is an array of hinge
 /// indices ordered such that **walking from index `n-1` down to
 /// 0** visits parents before children — a valid topological order
 /// for the chain of `setlimb` calls in voxlap's `kfadraw`.

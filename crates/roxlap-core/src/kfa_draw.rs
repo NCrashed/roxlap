@@ -9,8 +9,8 @@
 //! from its parent's. The caller then draws each posed limb via
 //! [`crate::dda_sprite::draw_sprite_dda`].
 //!
-//! Voxlap's animation-curve playback (`animsprite` + `seq[]` +
-//! `frmval[]` interpolation) lives in
+//! Animation-curve playback (advancing `kfaval[]` from a baked
+//! keyframe sequence) lives in
 //! [`roxlap_formats::kfa::KfaSprite::animsprite`] — call it to
 //! advance `kfaval[]` from a baked curve, or poke `kfaval[]`
 //! directly for procedural animation, then render here. The bone
@@ -78,13 +78,15 @@ fn mat2(
     (c_s, c_h, c_f, c_o)
 }
 
-/// Voxlap's `genperp` — given a non-zero axis vector `a`, build
-/// two orthonormal vectors `b`, `c` such that `(a, b, c)` form a
-/// right-handed orthonormal basis with `a` along its primary axis.
-/// Mirror of voxlap5.c:9546-9561.
+/// Given a non-zero axis vector `a`, build two unit vectors `b`, `c`
+/// such that `(a, b, c)` is a right-handed orthogonal frame with `a` as
+/// the primary axis (`a` is not normalised; `b` and `c` are). A zero
+/// input returns `([0; 3], [0; 3])`.
 ///
-/// If `a` is zero, returns `([0; 3], [0; 3])` (matches voxlap's
-/// degenerate-input zeroing).
+/// `b` is formed by zeroing `a`'s smallest-magnitude component and
+/// normalising the perpendicular it leaves; `c = a × b` completes the
+/// frame. Zeroing the smallest component keeps the perpendicular
+/// well-conditioned.
 fn genperp(a: [f32; 3]) -> ([f32; 3], [f32; 3]) {
     if a == [0.0, 0.0, 0.0] {
         return ([0.0; 3], [0.0; 3]);
@@ -113,11 +115,12 @@ fn genperp(a: [f32; 3]) -> ([f32; 3], [f32; 3]) {
     (b, c)
 }
 
-/// Voxlap's `mat0` (`voxlap5.c:9568`) — given `B` and `C` such
-/// that `A * B = C`, find `A`. Returns `(a_s, a_h, a_f, a_o)`.
-///
-/// Used by `setlimb` to find the rotation matrix that maps the
-/// parent's hinge frame to the child's hinge frame.
+/// Given orthonormal frames `B` and `C` (each a 3×3 basis + origin),
+/// find the rigid transform `A` with `A · B = C`. Since `B` is
+/// orthonormal, `A = C · Bᵀ`: each column of `A` is `C`'s column
+/// re-expressed in `B`'s frame, and the origin follows by subtracting
+/// `A · B_o`. Used by [`limb_xform`] to find the rotation mapping a
+/// bone's parent-side hinge frame onto its child-side frame.
 fn mat0(
     b_s: [f32; 3],
     b_h: [f32; 3],
@@ -128,9 +131,8 @@ fn mat0(
     c_f: [f32; 3],
     c_o: [f32; 3],
 ) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
-    // A's columns = C's columns expressed in B's frame.
-    // Voxlap evaluates as `bs.row * c.col + bh.row * c.col + bg.row * c.col`
-    // for each (row, output-col) pair.
+    // Each output column = C's column re-expressed in B's frame
+    // (= C · Bᵀ, B orthonormal).
     let ts = [
         b_s[0] * c_s[0] + b_h[0] * c_h[0] + b_f[0] * c_f[0],
         b_s[0] * c_s[1] + b_h[0] * c_h[1] + b_f[0] * c_f[1],
@@ -159,22 +161,9 @@ fn pt(p: Point3) -> [f32; 3] {
     [p.x, p.y, p.z]
 }
 
-/// Voxlap's `setlimb` (`voxlap5.c:9643`) — compute child limb
-/// `i`'s world transform from parent limb `p`'s world transform
-/// via the hinge connecting them.
-///
-/// Math:
-/// 1. Build the child-side velcro frame from the hinge: `qp =
-///    hinge.p[0]`, `(qs, qh, qf) = (hinge.v[0], genperp(hinge.v[0]))`.
-/// 2. Apply the hinge transform — for `htype == 0` (rotate around
-///    `qs` by `val` angle), rotate `(qh, qf)` in their plane.
-/// 3. Build the parent-side velcro frame: `pp = hinge.p[1]`,
-///    `(ps, ph, pf) = (hinge.v[1], genperp(hinge.v[1]))`.
-/// 4. `mat0`: find `R` such that `R * (ps, ph, pf, pp) = (qs, qh,
-///    qf, qp)` — `R` is the limb's hinge rotation in parent
-///    coords.
-/// 5. `mat2`: `child_world = parent_world * R`. The limb's `(s,
-///    h, f, p)` transform updates in place.
+/// Compute child limb `i`'s world transform from its parent's, via the
+/// hinge connecting them, and write it into `limbs[i]`. Thin wrapper
+/// over [`limb_xform`] (the pure math).
 fn setlimb(limbs: &mut [Sprite], hinges: &[Hinge], i: usize, parent: usize, xform: &BoneXform) {
     let p = &limbs[parent];
     let (cs, ch, cf, co) = limb_xform((p.s, p.h, p.f, p.p), &hinges[i], xform);
@@ -196,8 +185,8 @@ fn limb_xform(
 ) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
     let (parent_s, parent_h, parent_f, parent_p) = parent;
 
-    // Step 1: child-side velcro frame, with the animated translation added to
-    // the child anchor (velcro-local).
+    // Step 1: child-side anchor frame, with the animated translation added to
+    // the child anchor (anchor-local).
     let qp0 = pt(hinge.p[0]);
     let qp = [
         qp0[0] + xform.t[0],
@@ -207,15 +196,16 @@ fn limb_xform(
     let qs0 = pt(hinge.v[0]);
     let (qh0, qf0) = genperp(qs0);
 
-    // Step 2: apply the hinge rotation by rotating the whole velcro frame by
-    // the quaternion. For a rotation about the hinge axis this leaves `qs`
-    // fixed and spins `(qh, qf)` in their plane — voxlap's legacy 1-DOF case
-    // (see `BoneXform::from_hinge_angle`); a free quaternion gives full 3-DOF.
+    // Step 2: apply the hinge rotation by rotating the whole anchor frame
+    // by the quaternion. A rotation about the hinge axis leaves `qs` fixed
+    // and spins `(qh, qf)` in their plane — the legacy single-axis hinge
+    // case (see `BoneXform::from_hinge_angle`); a free quaternion gives
+    // full 3-DOF.
     let qs = xform.r.rotate(qs0);
     let qh = xform.r.rotate(qh0);
     let qf = xform.r.rotate(qf0);
 
-    // Step 3: parent-side velcro frame.
+    // Step 3: parent-side anchor frame.
     let pp = pt(hinge.p[1]);
     let ps = pt(hinge.v[1]);
     let (ph, pf) = genperp(ps);
@@ -240,7 +230,7 @@ fn limb_xform(
 /// topological order (parents first) and writes each limb's world
 /// `(s, h, f, p)` from its parent's via the per-limb `setlimb` math,
 /// reading the current [`KfaSprite::kfaval`] angles. Mirror of the
-/// transform portion of voxlap's `kfadraw` (voxlap5.c:9759).
+/// bone-hierarchy transform solve.
 ///
 /// Split out so non-CPU backends (e.g. the GPU instanced-sprite pass)
 /// can run the exact same posing and then consume `kfa.limbs[*]`
@@ -249,9 +239,9 @@ fn limb_xform(
 /// [`KfaSprite::animsprite`](roxlap_formats::kfa::KfaSprite::animsprite)
 /// to advance `kfaval[]` first, then this to resolve world transforms.
 pub fn solve_kfa_limbs(kfa: &mut KfaSprite) {
-    // Voxlap iterates `for i = numhin-1; i >= 0; i--`; sort_hinges
-    // puts parents at high indices, so descending iteration walks
-    // parents first.
+    // `hinge_sort` orders bones parents-before-children when walked in
+    // reverse (parents sit at the high indices), so descending iteration
+    // resolves each parent before its children.
     let n = kfa.hinge_sort.len();
     for k in (0..n).rev() {
         let j = kfa.hinge_sort[k];
@@ -259,7 +249,7 @@ pub fn solve_kfa_limbs(kfa: &mut KfaSprite) {
         if parent >= 0 {
             // Child bone: derive transform from parent using the bone's
             // resolved local TRS (`kfaval`). A non-zero `htype` means "no
-            // rotation/transform", matching voxlap.
+            // rotation/transform".
             let htype = kfa.hinges[j].htype;
             let xform = if htype == 0 {
                 kfa.kfaval[j]
@@ -269,7 +259,7 @@ pub fn solve_kfa_limbs(kfa: &mut KfaSprite) {
             setlimb(&mut kfa.limbs, &kfa.hinges, j, parent as usize, &xform);
         } else {
             // Root bone: copy world basis from KfaSprite + apply
-            // hinge.p[0] as the velcro offset (voxlap5.c:9772-9782).
+            // hinge.p[0] as the anchor offset.
             let s = kfa.s;
             let h = kfa.h;
             let f = kfa.f;
@@ -320,9 +310,9 @@ mod tests {
         assert_eq!(c, [0.0, 0.0, 0.0]);
     }
 
-    /// The original voxlap `setlimb` rotation math (rotate `(qh, qf)` about
-    /// `qs` by the Q15 angle, no translation / scale), kept as the spec the
-    /// new quaternion path must reproduce.
+    /// The single-axis hinge rotation in closed form (rotate `(qh, qf)`
+    /// about `qs` by the Q15 angle, no translation / scale), kept as the
+    /// reference the general `BoneXform` path must reproduce.
     fn legacy_limb_xform(
         parent: ([f32; 3], [f32; 3], [f32; 3], [f32; 3]),
         hinge: &Hinge,
