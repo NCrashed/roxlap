@@ -25,6 +25,7 @@
 use bytemuck::{Pod, Zeroable};
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
+use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 
 /// CPU-built voxel volume for one KV6 model.
 #[derive(Debug, Clone)]
@@ -115,6 +116,57 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
         dirs,
         voxel_world_size: 1.0,
     }
+}
+
+/// Build a [`SpriteModel`] directly from a decoded voxel-clip frame
+/// (VCL.2). The [`VoxelFrame`] dense-column layout is byte-for-byte the
+/// [`SpriteModel`] layout that [`build_sprite_model`] produces, so this is
+/// a field move — no per-column bucket-sort. `dirs` is the frame's
+/// surface-normal LUT indices (from [`DecodedClip::dirs`]), parallel to
+/// `frame.colors`.
+///
+/// # Panics
+/// In debug, if `dirs.len() != frame.colors.len()` or the field shapes
+/// don't match `dims` (the same invariants [`build_sprite_model`] upholds).
+#[must_use]
+pub fn sprite_model_from_voxel_frame(
+    frame: &VoxelFrame,
+    dirs: &[u32],
+    dims: [u32; 3],
+    pivot: [f32; 3],
+    voxel_world_size: f32,
+) -> SpriteModel {
+    let occ_words_per_col = dims[2].div_ceil(32).max(1);
+    let cols = (dims[0] * dims[1]) as usize;
+    debug_assert_eq!(frame.occupancy.len(), cols * occ_words_per_col as usize);
+    debug_assert_eq!(frame.color_offsets.len(), cols + 1);
+    debug_assert_eq!(dirs.len(), frame.colors.len());
+    SpriteModel {
+        dims,
+        occ_words_per_col,
+        pivot,
+        occupancy: frame.occupancy.clone(),
+        colors: frame.colors.clone(),
+        dirs: dirs.to_vec(),
+        color_offsets: frame.color_offsets.clone(),
+        voxel_world_size,
+    }
+}
+
+/// Build the [`SpriteModel`] for frame `frame` of a decoded clip — the
+/// per-frame model uploaded into a flipbook chain (VCL.2).
+///
+/// # Panics
+/// If `frame` is out of range, or the frame fails the layout invariants.
+#[must_use]
+pub fn sprite_model_from_clip_frame(clip: &DecodedClip, frame: usize) -> SpriteModel {
+    sprite_model_from_voxel_frame(
+        &clip.frames[frame],
+        &clip.dirs[frame],
+        clip.dims,
+        clip.pivot,
+        clip.voxel_world_size,
+    )
 }
 
 /// Per-instance transform consumed by the model-DDA shader: the
@@ -989,6 +1041,34 @@ impl SpriteRegistryResident {
             // Bounding sphere follows the pivot; radius/chain unchanged.
             ci.center = inst.transform.pos;
         }
+    }
+
+    /// Repoint instance `idx` at a different LOD chain — the per-frame
+    /// **flipbook** step for animated voxel clips (VCL.2). The instance's
+    /// transform / colmul are untouched; only which model's volume it
+    /// draws changes. The new chain's volume must already be resident
+    /// (uploaded via [`Self::add_model`] / [`Self::upload`]); `registry`
+    /// is the one those uploads used (so the bounding radius reseeds from
+    /// the new model). Like [`Self::update_transforms`], this is a CPU-side
+    /// rewrite — the next [`Self::cull_bin_upload`] re-uploads the packed
+    /// visible subset, so it costs nothing extra on the GPU. No-op if `idx`
+    /// is out of range.
+    ///
+    /// All frames of a clip share the same `dims`, so a flipbook swap
+    /// leaves the bounding radius unchanged; reseeding it anyway keeps the
+    /// method correct for arbitrary chain swaps.
+    pub fn set_instance_model(
+        &mut self,
+        registry: &SpriteModelRegistry,
+        idx: usize,
+        chain_id: u32,
+    ) {
+        let Some(ci) = self.cull.get_mut(idx) else {
+            return;
+        };
+        ci.chain_id = chain_id;
+        ci.gpu.model_id = chain_id; // placeholder; cull rewrites to the LOD entry
+        ci.radius = registry.model(chain_id).bound_radius();
     }
 
     /// GPU.12 incremental — re-upload only the entries of LOD chain
@@ -2476,6 +2556,77 @@ mod tests {
                 "colors entry {e}"
             );
         }
+    }
+
+    /// VCL.2 — a decoded voxel clip's frames register as a flipbook of LOD
+    /// chains, and `set_instance_model` flips which frame an instance
+    /// draws. The cull state it updates is exactly what
+    /// `cull_bin_upload` packs into the GPU instance buffer each frame, so
+    /// flipping `chain_id` redirects the rendered instance to the new
+    /// frame's resident volume.
+    #[test]
+    fn voxel_clip_flipbook_set_instance_model() {
+        use roxlap_formats::voxel_clip::{LoopMode, VoxelClip, VoxelFrame};
+        let Some(h) = headless() else { return };
+
+        // Two distinct frames of a 1×1×4 clip: frame 0 has a voxel at z=0;
+        // frame 1 adds z=1 — different occupancy + a longer colour run.
+        let dims = [1u32, 1, 4];
+        let owpc = dims[2].div_ceil(32).max(1) as usize; // 1
+        let mk_frame = |zs: &[u32], cols: &[u32]| -> VoxelFrame {
+            let mut occ = vec![0u32; owpc];
+            for &z in zs {
+                occ[(z >> 5) as usize] |= 1u32 << (z & 31);
+            }
+            VoxelFrame {
+                occupancy: occ,
+                colors: cols.to_vec(),
+                color_offsets: vec![0, cols.len() as u32],
+            }
+        };
+        let f0 = mk_frame(&[0], &[0x8011_2233]);
+        let f1 = mk_frame(&[0, 1], &[0x8011_2233, 0x80AA_BBCC]);
+        let clip = VoxelClip::from_frames(
+            dims,
+            [0.5, 0.5, 2.0],
+            1.0,
+            LoopMode::Loop,
+            &[f0, f1],
+            &[],
+            33,
+            0,
+        );
+        let decoded = clip.decode().expect("decode");
+
+        // Each frame → a single-level chain; both volumes resident + distinct.
+        let mut reg = SpriteModelRegistry::new();
+        let c0 = reg.add(sprite_model_from_clip_frame(&decoded, 0));
+        let c1 = reg.add(sprite_model_from_clip_frame(&decoded, 1));
+        assert_eq!(reg.model(c0).colors.len(), 1);
+        assert_eq!(reg.model(c1).colors.len(), 2);
+
+        // One instance, in front of the test frustum, drawing frame 0.
+        let mut res = SpriteRegistryResident::upload(&h.device, &reg, &[inst(c0, [0.0, 0.0, 5.0])]);
+        assert_eq!(res.cull[0].chain_id, c0);
+
+        // Flip to frame 1: the cull now draws chain c1 (radius reseeded).
+        res.set_instance_model(&reg, 0, c1);
+        assert_eq!(res.cull[0].chain_id, c1);
+        assert_eq!(res.cull[0].radius, reg.model(c1).bound_radius());
+
+        // The next cull packs the new chain into the GPU instance buffer
+        // (visible, no panic).
+        let f = test_frustum();
+        let (visible, _, _) = res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0);
+        assert_eq!(visible, 1);
+
+        // …and back to frame 0.
+        res.set_instance_model(&reg, 0, c0);
+        assert_eq!(res.cull[0].chain_id, c0);
+
+        // Out-of-range index is a safe no-op.
+        res.set_instance_model(&reg, 99, c1);
+        assert_eq!(res.cull[0].chain_id, c0);
     }
 
     fn test_frustum() -> ViewFrustum {

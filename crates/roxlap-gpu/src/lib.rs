@@ -53,7 +53,8 @@ pub use scene::{
     GpuSceneResident, GridRuntimeTransform, GridStaticMeta, RefreshOutcome, SceneUpload,
 };
 pub use sprite_model::{
-    build_sprite_model, SpriteInstance, SpriteInstanceTransform, SpriteModel, SpriteModelRegistry,
+    build_sprite_model, sprite_model_from_clip_frame, sprite_model_from_voxel_frame,
+    SpriteInstance, SpriteInstanceTransform, SpriteModel, SpriteModelRegistry,
     SpriteRegistryResident,
 };
 
@@ -3434,6 +3435,23 @@ impl GpuRenderer {
     ) {
         if let Some(reg) = self.sprite_registry.as_mut() {
             reg.update_model(&self.device, &self.queue, registry, chain_id);
+        }
+    }
+
+    /// VCL.2 — repoint sprite instance `index` at LOD chain `chain_id`
+    /// (the per-frame flipbook step for animated voxel clips). `registry`
+    /// is the resident one; `chain_id`'s volume must already be uploaded
+    /// (e.g. a clip's frames registered via [`Self::add_sprite_model`]).
+    /// CPU-side rewrite picked up by the next frame's cull — no volume
+    /// re-upload. No-op if no registry is resident.
+    pub fn set_sprite_instance_model(
+        &mut self,
+        registry: &sprite_model::SpriteModelRegistry,
+        index: usize,
+        chain_id: u32,
+    ) {
+        if let Some(reg) = self.sprite_registry.as_mut() {
+            reg.set_instance_model(registry, index, chain_id);
         }
     }
 
