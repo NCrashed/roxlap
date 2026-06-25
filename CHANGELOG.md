@@ -26,6 +26,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `roxlap_scene::render::CpuFog { color, max_scan_dist, side_shades }`
   — the CPU fog/side-shade config passed into the scene render entry
   points.
+- **Dynamic sprite-model + per-instance-transform API on `SceneRenderer`**
+  (purely additive — no existing signature changed): stream unique
+  procedural sprite models in and out and orient placed instances per
+  frame entirely through the facade, without dropping to `GpuRenderer`.
+  New items in `roxlap_render`:
+  - `SceneRenderer::add_sprite_model(&Kv6) -> SpriteModelId` — register
+    one model incrementally (GPU appends an LOD chain; works before any
+    `set_sprites`).
+  - `SceneRenderer::remove_sprite_model(SpriteModelId) -> bool` — free a
+    model's voxel data in place (ids never reused, so other handles stay
+    valid); `false` on a stale handle.
+  - `SceneRenderer::compact_sprite_models()` — reclaim the GPU buffer
+    holes left by removed models (no-op on the CPU backend).
+  - `SceneRenderer::add_sprite_instance_posed(SpriteModelId, DynSpriteTransform)`
+    — spawn an instance already oriented (no one-frame axis-aligned
+    flash).
+  - `SceneRenderer::set_sprite_instance_transform(SpriteInstanceId, DynSpriteTransform)`
+    and the batched `set_sprite_instance_transforms(&[(…, …)])` — update
+    placed instances' position + orientation per frame (the GPU backend
+    coalesces a frame's updates into a single buffer upload).
+  - `DynSpriteTransform { pos, right, up, forward }` — the per-instance
+    pose (model→world basis columns; `det ≠ 0`, identity by default; a
+    degenerate basis silently skips the instance).
+  - `SpriteModelId` is now a generational handle (`{ slot, gen }`,
+    fields private — externally unchanged); a removed model's handle
+    resolves to nothing → safe no-op.
+- `roxlap_gpu::sprite_model`: `SpriteModel::empty()` and
+  `SpriteModelRegistry::{remove, is_live}` — in-place free of a model
+  chain's voxel data, preserving ids (no remap), backing the facade's
+  `remove_sprite_model`.
 
 ### Changed
 

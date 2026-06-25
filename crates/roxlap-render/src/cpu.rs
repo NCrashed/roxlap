@@ -21,7 +21,26 @@ use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{DynDisplay, DynWindow, HasDisplayHandle, HasWindowHandle};
-use crate::{FrameParams, ImageId, KfaSprite, Line3, QuadDraw, RenderOptions, SpriteSet};
+use crate::{
+    DynSpriteTransform, FrameParams, ImageId, KfaSprite, Line3, QuadDraw, RenderOptions, SpriteSet,
+};
+
+/// An empty (zero-voxel) KV6 — the placeholder a removed CPU model
+/// template holds so its slot stays put while its geometry is freed.
+fn empty_kv6() -> Kv6 {
+    Kv6 {
+        xsiz: 0,
+        ysiz: 0,
+        zsiz: 0,
+        xpiv: 0.0,
+        ypiv: 0.0,
+        zpiv: 0.0,
+        voxels: Vec::new(),
+        xlen: Vec::new(),
+        ylen: Vec::new(),
+        palette: None,
+    }
+}
 
 /// Near plane (camera-forward distance, voxel units) below which a
 /// [`Line3`] endpoint is clipped — keeps the pinhole divide finite and
@@ -291,10 +310,10 @@ pub(crate) struct CpuBackend {
     /// model's `kv6` into every instance of it without a full rebuild.
     sprite_models: Vec<usize>,
     /// Model templates from the last [`SpriteSet`] (`set.models`), kept so
-    /// [`Self::add_dyn_instance`] can clone a model by id. The GPU backend
+    /// [`Self::add_dyn_instance_posed`] can clone a model by id. The GPU backend
     /// keeps the analogous `sprite_models_tpl`.
     models: Vec<Sprite>,
-    /// Dynamically added instances (see [`Self::add_dyn_instance`]) — a
+    /// Dynamically added instances (see [`Self::add_dyn_instance_posed`]) — a
     /// swap-removable tail sublist drawn after the static sprites, the CPU
     /// analogue of the GPU registry's appended instances.
     dyn_sprites: Vec<Sprite>,
@@ -478,20 +497,59 @@ impl CpuBackend {
         self.dyn_models.clear();
     }
 
-    /// Append one dynamic instance of `model_index` at `pos`; returns its
-    /// dynamic-sublist index (always the new last). The facade wraps this
-    /// in a stable handle. No-op-ish (returns the current count) if the
-    /// model id is unknown.
-    pub(crate) fn add_dyn_instance(&mut self, model_index: usize, pos: [f32; 3]) -> usize {
+    /// Append one dynamic instance of `model_index` pre-posed by `xf`;
+    /// returns its dynamic-sublist index (always the new last). The facade
+    /// wraps this in a stable handle. No-op-ish (returns the current count)
+    /// if the model id is unknown.
+    pub(crate) fn add_dyn_instance_posed(
+        &mut self,
+        model_index: usize,
+        xf: DynSpriteTransform,
+    ) -> usize {
         let idx = self.dyn_sprites.len();
         if let Some(model) = self.models.get(model_index) {
             let mut s = model.clone();
-            s.p = pos;
+            xf.apply_to(&mut s);
             self.dyn_sprites.push(s);
             self.dyn_models.push(model_index);
         }
         idx
     }
+
+    /// O(1) per-frame pose update of dynamic instance `idx` (position +
+    /// orientation). No-op if `idx` is out of range.
+    pub(crate) fn set_dyn_instance_transform(&mut self, idx: usize, xf: DynSpriteTransform) {
+        if let Some(s) = self.dyn_sprites.get_mut(idx) {
+            xf.apply_to(s);
+        }
+    }
+
+    /// Register a new model template (axis-aligned, kv6 cloned once) and
+    /// return its positional index. The streaming-in counterpart to
+    /// [`Self::add_dyn_instance_posed`] for unique generated geometry.
+    pub(crate) fn add_model(&mut self, kv6: &Kv6) -> usize {
+        let idx = self.models.len();
+        self.models.push(Sprite::axis_aligned(kv6.clone(), [0.0, 0.0, 0.0]));
+        idx
+    }
+
+    /// Tombstone model template `host_idx` in place: replace it with an
+    /// empty placeholder (freeing its kv6) but keep the slot, mirroring
+    /// the GPU backend's in-place tombstone. Existing instances keep their
+    /// own kv6 clones and draw until removed via
+    /// [`Self::remove_dyn_instance`]. No-op if `host_idx` is out of range.
+    pub(crate) fn remove_model(&mut self, host_idx: usize) {
+        if let Some(t) = self.models.get_mut(host_idx) {
+            *t = Sprite::axis_aligned(empty_kv6(), [0.0, 0.0, 0.0]);
+        }
+    }
+
+    /// No reclamation step on the CPU backend — removed templates already
+    /// dropped their kv6 in [`Self::remove_model`], and live instances own
+    /// independent clones. Present only for facade parity with the GPU
+    /// backend's buffer repack.
+    #[allow(clippy::unused_self)]
+    pub(crate) fn compact_models(&mut self) {}
 
     /// Remove the dynamic instance at `idx` by swap-remove. Returns
     /// `Some(old_last)` when a different instance was moved into `idx`, or

@@ -265,7 +265,43 @@ impl SpriteModelRegistry {
         }
     }
 
-    /// Number of LOD chains (distinct `model_id`s).
+    /// Free chain `chain_id`'s voxel data **in place**: replace each of
+    /// its LOD entries with [`SpriteModel::empty`] and clear the chain.
+    /// Entry ids and every other `model_id` are **preserved** (the chain
+    /// becomes empty, its entries become placeholders), so no id remap is
+    /// needed and the resident registry's entry alignment stays intact.
+    ///
+    /// This is safe to pair with the resident side because
+    /// [`SpriteRegistryResident::remove_model`] tombstones the same
+    /// entries (`dead[e]`) and [`compact`](SpriteRegistryResident::compact)
+    /// reads only live entries — so the resident never touches the empty
+    /// placeholders left here. Call `remove_model` (resident) **before**
+    /// this so those tombstones are set. No-op if `chain_id` is out of
+    /// range or already removed.
+    pub fn remove(&mut self, chain_id: u32) {
+        let Some(entries) = self.chains.get(chain_id as usize) else {
+            return;
+        };
+        // Clone the small id list so we can mutate `entries` while iterating.
+        let entries = entries.clone();
+        for e in entries {
+            self.entries[e as usize] = SpriteModel::empty();
+        }
+        self.chains[chain_id as usize] = Vec::new(); // tombstone (slot kept)
+    }
+
+    /// Whether `chain_id` is a live (registered, not [`removed`](Self::remove))
+    /// model. `false` for an out-of-range id or a tombstoned chain.
+    #[must_use]
+    pub fn is_live(&self, chain_id: u32) -> bool {
+        self.chains
+            .get(chain_id as usize)
+            .is_some_and(|c| !c.is_empty())
+    }
+
+    /// Number of LOD chains (distinct `model_id`s). Counts tombstoned
+    /// (removed) chains too — ids are never reused, so this is also the
+    /// next id that [`Self::add`] / [`Self::add_lod`] will mint.
     #[must_use]
     pub fn len(&self) -> usize {
         self.chains.len()
@@ -278,6 +314,26 @@ impl SpriteModelRegistry {
 }
 
 impl SpriteModel {
+    /// An empty (zero-voxel, zero-extent) placeholder model. Used by
+    /// [`SpriteModelRegistry::remove`] to free a removed chain's voxel
+    /// data while keeping its entry slot, so ids stay stable. Carries no
+    /// occupancy/colours; `color_offsets` is the single-element prefix
+    /// `[0]` (`cols + 1` with `cols == 0`), keeping the structural
+    /// invariant intact for any code that inspects it.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            dims: [0, 0, 0],
+            occ_words_per_col: 1,
+            pivot: [0.0, 0.0, 0.0],
+            occupancy: Vec::new(),
+            colors: Vec::new(),
+            dirs: Vec::new(),
+            color_offsets: vec![0],
+            voxel_world_size: 1.0,
+        }
+    }
+
     /// Recolour every voxel via `f(old_rgba) -> new_rgba`. Structure
     /// (occupancy / offsets) is untouched, so this is a cheap in-place
     /// edit — handy on a [`SpriteModelRegistry::fork`] to make a tinted
@@ -1902,6 +1958,42 @@ mod tests {
         // Parent colours untouched; fork fully overwritten.
         assert_eq!(&reg.model(base).colors, &[0xBB, 0xAA, 0xCC]);
         assert_eq!(&reg.model(forked).colors, &[0x11, 0x11, 0x11]);
+    }
+
+    #[test]
+    fn remove_frees_chain_data_keeps_ids_stable() {
+        let mut reg = SpriteModelRegistry::new();
+        let a = reg.add_lod(build_sprite_model(&kv6_unsorted()), 4);
+        let b = reg.add_lod(build_sprite_model(&kv6_unsorted()), 4);
+        let len_before = reg.len();
+        assert!(reg.is_live(a) && reg.is_live(b));
+
+        reg.remove(a);
+        // Chain `a` is tombstoned (its entries are freed to empty models;
+        // they're unreachable via `model()` now — that's the tombstone).
+        assert!(!reg.is_live(a));
+        // `b` is untouched and still live; `len()` (next id) is unchanged.
+        assert!(reg.is_live(b));
+        assert_eq!(&reg.model(b).colors, &[0xBB, 0xAA, 0xCC]);
+        assert_eq!(reg.len(), len_before);
+
+        // A later add mints a fresh id past the tombstone (no slot reuse).
+        let c = reg.add_lod(build_sprite_model(&kv6_unsorted()), 4);
+        assert_eq!(c, len_before as u32);
+        assert!(reg.is_live(c));
+        // `b`'s id stayed valid across the remove + add round-trip.
+        assert_eq!(&reg.model(b).colors, &[0xBB, 0xAA, 0xCC]);
+    }
+
+    #[test]
+    fn remove_is_idempotent_and_bounds_safe() {
+        let mut reg = SpriteModelRegistry::new();
+        let a = reg.add(build_sprite_model(&kv6_unsorted()));
+        reg.remove(a);
+        reg.remove(a); // already removed → no-op, no panic
+        reg.remove(999); // out of range → no-op
+        assert!(!reg.is_live(a));
+        assert!(!reg.is_live(999));
     }
 
     #[test]

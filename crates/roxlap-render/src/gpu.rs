@@ -17,7 +17,8 @@
 use std::collections::HashMap;
 
 use crate::{
-    FrameParams, ImageId, KfaSprite, Kv6, Line3, QuadDraw, RenderOptions, Sprite, SpriteSet,
+    DynSpriteTransform, FrameParams, ImageId, KfaSprite, Kv6, Line3, QuadDraw, RenderOptions,
+    Sprite, SpriteSet,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{HasDisplayHandle, HasWindowHandle};
@@ -74,11 +75,11 @@ pub(crate) struct GpuBackend {
     /// begin (static [`SpriteSet`] instances occupy `[0, kfa_base)`).
     kfa_base: usize,
     /// Model templates from the last [`SpriteSet`] (`set.models`), kept so
-    /// [`Self::add_dyn_instance`] can clone a model's base pose/kv6 for the
+    /// [`Self::add_dyn_instance_posed`] can clone a model's base pose/kv6 for the
     /// per-instance lighting basis. The CPU backend keeps the analogous
     /// `models`.
     sprite_models_tpl: Vec<Sprite>,
-    /// Count of dynamically added instances (see [`Self::add_dyn_instance`]),
+    /// Count of dynamically added instances (see [`Self::add_dyn_instance_posed`]),
     /// which occupy the tail of [`sprite_instances`] after the static set +
     /// KFA limbs. Their base index is `sprite_instances.len() - dyn_count`.
     dyn_count: usize,
@@ -111,6 +112,11 @@ pub(crate) struct GpuBackend {
     /// back, so `pick_image`'s alpha test samples this instead. Indexed by
     /// id (resized on demand); a dropped slot is `None`.
     image_pixels: Vec<Option<(Vec<u8>, u32, u32)>>,
+    /// Set when [`Self::set_dyn_instance_transform`] mutates a dynamic
+    /// instance's pose; [`Self::render`] flushes all pending poses to the
+    /// device once (full ordered slice) and clears it. Coalesces a whole
+    /// frame's per-instance updates into one upload (avoids O(n²)).
+    transforms_dirty: bool,
 }
 
 impl GpuBackend {
@@ -137,6 +143,7 @@ impl GpuBackend {
             auto_sky_color: None,
             chunk_upload_budget: Self::chunk_upload_budget_from_env(),
             image_pixels: Vec::new(),
+            transforms_dirty: false,
         }
     }
 
@@ -231,12 +238,17 @@ impl GpuBackend {
         self.dyn_count = 0;
     }
 
-    /// Append one dynamic instance of `model_index` at `pos`; returns its
-    /// dynamic-sublist index (the new last). Uses the incremental
-    /// `append_sprite_instances` (no registry rebuild) and mirrors the
-    /// instance into the parallel `sprite_instances`/`sprite_basis` so the
-    /// per-frame lighting + transform updates keep covering it.
-    pub(crate) fn add_dyn_instance(&mut self, model_index: usize, pos: [f32; 3]) -> usize {
+    /// Append one dynamic instance of `model_index` pre-posed by `xf`;
+    /// returns its dynamic-sublist index (the new last). Uses the
+    /// incremental `append_sprite_instances` (no registry rebuild) and
+    /// mirrors the instance into the parallel
+    /// `sprite_instances`/`sprite_basis` so the per-frame lighting +
+    /// transform updates keep covering it.
+    pub(crate) fn add_dyn_instance_posed(
+        &mut self,
+        model_index: usize,
+        xf: DynSpriteTransform,
+    ) -> usize {
         let idx = self.dyn_count;
         let (Some(&chain_id), Some(model), Some(registry)) = (
             self.sprite_model_ids.get(model_index),
@@ -246,7 +258,7 @@ impl GpuBackend {
             return idx;
         };
         let mut s = model.clone();
-        s.p = pos;
+        xf.apply_to(&mut s);
         let inst = SpriteInstance {
             model_id: chain_id,
             transform: SpriteInstanceTransform::from_sprite(&s),
@@ -256,6 +268,74 @@ impl GpuBackend {
         self.sprite_basis.push(s);
         self.dyn_count += 1;
         idx
+    }
+
+    /// Update dynamic instance `idx`'s pose (position + orientation) in
+    /// the parallel CPU-side mirrors and flag the instance buffer dirty;
+    /// the new transform is flushed to the GPU once per [`Self::render`]
+    /// (so spinning a whole cluster of instances is a single device
+    /// upload, not one per instance). No-op if `idx` is out of range.
+    pub(crate) fn set_dyn_instance_transform(&mut self, idx: usize, xf: DynSpriteTransform) {
+        if idx >= self.dyn_count {
+            return;
+        }
+        let gpu_index = (self.sprite_instances.len() - self.dyn_count) + idx;
+        if let Some(b) = self.sprite_basis.get_mut(gpu_index) {
+            xf.apply_to(b);
+            let t = SpriteInstanceTransform::from_sprite(b);
+            self.sprite_instances[gpu_index].transform = t;
+            self.transforms_dirty = true;
+        }
+    }
+
+    /// Register a new sprite model incrementally (its full LOD chain),
+    /// returning its positional host index (== registry chain id). Lazily
+    /// creates the registry + resident if none exists yet, so this works
+    /// before any `set_sprites`. Mirrors the new chain into the host-side
+    /// `sprite_model_ids` / `sprite_models_tpl`.
+    pub(crate) fn add_model(&mut self, kv6: &Kv6) -> usize {
+        let mut registry = self.sprite_registry.take().unwrap_or_default();
+        let chain_id = registry.add_lod(build_sprite_model(kv6), 4);
+        // `gpu.add_sprite_model` establishes residency (zero-instance
+        // upload) if none yet, else appends just this chain's volume.
+        self.gpu.add_sprite_model(&registry, chain_id);
+        let host_idx = self.sprite_model_ids.len();
+        self.sprite_model_ids.push(chain_id);
+        self.sprite_models_tpl
+            .push(Sprite::axis_aligned(kv6.clone(), [0.0, 0.0, 0.0]));
+        self.sprite_registry = Some(registry);
+        host_idx
+    }
+
+    /// Remove host model `host_idx`: tombstone its chain on the GPU
+    /// resident **first** (sets the `dead` flags), then free its voxel
+    /// data in the CPU-side registry, then drop the host-side template.
+    /// Ordering matters — `gpu.remove_sprite_model` must run before
+    /// `registry.remove` so the resident's dead-aware compact only ever
+    /// reads live entries. No-op if `host_idx` is unknown.
+    pub(crate) fn remove_model(&mut self, host_idx: usize) {
+        let Some(&chain_id) = self.sprite_model_ids.get(host_idx) else {
+            return;
+        };
+        // 1. Resident tombstone (frees GPU colour slots, marks `dead`).
+        self.gpu.remove_sprite_model(chain_id);
+        // 2. CPU registry free (must follow step 1 — see method doc).
+        if let Some(reg) = self.sprite_registry.as_mut() {
+            reg.remove(chain_id);
+        }
+        // 3. Drop the host template's kv6; keep the slot (id never reused).
+        if let Some(t) = self.sprite_models_tpl.get_mut(host_idx) {
+            *t = Sprite::axis_aligned(Kv6::from_fn(1, 1, 1, |_, _, _| None), [0.0, 0.0, 0.0]);
+        }
+    }
+
+    /// Reclaim the GPU buffer holes left by [`Self::remove_model`] by
+    /// repacking the resident registry to its live models only. Ids are
+    /// preserved. No-op if no registry is resident.
+    pub(crate) fn compact_models(&mut self) {
+        if let Some(reg) = self.sprite_registry.as_ref() {
+            self.gpu.compact_sprite_models(reg);
+        }
     }
 
     /// Remove the dynamic instance at dynamic-sublist index `idx` by
@@ -475,6 +555,17 @@ impl GpuBackend {
             self.upload_scene(scene);
         } else {
             self.refresh_dirty(scene);
+        }
+
+        // Flush any dynamic-instance pose changes accumulated this frame
+        // via `set_dyn_instance_transform` in a single device upload (the
+        // full ordered slice), coalescing N per-instance setters into one.
+        // The per-frame cull re-reads the new `cull` data, so no extra GPU
+        // work beyond this write.
+        if self.transforms_dirty {
+            self.gpu
+                .update_sprite_instance_transforms(&self.sprite_instances);
+            self.transforms_dirty = false;
         }
 
         // Per-frame GPU scene-LOD knob (GPU.11.1).

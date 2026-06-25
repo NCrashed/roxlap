@@ -472,6 +472,77 @@ mod tests {
         assert!(zb2[centre] < 100.0, "sprite depth must replace terrain's");
     }
 
+    /// The covered screen rect (min/max px,py) of whatever the sprite
+    /// painted — used to compare an axis-aligned vs a rotated pose.
+    fn covered_rect(fb: &[u32], w: u32, h: u32) -> (u32, u32, u32, u32) {
+        let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+        for py in 0..h {
+            for px in 0..w {
+                if fb[(py * w + px) as usize] & 0x00ff_ffff != 0 {
+                    x0 = x0.min(px);
+                    y0 = y0.min(py);
+                    x1 = x1.max(px);
+                    y1 = y1.max(py);
+                }
+            }
+        }
+        (x0, y0, x1, y1)
+    }
+
+    /// A non-cube box drawn axis-aligned vs. drawn with a per-instance
+    /// transform that swaps its long axis onto the screen's other axis
+    /// flips the silhouette's aspect ratio. Pins that the `s/h/f` basis
+    /// (the path `DynSpriteTransform` feeds) actually reorients the model.
+    #[test]
+    fn posed_basis_reorients_silhouette() {
+        // Wide-in-local-x, short-in-local-z box → appears wide on screen
+        // (screen-x = world-x via `right`, screen-y = world-z via `down`).
+        let kv6 = Kv6::solid_box(16, 4, 4, 0x80_C0_40_20);
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let cam = cam_looking_y();
+        let cs = camera_math::derive(&cam, w, h, 32.0, 32.0, 32.0);
+
+        // Axis-aligned: wide silhouette.
+        let aa = Sprite::axis_aligned(kv6.clone(), [0.0, 40.0, 0.0]);
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let _ = draw_sprite_dda(&mut fb, &mut zb, w as usize, w, h, &cs, &settings(w, h), &aa);
+        let (ax0, ay0, ax1, ay1) = covered_rect(&fb, w, h);
+        let aa_wide = (ax1 - ax0) as i32 - (ay1 - ay0) as i32;
+        assert!(aa_wide > 4, "axis-aligned box should be wider than tall (got w-h={aa_wide})");
+
+        // Posed: map local +x onto world +z and local +z onto world +x
+        // (det = -1 ≠ 0). Same box now reads tall on screen.
+        let mut posed = aa.clone();
+        posed.s = [0.0, 0.0, 1.0]; // local +x ↦ world +z (screen down)
+        posed.h = [0.0, 1.0, 0.0]; // local +y ↦ world +y (depth)
+        posed.f = [1.0, 0.0, 0.0]; // local +z ↦ world +x (screen right)
+        let mut fb2 = vec![0u32; n];
+        let mut zb2 = vec![f32::INFINITY; n];
+        let _ = draw_sprite_dda(&mut fb2, &mut zb2, w as usize, w, h, &cs, &settings(w, h), &posed);
+        let (bx0, by0, bx1, by1) = covered_rect(&fb2, w, h);
+        let posed_tall = (by1 - by0) as i32 - (bx1 - bx0) as i32;
+        assert!(posed_tall > 4, "posed box should be taller than wide (got h-w={posed_tall})");
+    }
+
+    /// A degenerate (singular) basis — `det == 0` — makes the sprite
+    /// silently skip rather than panic (the `DynSpriteTransform` guard).
+    #[test]
+    fn degenerate_basis_draws_nothing() {
+        let kv6 = Kv6::solid_cube(8, 0x80_FF_FF_FF);
+        let mut sprite = Sprite::axis_aligned(kv6, [0.0, 40.0, 0.0]);
+        sprite.f = sprite.s; // two equal columns → det 0
+        let (w, h) = (32u32, 32u32);
+        let n = (w * h) as usize;
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let cam = cam_looking_y();
+        let cs = camera_math::derive(&cam, w, h, 16.0, 16.0, 16.0);
+        let wrote = draw_sprite_dda(&mut fb, &mut zb, w as usize, w, h, &cs, &settings(w, h), &sprite);
+        assert_eq!(wrote, 0, "singular basis must skip, not panic");
+    }
+
     /// An invisible sprite draws nothing.
     #[test]
     fn invisible_sprite_skipped() {

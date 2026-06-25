@@ -84,8 +84,20 @@ pub struct SpriteInstanceDesc {
 /// re-register that model's geometry after a content edit — so callers
 /// never track the positional `usize` index themselves. Opaque on
 /// purpose: there is no arithmetic to do on it.
+///
+/// Also returned by [`SceneRenderer::add_sprite_model`] for an
+/// incrementally registered model, and accepted by
+/// [`remove_sprite_model`](SceneRenderer::remove_sprite_model). A handle
+/// to a removed model is **stale**: it resolves to nothing, so passing
+/// it anywhere is a safe no-op. The `gen` (generation) field guards a
+/// future compacting registry; it stays `0` today because model slots
+/// are tombstoned in place and never reused (GPU chain ids are
+/// append-only).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct SpriteModelId(pub(crate) usize);
+pub struct SpriteModelId {
+    pub(crate) slot: u32,
+    pub(crate) gen: u32,
+}
 
 /// Stable handle to a **dynamically added** sprite instance — the result
 /// of [`SceneRenderer::add_sprite_instance`], passed to
@@ -151,6 +163,110 @@ impl DynInstanceMap {
             self.order[removed as usize] = moved_slot;
         }
         self.order.pop();
+    }
+}
+
+/// Facade-side slotmap for registered sprite **models**, mirroring
+/// [`DynInstanceMap`] but **without** the swap-remove fixup: a model
+/// slot maps 1:1 to the backends' positional model index (the GPU LOD
+/// chain id), which is append-only and never reused. A removed model
+/// tombstones its slot *in place* (the backend frees the voxel data but
+/// keeps the id), so a stale [`SpriteModelId`] resolves to `None` → a
+/// safe no-op rather than aliasing another model.
+#[derive(Default)]
+struct DynModelMap {
+    /// Per slot (== backend model index): `(generation, live)`. Slots are
+    /// never reused, so `generation` stays `0`; `live` flips to `false`
+    /// on removal.
+    slots: Vec<(u32, bool)>,
+}
+
+impl DynModelMap {
+    /// Reset to `n` live models with ids `0..n` — used by
+    /// [`SceneRenderer::set_sprites`], which rebuilds the whole model set
+    /// positionally (model index = chain id on both backends).
+    fn reset(&mut self, n: usize) {
+        self.slots.clear();
+        self.slots.resize(n, (0, true));
+    }
+
+    /// Register a freshly appended model at positional index
+    /// `model_index` (always the new `slots.len()`); returns its handle.
+    fn alloc(&mut self, model_index: u32) -> SpriteModelId {
+        debug_assert_eq!(self.slots.len() as u32, model_index);
+        self.slots.push((0, true));
+        SpriteModelId {
+            slot: model_index,
+            gen: 0,
+        }
+    }
+
+    /// Resolve a handle to its backend model index, or `None` if it's
+    /// stale / already removed.
+    fn model_index(&self, id: SpriteModelId) -> Option<usize> {
+        let (gen, live) = *self.slots.get(id.slot as usize)?;
+        (gen == id.gen && live).then_some(id.slot as usize)
+    }
+
+    /// Tombstone a model slot in place. Returns `false` if the handle is
+    /// stale / already removed.
+    fn remove(&mut self, id: SpriteModelId) -> bool {
+        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
+            return false;
+        };
+        if slot.0 != id.gen || !slot.1 {
+            return false;
+        }
+        slot.1 = false;
+        true
+    }
+}
+
+/// Orientation + position for a dynamic sprite instance — the per-frame
+/// pose passed to [`SceneRenderer::add_sprite_instance_posed`] and
+/// [`set_sprite_instance_transform`](SceneRenderer::set_sprite_instance_transform).
+///
+/// `right`/`up`/`forward` are the instance's local axes expressed in
+/// world space (the columns of the model→world rotation), mapping
+/// directly onto the underlying [`Sprite`]'s `s`/`h`/`f` (kv6 local
+/// +x/+y/+z). They **must** be non-singular (`det ≠ 0`) but need not be
+/// orthonormal — a uniform/non-uniform scale or shear is fine. A
+/// near-singular basis falls through the renderer's degenerate-basis
+/// guards and the instance silently skips that frame rather than
+/// panicking. [`Default`] is the identity basis (axis-aligned).
+#[derive(Clone, Copy, Debug)]
+pub struct DynSpriteTransform {
+    /// Instance world position (the kv6 pivot maps here).
+    pub pos: [f32; 3],
+    /// Local +x in world space ↦ [`Sprite::s`].
+    pub right: [f32; 3],
+    /// Local +y in world space ↦ [`Sprite::h`].
+    pub up: [f32; 3],
+    /// Local +z in world space ↦ [`Sprite::f`].
+    pub forward: [f32; 3],
+}
+
+impl Default for DynSpriteTransform {
+    fn default() -> Self {
+        Self {
+            pos: [0.0, 0.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        }
+    }
+}
+
+impl DynSpriteTransform {
+    /// Stamp this pose onto a [`Sprite`] in place: `pos → p`,
+    /// `right/up/forward → s/h/f` (a direct copy — the basis is the
+    /// model→world columns). Both backends keep the rest of the template
+    /// (`kv6`, `flags`) and only overwrite the pose.
+    pub(crate) fn apply_to(self, s: &mut Sprite) {
+        s.p = self.pos;
+        s.s = self.right;
+        s.h = self.up;
+        s.f = self.forward;
     }
 }
 
@@ -556,6 +672,10 @@ pub struct SceneRenderer {
     /// Handles for dynamically added sprite instances (see
     /// [`Self::add_sprite_instance`]). Reset by [`Self::set_sprites`].
     dyn_map: DynInstanceMap,
+    /// Handles for registered sprite models (see [`Self::add_sprite_model`]
+    /// and the models returned by [`Self::set_sprites`]). Reset by
+    /// [`Self::set_sprites`].
+    model_map: DynModelMap,
 }
 
 impl SceneRenderer {
@@ -584,6 +704,7 @@ impl SceneRenderer {
                     return Self {
                         inner: BackendImpl::Gpu(Box::new(g)),
                         dyn_map: DynInstanceMap::default(),
+                        model_map: DynModelMap::default(),
                     };
                 }
                 Err(e) => {
@@ -596,6 +717,7 @@ impl SceneRenderer {
         Self {
             inner: BackendImpl::Cpu(Box::new(CpuBackend::new(window, size, opts))),
             dyn_map: DynInstanceMap::default(),
+            model_map: DynModelMap::default(),
         }
     }
 
@@ -625,6 +747,7 @@ impl SceneRenderer {
                     return Self {
                         inner: BackendImpl::Gpu(Box::new(g)),
                         dyn_map: DynInstanceMap::default(),
+                        model_map: DynModelMap::default(),
                     };
                 }
                 Err(e) => {
@@ -638,6 +761,7 @@ impl SceneRenderer {
         Self {
             inner: BackendImpl::Cpu(Box::new(CpuBackend::new_from_canvas(canvas, size, opts))),
             dyn_map: DynInstanceMap::default(),
+            model_map: DynModelMap::default(),
         }
     }
 
@@ -954,12 +1078,14 @@ impl SceneRenderer {
             BackendImpl::Gpu(g) => g.set_sprites(set),
         }
         // A fresh sprite set replaces the instance world, so any
-        // previously added dynamic instances are gone — drop their handles.
+        // previously added dynamic instances + models are gone — drop their
+        // handles and re-seat the model slotmap with `set.models.len()`
+        // live ids `0..n` (model index = chain id on both backends).
         self.dyn_map = DynInstanceMap::default();
-        // Handles are positional by construction (model index = chain id
-        // on both backends), so the facade hands them out directly —
-        // callers keep the handle instead of re-deriving the index.
-        (0..set.models.len()).map(SpriteModelId).collect()
+        self.model_map.reset(set.models.len());
+        (0..set.models.len() as u32)
+            .map(|slot| SpriteModelId { slot, gen: 0 })
+            .collect()
     }
 
     /// Re-register one sprite model's geometry after you've edited its
@@ -979,9 +1105,12 @@ impl SceneRenderer {
     /// the model. Use [`set_sprites`](Self::set_sprites) to add/remove
     /// models or change the instance set.
     pub fn refresh_sprite_model(&mut self, model: SpriteModelId, kv6: &Kv6) {
+        let Some(idx) = self.model_map.model_index(model) else {
+            return; // stale / removed handle → no-op
+        };
         match &mut self.inner {
-            BackendImpl::Cpu(c) => c.update_sprite_model(model.0, kv6),
-            BackendImpl::Gpu(g) => g.update_sprite_model(model.0, kv6),
+            BackendImpl::Cpu(c) => c.update_sprite_model(idx, kv6),
+            BackendImpl::Gpu(g) => g.update_sprite_model(idx, kv6),
         }
     }
 
@@ -996,9 +1125,45 @@ impl SceneRenderer {
     /// with zero initial instances). Dynamic instances live *after* the
     /// static set + any KFA limbs, so register those first.
     pub fn add_sprite_instance(&mut self, model: SpriteModelId, pos: [f32; 3]) -> SpriteInstanceId {
+        self.add_sprite_instance_posed(
+            model,
+            DynSpriteTransform {
+                pos,
+                ..DynSpriteTransform::default()
+            },
+        )
+    }
+
+    /// Add one sprite instance of an already-registered `model`,
+    /// pre-posed with the orientation in `xf` — the streaming-spawn path
+    /// for objects that appear mid-flight already rotated (so there's no
+    /// one-frame axis-aligned flash before the first
+    /// [`set_sprite_instance_transform`](Self::set_sprite_instance_transform)).
+    /// Otherwise identical to
+    /// [`add_sprite_instance`](Self::add_sprite_instance) (which is just
+    /// this with the identity basis). Returns a stable
+    /// [`SpriteInstanceId`].
+    ///
+    /// A stale/removed `model` handle spawns nothing and returns a handle
+    /// that is itself already stale (it resolves to no instance). `xf`'s
+    /// basis must be non-singular; a degenerate one makes the instance
+    /// silently skip drawing (see [`DynSpriteTransform`]).
+    pub fn add_sprite_instance_posed(
+        &mut self,
+        model: SpriteModelId,
+        xf: DynSpriteTransform,
+    ) -> SpriteInstanceId {
+        let Some(idx) = self.model_map.model_index(model) else {
+            // Stale model → spawn nothing; hand back a sentinel id that
+            // resolves to no live instance (a safe no-op everywhere).
+            return SpriteInstanceId {
+                slot: u32::MAX,
+                gen: u32::MAX,
+            };
+        };
         let dyn_index = match &mut self.inner {
-            BackendImpl::Cpu(c) => c.add_dyn_instance(model.0, pos),
-            BackendImpl::Gpu(g) => g.add_dyn_instance(model.0, pos),
+            BackendImpl::Cpu(c) => c.add_dyn_instance_posed(idx, xf),
+            BackendImpl::Gpu(g) => g.add_dyn_instance_posed(idx, xf),
         };
         self.dyn_map.alloc(dyn_index as u32)
     }
@@ -1024,6 +1189,107 @@ impl SceneRenderer {
     #[must_use]
     pub fn dynamic_sprite_count(&self) -> usize {
         self.dyn_map.order.len()
+    }
+
+    /// Register one new sprite **model** incrementally from `kv6`,
+    /// **without** rebuilding the existing model set — the streaming-in
+    /// counterpart to [`add_sprite_instance`](Self::add_sprite_instance)
+    /// for unique generated geometry (procedural asteroids, debris).
+    /// Returns a stable [`SpriteModelId`] usable immediately with
+    /// [`add_sprite_instance`](Self::add_sprite_instance) /
+    /// [`add_sprite_instance_posed`](Self::add_sprite_instance_posed).
+    ///
+    /// Works before any [`set_sprites`](Self::set_sprites) (it establishes
+    /// residency on the GPU backend's first model). The GPU backend
+    /// appends one LOD chain to the resident registry (amortised O(model
+    /// voxels)); the CPU backend pushes an axis-aligned template.
+    pub fn add_sprite_model(&mut self, kv6: &Kv6) -> SpriteModelId {
+        let model_index = match &mut self.inner {
+            BackendImpl::Cpu(c) => c.add_model(kv6),
+            BackendImpl::Gpu(g) => g.add_model(kv6),
+        };
+        self.model_map.alloc(model_index as u32)
+    }
+
+    /// Remove a registered sprite model, freeing its voxel data. Returns
+    /// `false` if `id` is stale / already removed.
+    ///
+    /// The model's slot is tombstoned **in place**: its id is never
+    /// reused, so every other [`SpriteModelId`] stays valid (no remap).
+    /// Existing instances of the removed model are **not** dropped here —
+    /// they linger but draw as nothing on the GPU backend (the CPU
+    /// backend keeps each instance's own kv6 clone, so they keep drawing
+    /// until removed via
+    /// [`remove_sprite_instance`](Self::remove_sprite_instance)); remove
+    /// them when convenient. Call
+    /// [`compact_sprite_models`](Self::compact_sprite_models) afterwards
+    /// to reclaim the GPU buffer holes.
+    pub fn remove_sprite_model(&mut self, id: SpriteModelId) -> bool {
+        let Some(idx) = self.model_map.model_index(id) else {
+            return false;
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.remove_model(idx),
+            BackendImpl::Gpu(g) => g.remove_model(idx),
+        }
+        self.model_map.remove(id)
+    }
+
+    /// Reclaim the GPU buffer space left by
+    /// [`remove_sprite_model`](Self::remove_sprite_model) by repacking the
+    /// resident registry to its live models only. Model ids are preserved
+    /// (no remap). O(live voxel volume) — call it when many models have
+    /// been removed, not every frame. No-op on the CPU backend (which
+    /// keeps cheap empty placeholders) and when nothing was removed.
+    pub fn compact_sprite_models(&mut self) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.compact_models(),
+            BackendImpl::Gpu(g) => g.compact_models(),
+        }
+    }
+
+    /// Update one dynamic instance's full pose (position + orientation)
+    /// for this frame. `id` is from
+    /// [`add_sprite_instance`](Self::add_sprite_instance) /
+    /// [`add_sprite_instance_posed`](Self::add_sprite_instance_posed). A
+    /// stale / removed handle is a no-op.
+    ///
+    /// For many instances per frame prefer
+    /// [`set_sprite_instance_transforms`](Self::set_sprite_instance_transforms):
+    /// the GPU backend flushes all pending pose changes to the device
+    /// once per [`render`](Self::render), so a per-instance call here is
+    /// still O(1) device work, but the batch variant avoids re-walking
+    /// the slotmap.
+    pub fn set_sprite_instance_transform(&mut self, id: SpriteInstanceId, xf: DynSpriteTransform) {
+        let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+            return;
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_dyn_instance_transform(dyn_index as usize, xf),
+            BackendImpl::Gpu(g) => g.set_dyn_instance_transform(dyn_index as usize, xf),
+        }
+    }
+
+    /// Batch form of
+    /// [`set_sprite_instance_transform`](Self::set_sprite_instance_transform)
+    /// — apply many `(instance, pose)` updates in one call. Stale handles
+    /// in `updates` are skipped. On the GPU backend this marks the
+    /// instance buffer dirty once and uploads the new poses a single time
+    /// at the next [`render`](Self::render), so spinning a whole cluster
+    /// of instances per frame is one device upload, not one per instance.
+    pub fn set_sprite_instance_transforms(
+        &mut self,
+        updates: &[(SpriteInstanceId, DynSpriteTransform)],
+    ) {
+        for &(id, xf) in updates {
+            let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+                continue;
+            };
+            match &mut self.inner {
+                BackendImpl::Cpu(c) => c.set_dyn_instance_transform(dyn_index as usize, xf),
+                BackendImpl::Gpu(g) => g.set_dyn_instance_transform(dyn_index as usize, xf),
+            }
+        }
     }
 
     /// Register animated KFA sprites (one or more bone hierarchies).
@@ -1243,6 +1509,73 @@ mod tests {
         }
         assert_eq!(map.order.len(), backend.len());
         assert_eq!(backend.len(), expect.len());
+    }
+
+    /// The model slotmap mints stable ids, resolves only live handles,
+    /// and never reuses a slot — so a removed model's id stays dead and
+    /// every other id survives the remove.
+    #[test]
+    fn dyn_model_map_lifecycle() {
+        let mut map = DynModelMap::default();
+        // `set_sprites(3 models)` seeds ids 0..3, all live.
+        map.reset(3);
+        let ids: Vec<SpriteModelId> = (0..3).map(|s| SpriteModelId { slot: s, gen: 0 }).collect();
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(map.model_index(id), Some(i));
+        }
+
+        // Incrementally add a fourth model.
+        let extra = map.alloc(3);
+        assert_eq!(extra, SpriteModelId { slot: 3, gen: 0 });
+        assert_eq!(map.model_index(extra), Some(3));
+
+        // Remove model 1: its handle goes stale, the rest stay valid.
+        assert!(map.remove(ids[1]));
+        assert_eq!(map.model_index(ids[1]), None);
+        assert_eq!(map.model_index(ids[0]), Some(0));
+        assert_eq!(map.model_index(ids[2]), Some(2));
+        assert_eq!(map.model_index(extra), Some(3));
+
+        // Double remove / stale removal is a no-op returning false.
+        assert!(!map.remove(ids[1]));
+
+        // A bogus / out-of-range handle resolves to nothing, no panic.
+        let bogus = SpriteModelId {
+            slot: 999,
+            gen: 0,
+        };
+        assert_eq!(map.model_index(bogus), None);
+        assert!(!map.remove(bogus));
+
+        // A handle with a mismatched generation never resolves (guards a
+        // future compacting registry).
+        let wrong_gen = SpriteModelId { slot: 0, gen: 7 };
+        assert_eq!(map.model_index(wrong_gen), None);
+    }
+
+    #[test]
+    fn dyn_sprite_transform_default_is_identity_and_applies() {
+        let xf = DynSpriteTransform::default();
+        assert_eq!(xf.pos, [0.0, 0.0, 0.0]);
+        assert_eq!(xf.right, [1.0, 0.0, 0.0]);
+        assert_eq!(xf.up, [0.0, 1.0, 0.0]);
+        assert_eq!(xf.forward, [0.0, 0.0, 1.0]);
+
+        let mut s = Sprite::axis_aligned(
+            roxlap_formats::kv6::Kv6::solid_cube(2, 0x80_FF_FF_FF),
+            [9.0, 9.0, 9.0],
+        );
+        let posed = DynSpriteTransform {
+            pos: [1.0, 2.0, 3.0],
+            right: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            forward: [1.0, 0.0, 0.0],
+        };
+        posed.apply_to(&mut s);
+        assert_eq!(s.p, [1.0, 2.0, 3.0]);
+        assert_eq!(s.s, [0.0, 0.0, 1.0]);
+        assert_eq!(s.h, [0.0, 1.0, 0.0]);
+        assert_eq!(s.f, [1.0, 0.0, 0.0]);
     }
 
     #[test]

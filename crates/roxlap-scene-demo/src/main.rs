@@ -22,8 +22,8 @@ use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::xform::BoneXform;
 use roxlap_render::{
-    FrameParams, ImageFacing, ImageId, ImageSprite, KfaSprite, Line3, RenderOptions, SceneRenderer,
-    SpriteInstanceDesc, SpriteInstanceId, SpriteModelId, SpriteSet,
+    DynSpriteTransform, FrameParams, ImageFacing, ImageId, ImageSprite, KfaSprite, Line3,
+    RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteInstanceId, SpriteModelId, SpriteSet,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -776,102 +776,137 @@ impl InputState {
 
 // --- sprite spinner (incremental add/remove demo) -----------------------
 
-/// Number of distinct colour sphere models the spinner cycles through.
+/// Number of distinct colours the spinner cycles through.
 const SPINNER_COLORS: usize = 6;
 /// World centre of the spinner ring (in front of the spawn camera at
 /// `[0, -120, 50]` looking +y), and its radius in voxels.
 // z is voxlap-down (smaller = higher); the streaming hills crest near
 // z≈72, so centre the ring well above that and keep its radius small
 // enough that the bottom (z = centre.z + radius) stays clear of terrain —
-// otherwise the lower spheres z-fight the hills and flicker.
+// otherwise the lower blocks z-fight the hills and flicker.
 const SPINNER_CENTER: [f32; 3] = [0.0, -45.0, 28.0];
 const SPINNER_RADIUS: f32 = 26.0;
 
-/// Build the spinner's colour sphere models — one small solid sphere per
-/// palette entry. Pivot is centred by `from_fn_shaded`, so an instance's
-/// position places the sphere's centre.
-fn build_spinner_models() -> Vec<Sprite> {
-    // voxlap-packed 0x80RRGGBB (high bit set = shaded).
-    const PALETTE: [u32; SPINNER_COLORS] = [
-        0x80FF_4040, // red
-        0x80FF_A030, // orange
-        0x80F0_F040, // yellow
-        0x8040_E060, // green
-        0x8040_A0FF, // blue
-        0x80C0_60FF, // violet
-    ];
-    let n: u32 = 9;
-    #[allow(clippy::cast_precision_loss)]
-    let c = n as f32 * 0.5;
-    let r = c - 0.5;
-    PALETTE
-        .iter()
-        .map(|&col| {
-            let kv6 = Kv6::from_fn_shaded(n, n, n, |x, y, z| {
-                #[allow(clippy::cast_precision_loss)]
-                let (dx, dy, dz) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c, z as f32 + 0.5 - c);
-                (dx * dx + dy * dy + dz * dz <= r * r).then_some(col)
-            });
-            Sprite::axis_aligned(kv6, SPINNER_CENTER)
-        })
-        .collect()
+/// The spinner's palette (voxlap-packed `0x80RRGGBB`, high bit = shaded).
+const SPINNER_PALETTE: [u32; SPINNER_COLORS] = [
+    0x80FF_4040, // red
+    0x80FF_A030, // orange
+    0x80F0_F040, // yellow
+    0x8040_E060, // green
+    0x8040_A0FF, // blue
+    0x80C0_60FF, // violet
+];
+
+/// Build one spinner block, recoloured `col`. Deliberately **non-cubic**
+/// (wide in local x) so the per-frame tumble the spinner applies is
+/// visible — a rotation visibly swings the silhouette's width. Pivot is
+/// centred by `from_fn_shaded`, so an instance's position places the
+/// block's centre.
+fn build_spinner_block(col: u32) -> Kv6 {
+    let (bx, by, bz) = (14u32, 5u32, 5u32);
+    Kv6::from_fn_shaded(bx, by, bz, |_, _, _| Some(col))
 }
 
-/// Where the carve target + spinner models landed in a [`SpriteSet`], so
-/// the demo can map [`SceneRenderer::set_sprites`]'s positional ids back
-/// to the right handles.
+/// Where the carve target landed in a [`SpriteSet`], so the demo can map
+/// [`SceneRenderer::set_sprites`]'s positional ids back to its handle.
+/// (The spinner streams its own models via `add_sprite_model`, so it
+/// needs no slot here.)
 struct SpriteLayout {
     /// Model index of the `G`-carve target, if present.
     carve_model: Option<usize>,
-    /// `[start, start+SPINNER_COLORS)` are the spinner colour models.
-    spinner_start: usize,
 }
 
-/// A rotating ring of coloured sphere sprites: every tick it appends one
-/// sphere at the advancing head angle and drops the oldest once the trail
-/// is full — driving the facade's incremental add/remove each frame on
-/// whichever backend is active.
+/// One live spinner block: its streamed-in unique model + instance, the
+/// fixed ring position (orbit angle), and a per-block spin offset for
+/// variety.
+struct SpinnerBlock {
+    model: SpriteModelId,
+    inst: SpriteInstanceId,
+    pos: [f32; 3],
+    spin_offset: f64,
+}
+
+/// A ring of coloured blocks streaming in and out while each tumbles in
+/// place — the canonical dogfood of the dynamic sprite API the way a
+/// physics demo (asteroids/debris) would drive it:
+///
+/// * `add_sprite_model` — every block is a unique procedural model
+///   registered incrementally (no full `set_sprites` rebuild);
+/// * `add_sprite_instance_posed` — blocks spawn already tumbling, so
+///   there's no one-frame axis-aligned flash;
+/// * `set_sprite_instance_transforms` — every frame all live blocks are
+///   re-posed in one batched call (GPU dirty-flush coalesces it to one
+///   upload);
+/// * `remove_sprite_instance` + `remove_sprite_model` — the oldest block
+///   leaves once the ring is full;
+/// * `compact_sprite_models` — periodically reclaims the removed models'
+///   GPU buffer space.
 #[derive(Default)]
 struct Spinner {
-    /// One [`SpriteModelId`] per palette colour (empty until models are
-    /// registered, e.g. `ROXLAP_GPU_NO_SPRITES`).
-    models: Vec<SpriteModelId>,
-    /// Live instances oldest→newest; the front is dropped when full.
-    ring: std::collections::VecDeque<SpriteInstanceId>,
-    /// Head angle (radians), advanced one step per appended sphere.
+    /// Live blocks oldest→newest; the front is dropped when full.
+    ring: std::collections::VecDeque<SpinnerBlock>,
+    /// Head angle (radians), advanced one step per appended block.
     angle: f64,
     /// Seconds accumulated toward the next append.
     accum: f64,
+    /// Total elapsed seconds — drives the shared tumble phase.
+    clock: f64,
     /// Next palette colour to use.
     next_color: usize,
+    /// Removed-model count since the last `compact_sprite_models`.
+    dead_models: usize,
+    /// `false` until the demo confirms the renderer's sprite layer is
+    /// live (cleared whenever a `set_sprites` wipes the dynamic layer).
+    enabled: bool,
 }
 
 impl Spinner {
     /// Seconds between appends (≈ append rate).
-    const ADD_PERIOD: f64 = 0.12;
-    /// Head-angle advance per appended sphere (radians) → visual spin
-    /// speed `ANGLE_STEP / ADD_PERIOD` rad/s. Wide spacing so the few
-    /// spheres are clearly separated around the ring.
-    const ANGLE_STEP: f64 = 0.5;
-    /// Trail length — spheres are dropped once the ring exceeds this.
-    const MAX: usize = 12;
+    const ADD_PERIOD: f64 = 0.18;
+    /// Head-angle advance per appended block (radians). Wide spacing so
+    /// the few blocks are clearly separated around the ring.
+    const ANGLE_STEP: f64 = 0.6;
+    /// Trail length — blocks are dropped once the ring exceeds this.
+    const MAX: usize = 10;
+    /// Tumble rate (radians/second) of each block about world-z.
+    const SPIN_RATE: f64 = 1.4;
+    /// Compact the registry after this many model removals.
+    const COMPACT_EVERY: usize = 8;
 
-    /// Point the spinner at a freshly registered set of colour models and
-    /// drop any prior handles (a `set_sprites` wiped the dynamic layer).
-    fn reset_models(&mut self, models: Vec<SpriteModelId>) {
-        self.models = models;
+    /// Enable the spinner against a freshly built sprite layer, dropping
+    /// any prior handles (a `set_sprites` invalidated every dynamic model
+    /// + instance). The spinner re-streams its own models from scratch.
+    fn reset(&mut self) {
         self.ring.clear();
         self.angle = 0.0;
         self.accum = 0.0;
+        self.clock = 0.0;
         self.next_color = 0;
+        self.dead_models = 0;
+        self.enabled = true;
     }
 
-    /// Advance by `dt` seconds: append spheres at the head and drop the
-    /// tail, exercising the renderer's incremental sprite API.
+    /// Tumble pose for a block at `pos` given the shared `phase` (radians)
+    /// — a rotation about world-z, so the wide block visibly swings its
+    /// silhouette width.
+    #[allow(clippy::cast_possible_truncation)]
+    fn pose(pos: [f32; 3], phase: f64) -> DynSpriteTransform {
+        let (s, c) = (phase.sin() as f32, phase.cos() as f32);
+        DynSpriteTransform {
+            pos,
+            right: [c, s, 0.0],   // local +x in world (xy-plane rotation)
+            up: [-s, c, 0.0],     // local +y in world
+            forward: [0.0, 0.0, 1.0], // local +z stays world +z
+        }
+    }
+
+    /// Advance by `dt` seconds: stream blocks in/out and re-pose every
+    /// live block, exercising the full dynamic sprite API each frame.
     fn update(&mut self, renderer: &mut SceneRenderer, dt: f64) {
-        if self.models.is_empty() {
+        if !self.enabled {
             return;
         }
+        self.clock += dt;
         // Clamp so a long stall (e.g. window drag) doesn't burst-spawn.
         self.accum = (self.accum + dt).min(0.5);
         while self.accum >= Self::ADD_PERIOD {
@@ -883,17 +918,44 @@ impl Spinner {
                 SPINNER_CENTER[1],
                 SPINNER_CENTER[2] + SPINNER_RADIUS * a.sin(),
             ];
-            let model = self.models[self.next_color % self.models.len()];
+            let col = SPINNER_PALETTE[self.next_color % SPINNER_PALETTE.len()];
+            let spin_offset = self.angle; // stagger each block's phase
             self.next_color += 1;
             self.angle += Self::ANGLE_STEP;
-            self.ring
-                .push_back(renderer.add_sprite_instance(model, pos));
+
+            // Stream a fresh unique model in, spawn it pre-posed.
+            let model = renderer.add_sprite_model(&build_spinner_block(col));
+            let phase = self.clock * Self::SPIN_RATE + spin_offset;
+            let inst = renderer.add_sprite_instance_posed(model, Self::pose(pos, phase));
+            self.ring.push_back(SpinnerBlock {
+                model,
+                inst,
+                pos,
+                spin_offset,
+            });
+
             if self.ring.len() > Self::MAX {
                 if let Some(old) = self.ring.pop_front() {
-                    renderer.remove_sprite_instance(old);
+                    renderer.remove_sprite_instance(old.inst);
+                    renderer.remove_sprite_model(old.model);
+                    self.dead_models += 1;
                 }
             }
+            // Periodically reclaim the removed models' GPU buffer holes.
+            if self.dead_models >= Self::COMPACT_EVERY {
+                renderer.compact_sprite_models();
+                self.dead_models = 0;
+            }
         }
+
+        // Re-pose every live block this frame in one batched upload.
+        let phase_base = self.clock * Self::SPIN_RATE;
+        let updates: Vec<(SpriteInstanceId, DynSpriteTransform)> = self
+            .ring
+            .iter()
+            .map(|b| (b.inst, Self::pose(b.pos, phase_base + b.spin_offset)))
+            .collect();
+        renderer.set_sprite_instance_transforms(&updates);
     }
 }
 
@@ -1354,10 +1416,8 @@ impl App {
             pos: TARGET_WORLD,
         });
 
-        // Spinner colour sphere models last (zero static instances — the
-        // spinner adds/removes their instances dynamically each frame).
-        let spinner_start = models.len();
-        models.extend(build_spinner_models());
+        // The spinner streams its own block models in dynamically via
+        // `add_sprite_model` (no static slots here).
 
         if models.is_empty() {
             return None;
@@ -1370,19 +1430,16 @@ impl App {
             },
             SpriteLayout {
                 carve_model: Some(target_model),
-                spinner_start,
             },
         ))
     }
 
     /// Map the positional ids from a [`SceneRenderer::set_sprites`] back
-    /// into the carve-target handle + the spinner's colour models.
+    /// into the carve-target handle, and (re-)enable the spinner — a
+    /// `set_sprites` wiped the dynamic layer, so it re-streams its models.
     fn map_sprite_ids(&mut self, ids: &[SpriteModelId], layout: &SpriteLayout) {
         self.carve_target_id = layout.carve_model.and_then(|i| ids.get(i).copied());
-        let end = layout.spinner_start + SPINNER_COLORS;
-        if let Some(slice) = ids.get(layout.spinner_start..end) {
-            self.spinner.reset_models(slice.to_vec());
-        }
+        self.spinner.reset();
     }
 
     /// The checkerboarded green/red `coco` field (model indices 0/1).
