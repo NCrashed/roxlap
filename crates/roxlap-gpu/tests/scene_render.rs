@@ -414,6 +414,120 @@ fn scene_dda_side_shades_darken_floor() {
     );
 }
 
+/// `vsid × vsid` chunk: every column carries an `nvox`-tall coloured
+/// slab whose top sits at `surf` — so the chunk's mip-0 colour count is
+/// `vsid² · nvox`. With `vsid = 128, nvox = 8` that's 131072 colours,
+/// 2× the per-chunk GPU colour stride — the dense-chunk case the cave
+/// demo hits (a fully solid 128×128×256 cave chunk).
+fn dense_floor_chunk(vsid: u32, surf: u8, nvox: u8) -> Vxl {
+    let n_cols = (vsid as usize) * (vsid as usize);
+    let bot = surf + nvox - 1;
+    let mut data: Vec<u8> = Vec::with_capacity(n_cols * (4 + nvox as usize * 4));
+    let mut column_offset: Vec<u32> = Vec::with_capacity(n_cols + 1);
+    let bgra = [0x00u8, 0x80, 0xff, 0x80];
+    for _ in 0..n_cols {
+        column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+        data.extend_from_slice(&[0, surf, bot, 0]);
+        for _ in 0..nvox {
+            data.extend_from_slice(&bgra);
+        }
+    }
+    column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+    Vxl {
+        vsid,
+        ipo: [0.0; 3],
+        ist: [1.0, 0.0, 0.0],
+        ihe: [0.0, 0.0, 1.0],
+        ifo: [0.0, 1.0, 0.0],
+        data: data.into_boxed_slice(),
+        column_offset: column_offset.into_boxed_slice(),
+        mip_base_offsets: Box::new([0, n_cols + 1]),
+        vbit: Box::new([]),
+        vbiti: 0,
+    }
+}
+
+/// Regression for the cave-demo "half the map is black" report: a chunk
+/// whose colour count exceeds the per-chunk GPU stride must NOT have its
+/// colours truncated. Columns are stored in `y·vsid + x` order, so a
+/// truncated tail blacks out the high-`y` spatial half of the chunk.
+///
+/// A dense top-faced floor is viewed straight down; with the bug the
+/// bottom half of the frame (world `y ≥ vsid/2`, the truncated columns)
+/// renders black instead of the floor colour.
+#[test]
+fn scene_dda_dense_chunk_colours_not_truncated() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 128u32;
+    let chunk = decompress_chunk(&dense_floor_chunk(vsid, 100, 8));
+    // Precondition: this chunk really does exceed the per-chunk stride,
+    // so the test exercises the truncation path (not a no-op).
+    assert!(
+        chunk.mips[0].colors.len() > roxlap_gpu::scene::COLORS_PER_CHUNK_WORDS as usize,
+        "test chunk must exceed the colour stride to exercise truncation \
+         ({} colours)",
+        chunk.mips[0].colors.len()
+    );
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // Inside the chunk, above the floor (z=2 < 100), looking straight
+    // down (+z). Screen-down maps to world +y, so the high-y (truncated)
+    // columns land in the bottom half of the frame.
+    let cam = Camera {
+        position: [vsid as f32 * 0.5, vsid as f32 * 0.5, 2.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let fb = renderer.render(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+
+    // Count floor-colour pixels in the top half (low world-y, never
+    // truncated) vs the bottom half (high world-y, truncated by the bug).
+    let half = (h / 2) as usize;
+    let count = |rows: std::ops::Range<usize>| {
+        let mut n = 0;
+        for y in rows {
+            for x in 0..w as usize {
+                if is_block_color(fb[y * w as usize + x]) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let top = count(0..half);
+    let bottom = count(half..h as usize);
+    eprintln!("dense_chunk: top-half floor px {top}, bottom-half floor px {bottom}");
+    assert!(top > 0, "top half should show the floor, got {top}");
+    // The bottom half is the truncated spatial half — it must still
+    // render the floor, not black.
+    assert!(
+        bottom * 2 > top,
+        "bottom (high-y) half is mostly black — colours were truncated \
+         (top {top} vs bottom {bottom})",
+    );
+}
+
 /// Lifting the 16-grid cap moved the per-grid cameras out of a fixed
 /// `array<…, 16>` uniform and into a runtime-sized storage buffer
 /// (binding 15). This guards that grid `g` marches with **its own**

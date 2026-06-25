@@ -251,6 +251,12 @@ pub struct GpuSceneResident {
     /// holding a different chunk than expected" + as the eviction
     /// origin.
     pub(crate) slot_chunk_idx_shadow: Vec<Vec<[i32; 4]>>,
+    /// Per-grid colour stride in u32 words (the adaptive
+    /// [`COLORS_PER_CHUNK_WORDS`]-or-larger value chosen at upload to
+    /// fit the grid's densest chunk). `refresh_chunk` reads it so a
+    /// streamed re-upload addresses colours with the same stride the
+    /// initial upload used.
+    pub(crate) colors_stride_shadow: Vec<u32>,
 }
 
 impl GpuSceneResident {
@@ -271,6 +277,10 @@ impl GpuSceneResident {
         let mut static_meta: Vec<GridStaticMeta> = Vec::with_capacity(info.grids.len());
         let mut chunk_occupancy_shadow: Vec<Vec<u32>> = Vec::with_capacity(info.grids.len());
         let mut slot_chunk_idx_shadow: Vec<Vec<[i32; 4]>> = Vec::with_capacity(info.grids.len());
+        // Per-grid colour stride (words/slot) — adaptive to the grid's
+        // densest chunk (see the in-loop derivation). `refresh_chunk`
+        // reads it back so streamed re-uploads use the same stride.
+        let mut grid_colors_strides: Vec<u32> = Vec::with_capacity(info.grids.len());
 
         for grid in &info.grids {
             let vsid = grid.vsid;
@@ -278,7 +288,27 @@ impl GpuSceneResident {
             let layout = MipLayout::for_vsid(vsid);
             let occ_words_per_slot = layout.occ_words_per_slot as usize;
             let offsets_words_per_slot = layout.offsets_words_per_slot as usize;
-            let colors_stride = COLORS_PER_CHUNK_WORDS as usize;
+            // Per-slot colour stride. The fixed-stride layout gives every
+            // slot — present or not — the same capacity, so streaming /
+            // re-bake can write a fresh chunk's colours into any slot.
+            // [`COLORS_PER_CHUNK_WORDS`] is sized for sparse terrain
+            // chunks (~36 k colours); a *fully dense* chunk (the cave
+            // demo's single 128×128×256 chunk carries ~207 k colours
+            // across its mip ladder) needs more, or its colours truncate
+            // and the chunk's high-`y` columns render black. Grow the
+            // stride to the grid's densest chunk, floored at the default
+            // so denser chunks that stream in later still fit the common
+            // case. Per-grid: a sparse grid keeps the small stride; only
+            // a grid that actually holds dense chunks pays for the
+            // bigger one.
+            let max_chunk_colors = grid
+                .chunks
+                .iter()
+                .map(|(_, c)| c.mips.iter().map(|m| m.colors.len()).sum::<usize>())
+                .max()
+                .unwrap_or(0);
+            let colors_stride = (COLORS_PER_CHUNK_WORDS as usize).max(max_chunk_colors);
+            grid_colors_strides.push(colors_stride as u32);
 
             // Validate pool_dims are powers of 2 — required for the
             // shader's `chunk_idx & (pool_dims - 1)` modular slot
@@ -513,6 +543,7 @@ impl GpuSceneResident {
             static_meta,
             chunk_occupancy_shadow,
             slot_chunk_idx_shadow,
+            colors_stride_shadow: grid_colors_strides,
         }
     }
 
@@ -544,7 +575,11 @@ impl GpuSceneResident {
         let layout = MipLayout::for_vsid(meta.vsid);
         let occ_words_per_slot = layout.occ_words_per_slot as usize;
         let offsets_words_per_slot = layout.offsets_words_per_slot as usize;
-        let colors_stride = COLORS_PER_CHUNK_WORDS as usize;
+        // Same adaptive stride the initial upload chose for this grid.
+        let colors_stride = self
+            .colors_stride_shadow
+            .get(scene_idx)
+            .map_or(COLORS_PER_CHUNK_WORDS as usize, |&s| s as usize);
 
         assert_eq!(
             chunk.mips.len() as u32,

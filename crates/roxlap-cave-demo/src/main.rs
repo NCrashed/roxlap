@@ -380,7 +380,10 @@ impl App {
         // jamming when one component collides. If already inside solid
         // (e.g. a regen edge case), skip the block test for that axis so
         // we can still escape.
-        let chunk = self.scene.grid(self.grid_id).and_then(|g| g.chunk(IVec3::ZERO));
+        let chunk = self
+            .scene
+            .grid(self.grid_id)
+            .and_then(|g| g.chunk(IVec3::ZERO));
         let already_stuck = chunk.is_some_and(|c| is_blocked(c, self.cam_pos));
         for axis in 0..3 {
             let mut candidate = self.cam_pos;
@@ -468,7 +471,10 @@ impl App {
                 }
                 // Solid hit?
                 let solid = chunk.is_some_and(|c| {
-                    !matches!(getcube(&c.data, &c.column_offset, c.vsid, vx, vy, vz), Cube::Air)
+                    !matches!(
+                        getcube(&c.data, &c.column_offset, c.vsid, vx, vy, vz),
+                        Cube::Air
+                    )
                 });
                 if solid {
                     impacts.push(IVec3::new(vx, vy, vz));
@@ -719,9 +725,12 @@ fn install_cave_chunk(scene: &mut Scene, grid_id: GridId, preset: Preset, seed: 
 
     // Carve a guaranteed-open spawn bubble at world centre so the camera
     // never spawns buried (set_sphere_with_colfunc bumps the version).
-    grid.set_sphere_with_colfunc(spawn_centre(), SPAWN_BUBBLE_RADIUS, SpanOp::Carve, |_, _, _| {
-        SPAWN_BUBBLE_COLOR
-    });
+    grid.set_sphere_with_colfunc(
+        spawn_centre(),
+        SPAWN_BUBBLE_RADIUS,
+        SpanOp::Carve,
+        |_, _, _| SPAWN_BUBBLE_COLOR,
+    );
 
     // Directional sun-style bake over the whole (single) chunk, then a
     // final version bump so the GPU backend re-uploads the baked

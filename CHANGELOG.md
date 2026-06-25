@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **GPU scene upload truncated dense chunks' colours** (`roxlap-gpu`).
+  The per-chunk colour stride was a fixed `COLORS_PER_CHUNK_WORDS`
+  (65536 u32s), sized for sparse terrain chunks (~36 k colours). A
+  *fully dense* chunk — e.g. the cave demo's single 128×128×256 chunk
+  (~207 k colours across its mip ladder) — overflowed the stride and had
+  its colour data truncated; since columns upload in `y·vsid + x` order,
+  the high-`y` spatial half of the chunk rendered **black** on the GPU
+  backend (the CPU backend was unaffected). The stride is now **adaptive
+  per grid** — grown to fit the grid's densest chunk, floored at the old
+  default — so dense chunks upload in full while sparse grids keep the
+  small stride (and now use slightly less memory). `GpuSceneResident`
+  carries the per-grid stride so streamed re-uploads (`refresh_chunk`)
+  address colours identically. Regression test:
+  `scene_dda_dense_chunk_colours_not_truncated`.
+
 ### Changed
 
 - **`roxlap-cave-demo` migrated onto the `SceneRenderer` facade**
