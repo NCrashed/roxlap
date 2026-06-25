@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`roxlap-cave-demo` migrated onto the `SceneRenderer` facade**
+  (demo-only). The cave world — exactly one scene chunk
+  (`128 × 128 × 256`) — is now a single-grid, single-chunk
+  `roxlap_scene::Scene` (identity transform, chunk `(0, 0, 0)`,
+  materialised via `CaveChunkGenerator`). The demo renders through
+  `SceneRenderer::{render, present}` instead of the hand-rolled
+  `softbuffer` + `render_dda_parallel` loop, so it gains the GPU backend
+  for free: run with `ROXLAP_GPU=1` (automatic CPU fallback). Carves +
+  relights go through `Grid::set_sphere_with_colfunc` +
+  `bake_lightmode`; collision reads the cave chunk via `getcube`;
+  plasma bullets are now voxel-sphere sprites driven by the dynamic
+  sprite API (`add_sprite_model` / `add_sprite_instance_posed` /
+  `set_sprite_instance_transforms` / `remove_sprite_instance`). The
+  per-chunk generator seed (`FNV(base_seed, (0,0,0))`) makes the cave
+  equivalent but not byte-identical to the prior direct-seed output.
+  Drops the `softbuffer` dependency; adds `roxlap-scene` + `roxlap-render`.
+
 ## [0.14.0] — 2026-06-25
 
 This release lands the **DDA** macro-stage (DDA.0–DDA.10): the CPU

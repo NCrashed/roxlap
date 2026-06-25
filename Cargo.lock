@@ -2117,10 +2117,12 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 name = "roxlap-cave-demo"
 version = "0.14.0"
 dependencies = [
+ "glam",
  "roxlap-cavegen",
  "roxlap-core",
  "roxlap-formats",
- "softbuffer",
+ "roxlap-render",
+ "roxlap-scene",
  "winit",
 ]
 

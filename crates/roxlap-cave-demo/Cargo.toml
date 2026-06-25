@@ -19,8 +19,10 @@ path = "src/main.rs"
 roxlap-core = { path = "../roxlap-core", version = "0.14" }
 roxlap-formats = { path = "../roxlap-formats", version = "0.14" }
 roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.14" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.14" }
+roxlap-render = { path = "../roxlap-render", version = "0.14" }
+glam = { workspace = true }
 winit = "0.30"
-softbuffer = "0.4"
 
 [lints]
 workspace = true
