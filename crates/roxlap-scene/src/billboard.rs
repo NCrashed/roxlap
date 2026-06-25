@@ -50,9 +50,8 @@
 //! Multi-mip and bigger resolutions are a S6.4 polish concern.
 
 use glam::{DVec3, IVec3};
-use roxlap_core::opticast::{opticast, OpticastOutcome, OpticastSettings};
-use roxlap_core::rasterizer::ScratchPool;
-use roxlap_core::scalar_rasterizer::ScalarRasterizer;
+use roxlap_core::dda::{render_dda, DdaEnv, RasterSink};
+use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Camera;
 
 use crate::{Grid, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
@@ -209,17 +208,6 @@ impl BillboardCache {
         // for foreshortened rays past the centre.
         let max_scan_dist = ((d + r) * 1.25).ceil().max(64.0) as i32;
 
-        // One ScratchPool shared across all 26 renders. Sized so
-        // the per-strip uurend stride fits the snapshot width.
-        let pool_vsid = CHUNK_SIZE_XY.max(resolution).max(64);
-        let mut pool = ScratchPool::new(resolution, resolution, pool_vsid);
-        // Skycast colour = SKY_SENTINEL so opticast stamps the
-        // sentinel into sky pixels (instead of a real colour the
-        // blit can't reliably tell apart from a voxel hit).
-        let sentinel_i = i32::from_ne_bytes(SKY_SENTINEL.to_ne_bytes());
-        pool.set_skycast(sentinel_i, 0);
-        pool.set_treat_z_max_as_air(true);
-
         for view_dir in viewpoints {
             let camera = snapshot_camera(view_dir, centre, d);
             let mut color = vec![SKY_SENTINEL; (resolution as usize) * (resolution as usize)];
@@ -227,7 +215,7 @@ impl BillboardCache {
 
             // Empty grid → render all-sky and move on (no chunks
             // means `chunk_xyz_backing` returns None).
-            let outcome = if let Some(backing) = grid.chunk_xyz_backing() {
+            if let Some(backing) = grid.chunk_xyz_backing() {
                 let cg = roxlap_core::ChunkGrid {
                     chunks: &backing.chunks,
                     origin_chunk_xy: backing.origin_chunk_xy,
@@ -238,24 +226,28 @@ impl BillboardCache {
                 };
                 let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
                 let settings = snapshot_settings(resolution, d, r, max_scan_dist);
-                let mut rasterizer =
-                    ScalarRasterizer::new(&mut color, &mut depth, resolution as usize, grid_view);
-                opticast(&mut rasterizer, &mut pool, &camera, &settings, grid_view)
-            } else {
-                // Empty grid — buffers stay at SKY_SENTINEL / INFINITY.
-                OpticastOutcome::Rendered
-            };
-            // `Rendered` and `SkippedCameraInSolid` both keep the
-            // buffers — the latter means the camera was inside
-            // solid material (impossible for our outside-the-grid
-            // camera position), in which case we get sky too.
-            let _ = outcome;
+                // DDA render: no textured sky (`DdaEnv::default`), so a
+                // miss leaves the `SKY_SENTINEL` prefill untouched — the
+                // blit detects impostor sky by that sentinel. Impostors
+                // are unfogged. `render_dda` builds its own per-call brick
+                // cache covering all populated chunks.
+                let mut sink = RasterSink::new(&mut color, &mut depth);
+                render_dda(
+                    &camera,
+                    &settings,
+                    grid_view,
+                    resolution as usize,
+                    &DdaEnv::default(),
+                    0,
+                    &mut sink,
+                );
+            }
 
-            // Sentinel post-process: opticast writes a finite
-            // depth (`gxmax` / `max_scan_dist`) for sky pixels via
-            // `phase_startsky`. Reset those to INFINITY so the
-            // blit's `is_infinite()` belt-and-braces check still
-            // works alongside the colour-sentinel check.
+            // Sentinel post-process: the prefill already left sky pixels
+            // at `SKY_SENTINEL` / `INFINITY`; DDA misses don't touch them,
+            // so depths are already `INFINITY`. This keeps the blit's
+            // `is_infinite()` belt-and-braces check consistent if a future
+            // change ever writes a finite sky depth.
             for (px, z) in color.iter().zip(depth.iter_mut()) {
                 if *px == SKY_SENTINEL {
                     *z = f32::INFINITY;

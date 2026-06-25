@@ -1,11 +1,9 @@
 //! Per-frame voxel-world borrow shape.
 //!
 //! Wraps the `(vsid, slab_buf, column_offsets, mip_base_offsets)`
-//! tuple that [`crate::opticast`] and
-//! [`crate::scalar_rasterizer::ScalarRasterizer`] both need. Today
-//! always represents a single chunk so callers building from a
-//! [`roxlap_formats::vxl::Vxl`] keep the existing flat-world
-//! semantics byte-identically.
+//! tuple the renderer ([`crate::dda`]) reads. A single
+//! [`roxlap_formats::vxl::Vxl`] is one chunk; a [`ChunkGrid`] composes
+//! many chunks behind the same borrow shape.
 //!
 //! Substage S4B.0 introduced the shape as a pure rename — opticast
 //! drove a single flat world behind a typed borrow. Subsequent
@@ -228,6 +226,201 @@ impl<'a> GridView<'a> {
         self
     }
 
+    /// Number of built mip levels (mip-0 always counts). `0` only for a
+    /// degenerate empty view.
+    #[must_use]
+    pub fn mip_count(&self) -> u32 {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.mip_base_offsets.len().saturating_sub(1) as u32
+        }
+    }
+
+    /// Raw slab-chain bytes for column `(x, y)` at mip `mip`, or `None`
+    /// if out of range / unbacked / `mip` not built. At mip-N the
+    /// per-chunk grid is `(vsid >> N)²` columns.
+    fn column_slab_mip(&self, x: u32, y: u32, mip: u32) -> Option<&'a [u8]> {
+        if mip >= self.mip_count() {
+            return None;
+        }
+        let vsid_m = (self.vsid >> mip).max(1);
+        if x >= vsid_m || y >= vsid_m {
+            return None;
+        }
+        let base = self.mip_base_offsets[mip as usize];
+        let col_idx = base + (y * vsid_m + x) as usize;
+        let start = *self.column_offsets.get(col_idx)? as usize;
+        // Return the unbounded tail from the column's start (not a
+        // `slng`-bounded slice): the slab-chain decoders self-terminate
+        // at `nextptr == 0`, so computing the exact length up front is a
+        // redundant full-chain walk — the dominant cost when
+        // `surface_color` is called per cell. `.get()` inside the
+        // decoders still guards the buffer end against malformed data.
+        self.slab_buf.get(start..)
+    }
+
+    /// Top z of the solid run containing voxel `(x, y, z)` at mip 0, or
+    /// `None` if the voxel is air. See [`Self::voxel_run_top_mip`].
+    #[must_use]
+    pub fn voxel_run_top(&self, x: u32, y: u32, z: u32) -> Option<i32> {
+        self.voxel_run_top_mip(x, y, z, 0)
+    }
+
+    /// Top z of the solid run containing voxel `(x, y, z)` at mip `mip`,
+    /// or `None` if air. Coordinates are in mip-`mip` units
+    /// (`x, y ∈ [0, vsid >> mip)`, `z ∈ [0, CHUNK_SIZE_Z >> mip)`).
+    ///
+    /// Mirrors [`roxlap_formats::edit::expandrle`]'s run decomposition
+    /// (the same `[top, bot)` solid runs the scene's `voxel_solid`
+    /// uses), walking the slab chain in place. The returned top is
+    /// always a colour-list voxel, so callers can shade an interior /
+    /// side-face hit with `voxel_color_mip(x, y, top, mip)`.
+    #[must_use]
+    pub fn voxel_run_top_mip(&self, x: u32, y: u32, z: u32, mip: u32) -> Option<i32> {
+        let maxz = (CHUNK_SIZE_Z >> mip) as i32;
+        if i64::from(z) >= i64::from(maxz) {
+            return None;
+        }
+        let slab = self.column_slab_mip(x, y, mip)?;
+        #[allow(clippy::cast_possible_wrap)]
+        let zi = z as i32;
+        // First run opens at the first slab's z1 (`expandrle uind[0]`).
+        let mut top = i32::from(slab[1]);
+        let mut v = 0usize;
+        loop {
+            let nextptr = usize::from(slab[v]);
+            if nextptr == 0 {
+                // Last run extends to bedrock: [top, maxz).
+                return (zi >= top && zi < maxz).then_some(top);
+            }
+            v += nextptr * 4;
+            let ze = i32::from(slab[v + 3]);
+            let z1 = i32::from(slab[v + 1]);
+            if ze >= z1 {
+                continue; // degenerate slab — run continues
+            }
+            // Current run closes at `ze`; the next opens at `z1`.
+            if zi >= top && zi < ze {
+                return Some(top);
+            }
+            top = z1;
+        }
+    }
+
+    /// Call `f(top, bot)` for each solid run `[top, bot)` of column
+    /// `(x, y)` at mip 0. See [`Self::for_each_run_mip`].
+    pub fn for_each_run(&self, x: u32, y: u32, f: impl FnMut(i32, i32)) {
+        self.for_each_run_mip(x, y, 0, f);
+    }
+
+    /// Call `f(top, bot)` for each solid run `[top, bot)` of column
+    /// `(x, y)` at mip `mip`, top-to-bottom (the
+    /// [`roxlap_formats::edit::expandrle`] decomposition). No-op for an
+    /// out-of-range / unbacked column. The brickmap builder
+    /// ([`crate::dda`]) uses this to mark occupied bricks.
+    pub fn for_each_run_mip(&self, x: u32, y: u32, mip: u32, mut f: impl FnMut(i32, i32)) {
+        let Some(slab) = self.column_slab_mip(x, y, mip) else {
+            return;
+        };
+        let maxz = (CHUNK_SIZE_Z >> mip) as i32;
+        let mut top = i32::from(slab[1]);
+        let mut v = 0usize;
+        loop {
+            let nextptr = usize::from(slab[v]);
+            if nextptr == 0 {
+                f(top, maxz); // last run extends to bedrock
+                return;
+            }
+            v += nextptr * 4;
+            let ze = i32::from(slab[v + 3]);
+            let z1 = i32::from(slab[v + 1]);
+            if ze >= z1 {
+                continue; // degenerate slab — run continues
+            }
+            f(top, ze);
+            top = z1;
+        }
+    }
+
+    /// DDA hit colour for voxel `(x, y, z)` at mip 0. See
+    /// [`Self::surface_color_mip`].
+    #[must_use]
+    pub fn surface_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
+        self.surface_color_mip(x, y, z, 0)
+    }
+
+    /// DDA hit colour for voxel `(x, y, z)` at mip `mip`: the display
+    /// colour if the cell is **solid and renderable**, or `None` for
+    /// air or an uncoloured bedrock run (stepped through transparently).
+    ///
+    /// Exact colour-list cells return their own colour; interior /
+    /// side-face cells fall back to the colour of their run's top voxel
+    /// (the surface colour "bleeds" down a cliff face).
+    #[must_use]
+    pub fn surface_color_mip(&self, x: u32, y: u32, z: u32, mip: u32) -> Option<u32> {
+        let top = self.voxel_run_top_mip(x, y, z, mip)?;
+        self.voxel_color_mip(x, y, z, mip)
+            .or_else(|| self.voxel_color_mip(x, y, u32::try_from(top).ok()?, mip))
+    }
+
+    /// Surface colour of voxel `(x, y, z)` at mip 0. See
+    /// [`Self::voxel_color_mip`].
+    #[must_use]
+    pub fn voxel_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
+        self.voxel_color_mip(x, y, z, 0)
+    }
+
+    /// Surface colour of voxel `(x, y, z)` at mip `mip` (mip-`mip`
+    /// coordinates), or `None` for an empty / out-of-range cell.
+    ///
+    /// Decodes the column's slab chain directly from the [`GridView`]
+    /// borrow (the same `vbuf` floor + ceiling list walk
+    /// [`roxlap_formats::vxl::Vxl::voxel_color`] performs). The returned
+    /// `u32` is packed `0xAARRGGBB`; a zero-RGB cell (empty-chunk
+    /// placeholder) reads as `None`. Surface voxels only — use
+    /// [`Self::surface_color_mip`] for the full solid-cell hit test.
+    #[must_use]
+    pub fn voxel_color_mip(&self, x: u32, y: u32, z: u32, mip: u32) -> Option<u32> {
+        let maxz = (CHUNK_SIZE_Z >> mip) as i32;
+        if i64::from(z) >= i64::from(maxz) {
+            return None;
+        }
+        let slab = self.column_slab_mip(x, y, mip)?;
+        #[allow(clippy::cast_possible_wrap)]
+        let zi = z as i32;
+        let texel = |b: &[u8]| -> Option<u32> {
+            let rgb = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            // Zero RGB = empty-chunk placeholder → untextured.
+            (rgb & 0x00ff_ffff != 0).then_some(rgb)
+        };
+        let mut v = 0usize;
+        loop {
+            // Floor colour list of the current slab: z ∈ [z1, z1c].
+            let z_start = i32::from(slab[v + 1]);
+            let z1c = i32::from(slab[v + 2]);
+            if zi >= z_start && zi <= z1c {
+                let off = v + 4 + ((zi - z_start) as usize) * 4;
+                return texel(slab.get(off..off + 4)?);
+            }
+            let nextptr = slab[v];
+            if nextptr == 0 {
+                return None; // last slab, z not in its floor list
+            }
+            let (prev_z1, prev_z1c, prev_nextptr) = (z_start, z1c, i32::from(nextptr));
+            v += usize::from(nextptr) * 4;
+            // Ceiling colour list for the NEW slab — stored in the tail
+            // of the previous slab's bytes (voxlap `vbuf` convention).
+            let ze = i32::from(slab[v + 3]);
+            let ceil_z_start = ze + prev_z1c - prev_z1 - prev_nextptr + 2;
+            if zi >= ceil_z_start && zi < ze {
+                let ceil_n = (ze - ceil_z_start) as usize;
+                let ceil_start = v - ceil_n * 4;
+                let off = ceil_start + ((zi - ceil_z_start) as usize) * 4;
+                return texel(slab.get(off..off + 4)?);
+            }
+        }
+    }
+
     /// S4B.2.d: voxel-space XY axis-aligned bounding box of the
     /// grid. Returns `([xmin, ymin], [xmax, ymax])` in voxel units;
     /// the grid contains voxels with coordinates in
@@ -239,9 +432,8 @@ impl<'a> GridView<'a> {
     /// - Multi-chunk (`chunk_grid: Some(&cg)`): derived from
     ///   `cg.origin_chunk_xy + cg.chunks_x/y * chunk_size_xy`.
     ///
-    /// Consumed by [`crate::opticast_prelude::recompute_in_bounds_xy`]
-    /// (camera-inside-grid check) and the rasterizer's gline
-    /// world-edge gxmax clip.
+    /// Used as the renderer's outer DDA bounds (the world-edge box the
+    /// per-pixel ray is clipped to).
     #[must_use]
     pub fn aabb_xy(&self) -> ([i32; 2], [i32; 2]) {
         if let Some(cg) = self.chunk_grid {
@@ -261,6 +453,29 @@ impl<'a> GridView<'a> {
             let v = self.vsid as i32;
             ([0, 0], [v, v])
         }
+    }
+
+    /// Full voxel-space bounding box of the grid: `([x0, y0, z0],
+    /// [x1, y1, z1])` half-open in grid-local voxel coordinates. XY
+    /// comes from [`Self::aabb_xy`]; Z spans the chunk grid's
+    /// `chunks_z` layers (`origin_chunk_z * CHUNK_SIZE_Z` upward), or a
+    /// single `[0, CHUNK_SIZE_Z)` chunk when un-stacked. The DDA
+    /// renderer ([`crate::dda`]) uses this as the outer traversal box.
+    #[must_use]
+    pub fn voxel_bounds(&self) -> ([i32; 3], [i32; 3]) {
+        let ([x0, y0], [x1, y1]) = self.aabb_xy();
+        let csz = CHUNK_SIZE_Z as i32;
+        let (z0, z1) = if let Some(cg) = self.chunk_grid {
+            #[allow(clippy::cast_possible_wrap)]
+            let chunks_z = cg.chunks_z as i32;
+            (
+                cg.origin_chunk_z * csz,
+                (cg.origin_chunk_z + chunks_z) * csz,
+            )
+        } else {
+            (0, csz)
+        };
+        ([x0, y0, z0], [x1, y1, z1])
     }
 
     /// S4B.2.a: chunk lookup for the cross-chunk-XY DDA.

@@ -7,21 +7,19 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 readme.workspace = true
-description = "Pure-Rust port of Ken Silverman's Voxlap voxel engine — engine core."
+description = "Independent Rust voxel engine core — clean-room DDA renderer reading Voxlap .vxl/.kv6 formats."
 documentation = "https://docs.rs/roxlap-core"
 keywords = ["voxlap", "voxel", "renderer", "raycaster", "engine"]
 categories = ["game-development", "graphics", "rendering::engine"]
 
 [dependencies]
-# R6: meltsphere builds Kv6 sprites from world voxel data; the Kv6
-# type lives in the formats crate alongside the parser/serialiser.
-# Path used during local development; version is what cargo publish
-# records for downstream resolution.
+# The .vxl/.kv6/.kfa parsers + edit API + sprite types this crate's
+# renderer and lighting consume. Path used during local development;
+# version is what cargo publish records for downstream resolution.
 roxlap-formats = { path = "../roxlap-formats", version = "0.13" }
 
-# R12.2.1: rayon's par_iter for the per-strip / per-row / per-sprite
-# parallel rendering paths. Single-threaded callers
-# (`ScratchPool::new`) skip the parallel branch entirely; rayon's
+# rayon's par_iter for the parallel DDA render bands + the world-voxel
+# lighting bake. Single-threaded callers skip the parallel branch; rayon's
 # default thread pool only warms up when the parallel branch fires.
 #
 # R10.X.2: rayon now works on wasm32 too via wasm-bindgen-rayon's
@@ -39,17 +37,6 @@ rayon = { workspace = true }
 # compares roxlap's meltsphere output against the byte-dumped C
 # oracle sprites in tests/fixtures/.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-# `examples/hello.rs` — minimum-viable WASD + cube demo for new devs.
-# Pulled in only for the example so the published crate's runtime
-# dependency surface stays unchanged.
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.13" }
-winit = "0.30"
-softbuffer = "0.4"
-
-[[example]]
-name = "hello"
-path = "examples/hello.rs"
-doc-scrape-examples = false
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 //! Per-voxel world queries against a `.vxl` column-slab world.
 //!
-//! Port of voxlap's `getcube` (voxlap5.c:937-962) — the engine's
+//! Port of voxlap's `getcube` — the engine's
 //! random-access voxel lookup. Used by sphere/region edits
 //! (`meltsphere`, `setrect`, etc.) and any logic that needs to ask
 //! "what's at (x, y, z)?" without going through a ray cast.

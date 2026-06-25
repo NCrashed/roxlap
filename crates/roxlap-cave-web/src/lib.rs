@@ -2,7 +2,7 @@
 //!
 //! GW.3: rendered through the `roxlap-render` [`SceneRenderer`] facade
 //! — the WebGPU compute marcher when the browser has WebGPU, else the
-//! CPU opticast path presented via the facade's WebGL2 blit. The cave
+//! CPU DDA path presented via the facade's WebGL2 blit. The cave
 //! is generated into a single-chunk `roxlap_scene::Scene` grid;
 //! flying, per-voxel collision, and runtime carving all run against
 //! the scene. Plasma bullets are facade **sprites** (small glowing
@@ -19,7 +19,6 @@ use std::rc::Rc;
 
 use glam::{DVec3, IVec3};
 use roxlap_cavegen::{BlueCaveGenerator, CaveParams, Generator, MagCaveGenerator, MAXZDIM};
-use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::{Camera, Engine, OpticastSettings};
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_NO_SHADING};
@@ -429,10 +428,9 @@ fn render(state: &mut State) {
     };
     state.renderer.set_sprites(&set);
 
-    // `lighting` + `frame` borrow `state.engine` immutably; the render
-    // call below mutably borrows the disjoint `state.scene` +
-    // `state.renderer` fields, so NLL lets them coexist.
-    let lighting = SpriteLighting::from_engine(&state.engine);
+    // `frame` borrows `state.engine` immutably; the render call below
+    // mutably borrows the disjoint `state.scene` + `state.renderer`
+    // fields, so NLL lets them coexist.
     let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
     let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
     settings.max_scan_dist = MAXZDIM;
@@ -447,7 +445,7 @@ fn render(state: &mut State) {
         gpu_mip_scan_dist: 64.0,
         gpu_max_outer_steps: chunks_visible,
         gpu_fov_y_rad: GPU_FOV_Y_DEG.to_radians(),
-        sprite_lighting: Some(&lighting),
+        draw_sprites: true,
         side_shades: [0; 6],
     };
     state.renderer.render(&mut state.scene, &cam, &frame);

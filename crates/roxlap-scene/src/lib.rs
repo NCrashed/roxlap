@@ -342,6 +342,11 @@ pub struct Grid {
     ///
     /// [`ChunkResult`]: streaming::ChunkResult
     pub pending_gen: HashSet<IVec3>,
+    /// Cross-frame DDA brick-occupancy cache (Substage DDA.7 perf).
+    /// Keyed by `(chunk, mip)` + the chunk's edit version, so a static
+    /// chunk's brick map is built once and reused every frame. Skipped
+    /// entirely on the voxlap render path. Not serialised.
+    pub dda_brick_cache: roxlap_core::BrickCache,
 }
 
 impl Grid {
@@ -361,7 +366,39 @@ impl Grid {
             stream_radius: StreamRadius::DISABLED,
             chunk_versions: HashMap::new(),
             pending_gen: HashSet::new(),
+            dda_brick_cache: roxlap_core::BrickCache::new(),
         }
+    }
+
+    /// Ensure the DDA brick cache holds current mip-`requested_mip`
+    /// occupancy maps for every populated chunk, rebuilding only chunks
+    /// whose edit version changed (Substage DDA.7). Clamps the mip to a
+    /// level every chunk has built (so coarse rendering never holes) and
+    /// returns that effective mip. Evicts cache entries for chunks no
+    /// longer present. Call once per frame before the DDA render.
+    pub fn ensure_dda_bricks(&mut self, requested_mip: u32) -> u32 {
+        // Split-borrow disjoint fields so the cache mutates while the
+        // chunks + versions are read.
+        let Self {
+            chunks,
+            chunk_versions,
+            dda_brick_cache,
+            ..
+        } = self;
+        // Effective uniform mip: min built mip across chunks, capped.
+        let mut mip = requested_mip;
+        if requested_mip > 0 {
+            for vxl in chunks.values() {
+                mip = mip.min(vxl.mip_count().saturating_sub(1));
+            }
+        }
+        for (idx, vxl) in chunks.iter() {
+            let version = chunk_versions.get(idx).copied().unwrap_or(0);
+            let view = roxlap_core::GridView::from_single_vxl(vxl);
+            dda_brick_cache.ensure([idx.x, idx.y, idx.z], mip, version, &view);
+        }
+        dda_brick_cache.retain_chunks(|c| chunks.contains_key(&IVec3::new(c[0], c[1], c[2])));
+        mip
     }
 
     /// Current per-chunk edit version (S7.2). Returns `0` for any

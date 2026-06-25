@@ -7,19 +7,14 @@ mod kv6_sprite;
 mod markers;
 #[cfg(test)]
 mod repro;
-#[cfg(test)]
-mod repro_vc;
 mod scene;
 mod ship;
 mod terrain;
-#[cfg(test)]
-mod vc6_repro;
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use roxlap_core::opticast::OpticastSettings;
-use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::Engine;
 use roxlap_formats::character::{self, Bone, Character, Clip, ClipData, MeshRef};
 use roxlap_formats::kfa::{Hinge, Point3, Seq};
@@ -1184,18 +1179,30 @@ impl App {
         #[allow(clippy::cast_sign_loss)]
         let chunks_visible = (self.scan_dist.max(1) as u32) / roxlap_scene::CHUNK_SIZE_XY + 4;
 
-        let lighting = SpriteLighting::from_engine(&self.engine);
         let frame = FrameParams {
             settings: &settings,
             sky_color: self.engine.sky_color(),
             sky: self.engine.sky(),
-            fog_color: self.engine.fog_color(),
-            fog_max_scan_dist: self.engine.fog_max_scan_dist(),
+            // DDA.9: fog is config-driven across all backends. Drive it
+            // from the sky colour + the live scan distance so terrain
+            // fades into the sky (matches the DDA/GPU look) and tracks
+            // the +/- scan-distance keys. (An explicit `Engine::set_fog`
+            // would override this.)
+            fog_color: if self.engine.fog_max_scan_dist() > 0 {
+                self.engine.fog_color()
+            } else {
+                self.engine.sky_color()
+            },
+            fog_max_scan_dist: if self.engine.fog_max_scan_dist() > 0 {
+                self.engine.fog_max_scan_dist()
+            } else {
+                self.scan_dist
+            },
             treat_z_max_as_air: true,
             gpu_mip_scan_dist: self.gpu_mip_scan_dist,
             gpu_max_outer_steps: chunks_visible,
             gpu_fov_y_rad: (GPU_FOV_Y_DEG as f32).to_radians(),
-            sprite_lighting: Some(&lighting),
+            draw_sprites: true,
             side_shades: self.engine.side_shades(),
         };
 

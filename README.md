@@ -1,16 +1,18 @@
 # roxlap
 
-A pure-Rust port of [Ken Silverman's Voxlap](http://advsys.net/ken/voxlap.htm)
-voxel engine — a 3D voxel renderer from the Build-engine era — grown into a
-small **voxel-scene engine**. The heritage CPU raycaster runs anywhere with
-no GPU and no C dependency; an **optional WGPU compute-shader renderer**
-sits alongside it behind one unified facade with automatic CPU fallback. On
-top is a **multi-grid scene graph** — f64 world placement + quaternion
-rotation, chunk streaming + procedural generation, serde snapshots, and
-real-time edit + screen→world picking APIs. One Cargo workspace, Linux /
-macOS / Windows + wasm, idiomatic safe Rust with per-architecture SIMD.
+An independent Rust voxel engine that reads
+[Ken Silverman's Voxlap](http://advsys.net/ken/voxlap.htm) file formats,
+grown into a small **voxel-scene engine**. The CPU renderer is a
+clean-room per-pixel 3D-DDA over a brickmap — it runs anywhere with no
+GPU and no C dependency; an **optional WGPU compute-shader renderer**
+sits alongside it behind one unified facade with automatic CPU fallback.
+On top is a **multi-grid scene graph** — f64 world placement +
+quaternion rotation, chunk streaming + procedural generation, serde
+snapshots, and real-time edit + screen→world picking APIs. One Cargo
+workspace, Linux / macOS / Windows + wasm, idiomatic safe Rust with
+per-architecture SIMD. Dual MIT/Apache-2.0, commercial use included.
 
-![sample render from roxlap-oracle](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/screenshot.png)
+![sample render from roxlap](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/screenshot.png)
 
 ## What is Voxlap?
 
@@ -23,12 +25,14 @@ algorithm — no GPU, no shaders. Cult-favourite games like
 [Ace of Spades](https://en.wikipedia.org/wiki/Ace_of_Spades_\(video_game\)),
 and Ken's own *Slab6* / *Voxed* shipped on top of it.
 
-roxlap is that engine, reimplemented from scratch in Rust. It reads the
-same `.vxl` (worlds) / `.kv6` / `.kvx` (sprite voxels) / `.kfa` (sprite
-animation rigs) files Ken's engine reads, renders them with the same
-algorithms, and is **bit-exact** against the reference C engine
-([voxlaptest](https://github.com/NCrashed/voxlaptest)) on every test
-pose where the underlying SIMD allows.
+roxlap reads the same `.vxl` (worlds) / `.kv6` / `.kvx` (sprite voxels)
+/ `.kfa` (sprite animation rigs) files Ken's engine reads, so existing
+Voxlap assets load directly. The rendering, lighting, editing and
+animation code is an independent Rust implementation — it contains no
+Voxlap C source. (The CPU renderer began as a faithful port of Voxlap's
+column raycaster; that has since been replaced by a clean-room
+per-pixel 3D-DDA, which also retires the old raycaster's silhouette and
+hairline artifacts.)
 
 It then grows past Ken's single-world engine: a multi-grid **scene graph**
 (`roxlap-scene`) places many independently-rotating chunked voxel grids in
@@ -126,7 +130,6 @@ won't spin up. Full setup + per-host header config in
 | [`roxlap-host`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). |
 | [`roxlap-web`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-web) | Engine demo for the browser (wasm32 + wasm-bindgen + canvas). Oracle world + WebAssembly SIMD batches, ~360 KB wasm bundle. Run via `trunk serve` for dev / `trunk build --release` for deploy. |
 | [`roxlap-cave-web`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cave-web) | Cave demo for the browser — Worley + Perlin cave-gen, fly + fire + carve with local relight on impact, all on wasm32. ~130 KB wasm bundle (no embedded asset; cave is generated client-side). |
-| [`roxlap-oracle`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-oracle) | Cross-engine render-hash oracle: renders 12 fixed test poses, FNV-1a-hashes each framebuffer, diffs against voxlaptest's C goldens. CI gates on this. |
 
 The library API surface is documented at [docs.rs/roxlap-core](https://docs.rs/roxlap-core)
 and [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
@@ -168,27 +171,13 @@ rotation, cross-chunk gline, far-LOD billboards, streaming + procgen) and
 the **GPU compute renderer** (GPU.0–13) have landed, with a unified
 CPU/GPU facade and a screen→world picking / `raycast` query API.
 
-The cross-engine oracle pins CPU-render correctness — it tracks 9 of 12
-voxlap C poses: 5 byte-for-byte bit-exact with the C reference, 4 frozen as
-roxlap's own goldens after visual verification (sub-pixel rounding noise
-from `_mm_rcp_ps`-based vertex projection is documented in
-[PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md)).
-The GPU renderer is non-deterministic across devices by design and is
-validated by a headless render-diff harness rather than byte-goldens.
-
-```text
-$ cargo run --release -p roxlap-oracle -- diff
-MATCH    north  326a7c41c3cc659d
-MATCH    east  3e00f1d0d62d5be0
-MATCH    diag_down  118de3c1132d0f6b
-MATCH    high_down  cd1ceac6e21c55f4
-MATCH    sprite_above  c92ebd054aa7c12e        (roxlap-frozen)
-MATCH    sprite_front  87c7de0ddeb0f7ce        (roxlap-frozen)
-MATCH    sprite_iso  9caf71069594fde6          (roxlap-frozen)
-MATCH    sprite_coco  bf0f4329b473c69e         (roxlap-frozen)
-MATCH    diag_down_lit  b536ce3fdf771b9e       (roxlap-frozen)
-9 match, 0 mismatch, 0 missing-from-golden (9 total roxlap rows)
-```
+CPU-render correctness is pinned by in-crate test suites: `roxlap-core`'s
+per-pixel DDA renderer is cross-checked against a dense per-voxel
+reference walk (including a leak-free empty-space-skip regression), and
+`roxlap-scene` freezes framebuffer-hash goldens for multi-grid / stacked
+/ streaming poses. The GPU renderer is non-deterministic across devices
+by design and is validated by a headless render-diff harness rather than
+byte-goldens.
 
 See [PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md)
 for the CPU-port substage roadmap, plus `PORTING-SCENE.md` (scene graph) and
@@ -227,14 +216,6 @@ not byte-stable across strip counts; CI freezes goldens at N=1).
 update_lighting and the sprite batch scale near-linearly past 8
 threads — they're the right axes for dynamic-light or
 massive-sprite scenes.
-
-Bench commands:
-
-```sh
-roxlap-oracle bench --threads N         # opticast scaling
-roxlap-oracle bench-lighting            # update_lighting scaling (RAYON_NUM_THREADS env)
-roxlap-oracle bench-sprites --sprites N # sprite scaling (RAYON_NUM_THREADS env)
-```
 
 Full design + tradeoffs in
 [PORTING-MULTICORE.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-MULTICORE.md).
@@ -277,15 +258,19 @@ Dual-licensed under either of:
 - Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/NCrashed/roxlap/blob/master/LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](https://github.com/NCrashed/roxlap/blob/master/LICENSE-MIT))
 
-at your option.
+at your option — including commercial use.
 
-The Voxlap engine algorithms and on-disk data formats this crate
-implements were originally created by Ken Silverman. Voxlap's
-original C source is distributed under separate terms: royalty-free
-for non-commercial use; commercial use requires a license from Ken
-Silverman directly. roxlap is an independent Rust port that does not
-contain Ken's original C source, but its observable behaviour mirrors
-his engine's. If you intend to use roxlap or any derived work
-commercially, contact Ken Silverman about Voxlap commercial
-licensing — see [advsys.net/ken](http://advsys.net/ken/) for
-current contact information.
+roxlap is an independent Rust implementation that contains none of Ken
+Silverman's original Voxlap C source. Its renderer is a clean-room
+per-pixel 3D-DDA over a brickmap — not Voxlap's column-coherent
+raycaster — and the remaining engine math (lighting, voxel editing,
+bone solving, projection) is independently implemented. The crates
+interoperate with Voxlap's on-disk file formats (`.vxl`, `.kv6`,
+`.kvx`, `.kfa`); file formats are not themselves subject to copyright,
+and the parsers here are independent implementations written to read
+those formats.
+
+Credit where due: the `.vxl`/`.kv6`/`.kvx`/`.kfa` formats and the
+original Voxlap engine that inspired this project are
+[Ken Silverman's](http://advsys.net/ken/) — see
+[advsys.net/ken/voxlap.htm](http://advsys.net/ken/voxlap.htm).

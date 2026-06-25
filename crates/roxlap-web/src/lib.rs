@@ -53,7 +53,7 @@ type RafCell = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 ///
 /// GW.2: the demo now renders through the `roxlap-render`
 /// [`SceneRenderer`] facade — WebGPU compute marcher when the browser
-/// has WebGPU, else the CPU opticast path presented via WebGL2 (the
+/// has WebGPU, else the CPU DDA path presented via WebGL2 (the
 /// facade owns both). The host keeps only the `Scene` + camera +
 /// engine sky/fog; the renderer owns the framebuffer + presentation.
 struct State {
@@ -278,7 +278,7 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, perf: &web_sys::Performance, now_ms
     integrate_input(&mut state, dt);
 
     // GW.2: march the world + present through the `roxlap-render`
-    // facade — WebGPU compute marcher if available, else CPU opticast
+    // facade — WebGPU compute marcher if available, else CPU DDA
     // presented via the facade's own WebGL2 blit. Disjoint `State`
     // fields are split-borrowed so the immutable engine sky/fog read
     // coexists with the mutable scene + renderer.
@@ -308,7 +308,7 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, perf: &web_sys::Performance, now_ms
             gpu_mip_scan_dist: 64.0,
             gpu_max_outer_steps: chunks_visible,
             gpu_fov_y_rad: GPU_FOV_Y_DEG.to_radians(),
-            sprite_lighting: None,
+            draw_sprites: false,
             side_shades: [0; 6],
         };
         renderer.render(scene, &cam, &frame);
@@ -427,7 +427,7 @@ async fn start() -> Result<(), JsValue> {
     let t_build_end = perf.as_ref().map_or(0.0, web_sys::Performance::now);
 
     // Prefer the WebGPU compute marcher; the facade falls back to the
-    // CPU opticast path (presented via WebGL2) when WebGPU is absent.
+    // CPU DDA path (presented via WebGL2) when WebGPU is absent.
     let opts = RenderOptions {
         want_gpu: true,
         cpu_max_grid_vsid: 8 * roxlap_scene::CHUNK_SIZE_XY,

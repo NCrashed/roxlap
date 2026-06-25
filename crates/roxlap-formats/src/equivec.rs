@@ -1,8 +1,8 @@
 //! Voxlap's `univec[256]` / `iunivec[256][4]` Fibonacci-spiral sphere
 //! direction tables.
 //!
-//! Port of `equivecinit(255)` (`voxlap5.c:7866`) plus the iunivec
-//! quantisation loop (`voxlap5.c:12302-12308`). Voxlap calls this
+//! Port of `equivecinit(255)` (``) plus the iunivec
+//! quantisation loop (``). Voxlap calls this
 //! once during `initvoxlap`; roxlap builds the tables lazily via
 //! [`OnceLock`] on first access from `updatereflects`.
 //!
@@ -30,7 +30,7 @@
 
 use std::sync::OnceLock;
 
-/// Voxlap's `GOLDRAT` constant (`voxlap5.c:18`): `1 - 1/φ`. Stored
+/// Voxlap's `GOLDRAT` constant (``): `1 - 1/φ`. Stored
 /// as `f64` because the original C expression `(float)i * (GOLDRAT *
 /// PI * 2)` evaluates the angle in `double` and only casts to
 /// `float` when calling `cosf`/`sinf` — preserving that precision

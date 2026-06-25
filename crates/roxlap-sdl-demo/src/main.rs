@@ -184,7 +184,7 @@ fn render_frame(
         gpu_mip_scan_dist: 64.0,
         gpu_max_outer_steps: 64,
         gpu_fov_y_rad: 60.0_f32.to_radians(),
-        sprite_lighting: None,
+        draw_sprites: false,
         side_shades: [0; 6],
     };
     renderer.render(scene, camera, &frame);

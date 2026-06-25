@@ -341,10 +341,12 @@ fn sky_color(dir: vec3<f32>) -> vec3<f32> {
 
 // GPU.8 fog blend. `t` is the world-space hit distance; below
 // `fog_near` the hit shows through fully; above `fog_far` only the
-// fog colour shows. Smoothstep gives a soft mid-band.
+// fog colour shows. Linear ramp (not smoothstep) to match the CPU /
+// DDA fog `clamp((t - near) / (far - near))` — smoothstep's S-curve
+// gave visibly weaker mid-distance fog than the DDA renderer.
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     let fog_near = u.fog_color.w;
-    let factor = smoothstep(fog_near, u.fog_far, t);
+    let factor = clamp((t - fog_near) / max(u.fog_far - fog_near, 1e-6), 0.0, 1.0);
     return mix(hit_color, u.fog_color.rgb, factor);
 }
 

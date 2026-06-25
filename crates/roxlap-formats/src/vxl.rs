@@ -1,8 +1,8 @@
 //! `.vxl` voxel-map format (Voxlap world / heightmap + slab columns).
 //!
-//! Reference: voxlaptest's `loadvxl` / `savevxl` (`voxlap5.c:3828` /
+//! Reference: voxlaptest's `loadvxl` / `savevxl` (`` /
 //! `:3887`) and the `vbuf` slab layout comment at
-//! `voxlap5.c:75`. File layout (all multi-byte fields are little-
+//! ``. File layout (all multi-byte fields are little-
 //! endian):
 //!
 //! ```text
@@ -89,14 +89,14 @@ pub struct Vxl {
     /// Slab-pool allocation bitmap — 1 bit per dword in [`Vxl::data`].
     /// A set bit marks the dword as belonging to an allocated column
     /// or mip-segment; clear bits are free space available to
-    /// [`Vxl::voxalloc`]. Voxlap's `vbit` (`voxlap5.c:72`).
+    /// [`Vxl::voxalloc`]. Voxlap's `vbit` (``).
     ///
     /// Empty after [`parse`] — read-only Vxls have no allocator
     /// state. Call [`Vxl::reserve_edit_capacity`] to upgrade to a
     /// mutation-ready slab pool.
     pub vbit: Box<[u32]>,
     /// Roving allocator index, in dwords. Voxlap's `vbiti`
-    /// (`voxlap5.c:72`). Advances past each successful
+    /// (``). Advances past each successful
     /// [`Vxl::voxalloc`] to amortise the search.
     pub vbiti: u32,
 }
@@ -369,7 +369,7 @@ impl Vxl {
     }
 
     /// Build mip-1..mip-`max_mips` column data in place, mirroring
-    /// voxlap's `genmipvxl` (`voxlap5.c:4710-4944`). Mip-0 is preserved.
+    /// voxlap's `genmipvxl` (``). Mip-0 is preserved.
     /// The loop halves dims each level and stops early when either
     /// dim drops to 1 or `max_mips` is reached.
     ///
@@ -446,7 +446,7 @@ impl Vxl {
 
     // ---- slab allocator (CD.2 cave-demo edit API) ---------------------
     //
-    // Voxlap's `vbuf`/`vbit`/`voxalloc`/`voxdealloc` (`voxlap5.c:64-862`)
+    // Voxlap's `vbuf`/`vbit`/`voxalloc`/`voxdealloc` (``)
     // are a bitmap free-list allocator over the slab byte pool. Roxlap
     // re-uses [`Vxl::data`] as that pool: existing column bytes stay
     // put, headroom appended at the tail is the free region. Granularity
@@ -512,7 +512,7 @@ impl Vxl {
     }
 
     /// Allocate `n_bytes` of slab pool, returning a byte offset into
-    /// [`Vxl::data`]. Voxlap's `voxalloc` (`voxlap5.c:841`).
+    /// [`Vxl::data`]. Voxlap's `voxalloc` (``).
     ///
     /// `n_bytes` MUST be a positive multiple of 4 (slab records are
     /// dword-aligned).
@@ -587,7 +587,7 @@ impl Vxl {
     /// Free the slab at `byte_offset` (which must point at the start
     /// of a slab chain previously returned by [`Vxl::voxalloc`] or
     /// recorded in a column table). Voxlap's `voxdealloc`
-    /// (`voxlap5.c:822`).
+    /// (``).
     ///
     /// Length is recovered by walking the slab chain via [`slng`] —
     /// the caller does not pass it.
@@ -623,7 +623,7 @@ impl Vxl {
     }
 }
 
-/// Slab-chain length helper. Voxlap's `slng` (`voxlap5.c:814`). Walks
+/// Slab-chain length helper. Voxlap's `slng` (``). Walks
 /// the next-slab pointer chain rooted at `slab[0]` until the
 /// terminator (`v[0] == 0`), then adds the last slab's floor-colour
 /// bytes (`(z1c - z1 + 1) * 4`) plus the terminating slab's 4-byte
@@ -670,13 +670,13 @@ fn vbit_is_set(vbit: &[u32], dword_idx: u32) -> bool {
 // ---------- multi-mip generation -----------------------------------------
 //
 // `build_mip_level` and friends below are a dense, cast-heavy port of
-// voxlap5.c:4710-4944. The pedantic-cast lints fire on every line
+//. The pedantic-cast lints fire on every line
 // that mirrors a C `int32_t`/`char *` interaction; they're allowed
 // scoped to each function rather than module-wide so the parser
 // keeps its full lint coverage.
 
 /// Maximum z-extent of a column — voxlap's `MAXZDIM` from
-/// `voxlap5.h:10`. Each mip level halves this bound.
+/// ``. Each mip level halves this bound.
 const MAXZDIM: i32 = 256;
 
 /// Default per-column edit-pool headroom reserved by [`Vxl::empty`] /
@@ -699,12 +699,12 @@ const MIXC_LANES: usize = 8;
 /// `n` colour bytes after `*2 + 1`, then `>> 16`. Originally a
 /// 4-lane packed `int64` (e.g. `0x7fff7fff7fff7fff`); we only need
 /// the low 16 bits because the scalar fallback at
-/// `voxlap5.c:4815-4837` reads the bottom u16 and broadcasts it.
+/// `` reads the bottom u16 and broadcasts it.
 const QMULMIP: [u32; 8] = [
     0x7fff, 0x4000, 0x2aaa, 0x2000, 0x1999, 0x1555, 0x1249, 0x1000,
 ];
 
-/// Average up to 8 packed BGRA colours (voxlap5.c:4815-4837 scalar
+/// Average up to 8 packed BGRA colours ( scalar
 /// translation). `n` is `1..=8`; `lanes[..n]` are the source
 /// `int32_t` BGRA records.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
@@ -775,7 +775,7 @@ fn build_mip_level(
             // Reset per-cell scratch.
             mixn.fill(0);
             tbuf.clear();
-            tbuf.resize(4, 0); // header placeholder (voxlap5.c:4779: tbuf[3] = 0; n = 4)
+            tbuf.resize(4, 0); // header placeholder (: tbuf[3] = 0; n = 4)
 
             // 4 source-column byte offsets at (2x, 2y), (2x+1, 2y),
             // (2x, 2y+1), (2x+1, 2y+1). Voxlap's `oysiz`/`oxsiz` are
@@ -860,7 +860,7 @@ fn build_mip_level(
             let mut cstat: i32 = 0;
             let mut oldn: usize = 0;
             let mut n: usize = 4;
-            let mut z: i32 = i32::MIN; // 0x80000000 sentinel (voxlap5.c:4779)
+            let mut z: i32 = i32::MIN; // 0x80000000 sentinel
             let mut cz: i32 = -1;
 
             loop {
@@ -956,7 +956,7 @@ fn build_mip_level(
                     }
                 }
 
-                // State machine update for besti (voxlap5.c:4887-4908).
+                // State machine update for besti.
                 let bit_pos = (besti << 2) as i32;
                 cstat = ((1i32 << bit_pos).wrapping_add(cstat)) & 0x3333;
                 let state = (cstat >> bit_pos) & 3;
@@ -984,7 +984,7 @@ fn build_mip_level(
                 }
             }
 
-            // After loop: emit the final slab tail (voxlap5.c:4910-4918).
+            // After loop: emit the final slab tail.
             tbuf[oldn + 2] = tbuf[oldn + 2].wrapping_sub(1);
             if cz >= 0 {
                 tbuf[oldn] = ((n - oldn) >> 2) as u8;

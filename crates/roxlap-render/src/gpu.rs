@@ -23,7 +23,6 @@ use crate::{
 use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
-use roxlap_core::sprite::sprite_colmul;
 use roxlap_core::Camera;
 use roxlap_gpu::{
     build_sprite_model, GpuInitError, GpuRenderer, GpuSceneResident, SpriteInstance,
@@ -445,22 +444,25 @@ impl GpuBackend {
             self.auto_sky_color = Some(frame.sky_color);
         }
 
-        // CPU `set_fog` ramps hits to `fog_color` from t=0 to
-        // `fog_max_scan_dist`, and is off when that distance is ≤ 0.
-        // Match it: near = 0, far = the scan distance (a huge far ≈
-        // "no fog" when disabled). The GPU uses a smoothstep where the
-        // CPU LUT is linear — same endpoints, slightly different curve.
+        // Config-driven fog, matching the CPU/DDA path (which reads the
+        // pool's fog state): on iff `fog_max_scan_dist > 0`, a linear
+        // ramp from t=0 to that distance toward `fog_color`. Off ⇒ a huge
+        // far ≈ no fog. The host (e.g. the scene demo) drives the fog
+        // colour/distance via `FrameParams`.
+        #[allow(clippy::cast_precision_loss)]
+        let far = if frame.fog_max_scan_dist > 0 {
+            frame.fog_max_scan_dist as f32
+        } else {
+            1.0e30
+        };
         let [r, g, b] = unpack_rgb(frame.fog_color);
         let color = [
             f32::from(r) / 255.0,
             f32::from(g) / 255.0,
             f32::from(b) / 255.0,
         ];
-        let far = if frame.fog_max_scan_dist > 0 {
-            frame.fog_max_scan_dist as f32
-        } else {
-            1.0e30
-        };
+        // near = 0 + linear curve (matched in the shader) = the CPU LUT
+        // / DDA `clamp(t / far)` blend.
         self.gpu.set_fog(color, 0.0, far);
     }
 
@@ -485,21 +487,9 @@ impl GpuBackend {
         // stacks, exactly as voxlap does. Default [0;6] = no shading.
         self.gpu.set_scene_side_shades(frame.side_shades);
 
-        // GPU.10 sprite lighting: rebuild each instance's voxlap
-        // `kv6colmul` table from its current pose + the frame's lighting,
-        // so the GPU sprite pass shades exactly like the CPU rasteriser
-        // (directional, normal-based). Cheap for the demo's handful of
-        // instances; recomputed every frame because KFA limbs rotate.
-        if let Some(lighting) = frame.sprite_lighting {
-            if !self.sprite_basis.is_empty() {
-                let tables: Vec<[u64; 256]> = self
-                    .sprite_basis
-                    .iter()
-                    .map(|s| sprite_colmul(s, lighting).0)
-                    .collect();
-                self.gpu.set_sprite_instance_colmul(&tables);
-            }
-        }
+        // Sprites render flat-lit (identity `kv6colmul`, the GPU default)
+        // to match the CPU backend's clean-room DDA sprite raycaster —
+        // the voxlap directional `sprite_colmul` shading is not used.
 
         let cameras = self.grid_cameras(scene, camera);
         // Sprites are world-space, so they project through the world

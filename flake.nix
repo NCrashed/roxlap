@@ -87,9 +87,8 @@
               # R10.2: `trunk` is the dev-server / bundler for the
               # `roxlap-web` + `roxlap-cave-web` crates.
               trunk
-              # Image inspection — imagemagick reads roxlap-oracle's
-              # PPM dumps and voxlap C oracle's PNG outputs for byte-
-              # level pixel diffing across the two engines.
+              # Image inspection — imagemagick converts PPM frame dumps
+              # to PNG for eyeballing renderer output and pixel diffing.
               imagemagick
             ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxRuntimeLibs;
 

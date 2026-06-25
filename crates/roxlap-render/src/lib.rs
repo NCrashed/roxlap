@@ -41,7 +41,6 @@ use std::sync::Arc;
 
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sky::Sky;
-use roxlap_core::sprite::SpriteLighting;
 use roxlap_core::Camera;
 use roxlap_scene::Scene;
 
@@ -197,14 +196,15 @@ pub struct FrameParams<'a> {
     /// GPU vertical field of view (radians). Ignored by the CPU
     /// backend (it derives projection from [`OpticastSettings`]).
     pub gpu_fov_y_rad: f32,
-    /// CPU sprite shading (built by the host from its engine). Required
-    /// for the CPU backend to draw sprites; ignored by the GPU backend
-    /// (its sprite pass shades from the uploaded model colours). `None`
-    /// skips CPU sprite drawing.
-    pub sprite_lighting: Option<&'a SpriteLighting<'a>>,
+    /// Whether to draw the renderer's sprites this frame. Both backends
+    /// draw KV6 sprites flat-lit (the clean-room DDA sprite raycaster on
+    /// CPU; uploaded model colours on GPU), so no host-supplied lighting
+    /// is needed — this is just the on/off opt-in. `false` skips sprite
+    /// drawing.
+    pub draw_sprites: bool,
     /// Per-face directional shading for the voxel grids — voxlap's
     /// `setsideshades(top, bot, left, right, up, down)`, the grid-scan
-    /// analogue of [`sprite_lighting`](Self::sprite_lighting). Each
+    /// analogue of [`draw_sprites`](Self::draw_sprites). Each
     /// entry darkens the faces pointing that way; the host typically
     /// passes its engine's `side_shades()`. The default `[0; 6]` keeps
     /// `sideshademode` off (no per-side shading), so existing hosts and

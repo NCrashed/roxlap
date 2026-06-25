@@ -11,13 +11,12 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use roxlap_core::camera_math;
+use roxlap_core::dda_sprite::draw_sprite_dda;
 use roxlap_core::kfa_draw::solve_kfa_limbs;
-use roxlap_core::rasterizer::ScratchPool;
-use roxlap_core::sprite::{draw_sprite, DrawTarget};
 use roxlap_core::Camera;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
-use roxlap_scene::render::render_scene_composed;
+use roxlap_scene::render::{render_scene_composed, CpuFog};
 use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -273,7 +272,6 @@ pub(crate) struct CpuBackend {
     /// per-frame `window.inner_size()` poll so the backend never
     /// touches a concrete window type.
     current_dims: (u32, u32),
-    pool: ScratchPool,
     zbuffer: Vec<f32>,
     /// Framebuffer dimensions of the last `render` — the `zbuffer`
     /// stride for [`Self::pick_depth`].
@@ -282,10 +280,6 @@ pub(crate) struct CpuBackend {
     /// from its [`OpticastSettings`] — the CPU unproject for
     /// [`Self::pixel_ray`].
     last_hxyz: (f32, f32, f32),
-    /// Widest combined-grid `vsid` the pool's `lastx` is sized for;
-    /// kept so a window grow can re-create the pool.
-    max_grid_vsid: u32,
-    n_threads: usize,
     clear_sky: u32,
     /// Pre-built per-instance sprites (one per [`SpriteSet`] instance,
     /// model KV6 cloned once at `set_sprites`), drawn each frame after
@@ -341,22 +335,15 @@ impl CpuBackend {
     /// surface or wasm WebGL2 blitter).
     fn assemble(present_target: Presenter, size: (u32, u32), opts: &RenderOptions) -> Self {
         let (w, h) = (size.0.max(1), size.1.max(1));
-        let n_threads = opts
-            .cpu_render_threads
-            .clamp(1, rayon::current_num_threads().max(1));
-        let pool = ScratchPool::new_parallel(w, h, opts.cpu_max_grid_vsid, n_threads);
         let zbuffer = vec![f32::INFINITY; (w as usize) * (h as usize)];
         let framebuffer = vec![opts.clear_sky; (w as usize) * (h as usize)];
 
         Self {
             present_target,
             current_dims: (w, h),
-            pool,
             zbuffer,
             last_dims: (w, h),
             last_hxyz: (0.0, 0.0, 0.0),
-            max_grid_vsid: opts.cpu_max_grid_vsid,
-            n_threads,
             clear_sky: opts.clear_sky,
             sprites: Vec::new(),
             sprite_models: Vec::new(),
@@ -581,34 +568,20 @@ impl CpuBackend {
         self.last_dims = (width, height);
         self.last_hxyz = (frame.settings.hx, frame.settings.hy, frame.settings.hz);
 
-        // Grow the z-buffer + pool to follow a window resize.
+        // Grow the z-buffer to follow a window resize.
         if self.zbuffer.len() < pixel_count {
             self.zbuffer.resize(pixel_count, f32::INFINITY);
         }
-        // anginc < 1 supersamples the angular fan (~1/anginc more rays than
-        // pixels), so the radar / angstart scratch must be sized for the
-        // inflated ray count or hrend indexes out of bounds. Clamp the
-        // oversample so the buffers stay bounded; the pool only grows.
-        let pool_xres = (width as f32 / frame.settings.anginc.clamp(0.125, 1.0)).ceil() as usize;
-        if self.pool.slot(0).uurend_half_stride < pool_xres {
-            #[allow(clippy::cast_possible_truncation)]
-            let px = pool_xres as u32;
-            self.pool = ScratchPool::new_parallel(px, height, self.max_grid_vsid, self.n_threads);
-        }
 
-        // Per-frame pool config (engine sky/fog → rasterizer). The
-        // rasterizer takes packed colours as `i32`; reinterpret the
-        // bits (not a numeric cast).
-        let sky_i = i32::from_ne_bytes(frame.sky_color.to_ne_bytes());
-        self.pool.set_skycast(sky_i, 0);
-        let fog_i = i32::from_ne_bytes(frame.fog_color.to_ne_bytes());
-        self.pool.set_fog(fog_i, frame.fog_max_scan_dist);
-        self.pool.set_treat_z_max_as_air(frame.treat_z_max_as_air);
-        // Per-face grid shading (voxlap setsideshades) — the grid-scan
-        // analogue of sprite_lighting. Default [0;6] keeps sideshademode
-        // off (byte-identical to the no-side-shade path).
-        let [top, bot, left, right, up, down] = frame.side_shades;
-        self.pool.set_side_shades(top, bot, left, right, up, down);
+        // Per-frame DDA fog config (engine sky/fog → renderer). Fog is
+        // off when `fog_max_scan_dist <= 0`; otherwise the DDA ramps each
+        // hit toward `fog_color` over that distance. `side_shades` darkens
+        // each voxel face (default `[0; 6]` = no side shading).
+        let fog = CpuFog {
+            color: frame.fog_color,
+            max_scan_dist: frame.fog_max_scan_dist,
+            side_shades: frame.side_shades,
+        };
 
         // Composite into the owned framebuffer (not the window) so the
         // present can be deferred — a host may paint a UI over it first.
@@ -632,7 +605,7 @@ impl CpuBackend {
             width as usize,
             width,
             height,
-            &mut self.pool,
+            fog,
             scene,
             camera,
             frame.settings,
@@ -640,41 +613,41 @@ impl CpuBackend {
             frame.sky,
         );
 
-        // Sprites layer on top of the heightmap world, z-tested against
-        // the same z-buffer (camera-facing voxel splat). Needs the
-        // host-built lighting; skipped if absent or no sprites.
-        if let Some(lighting) = frame.sprite_lighting {
-            if !self.sprites.is_empty()
+        // Sprites layer on top of the voxel world, z-tested against the
+        // same z-buffer via the clean-room DDA sprite raycaster. Drawn
+        // flat-lit; `frame.draw_sprites` is the opt-in.
+        if frame.draw_sprites
+            && (!self.sprites.is_empty()
                 || !self.dyn_sprites.is_empty()
-                || !self.kfa_limbs.is_empty()
+                || !self.kfa_limbs.is_empty())
+        {
+            let cam_state = camera_math::derive(
+                camera,
+                width,
+                height,
+                frame.settings.hx,
+                frame.settings.hy,
+                frame.settings.hz,
+            );
+            // Static sprites, then the posed KFA limbs (already solved by
+            // `update_kfa_poses`); both z-test against the shared buffer
+            // so order doesn't affect the result.
+            for sprite in self
+                .sprites
+                .iter()
+                .chain(self.dyn_sprites.iter())
+                .chain(self.kfa_limbs.iter())
             {
-                let cam_state = camera_math::derive(
-                    camera,
-                    width,
-                    height,
-                    frame.settings.hx,
-                    frame.settings.hy,
-                    frame.settings.hz,
-                );
-                let mut target = DrawTarget::new(
+                let _written = draw_sprite_dda(
                     fb,
                     &mut self.zbuffer[..pixel_count],
                     width as usize,
                     width,
                     height,
+                    &cam_state,
+                    frame.settings,
+                    sprite,
                 );
-                // Static sprites, then the posed KFA limbs (already
-                // solved by `update_kfa_poses`); both z-test against the
-                // shared buffer so order doesn't affect the result.
-                for sprite in self
-                    .sprites
-                    .iter()
-                    .chain(self.dyn_sprites.iter())
-                    .chain(self.kfa_limbs.iter())
-                {
-                    let _written =
-                        draw_sprite(&mut target, &cam_state, frame.settings, lighting, sprite);
-                }
             }
         }
 

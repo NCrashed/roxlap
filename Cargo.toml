@@ -7,7 +7,6 @@ members = [
     "crates/roxlap-formats",
     "crates/roxlap-gpu",
     "crates/roxlap-host",
-    "crates/roxlap-oracle",
     "crates/roxlap-render",
     "crates/roxlap-scene",
     "crates/roxlap-scene-demo",
