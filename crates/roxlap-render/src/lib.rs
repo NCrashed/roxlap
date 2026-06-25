@@ -47,6 +47,7 @@ use roxlap_scene::Scene;
 pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::kv6::Kv6;
 pub use roxlap_formats::sprite::Sprite;
+pub use roxlap_formats::voxel_clip::{DecodedClip, LoopMode, VoxelClip, VoxelFrame};
 pub use roxlap_gpu::{GpuInitError, GpuRendererSettings, PowerPreference};
 // Re-exported so hosts can name the [`SceneRenderer::new`] bounds
 // without adding a direct `raw-window-handle` dependency of their own.
@@ -219,6 +220,58 @@ impl DynModelMap {
         }
         slot.1 = false;
         true
+    }
+}
+
+/// Stable handle to a registered animated voxel clip (VCL.4) — the
+/// result of [`SceneRenderer::add_voxel_clip`], passed to
+/// [`add_clip_instance_posed`](SceneRenderer::add_clip_instance_posed)
+/// and [`remove_voxel_clip`](SceneRenderer::remove_voxel_clip). Like
+/// [`SpriteModelId`], a removed clip's handle is stale → a safe no-op.
+/// Reset by [`set_sprites`](SceneRenderer::set_sprites) (which drops the
+/// dynamic + clip layers).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct VoxelClipId {
+    slot: u32,
+    gen: u32,
+}
+
+/// Facade-side slotmap for registered voxel clips — mirrors
+/// [`DynModelMap`]: a clip slot maps 1:1 to the backends' positional clip
+/// index (append-only, tombstoned in place on removal, never reused).
+#[derive(Default)]
+struct DynClipMap {
+    slots: Vec<(u32, bool)>,
+}
+
+impl DynClipMap {
+    fn alloc(&mut self, clip_index: u32) -> VoxelClipId {
+        debug_assert_eq!(self.slots.len() as u32, clip_index);
+        self.slots.push((0, true));
+        VoxelClipId {
+            slot: clip_index,
+            gen: 0,
+        }
+    }
+
+    fn clip_index(&self, id: VoxelClipId) -> Option<usize> {
+        let (gen, live) = *self.slots.get(id.slot as usize)?;
+        (gen == id.gen && live).then_some(id.slot as usize)
+    }
+
+    fn remove(&mut self, id: VoxelClipId) -> bool {
+        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
+            return false;
+        };
+        if slot.0 != id.gen || !slot.1 {
+            return false;
+        }
+        slot.1 = false;
+        true
+    }
+
+    fn reset(&mut self) {
+        self.slots.clear();
     }
 }
 
@@ -676,6 +729,9 @@ pub struct SceneRenderer {
     /// and the models returned by [`Self::set_sprites`]). Reset by
     /// [`Self::set_sprites`].
     model_map: DynModelMap,
+    /// Handles for registered animated voxel clips (see
+    /// [`Self::add_voxel_clip`]). Reset by [`Self::set_sprites`].
+    clip_map: DynClipMap,
 }
 
 impl SceneRenderer {
@@ -705,6 +761,7 @@ impl SceneRenderer {
                         inner: BackendImpl::Gpu(Box::new(g)),
                         dyn_map: DynInstanceMap::default(),
                         model_map: DynModelMap::default(),
+                        clip_map: DynClipMap::default(),
                     };
                 }
                 Err(e) => {
@@ -718,6 +775,7 @@ impl SceneRenderer {
             inner: BackendImpl::Cpu(Box::new(CpuBackend::new(window, size, opts))),
             dyn_map: DynInstanceMap::default(),
             model_map: DynModelMap::default(),
+            clip_map: DynClipMap::default(),
         }
     }
 
@@ -748,6 +806,7 @@ impl SceneRenderer {
                         inner: BackendImpl::Gpu(Box::new(g)),
                         dyn_map: DynInstanceMap::default(),
                         model_map: DynModelMap::default(),
+                        clip_map: DynClipMap::default(),
                     };
                 }
                 Err(e) => {
@@ -762,6 +821,7 @@ impl SceneRenderer {
             inner: BackendImpl::Cpu(Box::new(CpuBackend::new_from_canvas(canvas, size, opts))),
             dyn_map: DynInstanceMap::default(),
             model_map: DynModelMap::default(),
+            clip_map: DynClipMap::default(),
         }
     }
 
@@ -1083,6 +1143,9 @@ impl SceneRenderer {
         // live ids `0..n` (model index = chain id on both backends).
         self.dyn_map = DynInstanceMap::default();
         self.model_map.reset(set.models.len());
+        // A full sprite rebuild drops the dynamic + clip layers on both
+        // backends (the GPU registry is replaced), so reset the clip map.
+        self.clip_map.reset();
         (0..set.models.len() as u32)
             .map(|slot| SpriteModelId { slot, gen: 0 })
             .collect()
@@ -1289,6 +1352,85 @@ impl SceneRenderer {
                 BackendImpl::Cpu(c) => c.set_dyn_instance_transform(dyn_index as usize, xf),
                 BackendImpl::Gpu(g) => g.set_dyn_instance_transform(dyn_index as usize, xf),
             }
+        }
+    }
+
+    // ---- animated voxel clips (VCL.4) ------------------------------------
+
+    /// Register an animated voxel clip ("GIF/MP4 for voxels"): decode all
+    /// its frames and upload the flipbook to the active backend (GPU: one
+    /// LOD chain per frame; CPU: a cached dense grid per frame). Returns a
+    /// [`VoxelClipId`] to spawn instances of it via
+    /// [`add_clip_instance_posed`](Self::add_clip_instance_posed).
+    ///
+    /// Build the [`DecodedClip`] from a `.rvc` via
+    /// [`VoxelClip::decode`](roxlap_formats::voxel_clip::VoxelClip::decode).
+    /// Like [`add_sprite_model`](Self::add_sprite_model), this works before
+    /// any [`set_sprites`](Self::set_sprites); a later `set_sprites`
+    /// **drops** all registered clips (re-register afterwards).
+    pub fn add_voxel_clip(&mut self, clip: &DecodedClip) -> VoxelClipId {
+        let clip_index = match &mut self.inner {
+            BackendImpl::Cpu(c) => c.add_voxel_clip(clip),
+            BackendImpl::Gpu(g) => g.add_voxel_clip(clip),
+        };
+        self.clip_map.alloc(clip_index as u32)
+    }
+
+    /// Remove a registered clip, freeing its per-frame volumes. Instances
+    /// of it linger but draw nothing until removed via
+    /// [`remove_sprite_instance`](Self::remove_sprite_instance). Returns
+    /// `false` if `id` is stale / already removed.
+    pub fn remove_voxel_clip(&mut self, id: VoxelClipId) -> bool {
+        let Some(clip_index) = self.clip_map.clip_index(id) else {
+            return false;
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.remove_voxel_clip(clip_index),
+            BackendImpl::Gpu(g) => g.remove_voxel_clip(clip_index),
+        }
+        self.clip_map.remove(id)
+    }
+
+    /// Spawn an instance of clip `clip`, posed by `xf`, starting on frame
+    /// 0. Returns a [`SpriteInstanceId`] — a clip instance is a dynamic
+    /// sprite instance, so move it with
+    /// [`set_sprite_instance_transform`](Self::set_sprite_instance_transform),
+    /// advance its frame with
+    /// [`set_clip_instance_frame`](Self::set_clip_instance_frame), and drop
+    /// it with [`remove_sprite_instance`](Self::remove_sprite_instance).
+    /// A stale `clip` handle yields an instance id that resolves to nothing
+    /// (a safe no-op everywhere).
+    pub fn add_clip_instance_posed(
+        &mut self,
+        clip: VoxelClipId,
+        xf: DynSpriteTransform,
+    ) -> SpriteInstanceId {
+        let Some(clip_index) = self.clip_map.clip_index(clip) else {
+            return SpriteInstanceId {
+                slot: u32::MAX,
+                gen: u32::MAX,
+            };
+        };
+        let dyn_index = match &mut self.inner {
+            BackendImpl::Cpu(c) => c.add_clip_instance(clip_index, xf),
+            BackendImpl::Gpu(g) => g.add_clip_instance(clip_index, xf),
+        };
+        self.dyn_map.alloc(dyn_index as u32)
+    }
+
+    /// Select which frame a clip instance shows — the per-frame playback
+    /// step. Cheap on both backends (GPU: swap the instance's model id;
+    /// CPU: select the cached frame grid), with no volume re-upload. Drive
+    /// it from a playback clock via
+    /// [`DecodedClip::frame_at`](roxlap_formats::voxel_clip::DecodedClip::frame_at).
+    /// No-op on a stale id or a non-clip instance.
+    pub fn set_clip_instance_frame(&mut self, id: SpriteInstanceId, frame: u32) {
+        let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+            return;
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_clip_frame(dyn_index as usize, frame as usize),
+            BackendImpl::Gpu(g) => g.set_clip_frame(dyn_index as usize, frame as usize),
         }
     }
 
@@ -1548,6 +1690,37 @@ mod tests {
         // future compacting registry).
         let wrong_gen = SpriteModelId { slot: 0, gen: 7 };
         assert_eq!(map.model_index(wrong_gen), None);
+    }
+
+    /// The voxel-clip slotmap (VCL.4) mints stable ids, resolves only live
+    /// handles, tombstones in place, and `reset` clears it — mirroring the
+    /// model slotmap, since clips register append-only too.
+    #[test]
+    fn dyn_clip_map_lifecycle() {
+        let mut map = DynClipMap::default();
+        // Two clips registered incrementally (indices 0, 1).
+        let c0 = map.alloc(0);
+        let c1 = map.alloc(1);
+        assert_eq!(c0, VoxelClipId { slot: 0, gen: 0 });
+        assert_eq!(map.clip_index(c0), Some(0));
+        assert_eq!(map.clip_index(c1), Some(1));
+
+        // Remove clip 0: stale handle, clip 1 stays valid; slot not reused.
+        assert!(map.remove(c0));
+        assert_eq!(map.clip_index(c0), None);
+        assert_eq!(map.clip_index(c1), Some(1));
+        // Double / stale / out-of-range removes are false, no panic.
+        assert!(!map.remove(c0));
+        assert!(!map.remove(VoxelClipId { slot: 99, gen: 0 }));
+        // Mismatched generation never resolves.
+        assert_eq!(map.clip_index(VoxelClipId { slot: 1, gen: 5 }), None);
+
+        // `set_sprites` resets the clip layer → ids restart at 0.
+        map.reset();
+        assert_eq!(map.clip_index(c1), None, "reset invalidates old handles");
+        let again = map.alloc(0);
+        assert_eq!(again, VoxelClipId { slot: 0, gen: 0 });
+        assert_eq!(map.clip_index(again), Some(0));
     }
 
     #[test]

@@ -437,6 +437,13 @@ pub struct ClipFlipbook {
 }
 
 impl ClipFlipbook {
+    /// An empty flipbook (no frames) — a tombstone for a removed clip;
+    /// [`draw_frame`](Self::draw_frame) always draws nothing.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { frames: Vec::new() }
+    }
+
     /// Decode + cache every frame of `clip` (one [`SpriteDense`] each).
     #[must_use]
     pub fn from_decoded(clip: &DecodedClip) -> Self {

@@ -11,11 +11,12 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use roxlap_core::camera_math;
-use roxlap_core::dda_sprite::draw_sprite_dda;
+use roxlap_core::dda_sprite::{draw_sprite_dda, ClipFlipbook};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::Camera;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
+use roxlap_formats::voxel_clip::DecodedClip;
 use roxlap_scene::render::{render_scene_composed, CpuFog};
 use roxlap_scene::Scene;
 
@@ -320,6 +321,16 @@ pub(crate) struct CpuBackend {
     /// Source model index per entry in [`dyn_sprites`](Self::dyn_sprites),
     /// so [`Self::update_sprite_model`] refreshes dynamic instances too.
     dyn_models: Vec<usize>,
+    /// Per dynamic instance: `Some((clip_book, frame))` if it plays an
+    /// animated voxel clip (VCL.4), else `None` for a plain KV6 sprite.
+    /// Parallel to [`dyn_sprites`](Self::dyn_sprites) — a clip instance's
+    /// `dyn_sprites` entry is a pose carrier (empty kv6); its pixels come
+    /// from `clip_books[book].draw_frame(frame, pose)`.
+    dyn_clip: Vec<Option<(usize, usize)>>,
+    /// Decoded animated voxel clips, one cached [`ClipFlipbook`] each
+    /// (VCL.3). A clip's frames are decoded once at
+    /// [`Self::add_voxel_clip`]; per-frame playback is a grid select.
+    clip_books: Vec<ClipFlipbook>,
     /// Posed KFA limbs (flattened across all registered KFA sprites),
     /// refreshed by [`Self::update_kfa_poses`] and drawn after the
     /// static sprites each frame via `draw_sprite`.
@@ -369,6 +380,8 @@ impl CpuBackend {
             models: Vec::new(),
             dyn_sprites: Vec::new(),
             dyn_models: Vec::new(),
+            dyn_clip: Vec::new(),
+            clip_books: Vec::new(),
             kfa_limbs: Vec::new(),
             capture_next: false,
             captured: None,
@@ -495,6 +508,7 @@ impl CpuBackend {
         self.models.clone_from(&set.models);
         self.dyn_sprites.clear();
         self.dyn_models.clear();
+        self.dyn_clip.clear();
     }
 
     /// Append one dynamic instance of `model_index` pre-posed by `xf`;
@@ -512,6 +526,7 @@ impl CpuBackend {
             xf.apply_to(&mut s);
             self.dyn_sprites.push(s);
             self.dyn_models.push(model_index);
+            self.dyn_clip.push(None);
         }
         idx
     }
@@ -563,7 +578,47 @@ impl CpuBackend {
         let last = self.dyn_sprites.len() - 1;
         self.dyn_sprites.swap_remove(idx);
         self.dyn_models.swap_remove(idx);
+        self.dyn_clip.swap_remove(idx);
         (idx != last).then_some(last)
+    }
+
+    /// Register an animated voxel clip (VCL.4): decode every frame into a
+    /// cached [`ClipFlipbook`]. Returns its positional clip index.
+    pub(crate) fn add_voxel_clip(&mut self, clip: &DecodedClip) -> usize {
+        let idx = self.clip_books.len();
+        self.clip_books.push(ClipFlipbook::from_decoded(clip));
+        idx
+    }
+
+    /// Tombstone clip `clip_idx` in place (replace its flipbook with an
+    /// empty one). Existing instances of it then draw nothing; the slot is
+    /// kept so other clip indices stay valid. No-op if out of range.
+    pub(crate) fn remove_voxel_clip(&mut self, clip_idx: usize) {
+        if let Some(book) = self.clip_books.get_mut(clip_idx) {
+            *book = ClipFlipbook::empty();
+        }
+    }
+
+    /// Append a dynamic instance playing clip `clip_idx`, posed by `xf`,
+    /// starting on frame 0. Returns its dynamic-sublist index. The
+    /// `dyn_sprites` entry is a pose carrier (empty kv6); the clip's
+    /// frames supply the pixels.
+    pub(crate) fn add_clip_instance(&mut self, clip_idx: usize, xf: DynSpriteTransform) -> usize {
+        let idx = self.dyn_sprites.len();
+        let mut s = Sprite::axis_aligned(empty_kv6(), [0.0, 0.0, 0.0]);
+        xf.apply_to(&mut s);
+        self.dyn_sprites.push(s);
+        self.dyn_models.push(usize::MAX); // not a KV6 model
+        self.dyn_clip.push(Some((clip_idx, 0)));
+        idx
+    }
+
+    /// Select the playback frame of clip instance `idx` (VCL.4). No-op if
+    /// `idx` isn't a clip instance / is out of range.
+    pub(crate) fn set_clip_frame(&mut self, idx: usize, frame: usize) {
+        if let Some(Some((_book, f))) = self.dyn_clip.get_mut(idx) {
+            *f = frame;
+        }
     }
 
     /// GPU.12 incremental — swap the edited `kv6` into every cached
@@ -688,15 +743,9 @@ impl CpuBackend {
                 frame.settings.hy,
                 frame.settings.hz,
             );
-            // Static sprites, then the posed KFA limbs (already solved by
-            // `update_kfa_poses`); both z-test against the shared buffer
-            // so order doesn't affect the result.
-            for sprite in self
-                .sprites
-                .iter()
-                .chain(self.dyn_sprites.iter())
-                .chain(self.kfa_limbs.iter())
-            {
+            // Static sprites + posed KFA limbs: plain KV6 sprites. All
+            // z-test against the shared buffer so order doesn't matter.
+            for sprite in self.sprites.iter().chain(self.kfa_limbs.iter()) {
                 let _written = draw_sprite_dda(
                     fb,
                     &mut self.zbuffer[..pixel_count],
@@ -707,6 +756,42 @@ impl CpuBackend {
                     frame.settings,
                     sprite,
                 );
+            }
+            // Dynamic instances: a KV6 sprite, or — if it carries a clip
+            // association — the selected frame of an animated voxel clip
+            // (VCL.4). The `dyn_sprites` entry is the pose carrier either way.
+            for (i, sprite) in self.dyn_sprites.iter().enumerate() {
+                let zb = &mut self.zbuffer[..pixel_count];
+                if let Some((book, fr)) = self.dyn_clip[i] {
+                    if let Some(b) = self.clip_books.get(book) {
+                        let _written = b.draw_frame(
+                            fb,
+                            zb,
+                            width as usize,
+                            width,
+                            height,
+                            &cam_state,
+                            frame.settings,
+                            fr,
+                            sprite.p,
+                            sprite.s,
+                            sprite.h,
+                            sprite.f,
+                            sprite.flags,
+                        );
+                    }
+                } else {
+                    let _written = draw_sprite_dda(
+                        fb,
+                        zb,
+                        width as usize,
+                        width,
+                        height,
+                        &cam_state,
+                        frame.settings,
+                        sprite,
+                    );
+                }
             }
         }
 

@@ -212,6 +212,49 @@ impl DecodedClip {
     pub fn total_ms(&self) -> u32 {
         self.durations.iter().copied().sum()
     }
+
+    /// The frame index to show after `elapsed_ms` of playback, honouring
+    /// the clip's [`LoopMode`] and per-frame durations. Pure — the host
+    /// (or the facade's clip-instance clocks) drives `set_clip_instance_frame`
+    /// from this. Empty clip ⇒ `0`.
+    ///
+    /// - [`LoopMode::Loop`]: wraps modulo the total length.
+    /// - [`LoopMode::Once`]: holds the last frame past the end.
+    /// - [`LoopMode::PingPong`]: bounces `0→N-1→0` over `2·total`.
+    #[must_use]
+    pub fn frame_at(&self, elapsed_ms: u32) -> usize {
+        let n = self.frames.len();
+        if n <= 1 {
+            return 0;
+        }
+        let total = self.total_ms();
+        if total == 0 {
+            return 0;
+        }
+        // Position within one forward pass (after applying the loop mode).
+        let t = match self.loop_mode {
+            LoopMode::Loop => elapsed_ms % total,
+            LoopMode::Once => elapsed_ms.min(total - 1),
+            LoopMode::PingPong => {
+                let p = elapsed_ms % (2 * total);
+                if p < total {
+                    p
+                } else {
+                    // Mirror the second half back: 2·total-1 → ~0.
+                    2 * total - 1 - p
+                }
+            }
+        };
+        // Walk the duration prefix sums to find the frame holding `t`.
+        let mut acc = 0u32;
+        for (i, &d) in self.durations.iter().enumerate() {
+            acc += d;
+            if t < acc {
+                return i;
+            }
+        }
+        n - 1
+    }
 }
 
 /// u32 occupancy words per `(x, y)` column for a clip of `dims`.
@@ -896,6 +939,42 @@ mod tests {
             VoxelClip::parse(&v),
             Err(ParseError::UnsupportedVersion(_))
         ));
+    }
+
+    #[test]
+    fn frame_at_honours_loop_modes() {
+        // 3 frames, 10 ms each (total 30).
+        let dims = [4, 4, 8];
+        let frames: Vec<VoxelFrame> = (0..3)
+            .map(|fi| {
+                frame_from_fn(dims, move |x, y, z| {
+                    (x == 0 && y == 0 && z == fi).then_some(0x8011_2233)
+                })
+            })
+            .collect();
+        let mk = |mode| {
+            VoxelClip::from_frames(dims, [0.0; 3], 1.0, mode, &frames, &[10, 10, 10], 33, 0)
+                .decode()
+                .unwrap()
+        };
+
+        let loop_c = mk(LoopMode::Loop);
+        assert_eq!(loop_c.frame_at(0), 0);
+        assert_eq!(loop_c.frame_at(9), 0);
+        assert_eq!(loop_c.frame_at(10), 1);
+        assert_eq!(loop_c.frame_at(25), 2);
+        assert_eq!(loop_c.frame_at(30), 0, "wraps at total");
+        assert_eq!(loop_c.frame_at(45), 1);
+
+        let once = mk(LoopMode::Once);
+        assert_eq!(once.frame_at(25), 2);
+        assert_eq!(once.frame_at(1000), 2, "holds the last frame");
+
+        let ping = mk(LoopMode::PingPong);
+        assert_eq!(ping.frame_at(5), 0);
+        assert_eq!(ping.frame_at(25), 2);
+        assert_eq!(ping.frame_at(35), 2, "mirror: 35→ frame 2");
+        assert_eq!(ping.frame_at(55), 0, "mirror back to 0 near 2·total");
     }
 
     #[test]
