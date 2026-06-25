@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Animated voxel-sprite clips (`.rvc`) — "GIF/MP4 for voxel models"**
+  (macro-stage VCL; `PORTING-VOXEL-CLIP.md`). A fixed-bbox sequence of
+  voxel frames encoded as keyframes + inter-frame diffs, for effects like
+  flame, spells, and muzzle flashes — decoded to a runtime *flipbook* and
+  played back by selecting a frame per render (no per-frame volume
+  re-upload).
+  - `roxlap_formats::voxel_clip`: `VoxelClip` / `VoxelFrame` (dense-column
+    layout matching the GPU sprite model) + `DecodedClip`; I/P codec
+    (`from_frames` / `decode`), `serialize` / `parse` (`RVCL` chunked
+    container), `LoopMode`, and `frame_at` playback math.
+  - GPU flipbook: `sprite_model_from_clip_frame` (field-move upload) +
+    `SpriteRegistryResident::set_instance_model` (the per-frame select).
+  - CPU flipbook: `roxlap_core::ClipFlipbook` (cached `SpriteDense` per
+    frame) + the generalised `draw_sprite_dense`.
+  - `SceneRenderer` facade: `add_voxel_clip` / `add_clip_instance_posed`
+    / `set_clip_instance_frame` (+ `VoxelClipId`).
+- **RKC v3 — multi-attachment bones.** `Character`'s bones now carry a
+  list of `Attachment`s (static KV6 meshes and/or animated voxel clips,
+  each with a `local_offset` + `ClipPlayback`) instead of a single mesh;
+  `MeshRef::Clip` indexes a new `Character::voxel_clips` (`VCLP` chunk).
+  v2/v1 files are rejected (regenerate from demiurg).
+- **Character attachment runtime.** `SceneRenderer::add_character` /
+  `advance_character` / `remove_character` (+ `CharacterId`) emit one
+  renderer instance per bone attachment — static meshes sit on their
+  bones, clip attachments play back on their own clocks, all driven by the
+  skeletal animation. `roxlap_core::kfa_draw::compose_attachment` composes
+  a bone's solved world transform with an attachment's local offset. The
+  scene-demo dogfoods it with a procedural flame clip on coco's swinging
+  arm.
+
 ### Fixed
 
 - **GPU scene upload truncated dense chunks' colours** (`roxlap-gpu`).

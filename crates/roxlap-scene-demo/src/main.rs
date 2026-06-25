@@ -22,8 +22,9 @@ use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::xform::BoneXform;
 use roxlap_render::{
-    DynSpriteTransform, FrameParams, ImageFacing, ImageId, ImageSprite, KfaSprite, Line3,
-    RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteInstanceId, SpriteModelId, SpriteSet,
+    CharacterId, DynSpriteTransform, FrameParams, ImageFacing, ImageId, ImageSprite, KfaSprite,
+    Line3, LoopMode, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteInstanceId,
+    SpriteModelId, SpriteSet, VoxelClip, VoxelFrame,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -515,6 +516,116 @@ fn build_kfa() -> Vec<KfaSprite> {
     };
 
     vec![character.to_kfa_sprite(Some(0))]
+}
+
+// ---- VCL.7 flame dogfood --------------------------------------------------
+
+/// Build a [`VoxelFrame`] from a dense `fill(x, y, z) -> Option<color>`
+/// closure (voxlap-packed `0x80RRGGBB`).
+fn voxel_frame_from_fn(dims: [u32; 3], fill: impl Fn(u32, u32, u32) -> Option<u32>) -> VoxelFrame {
+    let owpc = dims[2].div_ceil(32).max(1) as usize;
+    let cols = (dims[0] * dims[1]) as usize;
+    let mut occupancy = vec![0u32; cols * owpc];
+    let mut color_offsets = vec![0u32; cols + 1];
+    let mut colors = Vec::new();
+    for y in 0..dims[1] {
+        for x in 0..dims[0] {
+            let col = (x + y * dims[0]) as usize;
+            color_offsets[col] = colors.len() as u32;
+            for z in 0..dims[2] {
+                if let Some(c) = fill(x, y, z) {
+                    occupancy[col * owpc + (z >> 5) as usize] |= 1u32 << (z & 31);
+                    colors.push(c);
+                }
+            }
+        }
+    }
+    color_offsets[cols] = colors.len() as u32;
+    VoxelFrame {
+        occupancy,
+        colors,
+        color_offsets,
+    }
+}
+
+/// One procedural flame frame: a blob wider at the base (high local z),
+/// narrowing + reddening toward the tip (low z), with a per-frame height
+/// flicker + a cheap spatial wobble so the silhouette dances.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn flame_frame(dims: [u32; 3], fi: u32) -> VoxelFrame {
+    let (mx, my, mz) = (dims[0], dims[1], dims[2]);
+    let (cx, cy) = (mx as f32 * 0.5, my as f32 * 0.5);
+    // Per-frame flame height (70–100% of the bbox).
+    let height = mz as f32 * (0.7 + 0.3 * ((fi as f32 * 1.3).sin() * 0.5 + 0.5));
+    voxel_frame_from_fn(dims, move |x, y, z| {
+        // `up`: 0 at the base (z = mz-1), growing toward the tip (z = 0).
+        let up = (mz - 1 - z) as f32;
+        if up > height {
+            return None;
+        }
+        let frac = up / mz as f32; // 0 base → ~1 tip
+        let wobble = (((x * 7 + y * 11 + fi * 13) % 7) as f32 - 3.0) * 0.15;
+        let r = (1.0 - frac) * (mx as f32 * 0.45) + wobble;
+        let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+        if dx * dx + dy * dy > r * r {
+            return None;
+        }
+        // Yellow at the base → orange → red at the tip.
+        let t = frac.clamp(0.0, 1.0);
+        let grn = (0xF0 as f32 * (1.0 - t) + 0x20 as f32 * t) as u32;
+        let blu = (0x40 as f32 * (1.0 - t)) as u32;
+        Some(0x8000_0000 | (0xFF << 16) | (grn << 8) | blu)
+    })
+}
+
+/// A small looping procedural flame voxel clip (8 frames, ~70 ms each).
+fn flame_clip() -> VoxelClip {
+    const DIMS: [u32; 3] = [10, 10, 22];
+    const FRAMES: u32 = 8;
+    let frames: Vec<VoxelFrame> = (0..FRAMES).map(|fi| flame_frame(DIMS, fi)).collect();
+    // Pivot at the base centre (high z) so the flame rises from wherever the
+    // attachment places it.
+    #[allow(clippy::cast_precision_loss)]
+    VoxelClip::from_frames(
+        DIMS,
+        [5.0, 5.0, (DIMS[2] - 1) as f32],
+        1.0,
+        LoopMode::Loop,
+        &frames,
+        &[],
+        70,
+        2,
+    )
+}
+
+/// VCL.7 dogfood — the authored coco character plus a flame voxel clip hung
+/// off its swinging arm, registered via the attachment runtime
+/// ([`SceneRenderer::add_character`]). Positioned beside the KFA-path coco
+/// so both the legacy and new paths are visible. `None` if `coco.kv6`
+/// fails to parse.
+fn flame_character() -> Option<Character> {
+    use roxlap_formats::xform::{BoneXform, Quat};
+    let mut ch = authored_character()?;
+    // Sit beside the KFA-path coco (which is at [70, -75, 50]).
+    ch.root = [120.0, -75.0, 50.0];
+    ch.voxel_clips = vec![flame_clip()];
+    // A second attachment on the arm bone (index 1): the flame, offset out
+    // toward the arm tip + a bit up (world -z). Multi-attachment + a clip
+    // playing on its own clock.
+    ch.bones[1].attachments.push(Attachment {
+        target: roxlap_formats::character::MeshRef::Clip(0),
+        local_offset: BoneXform {
+            t: [40.0, 0.0, -20.0],
+            r: Quat::IDENTITY,
+            s: [1.0, 1.0, 1.0],
+        },
+        playback: roxlap_formats::character::ClipPlayback::default(),
+    });
+    Some(ch)
 }
 
 const FAST_MULT: f64 = 4.0;
@@ -1013,6 +1124,11 @@ struct App {
     /// Animated KFA sprite(s), registered once in `resumed` and re-posed
     /// each frame via `animsprite` + `update_kfa_poses`.
     kfa: Vec<KfaSprite>,
+    /// VCL.7 dogfood — a second coco registered via the **attachment
+    /// runtime** (`add_character`) with a procedural flame voxel clip
+    /// hanging off its swinging arm (multi-attachment + clip playback +
+    /// skeletal animation). Advanced each frame via `advance_character`.
+    flame_char: Option<CharacterId>,
     /// Post-S7.6: lighting + mip bake driver for streaming grids.
     /// Runs each frame right after `pump_streaming`; bakes any
     /// newly-installed chunks (and re-bakes their 4 cardinal
@@ -1104,6 +1220,7 @@ impl App {
             pick_saved_pose: None,
             sprites: build_sprites(),
             kfa: build_kfa(),
+            flame_char: None,
             bake_tracker: StreamingBakeTracker::new(),
             title_base: "roxlap-scene-demo".to_string(),
             fps_frames: 0,
@@ -1225,6 +1342,12 @@ impl App {
                 k.animsprite(dt_ms);
             }
             renderer.update_kfa_poses(&mut self.kfa);
+        }
+
+        // VCL.7 — advance the flame character (skeletal swing + flame clip
+        // playback) in one call.
+        if let Some(id) = self.flame_char {
+            renderer.advance_character(id, dt);
         }
 
         // Spinner: stream coloured spheres in/out around the ring each
@@ -1708,6 +1831,19 @@ impl ApplicationHandler for App {
             renderer.set_kfa_sprites(&mut self.kfa);
         }
 
+        // VCL.7 — a second coco via the attachment runtime, with a
+        // procedural flame voxel clip on its swinging arm (multi-attachment
+        // + clip playback). Must come after `set_sprites` (which resets the
+        // dynamic/clip/character layers).
+        if !no_sprites {
+            if let Some(ch) = flame_character() {
+                self.flame_char = Some(renderer.add_character(&ch, Some(0)));
+                eprintln!(
+                    "roxlap-render: flame character registered (add_character + clip attachment)"
+                );
+            }
+        }
+
         // HUD: bridge winit events into egui. `&*window` provides the
         // display handle egui-winit needs for clipboard/IME.
         self.egui_state = Some(egui_winit::State::new(
@@ -2049,8 +2185,32 @@ fn write_capture(
 
 #[cfg(test)]
 mod character_tests {
-    use super::{authored_character, build_kfa};
+    use super::{authored_character, build_kfa, flame_character, flame_clip};
     use roxlap_formats::character;
+
+    /// VCL.7 — the procedural flame clip decodes to a looping flipbook with
+    /// real voxels in every frame.
+    #[test]
+    fn flame_clip_decodes() {
+        let decoded = flame_clip().decode().expect("flame clip decodes");
+        assert_eq!(decoded.frame_count(), 8);
+        assert!(
+            decoded.frames.iter().all(|f| !f.colors.is_empty()),
+            "every flame frame has voxels"
+        );
+    }
+
+    /// VCL.7 — the flame character carries the clip and a multi-attachment
+    /// arm bone ([static mesh, flame clip]).
+    #[test]
+    fn flame_character_arm_is_multi_attachment() {
+        let ch = flame_character().expect("coco.kv6 parses");
+        assert_eq!(ch.voxel_clips.len(), 1);
+        let arm = &ch.bones[1].attachments;
+        assert_eq!(arm.len(), 2, "arm has the mesh + the flame clip");
+        assert!(matches!(arm[0].target, character::MeshRef::Static(0)));
+        assert!(matches!(arm[1].target, character::MeshRef::Clip(0)));
+    }
 
     // The authored character writes to disk and reloads byte-equal — the
     // path `ROXLAP_RKC_DUMP` then `ROXLAP_RKC` exercise.
