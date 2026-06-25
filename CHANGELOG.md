@@ -7,9 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> Work in progress — version not yet cut. Covers the **DDA** macro-stage
-> (DDA.0–DDA.10): a clean-room CPU renderer replacing voxlap's, removal
-> of the voxlap-derived renderer, and the resulting license change.
+## [0.14.0] — 2026-06-25
+
+This release lands the **DDA** macro-stage (DDA.0–DDA.10): the CPU
+renderer is now a **clean-room per-pixel 3D-DDA over an 8³ brickmap**
+that replaces voxlap's opticast outright — fixing the long-standing
+voxlap-inherent artifact classes (silhouette notch, floor hairlines,
+axis-aligned mip beams) — and the last voxlap-derived engine code is
+excised, so the **Ken-Silverman commercial-use caveat is dropped: roxlap
+is now MIT OR Apache-2.0 with no third-party restriction** (free for
+commercial use). On top of that, an additive **dynamic sprite-model +
+per-instance-transform API on `SceneRenderer`** lets a physics-driven
+caller stream sprite models in/out and orient instances per frame without
+bypassing to `GpuRenderer`. Breaking vs 0.13.0: `render_scene` /
+`render_scene_composed` take a `CpuFog` value instead of `&mut
+ScratchPool`, and `FrameParams::sprite_lighting` is replaced by a plain
+`draw_sprites: bool`.
 
 ### Added
 
