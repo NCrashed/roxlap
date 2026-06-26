@@ -41,7 +41,7 @@
 //! raw. **v1** (no `flags` byte, every payload raw) still parses.
 
 use crate::bytes::{Cursor, OutOfBounds};
-use crate::kv6::{compute_vis_dir, Kv6};
+use crate::kv6::{compute_vis_dir, Kv6, Voxel};
 
 const MAGIC: [u8; 4] = *b"RVCL";
 /// Current on-disk version. v2 adds a per-chunk `flags` byte (deflate).
@@ -166,6 +166,65 @@ impl VoxelFrame {
             occupancy,
             colors,
             color_offsets,
+        }
+    }
+
+    /// Inverse of [`from_kv6`](Self::from_kv6): materialise this frame as a
+    /// flat-lit `.kv6` model (every voxel `vis = 63`, `dir = 0` — voxel
+    /// clips render full-bright, so per-face normals are unused). `dims` is
+    /// the clip bounding box, `pivot` becomes the kv6 pivot. Lets a single
+    /// streaming-clip frame drive `add_sprite_model` / `refresh_sprite_model`
+    /// (one model re-uploaded per frame) instead of an N-frame flipbook.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn to_kv6(&self, dims: [u32; 3], pivot: [f32; 3]) -> Kv6 {
+        let (nx, ny) = (dims[0] as usize, dims[1] as usize);
+        let owpc = occ_words_per_col(dims) as usize;
+        let mut voxels = Vec::new();
+        let mut xlen = Vec::with_capacity(nx);
+        let mut ylen = Vec::with_capacity(nx);
+
+        // `.kv6` walks x-major, then y, then ascending z; the frame's column
+        // index is x-fastest (`col = x + y·nx`), so re-index back.
+        for x in 0..nx {
+            let mut col_counts: Vec<u16> = Vec::with_capacity(ny);
+            let mut xcount = 0u32;
+            for y in 0..ny {
+                let col = x + y * nx;
+                let run = self.column_colors(col);
+                let occ = &self.occupancy[col * owpc..(col + 1) * owpc];
+                let before = voxels.len();
+                let mut ci = 0usize;
+                for z in 0..dims[2] {
+                    if (occ[(z >> 5) as usize] >> (z & 31)) & 1 != 0 {
+                        voxels.push(Voxel {
+                            col: run[ci],
+                            z: z as u16,
+                            vis: 63,
+                            dir: 0,
+                        });
+                        ci += 1;
+                    }
+                }
+                let c = (voxels.len() - before) as u16;
+                col_counts.push(c);
+                xcount += u32::from(c);
+            }
+            xlen.push(xcount);
+            ylen.push(col_counts);
+        }
+
+        Kv6 {
+            xsiz: dims[0],
+            ysiz: dims[1],
+            zsiz: dims[2],
+            xpiv: pivot[0],
+            ypiv: pivot[1],
+            zpiv: pivot[2],
+            voxels,
+            xlen,
+            ylen,
+            palette: None,
         }
     }
 
@@ -1497,6 +1556,21 @@ mod tests {
                 expected: [2, 2, 2],
             }
         );
+    }
+
+    #[test]
+    fn to_kv6_inverts_from_kv6() {
+        // Solid below a per-column threshold (interior + surface voxels), a
+        // z-run crossing the 32-bit word boundary, distinct colours.
+        let dims = [3u32, 2, 40];
+        let frame = frame_from_fn(dims, |x, y, z| {
+            (z <= (x + y) * 6 + 3).then_some(0x8000_0000 | (z << 8) | (x * 16 + y))
+        });
+        let kv6 = frame.to_kv6(dims, [1.0, 0.5, 20.0]);
+        assert_eq!([kv6.xsiz, kv6.ysiz, kv6.zsiz], dims);
+        assert_eq!([kv6.xpiv, kv6.ypiv, kv6.zpiv], [1.0, 0.5, 20.0]);
+        // from_kv6 ∘ to_kv6 reproduces occupancy + colours exactly.
+        assert_eq!(VoxelFrame::from_kv6(&kv6), frame);
     }
 
     // ---- compression (v2 per-chunk deflate) -------------------------------

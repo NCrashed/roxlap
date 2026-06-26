@@ -31,8 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     over a clip's I/P stream (replays deltas from the nearest keyframe),
     the streaming alternative to `DecodedClip` for huge clips: holds one
     reconstructed frame + the compact encoded stream instead of N full
-    frames. Drive it from `frame_at`, rebuild one sprite model per frame
-    change via `SpriteDense::from_voxel_frame` / `refresh_sprite_model`.
+    frames. Plus `VoxelFrame::to_kv6` (the `from_kv6` inverse) to materialise
+    a frame as a flat-lit `.kv6` model.
+  - `SceneRenderer` streaming-clip facade: `add_streaming_clip` (one model +
+    the cursor, vs the flipbook's N volumes) / `add_streaming_clip_instance`
+    / `set_streaming_clip_frame` (seek + re-upload the single model) /
+    `remove_streaming_clip` (+ `StreamingClipId`). For huge clips where the
+    flipbook's resident N-frame footprint is too costly; all instances of a
+    streaming clip share its one model (same current frame).
   - GPU flipbook: `sprite_model_from_clip_frame` (field-move upload) +
     `SpriteRegistryResident::set_instance_model` (the per-frame select).
   - CPU flipbook: `roxlap_core::ClipFlipbook` (cached `SpriteDense` per

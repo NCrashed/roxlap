@@ -50,7 +50,9 @@ pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::kv6::Kv6;
 pub use roxlap_formats::sprite::Sprite;
-pub use roxlap_formats::voxel_clip::{DecodedClip, LoopMode, VoxelClip, VoxelFrame};
+pub use roxlap_formats::voxel_clip::{
+    DecodeError, DecodedClip, LoopMode, StreamingClip, VoxelClip, VoxelFrame,
+};
 pub use roxlap_gpu::{GpuInitError, GpuRendererSettings, PowerPreference};
 // Re-exported so hosts can name the [`SceneRenderer::new`] bounds
 // without adding a direct `raw-window-handle` dependency of their own.
@@ -321,6 +323,61 @@ impl CharMap {
     fn reset(&mut self) {
         self.slots.clear();
     }
+}
+
+/// Stable handle to a registered **streaming** voxel clip (follow-up #3) —
+/// the result of [`SceneRenderer::add_streaming_clip`], advanced with
+/// [`set_streaming_clip_frame`](SceneRenderer::set_streaming_clip_frame) and
+/// dropped with
+/// [`remove_streaming_clip`](SceneRenderer::remove_streaming_clip). Reset by
+/// [`set_sprites`](SceneRenderer::set_sprites).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct StreamingClipId {
+    slot: u32,
+    gen: u32,
+}
+
+/// Facade-side slotmap for streaming clips (mirrors [`CharMap`]).
+#[derive(Default)]
+struct StreamingClipMap {
+    slots: Vec<(u32, bool)>,
+}
+
+impl StreamingClipMap {
+    fn alloc(&mut self, index: u32) -> StreamingClipId {
+        debug_assert_eq!(self.slots.len() as u32, index);
+        self.slots.push((0, true));
+        StreamingClipId {
+            slot: index,
+            gen: 0,
+        }
+    }
+    fn index(&self, id: StreamingClipId) -> Option<usize> {
+        let (gen, live) = *self.slots.get(id.slot as usize)?;
+        (gen == id.gen && live).then_some(id.slot as usize)
+    }
+    fn remove(&mut self, id: StreamingClipId) -> bool {
+        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
+            return false;
+        };
+        if slot.0 != id.gen || !slot.1 {
+            return false;
+        }
+        slot.1 = false;
+        true
+    }
+    fn reset(&mut self) {
+        self.slots.clear();
+    }
+}
+
+/// One registered streaming clip: the seekable cursor + the single sprite
+/// model it re-uploads each frame, plus the dims/pivot used to rebuild it.
+struct StreamingClipState {
+    cursor: StreamingClip,
+    model: SpriteModelId,
+    dims: [u32; 3],
+    pivot: [f32; 3],
 }
 
 /// Per-clip-attachment playback clock (VCL.6): the timing it needs to
@@ -813,6 +870,12 @@ pub struct SceneRenderer {
     char_map: CharMap,
     /// Live character runtimes, parallel to `char_map` slots (VCL.6).
     char_instances: Vec<CharInstance>,
+    /// Handles for registered streaming clips (see
+    /// [`Self::add_streaming_clip`]). Reset by [`Self::set_sprites`].
+    streaming_map: StreamingClipMap,
+    /// Streaming-clip runtimes (cursor + one re-uploaded model), parallel
+    /// to `streaming_map` slots; `None` once removed (#3).
+    streaming_clips: Vec<Option<StreamingClipState>>,
 }
 
 impl SceneRenderer {
@@ -845,6 +908,8 @@ impl SceneRenderer {
                         clip_map: DynClipMap::default(),
                         char_map: CharMap::default(),
                         char_instances: Vec::new(),
+                        streaming_map: StreamingClipMap::default(),
+                        streaming_clips: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -861,6 +926,8 @@ impl SceneRenderer {
             clip_map: DynClipMap::default(),
             char_map: CharMap::default(),
             char_instances: Vec::new(),
+            streaming_map: StreamingClipMap::default(),
+            streaming_clips: Vec::new(),
         }
     }
 
@@ -894,6 +961,8 @@ impl SceneRenderer {
                         clip_map: DynClipMap::default(),
                         char_map: CharMap::default(),
                         char_instances: Vec::new(),
+                        streaming_map: StreamingClipMap::default(),
+                        streaming_clips: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -911,6 +980,8 @@ impl SceneRenderer {
             clip_map: DynClipMap::default(),
             char_map: CharMap::default(),
             char_instances: Vec::new(),
+            streaming_map: StreamingClipMap::default(),
+            streaming_clips: Vec::new(),
         }
     }
 
@@ -1238,6 +1309,8 @@ impl SceneRenderer {
         self.clip_map.reset();
         self.char_map.reset();
         self.char_instances.clear();
+        self.streaming_map.reset();
+        self.streaming_clips.clear();
         (0..set.models.len() as u32)
             .map(|slot| SpriteModelId { slot, gen: 0 })
             .collect()
@@ -1524,6 +1597,101 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.set_clip_frame(dyn_index as usize, frame as usize),
             BackendImpl::Gpu(g) => g.set_clip_frame(dyn_index as usize, frame as usize),
         }
+    }
+
+    // ---- streaming voxel clips (#3) --------------------------------------
+
+    /// Register a **streaming** voxel clip — `O(1-frame)` memory (one sprite
+    /// model + the compact encoded stream) rather than the N-volume flipbook
+    /// [`add_voxel_clip`](Self::add_voxel_clip) builds, for huge clips where
+    /// N frames are too costly to hold resident. Builds the model from frame
+    /// 0; advance it with
+    /// [`set_streaming_clip_frame`](Self::set_streaming_clip_frame). Spawn
+    /// instances with
+    /// [`add_streaming_clip_instance`](Self::add_streaming_clip_instance) —
+    /// note that, unlike a flipbook, **all** instances of a streaming clip
+    /// share its one model and so always show the same (current) frame.
+    ///
+    /// Takes the *encoded* [`VoxelClip`] (not a [`DecodedClip`]) — the whole
+    /// point is to avoid materialising every frame.
+    ///
+    /// # Errors
+    /// [`DecodeError`] if the clip's frame stream is empty or doesn't begin
+    /// with a keyframe.
+    pub fn add_streaming_clip(&mut self, clip: &VoxelClip) -> Result<StreamingClipId, DecodeError> {
+        let cursor = StreamingClip::new(clip)?;
+        let dims = cursor.dims();
+        let pivot = cursor.pivot();
+        let kv6 = cursor.current_frame().to_kv6(dims, pivot);
+        let model = self.add_sprite_model(&kv6);
+        let index = self.streaming_clips.len() as u32;
+        self.streaming_clips.push(Some(StreamingClipState {
+            cursor,
+            model,
+            dims,
+            pivot,
+        }));
+        Ok(self.streaming_map.alloc(index))
+    }
+
+    /// Spawn an instance of streaming clip `id`, posed by `xf`. Returns a
+    /// [`SpriteInstanceId`] — move it with
+    /// [`set_sprite_instance_transform`](Self::set_sprite_instance_transform)
+    /// and drop it with
+    /// [`remove_sprite_instance`](Self::remove_sprite_instance), like any
+    /// dynamic instance. All instances of one streaming clip share its single
+    /// model. A stale `id` yields a no-op instance handle.
+    pub fn add_streaming_clip_instance(
+        &mut self,
+        id: StreamingClipId,
+        xf: DynSpriteTransform,
+    ) -> SpriteInstanceId {
+        let model = self
+            .streaming_map
+            .index(id)
+            .and_then(|idx| self.streaming_clips[idx].as_ref())
+            .map(|s| s.model);
+        match model {
+            Some(model) => self.add_sprite_instance_posed(model, xf),
+            None => SpriteInstanceId {
+                slot: u32::MAX,
+                gen: u32::MAX,
+            },
+        }
+    }
+
+    /// Advance a streaming clip to `frame`: seek the cursor and re-upload its
+    /// single model — the per-frame streaming step (one volume re-upload,
+    /// vs the flipbook's cheap model-select). Updates **every** instance of
+    /// the clip at once. Drive it from a clock via
+    /// [`frame_at`](roxlap_formats::voxel_clip::frame_at). No-op on a stale
+    /// id; `frame` is clamped to the last.
+    pub fn set_streaming_clip_frame(&mut self, id: StreamingClipId, frame: u32) {
+        let Some(idx) = self.streaming_map.index(id) else {
+            return;
+        };
+        let Some((model, kv6)) = self.streaming_clips[idx].as_mut().and_then(|s| {
+            let vf = s.cursor.seek(frame as usize).ok()?;
+            Some((s.model, vf.to_kv6(s.dims, s.pivot)))
+        }) else {
+            return;
+        };
+        self.refresh_sprite_model(model, &kv6);
+    }
+
+    /// Remove a streaming clip: free its model and drop the cursor (the
+    /// memory win for huge clips). Instances linger but draw nothing until
+    /// removed. Returns `false` if `id` is stale / already removed.
+    pub fn remove_streaming_clip(&mut self, id: StreamingClipId) -> bool {
+        let Some(idx) = self.streaming_map.index(id) else {
+            return false;
+        };
+        let model = self.streaming_clips[idx].as_ref().map(|s| s.model);
+        self.streaming_clips[idx] = None;
+        if let Some(model) = model {
+            self.remove_sprite_model(model);
+        }
+        self.streaming_map.remove(id)
     }
 
     // ---- animated characters (VCL.6) -------------------------------------
@@ -1981,6 +2149,29 @@ mod tests {
         map.reset();
         assert_eq!(map.index(b), None);
         assert_eq!(map.alloc(0), CharacterId { slot: 0, gen: 0 });
+    }
+
+    /// The streaming-clip slotmap (#3) mints stable ids, resolves only live
+    /// handles, tombstones in place, and `reset` clears it.
+    #[test]
+    fn streaming_clip_map_lifecycle() {
+        let mut map = StreamingClipMap::default();
+        let a = map.alloc(0);
+        let b = map.alloc(1);
+        assert_eq!(a, StreamingClipId { slot: 0, gen: 0 });
+        assert_eq!(map.index(a), Some(0));
+        assert_eq!(map.index(b), Some(1));
+
+        assert!(map.remove(a));
+        assert_eq!(map.index(a), None);
+        assert_eq!(map.index(b), Some(1));
+        assert!(!map.remove(a)); // double remove is a no-op
+        assert!(!map.remove(StreamingClipId { slot: 9, gen: 0 }));
+        assert_eq!(map.index(StreamingClipId { slot: 1, gen: 7 }), None);
+
+        map.reset();
+        assert_eq!(map.index(b), None);
+        assert_eq!(map.alloc(0), StreamingClipId { slot: 0, gen: 0 });
     }
 
     #[test]
