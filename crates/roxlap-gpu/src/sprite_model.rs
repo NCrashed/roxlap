@@ -282,6 +282,15 @@ impl SpriteModelRegistry {
         &self.entries[self.chains[id as usize][0] as usize]
     }
 
+    /// Like [`Self::model`] but returns `None` for an out-of-range or
+    /// tombstoned (emptied) chain instead of panicking — the guarded form
+    /// for public primitives handed an arbitrary `chain_id`.
+    #[must_use]
+    pub fn model_checked(&self, id: u32) -> Option<&SpriteModel> {
+        let entry = *self.chains.get(id as usize)?.first()?;
+        self.entries.get(entry as usize)
+    }
+
     /// Mutable access to the finest (mip-0) model for editing — the
     /// copy-on-modify entry point (typically on a [`Self::fork`]).
     /// After a *structural* edit (occupancy/dims), call
@@ -1063,12 +1072,21 @@ impl SpriteRegistryResident {
         idx: usize,
         chain_id: u32,
     ) {
+        // Guard `chain_id` (the `cull.get_mut` below only covers `idx`): a
+        // public caller could pass an out-of-range / tombstoned chain, which
+        // `registry.model` would index-panic on.
+        let Some(radius) = registry
+            .model_checked(chain_id)
+            .map(SpriteModel::bound_radius)
+        else {
+            return;
+        };
         let Some(ci) = self.cull.get_mut(idx) else {
             return;
         };
         ci.chain_id = chain_id;
         ci.gpu.model_id = chain_id; // placeholder; cull rewrites to the LOD entry
-        ci.radius = registry.model(chain_id).bound_radius();
+        ci.radius = radius;
     }
 
     /// GPU.12 incremental — re-upload only the entries of LOD chain
@@ -2063,6 +2081,18 @@ mod tests {
         assert!(reg.is_live(c));
         // `b`'s id stayed valid across the remove + add round-trip.
         assert_eq!(&reg.model(b).colors, &[0xBB, 0xAA, 0xCC]);
+    }
+
+    #[test]
+    fn model_checked_guards_out_of_range_and_tombstoned() {
+        // The guard `set_instance_model` relies on: `model()` would
+        // index-panic on these, `model_checked` returns `None`.
+        let mut reg = SpriteModelRegistry::new();
+        let a = reg.add_lod(build_sprite_model(&kv6_unsorted()), 4);
+        assert!(reg.model_checked(a).is_some());
+        assert!(reg.model_checked(9999).is_none(), "out of range → None");
+        reg.remove(a);
+        assert!(reg.model_checked(a).is_none(), "tombstoned chain → None");
     }
 
     #[test]

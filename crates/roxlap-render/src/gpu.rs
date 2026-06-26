@@ -459,6 +459,14 @@ impl GpuBackend {
         if let Some(c) = self.clips.get_mut(clip_idx) {
             c.clear();
         }
+        // Detach instances that were playing this clip so they're no longer
+        // treated as clip instances (their now-tombstoned chain draws
+        // nothing regardless; this keeps the bookkeeping honest).
+        for slot in &mut self.dyn_clip {
+            if *slot == Some(clip_idx) {
+                *slot = None;
+            }
+        }
     }
 
     /// Append a dynamic instance playing clip `clip_idx`, posed by `xf`,

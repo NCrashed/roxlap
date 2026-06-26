@@ -56,6 +56,10 @@ const TAG_TIME: [u8; 4] = *b"TIME";
 
 /// Chunk `flags` bit: the payload is raw-deflated (`raw_len(u32) | data`).
 const CHUNK_FLAG_DEFLATED: u8 = 0x01;
+/// Cap on a deflated chunk's claimed uncompressed size (decompression-bomb
+/// guard). A real `.rvc` chunk never approaches this; a larger claim is
+/// rejected before it can drive a giant allocation.
+const MAX_CHUNK_INFLATE: usize = 64 << 20; // 64 MiB
 /// miniz_oxide deflate level for `.rvc` writes (clips are written once,
 /// read often — favour ratio over encode speed, but level 10 is overkill).
 const DEFLATE_LEVEL: u8 = 8;
@@ -133,18 +137,26 @@ impl VoxelFrame {
         let zmax = dims[2];
 
         // Bucket the kv6's flat voxel stream into the frame's column index.
+        // Defensive against a malformed (e.g. externally-parsed) kv6 whose
+        // `ylen` / `voxels` don't agree with the header dims: every index is
+        // bounds-checked, and only columns inside `dims` are mapped (the rest
+        // are still consumed so the stream stays aligned).
         let mut per_col: Vec<Vec<(u16, u32)>> = vec![Vec::new(); cols];
         let mut vi = 0usize;
         for x in 0..nx {
-            for (y, &cnt) in kv6.ylen[x].iter().enumerate() {
-                let count = cnt as usize;
-                let col = x + y * nx; // frame ordering (x-fastest)
-                for v in &kv6.voxels[vi..vi + count] {
-                    if u32::from(v.z) < zmax {
-                        per_col[col].push((v.z, v.col));
+            let col_counts = kv6.ylen.get(x).map_or(&[][..], Vec::as_slice);
+            for (y, &cnt) in col_counts.iter().enumerate() {
+                let start = vi.min(kv6.voxels.len());
+                let end = (start + cnt as usize).min(kv6.voxels.len());
+                if y < ny {
+                    let col = x + y * nx; // frame ordering (x-fastest)
+                    for v in &kv6.voxels[start..end] {
+                        if u32::from(v.z) < zmax {
+                            per_col[col].push((v.z, v.col));
+                        }
                     }
                 }
-                vi += count;
+                vi = end;
             }
         }
 
@@ -339,10 +351,13 @@ impl DecodedClip {
         self.frames.len()
     }
 
-    /// Total loop length in ms (sum of frame durations).
+    /// Total loop length in ms (sum of frame durations), saturating rather
+    /// than overflowing for absurdly long clips.
     #[must_use]
     pub fn total_ms(&self) -> u32 {
-        self.durations.iter().copied().sum()
+        self.durations
+            .iter()
+            .fold(0u32, |acc, &d| acc.saturating_add(d))
     }
 
     /// Padding diagnostics — declared `dims` vs. the tight content bbox
@@ -381,16 +396,19 @@ pub fn frame_at(durations: &[u32], loop_mode: LoopMode, elapsed_ms: u32) -> usiz
     if n <= 1 {
         return 0;
     }
-    let total: u32 = durations.iter().copied().sum();
+    // u64 throughout: a long clip's total (and `2·total` for PingPong) can
+    // exceed u32.
+    let total: u64 = durations.iter().map(|&d| u64::from(d)).sum();
     if total == 0 {
         return 0;
     }
+    let elapsed = u64::from(elapsed_ms);
     // Position within one forward pass (after applying the loop mode).
     let t = match loop_mode {
-        LoopMode::Loop => elapsed_ms % total,
-        LoopMode::Once => elapsed_ms.min(total - 1),
+        LoopMode::Loop => elapsed % total,
+        LoopMode::Once => elapsed.min(total - 1),
         LoopMode::PingPong => {
-            let p = elapsed_ms % (2 * total);
+            let p = elapsed % (2 * total);
             if p < total {
                 p
             } else {
@@ -400,9 +418,9 @@ pub fn frame_at(durations: &[u32], loop_mode: LoopMode, elapsed_ms: u32) -> usiz
         }
     };
     // Walk the duration prefix sums to find the frame holding `t`.
-    let mut acc = 0u32;
+    let mut acc = 0u64;
     for (i, &d) in durations.iter().enumerate() {
-        acc += d;
+        acc += u64::from(d);
         if t < acc {
             return i;
         }
@@ -1298,6 +1316,12 @@ fn inflate_chunk(payload: &[u8]) -> Result<Vec<u8>, ParseError> {
         return Err(ParseError::BadDeflate);
     }
     let raw_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    // The stored `raw_len` is untrusted (a crafted file could claim
+    // `u32::MAX` → a ~4 GiB allocation). Reject anything beyond a sane cap so
+    // it can't drive a decompression bomb.
+    if raw_len > MAX_CHUNK_INFLATE {
+        return Err(ParseError::BadDeflate);
+    }
     let out = miniz_oxide::inflate::decompress_to_vec_with_limit(&payload[4..], raw_len)
         .map_err(|_| ParseError::BadDeflate)?;
     if out.len() != raw_len {
@@ -2197,5 +2221,63 @@ mod tests {
         let decoded = clip.decode().unwrap();
         assert_eq!(decoded.frames[0], VoxelFrame::from_kv6(&ka));
         assert_eq!(decoded.frames[1], VoxelFrame::from_kv6(&kb));
+    }
+
+    // ---- hardening (review fixes) -----------------------------------------
+
+    #[test]
+    fn from_kv6_does_not_panic_on_malformed_kv6() {
+        // `ylen` claims far more voxels than exist, has a column beyond `ny`,
+        // and counts overrun `voxels` — an external/parsed kv6 could be bad.
+        let bad = Kv6 {
+            xsiz: 2,
+            ysiz: 2,
+            zsiz: 4,
+            xpiv: 0.0,
+            ypiv: 0.0,
+            zpiv: 0.0,
+            voxels: vec![Voxel {
+                col: 0x80FF_FFFF,
+                z: 0,
+                vis: 63,
+                dir: 0,
+            }],
+            xlen: vec![5, 5],                       // lies
+            ylen: vec![vec![3, 3], vec![3, 3, 99]], // > ny + huge counts
+            palette: None,
+        };
+        let f = VoxelFrame::from_kv6(&bad); // must not panic
+                                            // The result is still a consistent frame (only the one real voxel,
+                                            // mapped into column 0).
+        f.validate([2, 2, 4]).expect("frame is well-formed");
+        assert_eq!(f.colors, vec![0x80FF_FFFF]);
+    }
+
+    #[test]
+    fn inflate_rejects_oversized_raw_len() {
+        // A deflated META chunk claiming `raw_len = u32::MAX` must be rejected
+        // (decompression-bomb guard), not attempt a ~4 GiB allocation.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RVCL");
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(b"META");
+        bytes.push(CHUNK_FLAG_DEFLATED);
+        let mut payload = u32::MAX.to_le_bytes().to_vec(); // raw_len = u32::MAX
+        payload.extend_from_slice(&[0x01, 0x00, 0x00]); // junk deflate bytes
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        assert_eq!(VoxelClip::parse(&bytes), Err(ParseError::BadDeflate));
+    }
+
+    #[test]
+    fn frame_at_no_overflow_for_huge_durations() {
+        // total ≈ u32::MAX so `2·total` overflows u32; must stay correct in
+        // u64 and return a valid frame index, not panic.
+        let durations = vec![u32::MAX / 2, u32::MAX / 2];
+        let f = frame_at(&durations, LoopMode::PingPong, u32::MAX);
+        assert!(f < durations.len());
+        // Loop + Once likewise.
+        assert!(frame_at(&durations, LoopMode::Loop, u32::MAX) < durations.len());
+        assert!(frame_at(&durations, LoopMode::Once, u32::MAX) < durations.len());
     }
 }

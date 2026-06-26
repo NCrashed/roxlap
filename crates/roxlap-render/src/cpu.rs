@@ -509,6 +509,10 @@ impl CpuBackend {
         self.dyn_sprites.clear();
         self.dyn_models.clear();
         self.dyn_clip.clear();
+        // Mirror the GPU backend: drop the registered clip flipbooks too, so
+        // clip indices restart at 0 on both backends (and the old volumes
+        // don't leak).
+        self.clip_books.clear();
     }
 
     /// Append one dynamic instance of `model_index` pre-posed by `xf`;
@@ -596,6 +600,13 @@ impl CpuBackend {
     pub(crate) fn remove_voxel_clip(&mut self, clip_idx: usize) {
         if let Some(book) = self.clip_books.get_mut(clip_idx) {
             *book = ClipFlipbook::empty();
+        }
+        // Detach instances that were playing this clip (mirror the GPU
+        // backend) so they stop drawing the emptied flipbook.
+        for slot in &mut self.dyn_clip {
+            if matches!(slot, Some((book, _)) if *book == clip_idx) {
+                *slot = None;
+            }
         }
     }
 

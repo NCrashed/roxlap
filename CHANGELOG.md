@@ -76,6 +76,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Voxel-clip hardening** (review pass over the VCL stage). Defensive fixes
+  to the new clip code: `SpriteModelRegistry::set_instance_model` now guards
+  `chain_id` (a tombstoned/out-of-range chain no longer index-panics — new
+  `model_checked`); the CPU backend's `set_sprites` clears `clip_books` to
+  match the GPU (clip indices restart at 0 on both; no leak);
+  `remove_voxel_clip` detaches instances still pointing at the removed clip
+  on both backends; `VoxelFrame::from_kv6` bounds-checks a malformed kv6
+  (`ylen` / `voxels` disagreeing with the header) instead of panicking;
+  `.rvc` inflate caps an untrusted `raw_len` at 64 MiB (decompression-bomb
+  guard); and `frame_at` / `total_ms` compute in u64 / saturate so a very
+  long clip can't overflow `2·total`.
 - **GPU scene upload truncated dense chunks' colours** (`roxlap-gpu`).
   The per-chunk colour stride was a fixed `COLORS_PER_CHUNK_WORDS`
   (65536 u32s), sized for sparse terrain chunks (~36 k colours). A
