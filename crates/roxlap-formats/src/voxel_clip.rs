@@ -345,6 +345,13 @@ impl DecodedClip {
         self.durations.iter().copied().sum()
     }
 
+    /// Padding diagnostics — declared `dims` vs. the tight content bbox
+    /// across all frames (R3). See [`pad_stats`] / [`PadStats`].
+    #[must_use]
+    pub fn pad_stats(&self) -> PadStats {
+        pad_stats(self.dims, &self.frames)
+    }
+
     /// The frame index to show after `elapsed_ms` of playback, honouring
     /// the clip's [`LoopMode`] and per-frame durations. Pure — the host
     /// (or the facade's clip-instance clocks) drives `set_clip_instance_frame`
@@ -407,6 +414,115 @@ pub fn frame_at(durations: &[u32], loop_mode: LoopMode, elapsed_ms: u32) -> usiz
 #[must_use]
 pub fn occ_words_per_col(dims: [u32; 3]) -> u32 {
     dims[2].div_ceil(32).max(1)
+}
+
+/// Padding diagnostics for a clip (R3): a clip is a *fixed* bounding box, so
+/// every frame's occupancy bitmask is sized for `dims` even when its content
+/// only fills a corner — a clip with one big frame over-allocates the rest.
+/// [`pad_stats`] reports the declared `dims` vs. the tight `content_dims`;
+/// callers can warn (the encoder stays side-effect-free):
+///
+/// ```
+/// # use roxlap_formats::voxel_clip::{VoxelClip, LoopMode};
+/// # let frames = vec![];
+/// # let dims = [1, 1, 1];
+/// let stats = roxlap_formats::voxel_clip::pad_stats(dims, &frames);
+/// if stats.is_wasteful() {
+///     eprintln!("clip wastes padding: dims {:?} but content fits {:?} ({:.1}× volume)",
+///         stats.dims, stats.content_dims, stats.pad_ratio());
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PadStats {
+    /// The clip's declared bounding box.
+    pub dims: [u32; 3],
+    /// Tight bounding box (extent) of all solid voxels across every frame —
+    /// the smallest dims that would still hold the content. `[0; 3]` for an
+    /// empty clip.
+    pub content_dims: [u32; 3],
+    /// Solid voxels summed across all frames (context for a warning).
+    pub solid_voxels: u64,
+}
+
+impl PadStats {
+    /// Voxel-volume ratio of the declared bbox to the tight content bbox:
+    /// `1.0` = perfectly tight, `8.0` = the declared box holds 8× the
+    /// content's span (⅞ of every frame's occupancy is pure padding). `1.0`
+    /// for an empty clip.
+    #[must_use]
+    pub fn pad_ratio(&self) -> f32 {
+        let content = vol(self.content_dims);
+        if content == 0 {
+            1.0
+        } else {
+            vol(self.dims) as f32 / content as f32
+        }
+    }
+
+    /// Whether the clip wastes significant space on padding — the declared
+    /// bbox is `≥ 2×` the content's span, so re-bounding the frames to
+    /// `content_dims` would at least halve the per-frame occupancy storage.
+    #[must_use]
+    pub fn is_wasteful(&self) -> bool {
+        self.pad_ratio() >= 2.0
+    }
+}
+
+fn vol(d: [u32; 3]) -> u64 {
+    u64::from(d[0]) * u64::from(d[1]) * u64::from(d[2])
+}
+
+/// Compute [`PadStats`] for a clip's `dims` + its full `frames` (the encoder
+/// has these before diffing; see also [`DecodedClip::pad_stats`]). Walks the
+/// occupancy of every frame to find the tightest content bbox. Empty columns
+/// are skipped, so it's cheap for sparse clips.
+#[must_use]
+pub fn pad_stats(dims: [u32; 3], frames: &[VoxelFrame]) -> PadStats {
+    let owpc = occ_words_per_col(dims) as usize;
+    let (mx, my, mz) = (dims[0], dims[1], dims[2]);
+    let mut min = [u32::MAX; 3];
+    let mut max = [0u32; 3];
+    let mut solid_voxels = 0u64;
+    let mut any = false;
+
+    for f in frames {
+        for y in 0..my {
+            for x in 0..mx {
+                let base = (x + y * mx) as usize * owpc;
+                let occ = match f.occupancy.get(base..base + owpc) {
+                    Some(o) if o.iter().any(|&w| w != 0) => o,
+                    _ => continue, // empty / malformed column
+                };
+                for z in 0..mz {
+                    if (occ[(z >> 5) as usize] >> (z & 31)) & 1 != 0 {
+                        any = true;
+                        solid_voxels += 1;
+                        min[0] = min[0].min(x);
+                        min[1] = min[1].min(y);
+                        min[2] = min[2].min(z);
+                        max[0] = max[0].max(x);
+                        max[1] = max[1].max(y);
+                        max[2] = max[2].max(z);
+                    }
+                }
+            }
+        }
+    }
+
+    let content_dims = if any {
+        [
+            max[0] - min[0] + 1,
+            max[1] - min[1] + 1,
+            max[2] - min[2] + 1,
+        ]
+    } else {
+        [0; 3]
+    };
+    PadStats {
+        dims,
+        content_dims,
+        solid_voxels,
+    }
 }
 
 /// A seekable, **O(1-frame)-memory** cursor over a [`VoxelClip`]'s I/P
@@ -1767,5 +1883,64 @@ mod tests {
             StreamingClip::new(&mk(vec![EncodedFrame::Delta(Vec::new())])).map(|_| ()),
             Err(DecodeError::DeltaBeforeKey),
         );
+    }
+
+    // ---- pad diagnostics (R3, #5) -----------------------------------------
+
+    #[test]
+    fn pad_stats_tight_clip_is_not_wasteful() {
+        // Content reaches both far corners → content bbox == dims.
+        let dims = [8u32, 8, 8];
+        let frame = frame_from_fn(dims, |x, y, z| {
+            ((x == 0 && y == 0 && z == 0) || (x == 7 && y == 7 && z == 7)).then_some(0x80FF_FFFF)
+        });
+        let s = pad_stats(dims, std::slice::from_ref(&frame));
+        assert_eq!(s.content_dims, dims);
+        assert_eq!(s.solid_voxels, 2);
+        assert!((s.pad_ratio() - 1.0).abs() < 1e-6);
+        assert!(!s.is_wasteful());
+    }
+
+    #[test]
+    fn pad_stats_padded_clip_is_wasteful() {
+        // A 40³ bbox but content only in a 10³ corner across 3 frames.
+        let dims = [40u32, 40, 40];
+        let frames: Vec<VoxelFrame> = (0..3)
+            .map(|_| {
+                frame_from_fn(dims, |x, y, z| {
+                    (x < 10 && y < 10 && z < 10).then_some(0x80FF_0000)
+                })
+            })
+            .collect();
+        let s = pad_stats(dims, &frames);
+        assert_eq!(s.content_dims, [10, 10, 10]);
+        assert_eq!(s.solid_voxels, 3 * 1000);
+        // 40³ / 10³ = 64.
+        assert!((s.pad_ratio() - 64.0).abs() < 1e-3);
+        assert!(s.is_wasteful());
+    }
+
+    #[test]
+    fn pad_stats_empty_clip_is_not_wasteful() {
+        let dims = [4u32, 4, 4];
+        let empty = frame_from_fn(dims, |_, _, _| None);
+        let s = pad_stats(dims, std::slice::from_ref(&empty));
+        assert_eq!(s.content_dims, [0, 0, 0]);
+        assert_eq!(s.solid_voxels, 0);
+        assert!((s.pad_ratio() - 1.0).abs() < 1e-6);
+        assert!(!s.is_wasteful());
+    }
+
+    #[test]
+    fn decoded_clip_pad_stats_delegates() {
+        let dims = [20u32, 4, 4];
+        let frame = frame_from_fn(dims, |x, _, _| (x < 4).then_some(0x80FF_FFFF));
+        let clip =
+            VoxelClip::from_frames(dims, [0.0; 3], 1.0, LoopMode::Loop, &[frame], &[], 33, 0);
+        let s = clip.decode().unwrap().pad_stats();
+        assert_eq!(s.content_dims, [4, 4, 4]);
+        // 20·4·4 / 4·4·4 = 5.
+        assert!((s.pad_ratio() - 5.0).abs() < 1e-3);
+        assert!(s.is_wasteful());
     }
 }

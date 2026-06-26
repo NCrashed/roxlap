@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `remove_streaming_clip` (+ `StreamingClipId`). For huge clips where the
     flipbook's resident N-frame footprint is too costly; all instances of a
     streaming clip share its one model (same current frame).
+  - `voxel_clip::pad_stats` / `PadStats` (+ `DecodedClip::pad_stats`) — a
+    clip is a *fixed* bbox, so a frame whose content fills only a corner
+    still pays the full per-frame occupancy. Reports the declared `dims` vs.
+    the tight `content_dims` (`pad_ratio` / `is_wasteful`) so an asset
+    pipeline can warn; the encoder stays side-effect-free.
   - GPU flipbook: `sprite_model_from_clip_frame` (field-move upload) +
     `SpriteRegistryResident::set_instance_model` (the per-frame select).
   - CPU flipbook: `roxlap_core::ClipFlipbook` (cached `SpriteDense` per
