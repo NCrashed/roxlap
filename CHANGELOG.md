@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     still pays the full per-frame occupancy. Reports the declared `dims` vs.
     the tight `content_dims` (`pad_ratio` / `is_wasteful`) so an asset
     pipeline can warn; the encoder stays side-effect-free.
+  - `SceneRenderer` auto-playing clips: `add_clip_instance_playing`
+    (flipbook) / `play_streaming_clip` (streaming) attach a per-clip
+    playback clock (Q8 speed + start phase), advanced by a single
+    `advance_voxel_clips(dt)` — the host no longer hand-drives `frame_at` +
+    `set_clip_instance_frame` per instance per frame.
   - GPU flipbook: `sprite_model_from_clip_frame` (field-move upload) +
     `SpriteRegistryResident::set_instance_model` (the per-frame select).
   - CPU flipbook: `roxlap_core::ClipFlipbook` (cached `SpriteDense` per

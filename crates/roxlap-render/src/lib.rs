@@ -392,6 +392,40 @@ struct ClipClock {
     clock_ms: f64,
 }
 
+impl ClipClock {
+    /// Advance the clock by `dt` seconds at its Q8 `speed` and return the
+    /// frame to show. Shared by character attachments and standalone clip
+    /// players. A negative clock (rewind past 0) reads as frame 0 but is
+    /// kept signed so resuming forward is continuous.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn tick(&mut self, dt: f64) -> u32 {
+        self.clock_ms += dt * 1000.0 * f64::from(self.speed_q8) / 256.0;
+        frame_at(
+            &self.durations,
+            self.loop_mode,
+            self.clock_ms.max(0.0) as u32,
+        ) as u32
+    }
+}
+
+/// What an auto-advancing [`ClipPlayer`] (#6) drives each
+/// [`advance_voxel_clips`](SceneRenderer::advance_voxel_clips). A flipbook
+/// clip's frame is per-instance; a streaming clip's is per-clip (its
+/// instances share one model), so the targets differ.
+#[derive(Clone, Copy)]
+enum PlayerTarget {
+    Flipbook(SpriteInstanceId),
+    Streaming(StreamingClipId),
+}
+
+/// A standalone clip given its own playback clock (#6): the host calls
+/// `advance_voxel_clips(dt)` once instead of hand-driving `frame_at` +
+/// `set_clip_instance_frame`.
+struct ClipPlayer {
+    target: PlayerTarget,
+    clock: ClipClock,
+}
+
 /// One live bone attachment: which bone drives it, its local offset, the
 /// renderer instance it owns, and (for a clip target) its playback clock.
 struct AttachInst {
@@ -876,6 +910,15 @@ pub struct SceneRenderer {
     /// Streaming-clip runtimes (cursor + one re-uploaded model), parallel
     /// to `streaming_map` slots; `None` once removed (#3).
     streaming_clips: Vec<Option<StreamingClipState>>,
+    /// `(durations, loop_mode)` per registered flipbook clip, indexed by
+    /// the backend clip index (parallel to `clip_map`). Captured at
+    /// [`Self::add_voxel_clip`] so [`Self::add_clip_instance_playing`] can
+    /// seed a clock without re-passing the `DecodedClip`. Reset by
+    /// [`Self::set_sprites`].
+    clip_timing: Vec<(Vec<u32>, LoopMode)>,
+    /// Auto-advancing clip players (#6); ticked by
+    /// [`Self::advance_voxel_clips`]. Reset by [`Self::set_sprites`].
+    clip_players: Vec<ClipPlayer>,
 }
 
 impl SceneRenderer {
@@ -910,6 +953,8 @@ impl SceneRenderer {
                         char_instances: Vec::new(),
                         streaming_map: StreamingClipMap::default(),
                         streaming_clips: Vec::new(),
+                        clip_timing: Vec::new(),
+                        clip_players: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -928,6 +973,8 @@ impl SceneRenderer {
             char_instances: Vec::new(),
             streaming_map: StreamingClipMap::default(),
             streaming_clips: Vec::new(),
+            clip_timing: Vec::new(),
+            clip_players: Vec::new(),
         }
     }
 
@@ -963,6 +1010,8 @@ impl SceneRenderer {
                         char_instances: Vec::new(),
                         streaming_map: StreamingClipMap::default(),
                         streaming_clips: Vec::new(),
+                        clip_timing: Vec::new(),
+                        clip_players: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -982,6 +1031,8 @@ impl SceneRenderer {
             char_instances: Vec::new(),
             streaming_map: StreamingClipMap::default(),
             streaming_clips: Vec::new(),
+            clip_timing: Vec::new(),
+            clip_players: Vec::new(),
         }
     }
 
@@ -1311,6 +1362,8 @@ impl SceneRenderer {
         self.char_instances.clear();
         self.streaming_map.reset();
         self.streaming_clips.clear();
+        self.clip_timing.clear();
+        self.clip_players.clear();
         (0..set.models.len() as u32)
             .map(|slot| SpriteModelId { slot, gen: 0 })
             .collect()
@@ -1538,6 +1591,11 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.add_voxel_clip(clip),
             BackendImpl::Gpu(g) => g.add_voxel_clip(clip),
         };
+        // Capture timing for #6 auto-play; clip indices are sequential and
+        // parallel to `clip_timing`.
+        debug_assert_eq!(clip_index, self.clip_timing.len());
+        self.clip_timing
+            .push((clip.durations.clone(), clip.loop_mode));
         self.clip_map.alloc(clip_index as u32)
     }
 
@@ -1694,6 +1752,109 @@ impl SceneRenderer {
         self.streaming_map.remove(id)
     }
 
+    // ---- auto-advancing clip players (#6) --------------------------------
+
+    /// Spawn a flipbook-clip instance that **plays itself**: like
+    /// [`add_clip_instance_posed`](Self::add_clip_instance_posed), but the
+    /// facade tracks a playback clock so a single
+    /// [`advance_voxel_clips`](Self::advance_voxel_clips) call advances every
+    /// such instance — no per-frame `frame_at` + `set_clip_instance_frame`
+    /// bookkeeping in the host. `speed_q8` is the Q8 playback rate (`256` =
+    /// 1×); `start_phase_ms` offsets the clock (stagger copies of one clip).
+    /// A stale `clip` yields a no-op instance handle and no player.
+    pub fn add_clip_instance_playing(
+        &mut self,
+        clip: VoxelClipId,
+        xf: DynSpriteTransform,
+        speed_q8: i32,
+        start_phase_ms: u32,
+    ) -> SpriteInstanceId {
+        let Some(clip_index) = self.clip_map.clip_index(clip) else {
+            return SpriteInstanceId {
+                slot: u32::MAX,
+                gen: u32::MAX,
+            };
+        };
+        let (durations, loop_mode) = self.clip_timing[clip_index].clone();
+        let inst = self.add_clip_instance_posed(clip, xf);
+        self.clip_players.push(ClipPlayer {
+            target: PlayerTarget::Flipbook(inst),
+            clock: ClipClock {
+                durations,
+                loop_mode,
+                speed_q8,
+                clock_ms: f64::from(start_phase_ms),
+            },
+        });
+        inst
+    }
+
+    /// Give a streaming clip ([`add_streaming_clip`](Self::add_streaming_clip))
+    /// its own playback clock, advanced by
+    /// [`advance_voxel_clips`](Self::advance_voxel_clips). A streaming clip's
+    /// frame is per-clip (all its instances share one model), so this is
+    /// keyed on the clip, not an instance — register instances separately
+    /// with
+    /// [`add_streaming_clip_instance`](Self::add_streaming_clip_instance).
+    /// No-op on a stale `clip`.
+    pub fn play_streaming_clip(
+        &mut self,
+        clip: StreamingClipId,
+        speed_q8: i32,
+        start_phase_ms: u32,
+    ) {
+        let Some(idx) = self.streaming_map.index(clip) else {
+            return;
+        };
+        let Some(state) = self.streaming_clips[idx].as_ref() else {
+            return;
+        };
+        let clock = ClipClock {
+            durations: state.cursor.durations().to_vec(),
+            loop_mode: state.cursor.loop_mode(),
+            speed_q8,
+            clock_ms: f64::from(start_phase_ms),
+        };
+        self.clip_players.push(ClipPlayer {
+            target: PlayerTarget::Streaming(clip),
+            clock,
+        });
+    }
+
+    /// Advance every auto-playing clip ([`add_clip_instance_playing`] /
+    /// [`play_streaming_clip`]) by `dt` seconds: tick each clock, resolve its
+    /// frame via [`frame_at`](roxlap_formats::voxel_clip::frame_at), and
+    /// apply it. Players whose instance / clip was removed are pruned. Call
+    /// once per frame.
+    ///
+    /// [`add_clip_instance_playing`]: Self::add_clip_instance_playing
+    /// [`play_streaming_clip`]: Self::play_streaming_clip
+    pub fn advance_voxel_clips(&mut self, dt: f64) {
+        // Phase 1: tick clocks → (target, frame), pruning dead players.
+        // Borrow only the maps (disjoint from `clip_players`).
+        let dyn_map = &self.dyn_map;
+        let streaming_map = &self.streaming_map;
+        let mut updates: Vec<(PlayerTarget, u32)> = Vec::new();
+        self.clip_players.retain_mut(|p| {
+            let alive = match p.target {
+                PlayerTarget::Flipbook(inst) => dyn_map.dyn_index(inst).is_some(),
+                PlayerTarget::Streaming(clip) => streaming_map.index(clip).is_some(),
+            };
+            if !alive {
+                return false;
+            }
+            updates.push((p.target, p.clock.tick(dt)));
+            true
+        });
+        // Phase 2: apply (borrows self mutably, disjoint from the above).
+        for (target, frame) in updates {
+            match target {
+                PlayerTarget::Flipbook(inst) => self.set_clip_instance_frame(inst, frame),
+                PlayerTarget::Streaming(clip) => self.set_streaming_clip_frame(clip, frame),
+            }
+        }
+    }
+
     // ---- animated characters (VCL.6) -------------------------------------
 
     /// Register an animated character (RKC v3): upload its meshes as sprite
@@ -1801,10 +1962,7 @@ impl SceneRenderer {
                         up: h,
                         forward: f,
                     };
-                    let frame = a.clip.as_mut().map(|c| {
-                        c.clock_ms += dt * 1000.0 * f64::from(c.speed_q8) / 256.0;
-                        frame_at(&c.durations, c.loop_mode, c.clock_ms.max(0.0) as u32) as u32
-                    });
+                    let frame = a.clip.as_mut().map(|c| c.tick(dt));
                     (a.inst, xf, frame)
                 })
                 .collect()
@@ -2172,6 +2330,43 @@ mod tests {
         map.reset();
         assert_eq!(map.index(b), None);
         assert_eq!(map.alloc(0), StreamingClipId { slot: 0, gen: 0 });
+    }
+
+    /// The shared clip-playback clock (#6 / VCL.6): `tick` accumulates time
+    /// at its Q8 speed, resolves the frame, honours `start_phase`, and reads
+    /// a rewound (negative) clock as frame 0.
+    #[test]
+    fn clip_clock_tick_advances_and_resolves_frames() {
+        // 3 frames, 100 ms each → total 300 ms, looping.
+        let mut c = ClipClock {
+            durations: vec![100, 100, 100],
+            loop_mode: LoopMode::Loop,
+            speed_q8: 256, // 1×
+            clock_ms: 0.0,
+        };
+        assert_eq!(c.tick(0.0), 0); // t=0 → frame 0
+        assert_eq!(c.tick(0.10), 1); // t=100 → frame 1 (100 is not < 100)
+        assert_eq!(c.clock_ms as u32, 100);
+        assert_eq!(c.tick(0.15), 2); // t=250 → frame 2
+        assert_eq!(c.tick(0.10), 0); // t=350 → 350%300=50 → frame 0
+                                     // 0.5× speed advances half as fast.
+        let mut slow = ClipClock {
+            durations: vec![100, 100],
+            loop_mode: LoopMode::Once,
+            speed_q8: 128, // 0.5×
+            clock_ms: 0.0,
+        };
+        assert_eq!(slow.tick(0.20), 1); // 200ms wall → 100ms clock → frame 1
+        assert!((slow.clock_ms - 100.0).abs() < 1e-6);
+        // start_phase seeds the clock; negative clock reads as frame 0.
+        let mut phased = ClipClock {
+            durations: vec![50, 50, 50],
+            loop_mode: LoopMode::Loop,
+            speed_q8: -256, // rewind
+            clock_ms: 50.0, // start mid frame 1
+        };
+        assert_eq!(phased.tick(0.10), 0); // 50 - 100 = -50 → max(0)=0 → frame 0
+        assert!(phased.clock_ms < 0.0); // kept signed
     }
 
     #[test]
