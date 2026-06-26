@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     formats crate's first runtime dependency). Each chunk is deflated when
     that shrinks it (a `flags` byte in the envelope; occupancy bitmasks +
     colour runs compress hugely), else stored raw. v1 files still parse.
+  - `voxel_clip::StreamingClip` — a seekable, **O(1-frame)-memory** cursor
+    over a clip's I/P stream (replays deltas from the nearest keyframe),
+    the streaming alternative to `DecodedClip` for huge clips: holds one
+    reconstructed frame + the compact encoded stream instead of N full
+    frames. Drive it from `frame_at`, rebuild one sprite model per frame
+    change via `SpriteDense::from_voxel_frame` / `refresh_sprite_model`.
   - GPU flipbook: `sprite_model_from_clip_frame` (field-move upload) +
     `SpriteRegistryResident::set_instance_model` (the per-frame select).
   - CPU flipbook: `roxlap_core::ClipFlipbook` (cached `SpriteDense` per

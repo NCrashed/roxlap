@@ -350,6 +350,195 @@ pub fn occ_words_per_col(dims: [u32; 3]) -> u32 {
     dims[2].div_ceil(32).max(1)
 }
 
+/// A seekable, **O(1-frame)-memory** cursor over a [`VoxelClip`]'s I/P
+/// stream — the streaming alternative to [`DecodedClip`], which
+/// materialises *every* frame (and which the GPU/CPU flipbook then holds N
+/// volumes for). For a huge clip this keeps one reconstructed frame plus
+/// the compact encoded stream instead of N full frames.
+///
+/// Seeking to a frame replays deltas from the nearest preceding keyframe;
+/// stepping forward from the current frame is incremental. Drive it from
+/// [`frame_at`] like the flipbook, then rebuild a single sprite model from
+/// [`current_frame`](Self::current_frame) (+ [`current_dirs`](Self::current_dirs)
+/// for the GPU) each time the frame changes — e.g. via
+/// `roxlap_core::SpriteDense::from_voxel_frame` or
+/// `SceneRenderer::refresh_sprite_model`.
+#[derive(Debug, Clone)]
+pub struct StreamingClip {
+    dims: [u32; 3],
+    pivot: [f32; 3],
+    voxel_world_size: f32,
+    loop_mode: LoopMode,
+    owpc: usize,
+    cols: usize,
+    /// Owned copy of the encoded I/P stream (the compact representation).
+    frames: Vec<EncodedFrame>,
+    durations: Vec<u32>,
+    /// Ascending indices of the keyframes in `frames` (the seek points).
+    keyframes: Vec<usize>,
+    // --- cursor state ---
+    work_occ: Vec<u32>,
+    work_cols: Vec<Vec<u32>>,
+    /// Frame index currently reconstructed in the working set.
+    current: usize,
+    cur_frame: VoxelFrame,
+    cur_dirs: Vec<u32>,
+}
+
+impl StreamingClip {
+    /// Build a streaming cursor over `clip` and reconstruct frame 0.
+    ///
+    /// # Errors
+    /// [`DecodeError::DeltaBeforeKey`] if the stream is empty or doesn't
+    /// start with a keyframe; otherwise the same per-frame errors as
+    /// [`VoxelClip::decode`] (surfaced lazily while seeking).
+    pub fn new(clip: &VoxelClip) -> Result<Self, DecodeError> {
+        if !matches!(clip.frames.first(), Some(EncodedFrame::Key(_))) {
+            return Err(DecodeError::DeltaBeforeKey);
+        }
+        let owpc = occ_words_per_col(clip.dims) as usize;
+        let cols = (clip.dims[0] as usize) * (clip.dims[1] as usize);
+        let keyframes = clip
+            .frames
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| matches!(f, EncodedFrame::Key(_)).then_some(i))
+            .collect();
+        let durations = if clip.durations.is_empty() {
+            vec![clip.default_frame_ms; clip.frames.len()]
+        } else {
+            clip.durations.clone()
+        };
+        let mut s = Self {
+            dims: clip.dims,
+            pivot: clip.pivot,
+            voxel_world_size: clip.voxel_world_size,
+            loop_mode: clip.loop_mode,
+            owpc,
+            cols,
+            frames: clip.frames.clone(),
+            durations,
+            keyframes,
+            work_occ: vec![0u32; cols * owpc],
+            work_cols: vec![Vec::new(); cols],
+            current: 0,
+            cur_frame: VoxelFrame {
+                occupancy: Vec::new(),
+                colors: Vec::new(),
+                color_offsets: Vec::new(),
+            },
+            cur_dirs: Vec::new(),
+        };
+        s.reconstruct(0)?;
+        Ok(s)
+    }
+
+    #[must_use]
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+    #[must_use]
+    pub fn dims(&self) -> [u32; 3] {
+        self.dims
+    }
+    #[must_use]
+    pub fn pivot(&self) -> [f32; 3] {
+        self.pivot
+    }
+    #[must_use]
+    pub fn voxel_world_size(&self) -> f32 {
+        self.voxel_world_size
+    }
+    #[must_use]
+    pub fn loop_mode(&self) -> LoopMode {
+        self.loop_mode
+    }
+    #[must_use]
+    pub fn durations(&self) -> &[u32] {
+        &self.durations
+    }
+    /// Frame index currently reconstructed.
+    #[must_use]
+    pub fn current_index(&self) -> usize {
+        self.current
+    }
+    /// The currently-reconstructed frame.
+    #[must_use]
+    pub fn current_frame(&self) -> &VoxelFrame {
+        &self.cur_frame
+    }
+    /// Per-voxel `dir` LUT indices for the current frame, parallel to
+    /// `current_frame().colors` (for GPU sprite-model upload).
+    #[must_use]
+    pub fn current_dirs(&self) -> &[u32] {
+        &self.cur_dirs
+    }
+
+    /// Seek to `frame` (clamped to the last frame) and return the
+    /// reconstructed [`VoxelFrame`]. Forward seeks step incrementally;
+    /// backward / random seeks replay from the nearest preceding keyframe.
+    ///
+    /// # Errors
+    /// Per-frame [`DecodeError`]s from a malformed stream (out-of-range
+    /// delta column, invalid reconstructed frame).
+    pub fn seek(&mut self, frame: usize) -> Result<&VoxelFrame, DecodeError> {
+        let target = frame.min(self.frame_count() - 1);
+        if target != self.current || self.cur_frame.occupancy.is_empty() {
+            self.reconstruct(target)?;
+        }
+        Ok(&self.cur_frame)
+    }
+
+    /// Largest keyframe index `<= target` (frame 0 is always a keyframe).
+    fn keyframe_at_or_before(&self, target: usize) -> usize {
+        let pp = self.keyframes.partition_point(|&k| k <= target);
+        self.keyframes[pp - 1]
+    }
+
+    /// Rebuild the working set + materialised frame/dirs at `target`.
+    fn reconstruct(&mut self, target: usize) -> Result<(), DecodeError> {
+        // Step forward from the current frame when possible; otherwise reset
+        // the working set to the nearest preceding keyframe and replay.
+        let start = if target > self.current && !self.cur_frame.occupancy.is_empty() {
+            self.current + 1
+        } else {
+            let kf = self.keyframe_at_or_before(target);
+            let mut started = false;
+            apply_frame(
+                &self.frames[kf],
+                &mut self.work_occ,
+                &mut self.work_cols,
+                self.dims,
+                self.owpc,
+                self.cols,
+                &mut started,
+            )?;
+            kf + 1
+        };
+        let mut started = true;
+        for i in start..=target {
+            // Disjoint field borrows: `frames` (read) vs the working set.
+            let ef = &self.frames[i];
+            apply_frame(
+                ef,
+                &mut self.work_occ,
+                &mut self.work_cols,
+                self.dims,
+                self.owpc,
+                self.cols,
+                &mut started,
+            )?;
+        }
+        self.current = target;
+        self.cur_frame = flatten(&self.work_occ, &self.work_cols, self.cols);
+        self.cur_frame
+            .validate(self.dims)
+            .map_err(DecodeError::Frame)?;
+        self.cur_dirs = frame_dirs(&self.cur_frame, self.dims, self.owpc);
+        Ok(())
+    }
+}
+
 impl VoxelClip {
     /// u32 occupancy words per column for this clip.
     #[must_use]
@@ -500,31 +689,15 @@ impl VoxelClip {
         let mut started = false;
 
         for ef in &self.frames {
-            match ef {
-                EncodedFrame::Key(frame) => {
-                    frame.validate(self.dims).map_err(DecodeError::Frame)?;
-                    work_occ.copy_from_slice(&frame.occupancy);
-                    for (col, wc) in work_cols.iter_mut().enumerate() {
-                        wc.clear();
-                        wc.extend_from_slice(frame.column_colors(col));
-                    }
-                    started = true;
-                }
-                EncodedFrame::Delta(changed) => {
-                    if !started {
-                        return Err(DecodeError::DeltaBeforeKey);
-                    }
-                    for d in changed {
-                        let col = d.col as usize;
-                        if col >= cols || d.occ.len() != owpc {
-                            return Err(DecodeError::ColumnOutOfRange(d.col));
-                        }
-                        work_occ[col * owpc..(col + 1) * owpc].copy_from_slice(&d.occ);
-                        work_cols[col].clear();
-                        work_cols[col].extend_from_slice(&d.colors);
-                    }
-                }
-            }
+            apply_frame(
+                ef,
+                &mut work_occ,
+                &mut work_cols,
+                self.dims,
+                owpc,
+                cols,
+                &mut started,
+            )?;
             frames.push(flatten(&work_occ, &work_cols, cols));
         }
 
@@ -684,6 +857,47 @@ impl VoxelClip {
 }
 
 // ---- decode helpers ------------------------------------------------------
+
+/// Apply one I/P frame to the per-column working set (`work_occ` +
+/// `work_cols`): a keyframe overwrites the whole set, a delta rewrites only
+/// its changed columns. Shared by [`VoxelClip::decode`] and
+/// [`StreamingClip`]. `started` guards against a leading delta.
+fn apply_frame(
+    ef: &EncodedFrame,
+    work_occ: &mut [u32],
+    work_cols: &mut [Vec<u32>],
+    dims: [u32; 3],
+    owpc: usize,
+    cols: usize,
+    started: &mut bool,
+) -> Result<(), DecodeError> {
+    match ef {
+        EncodedFrame::Key(frame) => {
+            frame.validate(dims).map_err(DecodeError::Frame)?;
+            work_occ.copy_from_slice(&frame.occupancy);
+            for (col, wc) in work_cols.iter_mut().enumerate() {
+                wc.clear();
+                wc.extend_from_slice(frame.column_colors(col));
+            }
+            *started = true;
+        }
+        EncodedFrame::Delta(changed) => {
+            if !*started {
+                return Err(DecodeError::DeltaBeforeKey);
+            }
+            for d in changed {
+                let col = d.col as usize;
+                if col >= cols || d.occ.len() != owpc {
+                    return Err(DecodeError::ColumnOutOfRange(d.col));
+                }
+                work_occ[col * owpc..(col + 1) * owpc].copy_from_slice(&d.occ);
+                work_cols[col].clear();
+                work_cols[col].extend_from_slice(&d.colors);
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Flatten per-column working state into a [`VoxelFrame`].
 fn flatten(occ: &[u32], cols_colors: &[Vec<u32>], cols: usize) -> VoxelFrame {
@@ -1389,5 +1603,95 @@ mod tests {
         bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&payload);
         assert_eq!(VoxelClip::parse(&bytes), Err(ParseError::BadDeflate));
+    }
+
+    // ---- StreamingClip (O(1-frame) seekable cursor) -----------------------
+
+    /// A 7-frame clip with a rising fill height + per-frame colour, so every
+    /// frame differs from its neighbour (non-trivial deltas) and frame 6's
+    /// height crosses the 32-bit occupancy word boundary. `keyframe_interval
+    /// = 3` ⇒ keyframes at 0/3/6, deltas between (exercises replay).
+    fn build_varied_clip() -> VoxelClip {
+        let dims = [4u32, 3, 40];
+        let frames: Vec<VoxelFrame> = (0..7u32)
+            .map(|i| {
+                let h = 5 + i * 5;
+                frame_from_fn(dims, move |_x, _y, z| {
+                    (z < h).then_some(0x8000_0000 | (i * 0x10))
+                })
+            })
+            .collect();
+        VoxelClip::from_frames(
+            dims,
+            [2.0, 1.5, 20.0],
+            1.0,
+            LoopMode::Loop,
+            &frames,
+            &[],
+            33,
+            3,
+        )
+    }
+
+    #[test]
+    fn streaming_matches_decoded_forward_and_random() {
+        let clip = build_varied_clip();
+        let decoded = clip.decode().expect("decode");
+        let mut stream = StreamingClip::new(&clip).expect("stream");
+        assert_eq!(stream.frame_count(), decoded.frames.len());
+        assert_eq!(stream.dims(), decoded.dims);
+        assert_eq!(stream.pivot(), decoded.pivot);
+
+        // Sequential forward (incremental stepping).
+        for (i, want) in decoded.frames.iter().enumerate() {
+            let got = stream.seek(i).expect("seek").clone();
+            assert_eq!(&got, want, "frame {i} (forward)");
+            assert_eq!(
+                stream.current_dirs(),
+                decoded.dirs[i].as_slice(),
+                "dirs {i}"
+            );
+            assert_eq!(stream.current_index(), i);
+        }
+        // Random + backward order (keyframe replay).
+        for &i in &[6usize, 0, 4, 1, 5, 2, 3, 0, 6] {
+            let got = stream.seek(i).expect("seek").clone();
+            assert_eq!(&got, &decoded.frames[i], "frame {i} (random)");
+            assert_eq!(stream.current_dirs(), decoded.dirs[i].as_slice());
+        }
+    }
+
+    #[test]
+    fn streaming_seek_clamps_past_end() {
+        let clip = build_varied_clip();
+        let decoded = clip.decode().unwrap();
+        let mut stream = StreamingClip::new(&clip).unwrap();
+        let last = decoded.frames.len() - 1;
+        let got = stream.seek(999).unwrap().clone();
+        assert_eq!(got, decoded.frames[last]);
+        assert_eq!(stream.current_index(), last);
+    }
+
+    #[test]
+    fn streaming_rejects_empty_and_delta_first() {
+        let dims = [1u32, 1, 1];
+        let mk = |frames: Vec<EncodedFrame>| VoxelClip {
+            dims,
+            pivot: [0.0; 3],
+            voxel_world_size: 1.0,
+            loop_mode: LoopMode::Loop,
+            default_frame_ms: 1,
+            frames,
+            durations: Vec::new(),
+            extra_chunks: Vec::new(),
+        };
+        assert_eq!(
+            StreamingClip::new(&mk(Vec::new())).map(|_| ()),
+            Err(DecodeError::DeltaBeforeKey),
+        );
+        assert_eq!(
+            StreamingClip::new(&mk(vec![EncodedFrame::Delta(Vec::new())])).map(|_| ()),
+            Err(DecodeError::DeltaBeforeKey),
+        );
     }
 }
