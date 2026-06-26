@@ -8,6 +8,7 @@
 
 #![allow(dead_code)] // wired into the host in DS.1
 
+pub mod animation;
 pub mod empty;
 pub mod sprites;
 pub mod world;
