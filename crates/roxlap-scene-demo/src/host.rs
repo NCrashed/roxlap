@@ -17,7 +17,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::scene_api::{CameraRig, DemoScene, InputState, SceneCtx, SceneInput};
 use crate::scenes::{
-    animation::AnimationScene, empty::EmptyScene, sprites::SpritesScene, world::WorldScene,
+    animation::AnimationScene, empty::EmptyScene, picking::PickingScene,
+    primitives::PrimitivesScene, sprites::SpritesScene, world::WorldScene,
 };
 use crate::{
     load_png_sky, load_png_sky_rgba, MAX_GRID_VSID, RENDER_THREADS, SCAN_DIST_INITIAL,
@@ -76,6 +77,8 @@ impl Host {
             Box::new(WorldScene::new()),
             Box::new(SpritesScene::new()),
             Box::new(AnimationScene::new()),
+            Box::new(PickingScene::new()),
+            Box::new(PrimitivesScene::new()),
             Box::new(EmptyScene::new()),
         ];
         let cam = CameraRig::from_pose(scenes[0].start_pose());

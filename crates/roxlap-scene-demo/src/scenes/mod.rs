@@ -10,5 +10,7 @@
 
 pub mod animation;
 pub mod empty;
+pub mod picking;
+pub mod primitives;
 pub mod sprites;
 pub mod world;
