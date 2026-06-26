@@ -547,8 +547,10 @@ impl GpuBackend {
         let Some(reg) = self.sprite_registry.as_mut() else {
             return false;
         };
-        // Clips render flat-lit, so flat dirs suffice (as for streaming).
-        let dirs = vec![0u32; vf.colors.len()];
+        // Recompute dirs so the edited frame's model is byte-identical to the
+        // register path (`sprite_model_from_clip_frame`), not flat zeros —
+        // matters only if per-instance shading is ever applied to a clip.
+        let dirs = vf.dirs(dims);
         *reg.model_mut(chain_id) =
             sprite_model_from_voxel_frame(vf, &dirs, dims, pivot, voxel_world_size);
         reg.rebuild_lod(chain_id);

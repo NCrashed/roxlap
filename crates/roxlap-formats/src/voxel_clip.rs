@@ -240,6 +240,16 @@ impl VoxelFrame {
         }
     }
 
+    /// Per-voxel surface-normal LUT indices (`dir`), parallel to `colors`,
+    /// recomputed from the occupancy — the same dirs [`decode`](VoxelClip::decode)
+    /// caches per frame. The GPU sprite-model upload carries these; lets an
+    /// in-place frame edit build a model identical to the register path
+    /// (rather than flat zeros). The frame must be valid for `dims`.
+    #[must_use]
+    pub fn dirs(&self, dims: [u32; 3]) -> Vec<u32> {
+        frame_dirs(self, dims, occ_words_per_col(dims) as usize)
+    }
+
     /// Check the field shapes + per-column occupancy/colour agreement for
     /// the given clip `dims`.
     ///
@@ -1854,6 +1864,27 @@ mod tests {
         assert_eq!([kv6.xpiv, kv6.ypiv, kv6.zpiv], [1.0, 0.5, 20.0]);
         // from_kv6 ∘ to_kv6 reproduces occupancy + colours exactly.
         assert_eq!(VoxelFrame::from_kv6(&kv6), frame);
+    }
+
+    #[test]
+    fn voxel_frame_dirs_match_decoded() {
+        // `VoxelFrame::dirs` (used by the single-frame edit) must equal the
+        // dirs `decode` caches (the register path), so an edited frame's GPU
+        // model is identical to a freshly-registered one.
+        let dims = [4u32, 3, 8];
+        let frame = frame_from_fn(dims, |x, y, z| (z <= x + y).then_some(0x80FF_0000));
+        let clip = VoxelClip::from_frames(
+            dims,
+            [0.0; 3],
+            1.0,
+            LoopMode::Loop,
+            std::slice::from_ref(&frame),
+            &[],
+            33,
+            0,
+        );
+        let decoded = clip.decode().unwrap();
+        assert_eq!(frame.dirs(dims), decoded.dirs[0]);
     }
 
     // ---- compression (v2 per-chunk deflate) -------------------------------

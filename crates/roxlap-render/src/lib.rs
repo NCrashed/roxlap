@@ -1705,6 +1705,14 @@ impl SceneRenderer {
     /// it with [`remove_sprite_instance`](Self::remove_sprite_instance).
     /// A stale `clip` handle yields an instance id that resolves to nothing
     /// (a safe no-op everywhere).
+    ///
+    /// This instance has **no playback clock**: drive its frame yourself via
+    /// [`set_clip_instance_frame`](Self::set_clip_instance_frame) (frame-based
+    /// scrubbing). For *clock*-based control — auto-advance, play/pause, or
+    /// [`set_clip_instance_clock_ms`](Self::set_clip_instance_clock_ms)
+    /// scrubbing — spawn with
+    /// [`add_clip_instance_playing`](Self::add_clip_instance_playing) instead
+    /// (the player-control methods no-op on an instance with no player).
     pub fn add_clip_instance_posed(
         &mut self,
         clip: VoxelClipId,
