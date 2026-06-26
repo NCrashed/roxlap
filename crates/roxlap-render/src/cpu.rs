@@ -11,12 +11,12 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use roxlap_core::camera_math;
-use roxlap_core::dda_sprite::{draw_sprite_dda, ClipFlipbook};
+use roxlap_core::dda_sprite::{draw_sprite_dda, ClipFlipbook, SpriteDense};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::Camera;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
-use roxlap_formats::voxel_clip::DecodedClip;
+use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_scene::render::{render_scene_composed, CpuFog};
 use roxlap_scene::Scene;
 
@@ -630,6 +630,31 @@ impl CpuBackend {
         if let Some(Some((_book, f))) = self.dyn_clip.get_mut(idx) {
             *f = frame;
         }
+    }
+
+    /// The frame a clip instance is currently showing, or `None` if `idx`
+    /// isn't a (live) clip instance.
+    pub(crate) fn clip_instance_frame(&self, idx: usize) -> Option<usize> {
+        match self.dyn_clip.get(idx) {
+            Some(Some((_book, frame))) => Some(*frame),
+            _ => None,
+        }
+    }
+
+    /// Replace one frame's cached dense grid of clip `clip_idx` (the editor's
+    /// single-frame edit). Returns `false` if out of range.
+    pub(crate) fn update_clip_frame(
+        &mut self,
+        clip_idx: usize,
+        frame: usize,
+        vf: &VoxelFrame,
+        dims: [u32; 3],
+        pivot: [f32; 3],
+    ) -> bool {
+        let dense = SpriteDense::from_voxel_frame(vf, dims, pivot);
+        self.clip_books
+            .get_mut(clip_idx)
+            .is_some_and(|b| b.set_frame(frame, dense))
     }
 
     /// GPU.12 incremental — swap the edited `kv6` into every cached

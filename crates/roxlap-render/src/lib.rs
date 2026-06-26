@@ -408,6 +408,36 @@ impl ClipClock {
     }
 }
 
+/// Facade-side metadata captured for a registered flipbook clip, so editor
+/// queries + the auto-player don't shadow the `DecodedClip`.
+struct ClipMeta {
+    dims: [u32; 3],
+    pivot: [f32; 3],
+    voxel_world_size: f32,
+    durations: Vec<u32>,
+    loop_mode: LoopMode,
+}
+
+/// Public metadata for a registered clip — the inspector view returned by
+/// [`SceneRenderer::clip_metadata`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipMetadata {
+    /// Fixed bounding box (voxels).
+    pub dims: [u32; 3],
+    /// Model pivot (the kv6 pivot frames share).
+    pub pivot: [f32; 3],
+    /// Render scale (1 voxel = this many world units).
+    pub voxel_world_size: f32,
+    /// Playback wrap behaviour.
+    pub loop_mode: LoopMode,
+    /// Number of frames.
+    pub frame_count: usize,
+    /// Per-frame durations (ms), one per frame.
+    pub durations: Vec<u32>,
+    /// Total loop length (ms) — sum of `durations`.
+    pub total_ms: u32,
+}
+
 /// What an auto-advancing [`ClipPlayer`] (#6) drives each
 /// [`advance_voxel_clips`](SceneRenderer::advance_voxel_clips). A flipbook
 /// clip's frame is per-instance; a streaming clip's is per-clip (its
@@ -424,6 +454,9 @@ enum PlayerTarget {
 struct ClipPlayer {
     target: PlayerTarget,
     clock: ClipClock,
+    /// When `true`, [`advance_voxel_clips`](SceneRenderer::advance_voxel_clips)
+    /// leaves the clock (and frame) untouched — the editor's play/pause.
+    paused: bool,
 }
 
 /// One live bone attachment: which bone drives it, its local offset, the
@@ -440,6 +473,11 @@ struct AttachInst {
 struct CharInstance {
     skeleton: KfaSprite,
     attaches: Vec<AttachInst>,
+    /// Sprite models + voxel clips this character registered, so
+    /// [`remove_character`](SceneRenderer::remove_character) can free them
+    /// (otherwise they leak until the next `set_sprites`).
+    models: Vec<SpriteModelId>,
+    clips: Vec<VoxelClipId>,
 }
 
 /// Orientation + position for a dynamic sprite instance — the per-frame
@@ -910,12 +948,12 @@ pub struct SceneRenderer {
     /// Streaming-clip runtimes (cursor + one re-uploaded model), parallel
     /// to `streaming_map` slots; `None` once removed (#3).
     streaming_clips: Vec<Option<StreamingClipState>>,
-    /// `(durations, loop_mode)` per registered flipbook clip, indexed by
-    /// the backend clip index (parallel to `clip_map`). Captured at
-    /// [`Self::add_voxel_clip`] so [`Self::add_clip_instance_playing`] can
-    /// seed a clock without re-passing the `DecodedClip`. Reset by
+    /// Metadata per registered flipbook clip, indexed by the backend clip
+    /// index (parallel to `clip_map`). Captured at [`Self::add_voxel_clip`]
+    /// so the editor queries ([`Self::clip_metadata`]) + the auto-player
+    /// don't have to re-pass / shadow the `DecodedClip`. Reset by
     /// [`Self::set_sprites`].
-    clip_timing: Vec<(Vec<u32>, LoopMode)>,
+    clip_meta: Vec<ClipMeta>,
     /// Auto-advancing clip players (#6); ticked by
     /// [`Self::advance_voxel_clips`]. Reset by [`Self::set_sprites`].
     clip_players: Vec<ClipPlayer>,
@@ -953,7 +991,7 @@ impl SceneRenderer {
                         char_instances: Vec::new(),
                         streaming_map: StreamingClipMap::default(),
                         streaming_clips: Vec::new(),
-                        clip_timing: Vec::new(),
+                        clip_meta: Vec::new(),
                         clip_players: Vec::new(),
                     };
                 }
@@ -973,7 +1011,7 @@ impl SceneRenderer {
             char_instances: Vec::new(),
             streaming_map: StreamingClipMap::default(),
             streaming_clips: Vec::new(),
-            clip_timing: Vec::new(),
+            clip_meta: Vec::new(),
             clip_players: Vec::new(),
         }
     }
@@ -1010,7 +1048,7 @@ impl SceneRenderer {
                         char_instances: Vec::new(),
                         streaming_map: StreamingClipMap::default(),
                         streaming_clips: Vec::new(),
-                        clip_timing: Vec::new(),
+                        clip_meta: Vec::new(),
                         clip_players: Vec::new(),
                     };
                 }
@@ -1031,7 +1069,7 @@ impl SceneRenderer {
             char_instances: Vec::new(),
             streaming_map: StreamingClipMap::default(),
             streaming_clips: Vec::new(),
-            clip_timing: Vec::new(),
+            clip_meta: Vec::new(),
             clip_players: Vec::new(),
         }
     }
@@ -1362,7 +1400,7 @@ impl SceneRenderer {
         self.char_instances.clear();
         self.streaming_map.reset();
         self.streaming_clips.clear();
-        self.clip_timing.clear();
+        self.clip_meta.clear();
         self.clip_players.clear();
         (0..set.models.len() as u32)
             .map(|slot| SpriteModelId { slot, gen: 0 })
@@ -1591,11 +1629,16 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.add_voxel_clip(clip),
             BackendImpl::Gpu(g) => g.add_voxel_clip(clip),
         };
-        // Capture timing for #6 auto-play; clip indices are sequential and
-        // parallel to `clip_timing`.
-        debug_assert_eq!(clip_index, self.clip_timing.len());
-        self.clip_timing
-            .push((clip.durations.clone(), clip.loop_mode));
+        // Capture metadata for editor queries + #6 auto-play; clip indices
+        // are sequential and parallel to `clip_meta`.
+        debug_assert_eq!(clip_index, self.clip_meta.len());
+        self.clip_meta.push(ClipMeta {
+            dims: clip.dims,
+            pivot: clip.pivot,
+            voxel_world_size: clip.voxel_world_size,
+            durations: clip.durations.clone(),
+            loop_mode: clip.loop_mode,
+        });
         self.clip_map.alloc(clip_index as u32)
     }
 
@@ -1654,6 +1697,71 @@ impl SceneRenderer {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.set_clip_frame(dyn_index as usize, frame as usize),
             BackendImpl::Gpu(g) => g.set_clip_frame(dyn_index as usize, frame as usize),
+        }
+    }
+
+    // ---- clip queries (editor inspector) ---------------------------------
+
+    /// Frame count of a registered flipbook clip, or `None` if `id` is
+    /// stale. (Same as `clip_metadata(id)?.frame_count`, without the clone.)
+    #[must_use]
+    pub fn clip_frame_count(&self, id: VoxelClipId) -> Option<usize> {
+        let idx = self.clip_map.clip_index(id)?;
+        Some(self.clip_meta[idx].durations.len())
+    }
+
+    /// Inspector metadata (dims / pivot / scale / loop mode / per-frame
+    /// durations) of a registered flipbook clip, or `None` if `id` is stale
+    /// — so an editor needn't shadow the source [`DecodedClip`].
+    #[must_use]
+    pub fn clip_metadata(&self, id: VoxelClipId) -> Option<ClipMetadata> {
+        let idx = self.clip_map.clip_index(id)?;
+        let m = &self.clip_meta[idx];
+        Some(ClipMetadata {
+            dims: m.dims,
+            pivot: m.pivot,
+            voxel_world_size: m.voxel_world_size,
+            loop_mode: m.loop_mode,
+            frame_count: m.durations.len(),
+            durations: m.durations.clone(),
+            total_ms: m
+                .durations
+                .iter()
+                .fold(0u32, |acc, &d| acc.saturating_add(d)),
+        })
+    }
+
+    /// Which frame a clip instance is currently showing (the timeline
+    /// scrubber's read-back), or `None` if `id` isn't a live clip instance.
+    #[must_use]
+    pub fn get_clip_instance_frame(&self, id: SpriteInstanceId) -> Option<u32> {
+        let dyn_index = self.dyn_map.dyn_index(id)? as usize;
+        let frame = match &self.inner {
+            BackendImpl::Cpu(c) => c.clip_instance_frame(dyn_index),
+            BackendImpl::Gpu(g) => g.clip_instance_frame(dyn_index),
+        }?;
+        u32::try_from(frame).ok()
+    }
+
+    /// Re-upload a **single** `frame` of registered clip `id` in place — the
+    /// editor's one-voxel paint, O(1 frame) instead of `remove_voxel_clip` +
+    /// `add_voxel_clip` (which rebuilds all N volumes). `vf` must fit the
+    /// clip's fixed `dims`. Returns `false` on a stale `id`, an out-of-range
+    /// `frame`, or a frame that fails the clip's layout (so it can't corrupt
+    /// the flipbook).
+    pub fn update_clip_frame(&mut self, id: VoxelClipId, frame: u32, vf: &VoxelFrame) -> bool {
+        let Some(clip_index) = self.clip_map.clip_index(id) else {
+            return false;
+        };
+        let m = &self.clip_meta[clip_index];
+        let (dims, pivot, vws) = (m.dims, m.pivot, m.voxel_world_size);
+        if vf.validate(dims).is_err() {
+            return false;
+        }
+        let frame = frame as usize;
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.update_clip_frame(clip_index, frame, vf, dims, pivot),
+            BackendImpl::Gpu(g) => g.update_clip_frame(clip_index, frame, vf, dims, pivot, vws),
         }
     }
 
@@ -1775,16 +1883,18 @@ impl SceneRenderer {
                 gen: u32::MAX,
             };
         };
-        let (durations, loop_mode) = self.clip_timing[clip_index].clone();
+        let meta = &self.clip_meta[clip_index];
+        let clock = ClipClock {
+            durations: meta.durations.clone(),
+            loop_mode: meta.loop_mode,
+            speed_q8,
+            clock_ms: f64::from(start_phase_ms),
+        };
         let inst = self.add_clip_instance_posed(clip, xf);
         self.clip_players.push(ClipPlayer {
             target: PlayerTarget::Flipbook(inst),
-            clock: ClipClock {
-                durations,
-                loop_mode,
-                speed_q8,
-                clock_ms: f64::from(start_phase_ms),
-            },
+            clock,
+            paused: false,
         });
         inst
     }
@@ -1818,6 +1928,7 @@ impl SceneRenderer {
         self.clip_players.push(ClipPlayer {
             target: PlayerTarget::Streaming(clip),
             clock,
+            paused: false,
         });
     }
 
@@ -1843,16 +1954,87 @@ impl SceneRenderer {
             if !alive {
                 return false;
             }
-            updates.push((p.target, p.clock.tick(dt)));
+            // A paused player keeps its clock + frame (the editor's pause).
+            if !p.paused {
+                updates.push((p.target, p.clock.tick(dt)));
+            }
             true
         });
         // Phase 2: apply (borrows self mutably, disjoint from the above).
         for (target, frame) in updates {
-            match target {
-                PlayerTarget::Flipbook(inst) => self.set_clip_instance_frame(inst, frame),
-                PlayerTarget::Streaming(clip) => self.set_streaming_clip_frame(clip, frame),
-            }
+            self.apply_player_frame(target, frame);
         }
+    }
+
+    /// Apply a resolved frame to a player's target (flipbook instance vs.
+    /// streaming clip).
+    fn apply_player_frame(&mut self, target: PlayerTarget, frame: u32) {
+        match target {
+            PlayerTarget::Flipbook(inst) => self.set_clip_instance_frame(inst, frame),
+            PlayerTarget::Streaming(clip) => self.set_streaming_clip_frame(clip, frame),
+        }
+    }
+
+    /// Find the auto-player driving flipbook instance `inst`, if any.
+    fn flipbook_player_mut(&mut self, inst: SpriteInstanceId) -> Option<&mut ClipPlayer> {
+        self.clip_players
+            .iter_mut()
+            .find(|p| matches!(p.target, PlayerTarget::Flipbook(i) if i == inst))
+    }
+
+    /// Pause / resume the auto-player driving clip instance `id` (the
+    /// editor's play/pause). No-op if `id` has no player.
+    pub fn set_clip_instance_paused(&mut self, id: SpriteInstanceId, paused: bool) {
+        if let Some(p) = self.flipbook_player_mut(id) {
+            p.paused = paused;
+        }
+    }
+
+    /// Whether clip instance `id`'s auto-player is paused, or `None` if it
+    /// has no player.
+    #[must_use]
+    pub fn is_clip_instance_paused(&self, id: SpriteInstanceId) -> Option<bool> {
+        self.clip_players
+            .iter()
+            .find(|p| matches!(p.target, PlayerTarget::Flipbook(i) if i == id))
+            .map(|p| p.paused)
+    }
+
+    /// Set the playback speed (Q8: `256` = 1×, negative = reverse) of clip
+    /// instance `id`'s auto-player. No-op if `id` has no player.
+    pub fn set_clip_instance_speed(&mut self, id: SpriteInstanceId, speed_q8: i32) {
+        if let Some(p) = self.flipbook_player_mut(id) {
+            p.clock.speed_q8 = speed_q8;
+        }
+    }
+
+    /// **Scrub**: set clip instance `id`'s playback clock to `clock_ms` and
+    /// immediately show the matching frame (works while paused). No-op if
+    /// `id` has no player.
+    pub fn set_clip_instance_clock_ms(&mut self, id: SpriteInstanceId, clock_ms: f64) {
+        let Some((target, frame)) = self.flipbook_player_mut(id).map(|p| {
+            p.clock.clock_ms = clock_ms;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let frame = frame_at(
+                &p.clock.durations,
+                p.clock.loop_mode,
+                clock_ms.max(0.0) as u32,
+            ) as u32;
+            (p.target, frame)
+        }) else {
+            return;
+        };
+        self.apply_player_frame(target, frame);
+    }
+
+    /// Clip instance `id`'s current playback-clock position (ms), or `None`
+    /// if it has no player — the scrubber's read-back.
+    #[must_use]
+    pub fn clip_instance_clock_ms(&self, id: SpriteInstanceId) -> Option<f64> {
+        self.clip_players
+            .iter()
+            .find(|p| matches!(p.target, PlayerTarget::Flipbook(i) if i == id))
+            .map(|p| p.clock.clock_ms)
     }
 
     // ---- animated characters (VCL.6) -------------------------------------
@@ -1929,9 +2111,17 @@ impl SceneRenderer {
                 }
             }
         }
+        let clips: Vec<VoxelClipId> = clip_regs
+            .iter()
+            .filter_map(|r| r.as_ref().map(|(cid, _, _)| *cid))
+            .collect();
         let idx = self.char_instances.len();
-        self.char_instances
-            .push(CharInstance { skeleton, attaches });
+        self.char_instances.push(CharInstance {
+            skeleton,
+            attaches,
+            models: model_ids,
+            clips,
+        });
         self.char_map.alloc(idx as u32)
     }
 
@@ -1947,7 +2137,9 @@ impl SceneRenderer {
         // Phase 1: solve the skeleton + compute each attachment's update,
         // borrowing only `char_instances[idx]`.
         let updates: Vec<(SpriteInstanceId, DynSpriteTransform, Option<u32>)> = {
-            let CharInstance { skeleton, attaches } = &mut self.char_instances[idx];
+            let CharInstance {
+                skeleton, attaches, ..
+            } = &mut self.char_instances[idx];
             skeleton.animsprite((dt * 1000.0) as i32);
             solve_kfa_limbs(skeleton);
             attaches
@@ -1977,10 +2169,54 @@ impl SceneRenderer {
         }
     }
 
-    /// Remove a character, dropping all its attachment instances. Its
-    /// registered models/clips linger (tombstoned like
-    /// [`remove_sprite_model`](Self::remove_sprite_model)) until the next
-    /// `set_sprites`. Returns `false` if `id` is stale.
+    /// Move/re-orient a character to a new world transform `xf` (the root
+    /// limb's world pose) **without** ticking its animation or clip clocks —
+    /// a teleport that holds the current animation frame (e.g. dragging a
+    /// paused character in an editor). Re-solves the skeleton from the new
+    /// root + re-poses every attachment; clip frames are left as-is. No-op on
+    /// a stale id.
+    pub fn set_character_world_transform(&mut self, id: CharacterId, xf: DynSpriteTransform) {
+        let Some(idx) = self.char_map.index(id) else {
+            return;
+        };
+        // Phase 1: set the root pose + re-solve (no animsprite), then compute
+        // each attachment's new transform — borrowing only `char_instances`.
+        let updates: Vec<(SpriteInstanceId, DynSpriteTransform)> = {
+            let CharInstance {
+                skeleton, attaches, ..
+            } = &mut self.char_instances[idx];
+            skeleton.p = xf.pos;
+            skeleton.s = xf.right;
+            skeleton.h = xf.up;
+            skeleton.f = xf.forward;
+            solve_kfa_limbs(skeleton);
+            attaches
+                .iter()
+                .map(|a| {
+                    let limb = &skeleton.limbs[a.bone];
+                    let (s, h, f, p) =
+                        compose_attachment(limb.s, limb.h, limb.f, limb.p, &a.local_offset);
+                    (
+                        a.inst,
+                        DynSpriteTransform {
+                            pos: p,
+                            right: s,
+                            up: h,
+                            forward: f,
+                        },
+                    )
+                })
+                .collect()
+        };
+        // Phase 2: apply (clip frames untouched — clocks didn't tick).
+        for (inst, t) in updates {
+            self.set_sprite_instance_transform(inst, t);
+        }
+    }
+
+    /// Remove a character, dropping all its attachment instances **and**
+    /// freeing the sprite models + voxel clips it registered. Returns
+    /// `false` if `id` is stale.
     pub fn remove_character(&mut self, id: CharacterId) -> bool {
         let Some(idx) = self.char_map.index(id) else {
             return false;
@@ -1994,6 +2230,17 @@ impl SceneRenderer {
             self.remove_sprite_instance(inst);
         }
         self.char_instances[idx].attaches.clear();
+        // Free the models + clips this character registered (else they leak
+        // until a `set_sprites` — costly for an editor hot-swapping all
+        // session). `mem::take` so the per-id frees can borrow `self`.
+        let models = std::mem::take(&mut self.char_instances[idx].models);
+        let clips = std::mem::take(&mut self.char_instances[idx].clips);
+        for model in models {
+            self.remove_sprite_model(model);
+        }
+        for clip in clips {
+            self.remove_voxel_clip(clip);
+        }
         self.char_map.remove(id)
     }
 

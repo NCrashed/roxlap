@@ -466,6 +466,19 @@ impl ClipFlipbook {
         self.frames.get(frame)
     }
 
+    /// Replace one frame's cached dense grid in place — the CPU side of an
+    /// editor's single-frame edit (no re-decode of the other frames).
+    /// Returns `false` if `frame` is out of range.
+    pub fn set_frame(&mut self, frame: usize, dense: SpriteDense) -> bool {
+        match self.frames.get_mut(frame) {
+            Some(slot) => {
+                *slot = dense;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Draw frame `frame` at a world pose via [`draw_sprite_dense`] —
     /// `pos` is the world pivot, `s`/`h`/`f` the model→world basis columns.
     /// Returns pixels written (0 if `frame` is out of range).
@@ -613,6 +626,63 @@ mod tests {
             book.draw_frame(&mut fb, &mut zb, w as usize, w, h, &cs, &cfg, 9, pose, s, hh, f, 0),
             0
         );
+    }
+
+    #[test]
+    fn clip_flipbook_set_frame_replaces_one_frame() {
+        // The single-frame edit primitive: replace frame 0's dense with
+        // frame 1's content, in place. Out-of-range → false.
+        let dims = [8u32, 8, 8];
+        let f0 = clip_frame(dims, |_, _, z| (z < 4).then_some(0x00FF_0000)); // red
+        let f1 = clip_frame(dims, |_, _, z| (z >= 4).then_some(0x0000_FF00)); // green
+        let clip =
+            VoxelClip::from_frames(dims, [4.0; 3], 1.0, LoopMode::Loop, &[f0, f1], &[], 33, 0);
+        let decoded = clip.decode().unwrap();
+        let mut book = ClipFlipbook::from_decoded(&decoded);
+
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+        let cfg = settings(w, h);
+        let render0 = |b: &ClipFlipbook| -> Vec<u32> {
+            let mut fb = vec![0u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            let _ = b.draw_frame(
+                &mut fb,
+                &mut zb,
+                w as usize,
+                w,
+                h,
+                &cs,
+                &cfg,
+                0,
+                [0.0, 40.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                0,
+            );
+            fb
+        };
+
+        let before = render0(&book);
+        assert!(
+            before.iter().any(|&p| (p & 0x00FF_0000) != 0),
+            "frame 0 is red"
+        );
+
+        // Replace frame 0 with frame 1's dense.
+        let replacement = SpriteDense::from_voxel_frame(&decoded.frames[1], dims, decoded.pivot);
+        assert!(book.set_frame(0, replacement));
+        let extra = SpriteDense::from_voxel_frame(&decoded.frames[1], dims, decoded.pivot);
+        assert!(!book.set_frame(9, extra), "out-of-range set_frame is false");
+
+        let after = render0(&book);
+        assert!(
+            after.iter().any(|&p| (p & 0x0000_FF00) != 0),
+            "frame 0 now green"
+        );
+        assert_ne!(before, after);
     }
 
     /// A solid cube sprite in front of the camera is drawn, with the

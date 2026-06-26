@@ -25,10 +25,10 @@ use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::Camera;
-use roxlap_formats::voxel_clip::DecodedClip;
+use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_gpu::{
-    build_sprite_model, sprite_model_from_clip_frame, GpuInitError, GpuRenderer, GpuSceneResident,
-    SpriteInstance, SpriteInstanceTransform, SpriteModelRegistry,
+    build_sprite_model, sprite_model_from_clip_frame, sprite_model_from_voxel_frame, GpuInitError,
+    GpuRenderer, GpuSceneResident, SpriteInstance, SpriteInstanceTransform, SpriteModelRegistry,
 };
 use roxlap_scene::{GridId, Scene};
 
@@ -91,12 +91,13 @@ pub(crate) struct GpuBackend {
     /// which occupy the tail of [`sprite_instances`] after the static set +
     /// KFA limbs. Their base index is `sprite_instances.len() - dyn_count`.
     dyn_count: usize,
-    /// Per dynamic instance: `Some(clip_idx)` if it plays an animated
-    /// voxel clip (VCL.4), else `None`. Parallel to the dynamic tail of
-    /// `sprite_instances`; swap-removed alongside it. `set_clip_frame`
-    /// resolves `clips[clip_idx][frame]` → the chain to repoint the
-    /// instance's model at.
-    dyn_clip: Vec<Option<usize>>,
+    /// Per dynamic instance: `Some((clip_idx, frame))` if it plays an
+    /// animated voxel clip (VCL.4), else `None`. Parallel to the dynamic
+    /// tail of `sprite_instances`; swap-removed alongside it.
+    /// `set_clip_frame` resolves `clips[clip_idx][frame]` → the chain to
+    /// repoint the instance's model at, and records the current `frame` so
+    /// it can be queried (`clip_instance_frame`).
+    dyn_clip: Vec<Option<(usize, usize)>>,
     /// Registered animated voxel clips: per clip, one registry LOD-chain
     /// id per frame (the flipbook, VCL.2). A clip instance is a regular
     /// dynamic instance whose `model_id` we swap between these chains.
@@ -463,7 +464,7 @@ impl GpuBackend {
         // treated as clip instances (their now-tombstoned chain draws
         // nothing regardless; this keeps the bookkeeping honest).
         for slot in &mut self.dyn_clip {
-            if *slot == Some(clip_idx) {
+            if matches!(slot, Some((c, _)) if *c == clip_idx) {
                 *slot = None;
             }
         }
@@ -491,7 +492,7 @@ impl GpuBackend {
         self.gpu.append_sprite_instances(registry, &[inst]);
         self.sprite_instances.push(inst);
         self.sprite_basis.push(s);
-        self.dyn_clip.push(Some(clip_idx));
+        self.dyn_clip.push(Some((clip_idx, 0)));
         self.dyn_count += 1;
         idx
     }
@@ -504,7 +505,7 @@ impl GpuBackend {
         if idx >= self.dyn_count {
             return;
         }
-        let Some(Some(clip_idx)) = self.dyn_clip.get(idx).copied() else {
+        let Some(Some((clip_idx, _))) = self.dyn_clip.get(idx).copied() else {
             return;
         };
         let Some(&chain) = self.clips.get(clip_idx).and_then(|c| c.get(frame)) else {
@@ -515,6 +516,44 @@ impl GpuBackend {
         if let Some(reg) = self.sprite_registry.as_ref() {
             self.gpu.set_sprite_instance_model(reg, gpu_index, chain);
         }
+        self.dyn_clip[idx] = Some((clip_idx, frame));
+    }
+
+    /// The frame a clip instance is currently showing, or `None` if `idx`
+    /// isn't a (live) clip instance.
+    pub(crate) fn clip_instance_frame(&self, idx: usize) -> Option<usize> {
+        match self.dyn_clip.get(idx) {
+            Some(Some((_, frame))) => Some(*frame),
+            _ => None,
+        }
+    }
+
+    /// Re-upload **one** frame's volume of clip `clip_idx` in place (the
+    /// editor's single-voxel paint), without touching the other frames. The
+    /// frame's LOD chain is rebuilt + re-uploaded — O(1 frame), not the
+    /// whole flipbook. No-op if out of range.
+    pub(crate) fn update_clip_frame(
+        &mut self,
+        clip_idx: usize,
+        frame: usize,
+        vf: &VoxelFrame,
+        dims: [u32; 3],
+        pivot: [f32; 3],
+        voxel_world_size: f32,
+    ) -> bool {
+        let Some(&chain_id) = self.clips.get(clip_idx).and_then(|c| c.get(frame)) else {
+            return false;
+        };
+        let Some(reg) = self.sprite_registry.as_mut() else {
+            return false;
+        };
+        // Clips render flat-lit, so flat dirs suffice (as for streaming).
+        let dirs = vec![0u32; vf.colors.len()];
+        *reg.model_mut(chain_id) =
+            sprite_model_from_voxel_frame(vf, &dirs, dims, pivot, voxel_world_size);
+        reg.rebuild_lod(chain_id);
+        self.gpu.update_sprite_model(reg, chain_id);
+        true
     }
 
     /// Register KFA sprites: append each limb's kv6 as an instanced

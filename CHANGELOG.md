@@ -54,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     playback clock (Q8 speed + start phase), advanced by a single
     `advance_voxel_clips(dt)` — the host no longer hand-drives `frame_at` +
     `set_clip_instance_frame` per instance per frame.
+  - **Editor/authoring API for clips + characters.** Queries:
+    `clip_frame_count`, `clip_metadata` (`ClipMetadata`: dims / pivot /
+    scale / loop / per-frame durations), `get_clip_instance_frame` — so an
+    inspector + timeline scrubber needn't shadow the `DecodedClip`. Live
+    auto-player control (play/pause/scrub): `set_clip_instance_paused` /
+    `is_clip_instance_paused` / `set_clip_instance_speed` /
+    `set_clip_instance_clock_ms` (scrub) / `clip_instance_clock_ms`.
+    `update_clip_frame(id, frame, &VoxelFrame)` re-uploads one frame in
+    place (O(1 frame), vs remove + re-add). `remove_character` now frees the
+    models + clips it registered (no leak when hot-swapping). New
+    `set_character_world_transform` teleports a character (re-solve + re-pose)
+    without ticking its animation / clip clocks.
   - GPU flipbook: `sprite_model_from_clip_frame` (field-move upload) +
     `SpriteRegistryResident::set_instance_model` (the per-frame select).
   - CPU flipbook: `roxlap_core::ClipFlipbook` (cached `SpriteDense` per
