@@ -714,6 +714,51 @@ impl StreamingClip {
     }
 }
 
+/// When the auto-encoder ([`VoxelClip::from_frames_auto`]) stores a frame as
+/// a keyframe instead of a delta: once the delta would be at least this
+/// percentage of the keyframe's size. A delta that big is barely a saving
+/// and a keyframe is independently seekable, so prefer the keyframe.
+const KEYFRAME_COST_PCT: usize = 60;
+
+/// Per-column diff of `frame` against `prev` (same `dims`): the columns whose
+/// occupancy or colour run changed, as [`ColumnDelta`]s. Shared by the
+/// interval + auto encoders.
+fn column_diff(
+    prev: &VoxelFrame,
+    frame: &VoxelFrame,
+    cols: usize,
+    owpc: usize,
+) -> Vec<ColumnDelta> {
+    let mut changed = Vec::new();
+    for col in 0..cols {
+        if prev.column_occ(col, owpc) != frame.column_occ(col, owpc)
+            || prev.column_colors(col) != frame.column_colors(col)
+        {
+            changed.push(ColumnDelta {
+                col: col as u32,
+                occ: frame.column_occ(col, owpc).to_vec(),
+                colors: frame.column_colors(col).to_vec(),
+            });
+        }
+    }
+    changed
+}
+
+/// Serialised size (in u32 words) of `frame` stored as a keyframe.
+fn key_words(frame: &VoxelFrame) -> usize {
+    // occupancy + color_offsets + colors arrays, each with a length prefix.
+    frame.occupancy.len() + frame.color_offsets.len() + frame.colors.len() + 3
+}
+
+/// Serialised size (in u32 words) of a `changed`-column delta.
+fn delta_words(changed: &[ColumnDelta], owpc: usize) -> usize {
+    // changed_count + per column: col + occ words + colour-run (len + data).
+    1 + changed
+        .iter()
+        .map(|d| 1 + owpc + 1 + d.colors.len())
+        .sum::<usize>()
+}
+
 impl VoxelClip {
     /// u32 occupancy words per column for this clip.
     #[must_use]
@@ -748,6 +793,54 @@ impl VoxelClip {
         default_frame_ms: u32,
         keyframe_interval: u32,
     ) -> Result<Self, Kv6ImportError> {
+        let (dims, pivot, vframes) = Self::kv6_frames_prepare(frames)?;
+        Ok(Self::from_frames(
+            dims,
+            pivot,
+            voxel_world_size,
+            loop_mode,
+            &vframes,
+            durations,
+            default_frame_ms,
+            keyframe_interval,
+        ))
+    }
+
+    /// Like [`from_kv6_frames`](Self::from_kv6_frames) but **auto-chooses**
+    /// keyframe vs. delta per frame via
+    /// [`from_frames_auto`](Self::from_frames_auto) (VCL.1) — the turnkey
+    /// "import `.kv6` frames into a well-encoded clip" path. `max_keyframe_gap`
+    /// caps keyframe spacing (`0` = fully cost-driven).
+    ///
+    /// # Errors
+    /// Same as [`from_kv6_frames`](Self::from_kv6_frames).
+    pub fn from_kv6_frames_auto(
+        frames: &[Kv6],
+        voxel_world_size: f32,
+        loop_mode: LoopMode,
+        durations: &[u32],
+        default_frame_ms: u32,
+        max_keyframe_gap: u32,
+    ) -> Result<Self, Kv6ImportError> {
+        let (dims, pivot, vframes) = Self::kv6_frames_prepare(frames)?;
+        Ok(Self::from_frames_auto(
+            dims,
+            pivot,
+            voxel_world_size,
+            loop_mode,
+            &vframes,
+            durations,
+            default_frame_ms,
+            max_keyframe_gap,
+        ))
+    }
+
+    /// Validate a `.kv6` frame sequence (non-empty + uniform dims) and map it
+    /// to `(dims, pivot, frames)` for the import encoders.
+    #[allow(clippy::type_complexity)]
+    fn kv6_frames_prepare(
+        frames: &[Kv6],
+    ) -> Result<([u32; 3], [f32; 3], Vec<VoxelFrame>), Kv6ImportError> {
         let Some(first) = frames.first() else {
             return Err(Kv6ImportError::Empty);
         };
@@ -763,17 +856,8 @@ impl VoxelClip {
             }
         }
         let pivot = [first.xpiv, first.ypiv, first.zpiv];
-        let vframes: Vec<VoxelFrame> = frames.iter().map(VoxelFrame::from_kv6).collect();
-        Ok(Self::from_frames(
-            dims,
-            pivot,
-            voxel_world_size,
-            loop_mode,
-            &vframes,
-            durations,
-            default_frame_ms,
-            keyframe_interval,
-        ))
+        let vframes = frames.iter().map(VoxelFrame::from_kv6).collect();
+        Ok((dims, pivot, vframes))
     }
 
     /// Encode a sequence of full frames into a clip. Frame 0 (and every
@@ -815,20 +899,79 @@ impl VoxelClip {
             if is_key {
                 encoded.push(EncodedFrame::Key(frame.clone()));
             } else {
-                let prev = &frames[i - 1];
-                let mut changed = Vec::new();
-                for col in 0..cols {
-                    if prev.column_occ(col, owpc) != frame.column_occ(col, owpc)
-                        || prev.column_colors(col) != frame.column_colors(col)
-                    {
-                        changed.push(ColumnDelta {
-                            col: col as u32,
-                            occ: frame.column_occ(col, owpc).to_vec(),
-                            colors: frame.column_colors(col).to_vec(),
-                        });
-                    }
-                }
+                encoded.push(EncodedFrame::Delta(column_diff(
+                    &frames[i - 1],
+                    frame,
+                    cols,
+                    owpc,
+                )));
+            }
+        }
+
+        Self {
+            dims,
+            pivot,
+            voxel_world_size,
+            loop_mode,
+            default_frame_ms,
+            frames: encoded,
+            durations: durations.to_vec(),
+            extra_chunks: Vec::new(),
+        }
+    }
+
+    /// Encode a sequence of full frames, **auto-choosing** keyframe vs. delta
+    /// per frame (VCL.1) instead of a fixed interval — the codec's I-frame
+    /// decision. A frame is stored as a keyframe when its delta would be
+    /// large (a "scene change": at least [`KEYFRAME_COST_PCT`]% of the
+    /// keyframe's size — a delta that big is barely a saving and a keyframe
+    /// is independently seekable), or when `max_keyframe_gap` frames have
+    /// passed since the last keyframe (a seekability cap; `0` = no cap, fully
+    /// cost-driven). Frame 0 is always a keyframe. Otherwise identical to
+    /// [`from_frames`](Self::from_frames).
+    ///
+    /// # Panics
+    /// Same as [`from_frames`](Self::from_frames).
+    #[must_use]
+    pub fn from_frames_auto(
+        dims: [u32; 3],
+        pivot: [f32; 3],
+        voxel_world_size: f32,
+        loop_mode: LoopMode,
+        frames: &[VoxelFrame],
+        durations: &[u32],
+        default_frame_ms: u32,
+        max_keyframe_gap: u32,
+    ) -> Self {
+        for (i, f) in frames.iter().enumerate() {
+            f.validate(dims)
+                .unwrap_or_else(|e| panic!("frame {i} invalid: {e:?}"));
+        }
+        assert!(
+            durations.is_empty() || durations.len() == frames.len(),
+            "durations must be empty or one per frame",
+        );
+        let owpc = occ_words_per_col(dims) as usize;
+        let cols = (dims[0] as usize) * (dims[1] as usize);
+
+        let mut encoded = Vec::with_capacity(frames.len());
+        let mut since_key = 0u32;
+        for (i, frame) in frames.iter().enumerate() {
+            if i == 0 {
+                encoded.push(EncodedFrame::Key(frame.clone()));
+                since_key = 0;
+                continue;
+            }
+            let changed = column_diff(&frames[i - 1], frame, cols, owpc);
+            let gap_forces_key = max_keyframe_gap != 0 && since_key + 1 >= max_keyframe_gap;
+            let delta_too_big =
+                delta_words(&changed, owpc) * 100 >= key_words(frame) * KEYFRAME_COST_PCT;
+            if gap_forces_key || delta_too_big {
+                encoded.push(EncodedFrame::Key(frame.clone()));
+                since_key = 0;
+            } else {
                 encoded.push(EncodedFrame::Delta(changed));
+                since_key += 1;
             }
         }
 
@@ -1942,5 +2085,117 @@ mod tests {
         // 20·4·4 / 4·4·4 = 5.
         assert!((s.pad_ratio() - 5.0).abs() < 1e-3);
         assert!(s.is_wasteful());
+    }
+
+    // ---- auto keyframe heuristic (VCL.1) ----------------------------------
+
+    fn is_key(e: &EncodedFrame) -> bool {
+        matches!(e, EncodedFrame::Key(_))
+    }
+    fn key_positions(clip: &VoxelClip) -> Vec<usize> {
+        clip.frames
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| is_key(e).then_some(i))
+            .collect()
+    }
+
+    #[test]
+    fn from_frames_auto_round_trips() {
+        let dims = [4u32, 3, 40];
+        let frames: Vec<VoxelFrame> = (0..7u32)
+            .map(|i| {
+                let h = 5 + i * 5;
+                frame_from_fn(dims, move |_, _, z| {
+                    (z < h).then_some(0x8000_0000 | (i * 0x10))
+                })
+            })
+            .collect();
+        let clip =
+            VoxelClip::from_frames_auto(dims, [0.0; 3], 1.0, LoopMode::Loop, &frames, &[], 33, 0);
+        // The key/delta choice never changes the decoded output.
+        assert_eq!(clip.decode().unwrap().frames, frames);
+        assert!(is_key(&clip.frames[0]), "frame 0 is always a keyframe");
+    }
+
+    #[test]
+    fn from_frames_auto_keyframes_scene_change_but_deltas_small_change() {
+        let dims = [4u32, 4, 8];
+        let a = frame_from_fn(dims, |_, _, z| (z < 4).then_some(0x80FF_0000));
+        // Fully different (every column's occupancy + colour changes).
+        let scene_cut = frame_from_fn(dims, |_, _, z| (z >= 4).then_some(0x8000_FF00));
+        // `a` plus one extra voxel in a single column.
+        let small = frame_from_fn(dims, |x, y, z| {
+            ((z < 4) || (x == 0 && y == 0 && z == 4)).then_some(0x80FF_0000)
+        });
+
+        let cut = VoxelClip::from_frames_auto(
+            dims,
+            [0.0; 3],
+            1.0,
+            LoopMode::Loop,
+            &[a.clone(), scene_cut],
+            &[],
+            33,
+            0,
+        );
+        assert!(is_key(&cut.frames[1]), "scene change → keyframe");
+
+        let tweak = VoxelClip::from_frames_auto(
+            dims,
+            [0.0; 3],
+            1.0,
+            LoopMode::Loop,
+            &[a, small],
+            &[],
+            33,
+            0,
+        );
+        assert!(!is_key(&tweak.frames[1]), "small change → delta");
+    }
+
+    #[test]
+    fn from_frames_auto_gap_caps_keyframe_spacing() {
+        let dims = [2u32, 2, 4];
+        let f = frame_from_fn(dims, |_, _, z| (z < 2).then_some(0x80FF_FFFF));
+        let frames = vec![f; 7]; // identical → deltas are empty, never cost-forced
+
+        // No cap: only frame 0 is a keyframe.
+        let none =
+            VoxelClip::from_frames_auto(dims, [0.0; 3], 1.0, LoopMode::Loop, &frames, &[], 33, 0);
+        assert_eq!(key_positions(&none), vec![0]);
+
+        // Gap 3: keyframes at 0, 3, 6.
+        let capped =
+            VoxelClip::from_frames_auto(dims, [0.0; 3], 1.0, LoopMode::Loop, &frames, &[], 33, 3);
+        assert_eq!(key_positions(&capped), vec![0, 3, 6]);
+        for (i, e) in capped.frames.iter().enumerate() {
+            if let EncodedFrame::Delta(d) = e {
+                assert!(d.is_empty(), "identical frame {i} → empty delta");
+            }
+        }
+    }
+
+    #[test]
+    fn from_kv6_frames_auto_round_trips() {
+        let dims = [3u32, 3, 6];
+        let ka = Kv6::from_fn(dims[0], dims[1], dims[2], |_, _, z| {
+            (z == 0).then_some(0x80FF_0000)
+        });
+        let kb = Kv6::from_fn(dims[0], dims[1], dims[2], |_, _, z| {
+            (z >= 3).then_some(0x8000_FF00)
+        });
+        let clip = VoxelClip::from_kv6_frames_auto(
+            &[ka.clone(), kb.clone()],
+            1.0,
+            LoopMode::Loop,
+            &[],
+            33,
+            0,
+        )
+        .expect("import");
+        let decoded = clip.decode().unwrap();
+        assert_eq!(decoded.frames[0], VoxelFrame::from_kv6(&ka));
+        assert_eq!(decoded.frames[1], VoxelFrame::from_kv6(&kb));
     }
 }

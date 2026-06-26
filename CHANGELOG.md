@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sprite into one clip frame) + `VoxelClip::from_kv6_frames` (encode a
     sequence of same-dims `.kv6` frames straight into a clip), so clips can
     be built from existing voxel models, not just procedurally.
+  - `VoxelClip::from_frames_auto` / `from_kv6_frames_auto` — auto-choose
+    keyframe vs. delta per frame (the codec's I-frame decision) instead of a
+    fixed interval: a frame is keyframed on a "scene change" (its delta would
+    be ≥ 60% of a keyframe) or to cap keyframe spacing (`max_keyframe_gap`),
+    so seek points + size adapt to the content.
   - `.rvc` per-chunk deflate (format **v2**, via `miniz_oxide` — the
     formats crate's first runtime dependency). Each chunk is deflated when
     that shrinks it (a `flags` byte in the envelope; occupancy bitmasks +
