@@ -37,7 +37,7 @@
 //! backward-compatible follow-ups (a per-chunk "compressed" flag).
 
 use crate::bytes::{Cursor, OutOfBounds};
-use crate::kv6::compute_vis_dir;
+use crate::kv6::{compute_vis_dir, Kv6};
 
 const MAGIC: [u8; 4] = *b"RVCL";
 const VERSION: u16 = 1;
@@ -96,6 +96,65 @@ pub struct VoxelFrame {
 }
 
 impl VoxelFrame {
+    /// Build one dense-column [`VoxelFrame`] from a `.kv6` model — the
+    /// authoring bridge from a voxel sprite to a clip frame. The frame's
+    /// dims are the kv6's `[xsiz, ysiz, zsiz]`; the kv6's pivot +
+    /// voxel-world-size travel at the clip level (see
+    /// [`VoxelClip::from_kv6_frames`]).
+    ///
+    /// `.kv6` already stores surface voxels per `(x, y)` column in
+    /// ascending z — the very layout a frame wants — so this is a re-index
+    /// from the kv6's x-major column order (`x · ysiz + y`) to the frame's
+    /// `col = x + y · xsiz`, packing each column's z's into the occupancy
+    /// bitmask. Each column is sorted by z so the colour run is ascending
+    /// even if the source isn't strictly ordered; voxels with `z >= zsiz`
+    /// are dropped (defensive against malformed input).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn from_kv6(kv6: &Kv6) -> Self {
+        let dims = [kv6.xsiz, kv6.ysiz, kv6.zsiz];
+        let (nx, ny) = (dims[0] as usize, dims[1] as usize);
+        let cols = nx * ny;
+        let owpc = occ_words_per_col(dims) as usize;
+        let zmax = dims[2];
+
+        // Bucket the kv6's flat voxel stream into the frame's column index.
+        let mut per_col: Vec<Vec<(u16, u32)>> = vec![Vec::new(); cols];
+        let mut vi = 0usize;
+        for x in 0..nx {
+            for (y, &cnt) in kv6.ylen[x].iter().enumerate() {
+                let count = cnt as usize;
+                let col = x + y * nx; // frame ordering (x-fastest)
+                for v in &kv6.voxels[vi..vi + count] {
+                    if u32::from(v.z) < zmax {
+                        per_col[col].push((v.z, v.col));
+                    }
+                }
+                vi += count;
+            }
+        }
+
+        let mut occupancy = vec![0u32; cols * owpc];
+        let mut colors = Vec::new();
+        let mut color_offsets = Vec::with_capacity(cols + 1);
+        color_offsets.push(0u32);
+        for (col, run) in per_col.iter_mut().enumerate() {
+            run.sort_by_key(|&(z, _)| z);
+            for &(z, c) in run.iter() {
+                let zi = z as usize;
+                occupancy[col * owpc + zi / 32] |= 1u32 << (zi % 32);
+                colors.push(c);
+            }
+            color_offsets.push(colors.len() as u32);
+        }
+
+        Self {
+            occupancy,
+            colors,
+            color_offsets,
+        }
+    }
+
     /// Check the field shapes + per-column occupancy/colour agreement for
     /// the given clip `dims`.
     ///
@@ -287,6 +346,56 @@ impl VoxelClip {
     #[must_use]
     pub fn frame_count(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Build a clip from a sequence of `.kv6` frames sharing one
+    /// `[xsiz, ysiz, zsiz]` — the authoring path from animated voxel
+    /// sprites to a `.rvc` clip. Each kv6 becomes a [`VoxelFrame`] via
+    /// [`VoxelFrame::from_kv6`], then the lot is encoded with
+    /// [`VoxelClip::from_frames`] (frame 0 + every `keyframe_interval`-th a
+    /// keyframe; `0` ⇒ only frame 0). The pivot comes from the first
+    /// frame's kv6; `voxel_world_size` is the render scale (`.kv6` carries
+    /// none). `durations` is per-frame ms (empty ⇒ uniform
+    /// `default_frame_ms`).
+    ///
+    /// # Errors
+    /// [`Kv6ImportError::Empty`] if `frames` is empty;
+    /// [`Kv6ImportError::DimsMismatch`] if any frame's dims differ from the
+    /// first (clips are fixed-bbox).
+    pub fn from_kv6_frames(
+        frames: &[Kv6],
+        voxel_world_size: f32,
+        loop_mode: LoopMode,
+        durations: &[u32],
+        default_frame_ms: u32,
+        keyframe_interval: u32,
+    ) -> Result<Self, Kv6ImportError> {
+        let Some(first) = frames.first() else {
+            return Err(Kv6ImportError::Empty);
+        };
+        let dims = [first.xsiz, first.ysiz, first.zsiz];
+        for (i, k) in frames.iter().enumerate() {
+            let d = [k.xsiz, k.ysiz, k.zsiz];
+            if d != dims {
+                return Err(Kv6ImportError::DimsMismatch {
+                    frame: i,
+                    dims: d,
+                    expected: dims,
+                });
+            }
+        }
+        let pivot = [first.xpiv, first.ypiv, first.zpiv];
+        let vframes: Vec<VoxelFrame> = frames.iter().map(VoxelFrame::from_kv6).collect();
+        Ok(Self::from_frames(
+            dims,
+            pivot,
+            voxel_world_size,
+            loop_mode,
+            &vframes,
+            durations,
+            default_frame_ms,
+            keyframe_interval,
+        ))
     }
 
     /// Encode a sequence of full frames into a clip. Frame 0 (and every
@@ -700,6 +809,19 @@ fn parse_time(payload: &[u8], frame_count: u32) -> Result<Vec<u32>, ParseError> 
 
 // ---- errors --------------------------------------------------------------
 
+/// Why [`VoxelClip::from_kv6_frames`] could not build a clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kv6ImportError {
+    /// No frames were supplied.
+    Empty,
+    /// A frame's dims differ from the first frame's (clips are fixed-bbox).
+    DimsMismatch {
+        frame: usize,
+        dims: [u32; 3],
+        expected: [u32; 3],
+    },
+}
+
 /// Why a [`VoxelFrame`] failed validation against a clip's `dims`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
@@ -1005,5 +1127,102 @@ mod tests {
             extra_chunks: Vec::new(),
         };
         assert!(matches!(clip.decode(), Err(DecodeError::DeltaBeforeKey)));
+    }
+
+    // ---- VCL.1: .kv6 → VoxelFrame / VoxelClip import ----------------------
+
+    /// A fill whose every solid voxel is isolated (no 6-neighbour solid),
+    /// so `Kv6::from_fn` (surface-only) keeps all of them — letting the
+    /// import be compared against the all-voxels `frame_from_fn` reference.
+    /// Spaced on even coords; the colour encodes `(x, y, z)`.
+    fn isolated_fill(x: u32, y: u32, z: u32) -> Option<u32> {
+        (x % 2 == 0 && y % 2 == 0 && z % 2 == 0).then(|| 0x8000_0000 | (x << 16) | (y << 8) | z)
+    }
+
+    #[test]
+    fn from_kv6_matches_dense_reference() {
+        // Non-square xy exercises the x-major→x-fastest re-index; z = 41
+        // (> 32) exercises the 2-word occupancy column.
+        let dims = [3u32, 2, 41];
+        let kv6 = Kv6::from_fn(dims[0], dims[1], dims[2], isolated_fill);
+        let imported = VoxelFrame::from_kv6(&kv6);
+        let expected = frame_from_fn(dims, isolated_fill);
+        assert_eq!(imported, expected);
+        imported.validate(dims).expect("imported frame is valid");
+    }
+
+    #[test]
+    fn from_kv6_packs_z_across_word_boundary() {
+        // A single 1×1 column with voxels straddling the 32-bit word split.
+        let kv6 = Kv6::from_fn(1, 1, 41, |_, _, z| match z {
+            0 => Some(0x80FF_0000),
+            5 => Some(0x8000_FF00),
+            33 => Some(0x8000_00FF),
+            40 => Some(0x80FF_FF00),
+            _ => None,
+        });
+        let f = VoxelFrame::from_kv6(&kv6);
+        // owpc = 2; word0 bits 0,5; word1 bits 1 (=33-32), 8 (=40-32).
+        assert_eq!(f.occupancy, vec![(1 << 0) | (1 << 5), (1 << 1) | (1 << 8)]);
+        // Colours ascending z.
+        assert_eq!(
+            f.colors,
+            vec![0x80FF_0000, 0x8000_FF00, 0x8000_00FF, 0x80FF_FF00]
+        );
+        assert_eq!(f.color_offsets, vec![0, 4]);
+        f.validate([1, 1, 41]).expect("valid");
+    }
+
+    #[test]
+    fn from_kv6_frames_round_trips_through_clip() {
+        let dims = [2u32, 2, 3];
+        // Two full xy layers at different z's — every voxel surface-exposed.
+        let ka = Kv6::from_fn(dims[0], dims[1], dims[2], |_, _, z| {
+            (z == 0).then_some(0x80FF_0000)
+        });
+        let kb = Kv6::from_fn(dims[0], dims[1], dims[2], |_, _, z| {
+            (z == 2).then_some(0x8000_FF00)
+        });
+        let clip = VoxelClip::from_kv6_frames(
+            &[ka.clone(), kb.clone()],
+            2.0,
+            LoopMode::Loop,
+            &[100, 200],
+            0,
+            0,
+        )
+        .expect("import");
+        assert_eq!(clip.dims, dims);
+        assert_eq!(clip.voxel_world_size, 2.0);
+        assert_eq!(clip.pivot, [ka.xpiv, ka.ypiv, ka.zpiv]);
+        assert_eq!(clip.durations, vec![100, 200]);
+
+        let decoded = clip.decode().expect("decode");
+        assert_eq!(decoded.frames.len(), 2);
+        assert_eq!(decoded.frames[0], VoxelFrame::from_kv6(&ka));
+        assert_eq!(decoded.frames[1], VoxelFrame::from_kv6(&kb));
+    }
+
+    #[test]
+    fn from_kv6_frames_rejects_empty() {
+        let err = VoxelClip::from_kv6_frames(&[], 1.0, LoopMode::Loop, &[], 50, 0)
+            .expect_err("empty must fail");
+        assert_eq!(err, Kv6ImportError::Empty);
+    }
+
+    #[test]
+    fn from_kv6_frames_rejects_dims_mismatch() {
+        let ka = Kv6::from_fn(2, 2, 2, |_, _, z| (z == 0).then_some(0x80FF_FFFF));
+        let kb = Kv6::from_fn(3, 2, 2, |_, _, z| (z == 0).then_some(0x80FF_FFFF));
+        let err = VoxelClip::from_kv6_frames(&[ka, kb], 1.0, LoopMode::Loop, &[], 50, 0)
+            .expect_err("mismatch must fail");
+        assert_eq!(
+            err,
+            Kv6ImportError::DimsMismatch {
+                frame: 1,
+                dims: [3, 2, 2],
+                expected: [2, 2, 2],
+            }
+        );
     }
 }
