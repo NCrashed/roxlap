@@ -16,7 +16,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::scene_api::{CameraRig, DemoScene, InputState, SceneCtx, SceneInput};
-use crate::scenes::{empty::EmptyScene, world::WorldScene};
+use crate::scenes::{empty::EmptyScene, sprites::SpritesScene, world::WorldScene};
 use crate::{
     load_png_sky, load_png_sky_rgba, MAX_GRID_VSID, RENDER_THREADS, SCAN_DIST_INITIAL,
     SCAN_DIST_MAX, SCAN_DIST_MIN, SCAN_DIST_STEP, SKY_PNG,
@@ -70,8 +70,11 @@ impl Host {
         });
         engine.set_sky(Some(sky));
 
-        let scenes: Vec<Box<dyn DemoScene>> =
-            vec![Box::new(WorldScene::new()), Box::new(EmptyScene::new())];
+        let scenes: Vec<Box<dyn DemoScene>> = vec![
+            Box::new(WorldScene::new()),
+            Box::new(SpritesScene::new()),
+            Box::new(EmptyScene::new()),
+        ];
         let cam = CameraRig::from_pose(scenes[0].start_pose());
 
         Self {
