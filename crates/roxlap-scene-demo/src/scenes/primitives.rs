@@ -5,12 +5,13 @@
 //!
 //! Showcases `draw_lines` / `draw_images` / `upload_image` / `pick_image`.
 
-use roxlap_core::opticast::OpticastSettings;
-use roxlap_render::{FrameParams, ImageId};
-use roxlap_scene::{Scene, CHUNK_SIZE_XY};
+use roxlap_render::ImageId;
+use roxlap_scene::Scene;
 use winit::event::MouseButton;
 
-use crate::scene_api::{CameraPose, DemoScene, SceneCtx, SceneInput};
+use crate::scene_api::{
+    frame_params, opticast_settings, CameraPose, DemoScene, SceneCtx, SceneInput,
+};
 use crate::{debug_overlay_lines, demo_image_sprite, make_reference_image};
 
 pub struct PrimitivesScene {
@@ -89,25 +90,8 @@ impl DemoScene for PrimitivesScene {
     }
 
     fn render(&mut self, ctx: &mut SceneCtx) {
-        let mut settings = OpticastSettings::for_oracle_framebuffer(ctx.size.0, ctx.size.1);
-        settings.max_scan_dist = ctx.scan_dist;
-        settings.mip_levels = 6;
-        settings.mip_scan_dist = 64;
-        #[allow(clippy::cast_sign_loss)]
-        let chunks_visible = (ctx.scan_dist.max(1) as u32) / CHUNK_SIZE_XY + 4;
-        let frame = FrameParams {
-            settings: &settings,
-            sky_color: ctx.engine.sky_color(),
-            sky: ctx.engine.sky(),
-            fog_color: ctx.engine.sky_color(),
-            fog_max_scan_dist: ctx.scan_dist,
-            treat_z_max_as_air: true,
-            gpu_mip_scan_dist: 64.0,
-            gpu_max_outer_steps: chunks_visible,
-            gpu_fov_y_rad: 60.0_f32.to_radians(),
-            draw_sprites: true,
-            side_shades: ctx.engine.side_shades(),
-        };
+        let settings = opticast_settings(ctx.size, ctx.scan_dist);
+        let frame = frame_params(ctx.engine, &settings, ctx.scan_dist);
         let camera = ctx.cam.camera();
         ctx.renderer.render(&mut self.scene, &camera, &frame);
 

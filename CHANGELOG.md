@@ -58,6 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`roxlap-scene-demo` refactored into a menu-driven multi-scene
+  showcase** (demo-only; macro-stage DS, `PORTING-DEMO-SCENES.md`). The
+  2296-line kitchen-sink `App` (≈34 fields, ≈20 hotkeys, every feature
+  live at once) is split into a thin host (`host.rs`) + a `DemoScene`
+  trait (`scene_api.rs`) + one module per scene (`scenes/`). The host
+  owns the window, `SceneRenderer`, egui HUD, shared fly-camera +
+  mouse-look, and FPS; `Tab` opens a scene picker. Six scenes each
+  showcase one feature cluster: **World** (streaming hills + ship +
+  collision-fly), **Sprites** (coco field + shoot-to-carve + streaming
+  ring), **Animation** (KFA arm + flame-clip character), **Picking**
+  (top-down `view_ray`/`pick`), **Primitives** (`draw_lines` /
+  `draw_images` / `pick_image`), and **Empty**. Pruned the rarely-used
+  bits: `ROXLAP_AUTOFLY`, the in-app bench, the `H` A/B pose toggle, the
+  `F` frame-capture, `ROXLAP_NO_SPINNER`, and `ROXLAP_GPU_NO_SPRITES`.
+  Kept `ROXLAP_GPU` / `STATIC` / `RKC*` / `KFA_DUMP` / `FPS_LOG` /
+  `GPU_MIP_SCAN_DIST` / `SPRITE_GRID`.
 - **`roxlap-cave-demo` migrated onto the `SceneRenderer` facade**
   (demo-only). The cave world — exactly one scene chunk
   (`128 × 128 × 256`) — is now a single-grid, single-chunk

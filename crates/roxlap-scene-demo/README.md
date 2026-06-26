@@ -60,18 +60,40 @@ cargo run --release -p roxlap-scene-demo
 `--release` matters: the per-pixel scan loops are too slow in
 debug for an interactive frame rate.
 
+## Scenes
+
+The demo is a thin host driving one **scene** at a time, each a
+focused showcase of one engine feature cluster. Press `Tab` to
+open the scene menu and click a scene to switch; switching resets
+all sprite / clip / character layers and snaps the camera to the
+scene's start pose.
+
+| Scene          | Showcases                                                                                  |
+|----------------|--------------------------------------------------------------------------------------------|
+| **World**      | Streaming hills + a rotating ship, flown with collision; chunk streaming, multi-grid composition, LOD billboards. `R` ship spin · `B` LOD billboards · `T` streaming telemetry. |
+| **Sprites**    | A green/red `coco` field, a shoot-to-carve dense blob, and a streaming sprite ring. Left-click shoots the blob · `G` carves the red model's next layer. |
+| **Animation**  | A KFA `animsprite`-driven swinging arm + a flame-clip character (RKC v3 attachment runtime). Both animate on their own. |
+| **Picking**    | Top-down `view_ray` / `pick` (screen→world): a ground-plane cursor + left-click drops a marker at the picked surface voxel. |
+| **Primitives** | Depth-tested debug-line gizmos (`draw_lines`) + a 2D reference quad (`draw_images`); left-click runs the `pick_image` eyedropper. |
+| **Empty**      | A blank world (sky only) — the minimal `DemoScene`.                                         |
+
+Each scene's specific controls show in the on-screen HUD (`F1`).
+
 ## Controls
+
+Global (host-owned) controls, available in every scene:
 
 | Input                 | Action                                                                            |
 |-----------------------|-----------------------------------------------------------------------------------|
-| Click in window       | Grab cursor (mouse-look active)                                                   |
-| `Esc`                 | Release cursor (or close window if cursor isn't grabbed)                          |
+| `Tab`                 | Open / close the scene menu                                                       |
+| `F1`                  | Toggle the HUD (backend, FPS, camera, active scene + its controls)               |
+| Click in window       | Grab cursor (mouse-look active); a grabbed click is forwarded to the scene        |
+| `Esc`                 | Close the menu, else release the cursor, else close the window                    |
 | `W` / `A` / `S` / `D` | Forward / strafe-left / back / strafe-right (camera frame)                        |
 | `Space` / `LShift`    | Up / down (world frame, voxlap convention `−z` / `+z`)                            |
 | `LCtrl`               | Hold for 4× speed                                                                 |
 | Mouse                 | Look around (yaw + pitch)                                                         |
-| `F`                   | Capture current frame + camera state to `roxlap-scene-capture.{txt,ppm}` (debug). |
-| `+` / `-`             | Increase / decrease scan distance by 64 voxels (64..512). Larger values showcase multi-mip's distant-LOD pixel band; smaller values cap mip-0 work for low-end CPUs. Capped at 512 — past ~512 voxels the multi-mip path develops faint green axis-aligned beams against the sky (open bug, see `project_s4b_5_landed.md`). |
+| `+` / `-`             | Increase / decrease scan distance by 64 voxels (64..1024). Larger values showcase multi-mip's distant-LOD pixel band; smaller values cap mip-0 work for low-end CPUs. |
 
 The camera collides with solid voxels (per-axis sliding, ±0.3
 voxel skin) so you can't fly through the ground or the ship's
@@ -85,16 +107,25 @@ scene-build time; no per-frame light cost.
 
 ## Where the code lives
 
-- `src/main.rs` — winit `ApplicationHandler`, softbuffer surface,
-  per-frame render loop calling
-  [`roxlap_scene::render::render_scene_composed`].
-- `src/scene.rs` — `build_demo_scene()` entry point that returns
-  the populated [`Scene`].
-- `src/terrain.rs` — heightmap → chunk voxels with grass / dirt /
-  stone palette. Single-chunk at S3.x; iterates over a chunk
-  lattice once S4 lands.
-- `src/ship.rs` — ship hull geometry. Single-chunk + axis-aligned
-  at S3.x; multi-chunk + rotated once S4 + S5 land.
+- `src/host.rs` — the thin host: winit `ApplicationHandler`, the
+  [`SceneRenderer`] (CPU or GPU backend), the shared fly-camera +
+  mouse-look, the egui HUD + scene menu, FPS, and the active
+  `Box<dyn DemoScene>` + scene registry.
+- `src/scene_api.rs` — the `DemoScene` trait every scene
+  implements, the `SceneCtx` handed to it each frame, the
+  `CameraRig`, and the shared `opticast_settings` / `frame_params`
+  helpers.
+- `src/scenes/` — one module per scene (`world`, `sprites`,
+  `animation`, `picking`, `primitives`, `empty`); each owns its
+  world content + per-scene update / input / render / overlays.
+- `src/main.rs` — content helpers reused across scenes
+  (`build_sprites`, `CarveTarget`, `Spinner`, `build_kfa`,
+  `flame_character`, the debug-line / image / pick primitives) +
+  `fn main` (hands off to [`host::Host`]).
+- `src/scene.rs` — `build_demo()` (the World scene's streaming
+  terrain + ship) and the streaming bake tracker.
+- `src/terrain.rs` / `src/ship.rs` — terrain heightmap → chunk
+  voxels and the ship hull geometry.
 
 [`Scene`]: ../roxlap-scene/src/lib.rs
 [`roxlap_scene::render::render_scene_composed`]: ../roxlap-scene/src/render.rs

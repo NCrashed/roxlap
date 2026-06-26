@@ -6,17 +6,67 @@
 //! owns its world content + per-scene update / input / render / overlays.
 //! See `PORTING-DEMO-SCENES.md`.
 //!
-//! DS.0 lands the trait + context + an `Empty` placeholder; the host is
-//! wired to drive scenes in DS.1.
-
-#![allow(dead_code)] // wired into the host in DS.1
+//! The trait + context are defined here; the host and the concrete scenes
+//! consume them.
 
 use std::f64::consts::PI;
+use std::sync::OnceLock;
 
+use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::{Camera, Engine};
-use roxlap_render::SceneRenderer;
+use roxlap_render::{FrameParams, SceneRenderer};
+use roxlap_scene::CHUNK_SIZE_XY;
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
+
+/// Default GPU mip-scan distance, overridable once via the
+/// `ROXLAP_GPU_MIP_SCAN_DIST` env var (read on first use).
+fn gpu_mip_scan_dist() -> f32 {
+    static V: OnceLock<f32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ROXLAP_GPU_MIP_SCAN_DIST")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64.0)
+    })
+}
+
+/// Per-frame opticast settings every scene shares: the full 6-mip ladder
+/// with the host's `+`/`-` ray-march distance.
+#[must_use]
+pub fn opticast_settings(size: (u32, u32), scan_dist: i32) -> OpticastSettings {
+    let mut s = OpticastSettings::for_oracle_framebuffer(size.0, size.1);
+    s.max_scan_dist = scan_dist;
+    s.mip_levels = 6;
+    s.mip_scan_dist = 64;
+    s
+}
+
+/// Per-frame [`FrameParams`] every scene shares. Sky/fog/shading come from
+/// the host `engine`; the GPU mip-scan distance honours
+/// `ROXLAP_GPU_MIP_SCAN_DIST` (default 64).
+#[must_use]
+pub fn frame_params<'a>(
+    engine: &'a Engine,
+    settings: &'a OpticastSettings,
+    scan_dist: i32,
+) -> FrameParams<'a> {
+    #[allow(clippy::cast_sign_loss)]
+    let chunks_visible = (scan_dist.max(1) as u32) / CHUNK_SIZE_XY + 4;
+    FrameParams {
+        settings,
+        sky_color: engine.sky_color(),
+        sky: engine.sky(),
+        fog_color: engine.sky_color(),
+        fog_max_scan_dist: scan_dist,
+        treat_z_max_as_air: true,
+        gpu_mip_scan_dist: gpu_mip_scan_dist(),
+        gpu_max_outer_steps: chunks_visible,
+        gpu_fov_y_rad: 60.0_f32.to_radians(),
+        draw_sprites: true,
+        side_shades: engine.side_shades(),
+    }
+}
 
 /// Fly speed (voxels/sec) and look sensitivity shared by every scene.
 const MOVE_SPEED: f64 = 64.0;

@@ -198,9 +198,16 @@ pub fn build_demo() -> SceneAndCamera {
 /// [`tick_ship_spin`].
 pub struct SceneAndCamera {
     pub scene: Scene,
+    // `camera` / `cam_pos` / `yaw` / `pitch` and `refresh_camera` are
+    // only exercised by the `repro` regression tests now that the host
+    // drives the live camera via `CameraRig`; keep them for those poses.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub camera: Camera,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub cam_pos: [f64; 3],
+    #[cfg_attr(not(test), allow(dead_code))]
     pub yaw: f64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub pitch: f64,
     /// Grid id of the ship — held so the per-frame spin tick can
     /// update its [`GridTransform::rotation`] without re-iterating
@@ -236,6 +243,8 @@ pub struct SceneAndCamera {
 impl SceneAndCamera {
     /// Recompute the camera basis from the current `(pos, yaw,
     /// pitch)` state. Call after any input that touches them.
+    /// (Regression-test only now — see the field note above.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn refresh_camera(&mut self) {
         self.camera = camera_for_yaw_pitch(self.cam_pos, self.yaw, self.pitch);
     }
