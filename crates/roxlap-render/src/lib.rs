@@ -1970,6 +1970,12 @@ impl SceneRenderer {
     /// with
     /// [`add_streaming_clip_instance`](Self::add_streaming_clip_instance).
     /// No-op on a stale `clip`.
+    ///
+    /// Control the player (play/pause/scrub) via
+    /// [`set_streaming_clip_paused`](Self::set_streaming_clip_paused) /
+    /// [`set_streaming_clip_speed`](Self::set_streaming_clip_speed) /
+    /// [`set_streaming_clip_clock_ms`](Self::set_streaming_clip_clock_ms), the
+    /// per-clip analogues of the flipbook `set_clip_instance_*` methods.
     pub fn play_streaming_clip(
         &mut self,
         clip: StreamingClipId,
@@ -2097,6 +2103,70 @@ impl SceneRenderer {
         self.clip_players
             .iter()
             .find(|p| matches!(p.target, PlayerTarget::Flipbook(i) if i == id))
+            .map(|p| p.clock.clock_ms)
+    }
+
+    /// Find the auto-player driving streaming clip `clip`, if any (a player
+    /// registered via [`play_streaming_clip`](Self::play_streaming_clip)).
+    fn streaming_player_mut(&mut self, clip: StreamingClipId) -> Option<&mut ClipPlayer> {
+        self.clip_players
+            .iter_mut()
+            .find(|p| matches!(p.target, PlayerTarget::Streaming(c) if c == clip))
+    }
+
+    /// Pause / resume a streaming clip's auto-player
+    /// ([`play_streaming_clip`](Self::play_streaming_clip)). No-op if `clip`
+    /// has no player.
+    pub fn set_streaming_clip_paused(&mut self, clip: StreamingClipId, paused: bool) {
+        if let Some(p) = self.streaming_player_mut(clip) {
+            p.paused = paused;
+        }
+    }
+
+    /// Whether streaming clip `clip`'s auto-player is paused, or `None` if it
+    /// has no player.
+    #[must_use]
+    pub fn is_streaming_clip_paused(&self, clip: StreamingClipId) -> Option<bool> {
+        self.clip_players
+            .iter()
+            .find(|p| matches!(p.target, PlayerTarget::Streaming(c) if c == clip))
+            .map(|p| p.paused)
+    }
+
+    /// Set the playback speed (Q8: `256` = 1×, negative = reverse) of
+    /// streaming clip `clip`'s auto-player. No-op if `clip` has no player.
+    pub fn set_streaming_clip_speed(&mut self, clip: StreamingClipId, speed_q8: i32) {
+        if let Some(p) = self.streaming_player_mut(clip) {
+            p.clock.speed_q8 = speed_q8;
+        }
+    }
+
+    /// **Scrub** a streaming clip: set its auto-player's clock to `clock_ms`
+    /// and immediately show the matching frame (works while paused). No-op if
+    /// `clip` has no player.
+    pub fn set_streaming_clip_clock_ms(&mut self, clip: StreamingClipId, clock_ms: f64) {
+        let Some((target, frame)) = self.streaming_player_mut(clip).map(|p| {
+            p.clock.clock_ms = clock_ms;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let frame = frame_at(
+                &p.clock.durations,
+                p.clock.loop_mode,
+                clock_ms.max(0.0) as u32,
+            ) as u32;
+            (p.target, frame)
+        }) else {
+            return;
+        };
+        self.apply_player_frame(target, frame);
+    }
+
+    /// Streaming clip `clip`'s current playback-clock position (ms), or
+    /// `None` if it has no player — the scrubber's read-back.
+    #[must_use]
+    pub fn streaming_clip_clock_ms(&self, clip: StreamingClipId) -> Option<f64> {
+        self.clip_players
+            .iter()
+            .find(|p| matches!(p.target, PlayerTarget::Streaming(c) if c == clip))
             .map(|p| p.clock.clock_ms)
     }
 

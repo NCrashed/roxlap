@@ -60,8 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     inspector + timeline scrubber needn't shadow the `DecodedClip`. Live
     auto-player control (play/pause/scrub): `set_clip_instance_paused` /
     `is_clip_instance_paused` / `set_clip_instance_speed` /
-    `set_clip_instance_clock_ms` (scrub) / `clip_instance_clock_ms`.
-    `update_clip_frame(id, frame, &VoxelFrame)` re-uploads one frame in
+    `set_clip_instance_clock_ms` (scrub) / `clip_instance_clock_ms` (and the
+    per-clip `set_streaming_clip_paused` / `_speed` / `_clock_ms` /
+    `is_streaming_clip_paused` / `streaming_clip_clock_ms` analogues for
+    streaming players). `update_clip_frame(id, frame, &VoxelFrame)` re-uploads one frame in
     place (O(1 frame), vs remove + re-add). `remove_character` now frees the
     models + clips it registered (no leak when hot-swapping). New
     `set_character_world_transform` teleports a character (re-solve + re-pose)
