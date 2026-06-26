@@ -28,6 +28,10 @@ rust-version = "1.77"
 readme = "README.md"
 
 [workspace.dependencies]
+# VCL — pure-Rust deflate for `.rvc` per-chunk compression (roxlap-formats
+# `voxel_clip`). Already present transitively (flate2 / png); pinned here
+# so the direct dependency tracks the same major.
+miniz_oxide = "0.8"
 # R12 multicore rendering — rayon's work-stealing pool, par_iter, and
 # join cover every parallelism axis we need (per-quadrant in R12.2,
 # per-tile in R12.3, per-column lighting bake in R12.4). Declared

@@ -22,8 +22,11 @@
 //!
 //! ```text
 //! magic   b"RVCL"
-//! version u16 = 1
-//! chunks  [tag(4) | len(u32) | payload]  until EOF; unknown tags preserved
+//! version u16 = 2
+//! chunks  [tag(4) | flags(u8) | len(u32) | payload]  until EOF; unknown
+//!         tags preserved. flags bit0 = payload is raw-deflated, stored as
+//!         raw_len(u32) | deflate_bytes (and `len` counts that). Each chunk
+//!         is deflated only when it shrinks; small ones stay raw.
 //!   META : dims[3] u32, pivot[3] f32, voxel_world_size f32,
 //!          loop_mode u8, default_frame_ms u32, frame_count u32
 //!   FRMS : per frame: kind u8 {Key=0, Delta=1}; Key = full frame
@@ -33,18 +36,29 @@
 //!   TIME : optional per-frame durations (frame_count × u32 ms)
 //! ```
 //!
-//! v1 is plain (no varints / no deflate) — those are reserved as
-//! backward-compatible follow-ups (a per-chunk "compressed" flag).
+//! Compression is per-chunk deflate (`miniz_oxide`): the occupancy
+//! bitmasks + colour runs compress well, while `META` / small chunks stay
+//! raw. **v1** (no `flags` byte, every payload raw) still parses.
 
 use crate::bytes::{Cursor, OutOfBounds};
 use crate::kv6::{compute_vis_dir, Kv6};
 
 const MAGIC: [u8; 4] = *b"RVCL";
-const VERSION: u16 = 1;
+/// Current on-disk version. v2 adds a per-chunk `flags` byte (deflate).
+const VERSION: u16 = 2;
+/// v1 had no per-chunk `flags` byte and stored every payload raw; still
+/// readable.
+const VERSION_LEGACY: u16 = 1;
 
 const TAG_META: [u8; 4] = *b"META";
 const TAG_FRMS: [u8; 4] = *b"FRMS";
 const TAG_TIME: [u8; 4] = *b"TIME";
+
+/// Chunk `flags` bit: the payload is raw-deflated (`raw_len(u32) | data`).
+const CHUNK_FLAG_DEFLATED: u8 = 0x01;
+/// miniz_oxide deflate level for `.rvc` writes (clips are written once,
+/// read often — favour ratio over encode speed, but level 10 is overkill).
+const DEFLATE_LEVEL: u8 = 8;
 
 const FRAME_KIND_KEY: u8 = 0;
 const FRAME_KIND_DELTA: u8 = 1;
@@ -616,24 +630,32 @@ impl VoxelClip {
             });
         }
         let version = cur.read_u16()?;
-        if version != VERSION {
+        if version != VERSION && version != VERSION_LEGACY {
             return Err(ParseError::UnsupportedVersion(version));
         }
+        // v2 prefixes each chunk payload with a `flags` byte; v1 doesn't.
+        let has_flags = version >= VERSION;
 
-        let mut meta: Option<&[u8]> = None;
-        let mut frms: Option<&[u8]> = None;
-        let mut time: Option<&[u8]> = None;
+        let mut meta: Option<Vec<u8>> = None;
+        let mut frms: Option<Vec<u8>> = None;
+        let mut time: Option<Vec<u8>> = None;
         let mut extra_chunks = Vec::new();
         while cur.remaining() > 0 {
             let tag_buf = cur.read_bytes(4)?;
             let tag = [tag_buf[0], tag_buf[1], tag_buf[2], tag_buf[3]];
+            let flags = if has_flags { cur.read_u8()? } else { 0 };
             let len = cur.read_u32()? as usize;
-            let payload = cur.read_bytes(len)?;
+            let stored = cur.read_bytes(len)?;
+            let payload = if flags & CHUNK_FLAG_DEFLATED != 0 {
+                inflate_chunk(stored)?
+            } else {
+                stored.to_vec()
+            };
             match tag {
                 TAG_META => meta = Some(payload),
                 TAG_FRMS => frms = Some(payload),
                 TAG_TIME => time = Some(payload),
-                _ => extra_chunks.push((tag, payload.to_vec())),
+                _ => extra_chunks.push((tag, payload)),
             }
         }
 
@@ -641,10 +663,10 @@ impl VoxelClip {
         let frms = frms.ok_or(ParseError::MissingChunk(TAG_FRMS))?;
 
         let (dims, pivot, voxel_world_size, loop_mode, default_frame_ms, frame_count) =
-            parse_meta(meta)?;
-        let frames = parse_frms(frms, dims, frame_count)?;
+            parse_meta(&meta)?;
+        let frames = parse_frms(&frms, dims, frame_count)?;
         let durations = match time {
-            Some(p) => parse_time(p, frame_count)?,
+            Some(p) => parse_time(&p, frame_count)?,
             None => Vec::new(),
         };
 
@@ -710,14 +732,46 @@ fn frame_dirs(frame: &VoxelFrame, dims: [u32; 3], owpc: usize) -> Vec<u32> {
 
 // ---- serialize / parse helpers ------------------------------------------
 
+/// Write a v2 chunk: `tag(4) | flags(u8) | len(u32) | payload`. The body is
+/// built into a scratch buffer, deflated, and stored compressed
+/// (`CHUNK_FLAG_DEFLATED`, payload = `raw_len(u32) | deflate_bytes`) only
+/// when that actually shrinks it — small/incompressible chunks stay raw.
 fn write_chunk(out: &mut Vec<u8>, tag: [u8; 4], body: impl FnOnce(&mut Vec<u8>)) {
+    let mut raw = Vec::new();
+    body(&mut raw);
     out.extend_from_slice(&tag);
-    let len_pos = out.len();
-    out.extend_from_slice(&0u32.to_le_bytes());
-    let start = out.len();
-    body(out);
-    let len = u32::try_from(out.len() - start).expect("chunk payload length fits u32");
-    out[len_pos..len_pos + 4].copy_from_slice(&len.to_le_bytes());
+
+    let deflated = miniz_oxide::deflate::compress_to_vec(&raw, DEFLATE_LEVEL);
+    // `+4` accounts for the raw-length prefix a deflated payload carries.
+    if deflated.len() + 4 < raw.len() {
+        out.push(CHUNK_FLAG_DEFLATED);
+        let len = u32::try_from(deflated.len() + 4).expect("chunk length fits u32");
+        out.extend_from_slice(&len.to_le_bytes());
+        let raw_len = u32::try_from(raw.len()).expect("raw length fits u32");
+        out.extend_from_slice(&raw_len.to_le_bytes());
+        out.extend_from_slice(&deflated);
+    } else {
+        out.push(0);
+        let len = u32::try_from(raw.len()).expect("chunk length fits u32");
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&raw);
+    }
+}
+
+/// Inflate a `CHUNK_FLAG_DEFLATED` payload (`raw_len(u32) | deflate_bytes`).
+/// The stored `raw_len` bounds the output (decompression-bomb guard) and is
+/// checked against the actual inflated length.
+fn inflate_chunk(payload: &[u8]) -> Result<Vec<u8>, ParseError> {
+    if payload.len() < 4 {
+        return Err(ParseError::BadDeflate);
+    }
+    let raw_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let out = miniz_oxide::inflate::decompress_to_vec_with_limit(&payload[4..], raw_len)
+        .map_err(|_| ParseError::BadDeflate)?;
+    if out.len() != raw_len {
+        return Err(ParseError::BadDeflate);
+    }
+    Ok(out)
 }
 
 /// Length-prefixed (`u32`) array of `u32`s.
@@ -835,12 +889,17 @@ pub enum FrameError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
-    BadMagic { got: [u8; 4] },
+    BadMagic {
+        got: [u8; 4],
+    },
     UnsupportedVersion(u16),
     Truncated,
     MissingChunk([u8; 4]),
     BadLoopMode,
     BadFrameKind(u8),
+    /// A `CHUNK_FLAG_DEFLATED` payload failed to inflate, or its inflated
+    /// length disagreed with the stored `raw_len`.
+    BadDeflate,
 }
 
 impl From<OutOfBounds> for ParseError {
@@ -1224,5 +1283,111 @@ mod tests {
                 expected: [2, 2, 2],
             }
         );
+    }
+
+    // ---- compression (v2 per-chunk deflate) -------------------------------
+
+    #[test]
+    fn compressed_clip_round_trips_and_shrinks() {
+        // A fully-solid frame: every occupancy word all-set, one repeated
+        // colour — maximally compressible.
+        let dims = [16u32, 16, 32];
+        let frame = frame_from_fn(dims, |_, _, _| Some(0x80AB_CDEF));
+        let clip = VoxelClip::from_frames(
+            dims,
+            [8.0, 8.0, 16.0],
+            1.0,
+            LoopMode::Loop,
+            &[frame],
+            &[],
+            33,
+            0,
+        );
+        let bytes = clip.serialize();
+        // The colour run alone is 16·16·32·4 = 32 KiB raw; deflate of a
+        // single repeated colour collapses the whole file far under that.
+        let raw_colors_bytes = (dims[0] * dims[1] * dims[2]) as usize * 4;
+        assert!(
+            bytes.len() < raw_colors_bytes / 4,
+            "expected compression: {} serialized bytes vs {raw_colors_bytes} raw colour bytes",
+            bytes.len(),
+        );
+        // Version is 2 and round-trips through parse byte-for-byte (deflate
+        // is deterministic).
+        assert_eq!(&bytes[4..6], &VERSION.to_le_bytes());
+        let parsed = VoxelClip::parse(&bytes).expect("parse");
+        assert_eq!(parsed, clip);
+        assert_eq!(parsed.serialize(), bytes);
+    }
+
+    /// Serialize a keyframe-only clip in the pre-v2 (v1) byte form: no
+    /// per-chunk `flags` byte, every payload raw.
+    fn serialize_v1(clip: &VoxelClip) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(payload);
+        }
+        fn u32_vec(out: &mut Vec<u8>, v: &[u32]) {
+            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for w in v {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RVCL");
+        out.extend_from_slice(&1u16.to_le_bytes());
+
+        let mut meta = Vec::new();
+        for v in clip.dims {
+            meta.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in clip.pivot {
+            meta.extend_from_slice(&v.to_le_bytes());
+        }
+        meta.extend_from_slice(&clip.voxel_world_size.to_le_bytes());
+        meta.push(clip.loop_mode.to_u8());
+        meta.extend_from_slice(&clip.default_frame_ms.to_le_bytes());
+        meta.extend_from_slice(&(clip.frames.len() as u32).to_le_bytes());
+        chunk(&mut out, b"META", &meta);
+
+        let mut frms = Vec::new();
+        for ef in &clip.frames {
+            let EncodedFrame::Key(f) = ef else {
+                panic!("serialize_v1 test helper handles keyframes only");
+            };
+            frms.push(FRAME_KIND_KEY);
+            u32_vec(&mut frms, &f.occupancy);
+            u32_vec(&mut frms, &f.color_offsets);
+            u32_vec(&mut frms, &f.colors);
+        }
+        chunk(&mut out, b"FRMS", &frms);
+        out
+    }
+
+    #[test]
+    fn legacy_v1_file_still_parses() {
+        let dims = [2u32, 2, 3];
+        let frame = frame_from_fn(dims, |_, _, z| (z == 0).then_some(0x80FF_0000));
+        let clip =
+            VoxelClip::from_frames(dims, [0.0; 3], 1.0, LoopMode::Once, &[frame], &[], 50, 0);
+        let v1 = serialize_v1(&clip);
+        assert_eq!(&v1[4..6], &1u16.to_le_bytes(), "helper writes version 1");
+        let parsed = VoxelClip::parse(&v1).expect("v1 must still parse");
+        assert_eq!(parsed, clip);
+    }
+
+    #[test]
+    fn bad_deflate_payload_is_rejected() {
+        // v2 file whose META chunk is flagged deflated but holds garbage.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RVCL");
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(b"META");
+        bytes.push(CHUNK_FLAG_DEFLATED);
+        let payload = [99u8, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF]; // raw_len=99, junk
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        assert_eq!(VoxelClip::parse(&bytes), Err(ParseError::BadDeflate));
     }
 }

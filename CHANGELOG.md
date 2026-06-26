@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sprite into one clip frame) + `VoxelClip::from_kv6_frames` (encode a
     sequence of same-dims `.kv6` frames straight into a clip), so clips can
     be built from existing voxel models, not just procedurally.
+  - `.rvc` per-chunk deflate (format **v2**, via `miniz_oxide` — the
+    formats crate's first runtime dependency). Each chunk is deflated when
+    that shrinks it (a `flags` byte in the envelope; occupancy bitmasks +
+    colour runs compress hugely), else stored raw. v1 files still parse.
   - GPU flipbook: `sprite_model_from_clip_frame` (field-move upload) +
     `SpriteRegistryResident::set_instance_model` (the per-frame select).
   - CPU flipbook: `roxlap_core::ClipFlipbook` (cached `SpriteDense` per

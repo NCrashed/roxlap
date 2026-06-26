@@ -12,6 +12,12 @@ documentation = "https://docs.rs/roxlap-formats"
 keywords = ["voxlap", "voxel", "parser", "kv6", "vxl"]
 categories = ["parser-implementations", "game-development", "graphics"]
 
+[dependencies]
+# VCL — `.rvc` per-chunk deflate (occupancy bitmasks + colour runs
+# compress well). Pure-Rust deflate, already in the tree transitively
+# (flate2 / png). The crate's only runtime dependency.
+miniz_oxide = { workspace = true }
+
 [dev-dependencies]
 # R2.3: oracle.vxl.gz fixture is the procedurally-built world voxlaptest
 # renders, gzipped for repo-friendly size (37 MB → 200 KB). Pure-Rust
