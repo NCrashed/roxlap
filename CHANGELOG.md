@@ -78,6 +78,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **GPU flipbook-clip registration flushes the staging pool in batches**
+  (`roxlap-gpu` / `roxlap-render`; #4). `add_voxel_clip` uploads N frame
+  volumes at once; a big flipbook (or many clips registered in one frame)
+  could stage that many `write_buffer`s before the next submit and exhaust
+  the device staging pool — the same crash the `chunk_upload_budget` guards
+  against, which then panics egui-wgpu. It now flushes (`GpuRenderer::
+  flush_writes`, an empty submit) every `ROXLAP_GPU_CLIP_BUDGET` frames
+  (default 8; `0` = unbounded). Streaming clips upload one model, so they
+  sidestep the spike entirely.
 - **`roxlap-scene-demo` refactored into a menu-driven multi-scene
   showcase** (demo-only; macro-stage DS, `PORTING-DEMO-SCENES.md`). The
   2296-line kitchen-sink `App` (≈34 fields, ≈20 hotkeys, every feature

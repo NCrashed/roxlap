@@ -3360,6 +3360,16 @@ impl GpuRenderer {
     /// Cost is amortised O(new model voxels): the shared volume buffers
     /// carry slack and bump-append, growing (and rebuilding once from the
     /// registry) only on overflow.
+    /// Flush queued `write_buffer` uploads by submitting an empty command
+    /// stream. wgpu stages `write_buffer` data and flushes it on the next
+    /// `Queue::submit`; calling this between batches of uploads (e.g. a
+    /// flipbook's frames in [`Self::add_sprite_model`]) recycles the device
+    /// staging pool so a big one-shot batch can't exhaust it (which would
+    /// then crash egui-wgpu's own `write_buffer`).
+    pub fn flush_writes(&self) {
+        self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+    }
+
     pub fn add_sprite_model(
         &mut self,
         registry: &sprite_model::SpriteModelRegistry,

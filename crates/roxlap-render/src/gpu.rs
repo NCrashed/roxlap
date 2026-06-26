@@ -125,6 +125,13 @@ pub(crate) struct GpuBackend {
     /// rest ride the next frames (refresh runs every frame). `u32::MAX`
     /// (env `ROXLAP_GPU_CHUNK_BUDGET=0`) restores the old unbounded path.
     chunk_upload_budget: u32,
+    /// Flush the device staging pool every this-many frame uploads while
+    /// registering a flipbook clip ([`Self::add_voxel_clip`]): an N-frame
+    /// flipbook (or many clips at once) would otherwise stage N volumes of
+    /// `write_buffer`s before the next submit and exhaust the pool (#4).
+    /// `u32::MAX` (env `ROXLAP_GPU_CLIP_BUDGET=0`) restores the unbounded
+    /// path. (Streaming clips upload one model, so they never hit this.)
+    clip_upload_budget: u32,
     /// CPU shadow copy of each uploaded image (`rgba`, `w`, `h`), keyed by
     /// the [`ImageId`] `roxlap-gpu` hands back. The GPU texture isn't read
     /// back, so `pick_image`'s alpha test samples this instead. Indexed by
@@ -163,8 +170,23 @@ impl GpuBackend {
             host_sky_set: false,
             auto_sky_color: None,
             chunk_upload_budget: Self::chunk_upload_budget_from_env(),
+            clip_upload_budget: Self::clip_upload_budget_from_env(),
             image_pixels: Vec::new(),
             transforms_dirty: false,
+        }
+    }
+
+    /// Frames-per-staging-flush while registering a flipbook clip — default
+    /// 8, overridable via `ROXLAP_GPU_CLIP_BUDGET` (`0` = unbounded). See
+    /// [`Self::clip_upload_budget`].
+    fn clip_upload_budget_from_env() -> u32 {
+        match std::env::var("ROXLAP_GPU_CLIP_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            Some(0) => u32::MAX,
+            Some(n) => n,
+            None => 8,
         }
     }
 
@@ -399,10 +421,23 @@ impl GpuBackend {
             // appends just this chain's volume.
             self.gpu.add_sprite_model(&registry, chain);
             chains.push(chain);
+            // #4: keep the staging pool bounded — an N-frame flipbook stages
+            // N volumes of `write_buffer`s before the next submit; flush in
+            // batches so a big clip (or many at once) can't exhaust it.
+            if self.clip_upload_budget != u32::MAX
+                && (frame as u32 + 1) % self.clip_upload_budget == 0
+            {
+                self.gpu.flush_writes();
+            }
         }
         self.sprite_registry = Some(registry);
         let idx = self.clips.len();
         self.clips.push(chains);
+        // Final flush of this clip's residual (< budget) batch so a later
+        // clip registered the same frame starts from a drained pool.
+        if self.clip_upload_budget != u32::MAX {
+            self.gpu.flush_writes();
+        }
         idx
     }
 
