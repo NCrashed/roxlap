@@ -1,14 +1,25 @@
 //! roxlap-scene-demo — interactive showcase of the scene-graph
 //! engine. See `README.md` for the controls + the demo's
 //! evolution roadmap as the scene-graph substages land.
+//!
+//! DS refactor in progress: the host now lives in [`host`] and drives
+//! menu-selectable [`scene_api::DemoScene`]s. The old monolithic `App` +
+//! its sprite/animation/picking/primitive helpers below are kept (dead)
+//! as the source for porting the remaining scenes (DS.2–DS.4); the
+//! crate-level `allow(dead_code)` is removed in DS.5.
+
+// DS.1: the old `App` + per-feature helpers are dead until DS.2–DS.4 move
+// them into scenes; the host drives `WorldScene` + `EmptyScene` for now.
+#![allow(dead_code)]
 
 mod collision;
+mod host;
 mod kv6_sprite;
 mod markers;
 #[cfg(test)]
 mod repro;
 mod scene;
-// DS.0 — demo-scene API + scenes (host wiring lands in DS.1).
+// DS.0–DS.1 — demo-scene API + scenes + the thin host.
 mod scene_api;
 mod scenes;
 mod ship;
@@ -860,7 +871,7 @@ fn plane_hit(pos: [f64; 3], dir: [f64; 3], ground_z: f64) -> Option<[f32; 3]> {
 fn main() {
     let event_loop = EventLoop::new().expect("winit: EventLoop::new");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new();
+    let mut app = host::Host::new();
     event_loop.run_app(&mut app).expect("winit: run_app");
 }
 

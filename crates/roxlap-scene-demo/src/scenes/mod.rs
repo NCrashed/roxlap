@@ -9,3 +9,4 @@
 #![allow(dead_code)] // wired into the host in DS.1
 
 pub mod empty;
+pub mod world;
