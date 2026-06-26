@@ -66,6 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     models + clips it registered (no leak when hot-swapping). New
     `set_character_world_transform` teleports a character (re-solve + re-pose)
     without ticking its animation / clip clocks.
+  - Editor-API hardening: `add_streaming_clip_instance` now returns a
+    distinct `StreamingInstanceId` (+ `set_streaming_instance_transform` /
+    `remove_streaming_instance`) — a streaming clip's frame is per-clip, so
+    the type makes "scrub two instances independently" a compile error rather
+    than a silent coupling. The clip / character / streaming slotmaps bump a
+    generation epoch on `set_sprites`, so a handle held across a reset
+    resolves to `None` instead of aliasing whatever re-took its slot.
+    `upload_image` returns `Option<ImageId>` (was `ImageId(0)` on error,
+    indistinguishable from the first valid id).
   - GPU flipbook: `sprite_model_from_clip_frame` (field-move upload) +
     `SpriteRegistryResident::set_instance_model` (the per-frame select).
   - CPU flipbook: `roxlap_core::ClipFlipbook` (cached `SpriteDense` per

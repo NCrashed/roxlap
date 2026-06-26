@@ -244,18 +244,25 @@ pub struct VoxelClipId {
 /// Facade-side slotmap for registered voxel clips — mirrors
 /// [`DynModelMap`]: a clip slot maps 1:1 to the backends' positional clip
 /// index (append-only, tombstoned in place on removal, never reused).
+///
+/// `reset` clears the slots **and bumps `epoch`**, which is baked into each
+/// minted id's `gen`. A handle from before a `set_sprites` therefore carries
+/// the old epoch and resolves to `None` rather than silently aliasing the
+/// new clip that re-took its slot.
 #[derive(Default)]
 struct DynClipMap {
+    /// Per slot: `(epoch_at_alloc, live)`.
     slots: Vec<(u32, bool)>,
+    epoch: u32,
 }
 
 impl DynClipMap {
     fn alloc(&mut self, clip_index: u32) -> VoxelClipId {
         debug_assert_eq!(self.slots.len() as u32, clip_index);
-        self.slots.push((0, true));
+        self.slots.push((self.epoch, true));
         VoxelClipId {
             slot: clip_index,
-            gen: 0,
+            gen: self.epoch,
         }
     }
 
@@ -277,6 +284,7 @@ impl DynClipMap {
 
     fn reset(&mut self) {
         self.slots.clear();
+        self.epoch = self.epoch.wrapping_add(1);
     }
 }
 
@@ -291,19 +299,23 @@ pub struct CharacterId {
     gen: u32,
 }
 
-/// Facade-side slotmap for registered characters (mirrors [`DynClipMap`]).
+/// Facade-side slotmap for registered characters (mirrors [`DynClipMap`],
+/// including the epoch bump on `reset` so a pre-`set_sprites` handle
+/// resolves to `None` instead of aliasing a new character).
 #[derive(Default)]
 struct CharMap {
+    /// Per slot: `(epoch_at_alloc, live)`.
     slots: Vec<(u32, bool)>,
+    epoch: u32,
 }
 
 impl CharMap {
     fn alloc(&mut self, index: u32) -> CharacterId {
         debug_assert_eq!(self.slots.len() as u32, index);
-        self.slots.push((0, true));
+        self.slots.push((self.epoch, true));
         CharacterId {
             slot: index,
-            gen: 0,
+            gen: self.epoch,
         }
     }
     fn index(&self, id: CharacterId) -> Option<usize> {
@@ -322,6 +334,7 @@ impl CharMap {
     }
     fn reset(&mut self) {
         self.slots.clear();
+        self.epoch = self.epoch.wrapping_add(1);
     }
 }
 
@@ -337,19 +350,40 @@ pub struct StreamingClipId {
     gen: u32,
 }
 
-/// Facade-side slotmap for streaming clips (mirrors [`CharMap`]).
+/// Handle to an instance of a streaming clip
+/// ([`add_streaming_clip_instance`](SceneRenderer::add_streaming_clip_instance)).
+///
+/// Deliberately **distinct** from [`SpriteInstanceId`]: a streaming clip's
+/// frame is per-*clip* (all its instances share one re-uploaded model,
+/// advanced by
+/// [`set_streaming_clip_frame`](SceneRenderer::set_streaming_clip_frame)), so
+/// a streaming instance is *not* accepted by the per-instance
+/// [`set_clip_instance_frame`](SceneRenderer::set_clip_instance_frame) —
+/// trying to scrub two instances of one streaming clip independently is a
+/// compile error, not a silent coupling. (Use a flipbook clip for
+/// per-instance frames.) Move it with
+/// [`set_streaming_instance_transform`](SceneRenderer::set_streaming_instance_transform)
+/// and drop it with
+/// [`remove_streaming_instance`](SceneRenderer::remove_streaming_instance).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct StreamingInstanceId(SpriteInstanceId);
+
+/// Facade-side slotmap for streaming clips (mirrors [`CharMap`], epoch bump
+/// on `reset` included).
 #[derive(Default)]
 struct StreamingClipMap {
+    /// Per slot: `(epoch_at_alloc, live)`.
     slots: Vec<(u32, bool)>,
+    epoch: u32,
 }
 
 impl StreamingClipMap {
     fn alloc(&mut self, index: u32) -> StreamingClipId {
         debug_assert_eq!(self.slots.len() as u32, index);
-        self.slots.push((0, true));
+        self.slots.push((self.epoch, true));
         StreamingClipId {
             slot: index,
-            gen: 0,
+            gen: self.epoch,
         }
     }
     fn index(&self, id: StreamingClipId) -> Option<usize> {
@@ -368,6 +402,7 @@ impl StreamingClipMap {
     }
     fn reset(&mut self) {
         self.slots.clear();
+        self.epoch = self.epoch.wrapping_add(1);
     }
 }
 
@@ -1156,13 +1191,17 @@ impl SceneRenderer {
     /// so the per-frame draw call stays cheap. Sampling is
     /// nearest-neighbour (pixel-art friendly — no blurring).
     ///
-    /// Returns `ImageId(0)` for malformed input (wrong byte count or a
-    /// zero dimension); such an id draws nothing.
-    pub fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> ImageId {
-        match &mut self.inner {
+    /// Returns `None` for malformed input — a wrong byte count
+    /// (`!= width·height·4`) or a zero dimension — so a bad upload can't be
+    /// confused with the first valid id (`ImageId(0)`).
+    pub fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> Option<ImageId> {
+        if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
+            return None;
+        }
+        Some(match &mut self.inner {
             BackendImpl::Cpu(c) => c.upload_image(rgba, width, height),
             BackendImpl::Gpu(g) => g.upload_image(rgba, width, height),
-        }
+        })
     }
 
     /// Release a texture uploaded with [`upload_image`](Self::upload_image).
@@ -1811,19 +1850,35 @@ impl SceneRenderer {
         &mut self,
         id: StreamingClipId,
         xf: DynSpriteTransform,
-    ) -> SpriteInstanceId {
+    ) -> StreamingInstanceId {
         let model = self
             .streaming_map
             .index(id)
             .and_then(|idx| self.streaming_clips[idx].as_ref())
             .map(|s| s.model);
-        match model {
+        let inst = match model {
             Some(model) => self.add_sprite_instance_posed(model, xf),
             None => SpriteInstanceId {
                 slot: u32::MAX,
                 gen: u32::MAX,
             },
-        }
+        };
+        StreamingInstanceId(inst)
+    }
+
+    /// Re-pose a streaming-clip instance (world transform). No-op on a stale
+    /// handle.
+    pub fn set_streaming_instance_transform(
+        &mut self,
+        id: StreamingInstanceId,
+        xf: DynSpriteTransform,
+    ) {
+        self.set_sprite_instance_transform(id.0, xf);
+    }
+
+    /// Remove a streaming-clip instance. Returns `false` if `id` is stale.
+    pub fn remove_streaming_instance(&mut self, id: StreamingInstanceId) -> bool {
+        self.remove_sprite_instance(id.0)
     }
 
     /// Advance a streaming clip to `frame`: seek the cursor and re-upload its
@@ -2525,12 +2580,20 @@ mod tests {
         // Mismatched generation never resolves.
         assert_eq!(map.clip_index(VoxelClipId { slot: 1, gen: 5 }), None);
 
-        // `set_sprites` resets the clip layer → ids restart at 0.
+        // `set_sprites` resets the clip layer → ids restart at slot 0, but
+        // the epoch bumps so old handles don't alias the new clips.
         map.reset();
         assert_eq!(map.clip_index(c1), None, "reset invalidates old handles");
-        let again = map.alloc(0);
-        assert_eq!(again, VoxelClipId { slot: 0, gen: 0 });
+        let again = map.alloc(0); // re-takes slot 0 under the new epoch
+        assert_eq!(again, VoxelClipId { slot: 0, gen: 1 });
         assert_eq!(map.clip_index(again), Some(0));
+        // The footgun fix: c0 (slot 0, old epoch) must NOT resolve to the new
+        // clip now occupying slot 0.
+        assert_eq!(
+            map.clip_index(c0),
+            None,
+            "a pre-reset handle must not alias a new clip on the same slot"
+        );
     }
 
     /// The character slotmap (VCL.6) mints stable ids, resolves only live
@@ -2553,7 +2616,8 @@ mod tests {
 
         map.reset();
         assert_eq!(map.index(b), None);
-        assert_eq!(map.alloc(0), CharacterId { slot: 0, gen: 0 });
+        assert_eq!(map.alloc(0), CharacterId { slot: 0, gen: 1 });
+        assert_eq!(map.index(a), None, "pre-reset handle must not alias slot 0");
     }
 
     /// The streaming-clip slotmap (#3) mints stable ids, resolves only live
@@ -2576,7 +2640,8 @@ mod tests {
 
         map.reset();
         assert_eq!(map.index(b), None);
-        assert_eq!(map.alloc(0), StreamingClipId { slot: 0, gen: 0 });
+        assert_eq!(map.alloc(0), StreamingClipId { slot: 0, gen: 1 });
+        assert_eq!(map.index(a), None, "pre-reset handle must not alias slot 0");
     }
 
     /// The shared clip-playback clock (#6 / VCL.6): `tick` accumulates time

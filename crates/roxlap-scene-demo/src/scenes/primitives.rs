@@ -54,7 +54,7 @@ impl DemoScene for PrimitivesScene {
     fn enter(&mut self, ctx: &mut SceneCtx) {
         if self.image_id.is_none() {
             let (rgba, iw, ih) = make_reference_image();
-            self.image_id = Some(ctx.renderer.upload_image(&rgba, iw, ih));
+            self.image_id = ctx.renderer.upload_image(&rgba, iw, ih);
             eprintln!("Primitives: reference image uploaded ({iw}x{ih}); debug gizmos active");
         }
     }
