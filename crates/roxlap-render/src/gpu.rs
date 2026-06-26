@@ -56,6 +56,13 @@ pub(crate) struct GpuBackend {
     empty_resident: Option<GpuSceneResident>,
     /// Grid ids in upload order — index = per-grid camera slot.
     grid_ids: Vec<GridId>,
+    /// Sorted raw grid ids of the scene the [`resident`](Self::resident)
+    /// was last built for. A scene switch swaps the whole grid set; when
+    /// this no longer matches the incoming scene the resident is stale and
+    /// gets rebuilt — otherwise the previous scene's grids (e.g. the World
+    /// scene's ship) would ghost into a gridless scene. (The CPU backend
+    /// renders straight from the scene each frame, so it can't go stale.)
+    resident_scene_grids: Vec<u32>,
     /// Per-grid `chunk_idx → last-uploaded version` for the dirty poll.
     versions: Vec<HashMap<IVec3, u64>>,
     /// Instanced sprite registry + the uploaded instance list; `None`
@@ -139,6 +146,7 @@ impl GpuBackend {
             resident: None,
             empty_resident: None,
             grid_ids: Vec::new(),
+            resident_scene_grids: Vec::new(),
             versions: Vec::new(),
             sprite_registry: None,
             sprite_instances: Vec::new(),
@@ -659,6 +667,14 @@ impl GpuBackend {
         // (which carries its own sky texture + fog state).
         self.sync_sky_and_fog(frame);
 
+        // Drop a resident built for a different scene (a scene switch swaps
+        // the whole grid set). Without this the previous scene's grids —
+        // e.g. the World scene's ship saucer — ghost into a gridless scene,
+        // since `refresh_dirty` only walks the resident's own grid ids.
+        if self.resident.is_some() && !self.resident_matches_scene(scene) {
+            self.resident = None;
+        }
+
         if self.resident.is_none() {
             self.upload_scene(scene);
         } else {
@@ -884,7 +900,25 @@ impl GpuBackend {
     /// dirty-version trackers. Moved verbatim from the scene-demo's
     /// `upload_first_scene` (minus the streaming pump, which the host
     /// drives before calling render).
+    /// Whether the cached [`resident`](Self::resident) was built for
+    /// `scene`'s grid set (sorted raw ids). A mismatch ⇒ a scene switch or
+    /// grid add/remove invalidated it.
+    fn resident_matches_scene(&self, scene: &Scene) -> bool {
+        let mut ids: Vec<u32> = scene.grids().map(|(g, _)| g.raw()).collect();
+        ids.sort_unstable();
+        ids == self.resident_scene_grids
+    }
+
     fn upload_scene(&mut self, scene: &Scene) {
+        // Snapshot the scene's grid set so a later scene switch is detected
+        // (see `resident_matches_scene`). Recorded even when no grids are
+        // uploadable yet — the empty set still has to match next frame.
+        self.resident_scene_grids = {
+            let mut ids: Vec<u32> = scene.grids().map(|(g, _)| g.raw()).collect();
+            ids.sort_unstable();
+            ids
+        };
+
         let mut grids_by_id: Vec<_> = scene.grids().collect();
         grids_by_id.sort_by_key(|(gid, _)| gid.raw());
 
