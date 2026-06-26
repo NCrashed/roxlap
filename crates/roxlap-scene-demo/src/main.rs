@@ -8,6 +8,9 @@ mod markers;
 #[cfg(test)]
 mod repro;
 mod scene;
+// DS.0 — demo-scene API + scenes (host wiring lands in DS.1).
+mod scene_api;
+mod scenes;
 mod ship;
 mod terrain;
 

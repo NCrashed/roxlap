@@ -31,7 +31,7 @@ use crate::{markers, ship, terrain};
 
 /// Camera basis for "yaw=0, pitch=0 looks +x, voxlap-z down".
 /// Same convention as the existing `roxlap-host` demo.
-fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
+pub fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
     let (sy, cy) = yaw.sin_cos();
     let (sp, cp) = pitch.sin_cos();
     Camera {
