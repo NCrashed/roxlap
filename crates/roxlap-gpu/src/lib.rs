@@ -504,6 +504,13 @@ pub struct GpuRenderer {
     /// Lazy-built on first [`Self::render_scene`] call. Holds the
     /// multi-grid pipeline + per-grid camera uniforms.
     scene_dda: Option<SceneDdaResources>,
+    /// Whether the *current* deferred frame ran a scene pass that wrote
+    /// `scene_dda.depth_buffer`. [`Self::render_scene`] sets it; the
+    /// color-only [`Self::render_clear_deferred`] clears it. Without this,
+    /// depth-tested overlays (`draw_lines_deferred` / `draw_image`) drawn
+    /// over an empty/cleared scene would test against the *previous*
+    /// scene's stale depth and clip incorrectly.
+    scene_depth_valid: bool,
     /// GPU.8 — panoramic sky texture + sampler. Created at
     /// `new` as a 1×1 mid-grey default; [`Self::set_sky_panorama`]
     /// replaces it. The scene-DDA bind group references this each
@@ -1037,6 +1044,7 @@ impl GpuRenderer {
             chunk_dda: None,
             grid_dda: None,
             scene_dda: None,
+            scene_depth_valid: false,
             sky_texture,
             sky_view,
             sky_sampler,
@@ -2215,6 +2223,9 @@ impl GpuRenderer {
             rpass.draw(0..3, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
+        // This frame wrote `scene_dda.depth_buffer`, so depth-tested
+        // overlays may test against it.
+        self.scene_depth_valid = true;
         // Deferred present — the host calls `present` or `paint_egui`.
         self.pending_frame = Some((surf_tex, surf_view));
         self.frame_count = self.frame_count.wrapping_add(1);
@@ -2225,6 +2236,10 @@ impl GpuRenderer {
     /// presenting. The facade uses this before any grid is resident so a
     /// HUD can still be painted over an empty scene.
     pub fn render_clear_deferred(&mut self) {
+        // No scene pass this frame ⇒ `scene_dda.depth_buffer` (if it
+        // exists from an earlier scene) is stale; depth-tested overlays
+        // must not test against it.
+        self.scene_depth_valid = false;
         self.pending_frame = None;
         let Some(surf_tex) = self.acquire_frame() else {
             return;
@@ -2294,10 +2309,13 @@ impl GpuRenderer {
         self.ensure_line_resources();
         let res = self.line_resources.as_ref().expect("just built");
 
-        // Skip the depth test when there's no scene depth buffer to read
-        // (sprite-only / empty scene) — bind the 1-word dummy so the layout
-        // is satisfied; `no_depth = 1` keeps the shader from indexing it.
-        let no_depth = u32::from(self.scene_dda.is_none());
+        // Skip the depth test when there's no current scene depth to read —
+        // either no buffer at all (sprite-only / never-rendered) or this
+        // frame was a color-only clear so the buffer is stale (an empty
+        // scene drawn after a grid scene). The 1-word dummy / stale buffer
+        // is still bound to satisfy the layout; `no_depth = 1` keeps the
+        // shader from indexing it.
+        let no_depth = u32::from(self.scene_dda.is_none() || !self.scene_depth_valid);
         let params = LineParams {
             screen_w: w,
             screen_h: h,
@@ -2591,7 +2609,9 @@ impl GpuRenderer {
         }
 
         self.ensure_image_resources();
-        let no_depth = u32::from(self.scene_dda.is_none());
+        // See `draw_lines_deferred`: skip depth when there's no valid
+        // current-frame scene depth (none built, or a color-only clear).
+        let no_depth = u32::from(self.scene_dda.is_none() || !self.scene_depth_valid);
         let params = LineParams {
             screen_w: w,
             screen_h: h,
