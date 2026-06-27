@@ -1761,7 +1761,7 @@ mod tests {
     /// import be compared against the all-voxels `frame_from_fn` reference.
     /// Spaced on even coords; the colour encodes `(x, y, z)`.
     fn isolated_fill(x: u32, y: u32, z: u32) -> Option<u32> {
-        (x % 2 == 0 && y % 2 == 0 && z % 2 == 0).then(|| 0x8000_0000 | (x << 16) | (y << 8) | z)
+        (x % 2 == 0 && y % 2 == 0 && z % 2 == 0).then_some(0x8000_0000 | (x << 16) | (y << 8) | z)
     }
 
     #[test]
@@ -1925,8 +1925,8 @@ mod tests {
     /// Serialize a keyframe-only clip in the pre-v2 (v1) byte form: no
     /// per-chunk `flags` byte, every payload raw.
     fn serialize_v1(clip: &VoxelClip) -> Vec<u8> {
-        fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
-            out.extend_from_slice(tag);
+        fn chunk(out: &mut Vec<u8>, tag: [u8; 4], payload: &[u8]) {
+            out.extend_from_slice(&tag);
             out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             out.extend_from_slice(payload);
         }
@@ -1951,7 +1951,7 @@ mod tests {
         meta.push(clip.loop_mode.to_u8());
         meta.extend_from_slice(&clip.default_frame_ms.to_le_bytes());
         meta.extend_from_slice(&(clip.frames.len() as u32).to_le_bytes());
-        chunk(&mut out, b"META", &meta);
+        chunk(&mut out, *b"META", &meta);
 
         let mut frms = Vec::new();
         for ef in &clip.frames {
@@ -1963,7 +1963,7 @@ mod tests {
             u32_vec(&mut frms, &f.color_offsets);
             u32_vec(&mut frms, &f.colors);
         }
-        chunk(&mut out, b"FRMS", &frms);
+        chunk(&mut out, *b"FRMS", &frms);
         out
     }
 
