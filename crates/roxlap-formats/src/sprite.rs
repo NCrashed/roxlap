@@ -78,6 +78,12 @@ pub struct Sprite {
     /// unscaled, the default). Scales the material's alpha so an effect can
     /// fade out by cheap per-frame updates without re-uploading its volume.
     pub alpha_mul: u8,
+    /// Per-voxel material colour map (TV.3): `(rgb, material_id)` pairs that
+    /// classify this model's voxels into materials by colour — a mixed model
+    /// (opaque frame + glass, bottle + potion). **Empty** (the default) means
+    /// the whole sprite uses [`material`](Self::material) uniformly (the TV.1
+    /// path). See [`crate::material::material_for_color`].
+    pub material_map: Vec<(u32, u8)>,
 }
 
 impl Sprite {
@@ -113,6 +119,7 @@ impl Sprite {
             flags: 0,
             material: 0,
             alpha_mul: 255,
+            material_map: Vec::new(),
         }
     }
 

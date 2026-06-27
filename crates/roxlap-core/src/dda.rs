@@ -1620,8 +1620,16 @@ mod tests {
         let sky = crate::sky::Sky::from_pixels(pixels, 8, 1);
         let up = sample_sky(&sky, [0.0, 0.0, -1.0]); // −z is up
         let down = sample_sky(&sky, [0.0, 0.0, 1.0]); // +z is down
-        assert_eq!(up & 0x00ff_ffff, 0x0011_1111, "looking up → column 0 (zenith)");
-        assert_eq!(down & 0x00ff_ffff, 0x0099_9999, "looking down → last column (nadir)");
+        assert_eq!(
+            up & 0x00ff_ffff,
+            0x0011_1111,
+            "looking up → column 0 (zenith)"
+        );
+        assert_eq!(
+            down & 0x00ff_ffff,
+            0x0099_9999,
+            "looking down → last column (nadir)"
+        );
     }
 
     /// `render_sky_fill` paints the panorama for a **gridless** view — the

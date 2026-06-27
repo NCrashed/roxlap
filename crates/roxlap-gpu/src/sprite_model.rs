@@ -24,6 +24,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use roxlap_formats::kv6::Kv6;
+use roxlap_formats::material::material_for_color;
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 
@@ -48,6 +49,12 @@ pub struct SpriteModel {
     /// Prefix sums: `color_offsets[col]` is the first colour index of
     /// column `col`; length `mx * my + 1`.
     pub color_offsets: Vec<u32>,
+    /// Per-voxel material id (TV.3), parallel to [`colors`](Self::colors).
+    /// **Empty** means the model has no per-voxel materials — every voxel
+    /// uses the instance's uniform material (the TV.1/TV.2 path). A non-empty
+    /// array gives mixed-material models (opaque frame + glass). Built by
+    /// [`build_sprite_model_with_materials`].
+    pub materials: Vec<u8>,
     /// World-space size of one voxel of this model (GPU.10.4 LOD): 1.0
     /// at mip-0, doubling each [`SpriteModel::downsample`]. The shader
     /// divides the local ray by this so a coarse voxel spans the right
@@ -64,14 +71,38 @@ pub struct SpriteModel {
 /// malformed model).
 #[must_use]
 pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
+    build_sprite_model_inner(kv6, &[])
+}
+
+/// Build the DDA volume from a KV6, classifying each voxel into a per-voxel
+/// **material id** by colour (TV.3 mixed models) via `material_map`
+/// (`(rgb, material_id)` pairs; see
+/// [`material_for_color`](roxlap_formats::material::material_for_color)).
+/// An empty map produces a model with no per-voxel materials (identical to
+/// [`build_sprite_model`]).
+///
+/// # Panics
+/// As [`build_sprite_model`].
+#[must_use]
+pub fn build_sprite_model_with_materials(kv6: &Kv6, material_map: &[(u32, u8)]) -> SpriteModel {
+    build_sprite_model_inner(kv6, material_map)
+}
+
+fn build_sprite_model_inner(kv6: &Kv6, material_map: &[(u32, u8)]) -> SpriteModel {
     let (mx, my, mz) = (kv6.xsiz, kv6.ysiz, kv6.zsiz);
     let occ_words_per_col = mz.div_ceil(32).max(1);
     let cols = (mx * my) as usize;
+    let want_mats = !material_map.is_empty();
 
     let mut occupancy = vec![0u32; cols * occ_words_per_col as usize];
     let mut color_offsets = vec![0u32; cols + 1];
     let mut colors: Vec<u32> = Vec::with_capacity(kv6.voxels.len());
     let mut dirs: Vec<u32> = Vec::with_capacity(kv6.voxels.len());
+    let mut materials: Vec<u8> = if want_mats {
+        Vec::with_capacity(kv6.voxels.len())
+    } else {
+        Vec::new()
+    };
 
     // Pass 1 — consume voxels in KV6 storage order (x-outer / y-inner)
     // into per-column buckets keyed by `col = x + y*mx`. Each entry is
@@ -102,6 +133,9 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
             occupancy[base] |= 1u32 << (z & 31);
             colors.push(col_rgba);
             dirs.push(u32::from(dir));
+            if want_mats {
+                materials.push(material_for_color(material_map, col_rgba));
+            }
         }
     }
     color_offsets[cols] = colors.len() as u32;
@@ -114,6 +148,7 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
         color_offsets,
         colors,
         dirs,
+        materials,
         voxel_world_size: 1.0,
     }
 }
@@ -149,6 +184,8 @@ pub fn sprite_model_from_voxel_frame(
         colors: frame.colors.clone(),
         dirs: dirs.to_vec(),
         color_offsets: frame.color_offsets.clone(),
+        // Voxel clips have no per-voxel materials yet (per-instance only).
+        materials: Vec::new(),
         voxel_world_size,
     }
 }
@@ -391,6 +428,7 @@ impl SpriteModel {
             colors: Vec::new(),
             dirs: Vec::new(),
             color_offsets: vec![0],
+            materials: Vec::new(),
             voxel_world_size: 1.0,
         }
     }
@@ -446,6 +484,9 @@ impl SpriteModel {
                 // No normal supplied by this API — default to dir 0 (the
                 // sole caller, the carve hotkey, only ever clears).
                 self.dirs.insert(idx, 0);
+                if !self.materials.is_empty() {
+                    self.materials.insert(idx, 0); // new voxel → opaque material
+                }
                 for c in &mut self.color_offsets[col + 1..=cols] {
                     *c += 1;
                 }
@@ -458,6 +499,9 @@ impl SpriteModel {
             self.occupancy[base + zw] &= !(1u32 << zb);
             self.colors.remove(idx);
             self.dirs.remove(idx);
+            if !self.materials.is_empty() {
+                self.materials.remove(idx);
+            }
             for c in &mut self.color_offsets[col + 1..=cols] {
                 *c -= 1;
             }
@@ -494,10 +538,13 @@ impl SpriteModel {
         let [fx, fy, fz] = self.dims;
         let fidx = |x: u32, y: u32, z: u32| (x + y * fx + z * fx * fy) as usize;
 
-        // Reconstruct dense fine voxels (solid flag + colour + normal).
+        // Reconstruct dense fine voxels (solid flag + colour + normal + TV
+        // material).
+        let has_mats = !self.materials.is_empty();
         let mut solid = vec![false; (fx * fy * fz) as usize];
         let mut fine = vec![0u32; (fx * fy * fz) as usize];
         let mut fine_dir = vec![0u32; (fx * fy * fz) as usize];
+        let mut fine_mat = vec![0u8; (fx * fy * fz) as usize];
         for x in 0..fx {
             for y in 0..fy {
                 let col = (x + y * fx) as usize;
@@ -509,6 +556,9 @@ impl SpriteModel {
                     if (self.occupancy[w] >> (z & 31)) & 1 == 1 {
                         fine[fidx(x, y, z)] = self.colors[off + seen];
                         fine_dir[fidx(x, y, z)] = self.dirs[off + seen];
+                        if has_mats {
+                            fine_mat[fidx(x, y, z)] = self.materials[off + seen];
+                        }
                         solid[fidx(x, y, z)] = true;
                         seen += 1;
                     }
@@ -525,6 +575,7 @@ impl SpriteModel {
         let mut color_offsets = vec![0u32; cols + 1];
         let mut colors: Vec<u32> = Vec::new();
         let mut dirs: Vec<u32> = Vec::new();
+        let mut materials: Vec<u8> = Vec::new();
 
         // Emit in column-index order (`ccol = cx + cy*nx`), cy outer,
         // so `color_offsets` is a monotonic prefix sum like build's.
@@ -534,9 +585,11 @@ impl SpriteModel {
                 color_offsets[ccol] = colors.len() as u32;
                 for cz in 0..nz {
                     let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
-                    // Normals don't average meaningfully — keep the first
-                    // solid child's `dir` as the coarse voxel's normal.
+                    // Normals + materials don't average meaningfully — keep
+                    // the first solid child's `dir` / material for the coarse
+                    // voxel.
                     let mut rep_dir = 0u32;
+                    let mut rep_mat = 0u8;
                     for dz in 0..2 {
                         for dy in 0..2 {
                             for dx in 0..2 {
@@ -545,6 +598,7 @@ impl SpriteModel {
                                     let c = fine[fidx(x, y, z)];
                                     if n == 0 {
                                         rep_dir = fine_dir[fidx(x, y, z)];
+                                        rep_mat = fine_mat[fidx(x, y, z)];
                                     }
                                     a += (c >> 24) & 0xff;
                                     r += (c >> 16) & 0xff;
@@ -561,6 +615,9 @@ impl SpriteModel {
                         occupancy[base] |= 1u32 << (cz & 31);
                         colors.push(avg);
                         dirs.push(rep_dir);
+                        if has_mats {
+                            materials.push(rep_mat);
+                        }
                     }
                 }
             }
@@ -579,6 +636,7 @@ impl SpriteModel {
             colors,
             dirs,
             color_offsets,
+            materials,
             voxel_world_size: self.voxel_world_size * 2.0,
         }
     }
@@ -707,7 +765,9 @@ struct SpriteModelMeta {
     color_offsets_offset: u32,
     occ_words_per_col: u32,
     dims: [u32; 3],
-    _pad0: u32,
+    /// TV.3 — 1 if this model has per-voxel materials (`materials_vox` is
+    /// populated for it); 0 ⇒ use the instance's uniform material.
+    has_vox_materials: u32,
     pivot: [f32; 3],
     /// GPU.10.4 — world size of one voxel of this (mip) entry.
     voxel_world_size: f32,
@@ -773,6 +833,11 @@ pub struct SpriteRegistryResident {
     /// same layout as [`colors`](Self::colors). The shader indexes the
     /// per-instance `kv6colmul` table by it.
     pub dirs: wgpu::Buffer,
+    /// Per-voxel material id (TV.3), same layout as [`colors`](Self::colors)
+    /// (one u32 per voxel). `0` for models without per-voxel materials; the
+    /// per-model `has_vox_materials` flag in `model_meta` says whether to use
+    /// it (else the shader falls back to the instance's uniform material).
+    pub materials_vox: wgpu::Buffer,
     pub color_offsets: wgpu::Buffer,
     pub model_meta: wgpu::Buffer,
     /// Holds up to `instance_capacity` instances; the visible subset
@@ -879,6 +944,7 @@ impl SpriteRegistryResident {
         let mut all_offsets: Vec<u32> = Vec::new();
         let mut all_colors: Vec<u32> = vec![0; cap_total as usize];
         let mut all_dirs: Vec<u32> = vec![0; cap_total as usize];
+        let mut all_materials: Vec<u32> = vec![0; cap_total as usize];
         let mut meta: Vec<SpriteModelMeta> = Vec::with_capacity(registry.entries.len());
         let mut occ_lens: Vec<u32> = Vec::with_capacity(registry.entries.len());
         let mut coloff_lens: Vec<u32> = Vec::with_capacity(registry.entries.len());
@@ -892,7 +958,7 @@ impl SpriteRegistryResident {
                 color_offsets_offset: all_offsets.len() as u32,
                 occ_words_per_col: m.occ_words_per_col,
                 dims: m.dims,
-                _pad0: 0,
+                has_vox_materials: u32::from(!m.materials.is_empty()),
                 pivot: m.pivot,
                 voxel_world_size: m.voxel_world_size,
             });
@@ -903,6 +969,9 @@ impl SpriteRegistryResident {
             let off = slot.off as usize;
             all_colors[off..off + m.colors.len()].copy_from_slice(&m.colors);
             all_dirs[off..off + m.dirs.len()].copy_from_slice(&m.dirs);
+            for (i, &mat) in m.materials.iter().enumerate() {
+                all_materials[off + i] = u32::from(mat);
+            }
         }
 
         // Per-instance cull records: sphere centred at the instance
@@ -945,6 +1014,12 @@ impl SpriteRegistryResident {
                 cap_total,
             ),
             dirs: storage_dst_u32_cap(device, "roxlap-gpu sprite_reg.dirs", &all_dirs, cap_total),
+            materials_vox: storage_dst_u32_cap(
+                device,
+                "roxlap-gpu sprite_reg.materials_vox",
+                &all_materials,
+                cap_total,
+            ),
             color_offsets: storage_dst_u32_cap(
                 device,
                 "roxlap-gpu sprite_reg.color_offsets",
@@ -1193,6 +1268,12 @@ impl SpriteRegistryResident {
                         u64::from(off) * 4,
                         bytemuck::cast_slice(&m.dirs),
                     );
+                    let mats: Vec<u32> = m.materials.iter().map(|&x| u32::from(x)).collect();
+                    queue.write_buffer(
+                        &self.materials_vox,
+                        u64::from(off) * 4,
+                        bytemuck::cast_slice(&mats),
+                    );
                     if self.meta[e].colors_offset != off {
                         // Relocated — rewrite this entry's meta record.
                         self.meta[e].colors_offset = off;
@@ -1258,6 +1339,7 @@ impl SpriteRegistryResident {
 
         let mut all_colors = vec![0u32; cap_total as usize];
         let mut all_dirs = vec![0u32; cap_total as usize];
+        let mut all_materials = vec![0u32; cap_total as usize];
         for (e, m) in registry.entries.iter().enumerate() {
             if self.dead[e] {
                 self.meta[e].colors_offset = 0;
@@ -1266,6 +1348,9 @@ impl SpriteRegistryResident {
             let off = self.colors_alloc.slot(e).off as usize;
             all_colors[off..off + m.colors.len()].copy_from_slice(&m.colors);
             all_dirs[off..off + m.dirs.len()].copy_from_slice(&m.dirs);
+            for (i, &mat) in m.materials.iter().enumerate() {
+                all_materials[off + i] = u32::from(mat);
+            }
             self.meta[e].colors_offset = off as u32;
         }
         self.colors = storage_dst_u32_cap(
@@ -1275,7 +1360,15 @@ impl SpriteRegistryResident {
             cap_total,
         );
         self.dirs = storage_dst_u32_cap(device, "roxlap-gpu sprite_reg.dirs", &all_dirs, cap_total);
-        eprintln!("roxlap-gpu: sprite registry colors/dirs grew + repacked to {cap_total} words");
+        self.materials_vox = storage_dst_u32_cap(
+            device,
+            "roxlap-gpu sprite_reg.materials_vox",
+            &all_materials,
+            cap_total,
+        );
+        eprintln!(
+            "roxlap-gpu: sprite registry colors/dirs/materials grew + repacked to {cap_total} words"
+        );
     }
 
     /// Append a new model (its full LOD chain) to the resident registry
@@ -1338,7 +1431,7 @@ impl SpriteRegistryResident {
                 color_offsets_offset: coloff_off,
                 occ_words_per_col: m.occ_words_per_col,
                 dims: m.dims,
-                _pad0: 0,
+                has_vox_materials: u32::from(!m.materials.is_empty()),
                 pivot: m.pivot,
                 voxel_world_size: m.voxel_world_size,
             });
@@ -1364,6 +1457,8 @@ impl SpriteRegistryResident {
                 let off = u64::from(self.meta[e].colors_offset) * 4;
                 queue.write_buffer(&self.colors, off, bytemuck::cast_slice(&m.colors));
                 queue.write_buffer(&self.dirs, off, bytemuck::cast_slice(&m.dirs));
+                let mats: Vec<u32> = m.materials.iter().map(|&x| u32::from(x)).collect();
+                queue.write_buffer(&self.materials_vox, off, bytemuck::cast_slice(&mats));
             }
         }
 

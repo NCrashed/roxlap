@@ -28,8 +28,9 @@ use roxlap_core::Camera;
 use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_gpu::{
-    build_sprite_model, sprite_model_from_clip_frame, sprite_model_from_voxel_frame, GpuInitError,
-    GpuRenderer, GpuSceneResident, SpriteInstance, SpriteInstanceTransform, SpriteModelRegistry,
+    build_sprite_model, build_sprite_model_with_materials, sprite_model_from_clip_frame,
+    sprite_model_from_voxel_frame, GpuInitError, GpuRenderer, GpuSceneResident, SpriteInstance,
+    SpriteInstanceTransform, SpriteModelRegistry,
 };
 use roxlap_scene::{GridId, Scene};
 
@@ -389,8 +390,28 @@ impl GpuBackend {
     /// before any `set_sprites`. Mirrors the new chain into the host-side
     /// `sprite_model_ids` / `sprite_models_tpl`.
     pub(crate) fn add_model(&mut self, kv6: &Kv6) -> usize {
+        self.add_model_chain(build_sprite_model(kv6), kv6)
+    }
+
+    /// Register a model whose voxels carry per-voxel material ids (TV.3),
+    /// classified by colour from `material_map`. The per-voxel `materials`
+    /// ride the `SpriteModel`; the device-side material buffer + shader
+    /// lookup land in TV.3b (until then the GPU renders these with the
+    /// instance's uniform material).
+    pub(crate) fn add_model_with_materials(
+        &mut self,
+        kv6: &Kv6,
+        material_map: &[(u32, u8)],
+    ) -> usize {
+        self.add_model_chain(build_sprite_model_with_materials(kv6, material_map), kv6)
+    }
+
+    /// Shared body of [`Self::add_model`] / [`Self::add_model_with_materials`]:
+    /// add the model's LOD chain to the resident registry + mirror the host
+    /// template.
+    fn add_model_chain(&mut self, model: roxlap_gpu::SpriteModel, kv6: &Kv6) -> usize {
         let mut registry = self.sprite_registry.take().unwrap_or_default();
-        let chain_id = registry.add_lod(build_sprite_model(kv6), 4);
+        let chain_id = registry.add_lod(model, 4);
         // `gpu.add_sprite_model` establishes residency (zero-instance
         // upload) if none yet, else appends just this chain's volume.
         self.gpu.add_sprite_model(&registry, chain_id);

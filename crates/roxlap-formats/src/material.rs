@@ -161,6 +161,24 @@ impl Default for MaterialTable {
     }
 }
 
+/// Resolve a voxel's **material id** from a colour→material map — the
+/// authoring bridge for mixed-material models (TV.3). A model is colour-coded
+/// (e.g. cyan voxels = glass, grey = an opaque frame); `map` pairs an RGB
+/// colour (`0xRRGGBB`, the brightness byte is ignored) with the material id
+/// it maps to. A voxel whose colour isn't in `map` resolves to `0`
+/// ([`Material::OPAQUE`]). Linear scan — `map` is tiny (a handful of material
+/// colours), so this stays cheap even called per voxel.
+#[must_use]
+pub fn material_for_color(map: &[(u32, u8)], col: u32) -> u8 {
+    let rgb = col & 0x00ff_ffff;
+    for &(c, id) in map {
+        if c & 0x00ff_ffff == rgb {
+            return id;
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

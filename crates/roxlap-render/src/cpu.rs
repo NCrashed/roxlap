@@ -577,6 +577,21 @@ impl CpuBackend {
         idx
     }
 
+    /// Register a model template carrying a per-voxel material colour map
+    /// (TV.3 mixed models). Instances clone it, so the map travels with each
+    /// spawned instance and the per-draw decode classifies voxels by colour.
+    pub(crate) fn add_model_with_materials(
+        &mut self,
+        kv6: &Kv6,
+        material_map: &[(u32, u8)],
+    ) -> usize {
+        let idx = self.models.len();
+        let mut s = Sprite::axis_aligned(kv6.clone(), [0.0, 0.0, 0.0]);
+        s.material_map = material_map.to_vec();
+        self.models.push(s);
+        idx
+    }
+
     /// Tombstone model template `host_idx` in place: replace it with an
     /// empty placeholder (freeing its kv6) but keep the slot, mirroring
     /// the GPU backend's in-place tombstone. Existing instances keep their

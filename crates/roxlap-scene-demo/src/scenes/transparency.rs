@@ -56,7 +56,22 @@ impl TransparencyScene {
         let model = r.add_sprite_model(kv6);
         r.add_sprite_instance_posed(model, Self::pose(pos))
     }
+
+    /// A **mixed-material** window panel (TV.3): an opaque brown frame around
+    /// translucent cyan glass — built as one colour-coded model. Thin in y so
+    /// it faces the camera. The glass colour maps to `MAT_GLASS`; the frame
+    /// colour isn't in the map, so it stays opaque (material 0).
+    fn build_window() -> Kv6 {
+        const FRAME: u32 = 0x80_6A_4A_2A; // opaque brown
+        Kv6::from_fn(30, 3, 30, |x, _y, z| {
+            let edge = x < 4 || x >= 26 || z < 4 || z >= 26;
+            Some(if edge { FRAME } else { GLASS_RGB })
+        })
+    }
 }
+
+/// The glass voxel colour shared by the window's glass + its material map.
+const GLASS_RGB: u32 = 0x80_50_C0_E0;
 
 impl DemoScene for TransparencyScene {
     fn name(&self) -> &'static str {
@@ -106,6 +121,15 @@ impl DemoScene for TransparencyScene {
         r.set_sprite_instance_material(smoke, MAT_SMOKE);
         self.smoke = Some(smoke);
         self.clock = 0.0;
+
+        // Mixed-material window (TV.3): one model, an opaque frame around
+        // translucent glass — the glass colour maps to MAT_GLASS, the frame
+        // stays opaque (per-voxel materials, no per-instance material needed).
+        let window = r.add_sprite_model_with_materials(
+            &Self::build_window(),
+            &[(GLASS_RGB & 0x00ff_ffff, MAT_GLASS)],
+        );
+        let _window_inst = r.add_sprite_instance_posed(window, Self::pose([-50.0, 95.0, 40.0]));
 
         eprintln!(
             "Transparency: glass (alpha id {MAT_GLASS}) over an opaque backdrop, \

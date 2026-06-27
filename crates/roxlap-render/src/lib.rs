@@ -1599,6 +1599,29 @@ impl SceneRenderer {
         self.model_map.alloc(model_index as u32)
     }
 
+    /// Register a **mixed-material** sprite model (TV.3): `material_map` pairs
+    /// a voxel RGB colour (`0xRRGGBB`) with a material id (defined via
+    /// [`define_material`](Self::define_material)), so a single model can mix
+    /// opaque and translucent voxels — an opaque window frame around glass, a
+    /// bottle around a translucent potion. Voxels whose colour isn't in the
+    /// map are opaque (material 0). Like [`add_sprite_model`](Self::add_sprite_model)
+    /// otherwise.
+    ///
+    /// The CPU backend composites per-voxel materials today; the GPU backend
+    /// carries the data and renders per-voxel materials once the TV.3b device
+    /// path lands (until then it uses the instance's uniform material).
+    pub fn add_sprite_model_with_materials(
+        &mut self,
+        kv6: &Kv6,
+        material_map: &[(u32, u8)],
+    ) -> SpriteModelId {
+        let model_index = match &mut self.inner {
+            BackendImpl::Cpu(c) => c.add_model_with_materials(kv6, material_map),
+            BackendImpl::Gpu(g) => g.add_model_with_materials(kv6, material_map),
+        };
+        self.model_map.alloc(model_index as u32)
+    }
+
     /// Remove a registered sprite model, freeing its voxel data. Returns
     /// `false` if `id` is stale / already removed.
     ///

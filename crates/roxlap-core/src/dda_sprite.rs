@@ -20,7 +20,7 @@
 //! brightness model, not voxlap's `dir`-LUT reflection shading.
 
 use roxlap_formats::kv6::Kv6;
-use roxlap_formats::material::{BlendMode, MaterialTable};
+use roxlap_formats::material::{material_for_color, BlendMode, MaterialTable};
 use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_INVISIBLE, SPRITE_FLAG_NO_Z};
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 
@@ -96,6 +96,30 @@ impl SpriteDense {
             mat: Vec::new(),
             pivot: [kv6.xpiv, kv6.ypiv, kv6.zpiv],
         }
+    }
+
+    /// Like [`from_kv6`](Self::from_kv6) but classifies each voxel into a
+    /// material id by colour (TV.3 mixed models) via `material_map`
+    /// (`(rgb, material_id)` pairs; see
+    /// [`material_for_color`](roxlap_formats::material::material_for_color)).
+    /// The resulting per-voxel `mat` array is consulted by the
+    /// [`draw_sprite_dense_shaded`] accumulate path. An empty map yields the
+    /// same all-opaque (uniform) result as `from_kv6`.
+    #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn from_kv6_with_materials(kv6: &Kv6, material_map: &[(u32, u8)]) -> Self {
+        let mut dense = Self::from_kv6(kv6);
+        if !material_map.is_empty() {
+            let n = dense.col.len();
+            let mut mat = vec![0u8; n];
+            for (idx, slot) in mat.iter_mut().enumerate() {
+                if dense.occ[idx] {
+                    *slot = material_for_color(material_map, dense.col[idx]);
+                }
+            }
+            dense.mat = mat;
+        }
+        dense
     }
 
     /// Decode a voxel-clip [`VoxelFrame`] (dense-column layout) into the
@@ -334,9 +358,12 @@ fn cast_local_layers(
     // adjacent surface voxels passes through both and double-composites a thin
     // strip — the model reads as "diced" by a voxel grid. Treating each solid
     // run as one surface makes a wall contribute exactly one alpha regardless
-    // of how many of its voxels the ray grazes. (Opaque voxels still stop the
-    // ray on every cell — TV.3 mixed runs rely on that.)
+    // of how many of its voxels the ray grazes. A run is also re-entered on a
+    // material change (TV.3: two adjacent translucent materials each count),
+    // and an opaque voxel stops the ray on every cell (the opaque core of a
+    // mixed model).
     let mut prev_solid = false;
+    let mut prev_mat = 0u8;
 
     for _ in 0..max_steps {
         if cell[0] < 0
@@ -364,35 +391,26 @@ fn cast_local_layers(
                 dense.mat[idx]
             };
             let m = shade_ctx.materials.get(mat_id);
-            match m.mode {
-                BlendMode::Opaque => {
-                    acc.opaque = Some((shade(dense.col[idx], 0), t_curr));
-                    touched = true;
+            if m.is_opaque() {
+                acc.opaque = Some((shade(dense.col[idx], 0), t_curr));
+                touched = true;
+                break;
+            }
+            // Composite one alpha layer per solid-run entry or material change.
+            if !prev_solid || mat_id != prev_mat {
+                let lit = rgb_to_f32(shade(dense.col[idx], 0));
+                let a = f32::from(m.alpha) / 255.0 * (f32::from(shade_ctx.alpha_mul) / 255.0);
+                acc.rgb[0] += acc.trans * a * lit[0];
+                acc.rgb[1] += acc.trans * a * lit[1];
+                acc.rgb[2] += acc.trans * a * lit[2];
+                if m.mode == BlendMode::AlphaBlend {
+                    acc.trans *= 1.0 - a; // Additive glow does not occlude.
+                }
+                touched = true;
+                prev_mat = mat_id;
+                if acc.trans < 1.0 / 256.0 {
                     break;
                 }
-                BlendMode::AlphaBlend if !prev_solid => {
-                    let lit = rgb_to_f32(shade(dense.col[idx], 0));
-                    let a = f32::from(m.alpha) / 255.0 * (f32::from(shade_ctx.alpha_mul) / 255.0);
-                    acc.rgb[0] += acc.trans * a * lit[0];
-                    acc.rgb[1] += acc.trans * a * lit[1];
-                    acc.rgb[2] += acc.trans * a * lit[2];
-                    acc.trans *= 1.0 - a;
-                    touched = true;
-                    if acc.trans < 1.0 / 256.0 {
-                        break;
-                    }
-                }
-                BlendMode::Additive if !prev_solid => {
-                    let lit = rgb_to_f32(shade(dense.col[idx], 0));
-                    let a = f32::from(m.alpha) / 255.0 * (f32::from(shade_ctx.alpha_mul) / 255.0);
-                    acc.rgb[0] += acc.trans * a * lit[0];
-                    acc.rgb[1] += acc.trans * a * lit[1];
-                    acc.rgb[2] += acc.trans * a * lit[2];
-                    touched = true;
-                }
-                // Interior of a solid run (prev_solid) — already counted at
-                // entry; skip without re-compositing.
-                BlendMode::AlphaBlend | BlendMode::Additive => {}
             }
         }
         prev_solid = solid_here;
@@ -467,8 +485,14 @@ pub fn draw_sprite_dda_shaded(
         return 0;
     }
     // Decodes the KV6 to a dense grid each call (the per-frame cost an
-    // animated clip avoids via [`ClipFlipbook`]'s cached grids).
-    let dense = SpriteDense::from_kv6(&sprite.kv6);
+    // animated clip avoids via [`ClipFlipbook`]'s cached grids). A non-empty
+    // `material_map` classifies voxels into per-voxel materials (TV.3 mixed
+    // models); an empty one is the plain uniform-material decode.
+    let dense = if sprite.material_map.is_empty() {
+        SpriteDense::from_kv6(&sprite.kv6)
+    } else {
+        SpriteDense::from_kv6_with_materials(&sprite.kv6, &sprite.material_map)
+    };
     draw_sprite_dense_shaded(
         fb,
         zb,
@@ -1624,5 +1648,93 @@ mod tests {
             (after_glass >> 16) & 0xff < 0xFF,
             "glass should reduce the backdrop's red (got {after_glass:08x})"
         );
+    }
+
+    /// TV.3: `from_kv6_with_materials` classifies voxels into per-voxel
+    /// material ids by colour — mapped colour → its id, unmapped → 0.
+    #[test]
+    fn from_kv6_with_materials_classifies_by_color() {
+        let col = 0x80_AA_BB_CC;
+        let kv6 = Kv6::solid_cube(6, col);
+        let dense = SpriteDense::from_kv6_with_materials(&kv6, &[(0x00AA_BBCC, 2)]);
+        assert_eq!(
+            dense.mat.len(),
+            dense.col.len(),
+            "per-voxel mat array sized"
+        );
+        let mut solids = 0;
+        for idx in 0..dense.occ.len() {
+            if dense.occ[idx] {
+                assert_eq!(dense.mat[idx], 2, "mapped colour → material 2");
+                solids += 1;
+            }
+        }
+        assert!(solids > 0, "cube has solid voxels");
+        // A map that doesn't include the cube's colour → all opaque (0).
+        let dense0 = SpriteDense::from_kv6_with_materials(&kv6, &[(0x0012_3456, 5)]);
+        assert!(
+            dense0.mat.iter().all(|&m| m == 0),
+            "unmapped colour → material 0"
+        );
+    }
+
+    /// TV.3: a model whose every voxel maps to the *same* material id renders
+    /// identically to drawing it with that material as the instance's uniform
+    /// material — the per-voxel path reduces to the uniform path when
+    /// homogeneous (and overrides the instance's `material`).
+    #[test]
+    fn per_voxel_material_matches_uniform_when_homogeneous() {
+        let mut table = MaterialTable::new();
+        table.set(1, Material::alpha_blend(120));
+        let col = 0x80_30_A0_F0;
+        let kv6 = Kv6::solid_cube(10, col);
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+        let cfg = settings(w, h);
+        let (pos, s, hh, f) = (
+            [0.0, 40.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        );
+        let render = |dense: &SpriteDense, material: u8| -> Vec<u32> {
+            let mut fb = vec![0x80_10_10_10u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            let sh = SpriteShade {
+                materials: &table,
+                material,
+                alpha_mul: 255,
+            };
+            let _ = draw_sprite_dense_shaded(
+                &mut fb,
+                &mut zb,
+                w as usize,
+                w,
+                h,
+                &cs,
+                &cfg,
+                dense,
+                pos,
+                s,
+                hh,
+                f,
+                0,
+                Some(sh),
+            );
+            fb
+        };
+        // Per-voxel: every voxel → material 1; instance's uniform material is 0
+        // (opaque) but the per-voxel id overrides it.
+        let pv = render(
+            &SpriteDense::from_kv6_with_materials(&kv6, &[(col & 0xff_ffff, 1)]),
+            0,
+        );
+        // Uniform: no per-voxel data, instance material 1.
+        let un = render(&SpriteDense::from_kv6(&kv6), 1);
+        assert_eq!(pv, un, "homogeneous per-voxel material == uniform material");
+        // And it's actually translucent (differs from the bare background).
+        let centre = (h / 2 * w + w / 2) as usize;
+        assert_ne!(pv[centre] & 0x00ff_ffff, 0x0010_1010, "translucent, not bg");
     }
 }

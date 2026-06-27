@@ -53,9 +53,9 @@ pub use scene::{
     GpuSceneResident, GridRuntimeTransform, GridStaticMeta, RefreshOutcome, SceneUpload,
 };
 pub use sprite_model::{
-    build_sprite_model, sprite_model_from_clip_frame, sprite_model_from_voxel_frame,
-    SpriteInstance, SpriteInstanceTransform, SpriteModel, SpriteModelRegistry,
-    SpriteRegistryResident,
+    build_sprite_model, build_sprite_model_with_materials, sprite_model_from_clip_frame,
+    sprite_model_from_voxel_frame, SpriteInstance, SpriteInstanceTransform, SpriteModel,
+    SpriteModelRegistry, SpriteRegistryResident,
 };
 
 use std::sync::Arc;
@@ -2226,6 +2226,10 @@ impl GpuRenderer {
                             binding: 12,
                             resource: smd.materials_buf.as_entire_binding(),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 13,
+                            resource: reg.materials_vox.as_entire_binding(),
+                        },
                     ],
                 }))
             }
@@ -3618,6 +3622,7 @@ impl GpuRenderer {
                     bgl_storage_entry(10, true), // per-voxel dir
                     bgl_storage_entry(11, true), // per-instance kv6colmul
                     bgl_storage_entry(12, true), // TV — material palette
+                    bgl_storage_entry(13, true), // TV.3 — per-voxel material id
                 ],
             });
         let pl = self

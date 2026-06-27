@@ -42,5 +42,5 @@ pub mod voxel_clip;
 pub mod vxl;
 pub mod xform;
 
-pub use material::{BlendMode, Material, MaterialTable};
+pub use material::{material_for_color, BlendMode, Material, MaterialTable};
 pub use palette::Rgb6;

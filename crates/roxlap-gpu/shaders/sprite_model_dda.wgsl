@@ -16,7 +16,7 @@ struct ModelMeta {
     color_offsets_offset: u32,
     occ_words_per_col: u32,
     dims: vec3<u32>,
-    _pad0: u32,
+    has_vox_materials: u32, // TV.3: 1 ⇒ use per-voxel `materials_vox`
     pivot: vec3<f32>,
     voxel_world_size: f32, // GPU.10.4 LOD: world size of one voxel
 };
@@ -73,8 +73,11 @@ struct Uniform {
 // same order as `instances`. Indexed `colmul[inst*512u + dir*2u + n]`.
 @group(0) @binding(11) var<storage, read> colmul: array<u32>;
 // TV: global voxel-material palette (256 entries), indexed by an
-// instance's `material` id.
+// instance's `material` id (or a per-voxel id from `materials_vox`).
 @group(0) @binding(12) var<storage, read> materials: array<Mat>;
+// TV.3: per-voxel material id, parallel to `colors` (one u32 per voxel).
+// Only read when the model's `has_vox_materials` is set.
+@group(0) @binding(13) var<storage, read> materials_vox: array<u32>;
 
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     let fog_near = u.fog_color.w;
@@ -96,7 +99,9 @@ fn model_solid(m: ModelMeta, p: vec3<i32>) -> bool {
 // per-channel `_mm_mulhi_epu16` modulation the CPU rasteriser applies
 // (voxlap `drawboundcubesse`): `out[c] = min(255, (rgb[c] * mul[c]) >> 8)`.
 // Returns linear-ish 0..1 RGB (the marcher composites + fogs afterward).
-fn model_color(m: ModelMeta, p: vec3<i32>, inst_idx: u32) -> vec3<f32> {
+// Flat index of voxel `p` into the shared `colors`/`dirs`/`materials_vox`
+// arrays (popcount-rank within the column + the model's base offset).
+fn voxel_index(m: ModelMeta, p: vec3<i32>) -> u32 {
     let col = u32(p.x) + u32(p.y) * m.dims.x;
     let base = m.occupancy_offset + col * m.occ_words_per_col;
     let zw = u32(p.z) >> 5u;
@@ -108,9 +113,21 @@ fn model_color(m: ModelMeta, p: vec3<i32>, inst_idx: u32) -> vec3<f32> {
     var mask: u32 = 0u;
     if (zb > 0u) { mask = (1u << zb) - 1u; }
     rank = rank + countOneBits(occupancy[base + zw] & mask);
-
     let local_off = color_offsets[m.color_offsets_offset + col];
-    let vidx = m.colors_offset + local_off + rank;
+    return m.colors_offset + local_off + rank;
+}
+
+// TV.3: the material id for voxel `p` — per-voxel when the model has them,
+// else the instance's uniform material.
+fn voxel_material(m: ModelMeta, vidx: u32, inst_material: u32) -> u32 {
+    if (m.has_vox_materials == 1u) {
+        return materials_vox[vidx] & 0xffu;
+    }
+    return inst_material;
+}
+
+fn model_color(m: ModelMeta, p: vec3<i32>, inst_idx: u32) -> vec3<f32> {
+    let vidx = voxel_index(m, p);
     let packed = colors[vidx];
     let dir = dirs[vidx] & 0xffu;
 
@@ -199,19 +216,23 @@ fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32)
     return res;
 }
 
-// TV: march one *translucent* instance accumulating its solid voxels
-// front-to-back (the GPU mirror of the CPU `cast_local_layers`). All of a
-// TV.2 instance's voxels share one material `mt`; `a = mt.alpha *
-// inst.alpha_mul`. Additive contributes `a·colour` without occluding;
-// AlphaBlend does premultiplied `over` and stops once transmittance
-// decays. `limit` is the terrain/opaque depth cutoff. Returns the
-// premultiplied accumulated colour + remaining transmittance.
-struct Layers { rgb: vec3<f32>, trans: f32, touched: bool };
-fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32, mt: Mat) -> Layers {
+// TV: march one translucent / mixed instance front-to-back, accumulating
+// its solid voxels (the GPU mirror of the CPU `cast_local_layers`). Per
+// voxel the material is per-voxel (TV.3 mixed models) or the instance's
+// uniform material (TV.2). AlphaBlend does premultiplied `over` and decays
+// transmittance; Additive contributes `a·colour` without occluding; an
+// Opaque voxel is the model's own surface — it stops the ray and becomes the
+// background the front layers composite over (`has_opaque`/`opaque_color`).
+// Per-span: one alpha layer per contiguous solid run or material change.
+// `limit` is the terrain / nearest-opaque-sprite depth cutoff.
+struct Layers { rgb: vec3<f32>, trans: f32, touched: bool, has_opaque: bool, opaque_color: vec3<f32> };
+fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32) -> Layers {
     var res: Layers;
     res.rgb = vec3<f32>(0.0);
     res.trans = 1.0;
     res.touched = false;
+    res.has_opaque = false;
+    res.opaque_color = vec3<f32>(0.0);
 
     let m = models[inst.model_id];
     let inv = mat3x3<f32>(inst.inv_rot0.xyz, inst.inv_rot1.xyz, inst.inv_rot2.xyz);
@@ -243,25 +264,34 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
     var t_hit = t_enter;
     let max_steps = m.dims.x + m.dims.y + m.dims.z + 3u;
 
-    let a = clamp(mt.alpha * inst.alpha_mul, 0.0, 1.0);
-    let is_add = mt.mode == 2u;
-    // Per-span compositing: contribute one alpha layer per contiguous solid
-    // run (only on the air→solid entry), so a ray clipping the boundary
-    // between two adjacent surface voxels doesn't double-composite a thin
-    // strip — the fix for the "voxel grid" striping. Mirrors the CPU
-    // `cast_local_layers`.
     var prev_solid = false;
+    var prev_mat = 0u;
 
     for (var i: u32 = 0u; i < max_steps; i = i + 1u) {
         if (t_hit >= limit) { break; }
         let solid_here = model_solid(m, p);
-        if (solid_here && !prev_solid) {
-            let c = model_color(m, p, inst_idx);
-            res.rgb = res.rgb + res.trans * a * c;
-            res.touched = true;
-            if (!is_add) {
-                res.trans = res.trans * (1.0 - a);
-                if (res.trans < (1.0 / 256.0)) { prev_solid = solid_here; break; }
+        if (solid_here) {
+            let vidx = voxel_index(m, p);
+            let mat_id = voxel_material(m, vidx, inst.material);
+            let mm = materials[mat_id];
+            if (mm.mode == 0u) {
+                // Opaque voxel: the model's own surface — stop, it backs the
+                // translucent layers in front of it within this instance.
+                res.has_opaque = true;
+                res.opaque_color = model_color(m, p, inst_idx);
+                res.touched = true;
+                break;
+            }
+            if (!prev_solid || mat_id != prev_mat) {
+                let c = model_color(m, p, inst_idx);
+                let a = clamp(mm.alpha * inst.alpha_mul, 0.0, 1.0);
+                res.rgb = res.rgb + res.trans * a * c;
+                if (mm.mode != 2u) { // AlphaBlend occludes; Additive does not.
+                    res.trans = res.trans * (1.0 - a);
+                }
+                res.touched = true;
+                prev_mat = mat_id;
+                if (res.trans < (1.0 / 256.0)) { break; }
             }
         }
         prev_solid = solid_here;
@@ -324,14 +354,18 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // ---- TV translucent path ----
-    // Sweep 1: nearest opaque sprite (seeded at terrain depth) → background.
+    // Sweep 1: nearest *wholly opaque* sprite (seeded at terrain depth) →
+    // background. A mixed model (per-voxel materials) is handled in sweep 2,
+    // where its own opaque voxels back its translucent layers.
     var best_t = terrain_t;
     var best_color = vec3<f32>(0.0);
     var any_opaque = false;
     for (var k: u32 = 0u; k < count; k = k + 1u) {
         let inst_idx = tile_instances[offset + k];
         let inst = instances[inst_idx];
-        if (materials[inst.material].mode == 0u) {
+        let wholly_opaque = models[inst.model_id].has_vox_materials == 0u
+            && materials[inst.material].mode == 0u;
+        if (wholly_opaque) {
             let h = march_instance(inst, inst_idx, ray_dir, best_t);
             if (h.hit) {
                 best_t = h.t;
@@ -351,19 +385,23 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
         comp = unpack4x8unorm(output[pix]).rgb;
     }
 
-    // Sweep 2: composite translucent instances over `comp`, clipped to the
-    // opaque depth `best_t`. Tile order (not depth-sorted) — additive is
+    // Sweep 2: composite translucent + mixed instances over `comp`, clipped
+    // to `best_t`. A mixed instance's own opaque voxel backs its front layers
+    // (`has_opaque`/`opaque_color`); a purely translucent instance composites
+    // over the running `comp`. Tile order (not depth-sorted) — additive is
     // order-independent; alpha-over among overlapping translucents is
     // draw-order (the documented v1 limitation).
     var any_trans = false;
     for (var k: u32 = 0u; k < count; k = k + 1u) {
         let inst_idx = tile_instances[offset + k];
         let inst = instances[inst_idx];
-        let mt = materials[inst.material];
-        if (mt.mode != 0u) {
-            let lyr = march_instance_layers(inst, inst_idx, ray_dir, best_t, mt);
+        let translucent_or_mixed = models[inst.model_id].has_vox_materials == 1u
+            || materials[inst.material].mode != 0u;
+        if (translucent_or_mixed) {
+            let lyr = march_instance_layers(inst, inst_idx, ray_dir, best_t);
             if (lyr.touched) {
-                comp = lyr.rgb + lyr.trans * comp;
+                let bg = select(comp, lyr.opaque_color, lyr.has_opaque);
+                comp = lyr.rgb + lyr.trans * bg;
                 any_trans = true;
             }
         }
