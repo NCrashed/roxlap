@@ -240,6 +240,32 @@ fn sample_sky(sky: &Sky, dir: [f32; 3]) -> u32 {
     0x8000_0000 | (px & 0x00ff_ffff)
 }
 
+/// Fill `fb` with the panorama [`Sky`] sampled per pixel — the background for
+/// a **gridless** scene. The per-grid DDA samples the sky for its miss rays,
+/// but a scene with no grids (a sprite/effect-only view) casts no rays, so it
+/// would otherwise show a flat clear colour. This mirrors that miss-ray
+/// sample for every pixel. The z-buffer is left untouched (sky is infinitely
+/// far, so sprites always pass the depth test). `cam`/`settings` are the same
+/// per-frame projection the sprite pass uses.
+#[allow(clippy::cast_possible_truncation)]
+pub fn render_sky_fill(
+    fb: &mut [u32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
+    cam: &CameraState,
+    settings: &OpticastSettings,
+    sky: &Sky,
+) {
+    for py in 0..height {
+        let row = py as usize * pitch_pixels;
+        for px in 0..width {
+            let (_origin, dir) = pixel_ray(cam, settings, px, py);
+            fb[row + px as usize] = sample_sky(sky, dir);
+        }
+    }
+}
+
 /// World-space ray for screen pixel `(px, py)` under opticast's
 /// pinhole: origin is the camera position, direction is
 /// `(px - hx)·right + (py - hy)·down + hz·forward`.
@@ -1575,6 +1601,27 @@ mod tests {
         let (w, h) = (48u32, 48u32);
         let (fb, _) = render_brickmap_env(grid, &cam, w, h, &env);
         assert!(fb.iter().all(|&c| c >> 24 == 0x80), "all misses sky-filled");
+        let top = fb[0];
+        let bottom = fb[(h - 1) as usize * w as usize];
+        assert_ne!(top, bottom, "sky gradient should vary with elevation");
+    }
+
+    /// `render_sky_fill` paints the panorama for a **gridless** view — the
+    /// same per-pixel sky sample the miss-ray path uses, with no grid present
+    /// (the CPU empty-scene background, matching the GPU).
+    #[test]
+    fn sky_fill_paints_panorama_gridless() {
+        let sky = crate::sky::Sky::blue_gradient();
+        let cam = Camera::from_yaw_pitch([0.0, 0.0, 0.0], 0.3, -0.4);
+        let (w, h) = (48u32, 48u32);
+        let cs = crate::camera_math::derive(&cam, w, h, 24.0, 24.0, 24.0);
+        let settings = crate::opticast::OpticastSettings::for_oracle_framebuffer(w, h);
+        let mut fb = vec![0u32; (w * h) as usize];
+        render_sky_fill(&mut fb, w as usize, w, h, &cs, &settings, &sky);
+        assert!(
+            fb.iter().all(|&c| c >> 24 == 0x80),
+            "every pixel sky-filled with the brightness byte set"
+        );
         let top = fb[0];
         let bottom = fb[(h - 1) as usize * w as usize];
         assert_ne!(top, bottom, "sky gradient should vary with elevation");
