@@ -223,9 +223,11 @@ fn sample_sky(sky: &Sky, dir: [f32; 3]) -> u32 {
     let d = [dir[0] / len, dir[1] / len, dir[2] / len];
     let xsiz_full = sky.lat.len().max(1) as i32; // original column count
     let pi = std::f32::consts::PI;
-    // Elevation → x. z is down; looking up (z<0) → larger x (zenith).
-    let elev = (-d[2]).clamp(-1.0, 1.0).asin(); // -pi/2..pi/2
-    let x = (((elev / pi) + 0.5) * xsiz_full as f32) as i32;
+    // Elevation → x, matching the GPU `sky_color` (scene_dda.wgsl): z is
+    // down, so `acos(-z)` is 0 at the zenith (looking up) and π at the nadir
+    // (looking down); `/π` puts the zenith at x=0 and the nadir at x=xsiz.
+    let elev01 = (-d[2]).clamp(-1.0, 1.0).acos() / pi; // 0 (up) .. 1 (down)
+    let x = (elev01 * xsiz_full as f32) as i32;
     let x = x.clamp(0, xsiz_full - 1);
     // Azimuth → y (wrapped).
     let y = if sky.ysiz <= 1 {
@@ -1604,6 +1606,22 @@ mod tests {
         let top = fb[0];
         let bottom = fb[(h - 1) as usize * w as usize];
         assert_ne!(top, bottom, "sky gradient should vary with elevation");
+    }
+
+    /// Sky elevation orientation matches the GPU `sky_color` (acos(-z)/π):
+    /// looking **up** (−z) samples panorama column 0 (zenith), looking
+    /// **down** (+z) samples the last column (nadir). Regression for the
+    /// CPU up/down inversion.
+    #[test]
+    fn sky_elevation_zenith_at_column_zero() {
+        let mut pixels = vec![0i32; 8];
+        pixels[0] = 0x0011_1111; // zenith marker
+        pixels[7] = 0x0099_9999; // nadir marker
+        let sky = crate::sky::Sky::from_pixels(pixels, 8, 1);
+        let up = sample_sky(&sky, [0.0, 0.0, -1.0]); // −z is up
+        let down = sample_sky(&sky, [0.0, 0.0, 1.0]); // +z is down
+        assert_eq!(up & 0x00ff_ffff, 0x0011_1111, "looking up → column 0 (zenith)");
+        assert_eq!(down & 0x00ff_ffff, 0x0099_9999, "looking down → last column (nadir)");
     }
 
     /// `render_sky_fill` paints the panorama for a **gridless** view — the
