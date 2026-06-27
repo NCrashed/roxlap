@@ -19,7 +19,7 @@ use roxlap_formats::kv6::Kv6;
 use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
-use roxlap_scene::render::{render_scene_composed, CpuFog, RenderOutcome};
+use roxlap_scene::render::{render_scene_composed_with_materials, CpuFog, RenderOutcome};
 use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -361,6 +361,10 @@ pub(crate) struct CpuBackend {
     /// it is inert until the host defines a translucent material via
     /// [`SceneRenderer::define_material`](crate::SceneRenderer::define_material).
     materials: MaterialTable,
+    /// TV: terrain colour→material map (`(rgb, material_id)`). Empty (the
+    /// default) ⇒ terrain is fully opaque. Set via
+    /// [`SceneRenderer::set_terrain_materials`](crate::SceneRenderer::set_terrain_materials).
+    terrain_materials: Vec<(u32, u8)>,
     /// egui atlas cache + software rasteriser (`hud` feature).
     #[cfg(feature = "hud")]
     egui_raster: crate::cpu_egui::EguiRaster,
@@ -396,6 +400,7 @@ impl CpuBackend {
             flip_x: false,
             images: Vec::new(),
             materials: MaterialTable::new(),
+            terrain_materials: Vec::new(),
             #[cfg(feature = "hud")]
             egui_raster: crate::cpu_egui::EguiRaster::default(),
         }
@@ -621,6 +626,12 @@ impl CpuBackend {
         self.materials.get(id)
     }
 
+    /// Set the terrain colour→material map (TV.4): matching-colour terrain
+    /// voxels render with that material (glass/water in the world).
+    pub(crate) fn set_terrain_materials(&mut self, map: &[(u32, u8)]) {
+        self.terrain_materials = map.to_vec();
+    }
+
     /// Remove the dynamic instance at `idx` by swap-remove. Returns
     /// `Some(old_last)` when a different instance was moved into `idx`, or
     /// `None` if `idx` was the last / out of range — matching the GPU
@@ -799,7 +810,7 @@ impl CpuBackend {
             *z = f32::INFINITY;
         }
 
-        let outcome = render_scene_composed(
+        let outcome = render_scene_composed_with_materials(
             fb,
             &mut self.zbuffer[..pixel_count],
             width as usize,
@@ -811,6 +822,8 @@ impl CpuBackend {
             frame.settings,
             frame.sky_color,
             frame.sky,
+            Some(&self.materials),
+            &self.terrain_materials,
         );
 
         // Gridless scene (a sprite/effect-only view): the per-grid DDA never

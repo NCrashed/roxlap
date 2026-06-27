@@ -152,6 +152,9 @@ pub(crate) struct GpuBackend {
     /// The device-side palette + per-voxel material buffers + blending shader
     /// land in a later TV sub-stage; this holds the authoritative table.
     materials: MaterialTable,
+    /// TV: terrain colour→material map. Retained for the TV.6 GPU terrain
+    /// path; the CPU backend already composites with it.
+    terrain_materials: Vec<(u32, u8)>,
 }
 
 impl GpuBackend {
@@ -184,6 +187,7 @@ impl GpuBackend {
             image_pixels: Vec::new(),
             transforms_dirty: false,
             materials: MaterialTable::new(),
+            terrain_materials: Vec::new(),
         }
     }
 
@@ -465,6 +469,12 @@ impl GpuBackend {
     /// The material at `id` ([`Material::OPAQUE`] for any never-defined id).
     pub(crate) fn material(&self, id: u8) -> Material {
         self.materials.get(id)
+    }
+
+    /// Set the terrain colour→material map (TV.4). Retained for the TV.6 GPU
+    /// terrain transparency path.
+    pub(crate) fn set_terrain_materials(&mut self, map: &[(u32, u8)]) {
+        self.terrain_materials = map.to_vec();
     }
 
     /// Remove the dynamic instance at dynamic-sublist index `idx` by

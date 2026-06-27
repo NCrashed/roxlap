@@ -1590,6 +1590,19 @@ impl SceneRenderer {
         }
     }
 
+    /// Set the **terrain** colour→material map (TV.4): pairs of `(rgb,
+    /// material_id)` that make matching-colour world (grid) voxels translucent
+    /// — glass walls, water pools. The materials themselves are defined via
+    /// [`define_material`](Self::define_material). An empty map (the default)
+    /// keeps all terrain opaque. The CPU backend composites these today; the
+    /// GPU backend renders them once the TV.6 device path lands.
+    pub fn set_terrain_materials(&mut self, map: &[(u32, u8)]) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_terrain_materials(map),
+            BackendImpl::Gpu(g) => g.set_terrain_materials(map),
+        }
+    }
+
     /// voxels)); the CPU backend pushes an axis-aligned template.
     pub fn add_sprite_model(&mut self, kv6: &Kv6) -> SpriteModelId {
         let model_index = match &mut self.inner {

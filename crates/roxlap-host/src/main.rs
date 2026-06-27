@@ -573,6 +573,8 @@ impl App {
             fog_color: self.engine.fog_color(),
             fog_max_dist: self.engine.fog_max_scan_dist().max(0) as f32,
             side_shades: self.engine.side_shades(),
+            materials: None,
+            terrain_materials: &[],
         };
 
         // The world is one chunk; its brick occupancy is independent of

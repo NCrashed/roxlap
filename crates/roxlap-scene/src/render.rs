@@ -41,6 +41,7 @@ use roxlap_core::dda::{render_dda_parallel, DdaEnv};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
+use roxlap_formats::material::MaterialTable;
 
 use crate::billboard::{self, BillboardCache, DEFAULT_RESOLUTION as BILLBOARD_RESOLUTION};
 use crate::chunks;
@@ -232,6 +233,10 @@ pub fn render_scene(
                 0.0
             },
             side_shades: fog.side_shades,
+            // The direct (non-composed) path is opaque-only; terrain
+            // materials flow through render_scene_composed_with_materials.
+            materials: None,
+            terrain_materials: &[],
         };
         render_dda_parallel(
             &local_cam,
@@ -445,6 +450,47 @@ pub fn render_scene_composed(
         sky_color,
         sky,
         true,
+        None,
+        &[],
+    )
+}
+
+/// [`render_scene_composed`] with TV terrain materials: `materials` is the
+/// global palette and `terrain_materials` the colour→material map; together
+/// they make matching-colour terrain voxels translucent (front-to-back
+/// composited). An empty map / `None` palette renders identically to
+/// [`render_scene_composed`].
+#[allow(clippy::too_many_arguments)]
+pub fn render_scene_composed_with_materials(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
+    fog: CpuFog,
+    scene: &mut Scene,
+    camera: &Camera,
+    settings: &OpticastSettings,
+    sky_color: u32,
+    sky: Option<&Sky>,
+    materials: Option<&MaterialTable>,
+    terrain_materials: &[(u32, u8)],
+) -> RenderOutcome {
+    render_scene_composed_scissored(
+        fb,
+        zb,
+        pitch_pixels,
+        width,
+        height,
+        fog,
+        scene,
+        camera,
+        settings,
+        sky_color,
+        sky,
+        true,
+        materials,
+        terrain_materials,
     )
 }
 
@@ -468,6 +514,8 @@ fn render_scene_composed_scissored(
     sky_color: u32,
     sky: Option<&Sky>,
     scissor: bool,
+    materials: Option<&MaterialTable>,
+    terrain_materials: &[(u32, u8)],
 ) -> RenderOutcome {
     debug_assert_eq!(fb.len(), zb.len());
     let pixel_count = (width as usize) * (height as usize);
@@ -762,6 +810,8 @@ fn render_scene_composed_scissored(
                 0.0
             },
             side_shades: fog.side_shades,
+            materials,
+            terrain_materials,
         };
         // Effective render mip + brick cache were prepared above
         // (DDA.6 uniform per-grid mip, DDA.7 cross-frame cache).
@@ -1423,6 +1473,8 @@ mod tests {
                 sky_color,
                 None,
                 scissor,
+                None,
+                &[],
             );
             fb
         };

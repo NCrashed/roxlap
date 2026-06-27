@@ -42,6 +42,7 @@ use crate::opticast::OpticastSettings;
 use crate::raster_target::RasterTarget;
 use crate::sky::Sky;
 use crate::Camera;
+use roxlap_formats::material::{material_for_color, Material, MaterialTable};
 
 /// Per-frame environment for DDA shading (Substage DDA.5): a textured
 /// sky panorama, distance fog, and per-face side shading.
@@ -62,6 +63,13 @@ pub struct DdaEnv<'a> {
     /// Per-face brightness reduction `[x-, x+, y-, y+, z-, z+]`, applied
     /// to the hit face (voxlap `setsideshades`). All-zero = off.
     pub side_shades: [i8; 6],
+    /// TV: global voxel-material palette (id → opacity + blend mode). `None`
+    /// keeps terrain fully opaque (the first-hit path, bit-identical).
+    pub materials: Option<&'a MaterialTable>,
+    /// TV: terrain colour→material map (`(rgb, material_id)`). A hit voxel's
+    /// colour is looked up here for its material. **Empty** (the default) ⇒
+    /// every voxel is opaque, so the march returns the first hit unchanged.
+    pub terrain_materials: &'a [(u32, u8)],
 }
 
 impl Default for DdaEnv<'_> {
@@ -71,6 +79,8 @@ impl Default for DdaEnv<'_> {
             fog_color: 0,
             fog_max_dist: 0.0,
             side_shades: [0; 6],
+            materials: None,
+            terrain_materials: &[],
         }
     }
 }
@@ -200,6 +210,78 @@ fn apply_fog(color: u32, depth: f32, env: &DdaEnv<'_>) -> u32 {
         ((src * g + dst * f) >> 8).min(255)
     };
     0x8000_0000 | (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+/// TV: resolve a terrain voxel's [`Material`] from its colour via the env's
+/// colour→material map + palette. Returns [`Material::OPAQUE`] when no
+/// material table is set, the map is empty, or the colour is unmapped — so
+/// the march stays on the opaque first-hit path.
+#[inline]
+fn terrain_material(env: &DdaEnv<'_>, color: u32) -> Material {
+    match env.materials {
+        Some(table) if !env.terrain_materials.is_empty() => {
+            table.get(material_for_color(env.terrain_materials, color))
+        }
+        _ => Material::OPAQUE,
+    }
+}
+
+/// Composite premultiplied `accum` (+ remaining `trans`) over a packed
+/// background colour → packed `0x80RRGGBB`.
+#[inline]
+fn composite_over(accum: [f32; 3], trans: f32, bg: u32) -> u32 {
+    let b = rgb_to_f32(bg);
+    f32_to_rgb([
+        accum[0] + trans * b[0],
+        accum[1] + trans * b[1],
+        accum[2] + trans * b[2],
+    ])
+}
+
+/// Finalize a translucent terrain ray that exited the grid (sky). Returns
+/// `None` when nothing was accumulated (the opaque first-hit path — the
+/// caller's sky handling stands, bit-identical), else the accumulated
+/// layers composited over the sky at `dist`.
+#[inline]
+fn finalize_exit(
+    touched: bool,
+    accum: [f32; 3],
+    trans: f32,
+    env: &DdaEnv<'_>,
+    dir: [f32; 3],
+    dist: f32,
+) -> Option<Hit> {
+    if !touched {
+        return None;
+    }
+    let bg = match env.sky {
+        Some(s) => sample_sky(s, dir),
+        None => 0x8000_0000 | (env.fog_color & 0x00ff_ffff),
+    };
+    Some(Hit {
+        color: composite_over(accum, trans, bg),
+        dist,
+    })
+}
+
+/// Unpack `0x__RRGGBB` to `0..1` float channels (RGB; the high byte is
+/// dropped — it has already been folded into the colour by `shade`/`fog`).
+#[inline]
+#[allow(clippy::cast_precision_loss)]
+fn rgb_to_f32(c: u32) -> [f32; 3] {
+    [
+        ((c >> 16) & 0xff) as f32 / 255.0,
+        ((c >> 8) & 0xff) as f32 / 255.0,
+        (c & 0xff) as f32 / 255.0,
+    ]
+}
+
+/// Repack `0..1` float channels (clamped) into `0x80RRGGBB`.
+#[inline]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn f32_to_rgb(c: [f32; 3]) -> u32 {
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+    0x8000_0000 | (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2])
 }
 
 /// Sample the sky panorama in ray direction `dir` (need not be
@@ -824,6 +906,16 @@ fn cell_walk_skip(
     let mut t_curr = t_enter;
     let mut last_axis = 3usize;
 
+    // TV: front-to-back translucent accumulation. While no translucent voxel
+    // is hit (`touched` stays false) every return is unchanged — the opaque
+    // world renders bit-identically. `prev_*` drive per-span compositing (one
+    // alpha layer per contiguous solid run or material change).
+    let mut accum = [0.0f32; 3];
+    let mut trans = 1.0f32;
+    let mut touched = false;
+    let mut prev_solid = false;
+    let mut prev_mat = 0u8;
+
     // Each iteration either advances ≥1 cell (dense) or ≥1 box (skip),
     // so the total cell span bounds the loop.
     let span = (hi_c[0] - lo_c[0]) + (hi_c[1] - lo_c[1]) + (hi_c[2] - lo_c[2]);
@@ -836,11 +928,11 @@ fn cell_walk_skip(
             || cellc[2] < lo_c[2]
             || cellc[2] >= hi_c[2]
         {
-            return None;
+            return finalize_exit(touched, accum, trans, env, dir, max_dist);
         }
         let depth = t_curr * fwd_dot;
         if depth > max_dist || t_curr > t_exit {
-            return None;
+            return finalize_exit(touched, accum, trans, env, dir, max_dist);
         }
         // Fog is fully opaque at `fog_max_dist`: nothing beyond is
         // visible, so stop the ray there and return the fog colour
@@ -848,8 +940,14 @@ fn cell_walk_skip(
         // wall. Both correct and the dominant perf win for foggy worlds —
         // it caps every ray's length at the fog distance.
         if env.fog_max_dist > 0.0 && depth >= env.fog_max_dist {
+            let fog = 0x8000_0000 | (env.fog_color & 0x00ff_ffff);
+            let color = if touched {
+                composite_over(accum, trans, fog)
+            } else {
+                fog
+            };
             return Some(Hit {
-                color: 0x8000_0000 | (env.fog_color & 0x00ff_ffff),
+                color,
                 dist: env.fog_max_dist,
             });
         }
@@ -891,7 +989,7 @@ fn cell_walk_skip(
                 }
             }
             if best_axis == 3 {
-                return None;
+                return finalize_exit(touched, accum, trans, env, dir, max_dist);
             }
             // Land just across the boundary; pin the exit axis to the
             // integer boundary cell so float error can't skip the next
@@ -922,7 +1020,7 @@ fn cell_walk_skip(
                 || nc[2] < lo_c[2]
                 || nc[2] >= hi_c[2]
             {
-                return None;
+                return finalize_exit(touched, accum, trans, env, dir, max_dist);
             }
             cellc = nc;
             // Refresh t_max for the new cell (dir unchanged → t_delta and
@@ -936,6 +1034,7 @@ fn cell_walk_skip(
             }
             t_curr = best_t.max(t_curr);
             last_axis = best_axis;
+            prev_solid = false; // skipped empty space → next hit starts a run
             continue;
         }
 
@@ -944,11 +1043,47 @@ fn cell_walk_skip(
         prof::CELLS.with(|x| x.set(x.get() + 1));
         if let Some(color) = sampler.hit(cellc) {
             let bright_sub = side_shade_sub(env, last_axis, step);
-            let lit = shade(color, bright_sub);
-            return Some(Hit {
-                color: apply_fog(lit, depth.max(0.0), env),
-                dist: depth.max(0.0),
-            });
+            let lit = apply_fog(shade(color, bright_sub), depth.max(0.0), env);
+            let m = terrain_material(env, color);
+            if m.is_opaque() {
+                // Opaque surface: the background. Return the first hit verbatim
+                // when nothing translucent preceded it (bit-identical), else
+                // composite the accumulated layers over it.
+                let color = if touched {
+                    composite_over(accum, trans, lit)
+                } else {
+                    lit
+                };
+                return Some(Hit {
+                    color,
+                    dist: depth.max(0.0),
+                });
+            }
+            // Translucent: one alpha layer per solid-run entry or material
+            // change (per-span — avoids the voxel-grid striping through a
+            // thick glass/water slab).
+            let mat_id = material_for_color(env.terrain_materials, color);
+            if !prev_solid || mat_id != prev_mat {
+                let a = f32::from(m.alpha) / 255.0;
+                let c = rgb_to_f32(lit);
+                accum[0] += trans * a * c[0];
+                accum[1] += trans * a * c[1];
+                accum[2] += trans * a * c[2];
+                if !matches!(m.mode, roxlap_formats::material::BlendMode::Additive) {
+                    trans *= 1.0 - a; // AlphaBlend occludes; Additive does not.
+                }
+                touched = true;
+                prev_mat = mat_id;
+                if trans < 1.0 / 256.0 {
+                    return Some(Hit {
+                        color: f32_to_rgb(accum),
+                        dist: depth.max(0.0),
+                    });
+                }
+            }
+            prev_solid = true;
+        } else {
+            prev_solid = false;
         }
         let axis = min_axis(t_max);
         last_axis = axis;
@@ -1544,6 +1679,62 @@ mod tests {
         }
     }
 
+    /// TV terrain transparency: a glass-coloured voxel slab in front of an
+    /// opaque floor. With no terrain material map the glass is an opaque first
+    /// hit; with the map it becomes translucent and the floor tints through.
+    #[test]
+    fn terrain_glass_tints_floor_behind() {
+        let glass = 0x80_40_C0_E0; // cyan
+        let floor = 0x80_C0_40_40; // red
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| {
+            if z == 4 {
+                Some(glass)
+            } else if z >= 10 {
+                Some(floor)
+            } else {
+                None
+            }
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+        // Camera above the grid looking straight down (+z), centred.
+        let cam = Camera {
+            pos: [8.0, 8.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (w, h) = (32u32, 32u32);
+        let centre = (h / 2 * w + w / 2) as usize;
+
+        // Opaque: the glass voxel stops the ray (no terrain materials).
+        let (fb_op, _) = render_brickmap(grid, &cam, w, h);
+        assert_eq!(
+            fb_op[centre] & 0x00ff_ffff,
+            0x0040_C0E0,
+            "opaque glass first-hit"
+        );
+
+        // Translucent: glass colour → material 1 (alpha-blend).
+        let mut table = MaterialTable::new();
+        table.set(1, Material::alpha_blend(128));
+        let env = DdaEnv {
+            materials: Some(&table),
+            terrain_materials: &[(glass & 0x00ff_ffff, 1)],
+            ..DdaEnv::default()
+        };
+        let (fb_tr, _) = render_brickmap_env(grid, &cam, w, h, &env);
+        assert_ne!(
+            fb_tr[centre], fb_op[centre],
+            "glass should composite over the floor, not stay opaque"
+        );
+        let r_op = (fb_op[centre] >> 16) & 0xff; // glass red ≈ 0x40
+        let r_tr = (fb_tr[centre] >> 16) & 0xff; // + floor red bleeds in
+        assert!(
+            r_tr > r_op,
+            "floor red tints through the glass (op={r_op:02x} tr={r_tr:02x})"
+        );
+    }
+
     /// DDA.5: distance fog blends a hit toward the fog colour. A far
     /// floor pixel is closer to the fog colour than a near one.
     #[test]
@@ -1562,6 +1753,8 @@ mod tests {
             fog_color: 0x00_00_00_00, // black fog → distance darkens
             fog_max_dist: 64.0,
             side_shades: [0; 6],
+            materials: None,
+            terrain_materials: &[],
         };
         let (w, h) = (64u32, 64u32);
         let (fog, _) = render_brickmap_env(grid, &cam, w, h, &env);
@@ -1598,6 +1791,8 @@ mod tests {
             fog_color: 0,
             fog_max_dist: 0.0,
             side_shades: [0; 6],
+            materials: None,
+            terrain_materials: &[],
         };
         let cam = Camera::from_yaw_pitch([16.0, 16.0, 128.0], 0.3, -0.4);
         let (w, h) = (48u32, 48u32);
@@ -1674,6 +1869,8 @@ mod tests {
             fog_color: 0,
             fog_max_dist: 0.0,
             side_shades: [0, 0, 0, 0, 0x40, 0],
+            materials: None,
+            terrain_materials: &[],
         };
         let (shaded, _) = render_brickmap_env(grid, &cam, 32, 32, &env);
         let lum = |c: u32| (c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff);
@@ -2034,6 +2231,8 @@ mod tests {
             fog_color: 0x00_20_30_40,
             fog_max_dist: 120.0,
             side_shades: [0, 0, 0, 0, 0x30, 0x10],
+            materials: None,
+            terrain_materials: &[],
         };
 
         let (seq_fb, seq_zb) = render_brickmap_env(grid, &cam, w, h, &env);
