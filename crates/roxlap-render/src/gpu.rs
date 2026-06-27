@@ -25,6 +25,7 @@ use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::Camera;
+use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_gpu::{
     build_sprite_model, sprite_model_from_clip_frame, sprite_model_from_voxel_frame, GpuInitError,
@@ -143,6 +144,13 @@ pub(crate) struct GpuBackend {
     /// device once (full ordered slice) and clears it. Coalesces a whole
     /// frame's per-instance updates into one upload (avoids O(n²)).
     transforms_dirty: bool,
+    /// Global voxel-material palette (TV stage): per-voxel material ids index
+    /// this for opacity + blend mode. Defaults to all-[`Material::OPAQUE`], so
+    /// it is inert until the host defines a translucent material via
+    /// [`SceneRenderer::define_material`](crate::SceneRenderer::define_material).
+    /// The device-side palette + per-voxel material buffers + blending shader
+    /// land in a later TV sub-stage; this holds the authoritative table.
+    materials: MaterialTable,
 }
 
 impl GpuBackend {
@@ -174,6 +182,7 @@ impl GpuBackend {
             clip_upload_budget: Self::clip_upload_budget_from_env(),
             image_pixels: Vec::new(),
             transforms_dirty: false,
+            materials: MaterialTable::new(),
         }
     }
 
@@ -386,6 +395,19 @@ impl GpuBackend {
         if let Some(reg) = self.sprite_registry.as_ref() {
             self.gpu.compact_sprite_models(reg);
         }
+    }
+
+    /// Define global voxel-material `id` (TV stage). Id 0 is reserved as
+    /// [`Material::OPAQUE`]; defining it is a no-op returning `false`. The
+    /// table is held authoritatively here; device upload + blending land in
+    /// a later TV sub-stage.
+    pub(crate) fn define_material(&mut self, id: u8, mat: Material) -> bool {
+        self.materials.set(id, mat)
+    }
+
+    /// The material at `id` ([`Material::OPAQUE`] for any never-defined id).
+    pub(crate) fn material(&self, id: u8) -> Material {
+        self.materials.get(id)
     }
 
     /// Remove the dynamic instance at dynamic-sublist index `idx` by

@@ -29,6 +29,10 @@ pub mod equivec;
 pub mod kfa;
 pub mod kv6;
 pub mod kvx;
+/// Voxel materials — per-voxel opacity + blend mode (alpha / additive) for
+/// transparent voxels (smoke, glass, water, spell glows). See [`material`]
+/// + `PORTING-TRANSPARENCY.md`.
+pub mod material;
 pub mod palette;
 pub mod sprite;
 /// Animated voxel-sprite clips (`.rvc`) — keyframe + diff "GIF/MP4 for
@@ -38,4 +42,5 @@ pub mod voxel_clip;
 pub mod vxl;
 pub mod xform;
 
+pub use material::{BlendMode, Material, MaterialTable};
 pub use palette::Rgb6;

@@ -15,6 +15,7 @@ use roxlap_core::dda_sprite::{draw_sprite_dda, ClipFlipbook, SpriteDense};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::Camera;
 use roxlap_formats::kv6::Kv6;
+use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_scene::render::{render_scene_composed, CpuFog};
@@ -354,6 +355,11 @@ pub(crate) struct CpuBackend {
     /// Retained image-sprite textures, indexed by [`ImageId`]. A dropped
     /// slot is `None` and may be re-used by a later `upload_image`.
     images: Vec<Option<CpuImage>>,
+    /// Global voxel-material palette (TV stage): per-voxel material ids index
+    /// this for opacity + blend mode. Defaults to all-[`Material::OPAQUE`], so
+    /// it is inert until the host defines a translucent material via
+    /// [`SceneRenderer::define_material`](crate::SceneRenderer::define_material).
+    materials: MaterialTable,
     /// egui atlas cache + software rasteriser (`hud` feature).
     #[cfg(feature = "hud")]
     egui_raster: crate::cpu_egui::EguiRaster,
@@ -388,6 +394,7 @@ impl CpuBackend {
             framebuffer,
             flip_x: false,
             images: Vec::new(),
+            materials: MaterialTable::new(),
             #[cfg(feature = "hud")]
             egui_raster: crate::cpu_egui::EguiRaster::default(),
         }
@@ -570,6 +577,17 @@ impl CpuBackend {
     /// backend's buffer repack.
     #[allow(clippy::unused_self)]
     pub(crate) fn compact_models(&mut self) {}
+
+    /// Define global voxel-material `id` (TV stage). Id 0 is reserved as
+    /// [`Material::OPAQUE`]; defining it is a no-op returning `false`.
+    pub(crate) fn define_material(&mut self, id: u8, mat: Material) -> bool {
+        self.materials.set(id, mat)
+    }
+
+    /// The material at `id` ([`Material::OPAQUE`] for any never-defined id).
+    pub(crate) fn material(&self, id: u8) -> Material {
+        self.materials.get(id)
+    }
 
     /// Remove the dynamic instance at `idx` by swap-remove. Returns
     /// `Some(old_last)` when a different instance was moved into `idx`, or

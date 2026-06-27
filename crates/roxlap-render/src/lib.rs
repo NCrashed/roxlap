@@ -49,6 +49,7 @@ use roxlap_scene::Scene;
 pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::kv6::Kv6;
+pub use roxlap_formats::material::{BlendMode, Material};
 pub use roxlap_formats::sprite::Sprite;
 pub use roxlap_formats::voxel_clip::{
     DecodeError, DecodedClip, LoopMode, StreamingClip, VoxelClip, VoxelFrame,
@@ -1560,6 +1561,35 @@ impl SceneRenderer {
     /// Works before any [`set_sprites`](Self::set_sprites) (it establishes
     /// residency on the GPU backend's first model). The GPU backend
     /// appends one LOD chain to the resident registry (amortised O(model
+    /// Define a global voxel **material** (TV stage): the opacity + blend
+    /// mode that a per-voxel material id resolves to. The renderer owns one
+    /// 256-entry palette shared by every model and grid.
+    ///
+    /// Id `0` is permanently [`Material::OPAQUE`] — the value every voxel
+    /// without explicit material data resolves to — and **cannot** be
+    /// redefined; passing `id == 0` is a no-op that returns `false`. Any
+    /// other id returns `true`.
+    ///
+    /// While no translucent material is defined the renderer stays on the
+    /// fully-opaque fast path, so this is inert until first called. See
+    /// `PORTING-TRANSPARENCY.md`.
+    pub fn define_material(&mut self, id: u8, mat: Material) -> bool {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.define_material(id, mat),
+            BackendImpl::Gpu(g) => g.define_material(id, mat),
+        }
+    }
+
+    /// The [`Material`] currently at palette `id` ([`Material::OPAQUE`] for
+    /// any id never passed to [`define_material`](Self::define_material)).
+    #[must_use]
+    pub fn material(&self, id: u8) -> Material {
+        match &self.inner {
+            BackendImpl::Cpu(c) => c.material(id),
+            BackendImpl::Gpu(g) => g.material(id),
+        }
+    }
+
     /// voxels)); the CPU backend pushes an axis-aligned template.
     pub fn add_sprite_model(&mut self, kv6: &Kv6) -> SpriteModelId {
         let model_index = match &mut self.inner {
