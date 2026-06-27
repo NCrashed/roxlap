@@ -643,6 +643,10 @@ fn make_cull(registry: &SpriteModelRegistry, i: &SpriteInstance) -> CullInstance
             inv_rot2: i.transform.inv_rot[2],
             pos: i.transform.pos,
             model_id: i.model_id, // placeholder; cull rewrites per frame
+            material: u32::from(i.material),
+            alpha_mul: f32::from(i.alpha_mul) / 255.0,
+            _pad0: 0,
+            _pad1: 0,
         },
         chain_id: i.model_id,
         center: i.transform.pos,
@@ -669,6 +673,27 @@ fn instances_buffer(device: &wgpu::Device, cap: u32) -> wgpu::Buffer {
 pub struct SpriteInstance {
     pub model_id: u32,
     pub transform: SpriteInstanceTransform,
+    /// Voxel-material id (TV stage): indexes the renderer's global material
+    /// palette for this instance's opacity + blend mode. `0` (the default)
+    /// is opaque, so an unset instance renders unchanged.
+    pub material: u8,
+    /// Per-instance alpha multiplier (TV stage), `0..=255` (`255` =
+    /// unscaled, the default).
+    pub alpha_mul: u8,
+}
+
+impl SpriteInstance {
+    /// A model reference + pose with the default opaque material
+    /// (`material = 0`, `alpha_mul = 255`).
+    #[must_use]
+    pub fn new(model_id: u32, transform: SpriteInstanceTransform) -> Self {
+        Self {
+            model_id,
+            transform,
+            material: 0,
+            alpha_mul: 255,
+        }
+    }
 }
 
 /// GPU per-model metadata: where this model's data starts in the
@@ -689,7 +714,8 @@ struct SpriteModelMeta {
 }
 
 /// GPU per-instance record. Mirrors `Instance` in the shader (std430,
-/// 64 bytes): inverse rotation columns + position + model id.
+/// 80 bytes): inverse rotation columns + position + model id + the TV
+/// material id and per-instance alpha multiplier.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 struct SpriteInstanceGpu {
@@ -698,6 +724,12 @@ struct SpriteInstanceGpu {
     inv_rot2: [f32; 4],
     pos: [f32; 3],
     model_id: u32,
+    /// TV: material id into the global palette (binding 12).
+    material: u32,
+    /// TV: per-instance alpha multiplier, normalised to `0..=1`.
+    alpha_mul: f32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 /// Invert a 3×3 matrix given as basis columns `[c0, c1, c2]`,
@@ -1047,6 +1079,10 @@ impl SpriteRegistryResident {
             ci.gpu.inv_rot1 = inst.transform.inv_rot[1];
             ci.gpu.inv_rot2 = inst.transform.inv_rot[2];
             ci.gpu.pos = inst.transform.pos;
+            // TV: material id + alpha multiplier ride the same coalesced
+            // update as the pose (set via the facade's per-instance setters).
+            ci.gpu.material = u32::from(inst.material);
+            ci.gpu.alpha_mul = f32::from(inst.alpha_mul) / 255.0;
             // Bounding sphere follows the pivot; radius/chain unchanged.
             ci.center = inst.transform.pos;
         }
@@ -2109,7 +2145,9 @@ mod tests {
     #[test]
     fn registry_gpu_structs_have_expected_sizes() {
         assert_eq!(std::mem::size_of::<SpriteModelMeta>(), 48);
-        assert_eq!(std::mem::size_of::<SpriteInstanceGpu>(), 64);
+        // TV — grew 64 → 80 with the per-instance material id + alpha_mul
+        // (+ 8 bytes pad to keep the 16-byte std430 stride).
+        assert_eq!(std::mem::size_of::<SpriteInstanceGpu>(), 80);
     }
 
     #[test]
@@ -2404,13 +2442,10 @@ mod tests {
 
     fn inst(model_id: u32, pos: [f32; 3]) -> SpriteInstance {
         use roxlap_formats::sprite::Sprite;
-        SpriteInstance {
+        SpriteInstance::new(
             model_id,
-            transform: SpriteInstanceTransform::from_sprite(&Sprite::axis_aligned(
-                kv6_unsorted(),
-                pos,
-            )),
-        }
+            SpriteInstanceTransform::from_sprite(&Sprite::axis_aligned(kv6_unsorted(), pos)),
+        )
     }
 
     #[test]

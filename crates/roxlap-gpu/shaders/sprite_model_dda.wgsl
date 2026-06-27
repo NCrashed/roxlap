@@ -26,6 +26,16 @@ struct Instance {
     inv_rot2: vec4<f32>,
     pos: vec3<f32>,
     model_id: u32,
+    material: u32,    // TV: id into the material palette
+    alpha_mul: f32,   // TV: per-instance alpha multiplier (0..1)
+    _pad0: u32,
+    _pad1: u32,
+};
+// TV: one global-palette material (binding 12). `mode` is the
+// BlendMode discriminant: 0 = Opaque, 1 = AlphaBlend, 2 = Additive.
+struct Mat {
+    alpha: f32,
+    mode: u32,
 };
 struct Uniform {
     cam_pos: vec3<f32>, _p0: f32,
@@ -39,7 +49,7 @@ struct Uniform {
     fov_y_rad: f32,
     tiles_x: u32,    // GPU.10.3 screen-tile grid width
     tile_size: u32,  // GPU.10.3 tile edge in pixels
-    _p6: f32,
+    has_translucent: u32, // TV: 1 ⇒ run the accumulate path
 };
 
 @group(0) @binding(0) var<uniform> u: Uniform;
@@ -62,6 +72,9 @@ struct Uniform {
 // entry (lanes 0|1, then 2|3), 512 u32 per instance, packed in the
 // same order as `instances`. Indexed `colmul[inst*512u + dir*2u + n]`.
 @group(0) @binding(11) var<storage, read> colmul: array<u32>;
+// TV: global voxel-material palette (256 entries), indexed by an
+// instance's `material` id.
+@group(0) @binding(12) var<storage, read> materials: array<Mat>;
 
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     let fog_near = u.fog_color.w;
@@ -186,6 +199,78 @@ fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32)
     return res;
 }
 
+// TV: march one *translucent* instance accumulating its solid voxels
+// front-to-back (the GPU mirror of the CPU `cast_local_layers`). All of a
+// TV.2 instance's voxels share one material `mt`; `a = mt.alpha *
+// inst.alpha_mul`. Additive contributes `a·colour` without occluding;
+// AlphaBlend does premultiplied `over` and stops once transmittance
+// decays. `limit` is the terrain/opaque depth cutoff. Returns the
+// premultiplied accumulated colour + remaining transmittance.
+struct Layers { rgb: vec3<f32>, trans: f32, touched: bool };
+fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32, mt: Mat) -> Layers {
+    var res: Layers;
+    res.rgb = vec3<f32>(0.0);
+    res.trans = 1.0;
+    res.touched = false;
+
+    let m = models[inst.model_id];
+    let inv = mat3x3<f32>(inst.inv_rot0.xyz, inst.inv_rot1.xyz, inst.inv_rot2.xyz);
+    let s = m.voxel_world_size;
+    let o = inv * (u.cam_pos - inst.pos) / s + m.pivot;
+    let d = inv * ray_dir / s;
+
+    let box_max = vec3<f32>(f32(m.dims.x), f32(m.dims.y), f32(m.dims.z));
+    let inv_d = 1.0 / d;
+    let t0 = (vec3<f32>(0.0) - o) * inv_d;
+    let t1 = (box_max - o) * inv_d;
+    let tlo = min(t0, t1);
+    let thi = max(t0, t1);
+    let t_enter = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
+    let t_exit = min(thi.x, min(thi.y, thi.z));
+    if (t_exit < t_enter || t_enter >= limit) { return res; }
+
+    let entry = o + t_enter * d;
+    let dim_i = vec3<i32>(i32(m.dims.x), i32(m.dims.y), i32(m.dims.z));
+    var p = clamp(vec3<i32>(floor(entry)), vec3<i32>(0), dim_i - vec3<i32>(1));
+    let step = vec3<i32>(sign(d));
+    let t_delta = abs(inv_d);
+    let next_b = vec3<f32>(
+        select(f32(p.x), f32(p.x + 1), step.x > 0),
+        select(f32(p.y), f32(p.y + 1), step.y > 0),
+        select(f32(p.z), f32(p.z + 1), step.z > 0),
+    );
+    var t_max = shield_parallel((next_b - o) * inv_d, d);
+    var t_hit = t_enter;
+    let max_steps = m.dims.x + m.dims.y + m.dims.z + 3u;
+
+    let a = clamp(mt.alpha * inst.alpha_mul, 0.0, 1.0);
+    let is_add = mt.mode == 2u;
+
+    for (var i: u32 = 0u; i < max_steps; i = i + 1u) {
+        if (t_hit >= limit) { break; }
+        if (model_solid(m, p)) {
+            let c = model_color(m, p, inst_idx);
+            res.rgb = res.rgb + res.trans * a * c;
+            res.touched = true;
+            if (!is_add) {
+                res.trans = res.trans * (1.0 - a);
+                if (res.trans < (1.0 / 256.0)) { break; }
+            }
+        }
+        if (t_max.x < t_max.y && t_max.x < t_max.z) {
+            t_hit = t_max.x; p.x = p.x + step.x; t_max.x = t_max.x + t_delta.x;
+            if (p.x < 0 || p.x >= dim_i.x) { break; }
+        } else if (t_max.y < t_max.z) {
+            t_hit = t_max.y; p.y = p.y + step.y; t_max.y = t_max.y + t_delta.y;
+            if (p.y < 0 || p.y >= dim_i.y) { break; }
+        } else {
+            t_hit = t_max.z; p.z = p.z + step.z; t_max.z = t_max.z + t_delta.z;
+            if (p.z < 0 || p.z >= dim_i.z) { break; }
+        }
+    }
+    return res;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= u.screen_size.x || gid.y >= u.screen_size.y) { return; }
@@ -200,28 +285,83 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
         u.cam_forward + ndc_x * half_w * u.cam_right - ndc_y_top * half_h * u.cam_down
     );
 
-    // Start the nearest-hit search at the terrain depth; only sprites
-    // closer than the world matter.
-    var best_t = bitcast<f32>(depth_buffer[pix]);
-    var best_color = vec3<f32>(0.0);
-    var any = false;
-
     // GPU.10.3 — loop only the instances binned to this pixel's tile.
     let tile = (gid.y / u.tile_size) * u.tiles_x + (gid.x / u.tile_size);
     let offset = tile_ranges[2u * tile];
     let count = tile_ranges[2u * tile + 1u];
+
+    // Start the nearest-hit search at the terrain depth; only sprites
+    // closer than the world matter.
+    let terrain_t = bitcast<f32>(depth_buffer[pix]);
+
+    if (u.has_translucent == 0u) {
+        // ---- opaque fast-path: unchanged nearest-hit (no material reads) ----
+        var best_t = terrain_t;
+        var best_color = vec3<f32>(0.0);
+        var any = false;
+        for (var k: u32 = 0u; k < count; k = k + 1u) {
+            let inst_idx = tile_instances[offset + k];
+            let h = march_instance(instances[inst_idx], inst_idx, ray_dir, best_t);
+            if (h.hit) {
+                best_t = h.t;
+                best_color = h.color;
+                any = true;
+            }
+        }
+        if (any) {
+            let col = apply_fog(best_color, best_t);
+            output[pix] = pack4x8unorm(vec4<f32>(col, 1.0));
+        }
+        return;
+    }
+
+    // ---- TV translucent path ----
+    // Sweep 1: nearest opaque sprite (seeded at terrain depth) → background.
+    var best_t = terrain_t;
+    var best_color = vec3<f32>(0.0);
+    var any_opaque = false;
     for (var k: u32 = 0u; k < count; k = k + 1u) {
         let inst_idx = tile_instances[offset + k];
-        let h = march_instance(instances[inst_idx], inst_idx, ray_dir, best_t);
-        if (h.hit) {
-            best_t = h.t;
-            best_color = h.color;
-            any = true;
+        let inst = instances[inst_idx];
+        if (materials[inst.material].mode == 0u) {
+            let h = march_instance(inst, inst_idx, ray_dir, best_t);
+            if (h.hit) {
+                best_t = h.t;
+                best_color = h.color;
+                any_opaque = true;
+            }
         }
     }
 
-    if (any) {
-        let col = apply_fog(best_color, best_t);
-        output[gid.y * u.screen_size.x + gid.x] = pack4x8unorm(vec4<f32>(col, 1.0));
+    // Background colour the translucent layers composite over: the nearest
+    // opaque sprite (fogged), else whatever is already in the framebuffer
+    // (terrain / sky written by the scene pass).
+    var comp: vec3<f32>;
+    if (any_opaque) {
+        comp = apply_fog(best_color, best_t);
+    } else {
+        comp = unpack4x8unorm(output[pix]).rgb;
+    }
+
+    // Sweep 2: composite translucent instances over `comp`, clipped to the
+    // opaque depth `best_t`. Tile order (not depth-sorted) — additive is
+    // order-independent; alpha-over among overlapping translucents is
+    // draw-order (the documented v1 limitation).
+    var any_trans = false;
+    for (var k: u32 = 0u; k < count; k = k + 1u) {
+        let inst_idx = tile_instances[offset + k];
+        let inst = instances[inst_idx];
+        let mt = materials[inst.material];
+        if (mt.mode != 0u) {
+            let lyr = march_instance_layers(inst, inst_idx, ray_dir, best_t, mt);
+            if (lyr.touched) {
+                comp = lyr.rgb + lyr.trans * comp;
+                any_trans = true;
+            }
+        }
+    }
+
+    if (any_opaque || any_trans) {
+        output[pix] = pack4x8unorm(vec4<f32>(comp, 1.0));
     }
 }

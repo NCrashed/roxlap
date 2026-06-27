@@ -273,6 +273,8 @@ impl GpuBackend {
             instances.push(SpriteInstance {
                 model_id,
                 transform: SpriteInstanceTransform::from_sprite(&s),
+                material: s.material,
+                alpha_mul: s.alpha_mul,
             });
             basis.push(s);
         }
@@ -320,6 +322,8 @@ impl GpuBackend {
         let inst = SpriteInstance {
             model_id: chain_id,
             transform: SpriteInstanceTransform::from_sprite(&s),
+            material: s.material,
+            alpha_mul: s.alpha_mul,
         };
         self.gpu.append_sprite_instances(registry, &[inst]);
         self.sprite_instances.push(inst);
@@ -347,9 +351,11 @@ impl GpuBackend {
         }
     }
 
-    /// Set dynamic instance `idx`'s voxel-material id (TV stage). Retained on
-    /// the host-side `sprite_basis` mirror; the GPU sprite pass consumes it
-    /// once the device-side material path lands (TV.2). No-op if out of range.
+    /// Set dynamic instance `idx`'s voxel-material id (TV stage). Updates the
+    /// host-side `sprite_basis` + `sprite_instances` mirrors and flags the
+    /// instance buffer dirty; the new material rides the next [`Self::render`]
+    /// flush (coalesced with pose updates) and the per-frame cull. No-op if
+    /// out of range.
     pub(crate) fn set_dyn_instance_material(&mut self, idx: usize, material: u8) {
         if idx >= self.dyn_count {
             return;
@@ -358,11 +364,13 @@ impl GpuBackend {
         if let Some(b) = self.sprite_basis.get_mut(gpu_index) {
             b.material = material;
         }
+        self.sprite_instances[gpu_index].material = material;
+        self.transforms_dirty = true;
     }
 
     /// Set dynamic instance `idx`'s per-instance alpha multiplier (TV stage,
-    /// `255` = unscaled). Retained for the TV.2 GPU path. No-op if out of
-    /// range.
+    /// `255` = unscaled). Same coalesced-flush path as
+    /// [`Self::set_dyn_instance_material`]. No-op if out of range.
     pub(crate) fn set_dyn_instance_alpha(&mut self, idx: usize, alpha_mul: u8) {
         if idx >= self.dyn_count {
             return;
@@ -371,6 +379,8 @@ impl GpuBackend {
         if let Some(b) = self.sprite_basis.get_mut(gpu_index) {
             b.alpha_mul = alpha_mul;
         }
+        self.sprite_instances[gpu_index].alpha_mul = alpha_mul;
+        self.transforms_dirty = true;
     }
 
     /// Register a new sprite model incrementally (its full LOD chain),
@@ -536,6 +546,8 @@ impl GpuBackend {
         let inst = SpriteInstance {
             model_id: chain0,
             transform: SpriteInstanceTransform::from_sprite(&s),
+            material: s.material,
+            alpha_mul: s.alpha_mul,
         };
         self.gpu.append_sprite_instances(registry, &[inst]);
         self.sprite_instances.push(inst);
@@ -631,6 +643,8 @@ impl GpuBackend {
                 instances.push(SpriteInstance {
                     model_id: id,
                     transform: SpriteInstanceTransform::from_sprite(limb),
+                    material: limb.material,
+                    alpha_mul: limb.alpha_mul,
                 });
                 self.sprite_basis.push(limb.clone());
             }
@@ -833,6 +847,11 @@ impl GpuBackend {
         // byte it's pure runtime side-shading; with baked light it
         // stacks, exactly as voxlap does. Default [0;6] = no shading.
         self.gpu.set_scene_side_shades(frame.side_shades);
+
+        // TV — mirror the global voxel-material palette to the sprite pass
+        // (cheap; the shader only leaves the opaque fast-path once a
+        // translucent material is defined).
+        self.gpu.set_sprite_materials(&self.materials);
 
         // Sprites render flat-lit (identity `kv6colmul`, the GPU default)
         // to match the CPU backend's clean-room DDA sprite raycaster —

@@ -533,6 +533,11 @@ pub struct GpuRenderer {
     sprite_registry: Option<sprite_model::SpriteRegistryResident>,
     /// Lazy-built pipeline + uniform for the model-DDA pass.
     sprite_model_dda: Option<SpriteModelDdaResources>,
+    /// TV — global voxel-material palette mirrored to the sprite pass (256
+    /// entries, default all-opaque), set via [`Self::set_sprite_materials`].
+    /// `sprite_has_translucent` gates the shader's accumulate path.
+    sprite_materials: Box<[MaterialGpu; 256]>,
+    sprite_has_translucent: bool,
     /// GPU.10.4 — LOD aggressiveness: step a sprite to the next mip
     /// once a mip-0 voxel projects below this many screen pixels.
     /// Defaults to 4.0 (the empirical sweet spot); the host can tune
@@ -648,6 +653,10 @@ struct SpriteModelDdaResources {
     bgl: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     uniform_buf: wgpu::Buffer,
+    /// TV — global voxel-material palette (256 `MaterialGpu`, binding 12),
+    /// seeded from the renderer's `sprite_materials` and rewritten by
+    /// [`GpuRenderer::set_sprite_materials`].
+    materials_buf: wgpu::Buffer,
 }
 
 /// Per-frame uniform for the model-DDA pass. Mirrors `Uniform` in
@@ -672,11 +681,48 @@ struct SpriteModelUniform {
     fov_y_rad: f32,
     tiles_x: u32,
     tile_size: u32,
-    _p6: f32,
+    /// TV — 1 if any palette material is translucent: gates the shader's
+    /// accumulate path. 0 ⇒ the unchanged nearest-hit opaque path.
+    has_translucent: u32,
 }
 
 /// GPU.10.3 — sprite screen-tile edge in pixels for instance binning.
 const SPRITE_TILE_SIZE: u32 = 16;
+
+/// One material in the GPU sprite material palette (binding 12). Mirrors
+/// `Mat` in `sprite_model_dda.wgsl` (std430, 8 bytes). TV stage.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MaterialGpu {
+    /// Opacity / additive intensity, normalised to `0..=1`.
+    alpha: f32,
+    /// [`roxlap_formats::material::BlendMode`] discriminant.
+    mode: u32,
+}
+
+/// Convert the global [`MaterialTable`](roxlap_formats::material::MaterialTable)
+/// into the GPU palette + a flag of whether any material is non-opaque (the
+/// shader gate — an all-opaque palette runs the unchanged first-hit path).
+fn material_palette(
+    table: &roxlap_formats::material::MaterialTable,
+) -> (Box<[MaterialGpu; 256]>, bool) {
+    let mut out = Box::new(
+        [MaterialGpu {
+            alpha: 1.0,
+            mode: 0,
+        }; 256],
+    );
+    let mut any_translucent = false;
+    for (id, slot) in out.iter_mut().enumerate() {
+        let m = table.get(id as u8);
+        slot.alpha = f32::from(m.alpha) / 255.0;
+        slot.mode = u32::from(m.mode.as_u8());
+        if !m.is_opaque() {
+            any_translucent = true;
+        }
+    }
+    (out, any_translucent)
+}
 
 /// Build the per-grid camera storage buffer bound at `scene_dda.wgsl`
 /// binding 15 (read-only). One [`SceneDdaPerGridCamera`] per grid; the
@@ -1057,6 +1103,13 @@ impl GpuRenderer {
             fog_far: 1.0e30,
             sprite_registry: None,
             sprite_model_dda: None,
+            sprite_materials: Box::new(
+                [MaterialGpu {
+                    alpha: 1.0,
+                    mode: 0,
+                }; 256],
+            ),
+            sprite_has_translucent: false,
             // GPU.10.4 — default LOD threshold: step to a coarser mip
             // once a voxel projects below 4 px. Empirically the best
             // quality/cost tradeoff; the host can override.
@@ -2113,7 +2166,7 @@ impl GpuRenderer {
                     fov_y_rad,
                     tiles_x,
                     tile_size: SPRITE_TILE_SIZE,
-                    _p6: 0.0,
+                    has_translucent: u32::from(self.sprite_has_translucent),
                 };
                 self.queue
                     .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));
@@ -2168,6 +2221,10 @@ impl GpuRenderer {
                         wgpu::BindGroupEntry {
                             binding: 11,
                             resource: reg.colmul.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 12,
+                            resource: smd.materials_buf.as_entire_binding(),
                         },
                     ],
                 }))
@@ -3560,6 +3617,7 @@ impl GpuRenderer {
                     bgl_storage_entry(9, true),  // tile_instances
                     bgl_storage_entry(10, true), // per-voxel dir
                     bgl_storage_entry(11, true), // per-instance kv6colmul
+                    bgl_storage_entry(12, true), // TV — material palette
                 ],
             });
         let pl = self
@@ -3585,10 +3643,41 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // TV — material palette, seeded from the current renderer state so a
+        // table defined before the sprite pass was built still takes effect.
+        let materials_buf = {
+            use wgpu::util::DeviceExt;
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("roxlap-gpu sprite_model_dda.materials"),
+                    contents: bytemuck::cast_slice(self.sprite_materials.as_slice()),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                })
+        };
         SpriteModelDdaResources {
             bgl,
             pipeline,
             uniform_buf,
+            materials_buf,
+        }
+    }
+
+    /// TV — set the global voxel-material palette for the GPU sprite pass.
+    /// Mirrors the renderer's [`MaterialTable`](roxlap_formats::material::MaterialTable):
+    /// every sprite/clip instance's `material` id indexes it for opacity +
+    /// blend mode. Cheap (2 KB); call it whenever the palette changes (or
+    /// each frame). While every material is opaque the shader stays on the
+    /// unchanged first-hit path.
+    pub fn set_sprite_materials(&mut self, table: &roxlap_formats::material::MaterialTable) {
+        let (palette, any_translucent) = material_palette(table);
+        self.sprite_materials = palette;
+        self.sprite_has_translucent = any_translucent;
+        if let Some(smd) = &self.sprite_model_dda {
+            self.queue.write_buffer(
+                &smd.materials_buf,
+                0,
+                bytemuck::cast_slice(self.sprite_materials.as_slice()),
+            );
         }
     }
 }
