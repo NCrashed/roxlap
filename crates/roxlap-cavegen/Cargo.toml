@@ -13,7 +13,7 @@ keywords = ["voxlap", "voxel", "procedural", "cave", "worley"]
 categories = ["game-development", "graphics", "algorithms"]
 
 [dependencies]
-roxlap-formats = { path = "../roxlap-formats", version = "0.15" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.16" }
 
 [lints]
 workspace = true

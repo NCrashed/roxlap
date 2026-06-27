@@ -160,6 +160,14 @@ and [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
   (constant, jittered, position-dependent, texture-mapped) without
   the global-state dance the original engine required.
 
+- **Transparent voxels.** Alpha-blended and additive voxels for smoke,
+  fire, spell auras, glass, and water — on both backends. Because the
+  per-pixel 3D-DDA renderer visits voxels strictly front-to-back, it
+  composites them in order with no depth sort or OIT scheme. A 256-entry
+  material palette (`define_material`) drives per-instance, per-voxel
+  (mixed opaque-frame + glass models), and world-terrain (glass walls,
+  water) translucency. See `PORTING-TRANSPARENCY.md`.
+
 ## Status
 
 Published on crates.io (`roxlap-core`, `-formats`, `-cavegen`, `-scene`,

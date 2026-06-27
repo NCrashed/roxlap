@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-06-28
+
+### Added
+
+- **Transparent voxels** (macro-stage TV; `PORTING-TRANSPARENCY.md`):
+  alpha-blended and additive voxels for effects (smoke, fire, spell auras,
+  muzzle flashes) and glass/water, on both the CPU and GPU backends. The
+  per-pixel front-to-back 3D-DDA renderer composites translucent voxels in
+  visit order, so it is order-correct without any depth sorting; an
+  all-opaque scene renders byte-for-byte as before.
+  - **Material model** — `roxlap_formats::material`: `BlendMode`
+    (`Opaque` / `AlphaBlend` / `Additive`), `Material { alpha, mode }`, and
+    a 256-entry `MaterialTable` global palette (id 0 is permanently
+    `Material::OPAQUE`). Facade `SceneRenderer::define_material` / `material`.
+  - **Sprites & clips** — per-pixel accumulate-and-continue in the CPU
+    `dda_sprite` raycaster and the GPU `sprite_model_dda.wgsl` pass:
+    `Additive` (commutative glow) and `AlphaBlend` (`over`), a per-instance
+    `alpha_mul` (`set_sprite_instance_material` / `set_sprite_instance_alpha`)
+    for cheap fade animation, and **per-span compositing** (one alpha layer
+    per contiguous solid run / material change) so a translucent shell no
+    longer reads as a voxel grid.
+  - **Mixed-material models** (TV.3) — a single model can mix opaque and
+    translucent voxels (opaque frame + glass) via a colour→material map:
+    `add_sprite_model_with_materials`.
+  - **Terrain** (TV.4–TV.6) — glass/water as world (grid) geometry, resolved
+    from a global terrain colour→material map at render time
+    (`SceneRenderer::set_terrain_materials`) — no `.vxl` format change. CPU
+    `dda` + GPU `scene_dda.wgsl` both accumulate front-to-back.
+  - **Demo** — a "Transparency" scene (glass pane, additive glow, pulsing
+    smoke, a mixed opaque-frame+glass window, and a world glass wall).
+  - CPU `render_sky_fill`: the panorama sky now fills every background pixel
+    (sprite/effect-only views + the margins around small grids), matching the
+    GPU.
+
 ## [0.15.0] — 2026-06-27
 
 ### Added
