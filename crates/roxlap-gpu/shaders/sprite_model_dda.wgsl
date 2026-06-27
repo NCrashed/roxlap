@@ -245,18 +245,26 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
 
     let a = clamp(mt.alpha * inst.alpha_mul, 0.0, 1.0);
     let is_add = mt.mode == 2u;
+    // Per-span compositing: contribute one alpha layer per contiguous solid
+    // run (only on the air→solid entry), so a ray clipping the boundary
+    // between two adjacent surface voxels doesn't double-composite a thin
+    // strip — the fix for the "voxel grid" striping. Mirrors the CPU
+    // `cast_local_layers`.
+    var prev_solid = false;
 
     for (var i: u32 = 0u; i < max_steps; i = i + 1u) {
         if (t_hit >= limit) { break; }
-        if (model_solid(m, p)) {
+        let solid_here = model_solid(m, p);
+        if (solid_here && !prev_solid) {
             let c = model_color(m, p, inst_idx);
             res.rgb = res.rgb + res.trans * a * c;
             res.touched = true;
             if (!is_add) {
                 res.trans = res.trans * (1.0 - a);
-                if (res.trans < (1.0 / 256.0)) { break; }
+                if (res.trans < (1.0 / 256.0)) { prev_solid = solid_here; break; }
             }
         }
+        prev_solid = solid_here;
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
             t_hit = t_max.x; p.x = p.x + step.x; t_max.x = t_max.x + t_delta.x;
             if (p.x < 0 || p.x >= dim_i.x) { break; }

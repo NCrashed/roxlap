@@ -328,6 +328,15 @@ fn cast_local_layers(
         opaque: None,
     };
     let mut touched = false;
+    // Per-span compositing: a translucent voxel contributes one alpha layer
+    // only when the ray *enters* a contiguous solid run (the previous cell
+    // was air). Without this, a ray clipping the shared boundary between two
+    // adjacent surface voxels passes through both and double-composites a thin
+    // strip — the model reads as "diced" by a voxel grid. Treating each solid
+    // run as one surface makes a wall contribute exactly one alpha regardless
+    // of how many of its voxels the ray grazes. (Opaque voxels still stop the
+    // ray on every cell — TV.3 mixed runs rely on that.)
+    let mut prev_solid = false;
 
     for _ in 0..max_steps {
         if cell[0] < 0
@@ -347,21 +356,22 @@ fn cast_local_layers(
             break;
         }
         let idx = dense.idx_of(cell);
-        if dense.occ[idx] && depth >= NEAR_Z {
+        let solid_here = dense.occ[idx];
+        if solid_here && depth >= NEAR_Z {
             let mat_id = if dense.mat.is_empty() {
                 shade_ctx.material
             } else {
                 dense.mat[idx]
             };
             let m = shade_ctx.materials.get(mat_id);
-            let lit = rgb_to_f32(shade(dense.col[idx], 0));
             match m.mode {
                 BlendMode::Opaque => {
                     acc.opaque = Some((shade(dense.col[idx], 0), t_curr));
                     touched = true;
                     break;
                 }
-                BlendMode::AlphaBlend => {
+                BlendMode::AlphaBlend if !prev_solid => {
+                    let lit = rgb_to_f32(shade(dense.col[idx], 0));
                     let a = f32::from(m.alpha) / 255.0 * (f32::from(shade_ctx.alpha_mul) / 255.0);
                     acc.rgb[0] += acc.trans * a * lit[0];
                     acc.rgb[1] += acc.trans * a * lit[1];
@@ -372,15 +382,20 @@ fn cast_local_layers(
                         break;
                     }
                 }
-                BlendMode::Additive => {
+                BlendMode::Additive if !prev_solid => {
+                    let lit = rgb_to_f32(shade(dense.col[idx], 0));
                     let a = f32::from(m.alpha) / 255.0 * (f32::from(shade_ctx.alpha_mul) / 255.0);
                     acc.rgb[0] += acc.trans * a * lit[0];
                     acc.rgb[1] += acc.trans * a * lit[1];
                     acc.rgb[2] += acc.trans * a * lit[2];
                     touched = true;
                 }
+                // Interior of a solid run (prev_solid) — already counted at
+                // entry; skip without re-compositing.
+                BlendMode::AlphaBlend | BlendMode::Additive => {}
             }
         }
+        prev_solid = solid_here;
         let axis = min_axis(t_max);
         t_curr = t_max[axis];
         cell[axis] += step[axis];
@@ -1477,6 +1492,55 @@ mod tests {
         assert_eq!(
             centre, bg,
             "near terrain (z=5) must occlude the sprite at y≈36"
+        );
+    }
+
+    /// Per-span compositing: a translucent voxel contributes one alpha layer
+    /// per contiguous solid run, so a 2-voxel-thick slab composites the same
+    /// as a 1-voxel-thick one (adjacent voxels are not double-counted). This
+    /// is the fix for the voxel-grid striping where a ray clipping a shared
+    /// voxel boundary passed through two cells of one wall.
+    #[test]
+    fn per_span_thickness_independent() {
+        fn centre(ysiz: u32) -> u32 {
+            let mut table = MaterialTable::new();
+            table.set(1, Material::alpha_blend(128));
+            let dense = SpriteDense::from_kv6(&Kv6::solid_box(8, ysiz, 8, 0x80_C0_40_20));
+            let (w, h) = (64u32, 64u32);
+            let n = (w * h) as usize;
+            let mut fb = vec![0x80_10_10_10u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+            let sh = SpriteShade {
+                materials: &table,
+                material: 1,
+                alpha_mul: 255,
+            };
+            let _ = draw_sprite_dense_shaded(
+                &mut fb,
+                &mut zb,
+                w as usize,
+                w,
+                h,
+                &cs,
+                &settings(w, h),
+                &dense,
+                [0.0, 40.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                0,
+                Some(sh),
+            );
+            fb[(h / 2 * w + w / 2) as usize] & 0x00ff_ffff
+        }
+        // A 2-deep box is solid through (surface-only of a 2-thick box is both
+        // y-layers); per-span treats the straight-through ray's two adjacent
+        // voxels as one surface → identical to the 1-deep slab.
+        assert_eq!(
+            centre(1),
+            centre(2),
+            "per-span: a 2-thick slab must match a 1-thick one (no double-count)"
         );
     }
 }
