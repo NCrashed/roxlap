@@ -87,8 +87,11 @@ struct Uniforms {
     // to the grid's `mip_count`. `0` disables LOD (always mip-0).
     // Tunable for the axis-aligned-mip-beams mitigation (11.2).
     mip_scan_dist: f32,
-    _pad2: u32,
-    _pad3: u32,
+    // TV.6 — 1 if any terrain material is translucent (gates the
+    // accumulate path; 0 ⇒ unchanged first-hit opaque march).
+    terrain_has_translucent: u32,
+    // TV.6 — number of (rgb, material_id) entries in `terrain_map`.
+    terrain_map_count: u32,
     _pad4: u32,
     // World camera used purely to derive the per-pixel sky direction.
     // Always valid (even with grid_count == 0, where no grid ray
@@ -142,6 +145,25 @@ struct Uniforms {
 // is now the device's storage limit, not a baked-in 16. The shader only
 // indexes `0..grid_count`, so a grid-less scene binds a 1-element dummy.
 @group(0) @binding(15) var<storage, read> grid_cameras: array<PerGridCamera>;
+// TV.6 — global voxel-material palette (256), `mode`: 0=Opaque,
+// 1=AlphaBlend, 2=Additive; alpha normalised 0..1.
+struct Mat { alpha: f32, mode: u32 };
+@group(0) @binding(16) var<storage, read> materials_pal: array<Mat>;
+// TV.6 — terrain colour→material map: `.x` = rgb (0xRRGGBB), `.y` =
+// material id. A hit voxel's colour is matched here to find its material.
+@group(0) @binding(17) var<storage, read> terrain_map: array<vec2<u32>>;
+
+// TV.6 — material id for a terrain voxel colour (linear scan of the small
+// map); 0 (opaque) when unmapped or the map is empty.
+fn terrain_material_id(packed: u32) -> u32 {
+    let rgb = packed & 0x00ffffffu;
+    for (var i: u32 = 0u; i < u.terrain_map_count; i = i + 1u) {
+        if ((terrain_map[i].x & 0x00ffffffu) == rgb) {
+            return terrain_map[i].y;
+        }
+    }
+    return 0u;
+}
 
 // Read one occupancy word by global index, selecting its page.
 // Single-page scenes (multi-GiB GPUs) skip the division — the
@@ -214,14 +236,14 @@ fn side_shade_for(axis: i32, ray_dir: vec3<f32>) -> f32 {
     return f32(select(u.side_shades1.x, u.side_shades1.y, ray_dir.y >= 0.0));
 }
 
-fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>, face_shade: f32) -> vec3<f32> {
+// The raw packed `0x__RRGGBB` colour of a voxel (the value `voxel_color_in`
+// shades). TV.6 uses it for the terrain colour→material lookup.
+fn voxel_packed_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> u32 {
     let vsid_mip = grid_static_meta[g].vsid >> mip;
     let col_idx = u32(p_voxel.x) + u32(p_voxel.y) * vsid_mip;
     let col_word_base = col_word_base_mip(g, meta_id, mip, p_voxel);
     let z_word = u32(p_voxel.z) >> 5u;
     let z_bit = u32(p_voxel.z) & 31u;
-
-    // Rank = number of TEXTURED voxels below z. Indexes the colour.
     var rank: u32 = 0u;
     for (var w: u32 = 0u; w < z_word; w = w + 1u) {
         rank = rank + countOneBits(occ_word(col_word_base + w));
@@ -232,37 +254,27 @@ fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>, face_shade
     }
     let z_word_bits = occ_word(col_word_base + z_word);
     rank = rank + countOneBits(z_word_bits & mask);
-
-    // A bedrock hit (solid but not textured) inherits the colour of the
-    // textured surface directly above it: that's `rank - 1` (rank here
-    // counts surfaces strictly above). A textured hit uses `rank`.
     let is_textured = (z_word_bits & (1u << z_bit)) != 0u;
     var color_index = rank;
     if (!is_textured && rank > 0u) {
         color_index = rank - 1u;
     }
-
-    // Cumulative-within-slot colour offsets: the mip's sub-table
-    // lives at `mip_coff_rel[mip]`, and its values already include
-    // every finer mip's colour count, so `chunk_colors_base + value
-    // + index` indexes the slot's concatenated colour block directly.
     let offsets_base = grid_static_meta[g].color_offsets_offset
         + meta_id * grid_static_meta[g].offsets_words_per_slot
         + grid_static_meta[g].mip_coff_rel[mip];
     let chunk_local_offset = all_color_offsets[offsets_base + col_idx];
     let chunk_colors_base =
         all_chunk_colors_base[grid_static_meta[g].chunk_colors_base_offset + meta_id];
-    let packed = all_colors[grid_static_meta[g].colors_offset + chunk_colors_base
+    return all_colors[grid_static_meta[g].colors_offset + chunk_colors_base
         + chunk_local_offset + color_index];
+}
 
+fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>, face_shade: f32) -> vec3<f32> {
+    let packed = voxel_packed_in(g, meta_id, mip, p_voxel);
     let a = f32((packed >> 24u) & 0xffu);
     let r = f32((packed >> 16u) & 0xffu);
     let g_chan = f32((packed >> 8u) & 0xffu);
     let b = f32(packed & 0xffu);
-    // Side-shade: reduce the brightness byte by the hit face's shade
-    // before the /128 divide (CPU grouscan_shade equivalent). With no
-    // baked light (flat a=0x80) this is pure runtime side-shading; with
-    // baked light it stacks, exactly like voxlap.
     let brightness = max(0.0, a - face_shade) * (1.0 / 128.0);
     return vec3<f32>(r, g_chan, b) * (brightness / 255.0);
 }
@@ -379,6 +391,22 @@ struct GridHit {
     color: vec3<f32>,
 };
 
+// TV.6 — finalize a translucent terrain ray that exited the grid: composite
+// the accumulated layers over the sky. `touched == false` ⇒ no contribution,
+// returns a non-hit (identical to the opaque path's plain exit). Depth is a
+// large finite value (far) so it loses to nearer opaque grids but still wins
+// over the T_INF sky seed in `render_scene`.
+fn finalize_sky_grid(touched: bool, accum: vec3<f32>, trans: f32, ray_dir: vec3<f32>) -> GridHit {
+    var o: GridHit;
+    o.hit = touched;
+    o.t = 1.0e29;
+    o.color = vec3<f32>(0.0);
+    if (touched) {
+        o.color = accum + trans * sky_color(ray_dir);
+    }
+    return o;
+}
+
 fn march_grid(
     g: u32,
     ray_origin: vec3<f32>,
@@ -413,17 +441,28 @@ fn march_grid(
     out.t = T_INF;
     out.color = vec3<f32>(0.0);
 
+    // TV.6 — front-to-back translucent accumulation (gated on
+    // `terrain_has_translucent`; while off, `touched` stays false and every
+    // return is the unchanged opaque result). `prev_*` drive per-span
+    // compositing; reset per chunk (a seam at chunk borders is acceptable).
+    var accum = vec3<f32>(0.0);
+    var trans = 1.0;
+    var touched = false;
+    var prev_solid = false;
+    var prev_mat = 0u;
+
     for (var step: u32 = 0u; step < u.max_outer_steps; step = step + 1u) {
         if (t_enter > best_t) {
-            return out; // no closer hit possible in this grid
+            return finalize_sky_grid(touched, accum, trans, ray_dir);
         }
         // GPU.13.0 — once the ray has left the occupied chunk-AABB
         // along its travel direction, no resident chunk lies ahead:
         // stop instead of stepping empty space to max_outer_steps.
         if (aabb_passed(g, p_chunk, step_chunk)) {
-            return out;
+            return finalize_sky_grid(touched, accum, trans, ray_dir);
         }
         let slot_id = slot_idx_of(g, p_chunk);
+        prev_solid = false; // fresh chunk: start a new solid run
         if (chunk_has_content(g, slot_id, p_chunk)) {
             // GPU.11.1 — pick the mip for this chunk by entry distance.
             // Voxels are `vsize` world units; the chunk holds
@@ -467,18 +506,45 @@ fn march_grid(
 
             for (var iv: u32 = 0u; iv < MAX_INNER_STEPS; iv = iv + 1u) {
                 if (voxel_solid_in(g, slot_id, mip, p_voxel)) {
-                    if (t_hit < best_t) {
+                    if (t_hit >= best_t) {
+                        return finalize_sky_grid(touched, accum, trans, ray_dir);
+                    }
+                    let shade = side_shade_for(hit_axis, ray_dir);
+                    let lit = apply_fog(voxel_color_in(g, slot_id, mip, p_voxel, shade), t_hit);
+                    if (u.terrain_has_translucent == 0u) {
+                        // Opaque fast-path: unchanged first hit.
                         out.hit = true;
                         out.t = t_hit;
-                        let shade = side_shade_for(hit_axis, ray_dir);
-                        out.color = apply_fog(
-                            voxel_color_in(g, slot_id, mip, p_voxel, shade),
-                            t_hit,
-                        );
-                        return out;
-                    } else {
+                        out.color = lit;
                         return out;
                     }
+                    let packed = voxel_packed_in(g, slot_id, mip, p_voxel);
+                    let mat_id = terrain_material_id(packed);
+                    let mm = materials_pal[mat_id];
+                    if (mm.mode == 0u) {
+                        // Opaque surface backs the translucent layers in front.
+                        out.hit = true;
+                        out.t = t_hit;
+                        out.color = select(lit, accum + trans * lit, touched);
+                        return out;
+                    }
+                    // Translucent: one layer per solid-run entry / material change.
+                    if (!prev_solid || mat_id != prev_mat) {
+                        let a = mm.alpha;
+                        accum = accum + trans * a * lit;
+                        if (mm.mode != 2u) { trans = trans * (1.0 - a); }
+                        touched = true;
+                        prev_mat = mat_id;
+                        if (trans < (1.0 / 256.0)) {
+                            out.hit = true;
+                            out.t = t_hit;
+                            out.color = accum;
+                            return out;
+                        }
+                    }
+                    prev_solid = true;
+                } else {
+                    prev_solid = false;
                 }
                 if (t_max_voxel.x < t_max_voxel.y && t_max_voxel.x < t_max_voxel.z) {
                     t_hit = t_max_voxel.x;
@@ -525,7 +591,7 @@ fn march_grid(
             entry_axis = 2;
         }
     }
-    return out;
+    return finalize_sky_grid(touched, accum, trans, ray_dir);
 }
 
 @compute @workgroup_size(8, 8)

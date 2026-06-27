@@ -883,6 +883,10 @@ impl GpuBackend {
         // (cheap; the shader only leaves the opaque fast-path once a
         // translucent material is defined).
         self.gpu.set_sprite_materials(&self.materials);
+        // TV.6 — and the terrain palette + colour→material map to the scene
+        // pass (glass/water as world geometry).
+        self.gpu
+            .set_scene_terrain_materials(&self.materials, &self.terrain_materials);
 
         // Sprites render flat-lit (identity `kv6colmul`, the GPU default)
         // to match the CPU backend's clean-room DDA sprite raycaster —

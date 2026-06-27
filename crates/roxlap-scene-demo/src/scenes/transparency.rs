@@ -12,8 +12,9 @@
 //! (`define_material`) referenced by an instance via
 //! `set_sprite_instance_material`. See `PORTING-TRANSPARENCY.md`.
 
+use glam::{DVec3, IVec3};
 use roxlap_render::{DynSpriteTransform, Kv6, Material, SceneRenderer, SpriteInstanceId};
-use roxlap_scene::Scene;
+use roxlap_scene::{GridTransform, Scene};
 
 use crate::scene_api::{frame_params, opticast_settings, CameraPose, DemoScene, SceneCtx};
 
@@ -35,10 +36,31 @@ impl TransparencyScene {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            scene: Scene::new(),
+            scene: Self::build_terrain(),
             smoke: None,
             clock: 0.0,
         }
+    }
+
+    /// A world grid behind the sprite cluster (TV.5/TV.6 terrain
+    /// transparency): a big opaque red wall with a glass wall standing in
+    /// front of it. The glass colour maps to `MAT_GLASS` via
+    /// `set_terrain_materials`, so the red wall tints through it. Grid origin
+    /// is world `(−25, 130, 10)`; grid-local `(x, y, z)` → world
+    /// `(x−25, 130+y, 10+z)` (z is down).
+    fn build_terrain() -> Scene {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::new(-25.0, 130.0, 10.0)));
+        let g = scene.grid_mut(id).expect("terrain grid present");
+        // Opaque red wall (far, y-local 30..33), spanning x 0..50, z 0..50.
+        g.set_rect(
+            IVec3::new(0, 30, 0),
+            IVec3::new(50, 33, 50),
+            Some(0x80_B0_50_40),
+        );
+        // Glass wall in front of it (y-local 0..3) — same span.
+        g.set_rect(IVec3::new(0, 0, 0), IVec3::new(50, 3, 50), Some(GLASS_RGB));
+        scene
     }
 
     /// An axis-aligned pose at `pos` (identity model→world basis).
@@ -64,7 +86,7 @@ impl TransparencyScene {
     fn build_window() -> Kv6 {
         const FRAME: u32 = 0x80_6A_4A_2A; // opaque brown
         Kv6::from_fn(30, 3, 30, |x, _y, z| {
-            let edge = x < 4 || x >= 26 || z < 4 || z >= 26;
+            let edge = !(4..26).contains(&x) || !(4..26).contains(&z);
             Some(if edge { FRAME } else { GLASS_RGB })
         })
     }
@@ -98,6 +120,10 @@ impl DemoScene for TransparencyScene {
         r.define_material(MAT_GLASS, Material::alpha_blend(110));
         r.define_material(MAT_GLOW, Material::additive(200));
         r.define_material(MAT_SMOKE, Material::alpha_blend(150));
+
+        // TV.5/TV.6 — the world grid's glass-coloured voxels render as the
+        // glass material (the opaque red wall behind tints through).
+        r.set_terrain_materials(&[(GLASS_RGB & 0x00ff_ffff, MAT_GLASS)]);
 
         // Opaque brick backdrop (reference surface the glass tints).
         let _backdrop = Self::spawn(r, &Kv6::solid_cube(22, 0x80_B0_50_40), [40.0, 90.0, 40.0]);

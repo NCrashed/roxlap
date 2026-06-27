@@ -482,6 +482,7 @@ fn build_image_vertices(
     out
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent per-frame flags, not a state enum
 pub struct GpuRenderer {
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
@@ -504,6 +505,13 @@ pub struct GpuRenderer {
     /// Lazy-built on first [`Self::render_scene`] call. Holds the
     /// multi-grid pipeline + per-grid camera uniforms.
     scene_dda: Option<SceneDdaResources>,
+    /// TV.6 — global voxel-material palette mirrored to the scene pass (256
+    /// entries, default all-opaque), set via [`Self::set_scene_materials`].
+    scene_materials: Box<[MaterialGpu; 256]>,
+    /// TV.6 — terrain colour→material map (`[rgb, material_id]` rows) +
+    /// whether any mapped material is translucent (the shader gate).
+    scene_terrain_map: Vec<[u32; 2]>,
+    scene_terrain_translucent: bool,
     /// Whether the *current* deferred frame ran a scene pass that wrote
     /// `scene_dda.depth_buffer`. [`Self::render_scene`] sets it; the
     /// color-only [`Self::render_clear_deferred`] clears it. Without this,
@@ -644,6 +652,12 @@ struct SceneDdaResources {
     /// so the host can read back the per-pixel world-t after a frame
     /// (e.g. click → which voxel). Same size as `depth_buffer`.
     depth_readback: wgpu::Buffer,
+    /// TV.6 — global voxel-material palette (256 `MaterialGpu`, binding 16),
+    /// seeded from `scene_materials`, rewritten by [`GpuRenderer::set_scene_materials`].
+    materials_pal_buf: wgpu::Buffer,
+    /// TV.6 — terrain colour→material map (`[rgb, material_id]` rows, binding
+    /// 17); ≥1 element (wgpu rejects a zero-sized storage binding).
+    terrain_map_buf: wgpu::Buffer,
 }
 
 /// GPU.10.0 — single-sprite model-DDA pipeline: one thread per pixel
@@ -804,8 +818,11 @@ struct SceneDdaUniform {
     /// `floor(log2(max(t, msd) / msd))`, clamped to the grid's mip
     /// count. `0` disables LOD (always mip-0).
     mip_scan_dist: f32,
-    _pad2: u32,
-    _pad3: u32,
+    /// TV.6 — `1` if any terrain material is translucent (gates the
+    /// accumulate path; `0` ⇒ unchanged opaque first-hit march).
+    terrain_has_translucent: u32,
+    /// TV.6 — number of `(rgb, material_id)` entries in the terrain map.
+    terrain_map_count: u32,
     _pad4: u32,
     /// World camera used only to derive the per-pixel sky direction —
     /// always valid, so a `grid_count == 0` (sprite-only / empty) scene
@@ -1090,6 +1107,14 @@ impl GpuRenderer {
             chunk_dda: None,
             grid_dda: None,
             scene_dda: None,
+            scene_materials: Box::new(
+                [MaterialGpu {
+                    alpha: 1.0,
+                    mode: 0,
+                }; 256],
+            ),
+            scene_terrain_map: Vec::new(),
+            scene_terrain_translucent: false,
             scene_depth_valid: false,
             sky_texture,
             sky_view,
@@ -2049,8 +2074,8 @@ impl GpuRenderer {
             occ_page_words: scene.occupancy_page_words,
             occ_num_pages: scene.occupancy_num_pages,
             mip_scan_dist: self.scene_mip_scan_dist,
-            _pad2: 0,
-            _pad3: 0,
+            terrain_has_translucent: u32::from(self.scene_terrain_translucent),
+            terrain_map_count: self.scene_terrain_map.len() as u32,
             _pad4: 0,
             // Sky direction comes from the world (sprite) camera, so a
             // grid-less sprite-only scene still paints a real sky.
@@ -2130,6 +2155,14 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry {
                     binding: 15,
                     resource: grid_cameras.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: dda.materials_pal_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: dda.terrain_map_buf.as_entire_binding(),
                 },
             ],
         });
@@ -3130,6 +3163,9 @@ impl GpuRenderer {
                     bgl_storage_entry(14, true),
                     // Per-grid cameras (runtime-sized; one per grid).
                     bgl_storage_entry(15, true),
+                    // TV.6 — material palette + terrain colour→material map.
+                    bgl_storage_entry(16, true),
+                    bgl_storage_entry(17, true),
                 ],
             });
         let dda_pl = self
@@ -3234,6 +3270,34 @@ impl GpuRenderer {
             ],
         });
 
+        // TV.6 — material palette + terrain map buffers, seeded from the
+        // renderer's current scene-material state (so a map defined before the
+        // scene pass was built still takes effect).
+        let (materials_pal_buf, terrain_map_buf) = {
+            use wgpu::util::DeviceExt;
+            let pal = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("roxlap-gpu scene_dda.materials_pal"),
+                    contents: bytemuck::cast_slice(self.scene_materials.as_slice()),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                });
+            // Fixed 256-row map (≤256 materials anyway) → no re-alloc when the
+            // host changes the map after the scene pass is built.
+            let mut rows = [[0u32; 2]; 256];
+            for (slot, &row) in rows.iter_mut().zip(self.scene_terrain_map.iter()) {
+                *slot = row;
+            }
+            let map = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("roxlap-gpu scene_dda.terrain_map"),
+                    contents: bytemuck::cast_slice(&rows),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                });
+            (pal, map)
+        };
+
         SceneDdaResources {
             storage_size: (width, height),
             framebuffer,
@@ -3245,6 +3309,8 @@ impl GpuRenderer {
             blit_dims,
             depth_buffer,
             depth_readback,
+            materials_pal_buf,
+            terrain_map_buf,
         }
     }
 
@@ -3685,6 +3751,39 @@ impl GpuRenderer {
             );
         }
     }
+
+    /// TV.6 — set the scene (terrain) material palette + colour→material map
+    /// for the multi-grid scene pass. Matching-colour terrain voxels render
+    /// translucent; an empty map / all-opaque palette renders unchanged. The
+    /// map is capped at 256 rows (the fixed buffer size).
+    pub fn set_scene_terrain_materials(
+        &mut self,
+        table: &roxlap_formats::material::MaterialTable,
+        map: &[(u32, u8)],
+    ) {
+        let (palette, _) = material_palette(table);
+        self.scene_materials = palette;
+        self.scene_terrain_map = map
+            .iter()
+            .take(256)
+            .map(|&(c, m)| [c & 0x00ff_ffff, u32::from(m)])
+            .collect();
+        self.scene_terrain_translucent = map.iter().any(|&(_, m)| !table.get(m).is_opaque());
+        if let Some(dda) = &self.scene_dda {
+            self.queue.write_buffer(
+                &dda.materials_pal_buf,
+                0,
+                bytemuck::cast_slice(self.scene_materials.as_slice()),
+            );
+            if !self.scene_terrain_map.is_empty() {
+                self.queue.write_buffer(
+                    &dda.terrain_map_buf,
+                    0,
+                    bytemuck::cast_slice(&self.scene_terrain_map),
+                );
+            }
+        }
+    }
 }
 
 /// GPU.11 — headless scene-DDA renderer for tests + offline visual
@@ -3812,6 +3911,9 @@ impl HeadlessSceneRenderer {
                 bgl_storage_entry(14, true),
                 // Per-grid cameras (runtime-sized; one per grid).
                 bgl_storage_entry(15, true),
+                // TV.6 — material palette + terrain map (opaque dummies here).
+                bgl_storage_entry(16, true),
+                bgl_storage_entry(17, true),
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3895,6 +3997,29 @@ impl HeadlessSceneRenderer {
             .map(SceneDdaPerGridCamera::from_camera)
             .collect();
         let grid_cameras = upload_grid_cameras(device, &cam_vec);
+        // TV.6 — opaque dummies for the material palette + terrain map
+        // bindings (headless renders opaque-only: terrain_has_translucent=0).
+        let (dummy_pal, dummy_map) = {
+            use wgpu::util::DeviceExt;
+            let pal: Vec<MaterialGpu> = vec![
+                MaterialGpu {
+                    alpha: 1.0,
+                    mode: 0
+                };
+                256
+            ];
+            let p = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("roxlap-gpu headless.materials_pal"),
+                contents: bytemuck::cast_slice(&pal),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let m = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("roxlap-gpu headless.terrain_map"),
+                contents: bytemuck::cast_slice(&[[0u32; 2]]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            (p, m)
+        };
         let uniform = SceneDdaUniform {
             fov_y_rad,
             grid_count: scene.grid_count,
@@ -3909,8 +4034,8 @@ impl HeadlessSceneRenderer {
             occ_page_words: scene.occupancy_page_words,
             occ_num_pages: scene.occupancy_num_pages,
             mip_scan_dist,
-            _pad2: 0,
-            _pad3: 0,
+            terrain_has_translucent: 0, // headless gate: opaque only
+            terrain_map_count: 0,
             _pad4: 0,
             // Sky direction from the first grid camera (the world frame
             // in these tests); a default forward camera when there are
@@ -3996,6 +4121,14 @@ impl HeadlessSceneRenderer {
                 wgpu::BindGroupEntry {
                     binding: 15,
                     resource: grid_cameras.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: dummy_pal.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: dummy_map.as_entire_binding(),
                 },
             ],
         });

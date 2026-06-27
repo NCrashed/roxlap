@@ -324,16 +324,19 @@ fn sample_sky(sky: &Sky, dir: [f32; 3]) -> u32 {
     0x8000_0000 | (px & 0x00ff_ffff)
 }
 
-/// Fill `fb` with the panorama [`Sky`] sampled per pixel — the background for
-/// a **gridless** scene. The per-grid DDA samples the sky for its miss rays,
-/// but a scene with no grids (a sprite/effect-only view) casts no rays, so it
-/// would otherwise show a flat clear colour. This mirrors that miss-ray
-/// sample for every pixel. The z-buffer is left untouched (sky is infinitely
-/// far, so sprites always pass the depth test). `cam`/`settings` are the same
-/// per-frame projection the sprite pass uses.
+/// Fill the panorama [`Sky`] into every **background** pixel — one whose
+/// z-buffer entry is still `+∞` (no grid/terrain hit). The per-grid DDA only
+/// samples the sky inside each grid's screen rect (and only its sky-owning
+/// grid); pixels outside any grid — most of a sprite/effect-only view, or the
+/// margins around a small world grid — would otherwise keep the caller's flat
+/// clear colour. This paints the real panorama there while leaving terrain
+/// (finite z) and composited translucent pixels untouched. The z-buffer is
+/// not modified. `cam`/`settings` are the same per-frame projection the
+/// renderer used.
 #[allow(clippy::cast_possible_truncation)]
 pub fn render_sky_fill(
     fb: &mut [u32],
+    zb: &[f32],
     pitch_pixels: usize,
     width: u32,
     height: u32,
@@ -344,8 +347,12 @@ pub fn render_sky_fill(
     for py in 0..height {
         let row = py as usize * pitch_pixels;
         for px in 0..width {
+            let idx = row + px as usize;
+            if zb[idx].is_finite() {
+                continue; // a grid/terrain hit owns this pixel
+            }
             let (_origin, dir) = pixel_ray(cam, settings, px, py);
-            fb[row + px as usize] = sample_sky(sky, dir);
+            fb[idx] = sample_sky(sky, dir);
         }
     }
 }
@@ -1838,7 +1845,9 @@ mod tests {
         let cs = crate::camera_math::derive(&cam, w, h, 24.0, 24.0, 24.0);
         let settings = crate::opticast::OpticastSettings::for_oracle_framebuffer(w, h);
         let mut fb = vec![0u32; (w * h) as usize];
-        render_sky_fill(&mut fb, w as usize, w, h, &cs, &settings, &sky);
+        // All-background z-buffer (+∞) → every pixel gets the sky.
+        let zb = vec![f32::INFINITY; (w * h) as usize];
+        render_sky_fill(&mut fb, &zb, w as usize, w, h, &cs, &settings, &sky);
         assert!(
             fb.iter().all(|&c| c >> 24 == 0x80),
             "every pixel sky-filled with the brightness byte set"
@@ -1846,6 +1855,12 @@ mod tests {
         let top = fb[0];
         let bottom = fb[(h - 1) as usize * w as usize];
         assert_ne!(top, bottom, "sky gradient should vary with elevation");
+        // A finite-z (terrain) pixel is left untouched.
+        let mut fb2 = vec![0x1234_5678u32; (w * h) as usize];
+        let mut zb2 = vec![f32::INFINITY; (w * h) as usize];
+        zb2[0] = 10.0; // pretend a terrain hit at pixel 0
+        render_sky_fill(&mut fb2, &zb2, w as usize, w, h, &cs, &settings, &sky);
+        assert_eq!(fb2[0], 0x1234_5678, "finite-z pixel is not overwritten");
     }
 
     /// DDA.5: side shading darkens the hit face by its `side_shades`

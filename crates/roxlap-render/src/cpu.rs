@@ -19,7 +19,7 @@ use roxlap_formats::kv6::Kv6;
 use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
-use roxlap_scene::render::{render_scene_composed_with_materials, CpuFog, RenderOutcome};
+use roxlap_scene::render::{render_scene_composed_with_materials, CpuFog};
 use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -810,7 +810,7 @@ impl CpuBackend {
             *z = f32::INFINITY;
         }
 
-        let outcome = render_scene_composed_with_materials(
+        let _ = render_scene_composed_with_materials(
             fb,
             &mut self.zbuffer[..pixel_count],
             width as usize,
@@ -826,32 +826,32 @@ impl CpuBackend {
             &self.terrain_materials,
         );
 
-        // Gridless scene (a sprite/effect-only view): the per-grid DDA never
-        // ran, so the panorama sky was never sampled — the framebuffer is a
-        // flat `clear_sky` fill. Sample the panorama per pixel here so the
-        // background matches the GPU's empty-scene sky (the z-buffer stays
-        // +INF, so sprites composite over it). Grid scenes already get the
-        // panorama via their miss rays.
-        if matches!(outcome, RenderOutcome::Empty) {
-            if let Some(sky) = frame.sky {
-                let cam_state = camera_math::derive(
-                    camera,
-                    width,
-                    height,
-                    frame.settings.hx,
-                    frame.settings.hy,
-                    frame.settings.hz,
-                );
-                render_sky_fill(
-                    fb,
-                    width as usize,
-                    width,
-                    height,
-                    &cam_state,
-                    frame.settings,
-                    sky,
-                );
-            }
+        // Paint the panorama sky into every background pixel (z still +INF):
+        // pixels outside any grid's screen rect — most of a sprite/effect-only
+        // view, and the margins around a small world grid — would otherwise
+        // keep the flat `clear_sky` pre-fill. Terrain hits (finite z) and
+        // composited translucent pixels are left untouched. Matches the GPU's
+        // full-frame sky. (`outcome` no longer gates this — a grid scene needs
+        // it just as much as an empty one.)
+        if let Some(sky) = frame.sky {
+            let cam_state = camera_math::derive(
+                camera,
+                width,
+                height,
+                frame.settings.hx,
+                frame.settings.hy,
+                frame.settings.hz,
+            );
+            render_sky_fill(
+                fb,
+                &self.zbuffer[..pixel_count],
+                width as usize,
+                width,
+                height,
+                &cam_state,
+                frame.settings,
+                sky,
+            );
         }
 
         // Sprites layer on top of the voxel world, z-tested against the
