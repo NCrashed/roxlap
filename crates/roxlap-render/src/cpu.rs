@@ -13,12 +13,13 @@ use std::sync::Arc;
 use roxlap_core::camera_math;
 use roxlap_core::dda_sprite::{draw_sprite_dda_shaded, ClipFlipbook, SpriteDense, SpriteShade};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
+use roxlap_core::render_sky_fill;
 use roxlap_core::Camera;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
-use roxlap_scene::render::{render_scene_composed, CpuFog};
+use roxlap_scene::render::{render_scene_composed, CpuFog, RenderOutcome};
 use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -783,7 +784,7 @@ impl CpuBackend {
             *z = f32::INFINITY;
         }
 
-        let _outcome = render_scene_composed(
+        let outcome = render_scene_composed(
             fb,
             &mut self.zbuffer[..pixel_count],
             width as usize,
@@ -796,6 +797,34 @@ impl CpuBackend {
             frame.sky_color,
             frame.sky,
         );
+
+        // Gridless scene (a sprite/effect-only view): the per-grid DDA never
+        // ran, so the panorama sky was never sampled — the framebuffer is a
+        // flat `clear_sky` fill. Sample the panorama per pixel here so the
+        // background matches the GPU's empty-scene sky (the z-buffer stays
+        // +INF, so sprites composite over it). Grid scenes already get the
+        // panorama via their miss rays.
+        if matches!(outcome, RenderOutcome::Empty) {
+            if let Some(sky) = frame.sky {
+                let cam_state = camera_math::derive(
+                    camera,
+                    width,
+                    height,
+                    frame.settings.hx,
+                    frame.settings.hy,
+                    frame.settings.hz,
+                );
+                render_sky_fill(
+                    fb,
+                    width as usize,
+                    width,
+                    height,
+                    &cam_state,
+                    frame.settings,
+                    sky,
+                );
+            }
+        }
 
         // Sprites layer on top of the voxel world, z-tested against the
         // same z-buffer via the clean-room DDA sprite raycaster. Drawn
