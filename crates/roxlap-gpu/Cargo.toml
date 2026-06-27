@@ -22,7 +22,7 @@ wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { workspace = true }
 # GPU.2: source of `Vxl` chunks for the CPU-side decompressor.
-roxlap-formats = { path = "../roxlap-formats", version = "0.14" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.15" }
 # The renderer is decoupled from any specific windowing library: it
 # binds the wgpu surface to whatever `HasWindowHandle`/
 # `HasDisplayHandle` provider the host passes (winit, SDL, GLFW, …).
