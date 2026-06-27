@@ -11,4 +11,5 @@ pub mod empty;
 pub mod picking;
 pub mod primitives;
 pub mod sprites;
+pub mod transparency;
 pub mod world;
