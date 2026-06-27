@@ -606,17 +606,14 @@ pub fn draw_sprite_dense_shaded(
                 if fwd_dot <= 1e-6 {
                     continue;
                 }
-                // Terrain depth → ray-parameter cutoff (occlusion boundary).
-                // SAFETY: idx in rect ⊂ (width,height); single-threaded.
+                // Terrain/opaque depth cutoff (perpendicular distance, the
+                // same units `cast_local_layers` compares `t_curr·fwd_dot`
+                // against — NOT a ray parameter, since the CPU `dir` is
+                // unnormalised). SAFETY: idx in rect ⊂ (width,height).
                 let max_t = if no_z {
                     f32::INFINITY
                 } else {
-                    let zt = unsafe { target.read_depth(idx) };
-                    if zt.is_finite() {
-                        zt / fwd_dot
-                    } else {
-                        f32::INFINITY
-                    }
+                    unsafe { target.read_depth(idx) }
                 };
                 let Some(acc) =
                     cast_local_layers(dense, origin_local, dir_local, fwd_dot, max_t, shade_ctx)
@@ -1541,6 +1538,91 @@ mod tests {
             centre(1),
             centre(2),
             "per-span: a 2-thick slab must match a 1-thick one (no double-count)"
+        );
+    }
+
+    /// The demo scenario: an **opaque** backdrop sprite drawn first, then a
+    /// **translucent** sprite in front of it sharing the buffer. The glass
+    /// must composite over the backdrop colour (tint it), not leave it
+    /// unchanged. Pins the CPU opaque-then-translucent interaction.
+    #[test]
+    fn translucent_sprite_tints_opaque_sprite_behind() {
+        let mut table = MaterialTable::new();
+        table.set(1, Material::alpha_blend(128));
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let mut fb = vec![0x80_10_20_40u32; n]; // flat sky
+        let mut zb = vec![f32::INFINITY; n];
+        let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+        let cfg = settings(w, h);
+        let id = [1.0, 0.0, 0.0];
+        let up = [0.0, 1.0, 0.0];
+        let fw = [0.0, 0.0, 1.0];
+        let centre = (h / 2 * w + w / 2) as usize;
+
+        // Opaque red backdrop (material 0), far.
+        let backdrop = SpriteDense::from_kv6(&Kv6::solid_cube(12, 0x80_FF_00_00));
+        let sh_op = SpriteShade {
+            materials: &table,
+            material: 0,
+            alpha_mul: 255,
+        };
+        let _ = draw_sprite_dense_shaded(
+            &mut fb,
+            &mut zb,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &cfg,
+            &backdrop,
+            [0.0, 80.0, 0.0],
+            id,
+            up,
+            fw,
+            0,
+            Some(sh_op),
+        );
+        let after_backdrop = fb[centre];
+        assert_eq!(
+            after_backdrop & 0x00ff_ffff,
+            0x00FF_0000,
+            "backdrop red must be drawn first"
+        );
+
+        // Cyan glass (material 1), nearer + overlapping.
+        let glass = SpriteDense::from_kv6(&Kv6::solid_cube(12, 0x80_00_FF_FF));
+        let sh_gl = SpriteShade {
+            materials: &table,
+            material: 1,
+            alpha_mul: 255,
+        };
+        let wrote = draw_sprite_dense_shaded(
+            &mut fb,
+            &mut zb,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &cfg,
+            &glass,
+            [0.0, 40.0, 0.0],
+            id,
+            up,
+            fw,
+            0,
+            Some(sh_gl),
+        );
+        let _ = wrote;
+        let after_glass = fb[centre];
+        assert_ne!(
+            after_glass, after_backdrop,
+            "glass must tint the backdrop (composite over it)"
+        );
+        // Cyan over red: red channel drops, blue/green rise.
+        assert!(
+            (after_glass >> 16) & 0xff < 0xFF,
+            "glass should reduce the backdrop's red (got {after_glass:08x})"
         );
     }
 }
