@@ -347,6 +347,32 @@ impl GpuBackend {
         }
     }
 
+    /// Set dynamic instance `idx`'s voxel-material id (TV stage). Retained on
+    /// the host-side `sprite_basis` mirror; the GPU sprite pass consumes it
+    /// once the device-side material path lands (TV.2). No-op if out of range.
+    pub(crate) fn set_dyn_instance_material(&mut self, idx: usize, material: u8) {
+        if idx >= self.dyn_count {
+            return;
+        }
+        let gpu_index = (self.sprite_instances.len() - self.dyn_count) + idx;
+        if let Some(b) = self.sprite_basis.get_mut(gpu_index) {
+            b.material = material;
+        }
+    }
+
+    /// Set dynamic instance `idx`'s per-instance alpha multiplier (TV stage,
+    /// `255` = unscaled). Retained for the TV.2 GPU path. No-op if out of
+    /// range.
+    pub(crate) fn set_dyn_instance_alpha(&mut self, idx: usize, alpha_mul: u8) {
+        if idx >= self.dyn_count {
+            return;
+        }
+        let gpu_index = (self.sprite_instances.len() - self.dyn_count) + idx;
+        if let Some(b) = self.sprite_basis.get_mut(gpu_index) {
+            b.alpha_mul = alpha_mul;
+        }
+    }
+
     /// Register a new sprite model incrementally (its full LOD chain),
     /// returning its positional host index (== registry chain id). Lazily
     /// creates the registry + resident if none exists yet, so this works

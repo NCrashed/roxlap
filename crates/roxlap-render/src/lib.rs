@@ -1680,6 +1680,38 @@ impl SceneRenderer {
         }
     }
 
+    /// Set sprite instance `id`'s voxel-material id (TV stage) — indexes the
+    /// global palette defined via [`define_material`](Self::define_material)
+    /// for this whole instance's opacity + blend mode. `0` (the default) is
+    /// opaque. Stale handles are ignored.
+    ///
+    /// Only the CPU backend composites translucent sprites today; the GPU
+    /// backend retains the value for the forthcoming device-side path (see
+    /// `PORTING-TRANSPARENCY.md`).
+    pub fn set_sprite_instance_material(&mut self, id: SpriteInstanceId, material: u8) {
+        let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+            return;
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_dyn_instance_material(dyn_index as usize, material),
+            BackendImpl::Gpu(g) => g.set_dyn_instance_material(dyn_index as usize, material),
+        }
+    }
+
+    /// Set sprite instance `id`'s per-instance alpha multiplier (TV stage),
+    /// `0..=255` (`255` = unscaled). Scales the material's opacity so an
+    /// effect can fade out by cheap per-frame updates without re-uploading
+    /// its volume. Stale handles are ignored.
+    pub fn set_sprite_instance_alpha(&mut self, id: SpriteInstanceId, alpha_mul: u8) {
+        let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+            return;
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_dyn_instance_alpha(dyn_index as usize, alpha_mul),
+            BackendImpl::Gpu(g) => g.set_dyn_instance_alpha(dyn_index as usize, alpha_mul),
+        }
+    }
+
     // ---- animated voxel clips (VCL.4) ------------------------------------
 
     /// Register an animated voxel clip ("GIF/MP4 for voxels"): decode all

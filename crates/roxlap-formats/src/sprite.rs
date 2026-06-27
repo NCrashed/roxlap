@@ -68,6 +68,16 @@ pub struct Sprite {
     /// [`SPRITE_FLAG_KFA`], [`SPRITE_FLAG_INVISIBLE`],
     /// [`SPRITE_FLAG_NO_Z`].
     pub flags: u32,
+    /// Voxel-material id (TV stage) applied uniformly to this sprite's
+    /// voxels — indexes the renderer's global
+    /// [`MaterialTable`](crate::material::MaterialTable) for opacity + blend
+    /// mode. `0` (the default) is opaque, so an un-set sprite renders exactly
+    /// as before. See `PORTING-TRANSPARENCY.md`.
+    pub material: u8,
+    /// Per-instance opacity multiplier (TV stage), `0..=255` (`255` =
+    /// unscaled, the default). Scales the material's alpha so an effect can
+    /// fade out by cheap per-frame updates without re-uploading its volume.
+    pub alpha_mul: u8,
 }
 
 impl Sprite {
@@ -101,6 +111,8 @@ impl Sprite {
             h: [0.0, 1.0, 0.0],
             f: [0.0, 0.0, 1.0],
             flags: 0,
+            material: 0,
+            alpha_mul: 255,
         }
     }
 

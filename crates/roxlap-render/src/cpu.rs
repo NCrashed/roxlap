@@ -11,7 +11,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use roxlap_core::camera_math;
-use roxlap_core::dda_sprite::{draw_sprite_dda, ClipFlipbook, SpriteDense};
+use roxlap_core::dda_sprite::{draw_sprite_dda_shaded, ClipFlipbook, SpriteDense, SpriteShade};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::Camera;
 use roxlap_formats::kv6::Kv6;
@@ -550,6 +550,22 @@ impl CpuBackend {
         }
     }
 
+    /// Set dynamic instance `idx`'s voxel-material id (TV stage). No-op if
+    /// `idx` is out of range.
+    pub(crate) fn set_dyn_instance_material(&mut self, idx: usize, material: u8) {
+        if let Some(s) = self.dyn_sprites.get_mut(idx) {
+            s.material = material;
+        }
+    }
+
+    /// Set dynamic instance `idx`'s per-instance alpha multiplier (TV stage,
+    /// `255` = unscaled). No-op if `idx` is out of range.
+    pub(crate) fn set_dyn_instance_alpha(&mut self, idx: usize, alpha_mul: u8) {
+        if let Some(s) = self.dyn_sprites.get_mut(idx) {
+            s.alpha_mul = alpha_mul;
+        }
+    }
+
     /// Register a new model template (axis-aligned, kv6 cloned once) and
     /// return its positional index. The streaming-in counterpart to
     /// [`Self::add_dyn_instance_posed`] for unique generated geometry.
@@ -797,10 +813,20 @@ impl CpuBackend {
                 frame.settings.hy,
                 frame.settings.hz,
             );
+            // Global voxel-material palette (TV stage). A sprite whose
+            // material is opaque (the default, and all of them until a
+            // translucent material is defined) takes the unchanged first-hit
+            // path; only translucent sprites accumulate.
+            let materials = &self.materials;
+            let shade_of = |s: &Sprite| SpriteShade {
+                materials,
+                material: s.material,
+                alpha_mul: s.alpha_mul,
+            };
             // Static sprites + posed KFA limbs: plain KV6 sprites. All
             // z-test against the shared buffer so order doesn't matter.
             for sprite in self.sprites.iter().chain(self.kfa_limbs.iter()) {
-                let _written = draw_sprite_dda(
+                let _written = draw_sprite_dda_shaded(
                     fb,
                     &mut self.zbuffer[..pixel_count],
                     width as usize,
@@ -809,6 +835,7 @@ impl CpuBackend {
                     &cam_state,
                     frame.settings,
                     sprite,
+                    Some(shade_of(sprite)),
                 );
             }
             // Dynamic instances: a KV6 sprite, or — if it carries a clip
@@ -816,9 +843,10 @@ impl CpuBackend {
             // (VCL.4). The `dyn_sprites` entry is the pose carrier either way.
             for (i, sprite) in self.dyn_sprites.iter().enumerate() {
                 let zb = &mut self.zbuffer[..pixel_count];
+                let shade = shade_of(sprite);
                 if let Some((book, fr)) = self.dyn_clip[i] {
                     if let Some(b) = self.clip_books.get(book) {
-                        let _written = b.draw_frame(
+                        let _written = b.draw_frame_shaded(
                             fb,
                             zb,
                             width as usize,
@@ -832,10 +860,11 @@ impl CpuBackend {
                             sprite.h,
                             sprite.f,
                             sprite.flags,
+                            Some(shade),
                         );
                     }
                 } else {
-                    let _written = draw_sprite_dda(
+                    let _written = draw_sprite_dda_shaded(
                         fb,
                         zb,
                         width as usize,
@@ -844,6 +873,7 @@ impl CpuBackend {
                         &cam_state,
                         frame.settings,
                         sprite,
+                        Some(shade),
                     );
                 }
             }

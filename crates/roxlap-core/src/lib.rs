@@ -67,7 +67,10 @@ pub use dda::{
     effective_mip, pixel_ray, render_dda, render_dda_parallel, BrickCache, DdaEnv, PixelSink,
     RasterSink,
 };
-pub use dda_sprite::{draw_sprite_dda, draw_sprite_dense, ClipFlipbook, SpriteDense};
+pub use dda_sprite::{
+    draw_sprite_dda, draw_sprite_dda_shaded, draw_sprite_dense, draw_sprite_dense_shaded,
+    ClipFlipbook, SpriteDense, SpriteShade,
+};
 pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
 pub use grid_view::{ChunkGrid, GridView};
 pub use opticast::OpticastSettings;

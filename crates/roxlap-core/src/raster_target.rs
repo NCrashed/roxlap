@@ -103,6 +103,30 @@ impl<'a> RasterTarget<'a> {
         unsafe { self.zb_ptr.add(idx).write(z) };
     }
 
+    /// Read one z-buffer entry — the terrain depth a translucent sprite
+    /// march tests against (TV stage).
+    ///
+    /// # Safety
+    /// `idx < self.fb_len()`, plus the parallel-use invariant.
+    #[must_use]
+    pub unsafe fn read_depth(self, idx: usize) -> f32 {
+        debug_assert!(idx < self.zb_len, "zb idx {} >= len {}", idx, self.zb_len);
+        // SAFETY: caller asserts in-bounds + disjoint-from-other-threads.
+        unsafe { *self.zb_ptr.add(idx) }
+    }
+
+    /// Read one framebuffer pixel — the background a translucent sprite
+    /// composites over when its ray exits without an opaque hit (TV stage).
+    ///
+    /// # Safety
+    /// `idx < self.fb_len()`, plus the parallel-use invariant.
+    #[must_use]
+    pub unsafe fn read_color(self, idx: usize) -> u32 {
+        debug_assert!(idx < self.fb_len, "fb idx {} >= len {}", idx, self.fb_len);
+        // SAFETY: caller asserts in-bounds + disjoint-from-other-threads.
+        unsafe { *self.fb_ptr.add(idx) }
+    }
+
     /// Depth-tested write: store `(color, z)` only if `z` is strictly
     /// closer (smaller) than the current z-buffer entry. Returns whether
     /// the pixel was written. The compositing primitive the DDA sprite

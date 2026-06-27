@@ -20,6 +20,7 @@
 //! brightness model, not voxlap's `dir`-LUT reflection shading.
 
 use roxlap_formats::kv6::Kv6;
+use roxlap_formats::material::{BlendMode, MaterialTable};
 use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_INVISIBLE, SPRITE_FLAG_NO_Z};
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 
@@ -54,6 +55,12 @@ pub struct SpriteDense {
     dims: [i32; 3],
     occ: Vec<bool>,
     col: Vec<u32>,
+    /// Per-voxel material id (TV stage), parallel to [`col`](Self::col) /
+    /// [`occ`](Self::occ) (same dense index). **Empty** means every voxel
+    /// uses the draw-time uniform material (the TV.1 path); a non-empty
+    /// array gives mixed-material models (opaque frame + glass, TV.3). Only
+    /// consulted on the [`draw_sprite_dense_shaded`] accumulate path.
+    mat: Vec<u8>,
     pivot: [f32; 3],
 }
 
@@ -86,6 +93,7 @@ impl SpriteDense {
             dims,
             occ,
             col,
+            mat: Vec::new(),
             pivot: [kv6.xpiv, kv6.ypiv, kv6.zpiv],
         }
     }
@@ -122,14 +130,20 @@ impl SpriteDense {
             dims: [mx as i32, my as i32, mz as i32],
             occ,
             col,
+            mat: Vec::new(),
             pivot,
         }
     }
 
     #[inline]
     #[allow(clippy::cast_sign_loss)]
+    fn idx_of(&self, c: [i32; 3]) -> usize {
+        ((c[0] * self.dims[1] + c[1]) * self.dims[2] + c[2]) as usize
+    }
+
+    #[inline]
     fn at(&self, c: [i32; 3]) -> Option<u32> {
-        let idx = ((c[0] * self.dims[1] + c[1]) * self.dims[2] + c[2]) as usize;
+        let idx = self.idx_of(c);
         self.occ[idx].then(|| self.col[idx])
     }
 }
@@ -219,6 +233,163 @@ fn cast_local(dense: &SpriteDense, origin: [f32; 3], dir: [f32; 3]) -> Option<(u
     None
 }
 
+/// Material context for a translucent sprite draw (TV stage): the global
+/// [`MaterialTable`] plus this instance's uniform material id and per-frame
+/// alpha multiplier. Passed (as `Some`) to [`draw_sprite_dense_shaded`] /
+/// [`ClipFlipbook::draw_frame_shaded`] to enable front-to-back
+/// accumulate-and-continue compositing; `None` (or an all-opaque effective
+/// material) takes the existing first-hit opaque path byte-for-byte.
+#[derive(Clone, Copy)]
+pub struct SpriteShade<'a> {
+    /// Global voxel-material palette (per-voxel id → opacity + blend mode).
+    pub materials: &'a MaterialTable,
+    /// Uniform material id for every voxel of this sprite whose dense
+    /// per-voxel `mat` array is empty (the TV.1 whole-sprite material).
+    pub material: u8,
+    /// Per-instance opacity multiplier (`255` = unscaled), so an effect can
+    /// fade out by cheap per-frame updates without re-uploading the volume.
+    pub alpha_mul: u8,
+}
+
+/// Accumulated front-to-back composite for one ray through a sprite.
+struct LayerAccum {
+    /// Premultiplied accumulated colour, channels in `0..=~1` (additive may
+    /// exceed 1; clamped at pack time).
+    rgb: [f32; 3],
+    /// Remaining transmittance (starts 1.0, decays through `AlphaBlend`).
+    trans: f32,
+    /// The opaque/background hit that terminated the march, if any: its
+    /// already-shaded packed colour + world-ray parameter `t`. `None` if the
+    /// ray exited (or fully attenuated) without an opaque voxel — then the
+    /// background is whatever the framebuffer already holds (terrain/sky).
+    opaque: Option<(u32, f32)>,
+}
+
+/// Unpack a packed `0x..RRGGBB` colour to linear-ish `0..1` float channels
+/// (RGB only; the high byte is ignored here — sprite voxels are flat-lit).
+#[inline]
+fn rgb_to_f32(c: u32) -> [f32; 3] {
+    [
+        ((c >> 16) & 0xff) as f32 / 255.0,
+        ((c >> 8) & 0xff) as f32 / 255.0,
+        (c & 0xff) as f32 / 255.0,
+    ]
+}
+
+/// Repack `0..1` float channels (clamped) into `0x80RRGGBB` — the
+/// full-brightness packing the flat-lit sprite path writes.
+#[inline]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn f32_to_rgb(c: [f32; 3]) -> u32 {
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+    0x8000_0000 | (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2])
+}
+
+/// Cast one ray (in sprite-local voxel space) accumulating translucent
+/// voxels front-to-back until an opaque voxel, transmittance exhaustion, or
+/// the `max_t` cutoff (the terrain depth, so the march stops at geometry it
+/// can't see past). `fwd_dot = dir·camera-forward` converts the ray
+/// parameter to perpendicular depth. Returns `None` if the ray contributes
+/// nothing (missed the box, or every voxel was clipped / behind terrain).
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+fn cast_local_layers(
+    dense: &SpriteDense,
+    origin: [f32; 3],
+    dir: [f32; 3],
+    fwd_dot: f32,
+    max_t: f32,
+    shade_ctx: SpriteShade,
+) -> Option<LayerAccum> {
+    #[allow(clippy::cast_precision_loss)]
+    let hi = [
+        dense.dims[0] as f32,
+        dense.dims[1] as f32,
+        dense.dims[2] as f32,
+    ];
+    let (t0, t1) = intersect_aabb(origin, dir, [0.0; 3], hi)?;
+    let start = t0 + 1e-4;
+    let p = [
+        origin[0] + dir[0] * start,
+        origin[1] + dir[1] * start,
+        origin[2] + dir[2] * start,
+    ];
+    let mut cell = [
+        (p[0].floor() as i32).clamp(0, dense.dims[0] - 1),
+        (p[1].floor() as i32).clamp(0, dense.dims[1] - 1),
+        (p[2].floor() as i32).clamp(0, dense.dims[2] - 1),
+    ];
+    let (step, mut t_max, t_delta) = dda_setup(origin, dir, cell, 1.0);
+    let mut t_curr = t0;
+    let max_steps = (dense.dims[0] + dense.dims[1] + dense.dims[2]) as usize + 8;
+
+    let mut acc = LayerAccum {
+        rgb: [0.0; 3],
+        trans: 1.0,
+        opaque: None,
+    };
+    let mut touched = false;
+
+    for _ in 0..max_steps {
+        if cell[0] < 0
+            || cell[0] >= dense.dims[0]
+            || cell[1] < 0
+            || cell[1] >= dense.dims[1]
+            || cell[2] < 0
+            || cell[2] >= dense.dims[2]
+            || t_curr > t1
+        {
+            break;
+        }
+        // Stop at the terrain depth: everything past it is occluded, and the
+        // already-drawn framebuffer pixel becomes the background.
+        let depth = t_curr * fwd_dot;
+        if depth >= max_t {
+            break;
+        }
+        let idx = dense.idx_of(cell);
+        if dense.occ[idx] && depth >= NEAR_Z {
+            let mat_id = if dense.mat.is_empty() {
+                shade_ctx.material
+            } else {
+                dense.mat[idx]
+            };
+            let m = shade_ctx.materials.get(mat_id);
+            let lit = rgb_to_f32(shade(dense.col[idx], 0));
+            match m.mode {
+                BlendMode::Opaque => {
+                    acc.opaque = Some((shade(dense.col[idx], 0), t_curr));
+                    touched = true;
+                    break;
+                }
+                BlendMode::AlphaBlend => {
+                    let a = f32::from(m.alpha) / 255.0 * (f32::from(shade_ctx.alpha_mul) / 255.0);
+                    acc.rgb[0] += acc.trans * a * lit[0];
+                    acc.rgb[1] += acc.trans * a * lit[1];
+                    acc.rgb[2] += acc.trans * a * lit[2];
+                    acc.trans *= 1.0 - a;
+                    touched = true;
+                    if acc.trans < 1.0 / 256.0 {
+                        break;
+                    }
+                }
+                BlendMode::Additive => {
+                    let a = f32::from(m.alpha) / 255.0 * (f32::from(shade_ctx.alpha_mul) / 255.0);
+                    acc.rgb[0] += acc.trans * a * lit[0];
+                    acc.rgb[1] += acc.trans * a * lit[1];
+                    acc.rgb[2] += acc.trans * a * lit[2];
+                    touched = true;
+                }
+            }
+        }
+        let axis = min_axis(t_max);
+        t_curr = t_max[axis];
+        cell[axis] += step[axis];
+        t_max[axis] += t_delta[axis];
+    }
+
+    touched.then_some(acc)
+}
+
 /// Draw one KV6 [`Sprite`] into `(fb, zb)` by per-pixel ray casting,
 /// depth-compositing against whatever the terrain pass already wrote.
 /// Returns the number of pixels written.
@@ -247,10 +418,43 @@ pub fn draw_sprite_dda(
     if sprite.flags & SPRITE_FLAG_INVISIBLE != 0 {
         return 0;
     }
+    draw_sprite_dda_shaded(
+        fb,
+        zb,
+        pitch_pixels,
+        width,
+        height,
+        cam,
+        settings,
+        sprite,
+        None,
+    )
+}
+
+/// Draw one KV6 [`Sprite`], optionally with a translucent material (TV
+/// stage) — the [`draw_sprite_dense_shaded`] counterpart of
+/// [`draw_sprite_dda`]. `shade_ctx == None` (or an opaque effective
+/// material) renders the sprite opaque, byte-for-byte unchanged.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn draw_sprite_dda_shaded(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
+    cam: &CameraState,
+    settings: &OpticastSettings,
+    sprite: &Sprite,
+    shade_ctx: Option<SpriteShade>,
+) -> u32 {
+    if sprite.flags & SPRITE_FLAG_INVISIBLE != 0 {
+        return 0;
+    }
     // Decodes the KV6 to a dense grid each call (the per-frame cost an
     // animated clip avoids via [`ClipFlipbook`]'s cached grids).
     let dense = SpriteDense::from_kv6(&sprite.kv6);
-    draw_sprite_dense(
+    draw_sprite_dense_shaded(
         fb,
         zb,
         pitch_pixels,
@@ -264,6 +468,7 @@ pub fn draw_sprite_dda(
         sprite.h,
         sprite.f,
         sprite.flags,
+        shade_ctx,
     )
 }
 
@@ -272,11 +477,10 @@ pub fn draw_sprite_dda(
 /// [`ClipFlipbook`] frames. `pos` is the world pivot; `s`/`h`/`f` are the
 /// model→world basis columns (local +x/+y/+z); `flags` honours
 /// [`SPRITE_FLAG_INVISIBLE`] / [`SPRITE_FLAG_NO_Z`]. Returns pixels written.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
+///
+/// Fully opaque (the existing first-hit path). For translucent sprites use
+/// [`draw_sprite_dense_shaded`].
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn draw_sprite_dense(
     fb: &mut [u32],
@@ -293,6 +497,57 @@ pub fn draw_sprite_dense(
     f: [f32; 3],
     flags: u32,
 ) -> u32 {
+    draw_sprite_dense_shaded(
+        fb,
+        zb,
+        pitch_pixels,
+        width,
+        height,
+        cam,
+        settings,
+        dense,
+        pos,
+        s,
+        h,
+        f,
+        flags,
+        None,
+    )
+}
+
+/// Draw a pre-decoded [`SpriteDense`] at a world pose, optionally with a
+/// translucent material (TV stage). `shade_ctx`:
+/// - `None`, or a `Some` whose effective material is opaque ⇒ the existing
+///   first-hit, depth-tested opaque path, **byte-for-byte unchanged**.
+/// - `Some` with a translucent uniform material (or a non-empty per-voxel
+///   `mat` array) ⇒ front-to-back accumulate-and-continue: each ray marches
+///   through the sprite compositing `AlphaBlend`/`Additive` layers over what
+///   lies behind (terrain/sky already in the framebuffer, or an opaque voxel
+///   of the model). Opaque voxels write the model surface depth; purely
+///   translucent pixels composite over the framebuffer without touching the
+///   z-buffer (they do not occlude). See `PORTING-TRANSPARENCY.md`.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+#[must_use]
+pub fn draw_sprite_dense_shaded(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
+    cam: &CameraState,
+    settings: &OpticastSettings,
+    dense: &SpriteDense,
+    pos: [f32; 3],
+    s: [f32; 3],
+    h: [f32; 3],
+    f: [f32; 3],
+    flags: u32,
+    shade_ctx: Option<SpriteShade>,
+) -> u32 {
     if flags & SPRITE_FLAG_INVISIBLE != 0 || dense.occ.is_empty() {
         return 0;
     }
@@ -307,6 +562,14 @@ pub fn draw_sprite_dense(
         return 0;
     };
 
+    // Per-sprite gate: a sprite whose effective material is opaque (the
+    // common case, and every sprite while no translucent material is
+    // defined) takes the original loop unchanged — so the opaque world stays
+    // bit-identical. Only a genuinely translucent sprite runs the accumulate
+    // loop.
+    let layers =
+        shade_ctx.filter(|s| !dense.mat.is_empty() || !s.materials.get(s.material).is_opaque());
+
     debug_assert_eq!(fb.len(), zb.len());
     let target = RasterTarget::new(fb, zb);
     let mut written = 0u32;
@@ -319,29 +582,93 @@ pub fn draw_sprite_dense(
             let ol = mat_apply(&minv, rel);
             let origin_local = [ol[0] + pivot[0], ol[1] + pivot[1], ol[2] + pivot[2]];
             let dir_local = mat_apply(&minv, dir);
-            let Some((color, t)) = cast_local(dense, origin_local, dir_local) else {
-                continue;
-            };
             let fwd_dot =
                 dir[0] * cam.forward[0] + dir[1] * cam.forward[1] + dir[2] * cam.forward[2];
-            let depth = t * fwd_dot;
-            if depth < NEAR_Z {
-                continue;
-            }
-            let lit = shade(color, 0);
             let idx = row + px as usize;
-            // SAFETY: idx in-bounds for the rect within (width, height);
-            // single-threaded writer.
-            let wrote = unsafe {
-                if no_z {
-                    target.write_color(idx, lit);
-                    target.write_depth(idx, depth);
-                    true
-                } else {
-                    target.z_test_write(idx, lit, depth)
+
+            if let Some(shade_ctx) = layers {
+                // ---- translucent: accumulate front-to-back ----
+                if fwd_dot <= 1e-6 {
+                    continue;
                 }
-            };
-            written += u32::from(wrote);
+                // Terrain depth → ray-parameter cutoff (occlusion boundary).
+                // SAFETY: idx in rect ⊂ (width,height); single-threaded.
+                let max_t = if no_z {
+                    f32::INFINITY
+                } else {
+                    let zt = unsafe { target.read_depth(idx) };
+                    if zt.is_finite() {
+                        zt / fwd_dot
+                    } else {
+                        f32::INFINITY
+                    }
+                };
+                let Some(acc) =
+                    cast_local_layers(dense, origin_local, dir_local, fwd_dot, max_t, shade_ctx)
+                else {
+                    continue;
+                };
+                // SAFETY: idx in bounds; single-threaded writer.
+                let wrote = unsafe {
+                    match acc.opaque {
+                        Some((bg_color, t)) => {
+                            // Opaque model surface behind the translucent
+                            // layers: composite over it, write surface depth.
+                            let bg = rgb_to_f32(bg_color);
+                            let out = f32_to_rgb([
+                                acc.rgb[0] + acc.trans * bg[0],
+                                acc.rgb[1] + acc.trans * bg[1],
+                                acc.rgb[2] + acc.trans * bg[2],
+                            ]);
+                            let depth = t * fwd_dot;
+                            if no_z {
+                                target.write_color(idx, out);
+                                target.write_depth(idx, depth);
+                                true
+                            } else {
+                                target.z_test_write(idx, out, depth)
+                            }
+                        }
+                        None => {
+                            // Ray exited (or fully attenuated) with no opaque
+                            // model voxel: composite over the framebuffer
+                            // (terrain/sky). Translucent layers do not occlude,
+                            // so the z-buffer is left untouched.
+                            let bg = rgb_to_f32(target.read_color(idx));
+                            let out = f32_to_rgb([
+                                acc.rgb[0] + acc.trans * bg[0],
+                                acc.rgb[1] + acc.trans * bg[1],
+                                acc.rgb[2] + acc.trans * bg[2],
+                            ]);
+                            target.write_color(idx, out);
+                            true
+                        }
+                    }
+                };
+                written += u32::from(wrote);
+            } else {
+                // ---- opaque: original first-hit path (unchanged) ----
+                let Some((color, t)) = cast_local(dense, origin_local, dir_local) else {
+                    continue;
+                };
+                let depth = t * fwd_dot;
+                if depth < NEAR_Z {
+                    continue;
+                }
+                let lit = shade(color, 0);
+                // SAFETY: idx in-bounds for the rect within (width, height);
+                // single-threaded writer.
+                let wrote = unsafe {
+                    if no_z {
+                        target.write_color(idx, lit);
+                        target.write_depth(idx, depth);
+                        true
+                    } else {
+                        target.z_test_write(idx, lit, depth)
+                    }
+                };
+                written += u32::from(wrote);
+            }
         }
     }
     written
@@ -500,10 +827,51 @@ impl ClipFlipbook {
         f: [f32; 3],
         flags: u32,
     ) -> u32 {
+        self.draw_frame_shaded(
+            fb,
+            zb,
+            pitch_pixels,
+            width,
+            height,
+            cam,
+            settings,
+            frame,
+            pos,
+            s,
+            h,
+            f,
+            flags,
+            None,
+        )
+    }
+
+    /// Draw frame `frame`, optionally with a translucent material (TV stage)
+    /// — the [`draw_sprite_dense_shaded`] counterpart of
+    /// [`draw_frame`](Self::draw_frame). `shade_ctx == None` (or an opaque
+    /// effective material) renders the frame opaque, unchanged.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn draw_frame_shaded(
+        &self,
+        fb: &mut [u32],
+        zb: &mut [f32],
+        pitch_pixels: usize,
+        width: u32,
+        height: u32,
+        cam: &CameraState,
+        settings: &OpticastSettings,
+        frame: usize,
+        pos: [f32; 3],
+        s: [f32; 3],
+        h: [f32; 3],
+        f: [f32; 3],
+        flags: u32,
+        shade_ctx: Option<SpriteShade>,
+    ) -> u32 {
         let Some(dense) = self.frames.get(frame) else {
             return 0;
         };
-        draw_sprite_dense(
+        draw_sprite_dense_shaded(
             fb,
             zb,
             pitch_pixels,
@@ -517,6 +885,7 @@ impl ClipFlipbook {
             h,
             f,
             flags,
+            shade_ctx,
         )
     }
 }
@@ -527,6 +896,7 @@ mod tests {
     use crate::camera_math;
     use crate::Camera;
     use roxlap_formats::kv6::Kv6;
+    use roxlap_formats::material::{Material, MaterialTable};
     use roxlap_formats::sprite::Sprite;
     use roxlap_formats::voxel_clip::{LoopMode, VoxelClip, VoxelFrame};
 
@@ -936,5 +1306,177 @@ mod tests {
             &sprite,
         );
         assert_eq!(wrote, 0);
+    }
+
+    // ---------- TV.1a: translucent accumulate-and-continue path ----------
+
+    /// Draw a uniform-material 8³ cube (RGB `0xC0_40_20`) at world y=40 over
+    /// a `bg`-filled framebuffer with z-buffer `zb_v`, using palette id 1 =
+    /// `mat`. Returns `(centre_pixel, full_framebuffer)`.
+    fn draw_cube_shaded(mat: Material, alpha_mul: u8, bg: u32, zb_v: f32) -> (u32, Vec<u32>) {
+        let mut table = MaterialTable::new();
+        table.set(1, mat);
+        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_C0_40_20));
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let mut fb = vec![bg; n];
+        let mut zb = vec![zb_v; n];
+        let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+        let sh = SpriteShade {
+            materials: &table,
+            material: 1,
+            alpha_mul,
+        };
+        let _ = draw_sprite_dense_shaded(
+            &mut fb,
+            &mut zb,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &settings(w, h),
+            &dense,
+            [0.0, 40.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            0,
+            Some(sh),
+        );
+        (fb[(h / 2 * w + w / 2) as usize], fb)
+    }
+
+    /// An additive sprite over a dark background brightens it (glow) — and
+    /// never darkens any channel below the background.
+    #[test]
+    fn additive_sprite_brightens_background() {
+        let bg = 0x80_20_20_20;
+        let (centre, _) = draw_cube_shaded(Material::additive(255), 255, bg, f32::INFINITY);
+        let (cr, cg, cb) = ((centre >> 16) & 0xff, (centre >> 8) & 0xff, centre & 0xff);
+        assert!(
+            cr > 0x20 && cg > 0x20 && cb >= 0x20,
+            "centre {centre:08x} should be brighter than bg"
+        );
+        // Red channel (sprite 0xC0) lifts the most.
+        assert!(
+            cr >= cg && cr >= cb,
+            "additive of a red-dominant cube stays red-dominant"
+        );
+    }
+
+    /// An alpha-blend sprite composites *between* the background and its own
+    /// colour — neither equal to the bare background nor the opaque colour.
+    #[test]
+    fn alpha_blend_sprite_between_bg_and_color() {
+        let bg = 0x80_20_20_20;
+        let (centre, _) = draw_cube_shaded(Material::alpha_blend(128), 255, bg, f32::INFINITY);
+        let cr = (centre >> 16) & 0xff;
+        assert!(
+            cr > 0x20,
+            "blended red must rise above bg 0x20 (got {cr:02x})"
+        );
+        assert!(
+            cr < 0xC0,
+            "blended red must stay below opaque 0xC0 (got {cr:02x})"
+        );
+        // Distinct from both endpoints.
+        assert_ne!(centre & 0x00ff_ffff, bg & 0x00ff_ffff);
+        assert_ne!(centre & 0x00ff_ffff, 0x00_C0_40_20);
+    }
+
+    /// The per-instance `alpha_mul` scales opacity: a lower multiplier keeps
+    /// more of the background (less of the sprite colour).
+    #[test]
+    fn alpha_mul_scales_opacity() {
+        let bg = 0x80_20_20_20;
+        let (full, _) = draw_cube_shaded(Material::alpha_blend(255), 255, bg, f32::INFINITY);
+        let (faded, _) = draw_cube_shaded(Material::alpha_blend(255), 64, bg, f32::INFINITY);
+        let r_full = (full >> 16) & 0xff;
+        let r_faded = (faded >> 16) & 0xff;
+        // Both lift red above bg, but the faded one stays closer to bg.
+        assert!(
+            r_full > r_faded,
+            "alpha_mul=255 ({r_full:02x}) more opaque than 64 ({r_faded:02x})"
+        );
+        assert!(r_faded > 0x20, "even faded lifts above bg");
+    }
+
+    /// A `SpriteShade` whose effective material is **opaque** (id 0) renders
+    /// byte-for-byte identically to the plain opaque path — the per-sprite
+    /// gate that keeps the opaque world unchanged.
+    #[test]
+    fn opaque_shade_ctx_matches_plain_path() {
+        let table = MaterialTable::new();
+        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_C0_40_20));
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+        let pose = (
+            [0.0, 40.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        );
+
+        let mut fb_plain = vec![0u32; n];
+        let mut zb_plain = vec![f32::INFINITY; n];
+        let _ = draw_sprite_dense(
+            &mut fb_plain,
+            &mut zb_plain,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &settings(w, h),
+            &dense,
+            pose.0,
+            pose.1,
+            pose.2,
+            pose.3,
+            0,
+        );
+
+        let mut fb_sh = vec![0u32; n];
+        let mut zb_sh = vec![f32::INFINITY; n];
+        let sh = SpriteShade {
+            materials: &table,
+            material: 0, // opaque
+            alpha_mul: 255,
+        };
+        let _ = draw_sprite_dense_shaded(
+            &mut fb_sh,
+            &mut zb_sh,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &settings(w, h),
+            &dense,
+            pose.0,
+            pose.1,
+            pose.2,
+            pose.3,
+            0,
+            Some(sh),
+        );
+
+        assert_eq!(
+            fb_plain, fb_sh,
+            "opaque shade-ctx must match the plain path bit-for-bit"
+        );
+        assert_eq!(zb_plain, zb_sh, "opaque shade-ctx z-buffer must match too");
+    }
+
+    /// A translucent (additive) sprite behind nearer terrain is occluded:
+    /// the front depth (~36) is past the z-buffer cutoff (5), so the march
+    /// stops before contributing and the background pixel is untouched.
+    #[test]
+    fn translucent_sprite_occluded_by_near_terrain() {
+        let bg = 0x80_20_20_20;
+        let (centre, _) = draw_cube_shaded(Material::additive(255), 255, bg, 5.0);
+        assert_eq!(
+            centre, bg,
+            "near terrain (z=5) must occlude the sprite at y≈36"
+        );
     }
 }
