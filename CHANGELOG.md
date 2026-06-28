@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.17.0] — 2026-06-28
-
 ### Added
 
 - **Dynamic lighting** (macro-stage DL; `PORTING-DYNLIGHT.md`) — runtime,
@@ -41,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **"Lighting" demo scene** — a sweeping sun + three orbiting coloured point
     lights over a pillared floor; `P` pauses the sun, `K` toggles sun shadows,
     `L` toggles the point lights.
+
+## [0.17.0] — 2026-06-28
+
+### Added
 
 - **`SceneRenderer::wait_idle`** — blocks until the active backend has drained
   all in-flight work and releases any acquired-but-unpresented swapchain frame

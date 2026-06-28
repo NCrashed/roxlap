@@ -16,11 +16,11 @@ name = "roxlap-cave-demo"
 path = "src/main.rs"
 
 [dependencies]
-roxlap-core = { path = "../roxlap-core", version = "0.17" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.17" }
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.17" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.17" }
-roxlap-render = { path = "../roxlap-render", version = "0.17" }
+roxlap-core = { path = "../roxlap-core", version = "0.18" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.18" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.18" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.18" }
+roxlap-render = { path = "../roxlap-render", version = "0.18" }
 glam = { workspace = true }
 winit = "0.30"
 

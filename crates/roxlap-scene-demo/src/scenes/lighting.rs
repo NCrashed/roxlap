@@ -156,7 +156,9 @@ impl DemoScene for LightingScene {
         self.rebuild_points();
     }
 
-    fn update(&mut self, _ctx: &mut SceneCtx, dt: f64) {
+    fn update(&mut self, ctx: &mut SceneCtx, dt: f64) {
+        // Shared free-fly camera (WASD + Space/Shift); no collision here.
+        ctx.cam.fly_free(ctx.input, dt);
         if !self.paused {
             self.clock += dt;
         }
