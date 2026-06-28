@@ -8,12 +8,21 @@
 //! behind it), and a grey **smoke puff** whose per-instance `alpha_mul`
 //! pulses each frame — fading without re-uploading its volume.
 //!
+//! There is also a static mixed-material **window** (opaque frame + glass)
+//! and a **pulsing glass orb clip** — an animated `.rvc` whose voxels carry
+//! per-voxel materials (`add_voxel_clip_with_materials`), the animated
+//! analogue of the window.
+//!
 //! Each effect is one [`Material`] in the renderer's global palette
 //! (`define_material`) referenced by an instance via
-//! `set_sprite_instance_material`. See `PORTING-TRANSPARENCY.md`.
+//! `set_sprite_instance_material` (whole-instance), a colour→material map
+//! (`add_sprite_model_with_materials` / `add_voxel_clip_with_materials`,
+//! per voxel), or `set_terrain_materials` (grid). See `PORTING-TRANSPARENCY.md`.
 
 use glam::{DVec3, IVec3};
-use roxlap_render::{DynSpriteTransform, Kv6, Material, SceneRenderer, SpriteInstanceId};
+use roxlap_render::{
+    DynSpriteTransform, Kv6, LoopMode, Material, SceneRenderer, SpriteInstanceId, VoxelClip,
+};
 use roxlap_scene::{GridTransform, Scene};
 
 use crate::scene_api::{frame_params, opticast_settings, CameraPose, DemoScene, SceneCtx};
@@ -90,6 +99,32 @@ impl TransparencyScene {
             Some(if edge { FRAME } else { GLASS_RGB })
         })
     }
+
+    /// A **mixed-material animated clip** (TV.3 + the clip wiring): a small
+    /// orb that pulses between a tight and a loose radius across four frames,
+    /// every voxel in the glass colour. Registered via
+    /// `add_voxel_clip_with_materials` so the glass colour classifies into
+    /// `MAT_GLASS` per voxel — the animated, per-voxel-translucent analogue of
+    /// the static mixed-material window. Returns a looping `.rvc` clip.
+    fn build_glass_orb_clip() -> VoxelClip {
+        const DIM: u32 = 16;
+        let cx = (DIM as f32 - 1.0) * 0.5;
+        // Four radii pulsing small→large→small (looped), each a sphere of the
+        // glass colour.
+        let radii = [4.0f32, 5.5, 7.0, 5.5];
+        let frames: Vec<Kv6> = radii
+            .iter()
+            .map(|&r| {
+                let r2 = r * r;
+                Kv6::from_fn(DIM, DIM, DIM, |x, y, z| {
+                    let (dx, dy, dz) = (x as f32 - cx, y as f32 - cx, z as f32 - cx);
+                    (dx * dx + dy * dy + dz * dz <= r2).then_some(GLASS_RGB)
+                })
+            })
+            .collect();
+        VoxelClip::from_kv6_frames(&frames, 1.0, LoopMode::Loop, &[], 120, 1)
+            .expect("glass orb clip frames are non-empty + same dims")
+    }
 }
 
 /// The glass voxel colour shared by the window's glass + its material map.
@@ -157,6 +192,18 @@ impl DemoScene for TransparencyScene {
         );
         let _window_inst = r.add_sprite_instance_posed(window, Self::pose([-50.0, 95.0, 40.0]));
 
+        // Mixed-material *animated* clip: a pulsing glass orb whose voxels
+        // classify into MAT_GLASS per voxel (the clip analogue of the window).
+        // Auto-plays on its own clock — `advance_voxel_clips` ticks it.
+        let orb_clip = r.add_voxel_clip_with_materials(
+            &Self::build_glass_orb_clip()
+                .decode()
+                .expect("glass orb clip decodes"),
+            &[(GLASS_RGB & 0x00ff_ffff, MAT_GLASS)],
+        );
+        let _orb_inst =
+            r.add_clip_instance_playing(orb_clip, Self::pose([45.0, 70.0, 40.0]), 256, 0);
+
         eprintln!(
             "Transparency: glass (alpha id {MAT_GLASS}) over an opaque backdrop, \
              additive glow (id {MAT_GLOW}), pulsing smoke (id {MAT_SMOKE})"
@@ -165,6 +212,8 @@ impl DemoScene for TransparencyScene {
 
     fn update(&mut self, ctx: &mut SceneCtx, dt: f64) {
         ctx.cam.fly_free(ctx.input, dt);
+        // Advance the auto-playing glass-orb clip on its own clock.
+        ctx.renderer.advance_voxel_clips(dt);
         self.clock += dt;
         // Pulse the smoke opacity in [40, 255] so it visibly thins + thickens
         // — a per-instance alpha_mul update, no volume re-upload.
@@ -188,6 +237,7 @@ impl DemoScene for TransparencyScene {
             "glass: AlphaBlend over opaque backdrop".to_string(),
             "glow: Additive (order-independent)".to_string(),
             "smoke: pulsing per-instance alpha_mul".to_string(),
+            "orb: animated clip, per-voxel glass material".to_string(),
         ]
     }
 }

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Mixed-material animated clips** — per-voxel materials (TV.3) now extend to
+  voxel clips (`.rvc`), the animated analogue of
+  `add_sprite_model_with_materials`: `SceneRenderer::add_voxel_clip_with_materials`
+  classifies every frame's voxels into per-voxel material ids by a
+  colour→material map, so an animated clip can mix opaque and translucent
+  voxels (an opaque torch handle around an additive flame, a pulsing glass
+  orb) on both backends. Previously clips could only carry a whole-instance
+  uniform material; the per-voxel path was wired for static sprites but not
+  for clip frames. An empty map is byte-identical to `add_voxel_clip`. The
+  "Transparency" demo scene gains a pulsing glass-orb clip dogfooding it.
+
 ## [0.16.0] — 2026-06-28
 
 ### Added

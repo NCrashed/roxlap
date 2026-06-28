@@ -159,6 +159,32 @@ impl SpriteDense {
         }
     }
 
+    /// Like [`from_voxel_frame`](Self::from_voxel_frame) but classifies each
+    /// voxel into a material id by colour (TV.3 mixed models) via
+    /// `material_map` — the clip analogue of
+    /// [`from_kv6_with_materials`](Self::from_kv6_with_materials). An empty
+    /// map yields the same all-opaque (uniform) result as `from_voxel_frame`.
+    #[must_use]
+    pub fn from_voxel_frame_with_materials(
+        frame: &VoxelFrame,
+        dims: [u32; 3],
+        pivot: [f32; 3],
+        material_map: &[(u32, u8)],
+    ) -> Self {
+        let mut dense = Self::from_voxel_frame(frame, dims, pivot);
+        if !material_map.is_empty() {
+            let n = dense.col.len();
+            let mut mat = vec![0u8; n];
+            for (idx, slot) in mat.iter_mut().enumerate() {
+                if dense.occ[idx] {
+                    *slot = material_for_color(material_map, dense.col[idx]);
+                }
+            }
+            dense.mat = mat;
+        }
+        dense
+    }
+
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn idx_of(&self, c: [i32; 3]) -> usize {
@@ -810,10 +836,27 @@ impl ClipFlipbook {
     /// Decode + cache every frame of `clip` (one [`SpriteDense`] each).
     #[must_use]
     pub fn from_decoded(clip: &DecodedClip) -> Self {
+        Self::from_decoded_with_materials(clip, &[])
+    }
+
+    /// Like [`from_decoded`](Self::from_decoded) but classifies every frame's
+    /// voxels into per-voxel material ids by colour (TV.3 mixed models) via
+    /// `material_map` — the clip analogue of
+    /// [`SpriteDense::from_kv6_with_materials`]. An empty map yields the same
+    /// all-opaque result as `from_decoded`.
+    #[must_use]
+    pub fn from_decoded_with_materials(clip: &DecodedClip, material_map: &[(u32, u8)]) -> Self {
         let frames = clip
             .frames
             .iter()
-            .map(|frame| SpriteDense::from_voxel_frame(frame, clip.dims, clip.pivot))
+            .map(|frame| {
+                SpriteDense::from_voxel_frame_with_materials(
+                    frame,
+                    clip.dims,
+                    clip.pivot,
+                    material_map,
+                )
+            })
             .collect();
         Self { frames }
     }
@@ -1736,5 +1779,53 @@ mod tests {
         // And it's actually translucent (differs from the bare background).
         let centre = (h / 2 * w + w / 2) as usize;
         assert_ne!(pv[centre] & 0x00ff_ffff, 0x0010_1010, "translucent, not bg");
+    }
+
+    /// TV.3 (clip wiring): a [`ClipFlipbook`] built with a colour→material map
+    /// carries per-voxel materials on every cached frame (the clip analogue of
+    /// `from_kv6_with_materials`); an empty map leaves them all-opaque, so the
+    /// flipbook is byte-identical to `from_decoded`.
+    #[test]
+    fn clip_flipbook_with_materials_classifies_every_frame() {
+        let dims = [6u32, 6, 6];
+        let glass = 0x00AA_BBCC;
+        let glass_lit = 0x80AA_BBCC;
+        // Two distinct frames, both filled with the glass colour.
+        let f0 = clip_frame(dims, |_x, _y, z| (z < 3).then_some(glass_lit));
+        let f1 = clip_frame(dims, |_x, _y, z| (z >= 3).then_some(glass_lit));
+        let clip = VoxelClip::from_frames(
+            dims,
+            [3.0, 3.0, 3.0],
+            1.0,
+            LoopMode::Loop,
+            &[f0, f1],
+            &[],
+            33,
+            0,
+        );
+        let decoded = clip.decode().expect("decode");
+
+        let book = ClipFlipbook::from_decoded_with_materials(&decoded, &[(glass, 2)]);
+        assert_eq!(book.frame_count(), 2);
+        for fr in 0..2 {
+            let dense = book.frame(fr).expect("frame in range");
+            assert_eq!(dense.mat.len(), dense.col.len(), "frame {fr} mat sized");
+            let mut solids = 0;
+            for idx in 0..dense.occ.len() {
+                if dense.occ[idx] {
+                    assert_eq!(dense.mat[idx], 2, "frame {fr}: glass → material 2");
+                    solids += 1;
+                }
+            }
+            assert!(solids > 0, "frame {fr} has solid voxels");
+        }
+
+        // An empty map ⇒ no per-voxel materials, identical to `from_decoded`.
+        let plain = ClipFlipbook::from_decoded(&decoded);
+        let plain_mat = ClipFlipbook::from_decoded_with_materials(&decoded, &[]);
+        for fr in 0..2 {
+            assert!(plain.frame(fr).unwrap().mat.is_empty());
+            assert!(plain_mat.frame(fr).unwrap().mat.is_empty());
+        }
     }
 }

@@ -648,10 +648,21 @@ impl CpuBackend {
     }
 
     /// Register an animated voxel clip (VCL.4): decode every frame into a
-    /// cached [`ClipFlipbook`]. Returns its positional clip index.
-    pub(crate) fn add_voxel_clip(&mut self, clip: &DecodedClip) -> usize {
+    /// cached [`ClipFlipbook`]. With a non-empty `material_map` (TV.3), each
+    /// frame's voxels are classified into per-voxel material ids by colour —
+    /// the clip analogue of [`Self::add_model_with_materials`]. An empty map
+    /// is the plain all-opaque clip.
+    pub(crate) fn add_voxel_clip_with_materials(
+        &mut self,
+        clip: &DecodedClip,
+        material_map: &[(u32, u8)],
+    ) -> usize {
         let idx = self.clip_books.len();
-        self.clip_books.push(ClipFlipbook::from_decoded(clip));
+        self.clip_books
+            .push(ClipFlipbook::from_decoded_with_materials(
+                clip,
+                material_map,
+            ));
         idx
     }
 

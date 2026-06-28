@@ -28,9 +28,9 @@ use roxlap_core::Camera;
 use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_gpu::{
-    build_sprite_model, build_sprite_model_with_materials, sprite_model_from_clip_frame,
-    sprite_model_from_voxel_frame, GpuInitError, GpuRenderer, GpuSceneResident, SpriteInstance,
-    SpriteInstanceTransform, SpriteModelRegistry,
+    build_sprite_model, build_sprite_model_with_materials,
+    sprite_model_from_clip_frame_with_materials, sprite_model_from_voxel_frame, GpuInitError,
+    GpuRenderer, GpuSceneResident, SpriteInstance, SpriteInstanceTransform, SpriteModelRegistry,
 };
 use roxlap_scene::{GridId, Scene};
 
@@ -499,14 +499,24 @@ impl GpuBackend {
     }
 
     /// Register an animated voxel clip (VCL.4): upload every frame as an
-    /// LOD chain (the flipbook). Returns its positional clip index. Lazily
-    /// creates the registry/resident if none exists yet (like
+    /// LOD chain (the flipbook). With a non-empty `material_map` (TV.3), each
+    /// frame's voxels are classified into per-voxel material ids by colour —
+    /// the clip analogue of [`Self::add_model_with_materials`]. An empty map
+    /// is the plain all-opaque clip. Returns its positional clip index.
+    /// Lazily creates the registry/resident if none exists yet (like
     /// [`Self::add_model`]).
-    pub(crate) fn add_voxel_clip(&mut self, clip: &DecodedClip) -> usize {
+    pub(crate) fn add_voxel_clip_with_materials(
+        &mut self,
+        clip: &DecodedClip,
+        material_map: &[(u32, u8)],
+    ) -> usize {
         let mut registry = self.sprite_registry.take().unwrap_or_default();
         let mut chains = Vec::with_capacity(clip.frames.len());
         for frame in 0..clip.frames.len() {
-            let chain = registry.add_lod(sprite_model_from_clip_frame(clip, frame), 4);
+            let chain = registry.add_lod(
+                sprite_model_from_clip_frame_with_materials(clip, frame, material_map),
+                4,
+            );
             // Establishes residency (zero-instance upload) if none yet, else
             // appends just this chain's volume.
             self.gpu.add_sprite_model(&registry, chain);

@@ -1762,9 +1762,26 @@ impl SceneRenderer {
     /// any [`set_sprites`](Self::set_sprites); a later `set_sprites`
     /// **drops** all registered clips (re-register afterwards).
     pub fn add_voxel_clip(&mut self, clip: &DecodedClip) -> VoxelClipId {
+        self.add_voxel_clip_with_materials(clip, &[])
+    }
+
+    /// Register a **mixed-material** animated voxel clip (TV.3): the clip
+    /// analogue of
+    /// [`add_sprite_model_with_materials`](Self::add_sprite_model_with_materials).
+    /// `material_map` pairs a voxel RGB colour (`0xRRGGBB`) with a material id
+    /// (defined via [`define_material`](Self::define_material)), classifying
+    /// every frame's voxels so an animated clip can mix opaque and translucent
+    /// voxels — an opaque torch handle around an additive flame, a spinning
+    /// glass orb. Voxels whose colour isn't in the map stay opaque
+    /// (material 0). Like [`add_voxel_clip`](Self::add_voxel_clip) otherwise.
+    pub fn add_voxel_clip_with_materials(
+        &mut self,
+        clip: &DecodedClip,
+        material_map: &[(u32, u8)],
+    ) -> VoxelClipId {
         let clip_index = match &mut self.inner {
-            BackendImpl::Cpu(c) => c.add_voxel_clip(clip),
-            BackendImpl::Gpu(g) => g.add_voxel_clip(clip),
+            BackendImpl::Cpu(c) => c.add_voxel_clip_with_materials(clip, material_map),
+            BackendImpl::Gpu(g) => g.add_voxel_clip_with_materials(clip, material_map),
         };
         // Capture metadata for editor queries + #6 auto-play; clip indices
         // are sequential and parallel to `clip_meta`.

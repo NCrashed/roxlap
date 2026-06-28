@@ -54,8 +54,9 @@ pub use scene::{
 };
 pub use sprite_model::{
     build_sprite_model, build_sprite_model_with_materials, sprite_model_from_clip_frame,
-    sprite_model_from_voxel_frame, SpriteInstance, SpriteInstanceTransform, SpriteModel,
-    SpriteModelRegistry, SpriteRegistryResident,
+    sprite_model_from_clip_frame_with_materials, sprite_model_from_voxel_frame,
+    sprite_model_from_voxel_frame_with_materials, SpriteInstance, SpriteInstanceTransform,
+    SpriteModel, SpriteModelRegistry, SpriteRegistryResident,
 };
 
 use std::sync::Arc;
