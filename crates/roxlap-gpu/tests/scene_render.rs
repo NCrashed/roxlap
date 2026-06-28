@@ -562,7 +562,15 @@ fn scene_dda_cel_banding_terraces_sun() {
     };
     let centre = (h / 2 * w + w / 2) as usize;
     let render = |r: &mut HeadlessSceneRenderer| {
-        r.render(&gpu.device, &gpu.queue, &scene, &[cam], cam.fov_y_rad, 64, 0.0)[centre]
+        r.render(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
     };
 
     // Floor top normal = up (-z); N·L = -to_sun.z. Two sun elevations:

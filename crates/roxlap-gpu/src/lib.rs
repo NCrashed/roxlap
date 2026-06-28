@@ -2348,7 +2348,12 @@ impl GpuRenderer {
             shadow_bias: lights.shadow_bias,
             shadow_max_dist: lights.shadow_max_dist,
             _pad6: [0.0; 2],
-            shadow_tint: [lights.shadow_tint[0], lights.shadow_tint[1], lights.shadow_tint[2], 0.0],
+            shadow_tint: [
+                lights.shadow_tint[0],
+                lights.shadow_tint[1],
+                lights.shadow_tint[2],
+                0.0,
+            ],
             style_bands: lights.style_bands,
             _pad7: [0; 3],
         };

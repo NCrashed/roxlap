@@ -551,6 +551,7 @@ fn shade_lit(
     hit_axis: i32,
     ray_dir: vec3<f32>,
     hit_pos: vec3<f32>,
+    vox_center: vec3<f32>,
 ) -> vec3<f32> {
     let packed = voxel_packed_in(g, meta_id, mip, p_voxel);
     let a = f32((packed >> 24u) & 0xffu);
@@ -565,9 +566,13 @@ fn shade_lit(
     let styled = u.style_bands > 0u;
     // Surface normal (grid-local) — shared by the sun + point lights.
     let n = face_normal(hit_axis, ray_dir);
+    // DL.6 — stylized lighting samples at the VOXEL CENTRE (flat per voxel:
+    // the whole face gets one shade → blocky pools + blocky shadow edges,
+    // the retro look), smooth samples at the per-pixel hit (gradients).
+    let sample = select(hit_pos, vox_center, styled);
     // Shadow-ray origin: bias off the surface along the normal to avoid
     // self-shadow acne. Shared by every caster.
-    let shadow_origin = hit_pos + n * u.shadow_bias;
+    let shadow_origin = sample + n * u.shadow_bias;
     // Light remaining in shadow (the strength floor); 1.0 ⇒ unshadowed.
     let in_shadow = 1.0 - u.ambient_color.w;
 
@@ -603,7 +608,7 @@ fn shade_lit(
     let base = g * count;
     for (var i: u32 = 0u; i < count; i = i + 1u) {
         let pl = grid_point_lights[base + i];
-        let d3 = pl.pos - hit_pos;
+        let d3 = pl.pos - sample;
         let dist = length(d3);
         if (dist < pl.radius && dist > 1e-4) {
             let l = d3 / dist;
@@ -765,7 +770,11 @@ fn march_grid(
                     var base_color: vec3<f32>;
                     if ((u.sun_flags & 4u) != 0u) {
                         let hit_pos = ray_origin + t_hit * ray_dir;
-                        base_color = shade_lit(g, slot_id, mip, p_voxel, shade, hit_axis, ray_dir, hit_pos);
+                        // Voxel centre (grid-local) for flat per-voxel stylized
+                        // lighting; ignored by the smooth path.
+                        let vox_center = chunk_origin_world
+                            + (vec3<f32>(p_voxel) + vec3<f32>(0.5)) * vsize;
+                        base_color = shade_lit(g, slot_id, mip, p_voxel, shade, hit_axis, ray_dir, hit_pos, vox_center);
                     } else {
                         base_color = voxel_color_in(g, slot_id, mip, p_voxel, shade);
                     }

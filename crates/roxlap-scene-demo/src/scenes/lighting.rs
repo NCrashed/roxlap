@@ -47,8 +47,10 @@ pub struct LightingScene {
     paused: bool,
     sun_shadows: bool,
     points_on: bool,
-    /// DL.6 — stylized (cel + hue-ramp) vs smooth diffuse. `J` toggles.
+    /// DL.6 — stylized (cel + hue-ramp + flat per-voxel) vs smooth. `J`.
     stylized: bool,
+    /// DL.6 — cel band count when stylized; `[` / `]` adjust (clamped 2..16).
+    bands: u32,
     /// The point lights, rebuilt each frame (orbit) — borrowed into the
     /// per-frame [`LightRig`] at render time.
     points: Vec<PointLight>,
@@ -64,6 +66,7 @@ impl LightingScene {
             sun_shadows: true,
             points_on: true,
             stylized: true,
+            bands: 6,
             points: Vec::new(),
         }
     }
@@ -147,7 +150,7 @@ impl DemoScene for LightingScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD+mouse fly · P: pause sun · K: sun shadows · L: point lights · J: stylized/smooth (GPU only)"
+        "WASD+mouse fly · P: pause sun · K: shadows · L: points · J: stylized/smooth · [ ]: bands (GPU only)"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -203,8 +206,20 @@ impl DemoScene for LightingScene {
                 self.stylized = !self.stylized;
                 eprintln!(
                     "lighting = {}",
-                    if self.stylized { "stylized (cel+ramp)" } else { "smooth" }
+                    if self.stylized {
+                        "stylized (cel+ramp)"
+                    } else {
+                        "smooth"
+                    }
                 );
+            }
+            KeyCode::BracketRight => {
+                self.bands = (self.bands + 1).min(16);
+                eprintln!("cel bands = {}", self.bands);
+            }
+            KeyCode::BracketLeft => {
+                self.bands = self.bands.saturating_sub(1).max(2);
+                eprintln!("cel bands = {}", self.bands);
             }
             _ => {}
         }
@@ -228,9 +243,10 @@ impl DemoScene for LightingScene {
             shadow_strength: 0.85,
             shadow_bias_voxels: 1.5,
             shadow_max_dist: 256.0,
-            // DL.6 — stylized cel + hue-shifted ramp (J toggles vs smooth).
-            // Cool shadow tint → warm sun, terraced in 4 bands.
-            bands: if self.stylized { 4 } else { 0 },
+            // DL.6 — stylized cel + hue-shifted ramp + flat per-voxel (J
+            // toggles vs smooth; [ / ] change the band count). Cool shadow
+            // tint → warm sun.
+            bands: if self.stylized { self.bands } else { 0 },
             shadow_tint: [0.16, 0.2, 0.34],
         });
         let camera = ctx.cam.camera();
@@ -240,11 +256,16 @@ impl DemoScene for LightingScene {
     fn hud_lines(&self) -> Vec<String> {
         vec![
             format!(
-                "sun {} · shadows {} · points {} · {}",
+                "sun {} · shadows {} · points {} · {}{}",
                 if self.paused { "paused" } else { "sweeping" },
                 if self.sun_shadows { "on" } else { "off" },
                 if self.points_on { "on" } else { "off" },
                 if self.stylized { "stylized" } else { "smooth" },
+                if self.stylized {
+                    format!(" ({} bands)", self.bands)
+                } else {
+                    String::new()
+                },
             ),
             "GPU-only dynamic lighting (CPU shows baked ambient)".to_string(),
         ]
