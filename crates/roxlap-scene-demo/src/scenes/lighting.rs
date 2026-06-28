@@ -1,7 +1,10 @@
 //! The **Lighting** scene (DL stage): runtime dynamic lighting — a sweeping
 //! coloured **sun** that casts hard shadows, plus three orbiting coloured
-//! **point lights** (two shadow-casting, one not). GPU-only; the CPU
-//! backend renders the baked-ambient fallback.
+//! **point lights** (two shadow-casting, one not). The diffuse stylized
+//! lighting (sun + points + cel + ramp, flat per voxel) runs on **both**
+//! backends (CPU.1); **shadows are GPU-only** (the per-pixel shadow march is
+//! too costly for the CPU fallback), so on CPU the geometry is lit but
+//! unshadowed.
 //!
 //! Layout (camera looks +y): a grass floor with four stone pillars and a
 //! central monument. The sun rotates overhead so the pillars' shadows sweep
@@ -150,7 +153,7 @@ impl DemoScene for LightingScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD+mouse fly · P: pause sun · K: shadows · L: points · J: stylized/smooth · [ ]: bands (GPU only)"
+        "WASD+mouse fly · P: pause sun · K: shadows (GPU) · L: points · J: stylized/smooth · [ ]: bands"
     }
 
     fn start_pose(&self) -> CameraPose {

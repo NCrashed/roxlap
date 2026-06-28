@@ -845,6 +845,49 @@ impl CpuBackend {
             *z = f32::INFINITY;
         }
 
+        // CPU.1 — world-space dynamic lights for the diffuse stylized path
+        // (the scene renderer transforms them per grid). `None` ⇒ disabled
+        // (the baked-byte fallback, byte-identical to pre-DL). Shadows are
+        // GPU-only, so the CPU path never marches shadow rays.
+        let mut world_points: Vec<roxlap_core::CpuPointLight> = Vec::new();
+        let cpu_lights = if let Some(rig) = frame.lights {
+            for p in rig.points {
+                world_points.push(roxlap_core::CpuPointLight {
+                    pos: p.position,
+                    color: p.color,
+                    intensity: p.intensity,
+                    radius: p.radius,
+                });
+            }
+            let (sun, sun_dir, sun_color, sun_intensity) = match rig.sun {
+                Some(s) => {
+                    // Direction TO the sun = normalized −travel.
+                    let d = s.direction;
+                    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                    let to = if len > 1e-6 {
+                        [-d[0] / len, -d[1] / len, -d[2] / len]
+                    } else {
+                        [0.0; 3]
+                    };
+                    (true, to, s.color, s.intensity)
+                }
+                None => (false, [0.0; 3], [0.0; 3], 0.0),
+            };
+            roxlap_core::CpuLights {
+                enabled: true,
+                sun,
+                sun_dir,
+                sun_color,
+                sun_intensity,
+                points: &world_points,
+                ambient: rig.ambient,
+                bands: rig.bands,
+                shadow_tint: rig.shadow_tint,
+            }
+        } else {
+            roxlap_core::CpuLights::default()
+        };
+
         let _ = render_scene_composed_with_materials(
             fb,
             &mut self.zbuffer[..pixel_count],
@@ -859,6 +902,7 @@ impl CpuBackend {
             frame.sky,
             Some(&self.materials),
             &self.terrain_materials,
+            cpu_lights,
         );
 
         // Paint the panorama sky into every background pixel (z still +INF):

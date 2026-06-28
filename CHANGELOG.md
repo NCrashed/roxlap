@@ -47,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **"Lighting" demo scene** — a sweeping sun + three orbiting coloured point
     lights over a pillared floor; `P` pauses the sun, `K` toggles sun shadows,
     `L` toggles the point lights, `J` toggles stylized/smooth.
+  - **CPU diffuse lighting** (CPU.1) — the dynamic lighting now also runs on the
+    **CPU** backend (sun + point lights + cel + ramp, flat per voxel), so the
+    same `FrameParams.lights` rig lights both backends. **Shadows stay
+    GPU-only** (the per-pixel shadow march is too costly for the CPU fallback),
+    so CPU geometry is lit but unshadowed. Diffuse is arithmetic-only, so it's
+    effectively free on the (bandwidth-bound) CPU path. `lights: None` keeps the
+    CPU path byte-identical to the baked-brightness render.
 
 ## [0.17.0] — 2026-06-28
 

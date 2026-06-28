@@ -37,7 +37,7 @@
 #![allow(clippy::similar_names)]
 
 use glam::DVec3;
-use roxlap_core::dda::{render_dda_parallel, DdaEnv};
+use roxlap_core::dda::{render_dda_parallel, CpuLights, CpuPointLight, DdaEnv};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
@@ -106,6 +106,61 @@ fn world_camera_to_grid_local(camera: &Camera, transform: &GridTransform) -> Cam
         right: local_right.to_array(),
         down: local_down.to_array(),
         forward: local_forward.to_array(),
+    }
+}
+
+/// CPU.1 — transform world-space dynamic lights into a grid's local frame
+/// (the same translate + inverse-rotation as [`world_camera_to_grid_local`]):
+/// point positions are points (origin-relative + inverse-rotated); the sun
+/// direction is a vector (inverse-rotated only). Point lights land in `scratch`
+/// so the returned [`CpuLights`] can borrow them for the grid's render.
+fn grid_local_lights<'a>(
+    world: &CpuLights<'_>,
+    transform: &GridTransform,
+    scratch: &'a mut Vec<CpuPointLight>,
+) -> CpuLights<'a> {
+    scratch.clear();
+    if !world.enabled {
+        return CpuLights::default();
+    }
+    let inv = transform.rotation.inverse();
+    #[allow(clippy::cast_possible_truncation)]
+    let sun_dir = if world.sun {
+        let d = inv
+            * DVec3::new(
+                f64::from(world.sun_dir[0]),
+                f64::from(world.sun_dir[1]),
+                f64::from(world.sun_dir[2]),
+            );
+        [d.x as f32, d.y as f32, d.z as f32]
+    } else {
+        [0.0; 3]
+    };
+    for p in world.points {
+        let lp = inv
+            * (DVec3::new(
+                f64::from(p.pos[0]),
+                f64::from(p.pos[1]),
+                f64::from(p.pos[2]),
+            ) - transform.origin);
+        #[allow(clippy::cast_possible_truncation)]
+        scratch.push(CpuPointLight {
+            pos: [lp.x as f32, lp.y as f32, lp.z as f32],
+            color: p.color,
+            intensity: p.intensity,
+            radius: p.radius,
+        });
+    }
+    CpuLights {
+        enabled: true,
+        sun: world.sun,
+        sun_dir,
+        sun_color: world.sun_color,
+        sun_intensity: world.sun_intensity,
+        points: scratch.as_slice(),
+        ambient: world.ambient,
+        bands: world.bands,
+        shadow_tint: world.shadow_tint,
     }
 }
 
@@ -237,6 +292,9 @@ pub fn render_scene(
             // materials flow through render_scene_composed_with_materials.
             materials: None,
             terrain_materials: &[],
+            // The direct path is unlit (lighting flows through the composed
+            // path); keep it on the baked-byte shade.
+            lights: CpuLights::default(),
         };
         render_dda_parallel(
             &local_cam,
@@ -452,6 +510,7 @@ pub fn render_scene_composed(
         true,
         None,
         &[],
+        CpuLights::default(),
     )
 }
 
@@ -475,6 +534,7 @@ pub fn render_scene_composed_with_materials(
     sky: Option<&Sky>,
     materials: Option<&MaterialTable>,
     terrain_materials: &[(u32, u8)],
+    lights: CpuLights<'_>,
 ) -> RenderOutcome {
     render_scene_composed_scissored(
         fb,
@@ -491,6 +551,7 @@ pub fn render_scene_composed_with_materials(
         true,
         materials,
         terrain_materials,
+        lights,
     )
 }
 
@@ -516,6 +577,8 @@ fn render_scene_composed_scissored(
     scissor: bool,
     materials: Option<&MaterialTable>,
     terrain_materials: &[(u32, u8)],
+    // CPU.1 — world-space dynamic lights, transformed per grid in the loop.
+    lights: CpuLights<'_>,
 ) -> RenderOutcome {
     debug_assert_eq!(fb.len(), zb.len());
     let pixel_count = (width as usize) * (height as usize);
@@ -800,6 +863,10 @@ fn render_scene_composed_scissored(
         // `!owns_sky` grids so the textured-sky branch doesn't bypass
         // the sentinel.
         let fog_on = fog.max_scan_dist > 0;
+        // CPU.1 — transform the world lights into this grid's local frame
+        // (point scratch lives for the grid's render below).
+        let mut light_scratch: Vec<CpuPointLight> = Vec::new();
+        let local_lights = grid_local_lights(&lights, &grid.transform, &mut light_scratch);
         #[allow(clippy::cast_precision_loss)]
         let env = DdaEnv {
             sky: if owns_sky { sky } else { None },
@@ -812,6 +879,7 @@ fn render_scene_composed_scissored(
             side_shades: fog.side_shades,
             materials,
             terrain_materials,
+            lights: local_lights,
         };
         // Effective render mip + brick cache were prepared above
         // (DDA.6 uniform per-grid mip, DDA.7 cross-frame cache).
@@ -1475,6 +1543,7 @@ mod tests {
                 scissor,
                 None,
                 &[],
+                CpuLights::default(),
             );
             fb
         };

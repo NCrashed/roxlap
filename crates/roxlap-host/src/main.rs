@@ -575,6 +575,7 @@ impl App {
             side_shades: self.engine.side_shades(),
             materials: None,
             terrain_materials: &[],
+            lights: roxlap_core::CpuLights::default(),
         };
 
         // The world is one chunk; its brick occupancy is independent of

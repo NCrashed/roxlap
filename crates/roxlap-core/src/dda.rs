@@ -70,6 +70,48 @@ pub struct DdaEnv<'a> {
     /// colour is looked up here for its material. **Empty** (the default) ⇒
     /// every voxel is opaque, so the march returns the first hit unchanged.
     pub terrain_materials: &'a [(u32, u8)],
+    /// CPU.1 — dynamic lighting (stage DL on the CPU): sun + point lights +
+    /// stylized cel/ramp, evaluated flat per voxel. Disabled by default ⇒ the
+    /// hit uses the baked-byte [`shade`] path, byte-identical to pre-DL. Lights
+    /// here are already in the grid's **local** frame (the scene renderer
+    /// transforms them per grid). **No shadows** (the per-pixel shadow march is
+    /// GPU-only; see `PORTING-DYNLIGHT.md` CPU.2).
+    pub lights: CpuLights<'a>,
+}
+
+/// CPU.1 — one point light in a grid's local frame for the CPU renderer.
+#[derive(Clone, Copy)]
+pub struct CpuPointLight {
+    /// Grid-local position (world/voxel units).
+    pub pos: [f32; 3],
+    /// Linear RGB, 0..1.
+    pub color: [f32; 3],
+    pub intensity: f32,
+    /// Hard cutoff distance (world/voxel units).
+    pub radius: f32,
+}
+
+/// CPU.1 — the per-frame dynamic-light environment for one grid (grid-local).
+/// Mirror of the GPU `shade_lit` inputs. `enabled == false` (the default)
+/// keeps the baked-byte path. Diffuse only — **no shadows** on the CPU.
+#[derive(Clone, Copy, Default)]
+pub struct CpuLights<'a> {
+    /// Whether dynamic lighting is active this frame (else the baked path).
+    pub enabled: bool,
+    /// Whether the sun is present.
+    pub sun: bool,
+    /// Grid-local unit direction **to** the sun.
+    pub sun_dir: [f32; 3],
+    pub sun_color: [f32; 3],
+    pub sun_intensity: f32,
+    /// Grid-local point lights.
+    pub points: &'a [CpuPointLight],
+    /// Ambient multiplier on the baked byte (smooth mode's fill).
+    pub ambient: [f32; 3],
+    /// Cel band count: 0 = smooth, ≥1 = quantize + gradient-map (stylized).
+    pub bands: u32,
+    /// Stylized ramp's cool unlit-end tint (used when `bands > 0`).
+    pub shadow_tint: [f32; 3],
 }
 
 impl Default for DdaEnv<'_> {
@@ -81,6 +123,7 @@ impl Default for DdaEnv<'_> {
             side_shades: [0; 6],
             materials: None,
             terrain_materials: &[],
+            lights: CpuLights::default(),
         }
     }
 }
@@ -190,6 +233,120 @@ pub(crate) fn shade(color: u32, bright_sub: u32) -> u32 {
     let a = ((color >> 24) & 0xff).saturating_sub(bright_sub);
     let ch = |shift: u32| -> u32 { ((((color >> shift) & 0xff) * a) >> 7).min(255) };
     0x8000_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+// CPU.1 — cel quantization: snap a 0..1 factor to `bands + 1` levels.
+#[inline]
+fn cel_band(x: f32, bands: u32) -> f32 {
+    let b = bands as f32;
+    ((x * b).round() / b).clamp(0.0, 1.0)
+}
+
+// CPU.1 — point-light distance falloff (mirror of the GPU's): smooth
+// quadratic from 1 at the light to 0 at `radius`, hard-cut beyond.
+#[inline]
+fn point_falloff(d: f32, radius: f32) -> f32 {
+    let x = (1.0 - d / radius).clamp(0.0, 1.0);
+    x * x
+}
+
+// CPU.1 — face normal (grid-local) from the crossed axis + step: points back
+// toward the incoming ray. `axis == 3` (entry voxel, no face) falls back to up
+// (-z, voxlap z-down).
+#[inline]
+fn face_normal_cpu(axis: usize, step: [i32; 3]) -> [f32; 3] {
+    let mut n = [0.0f32; 3];
+    if axis < 3 {
+        n[axis] = -(step[axis] as f32);
+    } else {
+        n[2] = -1.0;
+    }
+    n
+}
+
+#[inline]
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// CPU.1 — dynamic-lighting shade for a terrain voxel (the CPU mirror of the
+/// GPU `shade_lit`): raw albedo × (ambient/AO + sun + point lights), evaluated
+/// **flat per voxel** (at the voxel centre, so a whole face reads one tone —
+/// the retro look). `bands > 0` quantizes (cel) and gradient-maps the sun key
+/// from `shadow_tint` (cool) to the sun colour (warm). **No shadows.** Returns
+/// a packed `0x80RRGGBB` colour (same convention as [`shade`]).
+fn shade_lit_cpu(
+    color: u32,
+    bright_sub: u32,
+    axis: usize,
+    step: [i32; 3],
+    cellc: [i32; 3],
+    cell_size: f32,
+    l: &CpuLights<'_>,
+) -> u32 {
+    let a_b = ((color >> 24) & 0xff).saturating_sub(bright_sub);
+    let ao = a_b as f32 / 128.0;
+    let albedo = [
+        ((color >> 16) & 0xff) as f32 / 255.0,
+        ((color >> 8) & 0xff) as f32 / 255.0,
+        (color & 0xff) as f32 / 255.0,
+    ];
+    let styled = l.bands > 0;
+    let n = face_normal_cpu(axis, step);
+    // Voxel centre (grid-local) — flat per-voxel sample point.
+    let center = [
+        (cellc[0] as f32 + 0.5) * cell_size,
+        (cellc[1] as f32 + 0.5) * cell_size,
+        (cellc[2] as f32 + 0.5) * cell_size,
+    ];
+
+    // Sun key (0..1): N·L (no shadow on the CPU).
+    let sun_key = if l.sun {
+        dot3(n, l.sun_dir).max(0.0)
+    } else {
+        0.0
+    };
+
+    // Base term: ambient + sun. Smooth = additive; stylized = gradient map.
+    let mut lit = if styled {
+        let key = cel_band(sun_key, l.bands);
+        let m = |i: usize| {
+            let warm = l.sun_color[i] * l.sun_intensity;
+            (l.shadow_tint[i] + (warm - l.shadow_tint[i]) * key) * ao
+        };
+        [albedo[0] * m(0), albedo[1] * m(1), albedo[2] * m(2)]
+    } else {
+        let base = |i: usize| {
+            albedo[i] * l.ambient[i] * ao + albedo[i] * l.sun_color[i] * l.sun_intensity * sun_key
+        };
+        [base(0), base(1), base(2)]
+    };
+
+    // Point lights (flat per voxel; no shadow).
+    for p in l.points {
+        let d3 = [
+            p.pos[0] - center[0],
+            p.pos[1] - center[1],
+            p.pos[2] - center[2],
+        ];
+        let dist = (d3[0] * d3[0] + d3[1] * d3[1] + d3[2] * d3[2]).sqrt();
+        if dist < p.radius && dist > 1e-4 {
+            let inv = 1.0 / dist;
+            let ndl = dot3(n, [d3[0] * inv, d3[1] * inv, d3[2] * inv]).max(0.0);
+            if ndl > 0.0 {
+                let mut f = ndl * point_falloff(dist, p.radius);
+                if styled {
+                    f = cel_band(f, l.bands);
+                }
+                for i in 0..3 {
+                    lit[i] += albedo[i] * p.color[i] * p.intensity * f;
+                }
+            }
+        }
+    }
+
+    let pack = |v: f32| -> u32 { (v.clamp(0.0, 1.0) * 255.0) as u32 };
+    0x8000_0000 | (pack(lit[0]) << 16) | (pack(lit[1]) << 8) | pack(lit[2])
 }
 
 /// Blend `color` toward `env.fog_color` by perpendicular `depth`
@@ -1053,7 +1210,22 @@ fn cell_walk_skip(
         prof::CELLS.with(|x| x.set(x.get() + 1));
         if let Some(color) = sampler.hit(cellc) {
             let bright_sub = side_shade_sub(env, last_axis, step);
-            let lit = apply_fog(shade(color, bright_sub), depth.max(0.0), env);
+            // CPU.1 — dynamic lighting (flat per voxel, no shadows) when a rig
+            // is active; else the baked-byte `shade` path (byte-identical).
+            let shaded = if env.lights.enabled {
+                shade_lit_cpu(
+                    color,
+                    bright_sub,
+                    last_axis,
+                    step,
+                    cellc,
+                    cell_size,
+                    &env.lights,
+                )
+            } else {
+                shade(color, bright_sub)
+            };
+            let lit = apply_fog(shaded, depth.max(0.0), env);
             let m = terrain_material(env, color);
             if m.is_opaque() {
                 // Opaque surface: the background. Return the first hit verbatim
@@ -1389,6 +1561,80 @@ fn cast_ray_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CPU.1 — luminance of a packed colour's low-24-bit RGB.
+    fn lum(p: u32) -> u32 {
+        (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff)
+    }
+
+    #[test]
+    fn cel_band_quantizes_and_collapses() {
+        // Two distinct factors round to the same band at bands=2.
+        assert_eq!(cel_band(0.8, 2), cel_band(0.9, 2));
+        assert!((cel_band(0.8, 2) - 1.0).abs() < 1e-6);
+        // ...but a low factor lands on a different band.
+        assert_ne!(cel_band(0.3, 2), cel_band(0.8, 2));
+    }
+
+    #[test]
+    fn shade_lit_cpu_sun_lights_by_facing() {
+        // Grey voxel (brightness 0x80 = full ambient). Floor top face: hit via
+        // a +z step (axis 2) ⇒ normal points up (-z).
+        let color = 0x80_80_80_80;
+        let step = [0, 0, 1];
+        let base = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_color: [1.0; 3],
+            sun_intensity: 1.0,
+            ambient: [0.2; 3],
+            ..CpuLights::default()
+        };
+        let facing = CpuLights {
+            sun_dir: [0.0, 0.0, -1.0],
+            ..base
+        }; // toward sun = up
+        let back = CpuLights {
+            sun_dir: [0.0, 0.0, 1.0],
+            ..base
+        }; // sun below the face
+        let lit = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &facing);
+        let dark = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &back);
+        assert!(
+            lum(lit) > lum(dark),
+            "sun facing the surface must brighten it: {lit:#08x} vs {dark:#08x}",
+        );
+    }
+
+    #[test]
+    fn shade_lit_cpu_cel_terraces_sun() {
+        // Two sun elevations with distinct N·L (0.8 / 0.9) collapse to one
+        // band at bands=2 ⇒ identical stylized colour; smooth (bands=0) differs.
+        let color = 0x80_80_80_80;
+        let step = [0, 0, 1];
+        let mk = |zc: f32, bands: u32| {
+            let n = (1.0f32 - zc * zc).sqrt();
+            CpuLights {
+                enabled: true,
+                sun: true,
+                sun_dir: [n, 0.0, -zc], // ndl on the up face = zc
+                sun_color: [1.0; 3],
+                sun_intensity: 1.0,
+                ambient: [0.1; 3],
+                bands,
+                ..CpuLights::default()
+            }
+        };
+        let smooth_a = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.8, 0));
+        let smooth_b = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.9, 0));
+        assert_ne!(smooth_a, smooth_b, "smooth diffuse must vary with N·L");
+        let cel_a = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.8, 2));
+        let cel_b = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.9, 2));
+        assert_eq!(
+            cel_a, cel_b,
+            "cel banding must terrace both N·L to one level"
+        );
+    }
 
     /// Recording sink: collects `(idx, color, dist)` puts for tests.
     #[derive(Default)]
@@ -1750,6 +1996,7 @@ mod tests {
         let env = DdaEnv {
             materials: Some(&table),
             terrain_materials: &[(glass & 0x00ff_ffff, 1)],
+            lights: CpuLights::default(),
             ..DdaEnv::default()
         };
         let (fb_tr, _) = render_brickmap_env(grid, &cam, w, h, &env);
@@ -1798,6 +2045,7 @@ mod tests {
             let env = DdaEnv {
                 materials: Some(&table),
                 terrain_materials: &[(smoke & 0x00ff_ffff, 1)],
+                lights: CpuLights::default(),
                 ..DdaEnv::default()
             };
             let (fb, _) = render_brickmap_env(grid, &cam, w, h, &env);
@@ -1831,6 +2079,7 @@ mod tests {
             side_shades: [0; 6],
             materials: None,
             terrain_materials: &[],
+            lights: CpuLights::default(),
         };
         let (w, h) = (64u32, 64u32);
         let (fog, _) = render_brickmap_env(grid, &cam, w, h, &env);
@@ -1869,6 +2118,7 @@ mod tests {
             side_shades: [0; 6],
             materials: None,
             terrain_materials: &[],
+            lights: CpuLights::default(),
         };
         let cam = Camera::from_yaw_pitch([16.0, 16.0, 128.0], 0.3, -0.4);
         let (w, h) = (48u32, 48u32);
@@ -1955,6 +2205,7 @@ mod tests {
             side_shades: [0, 0, 0, 0, 0x40, 0],
             materials: None,
             terrain_materials: &[],
+            lights: CpuLights::default(),
         };
         let (shaded, _) = render_brickmap_env(grid, &cam, 32, 32, &env);
         let lum = |c: u32| (c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff);
@@ -2317,6 +2568,7 @@ mod tests {
             side_shades: [0, 0, 0, 0, 0x30, 0x10],
             materials: None,
             terrain_materials: &[],
+            lights: CpuLights::default(),
         };
 
         let (seq_fb, seq_zb) = render_brickmap_env(grid, &cam, w, h, &env);
