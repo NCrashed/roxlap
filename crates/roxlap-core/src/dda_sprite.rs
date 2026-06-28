@@ -1642,9 +1642,12 @@ mod tests {
         fn red_at(depth: u32) -> u32 {
             let mut table = MaterialTable::new();
             table.set(1, Material::volumetric(128));
-            // FILLED box (every cell solid) so the ray passes through `depth`
-            // absorbing voxels — `solid_box` is a hollow shell, no good here.
-            let kv6 = Kv6::from_fn(8, depth, 8, |_, _, _| Some(0x80_C0_20_20));
+            // FILLED box (every cell solid, interior kept) so the ray actually
+            // traverses `depth` absorbing voxels. `from_fn` would cull the
+            // interior to a hollow shell (front+back faces only) — no genuine
+            // depth accumulation — so use `from_fn_keep_interior`.
+            let kv6 =
+                Kv6::from_fn_keep_interior(8, depth, 8, |_, _, _| Some(0x80_C0_20_20), |_| true);
             let dense = SpriteDense::from_kv6(&kv6);
             let (w, h) = (64u32, 64u32);
             let n = (w * h) as usize;

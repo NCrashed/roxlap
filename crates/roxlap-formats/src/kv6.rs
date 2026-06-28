@@ -166,7 +166,37 @@ impl Kv6 {
         zsiz: u32,
         fill: F,
     ) -> Kv6 {
-        Self::build_inner(xsiz, ysiz, zsiz, fill, false)
+        Self::build_inner(xsiz, ysiz, zsiz, fill, false, |_| false)
+    }
+
+    /// Like [`Kv6::from_fn`], but keeps **interior** (fully-enclosed) voxels
+    /// whose colour `keep_interior` returns `true` for, instead of culling
+    /// them as the surface-only default does.
+    ///
+    /// `from_fn` stores only voxels with at least one exposed face — correct
+    /// for opaque models (you never see an enclosed voxel) and the reason a
+    /// solid cube is a hollow shell. But a **`BlendMode::Volumetric`**
+    /// (Beer–Lambert) volume needs its interior: the per-cell absorption that
+    /// makes a filled cloud read denser at its core than its rim only works if
+    /// the ray actually traverses the inner voxels (`crate::material`). This
+    /// variant keeps an interior voxel when `keep_interior(colour)` is true —
+    /// pass a predicate that matches your translucent/volumetric colours, so
+    /// opaque interiors are still dropped (the storage win) while translucent
+    /// bodies stay solid through. The kept interiors are flat (`vis = 63`,
+    /// `dir = 0`); translucent voxels render flat-lit anyway.
+    #[must_use]
+    pub fn from_fn_keep_interior<F, G>(
+        xsiz: u32,
+        ysiz: u32,
+        zsiz: u32,
+        fill: F,
+        keep_interior: G,
+    ) -> Kv6
+    where
+        F: Fn(u32, u32, u32) -> Option<u32>,
+        G: Fn(u32) -> bool,
+    {
+        Self::build_inner(xsiz, ysiz, zsiz, fill, false, keep_interior)
     }
 
     /// Like [`Kv6::from_fn`], but fills **real** per-voxel surface
@@ -189,7 +219,7 @@ impl Kv6 {
         zsiz: u32,
         fill: F,
     ) -> Kv6 {
-        Self::build_inner(xsiz, ysiz, zsiz, fill, true)
+        Self::build_inner(xsiz, ysiz, zsiz, fill, true, |_| false)
     }
 
     // Dimensions are bounded by realistic model sizes: column/x counts
@@ -200,13 +230,18 @@ impl Kv6 {
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    fn build_inner<F: Fn(u32, u32, u32) -> Option<u32>>(
+    fn build_inner<F, G>(
         xsiz: u32,
         ysiz: u32,
         zsiz: u32,
         fill: F,
         shaded: bool,
-    ) -> Kv6 {
+        keep_interior: G,
+    ) -> Kv6
+    where
+        F: Fn(u32, u32, u32) -> Option<u32>,
+        G: Fn(u32) -> bool,
+    {
         let occupied = |x: i64, y: i64, z: i64| -> bool {
             x >= 0
                 && y >= 0
@@ -234,7 +269,7 @@ impl Kv6 {
                         || !occupied(xi, yi + 1, zi)
                         || !occupied(xi, yi, zi - 1)
                         || !occupied(xi, yi, zi + 1);
-                    if exposed {
+                    if exposed || keep_interior(col) {
                         let (vis, dir) = if shaded {
                             compute_vis_dir(&occupied, xi, yi, zi)
                         } else {
@@ -661,6 +696,33 @@ mod tests {
             .sum();
         assert_eq!(xlen_sum, cube.voxels.len());
         assert_eq!(ylen_sum, cube.voxels.len());
+    }
+
+    /// `from_fn_keep_interior` retains enclosed voxels whose colour the
+    /// predicate accepts — the storage policy for `BlendMode::Volumetric`
+    /// bodies (keep translucent interiors, still cull opaque ones).
+    #[test]
+    fn from_fn_keep_interior_retains_matching_interiors() {
+        let col = 0x8012_3456;
+        // All-solid 4³: from_fn culls the 2³ interior (56 voxels); keeping the
+        // interior gives the full 64.
+        let shell = Kv6::from_fn(4, 4, 4, |_, _, _| Some(col));
+        assert_eq!(shell.voxels.len(), 64 - 8, "from_fn is surface-only");
+
+        let filled = Kv6::from_fn_keep_interior(4, 4, 4, |_, _, _| Some(col), |c| c == col);
+        assert_eq!(filled.voxels.len(), 64, "keep_interior retains all 64");
+        // The dead-centre voxel (1,1,1) is fully enclosed — absent in the
+        // shell, present when kept.
+        assert_eq!(color_at(&shell, 1, 1, 1), None);
+        assert_eq!(color_at(&filled, 1, 1, 1), Some(col));
+
+        // A predicate that rejects the colour culls interiors as usual.
+        let culled = Kv6::from_fn_keep_interior(4, 4, 4, |_, _, _| Some(col), |_| false);
+        assert_eq!(
+            culled.voxels.len(),
+            64 - 8,
+            "predicate=false ⇒ surface-only"
+        );
     }
 
     /// Decode the colour stored at local `(tx, ty, tz)`, or `None` if

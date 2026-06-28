@@ -135,14 +135,26 @@ impl TransparencyScene {
     /// absorbing voxels and the centre reads denser than the rim — opacity
     /// grows with path length, the thickness-aware counterpart of the flat
     /// `MAT_SMOKE` puff. Mapped to `MAT_FOG` per voxel.
+    ///
+    /// Built with [`Kv6::from_fn_keep_interior`] so the sphere's **interior**
+    /// voxels survive — the default surface-only `from_fn` would leave a hollow
+    /// shell and the ray would only graze the front + back faces, killing the
+    /// depth-accumulation effect. The `keep_interior` predicate keeps the fog
+    /// colour (all of it here); an opaque colour would still be culled.
     fn build_fog_cloud() -> Kv6 {
         const DIM: u32 = 30;
         let cx = (DIM as f32 - 1.0) * 0.5;
         let r2 = (DIM as f32 * 0.48).powi(2);
-        Kv6::from_fn(DIM, DIM, DIM, |x, y, z| {
-            let (dx, dy, dz) = (x as f32 - cx, y as f32 - cx, z as f32 - cx);
-            (dx * dx + dy * dy + dz * dz <= r2).then_some(FOG_RGB)
-        })
+        Kv6::from_fn_keep_interior(
+            DIM,
+            DIM,
+            DIM,
+            |x, y, z| {
+                let (dx, dy, dz) = (x as f32 - cx, y as f32 - cx, z as f32 - cx);
+                (dx * dx + dy * dy + dz * dz <= r2).then_some(FOG_RGB)
+            },
+            |c| c == FOG_RGB, // translucent fog → keep interior; opaque → cull
+        )
     }
 }
 

@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both backends and both passes (sprites/clips + terrain), CPU pinned then GPU
   matched. New `Material::volumetric(alpha)`. The "Transparency" demo gains a
   filled volumetric fog cloud whose core reads denser than its rim.
+  - **`Kv6::from_fn_keep_interior`** — surface extraction normally culls every
+    enclosed voxel (a solid cube is a hollow shell), which would defeat
+    Volumetric (a filled cloud would render as front+back faces with air
+    between). This variant keeps interior voxels whose colour a predicate
+    accepts, so translucent/volumetric bodies stay solid through while opaque
+    interiors are still dropped (the storage win). (Terrain `.vxl` stores solid
+    runs, so its interiors were already traversable — this gap was kv6-only.)
 
 - **Mixed-material animated clips** — per-voxel materials (TV.3) now extend to
   voxel clips (`.rvc`), the animated analogue of
