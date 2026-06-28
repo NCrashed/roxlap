@@ -677,10 +677,6 @@ struct SpriteModelDdaResources {
     /// seeded from the renderer's `sprite_materials` and rewritten by
     /// [`GpuRenderer::set_sprite_materials`].
     materials_buf: wgpu::Buffer,
-    /// DL.4 — voxlap `univec[256]` surface-normal table (binding 14), as
-    /// `vec4<f32>` (xyz = unit normal). Static; built once. Maps a voxel's
-    /// `dir` index to a model-space normal for dynamic sprite lighting.
-    univec_buf: wgpu::Buffer,
 }
 
 /// Per-frame uniform for the model-DDA pass. Mirrors `Uniform` in
@@ -2588,11 +2584,8 @@ impl GpuRenderer {
                             binding: 13,
                             resource: reg.materials_vox.as_entire_binding(),
                         },
-                        // DL.4 — univec normal table (14) + world point lights (15).
-                        wgpu::BindGroupEntry {
-                            binding: 14,
-                            resource: smd.univec_buf.as_entire_binding(),
-                        },
+                        // DL.7 — world point lights (15). (Binding 14 univec
+                        // normal table dropped — face-normal lighting now.)
                         wgpu::BindGroupEntry {
                             binding: 15,
                             resource: sprite_point_buf.as_entire_binding(),
@@ -4054,8 +4047,7 @@ impl GpuRenderer {
                     bgl_storage_entry(11, true), // per-instance kv6colmul
                     bgl_storage_entry(12, true), // TV — material palette
                     bgl_storage_entry(13, true), // TV.3 — per-voxel material id
-                    bgl_storage_entry(14, true), // DL.4 — univec normal table
-                    bgl_storage_entry(15, true), // DL.4 — world point lights
+                    bgl_storage_entry(15, true), // DL.7 — world point lights
                 ],
             });
         let pl = self
@@ -4092,25 +4084,11 @@ impl GpuRenderer {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 })
         };
-        // DL.4 — voxlap univec[256] normal table as vec4 (xyz unit normal,
-        // w padding). Static, built once with the pipeline.
-        let univec_buf = {
-            use wgpu::util::DeviceExt;
-            let table = roxlap_formats::equivec::univec();
-            let rows: Vec<[f32; 4]> = table.iter().map(|n| [n[0], n[1], n[2], 0.0]).collect();
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("roxlap-gpu sprite_model_dda.univec"),
-                    contents: bytemuck::cast_slice(&rows),
-                    usage: wgpu::BufferUsages::STORAGE,
-                })
-        };
         SpriteModelDdaResources {
             bgl,
             pipeline,
             uniform_buf,
             materials_buf,
-            univec_buf,
         }
     }
 

@@ -25,7 +25,7 @@ use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_INVISIBLE, SPRITE_FLAG_NO_Z};
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 
 use crate::camera_math::CameraState;
-use crate::dda::{dda_setup, intersect_aabb, min_axis, pixel_ray, shade};
+use crate::dda::{dda_setup, intersect_aabb, min_axis, pixel_ray, shade, shade_dynamic, CpuLights};
 use crate::opticast::OpticastSettings;
 use crate::raster_target::RasterTarget;
 
@@ -239,7 +239,16 @@ fn mat_apply(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
 /// dense KV6 and return `(colour, t)` of the first solid voxel — `t` is
 /// the world-units ray parameter (shared with the world ray).
 #[allow(clippy::cast_possible_truncation)]
-fn cast_local(dense: &SpriteDense, origin: [f32; 3], dir: [f32; 3]) -> Option<(u32, f32)> {
+/// First solid voxel along the local ray. Returns `(color, t, normal_local,
+/// cell)`: `normal_local` is the **model-local** face normal of the hit
+/// (points back toward the ray; zero for the entry voxel, no face crossed) —
+/// the caller rotates it to world for dynamic lighting (DL.7); `cell` is the
+/// hit voxel for the flat-per-voxel world centre.
+fn cast_local(
+    dense: &SpriteDense,
+    origin: [f32; 3],
+    dir: [f32; 3],
+) -> Option<(u32, f32, [f32; 3], [i32; 3])> {
     #[allow(clippy::cast_precision_loss)]
     let hi = [
         dense.dims[0] as f32,
@@ -260,6 +269,9 @@ fn cast_local(dense: &SpriteDense, origin: [f32; 3], dir: [f32; 3]) -> Option<(u
     ];
     let (step, mut t_max, t_delta) = dda_setup(origin, dir, cell, 1.0);
     let mut t_curr = t0;
+    // Face crossed to reach the current cell (model-local normal). The entry
+    // voxel (solid at t0, no step yet) has none → zero normal.
+    let mut normal = [0.0f32; 3];
     let max_steps = (dense.dims[0] + dense.dims[1] + dense.dims[2]) as usize + 8;
     for _ in 0..max_steps {
         if cell[0] < 0
@@ -273,12 +285,14 @@ fn cast_local(dense: &SpriteDense, origin: [f32; 3], dir: [f32; 3]) -> Option<(u
             return None;
         }
         if let Some(color) = dense.at(cell) {
-            return Some((color, t_curr));
+            return Some((color, t_curr, normal, cell));
         }
         let axis = min_axis(t_max);
         t_curr = t_max[axis];
         cell[axis] += step[axis];
         t_max[axis] += t_delta[axis];
+        normal = [0.0; 3];
+        normal[axis] = -(step[axis] as f32);
     }
     None
 }
@@ -299,6 +313,10 @@ pub struct SpriteShade<'a> {
     /// Per-instance opacity multiplier (`255` = unscaled), so an effect can
     /// fade out by cheap per-frame updates without re-uploading the volume.
     pub alpha_mul: u8,
+    /// DL.7 — world-space dynamic lights. When `enabled`, the opaque hit is
+    /// lit (sun + point lights + cel + ramp, flat per voxel) instead of the
+    /// baked `shade`. `CpuLights::default()` (disabled) ⇒ unchanged.
+    pub lights: CpuLights<'a>,
 }
 
 /// Accumulated front-to-back composite for one ray through a sprite.
@@ -732,15 +750,45 @@ pub fn draw_sprite_dense_shaded(
                 };
                 written += u32::from(wrote);
             } else {
-                // ---- opaque: original first-hit path (unchanged) ----
-                let Some((color, t)) = cast_local(dense, origin_local, dir_local) else {
+                // ---- opaque: first-hit path ----
+                let Some((color, t, n_local, cell)) = cast_local(dense, origin_local, dir_local)
+                else {
                     continue;
                 };
                 let depth = t * fwd_dot;
                 if depth < NEAR_Z {
                     continue;
                 }
-                let lit = shade(color, 0);
+                // DL.7 — dynamic lighting when a rig is active (sun + point
+                // lights + cel + ramp, flat per voxel); else the baked `shade`
+                // (byte-identical). The model-local face normal + voxel centre
+                // are rotated into world space via the instance basis (s,h,f).
+                let dl = shade_ctx.map_or(CpuLights::default(), |s| s.lights);
+                let lit = if dl.enabled {
+                    let to_world = |v: [f32; 3]| {
+                        [
+                            v[0] * s[0] + v[1] * h[0] + v[2] * f[0],
+                            v[0] * s[1] + v[1] * h[1] + v[2] * f[1],
+                            v[0] * s[2] + v[1] * h[2] + v[2] * f[2],
+                        ]
+                    };
+                    let n_world = to_world(n_local);
+                    let rel = [
+                        cell[0] as f32 + 0.5 - pivot[0],
+                        cell[1] as f32 + 0.5 - pivot[1],
+                        cell[2] as f32 + 0.5 - pivot[2],
+                    ];
+                    let wc = to_world(rel);
+                    let center = [pos[0] + wc[0], pos[1] + wc[1], pos[2] + wc[2]];
+                    let albedo = [
+                        ((color >> 16) & 0xff) as f32 / 255.0,
+                        ((color >> 8) & 0xff) as f32 / 255.0,
+                        (color & 0xff) as f32 / 255.0,
+                    ];
+                    shade_dynamic(albedo, 1.0, n_world, center, &dl)
+                } else {
+                    shade(color, 0)
+                };
                 // SAFETY: idx in-bounds for the rect within (width, height);
                 // single-threaded writer.
                 let wrote = unsafe {
@@ -999,6 +1047,25 @@ mod tests {
     use crate::Camera;
     use roxlap_formats::kv6::Kv6;
     use roxlap_formats::material::{Material, MaterialTable};
+
+    /// DL.7 — `cast_local` reports the hit's model-local face normal (used to
+    /// light sprites/clips). A ray crossing air then a solid block via the
+    /// z face gets a back-facing (-z) normal; the entry voxel (immediately
+    /// solid) gets a zero normal.
+    #[test]
+    fn cast_local_reports_face_normal() {
+        // Solid only at z >= 4 (air below), full in x/y.
+        let kv6 = Kv6::from_fn(8, 8, 8, |_, _, z| (z >= 4).then_some(0x80_C0_40_20));
+        let dense = SpriteDense::from_kv6(&kv6);
+        // Ray from below, travelling +z: air (z<4) then the block's top face.
+        let (_c, _t, n, cell) =
+            cast_local(&dense, [4.0, 4.0, -5.0], [0.0, 0.0, 1.0]).expect("ray hits the block");
+        assert_eq!(cell[2], 4, "first solid voxel is the z=4 surface");
+        assert!(
+            n[2] < -0.5 && n[0].abs() < 1e-6 && n[1].abs() < 1e-6,
+            "z-crossing face normal points back toward the ray (-z): {n:?}",
+        );
+    }
     use roxlap_formats::sprite::Sprite;
     use roxlap_formats::voxel_clip::{LoopMode, VoxelClip, VoxelFrame};
 
@@ -1426,6 +1493,7 @@ mod tests {
         let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
         let sh = SpriteShade {
             materials: &table,
+            lights: CpuLights::default(),
             material: 1,
             alpha_mul,
         };
@@ -1542,6 +1610,7 @@ mod tests {
         let mut zb_sh = vec![f32::INFINITY; n];
         let sh = SpriteShade {
             materials: &table,
+            lights: CpuLights::default(),
             material: 0, // opaque
             alpha_mul: 255,
         };
@@ -1600,6 +1669,7 @@ mod tests {
             let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
             let sh = SpriteShade {
                 materials: &table,
+                lights: CpuLights::default(),
                 material: 1,
                 alpha_mul: 255,
             };
@@ -1656,6 +1726,7 @@ mod tests {
             let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
             let sh = SpriteShade {
                 materials: &table,
+                lights: CpuLights::default(),
                 material: 1,
                 alpha_mul: 255,
             };
@@ -1714,6 +1785,7 @@ mod tests {
         let backdrop = SpriteDense::from_kv6(&Kv6::solid_cube(12, 0x80_FF_00_00));
         let sh_op = SpriteShade {
             materials: &table,
+            lights: CpuLights::default(),
             material: 0,
             alpha_mul: 255,
         };
@@ -1744,6 +1816,7 @@ mod tests {
         let glass = SpriteDense::from_kv6(&Kv6::solid_cube(12, 0x80_00_FF_FF));
         let sh_gl = SpriteShade {
             materials: &table,
+            lights: CpuLights::default(),
             material: 1,
             alpha_mul: 255,
         };
@@ -1829,6 +1902,7 @@ mod tests {
             let mut zb = vec![f32::INFINITY; n];
             let sh = SpriteShade {
                 materials: &table,
+                lights: CpuLights::default(),
                 material,
                 alpha_mul: 255,
             };

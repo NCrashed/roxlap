@@ -104,10 +104,9 @@ struct PointLight {
 // TV.3: per-voxel material id, parallel to `colors` (one u32 per voxel).
 // Only read when the model's `has_vox_materials` is set.
 @group(0) @binding(13) var<storage, read> materials_vox: array<u32>;
-// DL.4 — voxlap univec[256] surface-normal table (xyz unit normal). The
-// voxel's `dir` index maps to a model-space normal; rotate to world for N·L.
-@group(0) @binding(14) var<storage, read> univec: array<vec4<f32>>;
-// DL.4 — world-space point lights for the sprite pass.
+// DL.7 — world-space point lights for the sprite pass. (Binding 14 was the
+// voxlap univec normal table; dropped — sprite lighting uses the DDA hit-face
+// normal now, like terrain + CPU, for robustness + the flat-per-voxel look.)
 @group(0) @binding(15) var<storage, read> point_lights: array<PointLight>;
 
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
@@ -186,16 +185,16 @@ fn cel_band(x: f32, bands: u32) -> f32 {
     return clamp(round(x * b) / b, 0.0, 1.0);
 }
 
-// DL.4/DL.6 — dynamic-lighting shade for an opaque sprite voxel: raw albedo ×
-// (ambient + sun + point lights), using the voxel's TRUE surface normal
-// (voxlap `univec[dir]`) rotated from model to world space. Two looks, matching
-// the terrain: **smooth** (`style_bands == 0`) and **stylized** (`≥ 1`): the
-// sun key + point factors quantize (cel) and the banded sun key gradient-maps
+// DL.4/DL.6/DL.7 — dynamic-lighting shade for an opaque sprite voxel: raw
+// albedo × (ambient + sun + point lights), using the DDA hit-FACE normal
+// (`n_model`, model-local) rotated to world. Two looks, matching the terrain:
+// **smooth** (`style_bands == 0`) and **stylized** (`≥ 1`): the sun key +
+// point factors quantize (cel) and the banded sun key gradient-maps
 // `shadow_tint` (cool) → sun colour (warm), sampled **flat per voxel** (at the
 // world voxel centre). No kv6colmul in this path and no sprite shadows
 // (deferred). Used only when `sun_flags` bit 2 is set; else the marcher keeps
 // `model_color` (flat / kv6colmul), unchanged.
-fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f32>, t_hit: f32) -> vec3<f32> {
+fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f32>, t_hit: f32, n_model: vec3<f32>) -> vec3<f32> {
     let vidx = voxel_index(m, p);
     let packed = colors[vidx];
     let albedo = vec3<f32>(
@@ -203,11 +202,14 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
         f32((packed >> 8u) & 0xffu),
         f32(packed & 0xffu),
     ) / 255.0;
-    // Model-space normal from the voxel's dir index, rotated to world. `inv`
-    // is the world→model rotation (columns); model→world = its transpose.
+    // Surface normal from the DDA hit FACE (model-local), rotated to world.
+    // `inv` is the world→model rotation (columns); model→world = its
+    // transpose. The face normal is robust (no dependence on the model's
+    // per-voxel `dir` table, which procedural/clip kv6 may not populate) and
+    // matches the terrain + CPU paths — flat per voxel-face (the retro look).
     let inv = mat3x3<f32>(inst.inv_rot0.xyz, inst.inv_rot1.xyz, inst.inv_rot2.xyz);
     let m2w = transpose(inv);
-    let n_world = m2w * univec[dirs[vidx] & 0xffu].xyz; // unit for active dirs, else zero
+    let n_world = m2w * n_model;
     let styled = u.style_bands > 0u;
 
     // Sample point for point lights: world voxel centre (flat per voxel) when
@@ -298,16 +300,30 @@ fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32)
     var t_max = shield_parallel((next_b - o) * inv_d, d);
     var t_hit = t_enter;
     let max_steps = m.dims.x + m.dims.y + m.dims.z + 3u;
+    // DL.7 fix — face axis crossed to reach the current voxel (model-local).
+    // Seed with the AABB entry face (largest `tlo`); each DDA step overwrites
+    // it. Used for the lit surface normal instead of the per-voxel `dir` LUT.
+    var hit_axis: i32 = 2;
+    if (tlo.x > tlo.y && tlo.x > tlo.z) {
+        hit_axis = 0;
+    } else if (tlo.y > tlo.z) {
+        hit_axis = 1;
+    }
 
     for (var i: u32 = 0u; i < max_steps; i = i + 1u) {
         if (model_solid(m, p)) {
             if (t_hit < limit) {
                 res.hit = true;
                 res.t = t_hit;
-                // DL.4 — lit path when dynamic lighting is active; else the
-                // unchanged flat/kv6colmul colour.
+                // DL.4/DL.7 — lit path when dynamic lighting is active; else the
+                // unchanged flat/kv6colmul colour. The model-local face normal
+                // points back toward the ray on the crossed axis.
                 if ((u.sun_flags & 4u) != 0u) {
-                    res.color = shade_sprite_lit(m, p, inst, ray_dir, t_hit);
+                    var n_model = vec3<f32>(0.0);
+                    if (hit_axis == 0) { n_model.x = -f32(step.x); }
+                    else if (hit_axis == 1) { n_model.y = -f32(step.y); }
+                    else { n_model.z = -f32(step.z); }
+                    res.color = shade_sprite_lit(m, p, inst, ray_dir, t_hit, n_model);
                 } else {
                     res.color = model_color(m, p, inst_idx);
                 }
@@ -316,12 +332,15 @@ fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32)
         }
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
             t_hit = t_max.x; p.x = p.x + step.x; t_max.x = t_max.x + t_delta.x;
+            hit_axis = 0;
             if (p.x < 0 || p.x >= dim_i.x) { return res; }
         } else if (t_max.y < t_max.z) {
             t_hit = t_max.y; p.y = p.y + step.y; t_max.y = t_max.y + t_delta.y;
+            hit_axis = 1;
             if (p.y < 0 || p.y >= dim_i.y) { return res; }
         } else {
             t_hit = t_max.z; p.z = p.z + step.z; t_max.z = t_max.z + t_delta.z;
+            hit_axis = 2;
             if (p.z < 0 || p.z >= dim_i.z) { return res; }
         }
         if (t_hit >= limit) { return res; }

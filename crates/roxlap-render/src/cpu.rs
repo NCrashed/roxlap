@@ -958,6 +958,9 @@ impl CpuBackend {
                 materials,
                 material: s.material,
                 alpha_mul: s.alpha_mul,
+                // DL.7 — world-space lights so opaque sprites/clips get the
+                // same stylized lighting as the terrain.
+                lights: cpu_lights,
             };
             // Static sprites + posed KFA limbs: plain KV6 sprites. All
             // z-test against the shared buffer so order doesn't matter.

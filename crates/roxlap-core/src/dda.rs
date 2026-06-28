@@ -291,7 +291,6 @@ fn shade_lit_cpu(
         ((color >> 8) & 0xff) as f32 / 255.0,
         (color & 0xff) as f32 / 255.0,
     ];
-    let styled = l.bands > 0;
     let n = face_normal_cpu(axis, step);
     // Voxel centre (grid-local) — flat per-voxel sample point.
     let center = [
@@ -299,7 +298,22 @@ fn shade_lit_cpu(
         (cellc[1] as f32 + 0.5) * cell_size,
         (cellc[2] as f32 + 0.5) * cell_size,
     ];
+    shade_dynamic(albedo, ao, n, center, l)
+}
 
+/// CPU.1/DL.7 — the shared dynamic-lighting core (terrain + sprites): raw
+/// `albedo` × (ambient/AO + sun + point lights), sampled **flat per voxel**
+/// at `sample` with surface normal `n`. `bands > 0` quantizes (cel) and
+/// gradient-maps the sun key from `shadow_tint` (cool) to the sun colour
+/// (warm). **No shadows** (GPU-only). Returns a packed `0x80RRGGBB` colour.
+pub(crate) fn shade_dynamic(
+    albedo: [f32; 3],
+    ao: f32,
+    n: [f32; 3],
+    sample: [f32; 3],
+    l: &CpuLights<'_>,
+) -> u32 {
+    let styled = l.bands > 0;
     // Sun key (0..1): N·L (no shadow on the CPU).
     let sun_key = if l.sun {
         dot3(n, l.sun_dir).max(0.0)
@@ -325,9 +339,9 @@ fn shade_lit_cpu(
     // Point lights (flat per voxel; no shadow).
     for p in l.points {
         let d3 = [
-            p.pos[0] - center[0],
-            p.pos[1] - center[1],
-            p.pos[2] - center[2],
+            p.pos[0] - sample[0],
+            p.pos[1] - sample[1],
+            p.pos[2] - sample[2],
         ];
         let dist = (d3[0] * d3[0] + d3[1] * d3[1] + d3[2] * d3[2]).sqrt();
         if dist < p.radius && dist > 1e-4 {
