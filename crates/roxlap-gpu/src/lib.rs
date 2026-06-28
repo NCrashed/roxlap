@@ -563,6 +563,11 @@ pub struct GpuRenderer {
     /// Each is the u8 shade intensity. `[[0;4];2]` = no shading. Set via
     /// [`Self::set_scene_side_shades`].
     scene_side_shades: [[i32; 4]; 2],
+    /// DL — per-frame dynamic lights (sun + point lights), already
+    /// transformed into each grid's local frame by the facade. Set via
+    /// [`Self::set_scene_lights`]; [`SceneLights::default`] = no lights
+    /// (the pre-DL render). Consumed by `render_scene` each frame.
+    scene_lights: SceneLights,
     /// Vertical FOV (radians) the last `render_scene` marched with —
     /// cached so [`Self::pixel_ray`] reconstructs the matching view ray
     /// for picking. `0` until the first scene render.
@@ -738,6 +743,89 @@ fn material_palette(
     (out, any_translucent)
 }
 
+// ───────────────────────── DL — dynamic lighting ─────────────────────────
+// Stage DL (GPU-only). The scene-DDA pass gains a runtime sun + point
+// lights + stylized hard shadows. The host passes lights already
+// transformed into each grid's local frame (mirroring the per-grid
+// cameras); the shader works entirely in grid-local space. DL.0 wires the
+// buffers + uniform fields + bindings; the shader receives them but does
+// not yet read them (the hit-site shading lands in DL.1+).
+
+/// Max point lights honoured per frame. Excess are dropped with a warning
+/// (never silently truncated). The per-grid buffer is sized
+/// `grid_count * point_count`.
+pub const MAX_POINT_LIGHTS: usize = 32;
+/// Max simultaneous shadow casters (the sun counts as one). Lights flagged
+/// to cast beyond this are demoted to shadowless with a warning. Enforced
+/// in DL.3 (shadow stage); declared here so the budget is one constant.
+pub const MAX_SHADOW_CASTERS: usize = 4;
+
+/// A point light in a grid's **local** space, as handed to
+/// [`GpuRenderer::set_scene_lights`]. The facade transforms world-space
+/// [`roxlap_render::PointLight`]s into each grid's frame.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuLight {
+    /// Grid-local position (voxel units).
+    pub position: [f32; 3],
+    /// Hard cutoff distance, world/voxel units.
+    pub radius: f32,
+    /// Linear RGB, `0..1`.
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub casts_shadow: bool,
+}
+
+/// The whole per-frame light environment, already transformed per grid.
+/// `grid_sun_dirs` and `grid_point_lights` are indexed by grid (outer
+/// length == `grid_count`); empty ⇒ that light type is off. Set each frame
+/// via [`GpuRenderer::set_scene_lights`]; [`Default`] = no lights (the
+/// pre-DL render).
+#[derive(Clone, Default)]
+pub struct SceneLights {
+    /// Per-grid unit direction **to** the sun (grid-local). Empty ⇒ no sun.
+    pub grid_sun_dirs: Vec<[f32; 3]>,
+    pub sun_color: [f32; 3],
+    pub sun_intensity: f32,
+    pub sun_casts_shadow: bool,
+    /// Per-grid point lights (grid-local). Outer len == `grid_count`; the
+    /// inner len (the point count) is the same for every grid.
+    pub grid_point_lights: Vec<Vec<GpuLight>>,
+    /// Multiplier on the baked ambient byte.
+    pub ambient: [f32; 3],
+    pub shadow_strength: f32,
+    pub shadow_bias: f32,
+    pub shadow_max_dist: f32,
+    pub shadow_max_steps: u32,
+}
+
+/// One point light packed for the GPU (binding 18, std430, 48 bytes).
+/// Mirrors `PointLight` in `scene_dda.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuPointLight {
+    pos: [f32; 3],
+    radius: f32,
+    color: [f32; 3],
+    intensity: f32,
+    casts_shadow: u32,
+    _pad: [u32; 3],
+}
+
+/// Build the per-grid point-light storage buffer (binding 18), grid-major:
+/// grid `g`'s lights occupy `[g*count .. (g+1)*count]`. Pads to one zeroed
+/// element when empty (wgpu rejects a zero-sized storage binding).
+fn upload_grid_point_lights(device: &wgpu::Device, lights: &[GpuPointLight]) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    let one = [GpuPointLight::zeroed()];
+    let src: &[GpuPointLight] = if lights.is_empty() { &one } else { lights };
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("roxlap-gpu scene_dda.grid_point_lights"),
+        contents: bytemuck::cast_slice(src),
+        usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
+
 /// Build the per-grid camera storage buffer bound at `scene_dda.wgsl`
 /// binding 15 (read-only). One [`SceneDdaPerGridCamera`] per grid; the
 /// shader only indexes `0..grid_count`. An empty scene pads to one
@@ -772,6 +860,11 @@ struct SceneDdaPerGridCamera {
     _pad2: f32,
     forward: [f32; 3],
     _pad3: f32,
+    /// DL — unit direction TO the sun in this grid's local frame (xyz; w
+    /// unused). Packed here rather than a separate per-grid storage buffer
+    /// because the device's `max_storage_buffers_per_shader_stage` (16) is
+    /// already saturated. Zero ⇒ no sun (the uniform's `sun_flags` gates).
+    sun_dir: [f32; 4],
 }
 
 impl SceneDdaPerGridCamera {
@@ -785,6 +878,7 @@ impl SceneDdaPerGridCamera {
             _pad2: 0.0,
             forward: c.forward,
             _pad3: 0.0,
+            sun_dir: [0.0; 4],
         }
     }
 }
@@ -835,6 +929,23 @@ struct SceneDdaUniform {
     /// `side_shades1 = (up, down, _, _)`. All-zero = no shading.
     side_shades0: [i32; 4],
     side_shades1: [i32; 4],
+    // ── DL — dynamic lighting (appended; all-zero ⇒ pre-DL render) ──
+    /// `rgb` = sun colour, `w` = sun intensity.
+    sun_color: [f32; 4],
+    /// `rgb` = ambient multiplier on the baked byte, `w` = shadow strength.
+    ambient_color: [f32; 4],
+    /// Bit 0 = sun enabled, bit 1 = sun casts shadow.
+    sun_flags: u32,
+    /// Number of point lights per grid (rows in the binding-18 buffer).
+    point_light_count: u32,
+    /// Shadow-ray step budget (DL.3).
+    shadow_max_steps: u32,
+    _pad5: u32,
+    /// Shadow-ray origin bias along the surface normal (voxel units).
+    shadow_bias: f32,
+    /// Sun shadow-ray length cap (world units).
+    shadow_max_dist: f32,
+    _pad6: [f32; 2],
 }
 
 #[repr(C)]
@@ -1142,6 +1253,7 @@ impl GpuRenderer {
             // GPU.11.1 — matches the CPU demo's mip_scan_dist=64.
             scene_mip_scan_dist: 64.0,
             scene_side_shades: [[0; 4]; 2],
+            scene_lights: SceneLights::default(),
             last_fov_y_rad: 0.0,
             pending_frame: None,
             line_resources: None,
@@ -2048,11 +2160,57 @@ impl GpuRenderer {
 
         // Pack per-grid cameras into a runtime-sized storage buffer
         // (binding 15) — no fixed cap on grid count.
-        let cam_vec: Vec<SceneDdaPerGridCamera> = cameras
+        let mut cam_vec: Vec<SceneDdaPerGridCamera> = cameras
             .iter()
             .map(SceneDdaPerGridCamera::from_camera)
             .collect();
+
+        // DL — pack the per-frame lights (already grid-local). The per-grid
+        // sun direction rides in each `PerGridCamera.sun_dir` (binding 15);
+        // point lights go in one new storage buffer (binding 18). All-zero
+        // ⇒ the pre-DL render (the shader does not yet read these in DL.0).
+        let grid_count = scene.grid_count as usize;
+        let lights = &self.scene_lights;
+        let sun_enabled = !lights.grid_sun_dirs.is_empty();
+        if sun_enabled {
+            for (g, cam) in cam_vec.iter_mut().enumerate() {
+                let d = lights.grid_sun_dirs.get(g).copied().unwrap_or([0.0; 3]);
+                cam.sun_dir = [d[0], d[1], d[2], 0.0];
+            }
+        }
+        // Point-light count per grid (same across grids); capped + warned.
+        let mut point_count = lights
+            .grid_point_lights
+            .first()
+            .map_or(0, std::vec::Vec::len);
+        if point_count > MAX_POINT_LIGHTS {
+            eprintln!(
+                "roxlap-gpu: {point_count} point lights > MAX_POINT_LIGHTS ({MAX_POINT_LIGHTS}); dropping the excess"
+            );
+            point_count = MAX_POINT_LIGHTS;
+        }
+        // Grid-major point-light buffer: grid g at [g*count .. (g+1)*count].
+        let mut packed_points: Vec<GpuPointLight> =
+            Vec::with_capacity(grid_count * point_count);
+        for g in 0..grid_count {
+            let row = lights.grid_point_lights.get(g);
+            for i in 0..point_count {
+                let p = row.and_then(|r| r.get(i));
+                packed_points.push(p.map_or(GpuPointLight::zeroed(), |l| GpuPointLight {
+                    pos: l.position,
+                    radius: l.radius,
+                    color: l.color,
+                    intensity: l.intensity,
+                    casts_shadow: u32::from(l.casts_shadow),
+                    _pad: [0; 3],
+                }));
+            }
+        }
         let grid_cameras = upload_grid_cameras(&self.device, &cam_vec);
+        let grid_point_lights = upload_grid_point_lights(&self.device, &packed_points);
+        let sun_flags = u32::from(sun_enabled)
+            | (u32::from(sun_enabled && lights.sun_casts_shadow) << 1);
+
         let uniform = SceneDdaUniform {
             fov_y_rad,
             grid_count: scene.grid_count,
@@ -2082,6 +2240,25 @@ impl GpuRenderer {
             sky_cam: SceneDdaPerGridCamera::from_camera(sprite_camera),
             side_shades0: self.scene_side_shades[0],
             side_shades1: self.scene_side_shades[1],
+            sun_color: [
+                lights.sun_color[0],
+                lights.sun_color[1],
+                lights.sun_color[2],
+                lights.sun_intensity,
+            ],
+            ambient_color: [
+                lights.ambient[0],
+                lights.ambient[1],
+                lights.ambient[2],
+                lights.shadow_strength,
+            ],
+            sun_flags,
+            point_light_count: point_count as u32,
+            shadow_max_steps: lights.shadow_max_steps,
+            _pad5: 0,
+            shadow_bias: lights.shadow_bias,
+            shadow_max_dist: lights.shadow_max_dist,
+            _pad6: [0.0; 2],
         };
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
@@ -2163,6 +2340,12 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry {
                     binding: 17,
                     resource: dda.terrain_map_buf.as_entire_binding(),
+                },
+                // DL — per-grid point lights (18). The per-grid sun dir
+                // rides in PerGridCamera.sun_dir (binding 15).
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: grid_point_lights.as_entire_binding(),
                 },
             ],
         });
@@ -3166,6 +3349,10 @@ impl GpuRenderer {
                     // TV.6 — material palette + terrain colour→material map.
                     bgl_storage_entry(16, true),
                     bgl_storage_entry(17, true),
+                    // DL — per-grid point lights (18). Sun dir rides in
+                    // PerGridCamera (binding 15) to stay within the 16
+                    // storage-buffer limit.
+                    bgl_storage_entry(18, true),
                 ],
             });
         let dda_pl = self
@@ -3659,6 +3846,15 @@ impl GpuRenderer {
         self.scene_side_shades = [[v(0), v(1), v(2), v(3)], [v(4), v(5), 0, 0]];
     }
 
+    /// DL — set the per-frame dynamic lights (sun + point lights), already
+    /// transformed into each grid's local frame. Call once per frame before
+    /// [`Self::render_scene`] (the facade does this from
+    /// `FrameParams::lights`). [`SceneLights::default`] clears all lights —
+    /// the pre-DL render. GPU-only; the CPU backend has no analogue.
+    pub fn set_scene_lights(&mut self, lights: SceneLights) {
+        self.scene_lights = lights;
+    }
+
     /// GPU.10.1 — build the instanced model-DDA pipeline (one thread
     /// per pixel). Lazily invoked the first frame a registry is present.
     fn build_sprite_model_dda(&self) -> SpriteModelDdaResources {
@@ -3914,6 +4110,9 @@ impl HeadlessSceneRenderer {
                 // TV.6 — material palette + terrain map (opaque dummies here).
                 bgl_storage_entry(16, true),
                 bgl_storage_entry(17, true),
+                // DL — per-grid point lights (18). Sun dir rides in
+                // PerGridCamera (binding 15).
+                bgl_storage_entry(18, true),
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -4020,6 +4219,11 @@ impl HeadlessSceneRenderer {
             });
             (p, m)
         };
+        // DL — headless renders without dynamic lights (the oracle goldens
+        // are the baked-byte path); a 1-element zeroed dummy for binding 18
+        // (point lights). The per-grid sun dir rides in PerGridCamera and
+        // is zero here (no sun).
+        let dummy_point_lights = upload_grid_point_lights(device, &[]);
         let uniform = SceneDdaUniform {
             fov_y_rad,
             grid_count: scene.grid_count,
@@ -4051,6 +4255,16 @@ impl HeadlessSceneRenderer {
             )),
             side_shades0: self.side_shades[0],
             side_shades1: self.side_shades[1],
+            // DL — no dynamic lights in headless (sun_flags=0, count=0).
+            sun_color: [0.0; 4],
+            ambient_color: [1.0, 1.0, 1.0, 0.0],
+            sun_flags: 0,
+            point_light_count: 0,
+            shadow_max_steps: 0,
+            _pad5: 0,
+            shadow_bias: 0.0,
+            shadow_max_dist: 0.0,
+            _pad6: [0.0; 2],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 
@@ -4129,6 +4343,12 @@ impl HeadlessSceneRenderer {
                 wgpu::BindGroupEntry {
                     binding: 17,
                     resource: dummy_map.as_entire_binding(),
+                },
+                // DL — dummy per-grid point lights (18). Sun dir rides in
+                // PerGridCamera (binding 15).
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: dummy_point_lights.as_entire_binding(),
                 },
             ],
         });

@@ -35,6 +35,8 @@ mod cpu_blit;
 #[cfg(feature = "hud")]
 mod cpu_egui;
 mod gpu;
+/// Dynamic lighting types (stage DL) — GPU-only sun + point lights.
+mod light;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -50,6 +52,7 @@ pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::kv6::Kv6;
 pub use roxlap_formats::material::{BlendMode, Material};
+pub use light::{DirectionalLight, LightRig, PointLight};
 pub use roxlap_formats::sprite::Sprite;
 pub use roxlap_formats::voxel_clip::{
     DecodeError, DecodedClip, LoopMode, StreamingClip, VoxelClip, VoxelFrame,
@@ -623,6 +626,13 @@ pub struct FrameParams<'a> {
     /// pass by darkening a hit voxel's brightness by the hit face's
     /// shade (the face taken from the DDA's last-stepped axis).
     pub side_shades: [i8; 6],
+    /// Dynamic lighting (stage DL) — runtime sun + point lights + stylized
+    /// shadows. **GPU-only**: the CPU backend ignores this and keeps
+    /// multiplying the baked ambient byte. `None` (the default for hosts
+    /// that don't set it) ⇒ exactly the pre-DL render, both backends. The
+    /// baked brightness byte is reinterpreted as the ambient/AO channel;
+    /// direct light composites on top (`albedo*ambient + Σ direct`).
+    pub lights: Option<LightRig<'a>>,
 }
 
 /// Result of [`SceneRenderer::pick`] — a resolved screen→world voxel

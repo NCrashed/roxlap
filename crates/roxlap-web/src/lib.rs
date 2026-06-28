@@ -310,6 +310,7 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, perf: &web_sys::Performance, now_ms
             gpu_fov_y_rad: GPU_FOV_Y_DEG.to_radians(),
             draw_sprites: false,
             side_shades: [0; 6],
+            lights: None, // DL — GPU-only dynamic lighting opt-in; off here.
         };
         renderer.render(scene, &cam, &frame);
         renderer.present();

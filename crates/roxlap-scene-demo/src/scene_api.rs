@@ -65,6 +65,8 @@ pub fn frame_params<'a>(
         gpu_fov_y_rad: 60.0_f32.to_radians(),
         draw_sprites: true,
         side_shades: engine.side_shades(),
+        // DL — dynamic lighting opt-in (GPU-only); default off ⇒ pre-DL render.
+        lights: None,
     }
 }
 

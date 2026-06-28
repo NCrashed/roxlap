@@ -32,6 +32,11 @@ struct PerGridCamera {
     _pad2: f32,
     forward: vec3<f32>,
     _pad3: f32,
+    // DL — unit direction TO the sun in this grid's local frame (xyz; w
+    // unused). Packed here instead of a separate per-grid storage buffer
+    // (the 16 storage-buffer limit is already saturated). Zero ⇒ no sun
+    // (the uniform's `sun_flags` gates whether it's used).
+    sun_dir: vec4<f32>,
 };
 
 struct GridStaticMeta {
@@ -106,6 +111,19 @@ struct Uniforms {
     // side_shades1 = (up, down, _, _). All-zero = no shading.
     side_shades0: vec4<i32>,
     side_shades1: vec4<i32>,
+    // ── DL — dynamic lighting (appended; all-zero ⇒ pre-DL render) ──
+    // rgb = sun colour, w = sun intensity.
+    sun_color: vec4<f32>,
+    // rgb = ambient multiplier on the baked byte, w = shadow strength.
+    ambient_color: vec4<f32>,
+    // bit0 = sun enabled, bit1 = sun casts shadow.
+    sun_flags: u32,
+    point_light_count: u32,
+    shadow_max_steps: u32,
+    _pad5: u32,
+    shadow_bias: f32,
+    shadow_max_dist: f32,
+    _pad6: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -152,6 +170,23 @@ struct Mat { alpha: f32, mode: u32 };
 // TV.6 — terrain colour→material map: `.x` = rgb (0xRRGGBB), `.y` =
 // material id. A hit voxel's colour is matched here to find its material.
 @group(0) @binding(17) var<storage, read> terrain_map: array<vec2<u32>>;
+// DL — dynamic lighting. One point light in a grid's local frame (std430,
+// 48 bytes). Mirrors `GpuPointLight` in lib.rs.
+struct PointLight {
+    pos: vec3<f32>,
+    radius: f32,
+    color: vec3<f32>,
+    intensity: f32,
+    casts_shadow: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+};
+// DL binding 18 — per-grid point lights, grid-major: grid g's lights at
+// [g*point_light_count .. (g+1)*point_light_count]. DL.0 binds the buffer
+// but the hit-site shading that reads it lands in DL.1+. (The per-grid sun
+// direction rides in `grid_cameras[g].sun_dir`, binding 15.)
+@group(0) @binding(18) var<storage, read> grid_point_lights: array<PointLight>;
 
 // TV.6 — material id for a terrain voxel colour (linear scan of the small
 // map); 0 (opaque) when unmapped or the map is empty.

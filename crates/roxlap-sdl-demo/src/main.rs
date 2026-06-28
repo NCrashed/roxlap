@@ -186,6 +186,7 @@ fn render_frame(
         gpu_fov_y_rad: 60.0_f32.to_radians(),
         draw_sprites: false,
         side_shades: [0; 6],
+        lights: None, // DL — GPU-only dynamic lighting opt-in; off here.
     };
     renderer.render(scene, camera, &frame);
     // render() composites but doesn't present — finish the frame.

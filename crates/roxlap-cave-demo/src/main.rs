@@ -583,6 +583,7 @@ impl App {
             gpu_fov_y_rad: 60.0_f32.to_radians(),
             draw_sprites: true,
             side_shades: self.engine.side_shades(),
+            lights: None, // DL — GPU-only dynamic lighting opt-in; off here.
         };
 
         let Some(renderer) = self.renderer.as_mut() else {

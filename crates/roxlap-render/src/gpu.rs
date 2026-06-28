@@ -879,6 +879,11 @@ impl GpuBackend {
         // stacks, exactly as voxlap does. Default [0;6] = no shading.
         self.gpu.set_scene_side_shades(frame.side_shades);
 
+        // DL — translate this frame's world-space LightRig into each grid's
+        // local frame and hand it to the GPU (GPU-only; the CPU backend
+        // ignores lights). `None` clears them ⇒ the pre-DL render.
+        self.sync_lights(scene, frame);
+
         // TV — mirror the global voxel-material palette to the sprite pass
         // (cheap; the shader only leaves the opaque fast-path once a
         // translucent material is defined).
@@ -1239,6 +1244,63 @@ impl GpuBackend {
         if decompressed > 8 || evicted > 0 {
             eprintln!("roxlap-render: refreshed {decompressed} chunks, evicted {evicted}");
         }
+    }
+
+    /// DL — translate the per-frame world-space [`LightRig`] into each
+    /// grid's local frame (sun direction as a vector, point positions as
+    /// points — mirroring [`grid_local_camera`]) and upload it. `None`
+    /// clears all lights (the pre-DL render). Iterates `self.grid_ids` in
+    /// the same order as [`Self::grid_cameras`], so per-grid light rows
+    /// line up with the per-grid cameras `render_scene` marches with.
+    fn sync_lights(&mut self, scene: &Scene, frame: &FrameParams) {
+        let Some(rig) = frame.lights.as_ref() else {
+            self.gpu.set_scene_lights(roxlap_gpu::SceneLights::default());
+            return;
+        };
+        let mut lights = roxlap_gpu::SceneLights {
+            sun_color: rig.sun.map_or([0.0; 3], |s| s.color),
+            sun_intensity: rig.sun.map_or(0.0, |s| s.intensity),
+            sun_casts_shadow: rig.sun.is_some_and(|s| s.casts_shadow),
+            ambient: rig.ambient,
+            shadow_strength: rig.shadow_strength,
+            shadow_bias: rig.shadow_bias_voxels,
+            shadow_max_dist: rig.shadow_max_dist,
+            // Shadow-ray step budget (consumed in DL.3); a sane default.
+            shadow_max_steps: 256,
+            ..Default::default()
+        };
+        for gid in &self.grid_ids {
+            let (rotation, origin) = scene.grid(*gid).map_or(
+                (glam::DQuat::IDENTITY, DVec3::ZERO),
+                |g| (g.transform.rotation, g.transform.origin),
+            );
+            let inv_rot = rotation.inverse();
+            if let Some(sun) = rig.sun {
+                // Direction TO the sun = negated travel direction, rotated
+                // into grid-local (a vector — no translation).
+                let to_sun =
+                    (inv_rot * (-DVec3::from_array(sun.direction.map(f64::from))))
+                        .normalize_or_zero();
+                lights.grid_sun_dirs.push([
+                    to_sun.x as f32,
+                    to_sun.y as f32,
+                    to_sun.z as f32,
+                ]);
+            }
+            let mut pts = Vec::with_capacity(rig.points.len());
+            for p in rig.points {
+                let local = inv_rot * (DVec3::from_array(p.position.map(f64::from)) - origin);
+                pts.push(roxlap_gpu::GpuLight {
+                    position: [local.x as f32, local.y as f32, local.z as f32],
+                    radius: p.radius,
+                    color: p.color,
+                    intensity: p.intensity,
+                    casts_shadow: p.casts_shadow,
+                });
+            }
+            lights.grid_point_lights.push(pts);
+        }
+        self.gpu.set_scene_lights(lights);
     }
 
     /// One per-grid [`roxlap_gpu::Camera`]: the world camera

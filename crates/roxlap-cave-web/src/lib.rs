@@ -447,6 +447,7 @@ fn render(state: &mut State) {
         gpu_fov_y_rad: GPU_FOV_Y_DEG.to_radians(),
         draw_sprites: true,
         side_shades: [0; 6],
+        lights: None, // DL — GPU-only dynamic lighting opt-in; off here.
     };
     state.renderer.render(&mut state.scene, &cam, &frame);
     state.renderer.present();
