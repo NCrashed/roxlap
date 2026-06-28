@@ -222,12 +222,17 @@ impl KeyState {
 }
 
 struct App {
-    window: Option<Arc<Window>>,
     /// Unified CPU/GPU renderer. Owns presentation, the brick cache, the
     /// z-buffer, and the sprite reps. Created in `resumed` —
     /// `ROXLAP_GPU=1` selects the GPU backend with automatic CPU
     /// fallback.
+    ///
+    /// Declared **before** `window`: the renderer owns the wgpu
+    /// surface/device, which must drop before the window they were created
+    /// from. Rust drops fields top-to-bottom, so this order is the correct
+    /// teardown even on the panic-unwind path (where `exiting` never runs).
     renderer: Option<SceneRenderer>,
+    window: Option<Arc<Window>>,
     engine: Engine,
     /// Single-grid, single-chunk scene holding the cave at chunk
     /// `(0, 0, 0)`.
@@ -276,8 +281,8 @@ impl App {
         ];
 
         Self {
-            window: None,
             renderer: None,
+            window: None,
             engine,
             scene,
             grid_id,
@@ -293,6 +298,19 @@ impl App {
             bullets: Vec::new(),
             carve: CarveWorker::new(),
         }
+    }
+
+    /// Clean GPU teardown: drain in-flight work, then drop the renderer
+    /// (wgpu device/queue/surface) before the window. Dropping the surface
+    /// with the queue idle and no acquired frame, while the window still
+    /// exists, is what keeps an exit from leaving the driver/compositor
+    /// showing stale buffers. Idempotent.
+    fn teardown(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.wait_idle();
+        }
+        self.renderer = None;
+        self.window = None;
     }
 
     /// Rebuild chunk `(0, 0, 0)` from `self.preset` + `self.seed`. Drops
@@ -731,6 +749,18 @@ impl ApplicationHandler for App {
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }
+    }
+
+    /// Graceful shutdown — drain the GPU and drop the renderer (wgpu
+    /// device/queue/surface) before the window, so an exit never tears the
+    /// swapchain down mid-frame (the leftover-triangles/flicker symptom).
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.teardown();
+    }
+
+    /// Same clean teardown when the platform suspends us; `resumed` rebuilds.
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.teardown();
     }
 }
 

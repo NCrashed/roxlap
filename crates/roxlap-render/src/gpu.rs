@@ -970,6 +970,12 @@ impl GpuBackend {
         self.gpu.present();
     }
 
+    /// Drain in-flight GPU work before teardown (see
+    /// [`SceneRenderer::wait_idle`](crate::SceneRenderer::wait_idle)).
+    pub(crate) fn wait_idle(&mut self) {
+        self.gpu.wait_idle();
+    }
+
     /// Horizontal scene flip — mirrors the marched scene + line/image
     /// overlays on present, leaving egui upright.
     pub(crate) fn set_flip_x(&mut self, flip: bool) {

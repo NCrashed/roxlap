@@ -1403,6 +1403,23 @@ impl SceneRenderer {
         }
     }
 
+    /// Block until the active backend has finished all in-flight work, ready
+    /// for a clean teardown. On the GPU backend this drains the device queue
+    /// and releases any acquired-but-unpresented swapchain frame; on the CPU
+    /// backend it is a no-op (nothing is in flight).
+    ///
+    /// Call this at shutdown **before dropping the renderer and its window**,
+    /// so the GPU device/surface tear down with no commands queued and no
+    /// half-presented frame. Skipping it (or dropping the window first) can
+    /// leave the driver/compositor showing stale buffers after an exit — the
+    /// "leftover triangles / flicker" symptom of an unclean shutdown.
+    pub fn wait_idle(&mut self) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.wait_idle(),
+            BackendImpl::Gpu(g) => g.wait_idle(),
+        }
+    }
+
     /// Overlay an egui UI on the frame [`render`](Self::render)
     /// composited, then present it (`hud` feature). The host runs egui
     /// itself (e.g. `egui` + `egui-winit`) and passes the tessellated

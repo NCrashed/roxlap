@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SceneRenderer::wait_idle`** — blocks until the active backend has drained
+  all in-flight work and releases any acquired-but-unpresented swapchain frame
+  (GPU: `device.poll(Wait)`; CPU: no-op). Call it at shutdown before dropping
+  the renderer and its window.
+
 - **`BlendMode::Volumetric`** (Beer–Lambert) — the thickness-aware transparency
   mode for *filled* volumes (true smoke, fog, murky water), the deferred
   follow-up to the per-span `AlphaBlend`. Where `AlphaBlend` composites one
@@ -43,6 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     edited frame from the clip's registered map) and the **streaming-clip**
     path: `add_streaming_clip_with_materials` + `refresh_sprite_model_with_materials`
     re-apply the colour→material map on every per-frame model re-upload.
+
+### Fixed
+
+- **Clean GPU teardown on exit** — the native demos (`scene-demo`, `cave-demo`,
+  `sdl-demo`) now drain the GPU and drop the renderer (wgpu device/queue/surface)
+  *before* the window, via a winit `exiting`/`suspended` handler (and a
+  renderer-before-window field order so the panic-unwind path tears down the
+  same way). Previously an exit could yank the swapchain mid-frame / drop the
+  window before the surface, leaving the driver or compositor showing stale
+  buffers — the "leftover triangles / flicker" after an unclean exit. (The
+  runtime already reconfigured the surface on `Lost`/`Outdated`; this fixes the
+  shutdown side.)
 
 ## [0.16.0] — 2026-06-28
 

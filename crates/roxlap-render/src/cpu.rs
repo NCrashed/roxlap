@@ -988,6 +988,12 @@ impl CpuBackend {
         self.blit_and_present(self.last_dims);
     }
 
+    /// No GPU work in flight on the software backend — teardown is a plain
+    /// drop. Present for facade parity (see
+    /// [`SceneRenderer::wait_idle`](crate::SceneRenderer::wait_idle)).
+    #[allow(clippy::unused_self)]
+    pub(crate) fn wait_idle(&mut self) {}
+
     /// Rasterise depth-tested world-space [`Line3`] segments over the
     /// framebuffer the last [`render`](Self::render) composited. Uses that
     /// frame's pinhole projection (`last_hxyz` / `last_dims`) and z-buffer
