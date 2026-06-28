@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **"Lighting" demo scene** — a sweeping sun + three orbiting coloured point
     lights over a pillared floor; `P` pauses the sun, `K` toggles sun shadows,
     `L` toggles the point lights, `J` toggles stylized/smooth.
+  - **Stylized sprites + clips** (DL.7) — the cel banding + gradient-ramp +
+    flat-per-voxel stylization now extends to the GPU sprite/clip pass (using
+    each voxel's true normal), so animated characters and voxel clips match the
+    terrain's retro look. `style_bands == 0` keeps the smooth path.
   - **CPU diffuse lighting** (CPU.1) — the dynamic lighting now also runs on the
     **CPU** backend (sun + point lights + cel + ramp, flat per voxel), so the
     same `FrameParams.lights` rig lights both backends. **Shadows stay

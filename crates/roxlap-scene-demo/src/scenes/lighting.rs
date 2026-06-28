@@ -20,7 +20,9 @@
 //! `L` toggle point lights.
 
 use glam::{DVec3, IVec3};
-use roxlap_render::{DirectionalLight, LightRig, PointLight};
+use roxlap_render::{
+    DirectionalLight, DynSpriteTransform, Kv6, LightRig, LoopMode, PointLight, VoxelClip,
+};
 use roxlap_scene::{GridTransform, Scene};
 use winit::keyboard::KeyCode;
 
@@ -108,6 +110,27 @@ impl LightingScene {
         GRID_ORIGIN + DVec3::new(48.0, 48.0, f64::from(FLOOR_TOP_Z) - 12.0)
     }
 
+    /// A solid voxel sphere — a curved surface shows the cel ramp + the
+    /// coloured point-light pools far better than the flat floor.
+    fn sphere_kv6(dim: u32, color: u32) -> Kv6 {
+        let c = (dim as f32 - 1.0) * 0.5;
+        let r2 = (dim as f32 * 0.46).powi(2);
+        Kv6::from_fn(dim, dim, dim, |x, y, z| {
+            let (dx, dy, dz) = (x as f32 - c, y as f32 - c, z as f32 - c);
+            (dx * dx + dy * dy + dz * dz <= r2).then_some(color)
+        })
+    }
+
+    /// An axis-aligned sprite pose at a world position (identity basis).
+    fn pose(pos: [f32; 3]) -> DynSpriteTransform {
+        DynSpriteTransform {
+            pos,
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        }
+    }
+
     /// The sun's world **travel** direction (from sky toward ground): a
     /// fixed downward tilt with the azimuth sweeping with the clock, so
     /// shadows rotate across the floor.
@@ -165,13 +188,51 @@ impl DemoScene for LightingScene {
         }
     }
 
-    fn enter(&mut self, _ctx: &mut SceneCtx) {
+    fn enter(&mut self, ctx: &mut SceneCtx) {
         self.rebuild_points();
+        // Showcase that the stylized lighting also covers sprites + clips
+        // (DL.4/DL.6): a static voxel sphere and a pulsing voxel clip standing
+        // on the floor, lit by the same sun + orbiting point lights as the
+        // terrain. Curved surfaces read the cel ramp + coloured pools clearly.
+        let c = Self::orbit_centre();
+        let ball = ctx
+            .renderer
+            .add_sprite_model(&Self::sphere_kv6(18, 0x80_c8_c8_cc));
+        ctx.renderer.add_sprite_instance_posed(
+            ball,
+            Self::pose([(c.x - 22.0) as f32, c.y as f32, (c.z - 6.0) as f32]),
+        );
+        // A pulsing-radius sphere clip (.rvc path) — same shader as sprites,
+        // so it gets the stylized lighting too.
+        let frames: Vec<Kv6> = [5.0_f32, 7.0, 9.0, 7.0]
+            .iter()
+            .map(|&r| {
+                let dim = 20u32;
+                let cc = (dim as f32 - 1.0) * 0.5;
+                let r2 = r * r;
+                Kv6::from_fn(dim, dim, dim, |x, y, z| {
+                    let (dx, dy, dz) = (x as f32 - cc, y as f32 - cc, z as f32 - cc);
+                    (dx * dx + dy * dy + dz * dz <= r2).then_some(0x80_d0_a0_50)
+                })
+            })
+            .collect();
+        if let Ok(clip) = VoxelClip::from_kv6_frames(&frames, 1.0, LoopMode::Loop, &[], 150, 1) {
+            if let Ok(decoded) = clip.decode() {
+                let id = ctx.renderer.add_voxel_clip(&decoded);
+                ctx.renderer.add_clip_instance_playing(
+                    id,
+                    Self::pose([(c.x + 22.0) as f32, c.y as f32, (c.z - 8.0) as f32]),
+                    256,
+                    0,
+                );
+            }
+        }
     }
 
     fn update(&mut self, ctx: &mut SceneCtx, dt: f64) {
         // Shared free-fly camera (WASD + Space/Shift); no collision here.
         ctx.cam.fly_free(ctx.input, dt);
+        ctx.renderer.advance_voxel_clips(dt);
         if !self.paused {
             self.clock += dt;
         }

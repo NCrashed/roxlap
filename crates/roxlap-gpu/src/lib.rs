@@ -720,6 +720,12 @@ struct SpriteModelUniform {
     sun_flags: u32,
     point_light_count: u32,
     _pad_dl: [u32; 2],
+    // ── DL.6 — stylized sprite lighting (cel + ramp + flat per voxel) ──
+    /// `rgb` = cool unlit end of the sun ramp; `w` unused.
+    shadow_tint: [f32; 4],
+    /// Cel band count; 0 = smooth.
+    style_bands: u32,
+    _pad_dl2: [u32; 3],
 }
 
 /// GPU.10.3 — sprite screen-tile edge in pixels for instance binning.
@@ -2516,6 +2522,9 @@ impl GpuRenderer {
                     sun_flags: sprite_sun_flags,
                     point_light_count: sprite_point_count,
                     _pad_dl: [0; 2],
+                    shadow_tint: [dl.shadow_tint[0], dl.shadow_tint[1], dl.shadow_tint[2], 0.0],
+                    style_bands: dl.style_bands,
+                    _pad_dl2: [0; 3],
                 };
                 self.queue
                     .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));

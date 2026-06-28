@@ -58,6 +58,13 @@ struct Uniform {
     point_light_count: u32,
     _pad_dl0: u32,
     _pad_dl1: u32,
+    // ── DL.6 — stylized lighting for sprites (cel + ramp + flat per voxel) ──
+    shadow_tint: vec4<f32>, // rgb = cool unlit end of the sun ramp
+    style_bands: u32,       // 0 = smooth; ≥1 = quantize + gradient-map
+    // Scalar pads (NOT vec3<u32> — its 16-align would mismatch Rust [u32;3]).
+    _pad_dl2: u32,
+    _pad_dl3: u32,
+    _pad_dl4: u32,
 };
 // DL.4 — world-space point light (std430, 48 bytes). Mirrors GpuPointLight.
 struct PointLight {
@@ -172,12 +179,22 @@ fn point_falloff(d: f32, radius: f32) -> f32 {
     return x * x;
 }
 
-// DL.4 — dynamic-lighting shade for an opaque sprite voxel: raw albedo ×
+// DL.6 — cel quantization (mirror of scene_dda's): snap a 0..1 factor to
+// `bands + 1` discrete levels.
+fn cel_band(x: f32, bands: u32) -> f32 {
+    let b = f32(bands);
+    return clamp(round(x * b) / b, 0.0, 1.0);
+}
+
+// DL.4/DL.6 — dynamic-lighting shade for an opaque sprite voxel: raw albedo ×
 // (ambient + sun + point lights), using the voxel's TRUE surface normal
-// (voxlap `univec[dir]`) rotated from model to world space. No kv6colmul
-// modulation in this path (it's replaced by the dynamic terms) and no
-// sprite shadows yet (deferred). Used only when `sun_flags` bit 2 is set;
-// otherwise the marcher keeps `model_color` (flat / kv6colmul), unchanged.
+// (voxlap `univec[dir]`) rotated from model to world space. Two looks, matching
+// the terrain: **smooth** (`style_bands == 0`) and **stylized** (`≥ 1`): the
+// sun key + point factors quantize (cel) and the banded sun key gradient-maps
+// `shadow_tint` (cool) → sun colour (warm), sampled **flat per voxel** (at the
+// world voxel centre). No kv6colmul in this path and no sprite shadows
+// (deferred). Used only when `sun_flags` bit 2 is set; else the marcher keeps
+// `model_color` (flat / kv6colmul), unchanged.
 fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f32>, t_hit: f32) -> vec3<f32> {
     let vidx = voxel_index(m, p);
     let packed = colors[vidx];
@@ -188,23 +205,44 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
     ) / 255.0;
     // Model-space normal from the voxel's dir index, rotated to world. `inv`
     // is the world→model rotation (columns); model→world = its transpose.
-    let n_model = univec[dirs[vidx] & 0xffu].xyz;
     let inv = mat3x3<f32>(inst.inv_rot0.xyz, inst.inv_rot1.xyz, inst.inv_rot2.xyz);
-    let n_world = transpose(inv) * n_model; // unit for active dirs, zero otherwise
+    let m2w = transpose(inv);
+    let n_world = m2w * univec[dirs[vidx] & 0xffu].xyz; // unit for active dirs, else zero
+    let styled = u.style_bands > 0u;
 
-    var lit = albedo * u.ambient_color.rgb;
-    if ((u.sun_flags & 1u) != 0u) {
-        let ndl = max(0.0, dot(n_world, u.sun_dir.xyz));
-        lit = lit + albedo * u.sun_color.rgb * u.sun_color.w * ndl;
-    }
+    // Sample point for point lights: world voxel centre (flat per voxel) when
+    // stylized; the per-pixel hit otherwise. Model voxel centre → world via
+    // `inst.pos + m2w * ((centre - pivot) * voxel_world_size)`.
     let hit_world = u.cam_pos + t_hit * ray_dir;
+    let vox_center = inst.pos + m2w * ((vec3<f32>(p) + vec3<f32>(0.5) - m.pivot) * m.voxel_world_size);
+    let sample = select(hit_world, vox_center, styled);
+
+    // Sun key (0..1): N·L (no sprite shadows).
+    var sun_key = 0.0;
+    if ((u.sun_flags & 1u) != 0u) {
+        sun_key = max(0.0, dot(n_world, u.sun_dir.xyz));
+    }
+
+    var lit: vec3<f32>;
+    if (styled) {
+        let key = cel_band(sun_key, u.style_bands);
+        let warm = u.sun_color.rgb * u.sun_color.w;
+        lit = albedo * mix(u.shadow_tint.rgb, warm, key);
+    } else {
+        lit = albedo * u.ambient_color.rgb + albedo * u.sun_color.rgb * u.sun_color.w * sun_key;
+    }
+
     for (var i: u32 = 0u; i < u.point_light_count; i = i + 1u) {
         let pl = point_lights[i];
-        let d3 = pl.pos - hit_world;
+        let d3 = pl.pos - sample;
         let dist = length(d3);
         if (dist < pl.radius && dist > 1e-4) {
             let ndl = max(0.0, dot(n_world, d3 / dist));
-            lit = lit + albedo * pl.color * pl.intensity * ndl * point_falloff(dist, pl.radius);
+            if (ndl > 0.0) {
+                var f = ndl * point_falloff(dist, pl.radius);
+                if (styled) { f = cel_band(f, u.style_bands); }
+                lit = lit + albedo * pl.color * pl.intensity * f;
+            }
         }
     }
     return lit;
