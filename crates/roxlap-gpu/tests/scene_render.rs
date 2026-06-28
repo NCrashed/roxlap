@@ -112,6 +112,44 @@ fn is_block_color(p: u32) -> bool {
     r > 180 && (80..=175).contains(&g) && b < 70
 }
 
+/// DL.3 — floor at z=100 in every column, plus a short wall standing on it
+/// at `x ∈ [wx0, wx1)` (all y), solid `z ∈ [wtop, 100]` (rising `100-wtop`
+/// voxels above the floor). Used to cast a sun shadow onto the floor next to
+/// the wall. Colour `0x80ff_8000`.
+fn floor_with_wall_chunk(vsid: u32, wx0: u32, wx1: u32, wtop: u8) -> Vxl {
+    let n_cols = (vsid as usize) * (vsid as usize);
+    let mut data: Vec<u8> = Vec::new();
+    let mut column_offset: Vec<u32> = Vec::with_capacity(n_cols + 1);
+    let bgra = [0x00u8, 0x80, 0xff, 0x80];
+    for i in 0..n_cols {
+        let x = (i as u32) % vsid;
+        column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+        if x >= wx0 && x < wx1 {
+            let n_vox = (100 - wtop + 1) as usize;
+            data.extend_from_slice(&[0, wtop, 100, 0]); // z1=wtop..z1c=100
+            for _ in 0..n_vox {
+                data.extend_from_slice(&bgra);
+            }
+        } else {
+            data.extend_from_slice(&[0, 100, 100, 0]); // floor voxel at z=100
+            data.extend_from_slice(&bgra);
+        }
+    }
+    column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+    Vxl {
+        vsid,
+        ipo: [0.0; 3],
+        ist: [1.0, 0.0, 0.0],
+        ihe: [0.0, 0.0, 1.0],
+        ifo: [0.0, 1.0, 0.0],
+        data: data.into_boxed_slice(),
+        column_offset: column_offset.into_boxed_slice(),
+        mip_base_offsets: Box::new([0, n_cols + 1]),
+        vbit: Box::new([]),
+        vbiti: 0,
+    }
+}
+
 /// `vsid × vsid` chunk: one textured floor voxel per column at `z =
 /// surf`, with implicit voxlap **bedrock** solid below it to z=255.
 /// Models a cliff/wall: only the top is coloured; the face below is
@@ -576,6 +614,89 @@ fn scene_dda_point_light_brightens_by_distance_and_facing() {
     assert!(
         lum(below) <= lum(baked) + 2,
         "a back-facing point light must not light the top face: {below:#08x} vs baked {baked:#08x}",
+    );
+}
+
+/// DL.3 — stylized hard shadows. A short wall stands on the floor at x≈16;
+/// the camera looks straight down at the floor point (14,16) — which the
+/// wall does NOT block from above. An angled sun (toward +x and up) is
+/// occluded by the wall on its way to that point, so with shadow-casting ON
+/// the point is darker than with the same sun and shadows OFF. Proves the
+/// `shadow_occluded` DDA, the normal bias, and the `casts_shadow` gate.
+#[test]
+fn scene_dda_sun_shadow_darkens_occluded_floor() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    // Wall at x ∈ [16,18), 10 voxels tall above the floor (z 90..100).
+    let chunk = decompress_chunk(&floor_with_wall_chunk(vsid, 16, 18, 90));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // Directly above the floor point (14,16): the centre pixel shows it, and
+    // the wall at x=16 doesn't block this straight-down view.
+    let cam = Camera {
+        position: [14.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
+    };
+
+    // Sun toward +x and up (to-sun = normalize(1,0,-1)): it reaches (14,16)
+    // only by passing through the wall at x=16 → occluded when shadows cast.
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    let sun = |casts_shadow: bool| SceneLights {
+        enabled: true,
+        grid_sun_dirs: vec![[s, 0.0, -s]],
+        sun_color: [1.0; 3],
+        sun_intensity: 3.0,
+        sun_casts_shadow: casts_shadow,
+        ambient: [0.5; 3],
+        shadow_strength: 1.0, // full black shadow
+        shadow_bias: 1.5,
+        shadow_max_dist: 512.0,
+        shadow_max_steps: 256,
+        ..SceneLights::default()
+    };
+
+    renderer.set_scene_lights(sun(false));
+    let lit = render(&mut renderer); // sun reaches the floor (no shadow test)
+    renderer.set_scene_lights(sun(true));
+    let shadowed = render(&mut renderer); // wall occludes the sun → darker
+
+    // Both are the floor (low blue), not the bluish sky — even at intensity 3
+    // the floor's blue stays 0 while sky is ~0xdc.
+    let blue = |p: u32| (p >> 16) & 0xff;
+    assert!(
+        blue(lit) < 70 && blue(shadowed) < 70,
+        "expected floor, not sky"
+    );
+    assert!(
+        lum(shadowed) < lum(lit),
+        "wall must cast a sun shadow on the floor: lit {lit:#08x} -> shadowed {shadowed:#08x}",
     );
 }
 

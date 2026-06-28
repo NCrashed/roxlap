@@ -863,18 +863,46 @@ fn pack_scene_lights(
         );
         point_count = MAX_POINT_LIGHTS;
     }
+    // MAX_SHADOW_CASTERS cap (locked decision #5): the sun (if it casts) is
+    // the first caster; keep at most MAX_SHADOW_CASTERS shadow casters total
+    // and demote the rest to shadowless — never silently. The point list is
+    // identical across grids (only positions differ), so decide per index
+    // once from the representative (grid-0) row.
+    let mut budget = MAX_SHADOW_CASTERS;
+    if sun_enabled && lights.sun_casts_shadow {
+        budget = budget.saturating_sub(1);
+    }
+    let mut allow_shadow = vec![false; point_count];
+    let mut demoted = 0usize;
+    if let Some(rep) = lights.grid_point_lights.first() {
+        for (i, slot) in allow_shadow.iter_mut().enumerate() {
+            if rep.get(i).is_some_and(|l| l.casts_shadow) {
+                if budget > 0 {
+                    *slot = true;
+                    budget -= 1;
+                } else {
+                    demoted += 1;
+                }
+            }
+        }
+    }
+    if demoted > 0 {
+        eprintln!(
+            "roxlap-gpu: {demoted} shadow-casting point lights > MAX_SHADOW_CASTERS ({MAX_SHADOW_CASTERS}); demoting the excess to shadowless"
+        );
+    }
     // Grid-major point-light buffer: grid g at [g*count .. (g+1)*count].
     let mut packed: Vec<GpuPointLight> = Vec::with_capacity(grid_count * point_count);
     for g in 0..grid_count {
         let row = lights.grid_point_lights.get(g);
-        for i in 0..point_count {
+        for (i, &allow) in allow_shadow.iter().enumerate() {
             let p = row.and_then(|r| r.get(i));
             packed.push(p.map_or(GpuPointLight::zeroed(), |l| GpuPointLight {
                 pos: l.position,
                 radius: l.radius,
                 color: l.color,
                 intensity: l.intensity,
-                casts_shadow: u32::from(l.casts_shadow),
+                casts_shadow: u32::from(l.casts_shadow && allow),
                 _pad: [0; 3],
             }));
         }

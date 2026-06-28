@@ -330,60 +330,6 @@ fn point_falloff(d: f32, radius: f32) -> f32 {
     return x * x;
 }
 
-// DL — dynamic-lighting surface shade (pre-fog), same 0..~2 scale as
-// `voxel_color_in`. The baked brightness byte is reinterpreted as the
-// ambient/AO term (× `ambient_color`); the sun + point lights add N·L
-// diffuse terms on top of the raw albedo. Shadows land in DL.3. Only taken
-// when dynamic lighting is active (`sun_flags` bit 2) — otherwise the hit
-// site uses `voxel_color_in` verbatim (the byte-identical pre-DL path).
-fn shade_lit(
-    g: u32,
-    meta_id: u32,
-    mip: u32,
-    p_voxel: vec3<i32>,
-    face_shade: f32,
-    hit_axis: i32,
-    ray_dir: vec3<f32>,
-    hit_pos: vec3<f32>,
-) -> vec3<f32> {
-    let packed = voxel_packed_in(g, meta_id, mip, p_voxel);
-    let a = f32((packed >> 24u) & 0xffu);
-    let albedo = vec3<f32>(
-        f32((packed >> 16u) & 0xffu),
-        f32((packed >> 8u) & 0xffu),
-        f32(packed & 0xffu),
-    ) * (1.0 / 255.0);
-    // Ambient term = baked brightness byte (with the per-face side-shade),
-    // matching `voxel_color_in`'s brightness, scaled by the ambient mult.
-    let ambient = max(0.0, a - face_shade) * (1.0 / 128.0);
-    var lit = albedo * u.ambient_color.rgb * ambient;
-    // Surface normal (grid-local) — shared by the sun + point lights.
-    let n = face_normal(hit_axis, ray_dir);
-    // Directional sun: N·L diffuse on the raw albedo. No shadow yet (DL.3).
-    if ((u.sun_flags & 1u) != 0u) {
-        let l = grid_cameras[g].sun_dir.xyz; // unit, TO the sun, grid-local
-        let ndl = max(0.0, dot(n, l));
-        lit = lit + albedo * u.sun_color.rgb * u.sun_color.w * ndl;
-    }
-    // Point lights: per-grid, grid-major rows at [g*count .. (g+1)*count].
-    // Each is N·L × distance falloff, hard-cut at the light's radius. No
-    // shadow yet (DL.3).
-    let count = u.point_light_count;
-    let base = g * count;
-    for (var i: u32 = 0u; i < count; i = i + 1u) {
-        let pl = grid_point_lights[base + i];
-        let d3 = pl.pos - hit_pos;
-        let dist = length(d3);
-        if (dist < pl.radius && dist > 1e-4) {
-            let l = d3 / dist;
-            let ndl = max(0.0, dot(n, l));
-            let atten = point_falloff(dist, pl.radius);
-            lit = lit + albedo * pl.color * pl.intensity * ndl * atten;
-        }
-    }
-    return lit;
-}
-
 // GPU.7 modular slot lookup. `pool_dims` are powers of 2 (asserted
 // on the host), so `chunk_idx & (pool_dims - 1)` is the slot index
 // per axis. Slot identity must be verified against
@@ -485,6 +431,167 @@ fn pick_mip(t: f32, mip_count: u32) -> u32 {
     let ratio = max(t, u.mip_scan_dist) / u.mip_scan_dist;
     let lvl = u32(floor(log2(ratio)));
     return min(lvl, mip_count - 1u);
+}
+
+// DL.3 — stylized hard shadow test. Is the segment from `origin` along unit
+// `dir` blocked by a solid voxel within grid `g` before `max_t`? Intra-grid
+// only (locked decision): outer chunk DDA skips empty chunks, inner voxel
+// DDA marches mip-0 and hit-tests the solid bitmap. Bounded by
+// `u.max_outer_steps` chunks and `u.shadow_max_steps` total voxel steps, so
+// it always terminates. Returns `true` on the first occluder.
+fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> bool {
+    let m = grid_static_meta[g];
+    let chunk_dim = vec3<f32>(f32(m.vsid), f32(m.vsid), f32(CHUNK_Z));
+    let vsid_i = i32(m.vsid);
+    let cz_i = i32(CHUNK_Z);
+
+    var p_chunk = vec3<i32>(floor(origin / chunk_dim));
+    let step_chunk = vec3<i32>(sign(dir));
+    let t_delta_chunk = abs(chunk_dim / dir);
+    let next_boundary_chunk = vec3<f32>(
+        select(f32(p_chunk.x), f32(p_chunk.x + 1), step_chunk.x > 0) * chunk_dim.x,
+        select(f32(p_chunk.y), f32(p_chunk.y + 1), step_chunk.y > 0) * chunk_dim.y,
+        select(f32(p_chunk.z), f32(p_chunk.z + 1), step_chunk.z > 0) * chunk_dim.z,
+    );
+    var t_max_chunk = shield_parallel((next_boundary_chunk - origin) / dir, dir);
+    var t_enter: f32 = 0.0;
+    var steps: u32 = 0u;
+
+    for (var oc: u32 = 0u; oc < u.max_outer_steps; oc = oc + 1u) {
+        if (t_enter > max_t) { return false; }
+        // Left the occupied chunk-AABB along the ray ⇒ nothing ahead.
+        if (aabb_passed(g, p_chunk, step_chunk)) { return false; }
+        let slot_id = slot_idx_of(g, p_chunk);
+        if (chunk_has_content(g, slot_id, p_chunk)) {
+            // Inner voxel DDA at mip-0 (voxel size 1).
+            let entry_world = origin + t_enter * dir;
+            let chunk_origin_world = vec3<f32>(p_chunk) * chunk_dim;
+            let entry_in_chunk = entry_world - chunk_origin_world;
+            var p_voxel = clamp(
+                vec3<i32>(floor(entry_in_chunk)),
+                vec3<i32>(0),
+                vec3<i32>(vsid_i - 1, vsid_i - 1, cz_i - 1),
+            );
+            let next_voxel_world = vec3<f32>(
+                select(f32(p_voxel.x), f32(p_voxel.x + 1), step_chunk.x > 0) + chunk_origin_world.x,
+                select(f32(p_voxel.y), f32(p_voxel.y + 1), step_chunk.y > 0) + chunk_origin_world.y,
+                select(f32(p_voxel.z), f32(p_voxel.z + 1), step_chunk.z > 0) + chunk_origin_world.z,
+            );
+            var t_max_voxel = shield_parallel((next_voxel_world - origin) / dir, dir);
+            let t_delta_voxel = abs(vec3<f32>(1.0) / dir);
+            loop {
+                if (voxel_solid_in(g, slot_id, 0u, p_voxel)) { return true; }
+                steps = steps + 1u;
+                if (steps >= u.shadow_max_steps) { return false; }
+                if (t_max_voxel.x < t_max_voxel.y && t_max_voxel.x < t_max_voxel.z) {
+                    if (t_max_voxel.x > max_t) { return false; }
+                    p_voxel.x = p_voxel.x + step_chunk.x;
+                    t_max_voxel.x = t_max_voxel.x + t_delta_voxel.x;
+                    if (p_voxel.x < 0 || p_voxel.x >= vsid_i) { break; }
+                } else if (t_max_voxel.y < t_max_voxel.z) {
+                    if (t_max_voxel.y > max_t) { return false; }
+                    p_voxel.y = p_voxel.y + step_chunk.y;
+                    t_max_voxel.y = t_max_voxel.y + t_delta_voxel.y;
+                    if (p_voxel.y < 0 || p_voxel.y >= vsid_i) { break; }
+                } else {
+                    if (t_max_voxel.z > max_t) { return false; }
+                    p_voxel.z = p_voxel.z + step_chunk.z;
+                    t_max_voxel.z = t_max_voxel.z + t_delta_voxel.z;
+                    if (p_voxel.z < 0 || p_voxel.z >= cz_i) { break; }
+                }
+            }
+        }
+        if (t_max_chunk.x < t_max_chunk.y && t_max_chunk.x < t_max_chunk.z) {
+            t_enter = t_max_chunk.x;
+            p_chunk.x = p_chunk.x + step_chunk.x;
+            t_max_chunk.x = t_max_chunk.x + t_delta_chunk.x;
+        } else if (t_max_chunk.y < t_max_chunk.z) {
+            t_enter = t_max_chunk.y;
+            p_chunk.y = p_chunk.y + step_chunk.y;
+            t_max_chunk.y = t_max_chunk.y + t_delta_chunk.y;
+        } else {
+            t_enter = t_max_chunk.z;
+            p_chunk.z = p_chunk.z + step_chunk.z;
+            t_max_chunk.z = t_max_chunk.z + t_delta_chunk.z;
+        }
+    }
+    return false;
+}
+
+// DL — dynamic-lighting surface shade (pre-fog), same 0..~2 scale as
+// `voxel_color_in`. The baked brightness byte is reinterpreted as the
+// ambient/AO term (× `ambient_color`); the sun + point lights add N·L
+// diffuse terms (each optionally shadowed, DL.3) on top of the raw albedo.
+// Only taken when dynamic lighting is active (`sun_flags` bit 2) — otherwise
+// the hit site uses `voxel_color_in` verbatim (the byte-identical pre-DL
+// path). Shadow factor in shadow = `1 - shadow_strength` (ambient_color.w).
+fn shade_lit(
+    g: u32,
+    meta_id: u32,
+    mip: u32,
+    p_voxel: vec3<i32>,
+    face_shade: f32,
+    hit_axis: i32,
+    ray_dir: vec3<f32>,
+    hit_pos: vec3<f32>,
+) -> vec3<f32> {
+    let packed = voxel_packed_in(g, meta_id, mip, p_voxel);
+    let a = f32((packed >> 24u) & 0xffu);
+    let albedo = vec3<f32>(
+        f32((packed >> 16u) & 0xffu),
+        f32((packed >> 8u) & 0xffu),
+        f32(packed & 0xffu),
+    ) * (1.0 / 255.0);
+    // Ambient term = baked brightness byte (with the per-face side-shade),
+    // matching `voxel_color_in`'s brightness, scaled by the ambient mult.
+    let ambient = max(0.0, a - face_shade) * (1.0 / 128.0);
+    var lit = albedo * u.ambient_color.rgb * ambient;
+    // Surface normal (grid-local) — shared by the sun + point lights.
+    let n = face_normal(hit_axis, ray_dir);
+    // Shadow-ray origin: bias off the surface along the normal to avoid
+    // self-shadow acne. Shared by every caster.
+    let shadow_origin = hit_pos + n * u.shadow_bias;
+    // Light remaining in shadow (the strength floor); 1.0 ⇒ unshadowed.
+    let in_shadow = 1.0 - u.ambient_color.w;
+    // Directional sun: N·L diffuse on the raw albedo, optionally shadowed.
+    if ((u.sun_flags & 1u) != 0u) {
+        let l = grid_cameras[g].sun_dir.xyz; // unit, TO the sun, grid-local
+        let ndl = max(0.0, dot(n, l));
+        if (ndl > 0.0) {
+            var sh = 1.0;
+            if ((u.sun_flags & 2u) != 0u && shadow_occluded(g, shadow_origin, l, u.shadow_max_dist)) {
+                sh = in_shadow;
+            }
+            lit = lit + albedo * u.sun_color.rgb * u.sun_color.w * ndl * sh;
+        }
+    }
+    // Point lights: per-grid, grid-major rows at [g*count .. (g+1)*count].
+    // N·L × distance falloff, hard-cut at the light's radius; shadow rays
+    // march to the light (intra-grid).
+    let count = u.point_light_count;
+    let base = g * count;
+    for (var i: u32 = 0u; i < count; i = i + 1u) {
+        let pl = grid_point_lights[base + i];
+        let d3 = pl.pos - hit_pos;
+        let dist = length(d3);
+        if (dist < pl.radius && dist > 1e-4) {
+            let l = d3 / dist;
+            let ndl = max(0.0, dot(n, l));
+            if (ndl > 0.0) {
+                let atten = point_falloff(dist, pl.radius);
+                var sh = 1.0;
+                if (pl.casts_shadow != 0u) {
+                    let to_light = pl.pos - shadow_origin;
+                    let max_t = length(to_light);
+                    if (max_t > 1e-4 && shadow_occluded(g, shadow_origin, to_light / max_t, max_t)) {
+                        sh = in_shadow;
+                    }
+                }
+                lit = lit + albedo * pl.color * pl.intensity * ndl * atten * sh;
+            }
+        }
+    }
+    return lit;
 }
 
 // March one grid; return (hit, t, color). `best_t` is the world-t
