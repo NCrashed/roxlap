@@ -1498,7 +1498,7 @@ impl SceneRenderer {
         };
         match &mut self.inner {
             BackendImpl::Cpu(c) => {
-                c.update_sprite_model_with_materials(idx, kv6, Some(material_map))
+                c.update_sprite_model_with_materials(idx, kv6, Some(material_map));
             }
             BackendImpl::Gpu(g) => g.update_sprite_model_with_materials(idx, kv6, material_map),
         }

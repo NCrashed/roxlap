@@ -912,6 +912,9 @@ fn cell_walk_skip(
     ];
     let mut t_curr = t_enter;
     let mut last_axis = 3usize;
+    // World ray length per ray-parameter unit; divided by `cell_size` it turns
+    // a cell's `t` span into its path length in voxel units (Volumetric weight).
+    let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
 
     // TV: front-to-back translucent accumulation. While no translucent voxel
     // is hit (`touched` stays false) every return is unchanged — the opaque
@@ -1066,12 +1069,32 @@ fn cell_walk_skip(
                     dist: depth.max(0.0),
                 });
             }
-            // Translucent: one alpha layer per solid-run entry or material
-            // change (per-span — avoids the voxel-grid striping through a
-            // thick glass/water slab).
             let mat_id = material_for_color(env.terrain_materials, color);
-            if !prev_solid || mat_id != prev_mat {
-                let a = f32::from(m.alpha) / 255.0;
+            let a = f32::from(m.alpha) / 255.0;
+            if matches!(m.mode, roxlap_formats::material::BlendMode::Volumetric) {
+                // Per-cell Beer–Lambert: opacity weighted by the ray's path
+                // length through this voxel (so a filled volume thickens
+                // smoothly with depth, a sliver contributes ≈0). Occludes.
+                let t_exit = t_max[min_axis(t_max)];
+                let seg_len = (t_exit - t_curr).max(0.0) * dir_len / cell_size;
+                let eff_a = 1.0 - (1.0 - a).powf(seg_len);
+                let c = rgb_to_f32(lit);
+                accum[0] += trans * eff_a * c[0];
+                accum[1] += trans * eff_a * c[1];
+                accum[2] += trans * eff_a * c[2];
+                trans *= 1.0 - eff_a;
+                touched = true;
+                prev_mat = mat_id;
+                if trans < 1.0 / 256.0 {
+                    return Some(Hit {
+                        color: f32_to_rgb(accum),
+                        dist: depth.max(0.0),
+                    });
+                }
+            } else if !prev_solid || mat_id != prev_mat {
+                // AlphaBlend / Additive: one alpha layer per solid-run entry or
+                // material change (per-span — avoids the voxel-grid striping
+                // through a thick glass/water slab; thickness-independent).
                 let c = rgb_to_f32(lit);
                 accum[0] += trans * a * c[0];
                 accum[1] += trans * a * c[1];
@@ -1739,6 +1762,52 @@ mod tests {
         assert!(
             r_tr > r_op,
             "floor red tints through the glass (op={r_op:02x} tr={r_tr:02x})"
+        );
+    }
+
+    /// TV terrain Volumetric: a **filled** grey smoke volume over a red floor.
+    /// Beer–Lambert opacity grows with the ray's path length, so a deeper smoke
+    /// column shows more of its own colour (green channel rises toward the
+    /// smoke grey) — thickness-dependent, unlike per-span AlphaBlend.
+    #[test]
+    fn terrain_volumetric_thickness_deepens_opacity() {
+        let smoke = 0x80_90_90_90; // grey
+        let floor = 0x80_C0_20_20; // red (low green)
+                                   // Centre green channel for a smoke column `depth` voxels deep (filled),
+                                   // floor at z>=12, camera looking straight down.
+        let green_at = |depth: u32| -> u32 {
+            let vxl = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| {
+                if (4..4 + depth).contains(&z) {
+                    Some(smoke)
+                } else if z >= 12 {
+                    Some(floor)
+                } else {
+                    None
+                }
+            });
+            let grid = GridView::from_single_vxl(&vxl);
+            let cam = Camera {
+                pos: [8.0, 8.0, 0.0],
+                right: [1.0, 0.0, 0.0],
+                down: [0.0, 1.0, 0.0],
+                forward: [0.0, 0.0, 1.0],
+            };
+            let (w, h) = (32u32, 32u32);
+            let mut table = MaterialTable::new();
+            table.set(1, Material::volumetric(80));
+            let env = DdaEnv {
+                materials: Some(&table),
+                terrain_materials: &[(smoke & 0x00ff_ffff, 1)],
+                ..DdaEnv::default()
+            };
+            let (fb, _) = render_brickmap_env(grid, &cam, w, h, &env);
+            (fb[(h / 2 * w + w / 2) as usize] >> 8) & 0xff
+        };
+        let shallow = green_at(1);
+        let deep = green_at(7);
+        assert!(
+            deep > shallow,
+            "deeper Volumetric smoke shows more of its grey (deep g={deep:02x} > shallow g={shallow:02x})"
         );
     }
 

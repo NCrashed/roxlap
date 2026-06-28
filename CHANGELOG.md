@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`BlendMode::Volumetric`** (Beer–Lambert) — the thickness-aware transparency
+  mode for *filled* volumes (true smoke, fog, murky water), the deferred
+  follow-up to the per-span `AlphaBlend`. Where `AlphaBlend` composites one
+  alpha per surface run (opacity independent of thickness — ideal for
+  shells/glass), `Volumetric` weights each voxel's opacity by the ray's path
+  length through it: per-cell effective opacity `1 − (1 − alpha)^seg_len`
+  (`seg_len` in voxel units), so a boundary sliver contributes ≈0 (no
+  voxel-grid dicing) and a filled volume thickens smoothly with depth. Lands on
+  both backends and both passes (sprites/clips + terrain), CPU pinned then GPU
+  matched. New `Material::volumetric(alpha)`. The "Transparency" demo gains a
+  filled volumetric fog cloud whose core reads denser than its rim.
+
 - **Mixed-material animated clips** — per-voxel materials (TV.3) now extend to
   voxel clips (`.rvc`), the animated analogue of
   `add_sprite_model_with_materials`: `SceneRenderer::add_voxel_clip_with_materials`

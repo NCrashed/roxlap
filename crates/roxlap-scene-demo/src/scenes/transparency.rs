@@ -1,6 +1,7 @@
 //! The **Transparency** scene (TV stage): translucent voxel sprites over
 //! opaque ones, showcasing the per-pixel front-to-back compositing the DDA
-//! renderer enables — `AlphaBlend` glass/smoke and `Additive` glow.
+//! renderer enables — `AlphaBlend` glass/smoke, `Additive` glow, and
+//! `Volumetric` (Beer–Lambert) fog.
 //!
 //! Layout (camera looks +y): an opaque brick backdrop with a cyan **glass
 //! pane** in front of it (the backdrop tints through), an **additive glow**
@@ -8,10 +9,12 @@
 //! behind it), and a grey **smoke puff** whose per-instance `alpha_mul`
 //! pulses each frame — fading without re-uploading its volume.
 //!
-//! There is also a static mixed-material **window** (opaque frame + glass)
-//! and a **pulsing glass orb clip** — an animated `.rvc` whose voxels carry
+//! There is also a static mixed-material **window** (opaque frame + glass),
+//! a **pulsing glass orb clip** — an animated `.rvc` whose voxels carry
 //! per-voxel materials (`add_voxel_clip_with_materials`), the animated
-//! analogue of the window.
+//! analogue of the window — and a **filled volumetric fog cloud** whose core
+//! reads denser than its rim (opacity ∝ ray path length, unlike the
+//! thickness-independent alpha-blend puff).
 //!
 //! Each effect is one [`Material`] in the renderer's global palette
 //! (`define_material`) referenced by an instance via
@@ -31,6 +34,7 @@ use crate::scene_api::{frame_params, opticast_settings, CameraPose, DemoScene, S
 const MAT_GLASS: u8 = 1;
 const MAT_GLOW: u8 = 2;
 const MAT_SMOKE: u8 = 3;
+const MAT_FOG: u8 = 4;
 
 pub struct TransparencyScene {
     /// Empty world — every surface here is a sprite (sky background).
@@ -125,7 +129,25 @@ impl TransparencyScene {
         VoxelClip::from_kv6_frames(&frames, 1.0, LoopMode::Loop, &[], 120, 1)
             .expect("glass orb clip frames are non-empty + same dims")
     }
+
+    /// A **filled** smoke cloud for the `Volumetric` (Beer–Lambert) material:
+    /// a solid grey sphere (not a hollow shell), so the ray traverses many
+    /// absorbing voxels and the centre reads denser than the rim — opacity
+    /// grows with path length, the thickness-aware counterpart of the flat
+    /// `MAT_SMOKE` puff. Mapped to `MAT_FOG` per voxel.
+    fn build_fog_cloud() -> Kv6 {
+        const DIM: u32 = 30;
+        let cx = (DIM as f32 - 1.0) * 0.5;
+        let r2 = (DIM as f32 * 0.48).powi(2);
+        Kv6::from_fn(DIM, DIM, DIM, |x, y, z| {
+            let (dx, dy, dz) = (x as f32 - cx, y as f32 - cx, z as f32 - cx);
+            (dx * dx + dy * dy + dz * dz <= r2).then_some(FOG_RGB)
+        })
+    }
 }
+
+/// The smoke voxel colour shared by the volumetric cloud + its material map.
+const FOG_RGB: u32 = 0x80_A0_A0_A8;
 
 /// The glass voxel colour shared by the window's glass + its material map.
 const GLASS_RGB: u32 = 0x80_50_C0_E0;
@@ -155,6 +177,9 @@ impl DemoScene for TransparencyScene {
         r.define_material(MAT_GLASS, Material::alpha_blend(110));
         r.define_material(MAT_GLOW, Material::additive(200));
         r.define_material(MAT_SMOKE, Material::alpha_blend(150));
+        // Beer–Lambert fog: low per-voxel absorption, so a filled volume reads
+        // dense at its core and thin at its rim (thickness-aware).
+        r.define_material(MAT_FOG, Material::volumetric(28));
 
         // TV.5/TV.6 — the world grid's glass-coloured voxels render as the
         // glass material (the opaque red wall behind tints through).
@@ -204,9 +229,19 @@ impl DemoScene for TransparencyScene {
         let _orb_inst =
             r.add_clip_instance_playing(orb_clip, Self::pose([45.0, 70.0, 40.0]), 256, 0);
 
+        // Volumetric (Beer–Lambert) fog cloud: a *filled* grey sphere mapped
+        // per voxel to MAT_FOG, so its core reads denser than its rim — the
+        // thickness-aware counterpart of the flat alpha-blend smoke puff.
+        let fog = r.add_sprite_model_with_materials(
+            &Self::build_fog_cloud(),
+            &[(FOG_RGB & 0x00ff_ffff, MAT_FOG)],
+        );
+        let _fog_inst = r.add_sprite_instance_posed(fog, Self::pose([95.0, 85.0, 36.0]));
+
         eprintln!(
             "Transparency: glass (alpha id {MAT_GLASS}) over an opaque backdrop, \
-             additive glow (id {MAT_GLOW}), pulsing smoke (id {MAT_SMOKE})"
+             additive glow (id {MAT_GLOW}), pulsing smoke (id {MAT_SMOKE}), \
+             volumetric fog cloud (id {MAT_FOG})"
         );
     }
 
@@ -238,6 +273,7 @@ impl DemoScene for TransparencyScene {
             "glow: Additive (order-independent)".to_string(),
             "smoke: pulsing per-instance alpha_mul".to_string(),
             "orb: animated clip, per-voxel glass material".to_string(),
+            "fog: Volumetric (Beer-Lambert, thickness-aware)".to_string(),
         ]
     }
 }
