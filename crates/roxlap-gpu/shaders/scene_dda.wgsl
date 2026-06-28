@@ -323,12 +323,19 @@ fn face_normal(axis: i32, ray_dir: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(0.0, 0.0, -sign(ray_dir.z));
 }
 
+// DL — point-light distance falloff: smooth quadratic from 1 at the light
+// to 0 at `radius` (hard cutoff). Stylized, cheap, and never negative.
+fn point_falloff(d: f32, radius: f32) -> f32 {
+    let x = clamp(1.0 - d / radius, 0.0, 1.0);
+    return x * x;
+}
+
 // DL — dynamic-lighting surface shade (pre-fog), same 0..~2 scale as
 // `voxel_color_in`. The baked brightness byte is reinterpreted as the
-// ambient/AO term (× `ambient_color`); the sun adds an N·L diffuse term on
-// top of the raw albedo. Point lights + shadows land in DL.2 / DL.3. Only
-// taken when dynamic lighting is active (`sun_flags` bit 2) — otherwise the
-// hit site uses `voxel_color_in` verbatim (the byte-identical pre-DL path).
+// ambient/AO term (× `ambient_color`); the sun + point lights add N·L
+// diffuse terms on top of the raw albedo. Shadows land in DL.3. Only taken
+// when dynamic lighting is active (`sun_flags` bit 2) — otherwise the hit
+// site uses `voxel_color_in` verbatim (the byte-identical pre-DL path).
 fn shade_lit(
     g: u32,
     meta_id: u32,
@@ -337,6 +344,7 @@ fn shade_lit(
     face_shade: f32,
     hit_axis: i32,
     ray_dir: vec3<f32>,
+    hit_pos: vec3<f32>,
 ) -> vec3<f32> {
     let packed = voxel_packed_in(g, meta_id, mip, p_voxel);
     let a = f32((packed >> 24u) & 0xffu);
@@ -349,12 +357,29 @@ fn shade_lit(
     // matching `voxel_color_in`'s brightness, scaled by the ambient mult.
     let ambient = max(0.0, a - face_shade) * (1.0 / 128.0);
     var lit = albedo * u.ambient_color.rgb * ambient;
+    // Surface normal (grid-local) — shared by the sun + point lights.
+    let n = face_normal(hit_axis, ray_dir);
     // Directional sun: N·L diffuse on the raw albedo. No shadow yet (DL.3).
     if ((u.sun_flags & 1u) != 0u) {
-        let n = face_normal(hit_axis, ray_dir);
         let l = grid_cameras[g].sun_dir.xyz; // unit, TO the sun, grid-local
         let ndl = max(0.0, dot(n, l));
         lit = lit + albedo * u.sun_color.rgb * u.sun_color.w * ndl;
+    }
+    // Point lights: per-grid, grid-major rows at [g*count .. (g+1)*count].
+    // Each is N·L × distance falloff, hard-cut at the light's radius. No
+    // shadow yet (DL.3).
+    let count = u.point_light_count;
+    let base = g * count;
+    for (var i: u32 = 0u; i < count; i = i + 1u) {
+        let pl = grid_point_lights[base + i];
+        let d3 = pl.pos - hit_pos;
+        let dist = length(d3);
+        if (dist < pl.radius && dist > 1e-4) {
+            let l = d3 / dist;
+            let ndl = max(0.0, dot(n, l));
+            let atten = point_falloff(dist, pl.radius);
+            lit = lit + albedo * pl.color * pl.intensity * ndl * atten;
+        }
     }
     return lit;
 }
@@ -593,12 +618,14 @@ fn march_grid(
                         return finalize_sky_grid(touched, accum, trans, ray_dir);
                     }
                     let shade = side_shade_for(hit_axis, ray_dir);
-                    // DL — lit path (ambient + sun) when dynamic lighting is
-                    // active (sun_flags bit 2); else the baked-only path,
-                    // byte-identical to pre-DL.
+                    // DL — lit path (ambient + sun + point lights) when
+                    // dynamic lighting is active (sun_flags bit 2); else the
+                    // baked-only path, byte-identical to pre-DL. The hit
+                    // position (grid-local) feeds point-light distance/dir.
                     var base_color: vec3<f32>;
                     if ((u.sun_flags & 4u) != 0u) {
-                        base_color = shade_lit(g, slot_id, mip, p_voxel, shade, hit_axis, ray_dir);
+                        let hit_pos = ray_origin + t_hit * ray_dir;
+                        base_color = shade_lit(g, slot_id, mip, p_voxel, shade, hit_axis, ray_dir, hit_pos);
                     } else {
                         base_color = voxel_color_in(g, slot_id, mip, p_voxel, shade);
                     }

@@ -25,8 +25,8 @@ use std::sync::Mutex;
 
 use roxlap_formats::vxl::Vxl;
 use roxlap_gpu::{
-    decompress_chunk, Camera, GpuInitError, GpuRendererSettings, GpuSceneResident, GridUpload,
-    HeadlessGpu, HeadlessSceneRenderer, SceneLights, SceneUpload,
+    decompress_chunk, Camera, GpuInitError, GpuLight, GpuRendererSettings, GpuSceneResident,
+    GridUpload, HeadlessGpu, HeadlessSceneRenderer, SceneLights, SceneUpload,
 };
 
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -490,6 +490,92 @@ fn scene_dda_sun_lights_floor_by_facing() {
     assert!(
         lum(lit_above) > lum(lit_below),
         "sun facing the surface must beat a back-facing sun: {lit_above:#08x} vs {lit_below:#08x}",
+    );
+}
+
+/// DL.2 — point lights: N·L diffuse + distance falloff + hard radius cut.
+/// Floor viewed straight down (top-face normal = up = -z). A point light
+/// hovering just above the floor centre brightens it vs the baked baseline;
+/// a light below the top face contributes nothing (back-facing); a distant
+/// light (still above) is dimmer than a near one (falloff).
+#[test]
+fn scene_dda_point_light_brightens_by_distance_and_facing() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&floor_chunk(vsid)); // floor at z=100
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
+    };
+
+    // Baseline: no lights (ambient only via the baked path).
+    let baked = render(&mut renderer);
+    assert!(
+        is_block_color(baked),
+        "centre should be the floor: {baked:#08x}"
+    );
+
+    // Identity grid ⇒ grid-local == world. The floor centre is ~(16,16,100).
+    let one_point = |pos: [f32; 3]| SceneLights {
+        enabled: true,
+        ambient: [1.0; 3],
+        grid_point_lights: vec![vec![GpuLight {
+            position: pos,
+            radius: 64.0,
+            color: [1.0; 3],
+            intensity: 2.0,
+            casts_shadow: false,
+        }]],
+        ..SceneLights::default()
+    };
+
+    renderer.set_scene_lights(one_point([16.0, 16.0, 98.0])); // 2 above the top
+    let near_above = render(&mut renderer);
+    renderer.set_scene_lights(one_point([16.0, 16.0, 60.0])); // 40 above the top
+    let far_above = render(&mut renderer);
+    renderer.set_scene_lights(one_point([16.0, 16.0, 110.0])); // below the top face
+    let below = render(&mut renderer);
+
+    assert!(
+        lum(near_above) > lum(baked),
+        "a near point light must brighten the floor: baked {baked:#08x} -> {near_above:#08x}",
+    );
+    assert!(
+        lum(near_above) > lum(far_above),
+        "distance falloff: near must beat far: {near_above:#08x} vs {far_above:#08x}",
+    );
+    assert!(
+        lum(below) <= lum(baked) + 2,
+        "a back-facing point light must not light the top face: {below:#08x} vs baked {baked:#08x}",
     );
 }
 
