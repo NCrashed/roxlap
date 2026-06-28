@@ -677,6 +677,10 @@ struct SpriteModelDdaResources {
     /// seeded from the renderer's `sprite_materials` and rewritten by
     /// [`GpuRenderer::set_sprite_materials`].
     materials_buf: wgpu::Buffer,
+    /// DL.4 — voxlap `univec[256]` surface-normal table (binding 14), as
+    /// `vec4<f32>` (xyz = unit normal). Static; built once. Maps a voxel's
+    /// `dir` index to a model-space normal for dynamic sprite lighting.
+    univec_buf: wgpu::Buffer,
 }
 
 /// Per-frame uniform for the model-DDA pass. Mirrors `Uniform` in
@@ -704,6 +708,18 @@ struct SpriteModelUniform {
     /// TV — 1 if any palette material is translucent: gates the shader's
     /// accumulate path. 0 ⇒ the unchanged nearest-hit opaque path.
     has_translucent: u32,
+    // ── DL.4 — dynamic lighting for sprites (world space; all-zero ⇒
+    // unchanged flat-lit sprites). No sprite shadows (deferred). ──
+    /// World-space unit direction TO the sun (xyz; w unused).
+    sun_dir: [f32; 4],
+    /// `rgb` = sun colour, `w` = sun intensity.
+    sun_color: [f32; 4],
+    /// `rgb` = ambient multiplier on the sprite's albedo, `w` unused.
+    ambient_color: [f32; 4],
+    /// bit0 = sun enabled, bit2 = dynamic lighting active (use the lit path).
+    sun_flags: u32,
+    point_light_count: u32,
+    _pad_dl: [u32; 2],
 }
 
 /// GPU.10.3 — sprite screen-tile edge in pixels for instance binning.
@@ -803,6 +819,14 @@ pub struct SceneLights {
     pub shadow_bias: f32,
     pub shadow_max_dist: f32,
     pub shadow_max_steps: u32,
+    /// DL.4 — **world-space** unit direction to the sun, for the sprite
+    /// pass (sprites render in world space, not grid-local). `[0;3]` ⇒ no
+    /// sun. Empty `grid_sun_dirs` and a zero `world_sun_dir` both mean
+    /// "no sun" for their respective passes.
+    pub world_sun_dir: [f32; 3],
+    /// DL.4 — world-space point lights for the sprite pass (positions in
+    /// world coords; same colour/intensity/radius as the per-grid copies).
+    pub world_points: Vec<GpuLight>,
 }
 
 /// One point light packed for the GPU (binding 18, std430, 48 bytes).
@@ -2416,6 +2440,26 @@ impl GpuRenderer {
                 // World camera (see the cull pass above) — sprites
                 // project through it regardless of grid 0's transform.
                 let cam = sprite_camera;
+                // DL.4 — world-space lights for the sprite pass (sprites are
+                // world-space, not grid-local). No sprite shadows (deferred).
+                let dl = &self.scene_lights;
+                let sprite_sun_enabled = dl.world_sun_dir != [0.0; 3];
+                let sprite_pts: Vec<GpuPointLight> = dl
+                    .world_points
+                    .iter()
+                    .take(MAX_POINT_LIGHTS)
+                    .map(|l| GpuPointLight {
+                        pos: l.position,
+                        radius: l.radius,
+                        color: l.color,
+                        intensity: l.intensity,
+                        casts_shadow: 0, // no sprite shadows in DL.4
+                        _pad: [0; 3],
+                    })
+                    .collect();
+                let sprite_point_count = sprite_pts.len() as u32;
+                let sprite_point_buf = upload_grid_point_lights(&self.device, &sprite_pts);
+                let sprite_sun_flags = u32::from(sprite_sun_enabled) | (u32::from(dl.enabled) << 2);
                 let uni = SpriteModelUniform {
                     cam_pos: cam.position,
                     _p0: 0.0,
@@ -2438,6 +2482,22 @@ impl GpuRenderer {
                     tiles_x,
                     tile_size: SPRITE_TILE_SIZE,
                     has_translucent: u32::from(self.sprite_has_translucent),
+                    sun_dir: [
+                        dl.world_sun_dir[0],
+                        dl.world_sun_dir[1],
+                        dl.world_sun_dir[2],
+                        0.0,
+                    ],
+                    sun_color: [
+                        dl.sun_color[0],
+                        dl.sun_color[1],
+                        dl.sun_color[2],
+                        dl.sun_intensity,
+                    ],
+                    ambient_color: [dl.ambient[0], dl.ambient[1], dl.ambient[2], 0.0],
+                    sun_flags: sprite_sun_flags,
+                    point_light_count: sprite_point_count,
+                    _pad_dl: [0; 2],
                 };
                 self.queue
                     .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));
@@ -2500,6 +2560,15 @@ impl GpuRenderer {
                         wgpu::BindGroupEntry {
                             binding: 13,
                             resource: reg.materials_vox.as_entire_binding(),
+                        },
+                        // DL.4 — univec normal table (14) + world point lights (15).
+                        wgpu::BindGroupEntry {
+                            binding: 14,
+                            resource: smd.univec_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 15,
+                            resource: sprite_point_buf.as_entire_binding(),
                         },
                     ],
                 }))
@@ -3958,6 +4027,8 @@ impl GpuRenderer {
                     bgl_storage_entry(11, true), // per-instance kv6colmul
                     bgl_storage_entry(12, true), // TV — material palette
                     bgl_storage_entry(13, true), // TV.3 — per-voxel material id
+                    bgl_storage_entry(14, true), // DL.4 — univec normal table
+                    bgl_storage_entry(15, true), // DL.4 — world point lights
                 ],
             });
         let pl = self
@@ -3994,11 +4065,25 @@ impl GpuRenderer {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 })
         };
+        // DL.4 — voxlap univec[256] normal table as vec4 (xyz unit normal,
+        // w padding). Static, built once with the pipeline.
+        let univec_buf = {
+            use wgpu::util::DeviceExt;
+            let table = roxlap_formats::equivec::univec();
+            let rows: Vec<[f32; 4]> = table.iter().map(|n| [n[0], n[1], n[2], 0.0]).collect();
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("roxlap-gpu sprite_model_dda.univec"),
+                    contents: bytemuck::cast_slice(&rows),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
         SpriteModelDdaResources {
             bgl,
             pipeline,
             uniform_buf,
             materials_buf,
+            univec_buf,
         }
     }
 

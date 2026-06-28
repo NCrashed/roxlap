@@ -1335,6 +1335,23 @@ impl GpuBackend {
             }
             lights.grid_point_lights.push(pts);
         }
+        // DL.4 — world-space copies for the sprite pass (sprites render in
+        // world space, not grid-local). Sun dir = normalized −travel.
+        if let Some(sun) = rig.sun {
+            let to_sun = (-DVec3::from_array(sun.direction.map(f64::from))).normalize_or_zero();
+            lights.world_sun_dir = [to_sun.x as f32, to_sun.y as f32, to_sun.z as f32];
+        }
+        lights.world_points = rig
+            .points
+            .iter()
+            .map(|p| roxlap_gpu::GpuLight {
+                position: p.position,
+                radius: p.radius,
+                color: p.color,
+                intensity: p.intensity,
+                casts_shadow: p.casts_shadow,
+            })
+            .collect();
         self.gpu.set_scene_lights(lights);
     }
 

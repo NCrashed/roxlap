@@ -50,6 +50,25 @@ struct Uniform {
     tiles_x: u32,    // GPU.10.3 screen-tile grid width
     tile_size: u32,  // GPU.10.3 tile edge in pixels
     has_translucent: u32, // TV: 1 ⇒ run the accumulate path
+    // ── DL.4 — dynamic lighting for sprites (world space) ──
+    sun_dir: vec4<f32>,     // xyz = world dir TO sun
+    sun_color: vec4<f32>,   // rgb + intensity in w
+    ambient_color: vec4<f32>, // rgb ambient multiplier on albedo
+    sun_flags: u32,         // bit0 sun enabled, bit2 dynamic lighting active
+    point_light_count: u32,
+    _pad_dl0: u32,
+    _pad_dl1: u32,
+};
+// DL.4 — world-space point light (std430, 48 bytes). Mirrors GpuPointLight.
+struct PointLight {
+    pos: vec3<f32>,
+    radius: f32,
+    color: vec3<f32>,
+    intensity: f32,
+    casts_shadow: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniform;
@@ -78,6 +97,11 @@ struct Uniform {
 // TV.3: per-voxel material id, parallel to `colors` (one u32 per voxel).
 // Only read when the model's `has_vox_materials` is set.
 @group(0) @binding(13) var<storage, read> materials_vox: array<u32>;
+// DL.4 — voxlap univec[256] surface-normal table (xyz unit normal). The
+// voxel's `dir` index maps to a model-space normal; rotate to world for N·L.
+@group(0) @binding(14) var<storage, read> univec: array<vec4<f32>>;
+// DL.4 — world-space point lights for the sprite pass.
+@group(0) @binding(15) var<storage, read> point_lights: array<PointLight>;
 
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     let fog_near = u.fog_color.w;
@@ -141,6 +165,51 @@ fn model_color(m: ModelMeta, p: vec3<i32>, inst_idx: u32) -> vec3<f32> {
     return vec3<f32>(f32(r), f32(g), f32(b)) / 255.0;
 }
 
+// DL.4 — point-light distance falloff (mirrors scene_dda's): smooth
+// quadratic from 1 at the light to 0 at `radius` (hard cut).
+fn point_falloff(d: f32, radius: f32) -> f32 {
+    let x = clamp(1.0 - d / radius, 0.0, 1.0);
+    return x * x;
+}
+
+// DL.4 — dynamic-lighting shade for an opaque sprite voxel: raw albedo ×
+// (ambient + sun + point lights), using the voxel's TRUE surface normal
+// (voxlap `univec[dir]`) rotated from model to world space. No kv6colmul
+// modulation in this path (it's replaced by the dynamic terms) and no
+// sprite shadows yet (deferred). Used only when `sun_flags` bit 2 is set;
+// otherwise the marcher keeps `model_color` (flat / kv6colmul), unchanged.
+fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f32>, t_hit: f32) -> vec3<f32> {
+    let vidx = voxel_index(m, p);
+    let packed = colors[vidx];
+    let albedo = vec3<f32>(
+        f32((packed >> 16u) & 0xffu),
+        f32((packed >> 8u) & 0xffu),
+        f32(packed & 0xffu),
+    ) / 255.0;
+    // Model-space normal from the voxel's dir index, rotated to world. `inv`
+    // is the world→model rotation (columns); model→world = its transpose.
+    let n_model = univec[dirs[vidx] & 0xffu].xyz;
+    let inv = mat3x3<f32>(inst.inv_rot0.xyz, inst.inv_rot1.xyz, inst.inv_rot2.xyz);
+    let n_world = transpose(inv) * n_model; // unit for active dirs, zero otherwise
+
+    var lit = albedo * u.ambient_color.rgb;
+    if ((u.sun_flags & 1u) != 0u) {
+        let ndl = max(0.0, dot(n_world, u.sun_dir.xyz));
+        lit = lit + albedo * u.sun_color.rgb * u.sun_color.w * ndl;
+    }
+    let hit_world = u.cam_pos + t_hit * ray_dir;
+    for (var i: u32 = 0u; i < u.point_light_count; i = i + 1u) {
+        let pl = point_lights[i];
+        let d3 = pl.pos - hit_world;
+        let dist = length(d3);
+        if (dist < pl.radius && dist > 1e-4) {
+            let ndl = max(0.0, dot(n_world, d3 / dist));
+            lit = lit + albedo * pl.color * pl.intensity * ndl * point_falloff(dist, pl.radius);
+        }
+    }
+    return lit;
+}
+
 fn shield_parallel(t: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     var o = t;
     if (dir.x == 0.0) { o.x = T_INF; }
@@ -197,7 +266,13 @@ fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32)
             if (t_hit < limit) {
                 res.hit = true;
                 res.t = t_hit;
-                res.color = model_color(m, p, inst_idx);
+                // DL.4 — lit path when dynamic lighting is active; else the
+                // unchanged flat/kv6colmul colour.
+                if ((u.sun_flags & 4u) != 0u) {
+                    res.color = shade_sprite_lit(m, p, inst, ray_dir, t_hit);
+                } else {
+                    res.color = model_color(m, p, inst_idx);
+                }
             }
             return res;
         }
