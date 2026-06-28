@@ -783,6 +783,12 @@ pub struct GpuLight {
 /// pre-DL render).
 #[derive(Clone, Default)]
 pub struct SceneLights {
+    /// Whether a dynamic-lighting rig is active this frame. `false` (the
+    /// default) ⇒ the shader takes the unchanged baked-only path
+    /// (byte-identical to pre-DL). `true` ⇒ the lit path runs (ambient
+    /// term + sun + point lights), even with no sun/points set, so the
+    /// `ambient` multiplier still applies.
+    pub enabled: bool,
     /// Per-grid unit direction **to** the sun (grid-local). Empty ⇒ no sun.
     pub grid_sun_dirs: Vec<[f32; 3]>,
     pub sun_color: [f32; 3],
@@ -826,6 +832,59 @@ fn upload_grid_point_lights(device: &wgpu::Device, lights: &[GpuPointLight]) -> 
     })
 }
 
+/// DL — pack `lights` for the scene-DDA pass, shared by the surface and
+/// headless paths. Injects each grid's sun direction into
+/// `cam_vec[g].sun_dir` (binding 15), builds the grid-major point-light
+/// buffer (binding 18), and returns `(point_light_buffer, sun_flags,
+/// point_count)`. `sun_flags`: bit0 = sun enabled, bit1 = sun casts shadow,
+/// bit2 = dynamic lighting active. Over-cap point lights are dropped with a
+/// warning (never silently truncated).
+fn pack_scene_lights(
+    device: &wgpu::Device,
+    lights: &SceneLights,
+    grid_count: usize,
+    cam_vec: &mut [SceneDdaPerGridCamera],
+) -> (wgpu::Buffer, u32, u32) {
+    let sun_enabled = !lights.grid_sun_dirs.is_empty();
+    if sun_enabled {
+        for (g, cam) in cam_vec.iter_mut().enumerate() {
+            let d = lights.grid_sun_dirs.get(g).copied().unwrap_or([0.0; 3]);
+            cam.sun_dir = [d[0], d[1], d[2], 0.0];
+        }
+    }
+    // Point-light count per grid (same across grids); capped + warned.
+    let mut point_count = lights
+        .grid_point_lights
+        .first()
+        .map_or(0, std::vec::Vec::len);
+    if point_count > MAX_POINT_LIGHTS {
+        eprintln!(
+            "roxlap-gpu: {point_count} point lights > MAX_POINT_LIGHTS ({MAX_POINT_LIGHTS}); dropping the excess"
+        );
+        point_count = MAX_POINT_LIGHTS;
+    }
+    // Grid-major point-light buffer: grid g at [g*count .. (g+1)*count].
+    let mut packed: Vec<GpuPointLight> = Vec::with_capacity(grid_count * point_count);
+    for g in 0..grid_count {
+        let row = lights.grid_point_lights.get(g);
+        for i in 0..point_count {
+            let p = row.and_then(|r| r.get(i));
+            packed.push(p.map_or(GpuPointLight::zeroed(), |l| GpuPointLight {
+                pos: l.position,
+                radius: l.radius,
+                color: l.color,
+                intensity: l.intensity,
+                casts_shadow: u32::from(l.casts_shadow),
+                _pad: [0; 3],
+            }));
+        }
+    }
+    let buf = upload_grid_point_lights(device, &packed);
+    let sun_flags = u32::from(sun_enabled)
+        | (u32::from(sun_enabled && lights.sun_casts_shadow) << 1)
+        | (u32::from(lights.enabled) << 2);
+    (buf, sun_flags, point_count as u32)
+}
 
 /// Build the per-grid camera storage buffer bound at `scene_dda.wgsl`
 /// binding 15 (read-only). One [`SceneDdaPerGridCamera`] per grid; the
@@ -2169,48 +2228,15 @@ impl GpuRenderer {
         // DL — pack the per-frame lights (already grid-local). The per-grid
         // sun direction rides in each `PerGridCamera.sun_dir` (binding 15);
         // point lights go in one new storage buffer (binding 18). All-zero
-        // ⇒ the pre-DL render (the shader does not yet read these in DL.0).
-        let grid_count = scene.grid_count as usize;
-        let lights = &self.scene_lights;
-        let sun_enabled = !lights.grid_sun_dirs.is_empty();
-        if sun_enabled {
-            for (g, cam) in cam_vec.iter_mut().enumerate() {
-                let d = lights.grid_sun_dirs.get(g).copied().unwrap_or([0.0; 3]);
-                cam.sun_dir = [d[0], d[1], d[2], 0.0];
-            }
-        }
-        // Point-light count per grid (same across grids); capped + warned.
-        let mut point_count = lights
-            .grid_point_lights
-            .first()
-            .map_or(0, std::vec::Vec::len);
-        if point_count > MAX_POINT_LIGHTS {
-            eprintln!(
-                "roxlap-gpu: {point_count} point lights > MAX_POINT_LIGHTS ({MAX_POINT_LIGHTS}); dropping the excess"
-            );
-            point_count = MAX_POINT_LIGHTS;
-        }
-        // Grid-major point-light buffer: grid g at [g*count .. (g+1)*count].
-        let mut packed_points: Vec<GpuPointLight> =
-            Vec::with_capacity(grid_count * point_count);
-        for g in 0..grid_count {
-            let row = lights.grid_point_lights.get(g);
-            for i in 0..point_count {
-                let p = row.and_then(|r| r.get(i));
-                packed_points.push(p.map_or(GpuPointLight::zeroed(), |l| GpuPointLight {
-                    pos: l.position,
-                    radius: l.radius,
-                    color: l.color,
-                    intensity: l.intensity,
-                    casts_shadow: u32::from(l.casts_shadow),
-                    _pad: [0; 3],
-                }));
-            }
-        }
+        // ⇒ the pre-DL render. Shared with the headless path.
+        let lights = self.scene_lights.clone();
+        let (grid_point_lights, sun_flags, point_count) = pack_scene_lights(
+            &self.device,
+            &lights,
+            scene.grid_count as usize,
+            &mut cam_vec,
+        );
         let grid_cameras = upload_grid_cameras(&self.device, &cam_vec);
-        let grid_point_lights = upload_grid_point_lights(&self.device, &packed_points);
-        let sun_flags = u32::from(sun_enabled)
-            | (u32::from(sun_enabled && lights.sun_casts_shadow) << 1);
 
         let uniform = SceneDdaUniform {
             fov_y_rad,
@@ -2254,7 +2280,7 @@ impl GpuRenderer {
                 lights.shadow_strength,
             ],
             sun_flags,
-            point_light_count: point_count as u32,
+            point_light_count: point_count,
             shadow_max_steps: lights.shadow_max_steps,
             _pad5: 0,
             shadow_bias: lights.shadow_bias,
@@ -4025,6 +4051,10 @@ pub struct HeadlessSceneRenderer {
     /// `[(top,bot,left,right), (up,down,_,_)]`; set via
     /// [`Self::set_side_shades`].
     side_shades: [[i32; 4]; 2],
+    /// DL — dynamic lights for the render (already grid-local, like the
+    /// surface path). Default = none (baked-only). Set via
+    /// [`Self::set_scene_lights`]; lets tests exercise the lit path.
+    lights: SceneLights,
 }
 
 impl HeadlessSceneRenderer {
@@ -4170,7 +4200,15 @@ impl HeadlessSceneRenderer {
             pipeline,
             readback,
             side_shades: [[0; 4]; 2],
+            lights: SceneLights::default(),
         }
+    }
+
+    /// DL — set dynamic lights for subsequent [`Self::render`] calls
+    /// (already in grid-local space). Lets tests exercise the lit path
+    /// (sun N·L, point lights). Default = none (baked-only).
+    pub fn set_scene_lights(&mut self, lights: SceneLights) {
+        self.lights = lights;
     }
 
     /// Set per-face side-shades for subsequent [`Self::render`] calls —
@@ -4210,11 +4248,10 @@ impl HeadlessSceneRenderer {
             scene.grid_count,
         );
 
-        let cam_vec: Vec<SceneDdaPerGridCamera> = cameras
+        let mut cam_vec: Vec<SceneDdaPerGridCamera> = cameras
             .iter()
             .map(SceneDdaPerGridCamera::from_camera)
             .collect();
-        let grid_cameras = upload_grid_cameras(device, &cam_vec);
         // TV.6 — opaque dummies for the material palette + terrain map
         // bindings (headless renders opaque-only: terrain_has_translucent=0).
         let (dummy_pal, dummy_map) = {
@@ -4238,11 +4275,14 @@ impl HeadlessSceneRenderer {
             });
             (p, m)
         };
-        // DL — headless renders without dynamic lights (the oracle goldens
-        // are the baked-byte path); a 1-element zeroed dummy for binding 18
-        // (point lights). The per-grid sun dir rides in PerGridCamera and
-        // is zero here (no sun).
-        let dummy_point_lights = upload_grid_point_lights(device, &[]);
+        // DL — pack any dynamic lights (default none ⇒ the baked-only path,
+        // matching the oracle goldens). Injects sun dir into cam_vec.sun_dir
+        // and builds the point-light buffer (binding 18). Shared with the
+        // surface path.
+        let dl = self.lights.clone();
+        let (dummy_point_lights, sun_flags, point_count) =
+            pack_scene_lights(device, &dl, scene.grid_count as usize, &mut cam_vec);
+        let grid_cameras = upload_grid_cameras(device, &cam_vec);
         let uniform = SceneDdaUniform {
             fov_y_rad,
             grid_count: scene.grid_count,
@@ -4274,15 +4314,25 @@ impl HeadlessSceneRenderer {
             )),
             side_shades0: self.side_shades[0],
             side_shades1: self.side_shades[1],
-            // DL — no dynamic lights in headless (sun_flags=0, count=0).
-            sun_color: [0.0; 4],
-            ambient_color: [1.0, 1.0, 1.0, 0.0],
-            sun_flags: 0,
-            point_light_count: 0,
-            shadow_max_steps: 0,
+            // DL — light parameters (default = no lights ⇒ sun_flags 0).
+            sun_color: [
+                dl.sun_color[0],
+                dl.sun_color[1],
+                dl.sun_color[2],
+                dl.sun_intensity,
+            ],
+            ambient_color: [
+                dl.ambient[0],
+                dl.ambient[1],
+                dl.ambient[2],
+                dl.shadow_strength,
+            ],
+            sun_flags,
+            point_light_count: point_count,
+            shadow_max_steps: dl.shadow_max_steps,
             _pad5: 0,
-            shadow_bias: 0.0,
-            shadow_max_dist: 0.0,
+            shadow_bias: dl.shadow_bias,
+            shadow_max_dist: dl.shadow_max_dist,
             _pad6: [0.0; 2],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));

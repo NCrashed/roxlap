@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use roxlap_formats::vxl::Vxl;
 use roxlap_gpu::{
     decompress_chunk, Camera, GpuInitError, GpuRendererSettings, GpuSceneResident, GridUpload,
-    HeadlessGpu, HeadlessSceneRenderer, SceneUpload,
+    HeadlessGpu, HeadlessSceneRenderer, SceneLights, SceneUpload,
 };
 
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -411,6 +411,85 @@ fn scene_dda_side_shades_darken_floor() {
         shaded & 0x00ff_ffff,
         0,
         "half-shaded floor must not be black"
+    );
+}
+
+/// DL.1 — the directional sun (N·L diffuse) lights a grid face by its
+/// facing. Camera looks straight down a floor (hit via +z step ⇒ top-face
+/// normal = -z = up). A sun coming from above (to-sun = up = -z) gives
+/// N·L = 1 → the floor is brighter than the baked-only baseline; a sun
+/// from below (to-sun = +z) gives N·L = 0 → no sun term. Proves the
+/// albedo/ambient split, face-normal, sun_dir plumbing, and `sun_flags`
+/// gate end-to-end through `scene_dda.wgsl`.
+#[test]
+fn scene_dda_sun_lights_floor_by_facing() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&floor_chunk(vsid)); // floor voxel at z=100
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
+    };
+
+    // Baseline: no lights (baked-only path).
+    let baked = render(&mut renderer);
+    assert!(
+        is_block_color(baked),
+        "centre should be the floor: {baked:#08x}"
+    );
+
+    // A single white grid is identity-aligned, so grid-local == world. Sun
+    // from above: to-sun direction is up (-z, voxlap z-down).
+    let sun = |to_sun: [f32; 3]| SceneLights {
+        enabled: true,
+        grid_sun_dirs: vec![to_sun],
+        sun_color: [1.0; 3],
+        sun_intensity: 1.0,
+        ambient: [1.0; 3],
+        ..SceneLights::default()
+    };
+
+    renderer.set_scene_lights(sun([0.0, 0.0, -1.0]));
+    let lit_above = render(&mut renderer);
+    renderer.set_scene_lights(sun([0.0, 0.0, 1.0]));
+    let lit_below = render(&mut renderer);
+
+    assert!(
+        lum(lit_above) > lum(baked),
+        "sun from above must brighten the floor: baked {baked:#08x} -> {lit_above:#08x}",
+    );
+    assert!(
+        lum(lit_above) > lum(lit_below),
+        "sun facing the surface must beat a back-facing sun: {lit_above:#08x} vs {lit_below:#08x}",
     );
 }
 

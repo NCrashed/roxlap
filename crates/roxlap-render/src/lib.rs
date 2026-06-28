@@ -48,11 +48,11 @@ use roxlap_core::Camera;
 use roxlap_formats::voxel_clip::frame_at;
 use roxlap_scene::Scene;
 
+pub use light::{DirectionalLight, LightRig, PointLight};
 pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::kv6::Kv6;
 pub use roxlap_formats::material::{BlendMode, Material};
-pub use light::{DirectionalLight, LightRig, PointLight};
 pub use roxlap_formats::sprite::Sprite;
 pub use roxlap_formats::voxel_clip::{
     DecodeError, DecodedClip, LoopMode, StreamingClip, VoxelClip, VoxelFrame,

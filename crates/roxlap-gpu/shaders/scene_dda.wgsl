@@ -314,6 +314,51 @@ fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>, face_shade
     return vec3<f32>(r, g_chan, b) * (brightness / 255.0);
 }
 
+// DL — face normal in grid-local space: it points back along the ray on
+// the crossed axis (toward the incoming ray). `axis` ∈ {0,1,2} is the
+// DDA's last-stepped axis (the same value side-shading uses).
+fn face_normal(axis: i32, ray_dir: vec3<f32>) -> vec3<f32> {
+    if (axis == 0) { return vec3<f32>(-sign(ray_dir.x), 0.0, 0.0); }
+    if (axis == 1) { return vec3<f32>(0.0, -sign(ray_dir.y), 0.0); }
+    return vec3<f32>(0.0, 0.0, -sign(ray_dir.z));
+}
+
+// DL — dynamic-lighting surface shade (pre-fog), same 0..~2 scale as
+// `voxel_color_in`. The baked brightness byte is reinterpreted as the
+// ambient/AO term (× `ambient_color`); the sun adds an N·L diffuse term on
+// top of the raw albedo. Point lights + shadows land in DL.2 / DL.3. Only
+// taken when dynamic lighting is active (`sun_flags` bit 2) — otherwise the
+// hit site uses `voxel_color_in` verbatim (the byte-identical pre-DL path).
+fn shade_lit(
+    g: u32,
+    meta_id: u32,
+    mip: u32,
+    p_voxel: vec3<i32>,
+    face_shade: f32,
+    hit_axis: i32,
+    ray_dir: vec3<f32>,
+) -> vec3<f32> {
+    let packed = voxel_packed_in(g, meta_id, mip, p_voxel);
+    let a = f32((packed >> 24u) & 0xffu);
+    let albedo = vec3<f32>(
+        f32((packed >> 16u) & 0xffu),
+        f32((packed >> 8u) & 0xffu),
+        f32(packed & 0xffu),
+    ) * (1.0 / 255.0);
+    // Ambient term = baked brightness byte (with the per-face side-shade),
+    // matching `voxel_color_in`'s brightness, scaled by the ambient mult.
+    let ambient = max(0.0, a - face_shade) * (1.0 / 128.0);
+    var lit = albedo * u.ambient_color.rgb * ambient;
+    // Directional sun: N·L diffuse on the raw albedo. No shadow yet (DL.3).
+    if ((u.sun_flags & 1u) != 0u) {
+        let n = face_normal(hit_axis, ray_dir);
+        let l = grid_cameras[g].sun_dir.xyz; // unit, TO the sun, grid-local
+        let ndl = max(0.0, dot(n, l));
+        lit = lit + albedo * u.sun_color.rgb * u.sun_color.w * ndl;
+    }
+    return lit;
+}
+
 // GPU.7 modular slot lookup. `pool_dims` are powers of 2 (asserted
 // on the host), so `chunk_idx & (pool_dims - 1)` is the slot index
 // per axis. Slot identity must be verified against
@@ -548,7 +593,16 @@ fn march_grid(
                         return finalize_sky_grid(touched, accum, trans, ray_dir);
                     }
                     let shade = side_shade_for(hit_axis, ray_dir);
-                    let lit = apply_fog(voxel_color_in(g, slot_id, mip, p_voxel, shade), t_hit);
+                    // DL — lit path (ambient + sun) when dynamic lighting is
+                    // active (sun_flags bit 2); else the baked-only path,
+                    // byte-identical to pre-DL.
+                    var base_color: vec3<f32>;
+                    if ((u.sun_flags & 4u) != 0u) {
+                        base_color = shade_lit(g, slot_id, mip, p_voxel, shade, hit_axis, ray_dir);
+                    } else {
+                        base_color = voxel_color_in(g, slot_id, mip, p_voxel, shade);
+                    }
+                    let lit = apply_fog(base_color, t_hit);
                     if (u.terrain_has_translucent == 0u) {
                         // Opaque fast-path: unchanged first hit.
                         out.hit = true;

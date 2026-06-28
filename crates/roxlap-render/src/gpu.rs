@@ -1293,10 +1293,14 @@ impl GpuBackend {
     /// line up with the per-grid cameras `render_scene` marches with.
     fn sync_lights(&mut self, scene: &Scene, frame: &FrameParams) {
         let Some(rig) = frame.lights.as_ref() else {
-            self.gpu.set_scene_lights(roxlap_gpu::SceneLights::default());
+            self.gpu
+                .set_scene_lights(roxlap_gpu::SceneLights::default());
             return;
         };
         let mut lights = roxlap_gpu::SceneLights {
+            // A rig is present ⇒ take the lit path (so `ambient` applies even
+            // with no sun/points). `None` keeps the default `enabled: false`.
+            enabled: true,
             sun_color: rig.sun.map_or([0.0; 3], |s| s.color),
             sun_intensity: rig.sun.map_or(0.0, |s| s.intensity),
             sun_casts_shadow: rig.sun.is_some_and(|s| s.casts_shadow),
@@ -1309,28 +1313,20 @@ impl GpuBackend {
             ..Default::default()
         };
         for gid in &self.grid_ids {
-            let (rotation, origin) = scene.grid(*gid).map_or(
-                (glam::DQuat::IDENTITY, DVec3::ZERO),
-                |g| (g.transform.rotation, g.transform.origin),
-            );
-            let inv_rot = rotation.inverse();
+            let (rotation, origin) = scene
+                .grid(*gid)
+                .map_or((glam::DQuat::IDENTITY, DVec3::ZERO), |g| {
+                    (g.transform.rotation, g.transform.origin)
+                });
             if let Some(sun) = rig.sun {
-                // Direction TO the sun = negated travel direction, rotated
-                // into grid-local (a vector — no translation).
-                let to_sun =
-                    (inv_rot * (-DVec3::from_array(sun.direction.map(f64::from))))
-                        .normalize_or_zero();
-                lights.grid_sun_dirs.push([
-                    to_sun.x as f32,
-                    to_sun.y as f32,
-                    to_sun.z as f32,
-                ]);
+                lights
+                    .grid_sun_dirs
+                    .push(grid_local_sun_dir(rotation, sun.direction));
             }
             let mut pts = Vec::with_capacity(rig.points.len());
             for p in rig.points {
-                let local = inv_rot * (DVec3::from_array(p.position.map(f64::from)) - origin);
                 pts.push(roxlap_gpu::GpuLight {
-                    position: [local.x as f32, local.y as f32, local.z as f32],
+                    position: grid_local_point(rotation, origin, p.position),
                     radius: p.radius,
                     color: p.color,
                     intensity: p.intensity,
@@ -1398,6 +1394,30 @@ pub(crate) fn grid_local_camera(
         // Camera's fov field is unused by the marcher.
         fov_y_rad: 60_f32.to_radians(),
     }
+}
+
+/// DL — a world-space sun **travel** direction → the unit direction **to**
+/// the sun in a grid's local frame. A direction is a vector, so only the
+/// inverse rotation applies (no translation); the negation flips travel →
+/// toward-light for the shader's N·L. Handedness is preserved (rigid
+/// rotation), so the sign convention stays consistent under rotation — the
+/// chirality footgun the per-grid cameras also have to respect.
+pub(crate) fn grid_local_sun_dir(rotation: glam::DQuat, travel_world: [f32; 3]) -> [f32; 3] {
+    let to_sun = (rotation.inverse() * (-DVec3::from_array(travel_world.map(f64::from))))
+        .normalize_or_zero();
+    [to_sun.x as f32, to_sun.y as f32, to_sun.z as f32]
+}
+
+/// DL — a world-space point-light position → its position in a grid's
+/// local frame (inverse rotation + origin-relative translation, exactly
+/// like [`grid_local_camera`]'s position).
+pub(crate) fn grid_local_point(
+    rotation: glam::DQuat,
+    origin: DVec3,
+    pos_world: [f32; 3],
+) -> [f32; 3] {
+    let local = rotation.inverse() * (DVec3::from_array(pos_world.map(f64::from)) - origin);
+    [local.x as f32, local.y as f32, local.z as f32]
 }
 
 #[cfg(test)]
@@ -1469,5 +1489,52 @@ mod tests {
             world_h,
             "grid-local transform flipped the basis handedness",
         );
+    }
+
+    // ───────────────────────── DL — light transforms ─────────────────────────
+
+    fn approx(a: [f32; 3], b: [f32; 3]) {
+        for i in 0..3 {
+            assert!((a[i] - b[i]).abs() < 1e-5, "{a:?} != {b:?}");
+        }
+    }
+
+    #[test]
+    fn sun_dir_negates_travel_and_normalizes() {
+        // Identity grid: a sun travelling +z (straight down, voxlap z-down)
+        // → direction TO the sun is -z (straight up), unit length.
+        let d = grid_local_sun_dir(glam::DQuat::IDENTITY, [0.0, 0.0, 5.0]);
+        approx(d, [0.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn sun_dir_follows_inverse_grid_rotation() {
+        // Grid yawed +90° about z: a world sun travelling +x maps to a
+        // to-sun direction of -x in world, then into grid-local via the
+        // inverse rotation. Cross-check against the raw quat math.
+        let rot = glam::DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        let got = grid_local_sun_dir(rot, [3.0, 0.0, 0.0]);
+        let want = rot.inverse() * DVec3::new(-1.0, 0.0, 0.0); // -travel, normalized
+        approx(got, [want.x as f32, want.y as f32, want.z as f32]);
+        // Still unit length after the rotation.
+        let len = (got[0] * got[0] + got[1] * got[1] + got[2] * got[2]).sqrt();
+        assert!((len - 1.0).abs() < 1e-5, "sun dir not unit: {len}");
+    }
+
+    #[test]
+    fn point_pos_is_translation_plus_inverse_rotation() {
+        // Identity rotation: only the origin-relative shift applies.
+        let p = grid_local_point(
+            glam::DQuat::IDENTITY,
+            DVec3::new(10.0, 20.0, 30.0),
+            [12.0, 24.0, 33.0],
+        );
+        approx(p, [2.0, 4.0, 3.0]);
+        // A light sitting on the grid origin maps to the local origin
+        // regardless of rotation.
+        let rot = glam::DQuat::from_euler(glam::EulerRot::XYZ, 0.4, -0.7, 0.2);
+        let origin = DVec3::new(5.0, -6.0, 7.0);
+        let at_origin = grid_local_point(rot, origin, [5.0, -6.0, 7.0]);
+        approx(at_origin, [0.0, 0.0, 0.0]);
     }
 }
