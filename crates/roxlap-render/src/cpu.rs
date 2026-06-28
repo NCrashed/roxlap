@@ -648,10 +648,21 @@ impl CpuBackend {
     }
 
     /// Register an animated voxel clip (VCL.4): decode every frame into a
-    /// cached [`ClipFlipbook`]. Returns its positional clip index.
-    pub(crate) fn add_voxel_clip(&mut self, clip: &DecodedClip) -> usize {
+    /// cached [`ClipFlipbook`]. With a non-empty `material_map` (TV.3), each
+    /// frame's voxels are classified into per-voxel material ids by colour —
+    /// the clip analogue of [`Self::add_model_with_materials`]. An empty map
+    /// is the plain all-opaque clip.
+    pub(crate) fn add_voxel_clip_with_materials(
+        &mut self,
+        clip: &DecodedClip,
+        material_map: &[(u32, u8)],
+    ) -> usize {
         let idx = self.clip_books.len();
-        self.clip_books.push(ClipFlipbook::from_decoded(clip));
+        self.clip_books
+            .push(ClipFlipbook::from_decoded_with_materials(
+                clip,
+                material_map,
+            ));
         idx
     }
 
@@ -711,8 +722,9 @@ impl CpuBackend {
         vf: &VoxelFrame,
         dims: [u32; 3],
         pivot: [f32; 3],
+        material_map: &[(u32, u8)],
     ) -> bool {
-        let dense = SpriteDense::from_voxel_frame(vf, dims, pivot);
+        let dense = SpriteDense::from_voxel_frame_with_materials(vf, dims, pivot, material_map);
         self.clip_books
             .get_mut(clip_idx)
             .is_some_and(|b| b.set_frame(frame, dense))
@@ -725,20 +737,43 @@ impl CpuBackend {
     /// instance, so the win is parity rather than bandwidth). No-op if no
     /// instance references `model_index`.
     pub(crate) fn update_sprite_model(&mut self, model_index: usize, kv6: &Kv6) {
+        self.update_sprite_model_with_materials(model_index, kv6, None);
+    }
+
+    /// Like [`Self::update_sprite_model`] but also overwrites the per-voxel
+    /// material colour map on the model's instances/template (TV.3) — the
+    /// material-aware refresh behind the streaming-clip path. `Some(map)`
+    /// replaces the map (empty clears it); `None` leaves the existing map
+    /// untouched (the plain `refresh_sprite_model` behaviour).
+    pub(crate) fn update_sprite_model_with_materials(
+        &mut self,
+        model_index: usize,
+        kv6: &Kv6,
+        material_map: Option<&[(u32, u8)]>,
+    ) {
         for (s, &m) in self.sprites.iter_mut().zip(&self.sprite_models) {
             if m == model_index {
                 s.kv6 = kv6.clone();
+                if let Some(map) = material_map {
+                    s.material_map = map.to_vec();
+                }
             }
         }
         // Dynamic instances of the same model refresh too.
         for (s, &m) in self.dyn_sprites.iter_mut().zip(&self.dyn_models) {
             if m == model_index {
                 s.kv6 = kv6.clone();
+                if let Some(map) = material_map {
+                    s.material_map = map.to_vec();
+                }
             }
         }
         // Keep the stored template current so future dynamic adds use it.
         if let Some(t) = self.models.get_mut(model_index) {
             t.kv6 = kv6.clone();
+            if let Some(map) = material_map {
+                t.material_map = map.to_vec();
+            }
         }
     }
 
@@ -952,6 +987,12 @@ impl CpuBackend {
         }
         self.blit_and_present(self.last_dims);
     }
+
+    /// No GPU work in flight on the software backend — teardown is a plain
+    /// drop. Present for facade parity (see
+    /// [`SceneRenderer::wait_idle`](crate::SceneRenderer::wait_idle)).
+    #[allow(clippy::unused_self)]
+    pub(crate) fn wait_idle(&mut self) {}
 
     /// Rasterise depth-tested world-space [`Line3`] segments over the
     /// framebuffer the last [`render`](Self::render) composited. Uses that

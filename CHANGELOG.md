@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-06-28
+
+### Added
+
+- **`SceneRenderer::wait_idle`** — blocks until the active backend has drained
+  all in-flight work and releases any acquired-but-unpresented swapchain frame
+  (GPU: `device.poll(Wait)`; CPU: no-op). Call it at shutdown before dropping
+  the renderer and its window.
+
+- **`BlendMode::Volumetric`** (Beer–Lambert) — the thickness-aware transparency
+  mode for *filled* volumes (true smoke, fog, murky water), the deferred
+  follow-up to the per-span `AlphaBlend`. Where `AlphaBlend` composites one
+  alpha per surface run (opacity independent of thickness — ideal for
+  shells/glass), `Volumetric` weights each voxel's opacity by the ray's path
+  length through it: per-cell effective opacity `1 − (1 − alpha)^seg_len`
+  (`seg_len` in voxel units), so a boundary sliver contributes ≈0 (no
+  voxel-grid dicing) and a filled volume thickens smoothly with depth. Lands on
+  both backends and both passes (sprites/clips + terrain), CPU pinned then GPU
+  matched. New `Material::volumetric(alpha)`. The "Transparency" demo gains a
+  filled volumetric fog cloud whose core reads denser than its rim.
+  - **`Kv6::from_fn_keep_interior`** — surface extraction normally culls every
+    enclosed voxel (a solid cube is a hollow shell), which would defeat
+    Volumetric (a filled cloud would render as front+back faces with air
+    between). This variant keeps interior voxels whose colour a predicate
+    accepts, so translucent/volumetric bodies stay solid through while opaque
+    interiors are still dropped (the storage win). (Terrain `.vxl` stores solid
+    runs, so its interiors were already traversable — this gap was kv6-only.)
+
+- **Mixed-material animated clips** — per-voxel materials (TV.3) now extend to
+  voxel clips (`.rvc`), the animated analogue of
+  `add_sprite_model_with_materials`: `SceneRenderer::add_voxel_clip_with_materials`
+  classifies every frame's voxels into per-voxel material ids by a
+  colour→material map, so an animated clip can mix opaque and translucent
+  voxels (an opaque torch handle around an additive flame, a pulsing glass
+  orb) on both backends. Previously clips could only carry a whole-instance
+  uniform material; the per-voxel path was wired for static sprites but not
+  for clip frames. An empty map is byte-identical to `add_voxel_clip`. The
+  "Transparency" demo scene gains a pulsing glass-orb clip dogfooding it.
+  - The per-voxel materials are also preserved across the **in-place
+    single-frame edit** (`update_clip_frame`, which now re-classifies the
+    edited frame from the clip's registered map) and the **streaming-clip**
+    path: `add_streaming_clip_with_materials` + `refresh_sprite_model_with_materials`
+    re-apply the colour→material map on every per-frame model re-upload.
+
+### Fixed
+
+- **Clean GPU teardown on exit** — the native demos (`scene-demo`, `cave-demo`,
+  `sdl-demo`) now drain the GPU and drop the renderer (wgpu device/queue/surface)
+  *before* the window, via a winit `exiting`/`suspended` handler (and a
+  renderer-before-window field order so the panic-unwind path tears down the
+  same way). Previously an exit could yank the swapchain mid-frame / drop the
+  window before the surface, leaving the driver or compositor showing stale
+  buffers — the "leftover triangles / flicker" after an unclean exit. (The
+  runtime already reconfigured the surface on `Lost`/`Outdated`; this fixes the
+  shutdown side.)
+
 ## [0.16.0] — 2026-06-28
 
 ### Added

@@ -417,6 +417,10 @@ struct StreamingClipState {
     model: SpriteModelId,
     dims: [u32; 3],
     pivot: [f32; 3],
+    /// Colour→material map (TV.3), empty for an all-opaque streaming clip.
+    /// Re-applied on every per-frame re-upload so the streamed model keeps
+    /// its per-voxel materials as it advances.
+    material_map: Vec<(u32, u8)>,
 }
 
 /// Per-clip-attachment playback clock (VCL.6): the timing it needs to
@@ -455,6 +459,11 @@ struct ClipMeta {
     voxel_world_size: f32,
     durations: Vec<u32>,
     loop_mode: LoopMode,
+    /// Colour→material map the clip was registered with (TV.3), empty for an
+    /// all-opaque clip. Retained so an in-place
+    /// [`update_clip_frame`](SceneRenderer::update_clip_frame) re-classifies
+    /// the edited frame's voxels instead of dropping its per-voxel materials.
+    material_map: Vec<(u32, u8)>,
 }
 
 /// Public metadata for a registered clip — the inspector view returned by
@@ -1404,6 +1413,23 @@ impl SceneRenderer {
         }
     }
 
+    /// Block until the active backend has finished all in-flight work, ready
+    /// for a clean teardown. On the GPU backend this drains the device queue
+    /// and releases any acquired-but-unpresented swapchain frame; on the CPU
+    /// backend it is a no-op (nothing is in flight).
+    ///
+    /// Call this at shutdown **before dropping the renderer and its window**,
+    /// so the GPU device/surface tear down with no commands queued and no
+    /// half-presented frame. Skipping it (or dropping the window first) can
+    /// leave the driver/compositor showing stale buffers after an exit — the
+    /// "leftover triangles / flicker" symptom of an unclean shutdown.
+    pub fn wait_idle(&mut self) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.wait_idle(),
+            BackendImpl::Gpu(g) => g.wait_idle(),
+        }
+    }
+
     /// Overlay an egui UI on the frame [`render`](Self::render)
     /// composited, then present it (`hud` feature). The host runs egui
     /// itself (e.g. `egui` + `egui-winit`) and passes the tessellated
@@ -1480,6 +1506,28 @@ impl SceneRenderer {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.update_sprite_model(idx, kv6),
             BackendImpl::Gpu(g) => g.update_sprite_model(idx, kv6),
+        }
+    }
+
+    /// Like [`refresh_sprite_model`](Self::refresh_sprite_model) but also
+    /// re-classifies the refreshed voxels into per-voxel material ids by
+    /// colour (TV.3) via `material_map` — used by the material-aware streaming
+    /// clip path so a re-uploaded frame keeps its per-voxel materials. An
+    /// empty map matches `refresh_sprite_model`.
+    pub fn refresh_sprite_model_with_materials(
+        &mut self,
+        model: SpriteModelId,
+        kv6: &Kv6,
+        material_map: &[(u32, u8)],
+    ) {
+        let Some(idx) = self.model_map.model_index(model) else {
+            return; // stale / removed handle → no-op
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => {
+                c.update_sprite_model_with_materials(idx, kv6, Some(material_map));
+            }
+            BackendImpl::Gpu(g) => g.update_sprite_model_with_materials(idx, kv6, material_map),
         }
     }
 
@@ -1772,9 +1820,26 @@ impl SceneRenderer {
     /// any [`set_sprites`](Self::set_sprites); a later `set_sprites`
     /// **drops** all registered clips (re-register afterwards).
     pub fn add_voxel_clip(&mut self, clip: &DecodedClip) -> VoxelClipId {
+        self.add_voxel_clip_with_materials(clip, &[])
+    }
+
+    /// Register a **mixed-material** animated voxel clip (TV.3): the clip
+    /// analogue of
+    /// [`add_sprite_model_with_materials`](Self::add_sprite_model_with_materials).
+    /// `material_map` pairs a voxel RGB colour (`0xRRGGBB`) with a material id
+    /// (defined via [`define_material`](Self::define_material)), classifying
+    /// every frame's voxels so an animated clip can mix opaque and translucent
+    /// voxels — an opaque torch handle around an additive flame, a spinning
+    /// glass orb. Voxels whose colour isn't in the map stay opaque
+    /// (material 0). Like [`add_voxel_clip`](Self::add_voxel_clip) otherwise.
+    pub fn add_voxel_clip_with_materials(
+        &mut self,
+        clip: &DecodedClip,
+        material_map: &[(u32, u8)],
+    ) -> VoxelClipId {
         let clip_index = match &mut self.inner {
-            BackendImpl::Cpu(c) => c.add_voxel_clip(clip),
-            BackendImpl::Gpu(g) => g.add_voxel_clip(clip),
+            BackendImpl::Cpu(c) => c.add_voxel_clip_with_materials(clip, material_map),
+            BackendImpl::Gpu(g) => g.add_voxel_clip_with_materials(clip, material_map),
         };
         // Capture metadata for editor queries + #6 auto-play; clip indices
         // are sequential and parallel to `clip_meta`.
@@ -1785,6 +1850,7 @@ impl SceneRenderer {
             voxel_world_size: clip.voxel_world_size,
             durations: clip.durations.clone(),
             loop_mode: clip.loop_mode,
+            material_map: material_map.to_vec(),
         });
         self.clip_map.alloc(clip_index as u32)
     }
@@ -1913,10 +1979,17 @@ impl SceneRenderer {
         if vf.validate(dims).is_err() {
             return false;
         }
+        // Re-classify with the clip's registered colour→material map (TV.3) so
+        // an in-place frame edit keeps the clip's per-voxel materials.
+        let material_map = m.material_map.clone();
         let frame = frame as usize;
         match &mut self.inner {
-            BackendImpl::Cpu(c) => c.update_clip_frame(clip_index, frame, vf, dims, pivot),
-            BackendImpl::Gpu(g) => g.update_clip_frame(clip_index, frame, vf, dims, pivot, vws),
+            BackendImpl::Cpu(c) => {
+                c.update_clip_frame(clip_index, frame, vf, dims, pivot, &material_map)
+            }
+            BackendImpl::Gpu(g) => {
+                g.update_clip_frame(clip_index, frame, vf, dims, pivot, vws, &material_map)
+            }
         }
     }
 
@@ -1940,17 +2013,37 @@ impl SceneRenderer {
     /// [`DecodeError`] if the clip's frame stream is empty or doesn't begin
     /// with a keyframe.
     pub fn add_streaming_clip(&mut self, clip: &VoxelClip) -> Result<StreamingClipId, DecodeError> {
+        self.add_streaming_clip_with_materials(clip, &[])
+    }
+
+    /// Register a **mixed-material** streaming voxel clip (TV.3): the streaming
+    /// analogue of
+    /// [`add_voxel_clip_with_materials`](Self::add_voxel_clip_with_materials).
+    /// `material_map` pairs a voxel RGB colour with a material id (defined via
+    /// [`define_material`](Self::define_material)); it is re-applied on every
+    /// per-frame re-upload, so the single streamed model keeps its per-voxel
+    /// materials as the clip advances. An empty map is identical to
+    /// [`add_streaming_clip`](Self::add_streaming_clip).
+    ///
+    /// # Errors
+    /// As [`add_streaming_clip`](Self::add_streaming_clip).
+    pub fn add_streaming_clip_with_materials(
+        &mut self,
+        clip: &VoxelClip,
+        material_map: &[(u32, u8)],
+    ) -> Result<StreamingClipId, DecodeError> {
         let cursor = StreamingClip::new(clip)?;
         let dims = cursor.dims();
         let pivot = cursor.pivot();
         let kv6 = cursor.current_frame().to_kv6(dims, pivot);
-        let model = self.add_sprite_model(&kv6);
+        let model = self.add_sprite_model_with_materials(&kv6, material_map);
         let index = self.streaming_clips.len() as u32;
         self.streaming_clips.push(Some(StreamingClipState {
             cursor,
             model,
             dims,
             pivot,
+            material_map: material_map.to_vec(),
         }));
         Ok(self.streaming_map.alloc(index))
     }
@@ -2007,13 +2100,13 @@ impl SceneRenderer {
         let Some(idx) = self.streaming_map.index(id) else {
             return;
         };
-        let Some((model, kv6)) = self.streaming_clips[idx].as_mut().and_then(|s| {
+        let Some((model, kv6, material_map)) = self.streaming_clips[idx].as_mut().and_then(|s| {
             let vf = s.cursor.seek(frame as usize).ok()?;
-            Some((s.model, vf.to_kv6(s.dims, s.pivot)))
+            Some((s.model, vf.to_kv6(s.dims, s.pivot), s.material_map.clone()))
         }) else {
             return;
         };
-        self.refresh_sprite_model(model, &kv6);
+        self.refresh_sprite_model_with_materials(model, &kv6, &material_map);
     }
 
     /// Remove a streaming clip: free its model and drop the cursor (the

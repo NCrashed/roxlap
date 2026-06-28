@@ -28,9 +28,10 @@ use roxlap_core::Camera;
 use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_gpu::{
-    build_sprite_model, build_sprite_model_with_materials, sprite_model_from_clip_frame,
-    sprite_model_from_voxel_frame, GpuInitError, GpuRenderer, GpuSceneResident, SpriteInstance,
-    SpriteInstanceTransform, SpriteModelRegistry,
+    build_sprite_model, build_sprite_model_with_materials,
+    sprite_model_from_clip_frame_with_materials, sprite_model_from_voxel_frame_with_materials,
+    GpuInitError, GpuRenderer, GpuSceneResident, SpriteInstance, SpriteInstanceTransform,
+    SpriteModelRegistry,
 };
 use roxlap_scene::{GridId, Scene};
 
@@ -499,14 +500,24 @@ impl GpuBackend {
     }
 
     /// Register an animated voxel clip (VCL.4): upload every frame as an
-    /// LOD chain (the flipbook). Returns its positional clip index. Lazily
-    /// creates the registry/resident if none exists yet (like
+    /// LOD chain (the flipbook). With a non-empty `material_map` (TV.3), each
+    /// frame's voxels are classified into per-voxel material ids by colour —
+    /// the clip analogue of [`Self::add_model_with_materials`]. An empty map
+    /// is the plain all-opaque clip. Returns its positional clip index.
+    /// Lazily creates the registry/resident if none exists yet (like
     /// [`Self::add_model`]).
-    pub(crate) fn add_voxel_clip(&mut self, clip: &DecodedClip) -> usize {
+    pub(crate) fn add_voxel_clip_with_materials(
+        &mut self,
+        clip: &DecodedClip,
+        material_map: &[(u32, u8)],
+    ) -> usize {
         let mut registry = self.sprite_registry.take().unwrap_or_default();
         let mut chains = Vec::with_capacity(clip.frames.len());
         for frame in 0..clip.frames.len() {
-            let chain = registry.add_lod(sprite_model_from_clip_frame(clip, frame), 4);
+            let chain = registry.add_lod(
+                sprite_model_from_clip_frame_with_materials(clip, frame, material_map),
+                4,
+            );
             // Establishes residency (zero-instance upload) if none yet, else
             // appends just this chain's volume.
             self.gpu.add_sprite_model(&registry, chain);
@@ -631,6 +642,7 @@ impl GpuBackend {
         dims: [u32; 3],
         pivot: [f32; 3],
         voxel_world_size: f32,
+        material_map: &[(u32, u8)],
     ) -> bool {
         let Some(&chain_id) = self.clips.get(clip_idx).and_then(|c| c.get(frame)) else {
             return false;
@@ -641,9 +653,17 @@ impl GpuBackend {
         // Recompute dirs so the edited frame's model is byte-identical to the
         // register path (`sprite_model_from_clip_frame`), not flat zeros —
         // matters only if per-instance shading is ever applied to a clip.
+        // `material_map` re-classifies the edited frame's voxels (TV.3) so an
+        // in-place edit keeps the clip's per-voxel materials.
         let dirs = vf.dirs(dims);
-        *reg.model_mut(chain_id) =
-            sprite_model_from_voxel_frame(vf, &dirs, dims, pivot, voxel_world_size);
+        *reg.model_mut(chain_id) = sprite_model_from_voxel_frame_with_materials(
+            vf,
+            &dirs,
+            dims,
+            pivot,
+            voxel_world_size,
+            material_map,
+        );
         reg.rebuild_lod(chain_id);
         self.gpu.update_sprite_model(reg, chain_id);
         true
@@ -752,6 +772,19 @@ impl GpuBackend {
     /// chain's GPU data. The instance set is untouched. No-op if no
     /// registry is resident or `model_index` is unknown.
     pub(crate) fn update_sprite_model(&mut self, model_index: usize, kv6: &Kv6) {
+        self.update_sprite_model_with_materials(model_index, kv6, &[]);
+    }
+
+    /// Like [`Self::update_sprite_model`] but classifies the rebuilt voxels
+    /// into per-voxel material ids by colour (TV.3) via `material_map` — the
+    /// material-aware refresh behind the streaming-clip path. An empty map is
+    /// identical to [`Self::update_sprite_model`].
+    pub(crate) fn update_sprite_model_with_materials(
+        &mut self,
+        model_index: usize,
+        kv6: &Kv6,
+        material_map: &[(u32, u8)],
+    ) {
         let Some(&chain_id) = self.sprite_model_ids.get(model_index) else {
             return;
         };
@@ -760,7 +793,7 @@ impl GpuBackend {
         };
         // Rebuild mip-0 from the edited kv6, then refresh the coarse mips
         // so every LOD level matches before the single-chain re-upload.
-        *reg.model_mut(chain_id) = build_sprite_model(kv6);
+        *reg.model_mut(chain_id) = build_sprite_model_with_materials(kv6, material_map);
         reg.rebuild_lod(chain_id);
         self.gpu.update_sprite_model(reg, chain_id);
     }
@@ -940,6 +973,12 @@ impl GpuBackend {
     /// Present the frame `render` composited, with no UI overlay.
     pub(crate) fn present(&mut self) {
         self.gpu.present();
+    }
+
+    /// Drain in-flight GPU work before teardown (see
+    /// [`SceneRenderer::wait_idle`](crate::SceneRenderer::wait_idle)).
+    pub(crate) fn wait_idle(&mut self) {
+        self.gpu.wait_idle();
     }
 
     /// Horizontal scene flip — mirrors the marched scene + line/image

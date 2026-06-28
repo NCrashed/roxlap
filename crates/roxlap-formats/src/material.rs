@@ -30,6 +30,15 @@ pub enum BlendMode {
     /// without occluding what is behind it (order-independent). Spells,
     /// fire, magic auras, muzzle flashes.
     Additive = 2,
+    /// Thickness-aware Beer–Lambert absorption for **filled** volumes (true
+    /// smoke, fog, murky water). Unlike [`AlphaBlend`] (which composites one
+    /// alpha per surface run, so opacity is independent of thickness — ideal
+    /// for shells/glass), `Volumetric` weights each voxel's opacity by the
+    /// ray's path length through it: the per-cell effective opacity is
+    /// `1 − (1 − alpha)^seg_len` where `seg_len` is the traversed length in
+    /// voxel units. A boundary sliver contributes ≈0 (no voxel-grid dicing)
+    /// while opacity grows smoothly with depth. Occludes like `AlphaBlend`.
+    Volumetric = 3,
 }
 
 impl BlendMode {
@@ -40,6 +49,7 @@ impl BlendMode {
             0 => Some(Self::Opaque),
             1 => Some(Self::AlphaBlend),
             2 => Some(Self::Additive),
+            3 => Some(Self::Volumetric),
             _ => None,
         }
     }
@@ -86,6 +96,17 @@ impl Material {
         Self {
             alpha,
             mode: BlendMode::Additive,
+        }
+    }
+
+    /// A [`BlendMode::Volumetric`] (Beer–Lambert) material whose `alpha` is
+    /// the per-voxel-unit absorption — opacity accrues with the ray's path
+    /// length through filled volumes (smoke/fog/murky water).
+    #[must_use]
+    pub fn volumetric(alpha: u8) -> Self {
+        Self {
+            alpha,
+            mode: BlendMode::Volumetric,
         }
     }
 
@@ -189,11 +210,14 @@ mod tests {
             BlendMode::Opaque,
             BlendMode::AlphaBlend,
             BlendMode::Additive,
+            BlendMode::Volumetric,
         ] {
             assert_eq!(BlendMode::from_u8(m.as_u8()), Some(m));
         }
-        assert_eq!(BlendMode::from_u8(3), None);
+        assert_eq!(BlendMode::from_u8(4), None);
         assert_eq!(BlendMode::default(), BlendMode::Opaque);
+        // Volumetric is translucent (not the opaque first-hit path).
+        assert!(!Material::volumetric(128).is_opaque());
     }
 
     #[test]

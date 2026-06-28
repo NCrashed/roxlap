@@ -450,6 +450,9 @@ fn march_grid(
 ) -> GridHit {
     let m = grid_static_meta[g];
     let chunk_dim = vec3<f32>(f32(m.vsid), f32(m.vsid), f32(CHUNK_Z));
+    // World ray length per `t` unit; divided by a voxel's size it turns a
+    // cell's `t` span into its path length in voxel units (Volumetric weight).
+    let ray_dir_len = length(ray_dir);
 
     var p_chunk = vec3<i32>(floor(ray_origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(ray_dir));
@@ -563,9 +566,26 @@ fn march_grid(
                         out.color = select(lit, accum + trans * lit, touched);
                         return out;
                     }
-                    // Translucent: one layer per solid-run entry / material change.
-                    if (!prev_solid || mat_id != prev_mat) {
-                        let a = mm.alpha;
+                    let a = mm.alpha;
+                    if (mm.mode == 3u) {
+                        // Volumetric (Beer–Lambert): per-cell opacity weighted
+                        // by the ray's path length (voxel units); occludes.
+                        let t_exit = min(t_max_voxel.x, min(t_max_voxel.y, t_max_voxel.z));
+                        let seg_len = max(t_exit - t_hit, 0.0) * ray_dir_len / vsize;
+                        let eff_a = 1.0 - pow(1.0 - a, seg_len);
+                        accum = accum + trans * eff_a * lit;
+                        trans = trans * (1.0 - eff_a);
+                        touched = true;
+                        prev_mat = mat_id;
+                        if (trans < (1.0 / 256.0)) {
+                            out.hit = true;
+                            out.t = t_hit;
+                            out.color = accum;
+                            return out;
+                        }
+                    } else if (!prev_solid || mat_id != prev_mat) {
+                        // AlphaBlend / Additive: one layer per solid-run entry
+                        // / material change (thickness-independent).
                         accum = accum + trans * a * lit;
                         if (mm.mode != 2u) { trans = trans * (1.0 - a); }
                         touched = true;

@@ -40,8 +40,13 @@ fn empty_sprite_set() -> SpriteSet {
 }
 
 pub struct Host {
-    window: Option<Arc<Window>>,
+    // Field order matters for teardown: the renderer owns the wgpu
+    // surface/device, which must drop *before* the window they were created
+    // from. Rust drops fields top-to-bottom, so `renderer` is declared before
+    // `window` — this keeps the order correct even on the panic-unwind path
+    // where `exiting` (the graceful teardown) never runs.
     renderer: Option<SceneRenderer>,
+    window: Option<Arc<Window>>,
     engine: Engine,
     cam: CameraRig,
     input: InputState,
@@ -86,8 +91,8 @@ impl Host {
         let cam = CameraRig::from_pose(scenes[0].start_pose());
 
         Self {
-            window: None,
             renderer: None,
+            window: None,
             engine,
             cam,
             input: InputState::default(),
@@ -107,6 +112,22 @@ impl Host {
             fps_last: Instant::now(),
             last_fps: 0.0,
         }
+    }
+
+    /// Tear the renderer + window down in the correct order for a clean GPU
+    /// shutdown: drain in-flight GPU work, then drop the renderer (releasing
+    /// the wgpu device/queue/surface), then the egui state, then the window.
+    /// Dropping the surface/device before the window — with the queue idle and
+    /// no acquired frame — is what keeps an exit from leaving the driver /
+    /// compositor showing stale buffers (the leftover-triangles/flicker bug).
+    /// Idempotent: safe if already torn down.
+    fn teardown(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.wait_idle();
+        }
+        self.renderer = None;
+        self.egui_state = None;
+        self.window = None;
     }
 
     /// Forward a scene-local input event to the active scene (split-borrow
@@ -464,6 +485,20 @@ impl ApplicationHandler for Host {
             self.look_accum.0 += dx;
             self.look_accum.1 += dy;
         }
+    }
+
+    /// Graceful shutdown: winit calls this once the event loop is told to
+    /// exit (`event_loop.exit()` from a close/Esc). Tear the GPU down cleanly
+    /// here so an exit never yanks the swapchain mid-frame.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.teardown();
+    }
+
+    /// The platform asked us to release the window/surface (Android-style;
+    /// rare on desktop). Drop the GPU resources cleanly too — `resumed`
+    /// rebuilds them. Same clean-teardown path as `exiting`.
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.teardown();
     }
 }
 

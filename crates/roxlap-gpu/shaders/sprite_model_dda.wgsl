@@ -239,6 +239,9 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
     let s = m.voxel_world_size;
     let o = inv * (u.cam_pos - inst.pos) / s + m.pivot;
     let d = inv * ray_dir / s;
+    // Local ray length per `t` unit — converts a cell's `t` span to its path
+    // length in voxel units for the Volumetric Beer–Lambert weight.
+    let d_len = length(d);
 
     let box_max = vec3<f32>(f32(m.dims.x), f32(m.dims.y), f32(m.dims.z));
     let inv_d = 1.0 / d;
@@ -282,9 +285,21 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
                 res.touched = true;
                 break;
             }
-            if (!prev_solid || mat_id != prev_mat) {
+            let a = clamp(mm.alpha * inst.alpha_mul, 0.0, 1.0);
+            if (mm.mode == 3u) {
+                // Volumetric (Beer–Lambert): per-cell opacity weighted by the
+                // ray's path length (voxel units) through this voxel; occludes.
+                let t_exit = min(t_max.x, min(t_max.y, t_max.z));
+                let seg_len = max(t_exit - t_hit, 0.0) * d_len;
+                let eff_a = 1.0 - pow(1.0 - a, seg_len);
                 let c = model_color(m, p, inst_idx);
-                let a = clamp(mm.alpha * inst.alpha_mul, 0.0, 1.0);
+                res.rgb = res.rgb + res.trans * eff_a * c;
+                res.trans = res.trans * (1.0 - eff_a);
+                res.touched = true;
+                prev_mat = mat_id;
+                if (res.trans < (1.0 / 256.0)) { break; }
+            } else if (!prev_solid || mat_id != prev_mat) {
+                let c = model_color(m, p, inst_idx);
                 res.rgb = res.rgb + res.trans * a * c;
                 if (mm.mode != 2u) { // AlphaBlend occludes; Additive does not.
                     res.trans = res.trans * (1.0 - a);

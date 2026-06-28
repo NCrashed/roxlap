@@ -171,11 +171,41 @@ pub fn sprite_model_from_voxel_frame(
     pivot: [f32; 3],
     voxel_world_size: f32,
 ) -> SpriteModel {
+    sprite_model_from_voxel_frame_with_materials(frame, dirs, dims, pivot, voxel_world_size, &[])
+}
+
+/// Like [`sprite_model_from_voxel_frame`] but classifies each voxel into a
+/// per-voxel **material id** by colour (TV.3 mixed models) via `material_map`
+/// (`(rgb, material_id)` pairs). An empty map produces a model with no
+/// per-voxel materials (identical to [`sprite_model_from_voxel_frame`]).
+///
+/// # Panics
+/// As [`sprite_model_from_voxel_frame`].
+#[must_use]
+pub fn sprite_model_from_voxel_frame_with_materials(
+    frame: &VoxelFrame,
+    dirs: &[u32],
+    dims: [u32; 3],
+    pivot: [f32; 3],
+    voxel_world_size: f32,
+    material_map: &[(u32, u8)],
+) -> SpriteModel {
     let occ_words_per_col = dims[2].div_ceil(32).max(1);
     let cols = (dims[0] * dims[1]) as usize;
     debug_assert_eq!(frame.occupancy.len(), cols * occ_words_per_col as usize);
     debug_assert_eq!(frame.color_offsets.len(), cols + 1);
     debug_assert_eq!(dirs.len(), frame.colors.len());
+    // Per-voxel materials are parallel to `colors` (popcount-rank order), so
+    // classify the frame's colour run directly — no re-index needed.
+    let materials: Vec<u8> = if material_map.is_empty() {
+        Vec::new()
+    } else {
+        frame
+            .colors
+            .iter()
+            .map(|&c| material_for_color(material_map, c))
+            .collect()
+    };
     SpriteModel {
         dims,
         occ_words_per_col,
@@ -184,8 +214,7 @@ pub fn sprite_model_from_voxel_frame(
         colors: frame.colors.clone(),
         dirs: dirs.to_vec(),
         color_offsets: frame.color_offsets.clone(),
-        // Voxel clips have no per-voxel materials yet (per-instance only).
-        materials: Vec::new(),
+        materials,
         voxel_world_size,
     }
 }
@@ -197,12 +226,28 @@ pub fn sprite_model_from_voxel_frame(
 /// If `frame` is out of range, or the frame fails the layout invariants.
 #[must_use]
 pub fn sprite_model_from_clip_frame(clip: &DecodedClip, frame: usize) -> SpriteModel {
-    sprite_model_from_voxel_frame(
+    sprite_model_from_clip_frame_with_materials(clip, frame, &[])
+}
+
+/// Like [`sprite_model_from_clip_frame`] but classifies the frame's voxels
+/// into per-voxel material ids by colour (TV.3 mixed models) via
+/// `material_map`. An empty map is identical to [`sprite_model_from_clip_frame`].
+///
+/// # Panics
+/// If `frame` is out of range, or the frame fails the layout invariants.
+#[must_use]
+pub fn sprite_model_from_clip_frame_with_materials(
+    clip: &DecodedClip,
+    frame: usize,
+    material_map: &[(u32, u8)],
+) -> SpriteModel {
+    sprite_model_from_voxel_frame_with_materials(
         &clip.frames[frame],
         &clip.dirs[frame],
         clip.dims,
         clip.pivot,
         clip.voxel_world_size,
+        material_map,
     )
 }
 
@@ -2722,6 +2767,92 @@ mod tests {
     /// chains, and `set_instance_model` flips which frame an instance
     /// draws. The cull state it updates is exactly what
     /// `cull_bin_upload` packs into the GPU instance buffer each frame, so
+    /// TV.3 (clip wiring): `sprite_model_from_clip_frame_with_materials`
+    /// classifies a clip frame's voxels into a per-voxel `materials` array
+    /// (parallel to `colors`) by colour; an empty map leaves it empty (the
+    /// all-opaque clip), identical to `sprite_model_from_clip_frame`.
+    #[test]
+    fn clip_frame_with_materials_classifies_by_color() {
+        use roxlap_formats::voxel_clip::{LoopMode, VoxelClip, VoxelFrame};
+
+        let dims = [1u32, 1, 4];
+        let owpc = dims[2].div_ceil(32).max(1) as usize; // 1
+        let glass = 0x80AA_BBCC;
+        let stone = 0x8011_2233;
+        let frame = VoxelFrame {
+            occupancy: {
+                let mut occ = vec![0u32; owpc];
+                occ[0] |= (1 << 0) | (1 << 1);
+                occ
+            },
+            colors: vec![stone, glass], // ascending z: z=0 stone, z=1 glass
+            color_offsets: vec![0, 2],
+        };
+        let clip = VoxelClip::from_frames(
+            dims,
+            [0.5, 0.5, 2.0],
+            1.0,
+            LoopMode::Loop,
+            &[frame],
+            &[],
+            33,
+            0,
+        );
+        let decoded = clip.decode().expect("decode");
+
+        // Map only the glass colour → material 2; stone stays opaque (0).
+        let m = sprite_model_from_clip_frame_with_materials(&decoded, 0, &[(0x00AA_BBCC, 2)]);
+        assert_eq!(
+            m.materials.len(),
+            m.colors.len(),
+            "materials parallel to colors"
+        );
+        // `colors` is in popcount-rank (ascending z) order: stone then glass.
+        assert_eq!(
+            m.materials,
+            vec![0u8, 2u8],
+            "stone opaque, glass material 2"
+        );
+
+        // Empty map ⇒ no per-voxel materials, identical to the plain builder.
+        let plain = sprite_model_from_clip_frame(&decoded, 0);
+        let plain_mat = sprite_model_from_clip_frame_with_materials(&decoded, 0, &[]);
+        assert!(plain.materials.is_empty());
+        assert!(plain_mat.materials.is_empty());
+        assert_eq!(plain.colors, plain_mat.colors);
+    }
+
+    /// TV.3 (streaming-clip refresh path): `build_sprite_model_with_materials`
+    /// — the builder behind `GpuBackend::update_sprite_model_with_materials`,
+    /// which a streaming clip re-runs each frame — classifies a kv6's voxels
+    /// into a per-voxel `materials` array (popcount-rank order) by colour.
+    #[test]
+    fn build_with_materials_classifies_by_color() {
+        let glass = 0x80AA_BBCC;
+        let stone = 0x8011_2233;
+        // One column (x=0,y=0), two voxels: z=0 stone, z=1 glass.
+        let kv6 = kv6_from(1, 1, 4, &[(0, 0, 0, stone), (0, 0, 1, glass)]);
+
+        let m = build_sprite_model_with_materials(&kv6, &[(0x00AA_BBCC, 2)]);
+        assert_eq!(
+            m.materials.len(),
+            m.colors.len(),
+            "materials parallel to colors"
+        );
+        assert_eq!(
+            m.materials,
+            vec![0u8, 2u8],
+            "stone opaque, glass material 2"
+        );
+
+        // Empty map ⇒ no per-voxel materials, identical to `build_sprite_model`.
+        let plain = build_sprite_model(&kv6);
+        let plain_mat = build_sprite_model_with_materials(&kv6, &[]);
+        assert!(plain.materials.is_empty());
+        assert!(plain_mat.materials.is_empty());
+        assert_eq!(plain.colors, plain_mat.colors);
+    }
+
     /// flipping `chain_id` redirects the rendered instance to the new
     /// frame's resident volume.
     #[test]

@@ -160,13 +160,16 @@ and [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
   (constant, jittered, position-dependent, texture-mapped) without
   the global-state dance the original engine required.
 
-- **Transparent voxels.** Alpha-blended and additive voxels for smoke,
-  fire, spell auras, glass, and water — on both backends. Because the
-  per-pixel 3D-DDA renderer visits voxels strictly front-to-back, it
-  composites them in order with no depth sort or OIT scheme. A 256-entry
-  material palette (`define_material`) drives per-instance, per-voxel
-  (mixed opaque-frame + glass models), and world-terrain (glass walls,
-  water) translucency. See `PORTING-TRANSPARENCY.md`.
+- **Transparent voxels.** Alpha-blended, additive, and Beer–Lambert
+  *volumetric* voxels for smoke, fire, spell auras, glass, water, and
+  filled fog — on both backends. Because the per-pixel 3D-DDA renderer
+  visits voxels strictly front-to-back, it composites them in order with
+  no depth sort or OIT scheme. A 256-entry material palette
+  (`define_material`) drives per-instance, per-voxel (mixed opaque-frame +
+  glass models — for static sprites **and** animated clips), and
+  world-terrain (glass walls, water) translucency; `Volumetric` weights
+  opacity by the ray's path length so a filled cloud reads denser at its
+  core. See `PORTING-TRANSPARENCY.md`.
 
 ## Status
 

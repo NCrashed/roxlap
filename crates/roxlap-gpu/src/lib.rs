@@ -54,8 +54,9 @@ pub use scene::{
 };
 pub use sprite_model::{
     build_sprite_model, build_sprite_model_with_materials, sprite_model_from_clip_frame,
-    sprite_model_from_voxel_frame, SpriteInstance, SpriteInstanceTransform, SpriteModel,
-    SpriteModelRegistry, SpriteRegistryResident,
+    sprite_model_from_clip_frame_with_materials, sprite_model_from_voxel_frame,
+    sprite_model_from_voxel_frame_with_materials, SpriteInstance, SpriteInstanceTransform,
+    SpriteModel, SpriteModelRegistry, SpriteRegistryResident,
 };
 
 use std::sync::Arc;
@@ -2558,6 +2559,24 @@ impl GpuRenderer {
     pub fn present(&mut self) {
         if let Some((surf_tex, _view)) = self.pending_frame.take() {
             surf_tex.present();
+        }
+    }
+
+    /// Block until the GPU has drained every submitted command (queue
+    /// idle), dropping any not-yet-presented swapchain frame first. Call at
+    /// shutdown — before the [`GpuRenderer`] (and its window) drop — so the
+    /// device is torn down with no work in flight and no half-presented
+    /// frame, instead of yanking the swapchain mid-submission (which leaves
+    /// the driver/compositor compositing stale buffers — the "leftover
+    /// triangles / flicker after an unclean exit" symptom). No-op on wasm
+    /// (`poll(Wait)` is unavailable there; the browser reclaims the device).
+    pub fn wait_idle(&mut self) {
+        // Release the acquired-but-unpresented frame so its swapchain image
+        // isn't held across teardown.
+        self.pending_frame = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
         }
     }
 

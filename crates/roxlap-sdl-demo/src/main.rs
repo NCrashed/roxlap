@@ -310,7 +310,11 @@ fn main() -> Result<(), String> {
         render_frame(&mut renderer, &mut scene, &cam.camera(), &settings);
     }
 
-    // `renderer` drops here, before `window` — the surface releases the
-    // raw handles while the SDL window is still alive.
+    // Clean teardown: drain in-flight GPU work + release any acquired frame
+    // before the device/surface drop, so quitting never yanks the swapchain
+    // mid-submission (the leftover-triangles/flicker symptom of an unclean
+    // exit). `renderer` then drops here, before `window` — the surface
+    // releases the raw handles while the SDL window is still alive.
+    renderer.wait_idle();
     Ok(())
 }

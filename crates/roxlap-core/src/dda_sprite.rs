@@ -159,6 +159,32 @@ impl SpriteDense {
         }
     }
 
+    /// Like [`from_voxel_frame`](Self::from_voxel_frame) but classifies each
+    /// voxel into a material id by colour (TV.3 mixed models) via
+    /// `material_map` — the clip analogue of
+    /// [`from_kv6_with_materials`](Self::from_kv6_with_materials). An empty
+    /// map yields the same all-opaque (uniform) result as `from_voxel_frame`.
+    #[must_use]
+    pub fn from_voxel_frame_with_materials(
+        frame: &VoxelFrame,
+        dims: [u32; 3],
+        pivot: [f32; 3],
+        material_map: &[(u32, u8)],
+    ) -> Self {
+        let mut dense = Self::from_voxel_frame(frame, dims, pivot);
+        if !material_map.is_empty() {
+            let n = dense.col.len();
+            let mut mat = vec![0u8; n];
+            for (idx, slot) in mat.iter_mut().enumerate() {
+                if dense.occ[idx] {
+                    *slot = material_for_color(material_map, dense.col[idx]);
+                }
+            }
+            dense.mat = mat;
+        }
+        dense
+    }
+
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn idx_of(&self, c: [i32; 3]) -> usize {
@@ -364,6 +390,9 @@ fn cast_local_layers(
     // mixed model).
     let mut prev_solid = false;
     let mut prev_mat = 0u8;
+    // Local ray length per ray-parameter unit — converts a cell's `t` span to
+    // its path length in voxel units for the `Volumetric` Beer–Lambert weight.
+    let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
 
     for _ in 0..max_steps {
         if cell[0] < 0
@@ -382,6 +411,10 @@ fn cast_local_layers(
         if depth >= max_t {
             break;
         }
+        // Exit `t` of the current cell — the next boundary crossing. Its span
+        // from `t_curr` is the ray's path through this cell (Volumetric).
+        let exit_axis = min_axis(t_max);
+        let t_exit = t_max[exit_axis];
         let idx = dense.idx_of(cell);
         let solid_here = dense.occ[idx];
         if solid_here && depth >= NEAR_Z {
@@ -396,10 +429,27 @@ fn cast_local_layers(
                 touched = true;
                 break;
             }
-            // Composite one alpha layer per solid-run entry or material change.
-            if !prev_solid || mat_id != prev_mat {
+            let a = f32::from(m.alpha) / 255.0 * (f32::from(shade_ctx.alpha_mul) / 255.0);
+            if m.mode == BlendMode::Volumetric {
+                // Per-cell Beer–Lambert: opacity weighted by traversed length
+                // (in voxel units), so a thin sliver contributes ≈0 and a
+                // filled volume thickens smoothly with depth. Always occludes.
+                let seg_len = (t_exit - t_curr).max(0.0) * dir_len;
+                let eff_a = 1.0 - (1.0 - a).powf(seg_len);
                 let lit = rgb_to_f32(shade(dense.col[idx], 0));
-                let a = f32::from(m.alpha) / 255.0 * (f32::from(shade_ctx.alpha_mul) / 255.0);
+                acc.rgb[0] += acc.trans * eff_a * lit[0];
+                acc.rgb[1] += acc.trans * eff_a * lit[1];
+                acc.rgb[2] += acc.trans * eff_a * lit[2];
+                acc.trans *= 1.0 - eff_a;
+                touched = true;
+                prev_mat = mat_id;
+                if acc.trans < 1.0 / 256.0 {
+                    break;
+                }
+            } else if !prev_solid || mat_id != prev_mat {
+                // AlphaBlend / Additive: one alpha layer per solid-run entry or
+                // material change (thickness-independent — shells, glass).
+                let lit = rgb_to_f32(shade(dense.col[idx], 0));
                 acc.rgb[0] += acc.trans * a * lit[0];
                 acc.rgb[1] += acc.trans * a * lit[1];
                 acc.rgb[2] += acc.trans * a * lit[2];
@@ -414,10 +464,9 @@ fn cast_local_layers(
             }
         }
         prev_solid = solid_here;
-        let axis = min_axis(t_max);
-        t_curr = t_max[axis];
-        cell[axis] += step[axis];
-        t_max[axis] += t_delta[axis];
+        t_curr = t_exit;
+        cell[exit_axis] += step[exit_axis];
+        t_max[exit_axis] += t_delta[exit_axis];
     }
 
     touched.then_some(acc)
@@ -810,10 +859,27 @@ impl ClipFlipbook {
     /// Decode + cache every frame of `clip` (one [`SpriteDense`] each).
     #[must_use]
     pub fn from_decoded(clip: &DecodedClip) -> Self {
+        Self::from_decoded_with_materials(clip, &[])
+    }
+
+    /// Like [`from_decoded`](Self::from_decoded) but classifies every frame's
+    /// voxels into per-voxel material ids by colour (TV.3 mixed models) via
+    /// `material_map` — the clip analogue of
+    /// [`SpriteDense::from_kv6_with_materials`]. An empty map yields the same
+    /// all-opaque result as `from_decoded`.
+    #[must_use]
+    pub fn from_decoded_with_materials(clip: &DecodedClip, material_map: &[(u32, u8)]) -> Self {
         let frames = clip
             .frames
             .iter()
-            .map(|frame| SpriteDense::from_voxel_frame(frame, clip.dims, clip.pivot))
+            .map(|frame| {
+                SpriteDense::from_voxel_frame_with_materials(
+                    frame,
+                    clip.dims,
+                    clip.pivot,
+                    material_map,
+                )
+            })
             .collect();
         Self { frames }
     }
@@ -1565,6 +1631,66 @@ mod tests {
         );
     }
 
+    /// Volumetric (Beer–Lambert) is the thickness-*dependent* counterpart of
+    /// per-span: a deeper **filled** volume absorbs more, so its centre pixel
+    /// sits closer to the volume colour (less background shows through) than a
+    /// shallow one — the opposite of `per_span_thickness_independent`.
+    #[test]
+    fn volumetric_thickness_deepens_opacity() {
+        // Centre-pixel red channel of a filled red box `depth` voxels deep,
+        // Volumetric material, over a dark background.
+        fn red_at(depth: u32) -> u32 {
+            let mut table = MaterialTable::new();
+            table.set(1, Material::volumetric(128));
+            // FILLED box (every cell solid, interior kept) so the ray actually
+            // traverses `depth` absorbing voxels. `from_fn` would cull the
+            // interior to a hollow shell (front+back faces only) — no genuine
+            // depth accumulation — so use `from_fn_keep_interior`.
+            let kv6 =
+                Kv6::from_fn_keep_interior(8, depth, 8, |_, _, _| Some(0x80_C0_20_20), |_| true);
+            let dense = SpriteDense::from_kv6(&kv6);
+            let (w, h) = (64u32, 64u32);
+            let n = (w * h) as usize;
+            let mut fb = vec![0x80_10_10_10u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+            let sh = SpriteShade {
+                materials: &table,
+                material: 1,
+                alpha_mul: 255,
+            };
+            let _ = draw_sprite_dense_shaded(
+                &mut fb,
+                &mut zb,
+                w as usize,
+                w,
+                h,
+                &cs,
+                &settings(w, h),
+                &dense,
+                [0.0, 40.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                0,
+                Some(sh),
+            );
+            (fb[(h / 2 * w + w / 2) as usize] >> 16) & 0xff
+        }
+        let shallow = red_at(1);
+        let deep = red_at(12);
+        // Both lift red above the 0x10 background; the deeper volume absorbs
+        // more of its own colour in, so its red is higher (more opaque).
+        assert!(
+            shallow > 0x10,
+            "even a 1-deep volume tints (got {shallow:02x})"
+        );
+        assert!(
+            deep > shallow,
+            "deeper Volumetric volume is more opaque: deep {deep:02x} > shallow {shallow:02x}"
+        );
+    }
+
     /// The demo scenario: an **opaque** backdrop sprite drawn first, then a
     /// **translucent** sprite in front of it sharing the buffer. The glass
     /// must composite over the backdrop colour (tint it), not leave it
@@ -1736,5 +1862,53 @@ mod tests {
         // And it's actually translucent (differs from the bare background).
         let centre = (h / 2 * w + w / 2) as usize;
         assert_ne!(pv[centre] & 0x00ff_ffff, 0x0010_1010, "translucent, not bg");
+    }
+
+    /// TV.3 (clip wiring): a [`ClipFlipbook`] built with a colour→material map
+    /// carries per-voxel materials on every cached frame (the clip analogue of
+    /// `from_kv6_with_materials`); an empty map leaves them all-opaque, so the
+    /// flipbook is byte-identical to `from_decoded`.
+    #[test]
+    fn clip_flipbook_with_materials_classifies_every_frame() {
+        let dims = [6u32, 6, 6];
+        let glass = 0x00AA_BBCC;
+        let glass_lit = 0x80AA_BBCC;
+        // Two distinct frames, both filled with the glass colour.
+        let f0 = clip_frame(dims, |_x, _y, z| (z < 3).then_some(glass_lit));
+        let f1 = clip_frame(dims, |_x, _y, z| (z >= 3).then_some(glass_lit));
+        let clip = VoxelClip::from_frames(
+            dims,
+            [3.0, 3.0, 3.0],
+            1.0,
+            LoopMode::Loop,
+            &[f0, f1],
+            &[],
+            33,
+            0,
+        );
+        let decoded = clip.decode().expect("decode");
+
+        let book = ClipFlipbook::from_decoded_with_materials(&decoded, &[(glass, 2)]);
+        assert_eq!(book.frame_count(), 2);
+        for fr in 0..2 {
+            let dense = book.frame(fr).expect("frame in range");
+            assert_eq!(dense.mat.len(), dense.col.len(), "frame {fr} mat sized");
+            let mut solids = 0;
+            for idx in 0..dense.occ.len() {
+                if dense.occ[idx] {
+                    assert_eq!(dense.mat[idx], 2, "frame {fr}: glass → material 2");
+                    solids += 1;
+                }
+            }
+            assert!(solids > 0, "frame {fr} has solid voxels");
+        }
+
+        // An empty map ⇒ no per-voxel materials, identical to `from_decoded`.
+        let plain = ClipFlipbook::from_decoded(&decoded);
+        let plain_mat = ClipFlipbook::from_decoded_with_materials(&decoded, &[]);
+        for fr in 0..2 {
+            assert!(plain.frame(fr).unwrap().mat.is_empty());
+            assert!(plain_mat.frame(fr).unwrap().mat.is_empty());
+        }
     }
 }
