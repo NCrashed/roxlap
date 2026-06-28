@@ -1310,6 +1310,9 @@ impl GpuBackend {
             shadow_max_dist: rig.shadow_max_dist,
             // Shadow-ray step budget (consumed in DL.3); a sane default.
             shadow_max_steps: 256,
+            // DL.6 — stylized lighting (cel banding + gradient-map ramp).
+            style_bands: rig.bands,
+            shadow_tint: rig.shadow_tint,
             ..Default::default()
         };
         for gid in &self.grid_ids {

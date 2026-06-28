@@ -36,6 +36,10 @@ const GRID_ORIGIN: DVec3 = DVec3::new(-48.0, 30.0, 0.0);
 /// the camera stands above). World centre of the floor ≈ (0, 78, 60).
 const FLOOR_TOP_Z: i32 = 60;
 
+// Four independent demo toggles (sun pause / sun shadows / point lights /
+// stylized) — each a distinct on/off control, not a state better modelled
+// as an enum.
+#[allow(clippy::struct_excessive_bools)]
 pub struct LightingScene {
     scene: Scene,
     /// Seconds since `enter`, driving the sun sweep + point-light orbit.
@@ -43,6 +47,8 @@ pub struct LightingScene {
     paused: bool,
     sun_shadows: bool,
     points_on: bool,
+    /// DL.6 — stylized (cel + hue-ramp) vs smooth diffuse. `J` toggles.
+    stylized: bool,
     /// The point lights, rebuilt each frame (orbit) — borrowed into the
     /// per-frame [`LightRig`] at render time.
     points: Vec<PointLight>,
@@ -57,6 +63,7 @@ impl LightingScene {
             paused: false,
             sun_shadows: true,
             points_on: true,
+            stylized: true,
             points: Vec::new(),
         }
     }
@@ -140,7 +147,7 @@ impl DemoScene for LightingScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD+mouse fly · P: pause sun · K: sun shadows · L: point lights (GPU only)"
+        "WASD+mouse fly · P: pause sun · K: sun shadows · L: point lights · J: stylized/smooth (GPU only)"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -192,6 +199,13 @@ impl DemoScene for LightingScene {
                     if self.points_on { "ON" } else { "OFF" }
                 );
             }
+            KeyCode::KeyJ => {
+                self.stylized = !self.stylized;
+                eprintln!(
+                    "lighting = {}",
+                    if self.stylized { "stylized (cel+ramp)" } else { "smooth" }
+                );
+            }
             _ => {}
         }
     }
@@ -214,6 +228,10 @@ impl DemoScene for LightingScene {
             shadow_strength: 0.85,
             shadow_bias_voxels: 1.5,
             shadow_max_dist: 256.0,
+            // DL.6 — stylized cel + hue-shifted ramp (J toggles vs smooth).
+            // Cool shadow tint → warm sun, terraced in 4 bands.
+            bands: if self.stylized { 4 } else { 0 },
+            shadow_tint: [0.16, 0.2, 0.34],
         });
         let camera = ctx.cam.camera();
         ctx.renderer.render(&mut self.scene, &camera, &frame);
@@ -222,10 +240,11 @@ impl DemoScene for LightingScene {
     fn hud_lines(&self) -> Vec<String> {
         vec![
             format!(
-                "sun {} · shadows {} · points {}",
+                "sun {} · shadows {} · points {} · {}",
                 if self.paused { "paused" } else { "sweeping" },
                 if self.sun_shadows { "on" } else { "off" },
                 if self.points_on { "on" } else { "off" },
+                if self.stylized { "stylized" } else { "smooth" },
             ),
             "GPU-only dynamic lighting (CPU shows baked ambient)".to_string(),
         ]

@@ -36,9 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     lights using their **true per-voxel normals** (voxlap `univec[256]` mapped
     from each voxel's `dir` index, rotated to world). World-space lights for the
     sprite pass; sprite shadows deferred.
+  - **Stylized (retro) lighting** (DL.6) — smooth N·L reads as generic Phong
+    and flattens the voxel identity, so terrain lighting gains an opt-in retro
+    look: `LightRig.bands` (cel quantization — the sun key + each point factor
+    snap to `bands + 1` discrete levels) + a gradient-map ramp from
+    `LightRig.shadow_tint` (cool, unlit) to the sun colour (warm, lit), giving
+    terraced, hue-shifted shading where shadows tint cool instead of just
+    darkening. `bands == 0` keeps the smooth path byte-identical. The
+    "Lighting" demo's `J` toggles stylized ↔ smooth.
   - **"Lighting" demo scene** — a sweeping sun + three orbiting coloured point
     lights over a pillared floor; `P` pauses the sun, `K` toggles sun shadows,
-    `L` toggles the point lights.
+    `L` toggles the point lights, `J` toggles stylized/smooth.
 
 ## [0.17.0] — 2026-06-28
 

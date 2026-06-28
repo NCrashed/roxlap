@@ -531,6 +531,76 @@ fn scene_dda_sun_lights_floor_by_facing() {
     );
 }
 
+/// DL.6 — stylized cel banding terraces the sun's diffuse. Two sun
+/// directions giving distinct smooth N·L (0.8 vs 0.9 on the flat floor)
+/// land on the **same** band at `bands = 2` (both round to the top level),
+/// so the stylized floor renders identically while the smooth floor differs.
+#[test]
+fn scene_dda_cel_banding_terraces_sun() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&floor_chunk(vsid));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render(&gpu.device, &gpu.queue, &scene, &[cam], cam.fov_y_rad, 64, 0.0)[centre]
+    };
+
+    // Floor top normal = up (-z); N·L = -to_sun.z. Two sun elevations:
+    // ndl = 0.8 and 0.9 (distinct), both rounding to the top band at bands=2.
+    let a = [0.6_f32, 0.0, -0.8]; // ndl 0.8
+    let b = [0.435_89_f32, 0.0, -0.9]; // ndl 0.9
+    let rig = |to_sun: [f32; 3], bands: u32| SceneLights {
+        enabled: true,
+        grid_sun_dirs: vec![to_sun],
+        sun_color: [1.0; 3],
+        sun_intensity: 1.0,
+        ambient: [0.1; 3],
+        style_bands: bands,
+        shadow_tint: [0.1, 0.1, 0.2],
+        ..SceneLights::default()
+    };
+
+    // Smooth (bands = 0): the two elevations differ.
+    renderer.set_scene_lights(rig(a, 0));
+    let smooth_a = render(&mut renderer);
+    renderer.set_scene_lights(rig(b, 0));
+    let smooth_b = render(&mut renderer);
+    assert_ne!(
+        smooth_a, smooth_b,
+        "smooth diffuse must vary with N·L: {smooth_a:#08x} vs {smooth_b:#08x}",
+    );
+
+    // Stylized (bands = 2): both N·L round to the same band ⇒ identical.
+    renderer.set_scene_lights(rig(a, 2));
+    let cel_a = render(&mut renderer);
+    renderer.set_scene_lights(rig(b, 2));
+    let cel_b = render(&mut renderer);
+    assert_eq!(
+        cel_a, cel_b,
+        "cel banding must terrace both N·L to one level: {cel_a:#08x} vs {cel_b:#08x}",
+    );
+}
+
 /// DL.2 — point lights: N·L diffuse + distance falloff + hard radius cut.
 /// Floor viewed straight down (top-face normal = up = -z). A point light
 /// hovering just above the floor centre brightens it vs the baked baseline;

@@ -124,6 +124,14 @@ struct Uniforms {
     shadow_bias: f32,
     shadow_max_dist: f32,
     _pad6: vec2<f32>,
+    // DL.6 — stylized lighting: cel banding + gradient-map ramp.
+    shadow_tint: vec4<f32>, // rgb = cool unlit end of the sun ramp
+    style_bands: u32,       // 0 = smooth; ≥1 = quantize to bands+1 levels
+    // Three scalar pads (NOT vec3<u32>, whose 16-byte align would add a
+    // gap the Rust `[u32; 3]` doesn't have → uniform size mismatch).
+    _pad7a: u32,
+    _pad7b: u32,
+    _pad7c: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -518,13 +526,22 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> boo
     return false;
 }
 
+// DL.6 — cel quantization: snap a 0..1 light factor to `bands + 1` discrete
+// levels (terraced light instead of a smooth gradient). `bands == 0` never
+// reaches here (the smooth path is taken instead).
+fn cel_band(x: f32, bands: u32) -> f32 {
+    let b = f32(bands);
+    return clamp(round(x * b) / b, 0.0, 1.0);
+}
+
 // DL — dynamic-lighting surface shade (pre-fog), same 0..~2 scale as
-// `voxel_color_in`. The baked brightness byte is reinterpreted as the
-// ambient/AO term (× `ambient_color`); the sun + point lights add N·L
-// diffuse terms (each optionally shadowed, DL.3) on top of the raw albedo.
-// Only taken when dynamic lighting is active (`sun_flags` bit 2) — otherwise
-// the hit site uses `voxel_color_in` verbatim (the byte-identical pre-DL
-// path). Shadow factor in shadow = `1 - shadow_strength` (ambient_color.w).
+// `voxel_color_in`. The baked brightness byte is the ambient/AO term; the
+// sun + point lights add N·L diffuse. Two looks: **smooth** (`style_bands
+// == 0`, physically-ish) and **stylized** (DL.6, `style_bands ≥ 1`): the
+// sun key + each point factor quantize to bands (cel), and the banded sun
+// key gradient-maps `shadow_tint` (cool) → sun colour (warm) — retro
+// hue-shifted terracing instead of generic Phong. Only taken when dynamic
+// lighting is active (`sun_flags` bit 2); else `voxel_color_in` verbatim.
 fn shade_lit(
     g: u32,
     meta_id: u32,
@@ -542,10 +559,10 @@ fn shade_lit(
         f32((packed >> 8u) & 0xffu),
         f32(packed & 0xffu),
     ) * (1.0 / 255.0);
-    // Ambient term = baked brightness byte (with the per-face side-shade),
-    // matching `voxel_color_in`'s brightness, scaled by the ambient mult.
-    let ambient = max(0.0, a - face_shade) * (1.0 / 128.0);
-    var lit = albedo * u.ambient_color.rgb * ambient;
+    // Baked brightness byte (with the per-face side-shade) = the ambient/AO
+    // scalar, matching `voxel_color_in`'s brightness.
+    let ao = max(0.0, a - face_shade) * (1.0 / 128.0);
+    let styled = u.style_bands > 0u;
     // Surface normal (grid-local) — shared by the sun + point lights.
     let n = face_normal(hit_axis, ray_dir);
     // Shadow-ray origin: bias off the surface along the normal to avoid
@@ -553,7 +570,9 @@ fn shade_lit(
     let shadow_origin = hit_pos + n * u.shadow_bias;
     // Light remaining in shadow (the strength floor); 1.0 ⇒ unshadowed.
     let in_shadow = 1.0 - u.ambient_color.w;
-    // Directional sun: N·L diffuse on the raw albedo, optionally shadowed.
+
+    // Sun key (0..1): N·L × shadow factor.
+    var sun_key = 0.0;
     if ((u.sun_flags & 1u) != 0u) {
         let l = grid_cameras[g].sun_dir.xyz; // unit, TO the sun, grid-local
         let ndl = max(0.0, dot(n, l));
@@ -562,12 +581,24 @@ fn shade_lit(
             if ((u.sun_flags & 2u) != 0u && shadow_occluded(g, shadow_origin, l, u.shadow_max_dist)) {
                 sh = in_shadow;
             }
-            lit = lit + albedo * u.sun_color.rgb * u.sun_color.w * ndl * sh;
+            sun_key = ndl * sh;
         }
     }
+
+    // Base term: ambient + sun. Smooth = additive; stylized = gradient map.
+    var lit: vec3<f32>;
+    if (styled) {
+        let key = cel_band(sun_key, u.style_bands);
+        let warm = u.sun_color.rgb * u.sun_color.w;
+        lit = albedo * mix(u.shadow_tint.rgb, warm, key) * ao;
+    } else {
+        lit = albedo * u.ambient_color.rgb * ao
+            + albedo * u.sun_color.rgb * u.sun_color.w * sun_key;
+    }
+
     // Point lights: per-grid, grid-major rows at [g*count .. (g+1)*count].
     // N·L × distance falloff, hard-cut at the light's radius; shadow rays
-    // march to the light (intra-grid).
+    // march to the light (intra-grid). Stylized ⇒ the factor is celled too.
     let count = u.point_light_count;
     let base = g * count;
     for (var i: u32 = 0u; i < count; i = i + 1u) {
@@ -587,7 +618,9 @@ fn shade_lit(
                         sh = in_shadow;
                     }
                 }
-                lit = lit + albedo * pl.color * pl.intensity * ndl * atten * sh;
+                var f = ndl * atten * sh;
+                if (styled) { f = cel_band(f, u.style_bands); }
+                lit = lit + albedo * pl.color * pl.intensity * f;
             }
         }
     }

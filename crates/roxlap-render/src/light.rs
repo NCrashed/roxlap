@@ -89,6 +89,19 @@ pub struct LightRig<'a> {
     /// Sun shadow-ray length cap, world units (point-light shadow rays
     /// stop at the light instead).
     pub shadow_max_dist: f32,
+    /// DL.6 — **stylized lighting**. `0` ⇒ smooth (physically-ish) diffuse
+    /// (the default). `≥1` ⇒ retro cel look: the sun's key term and each
+    /// point light's diffuse factor quantize to `bands + 1` discrete levels
+    /// (terraced light instead of a smooth gradient), and the banded sun key
+    /// drives a **gradient map** from [`shadow_tint`](Self::shadow_tint)
+    /// (cool, unlit) to the sun's colour (warm, lit) — hue-shifted shadows
+    /// rather than plain darkening. Avoids the "generic Phong" read that
+    /// flattens the voxel/retro identity.
+    pub bands: u32,
+    /// DL.6 — the cool shadow/ambient tint the stylized ramp starts from
+    /// (the unlit end). Multiplied by the baked ambient/AO byte. Ignored
+    /// when `bands == 0` (then [`ambient`](Self::ambient) is used instead).
+    pub shadow_tint: [f32; 3],
 }
 
 impl Default for LightRig<'_> {
@@ -100,6 +113,8 @@ impl Default for LightRig<'_> {
             shadow_strength: 0.7,
             shadow_bias_voxels: 1.5,
             shadow_max_dist: 512.0,
+            bands: 0,
+            shadow_tint: [0.12, 0.14, 0.2],
         }
     }
 }

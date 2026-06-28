@@ -827,6 +827,11 @@ pub struct SceneLights {
     /// DL.4 — world-space point lights for the sprite pass (positions in
     /// world coords; same colour/intensity/radius as the per-grid copies).
     pub world_points: Vec<GpuLight>,
+    /// DL.6 — stylized cel banding: `0` = smooth, `≥1` = quantize the
+    /// diffuse to `bands + 1` levels + gradient-map the sun key.
+    pub style_bands: u32,
+    /// DL.6 — cool shadow/ambient tint (the stylized ramp's unlit end).
+    pub shadow_tint: [f32; 3],
 }
 
 /// One point light packed for the GPU (binding 18, std430, 48 bytes).
@@ -1058,6 +1063,11 @@ struct SceneDdaUniform {
     /// Sun shadow-ray length cap (world units).
     shadow_max_dist: f32,
     _pad6: [f32; 2],
+    /// DL.6 — stylized ramp's cool shadow tint (rgb; w unused).
+    shadow_tint: [f32; 4],
+    /// DL.6 — cel band count; 0 = smooth (no banding / gradient map).
+    style_bands: u32,
+    _pad7: [u32; 3],
 }
 
 #[repr(C)]
@@ -2338,6 +2348,9 @@ impl GpuRenderer {
             shadow_bias: lights.shadow_bias,
             shadow_max_dist: lights.shadow_max_dist,
             _pad6: [0.0; 2],
+            shadow_tint: [lights.shadow_tint[0], lights.shadow_tint[1], lights.shadow_tint[2], 0.0],
+            style_bands: lights.style_bands,
+            _pad7: [0; 3],
         };
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
@@ -4447,6 +4460,9 @@ impl HeadlessSceneRenderer {
             shadow_bias: dl.shadow_bias,
             shadow_max_dist: dl.shadow_max_dist,
             _pad6: [0.0; 2],
+            shadow_tint: [dl.shadow_tint[0], dl.shadow_tint[1], dl.shadow_tint[2], 0.0],
+            style_bands: dl.style_bands,
+            _pad7: [0; 3],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 
