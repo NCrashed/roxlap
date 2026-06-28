@@ -17,7 +17,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::scene_api::{CameraRig, DemoScene, InputState, SceneCtx, SceneInput};
 use crate::scenes::{
-    animation::AnimationScene, empty::EmptyScene, picking::PickingScene,
+    animation::AnimationScene, empty::EmptyScene, lighting::LightingScene, picking::PickingScene,
     primitives::PrimitivesScene, sprites::SpritesScene, transparency::TransparencyScene,
     world::WorldScene,
 };
@@ -84,6 +84,7 @@ impl Host {
             Box::new(SpritesScene::new()),
             Box::new(AnimationScene::new()),
             Box::new(TransparencyScene::new()),
+            Box::new(LightingScene::new()),
             Box::new(PickingScene::new()),
             Box::new(PrimitivesScene::new()),
             Box::new(EmptyScene::new()),

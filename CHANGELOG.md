@@ -11,6 +11,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dynamic lighting** (macro-stage DL; `PORTING-DYNLIGHT.md`) — runtime,
+  **GPU-only** lighting layered on the scene-DDA raymarcher: one coloured
+  directional **sun**, several coloured **point lights**, and **stylized hard
+  voxel shadows** cast by the sun and a chosen subset of point lights (the rest
+  shadowless). The baked brightness byte is reinterpreted as the ambient/AO
+  fill (`out = albedo·ambient + Σ direct`); the CPU backend ignores lights and
+  keeps the baked path. Lights are per-frame via `FrameParams.lights`
+  (`LightRig { sun, points, ambient, shadow_strength, shadow_bias_voxels,
+  shadow_max_dist }`); `None` ⇒ byte-identical to pre-DL. New `DirectionalLight`
+  / `PointLight` / `LightRig` types in `roxlap-render`.
+  - **Sun + point lights** (DL.1/DL.2) — `shade_lit` in `scene_dda.wgsl`:
+    raw albedo × ambient + N·L diffuse per light, using the DDA's hit-face
+    normal (free) for terrain. Point lights attenuate with a smooth quadratic
+    falloff and a hard radius cut. Lights are transformed into each grid's
+    local frame on the CPU (mirroring the per-grid cameras); the per-grid sun
+    direction rides in the camera struct to stay within the GPU's 16
+    storage-buffer limit.
+  - **Hard shadows** (DL.3) — `shadow_occluded`, a dedicated intra-grid shadow
+    DDA (chunk-skipping outer loop + mip-0 inner voxel walk) reusing the scene
+    occupancy. Shadow-ray origin is biased along the surface normal (anti-acne);
+    the in-shadow floor is `1 − shadow_strength`. `MAX_SHADOW_CASTERS` caps the
+    casters (excess demoted to shadowless with a warning). Cross-grid shadows
+    deferred.
+  - **Lit sprites** (DL.4) — opaque sprites/clips shade with the sun + point
+    lights using their **true per-voxel normals** (voxlap `univec[256]` mapped
+    from each voxel's `dir` index, rotated to world). World-space lights for the
+    sprite pass; sprite shadows deferred.
+  - **"Lighting" demo scene** — a sweeping sun + three orbiting coloured point
+    lights over a pillared floor; `P` pauses the sun, `K` toggles sun shadows,
+    `L` toggles the point lights.
+
 - **`SceneRenderer::wait_idle`** — blocks until the active backend has drained
   all in-flight work and releases any acquired-but-unpresented swapchain frame
   (GPU: `device.poll(Wait)`; CPU: no-op). Call it at shutdown before dropping

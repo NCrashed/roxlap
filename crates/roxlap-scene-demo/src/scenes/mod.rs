@@ -8,6 +8,7 @@
 
 pub mod animation;
 pub mod empty;
+pub mod lighting;
 pub mod picking;
 pub mod primitives;
 pub mod sprites;

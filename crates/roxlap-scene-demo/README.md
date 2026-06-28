@@ -73,6 +73,7 @@ scene's start pose.
 | **World**      | Streaming hills + a rotating ship, flown with collision; chunk streaming, multi-grid composition, LOD billboards. `R` ship spin · `B` LOD billboards · `T` streaming telemetry. |
 | **Sprites**    | A green/red `coco` field, a shoot-to-carve dense blob, and a streaming sprite ring. Left-click shoots the blob · `G` carves the red model's next layer. |
 | **Animation**  | A KFA `animsprite`-driven swinging arm + a flame-clip character (RKC v3 attachment runtime). Both animate on their own. |
+| **Lighting**   | Runtime dynamic lighting (**GPU-only**): a sweeping coloured sun casting hard shadows + three orbiting coloured point lights (two shadow-casting) over a pillared floor. `P` pause sun · `K` sun shadows · `L` point lights. |
 | **Picking**    | Top-down `view_ray` / `pick` (screen→world): a ground-plane cursor + left-click drops a marker at the picked surface voxel. |
 | **Primitives** | Depth-tested debug-line gizmos (`draw_lines`) + a 2D reference quad (`draw_images`); left-click runs the `pick_image` eyedropper. |
 | **Empty**      | A blank world (sky only) — the minimal `DemoScene`.                                         |
