@@ -2822,6 +2822,37 @@ mod tests {
         assert_eq!(plain.colors, plain_mat.colors);
     }
 
+    /// TV.3 (streaming-clip refresh path): `build_sprite_model_with_materials`
+    /// — the builder behind `GpuBackend::update_sprite_model_with_materials`,
+    /// which a streaming clip re-runs each frame — classifies a kv6's voxels
+    /// into a per-voxel `materials` array (popcount-rank order) by colour.
+    #[test]
+    fn build_with_materials_classifies_by_color() {
+        let glass = 0x80AA_BBCC;
+        let stone = 0x8011_2233;
+        // One column (x=0,y=0), two voxels: z=0 stone, z=1 glass.
+        let kv6 = kv6_from(1, 1, 4, &[(0, 0, 0, stone), (0, 0, 1, glass)]);
+
+        let m = build_sprite_model_with_materials(&kv6, &[(0x00AA_BBCC, 2)]);
+        assert_eq!(
+            m.materials.len(),
+            m.colors.len(),
+            "materials parallel to colors"
+        );
+        assert_eq!(
+            m.materials,
+            vec![0u8, 2u8],
+            "stone opaque, glass material 2"
+        );
+
+        // Empty map ⇒ no per-voxel materials, identical to `build_sprite_model`.
+        let plain = build_sprite_model(&kv6);
+        let plain_mat = build_sprite_model_with_materials(&kv6, &[]);
+        assert!(plain.materials.is_empty());
+        assert!(plain_mat.materials.is_empty());
+        assert_eq!(plain.colors, plain_mat.colors);
+    }
+
     /// flipping `chain_id` redirects the rendered instance to the new
     /// frame's resident volume.
     #[test]

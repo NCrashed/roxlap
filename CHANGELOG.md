@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uniform material; the per-voxel path was wired for static sprites but not
   for clip frames. An empty map is byte-identical to `add_voxel_clip`. The
   "Transparency" demo scene gains a pulsing glass-orb clip dogfooding it.
+  - The per-voxel materials are also preserved across the **in-place
+    single-frame edit** (`update_clip_frame`, which now re-classifies the
+    edited frame from the clip's registered map) and the **streaming-clip**
+    path: `add_streaming_clip_with_materials` + `refresh_sprite_model_with_materials`
+    re-apply the colour→material map on every per-frame model re-upload.
 
 ## [0.16.0] — 2026-06-28
 
