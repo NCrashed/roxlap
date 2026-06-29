@@ -51,6 +51,14 @@ pub(crate) const MAXZDIM: i32 = 256;
 /// `(2*RAD+1)³ = 5×5×5` cube.
 pub(crate) const ESTNORMRAD: i32 = 2;
 
+/// AO.2 — ambient-occlusion sampling radius (≤ `ESTNORMRAD`, so the same
+/// cache padding suffices). The per-exposed-face method (see
+/// [`EstNormCache::ambient_occlusion`]) is concave-only at any radius; this
+/// just sets how far a concave contact's darkening reaches. `1` keeps it a
+/// tight 1-voxel edge; raise for a wider contact band.
+pub(crate) const AO_RAD: i32 = 1;
+const _: () = assert!(AO_RAD <= ESTNORMRAD);
+
 /// `bits k..31 set, low k bits clear` (`!0 << k`). Used by
 /// [`expandbit256`] to fill from an air→solid transition up to the
 /// top of a 32-bit word.
@@ -324,42 +332,53 @@ impl EstNormCache {
         [nx as f32 * inv, ny as f32 * inv, nz as f32 * inv]
     }
 
-    /// AO.0 — ambient occlusion at solid voxel `(x, y, z)` given its
-    /// surface normal `n` (from [`estnorm`](Self::estnorm), which points
-    /// toward the **solid** side). Returns `0.0` (fully open, e.g. a flat
-    /// floor under open sky) … `1.0` (fully enclosed).
+    /// AO.2 — ambient occlusion at solid voxel `(x, y, z)`. Returns `0.0`
+    /// (open, e.g. a flat floor under open sky, or a convex edge) … `1.0`
+    /// (fully enclosed).
     ///
-    /// Samples the `±ESTNORMRAD` neighbourhood on the voxel's **air** side
-    /// (`offset · n < 0`, i.e. away from the solid the normal points into)
-    /// and measures how much of it is solid — crevices / inside corners
-    /// read occluded (dark), open faces read clear (bright). Each occluder
-    /// is inverse-distance weighted so contact darkening dominates. A
-    /// degenerate normal (`[0,0,0]`, all-solid/all-air) ⇒ `0.0` (no AO).
+    /// **Per-exposed-face**, normal-free: for each of the 6 axis faces whose
+    /// immediate neighbour is air (an exposed face), sample the `±AO_RAD`
+    /// half-space **in front of that face** (`offset · face_dir > 0`) and
+    /// measure how much of it is solid (inverse-distance weighted). This only
+    /// fires at **concave** corners — a perpendicular solid sitting in front of
+    /// an exposed face. Flat faces and **convex** edges read `0` (the space in
+    /// front of every exposed face is air). Crucially it does **not** use the
+    /// `estnorm` gradient normal, which tilts near a convex edge and would make
+    /// a voxel's own folded-over surface (e.g. a pillar's top above its side
+    /// face) count as occlusion — the "pillow" border on every edge.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
-    pub fn ambient_occlusion(&self, x: i32, y: i32, z: i32, n: [f32; 3]) -> f32 {
-        if n == [0.0, 0.0, 0.0] {
-            return 0.0;
-        }
+    pub fn ambient_occlusion(&self, x: i32, y: i32, z: i32) -> f32 {
+        const FACES: [[i32; 3]; 6] = [
+            [-1, 0, 0],
+            [1, 0, 0],
+            [0, -1, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+            [0, 0, 1],
+        ];
         let cx = (x - self.origin_x) as i32;
         let cy = (y - self.origin_y) as i32;
         let mut occ = 0.0f32;
         let mut total = 0.0f32;
-        for dy in -ESTNORMRAD..=ESTNORMRAD {
-            for dx in -ESTNORMRAD..=ESTNORMRAD {
-                for dz in -ESTNORMRAD..=ESTNORMRAD {
-                    if dx == 0 && dy == 0 && dz == 0 {
-                        continue;
-                    }
-                    let d = [dx as f32, dy as f32, dz as f32];
-                    // Air side only: away from the solid the normal points into.
-                    if d[0] * n[0] + d[1] * n[1] + d[2] * n[2] >= 0.0 {
-                        continue;
-                    }
-                    let w = 1.0 / (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    total += w;
-                    if self.solid((cx + dx) as usize, (cy + dy) as usize, z + dz) {
-                        occ += w;
+        for f in FACES {
+            // Only exposed faces (immediate neighbour is air) contribute.
+            if self.solid((cx + f[0]) as usize, (cy + f[1]) as usize, z + f[2]) {
+                continue;
+            }
+            for dy in -AO_RAD..=AO_RAD {
+                for dx in -AO_RAD..=AO_RAD {
+                    for dz in -AO_RAD..=AO_RAD {
+                        // Only the half-space strictly in front of this face.
+                        if dx * f[0] + dy * f[1] + dz * f[2] <= 0 {
+                            continue;
+                        }
+                        let d = [dx as f32, dy as f32, dz as f32];
+                        let w = 1.0 / (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                        total += w;
+                        if self.solid((cx + dx) as usize, (cy + dy) as usize, z + dz) {
+                            occ += w;
+                        }
                     }
                 }
             }
@@ -772,13 +791,13 @@ fn shade_column(
         let lo = sz0.max(z_lo);
         let hi = sz1.min(z_hi);
         for z in lo..hi {
-            let normal = cache.estnorm(x, y, z);
             // AO.0 — `lightmode == 3` bakes ambient occlusion into the byte
-            // (the DL ambient/AO channel); other modes keep the directional /
-            // point-light brightness.
+            // (the DL ambient/AO channel; normal-free); other modes use the
+            // estnorm surface normal for the directional / point-light bake.
             let brightness = if lightmode == 3 {
-                ao_byte(cache, x, y, z, normal)
+                ao_byte(cache, x, y, z)
             } else {
+                let normal = cache.estnorm(x, y, z);
                 compute_brightness(x, y, z, normal, lightmode, lights, lightsub)
             };
             let byte_off = voxel_byte_offset_signed + ((z as isize) << 2);
@@ -797,8 +816,8 @@ const AO_STRENGTH: f32 = 0.8;
 /// AO.0 — map ambient occlusion to the brightness byte (the DL ambient/AO
 /// channel). Open voxels keep the neutral `128` (= full ambient, shader
 /// `byte/128 == 1.0`); occluded voxels darken toward `128·(1 − strength)`.
-fn ao_byte(cache: &EstNormCache, x: i32, y: i32, z: i32, n: [f32; 3]) -> u8 {
-    let ao = cache.ambient_occlusion(x, y, z, n);
+fn ao_byte(cache: &EstNormCache, x: i32, y: i32, z: i32) -> u8 {
+    let ao = cache.ambient_occlusion(x, y, z);
     clamp_to_byte(128.0 * (1.0 - AO_STRENGTH * ao))
 }
 
@@ -868,6 +887,48 @@ fn clamp_to_byte(f: f32) -> u8 {
 mod tests {
     use super::*;
 
+    /// AO.2 — only **concave** edges occlude: a raised block on a floor has a
+    /// **convex** top (flat + edge) that must stay open (AO ≈ 0), while the
+    /// floor at its **concave** base darkens.
+    #[test]
+    fn ao_only_darkens_concave_not_convex() {
+        let vsid: u32 = 10;
+        let column = |z1: u8, z2: u8| -> Vec<u8> {
+            let mut c = vec![0u8, z1, z2, 0];
+            for _ in z1..=z2 {
+                c.extend([0x20, 0x20, 0x20, 0x80]);
+            }
+            c
+        };
+        let floor = column(20, 20); // air z<20, solid z>=20 (bedrock below)
+        let block = column(15, 15); // raised: air z<15, solid z>=15
+        let mut data = Vec::new();
+        let mut offsets = vec![0u32; (vsid * vsid + 1) as usize];
+        for i in 0..(vsid * vsid) {
+            offsets[i as usize] = data.len() as u32;
+            let x = i % vsid;
+            let y = i / vsid;
+            // 3×3 raised block at x∈[3,5], y∈[3,5].
+            let raised = (3..=5).contains(&x) && (3..=5).contains(&y);
+            data.extend_from_slice(if raised { &block } else { &floor });
+        }
+        offsets[(vsid * vsid) as usize] = data.len() as u32;
+        let cache = EstNormCache::build(&data, &offsets, vsid, 0, 0, vsid as i32, vsid as i32);
+
+        let ao = |x, y, z| cache.ambient_occlusion(x, y, z);
+        let top_center = ao(4, 4, 15); // convex flat top
+        let top_edge = ao(3, 4, 15); // convex top edge
+        let base = ao(2, 4, 20); // concave: floor at the block's base
+        let flat = ao(0, 0, 20); // open flat floor
+        assert!(flat < 0.01, "open flat floor must not occlude: {flat}");
+        assert!(
+            top_center < 0.01,
+            "convex flat top must not occlude: {top_center}"
+        );
+        assert!(top_edge < 0.01, "convex edge must not occlude: {top_edge}");
+        assert!(base > 0.1, "concave base must occlude: {base}");
+    }
+
     /// AO.0 — a floor voxel beside a wall is more occluded (darker) than an
     /// open floor voxel; an open voxel reads ≈0 occlusion.
     #[test]
@@ -895,8 +956,8 @@ mod tests {
 
         let cache = EstNormCache::build(&data, &offsets, vsid, 0, 0, vsid as i32, vsid as i32);
         // (4,3) sits next to the wall at (5,3); (2,3) is in the open.
-        let near = cache.ambient_occlusion(4, 3, 20, cache.estnorm(4, 3, 20));
-        let open = cache.ambient_occlusion(2, 3, 20, cache.estnorm(2, 3, 20));
+        let near = cache.ambient_occlusion(4, 3, 20);
+        let open = cache.ambient_occlusion(2, 3, 20);
         assert!(
             open < 0.05,
             "open floor voxel should be ~unoccluded: {open}"

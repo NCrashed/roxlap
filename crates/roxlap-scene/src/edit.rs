@@ -380,6 +380,63 @@ mod tests {
         assert_eq!(g.chunk_count(), 0);
     }
 
+    /// AO regression on real `set_rect` geometry (floor + pillar): AO must
+    /// darken **only concave** edges — the pillar's convex top + its flat
+    /// vertical faces (above the floor contact) stay open; only the floor /
+    /// pillar-base contact occludes. Guards the "pillow border on every edge"
+    /// bug (the estnorm normal tilts near a convex edge and used to count the
+    /// voxel's own folded surface as occlusion).
+    #[test]
+    fn ao_only_concave_on_setrect_pillar() {
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_rect(
+            IVec3::new(0, 0, 60),
+            IVec3::new(64, 64, 63),
+            Some(0x80_4d_8a_3a),
+        ); // floor z60..62
+        g.set_rect(
+            IVec3::new(20, 20, 30),
+            IVec3::new(30, 30, 60),
+            Some(0x80_8a_8a_92),
+        ); // pillar z30..59
+        let vxl = g.chunk(IVec3::ZERO).expect("chunk");
+        let cache = roxlap_core::EstNormCache::build(
+            &vxl.data,
+            &vxl.column_offset,
+            CHUNK_SIZE_XY,
+            16,
+            16,
+            40,
+            40,
+        );
+        let ao = |x, y, z| cache.ambient_occlusion(x, y, z);
+
+        // Convex top face (z=30) + flat vertical faces (z 31..57, clear of the
+        // floor at z60) must NOT occlude.
+        for x in 20..30 {
+            for y in 20..30 {
+                assert!(
+                    ao(x, y, 30) < 0.01,
+                    "convex top ({x},{y},30) occluded: {}",
+                    ao(x, y, 30)
+                );
+            }
+            for z in 31..57 {
+                let a = ao(x, 20, z);
+                assert!(
+                    a < 0.01,
+                    "flat front face ({x},20,{z}) occluded (pillow): {a}"
+                );
+            }
+        }
+        // Concave floor-to-pillar contact occludes.
+        assert!(
+            ao(19, 24, 60) > 0.1,
+            "concave base must occlude: {}",
+            ao(19, 24, 60)
+        );
+    }
+
     #[test]
     fn set_rect_within_one_chunk() {
         let mut g = Grid::new(GridTransform::identity());
