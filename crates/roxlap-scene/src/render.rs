@@ -149,6 +149,7 @@ fn grid_local_lights<'a>(
             color: p.color,
             intensity: p.intensity,
             radius: p.radius,
+            casts_shadow: p.casts_shadow,
         });
     }
     CpuLights {
@@ -157,10 +158,16 @@ fn grid_local_lights<'a>(
         sun_dir,
         sun_color: world.sun_color,
         sun_intensity: world.sun_intensity,
+        sun_casts_shadow: world.sun_casts_shadow,
         points: scratch.as_slice(),
         ambient: world.ambient,
         bands: world.bands,
         shadow_tint: world.shadow_tint,
+        // CPU.2 — shadows: the rig is world-space here; shadow distances are
+        // grid-uniform (no scaling), so they carry through unchanged.
+        shadow_strength: world.shadow_strength,
+        shadow_bias: world.shadow_bias,
+        shadow_max_dist: world.shadow_max_dist,
     }
 }
 

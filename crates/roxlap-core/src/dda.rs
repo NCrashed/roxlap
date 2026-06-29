@@ -89,11 +89,18 @@ pub struct CpuPointLight {
     pub intensity: f32,
     /// Hard cutoff distance (world/voxel units).
     pub radius: f32,
+    /// CPU.2 — whether this light casts a hard shadow (a shadow ray
+    /// marches to the light through the grid's voxels). Mirrors the
+    /// GPU's per-light `casts_shadow`; the renderer applies the same
+    /// caster cap before building the CPU rig.
+    pub casts_shadow: bool,
 }
 
 /// CPU.1 — the per-frame dynamic-light environment for one grid (grid-local).
 /// Mirror of the GPU `shade_lit` inputs. `enabled == false` (the default)
-/// keeps the baked-byte path. Diffuse only — **no shadows** on the CPU.
+/// keeps the baked-byte path. CPU.2 adds hard voxel shadows (sun + flagged
+/// point lights) via a per-(voxel,face) shadow march; `shadow_strength == 0`
+/// (the [`Default`]) leaves the lighting diffuse-only.
 #[derive(Clone, Copy, Default)]
 pub struct CpuLights<'a> {
     /// Whether dynamic lighting is active this frame (else the baked path).
@@ -104,6 +111,8 @@ pub struct CpuLights<'a> {
     pub sun_dir: [f32; 3],
     pub sun_color: [f32; 3],
     pub sun_intensity: f32,
+    /// CPU.2 — whether the sun casts a hard shadow.
+    pub sun_casts_shadow: bool,
     /// Grid-local point lights.
     pub points: &'a [CpuPointLight],
     /// Ambient multiplier on the baked byte (smooth mode's fill).
@@ -112,6 +121,16 @@ pub struct CpuLights<'a> {
     pub bands: u32,
     /// Stylized ramp's cool unlit-end tint (used when `bands > 0`).
     pub shadow_tint: [f32; 3],
+    /// CPU.2 — fraction of a caster's light removed where a shadow ray is
+    /// occluded (`0` ⇒ shadows off, `1` ⇒ full black). A shadowed sample
+    /// keeps `1 - shadow_strength` of that caster.
+    pub shadow_strength: f32,
+    /// CPU.2 — shadow-ray origin bias along the surface normal, voxel
+    /// units (kills self-shadow acne). ~1.5 is a good default.
+    pub shadow_bias: f32,
+    /// CPU.2 — sun shadow-ray length cap, voxel units (point-light rays
+    /// stop at the light instead).
+    pub shadow_max_dist: f32,
 }
 
 impl Default for DdaEnv<'_> {
@@ -269,6 +288,16 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// CPU.2 — a hard-shadow occlusion test for the dynamic-lighting shade.
+/// `occluded(origin, dir, max_t)` returns `true` if a solid voxel blocks
+/// the segment from `origin` (grid-local, already biased off the surface)
+/// in unit direction `dir` within `max_t` voxel units. Terrain hits pass
+/// a [`SamplerShadow`] (marches the grid voxels); sprites pass `None`
+/// (no sprite shadows, matching the GPU).
+pub(crate) trait ShadowTester {
+    fn occluded(&mut self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool;
+}
+
 /// CPU.1 — dynamic-lighting shade for a terrain voxel (the CPU mirror of the
 /// GPU `shade_lit`): raw albedo × (ambient/AO + sun + point lights), evaluated
 /// **flat per voxel** (at the voxel centre, so a whole face reads one tone —
@@ -283,6 +312,7 @@ fn shade_lit_cpu(
     cellc: [i32; 3],
     cell_size: f32,
     l: &CpuLights<'_>,
+    shadow: Option<&mut dyn ShadowTester>,
 ) -> u32 {
     let a_b = ((color >> 24) & 0xff).saturating_sub(bright_sub);
     let ao = a_b as f32 / 128.0;
@@ -298,7 +328,7 @@ fn shade_lit_cpu(
         (cellc[1] as f32 + 0.5) * cell_size,
         (cellc[2] as f32 + 0.5) * cell_size,
     ];
-    shade_dynamic(albedo, ao, n, center, l)
+    shade_dynamic(albedo, ao, n, center, l, shadow)
 }
 
 /// CPU.1/DL.7 — the shared dynamic-lighting core (terrain + sprites): raw
@@ -312,11 +342,35 @@ pub(crate) fn shade_dynamic(
     n: [f32; 3],
     sample: [f32; 3],
     l: &CpuLights<'_>,
+    shadow: Option<&mut dyn ShadowTester>,
 ) -> u32 {
     let styled = l.bands > 0;
-    // Sun key (0..1): N·L (no shadow on the CPU).
+    // CPU.2 — shadow ray origin: bias off the surface along the normal to
+    // avoid self-shadow acne (shared by every caster). Light kept in
+    // shadow = `1 - shadow_strength` (1.0 ⇒ shadows effectively off).
+    let mut shadow = shadow;
+    let shadow_origin = [
+        sample[0] + n[0] * l.shadow_bias,
+        sample[1] + n[1] * l.shadow_bias,
+        sample[2] + n[2] * l.shadow_bias,
+    ];
+    let in_shadow = 1.0 - l.shadow_strength;
+
+    // Sun key (0..1): N·L × shadow factor.
     let sun_key = if l.sun {
-        dot3(n, l.sun_dir).max(0.0)
+        let ndl = dot3(n, l.sun_dir).max(0.0);
+        if ndl > 0.0 && l.sun_casts_shadow {
+            let occ = shadow
+                .as_deref_mut()
+                .is_some_and(|s| s.occluded(shadow_origin, l.sun_dir, l.shadow_max_dist));
+            if occ {
+                ndl * in_shadow
+            } else {
+                ndl
+            }
+        } else {
+            ndl
+        }
     } else {
         0.0
     };
@@ -336,7 +390,8 @@ pub(crate) fn shade_dynamic(
         [base(0), base(1), base(2)]
     };
 
-    // Point lights (flat per voxel; no shadow).
+    // Point lights (flat per voxel). CPU.2 — a flagged caster's shadow ray
+    // marches to the light; an occluded sample keeps `in_shadow` of it.
     for p in l.points {
         let d3 = [
             p.pos[0] - sample[0],
@@ -346,9 +401,20 @@ pub(crate) fn shade_dynamic(
         let dist = (d3[0] * d3[0] + d3[1] * d3[1] + d3[2] * d3[2]).sqrt();
         if dist < p.radius && dist > 1e-4 {
             let inv = 1.0 / dist;
-            let ndl = dot3(n, [d3[0] * inv, d3[1] * inv, d3[2] * inv]).max(0.0);
+            let ldir = [d3[0] * inv, d3[1] * inv, d3[2] * inv];
+            let ndl = dot3(n, ldir).max(0.0);
             if ndl > 0.0 {
-                let mut f = ndl * point_falloff(dist, p.radius);
+                // Shadow ray marches from the surface to the light (`dist`).
+                let sh = if p.casts_shadow
+                    && shadow
+                        .as_deref_mut()
+                        .is_some_and(|s| s.occluded(shadow_origin, ldir, dist))
+                {
+                    in_shadow
+                } else {
+                    1.0
+                };
+                let mut f = ndl * point_falloff(dist, p.radius) * sh;
                 if styled {
                     f = cel_band(f, l.bands);
                 }
@@ -1019,6 +1085,60 @@ impl<'a> Sampler<'a> {
     }
 }
 
+/// CPU.2 — safety cap on a shadow ray's voxel steps (the `shadow_max_dist`
+/// / light-distance bound is the real limit; this only backstops a
+/// degenerate ray). Mirrors the GPU `shadow_max_steps`.
+const SHADOW_MAX_STEPS: u32 = 1024;
+
+/// CPU.2 — [`ShadowTester`] backed by the render [`Sampler`]: a hard-shadow
+/// occlusion march over the grid's mip-`mip` voxels. The march reuses the
+/// same `sampler.hit()` occupancy the primary ray uses (so a shadow ray is
+/// blocked by the same surfaces the camera sees) and the same `[lo_c, hi_c)`
+/// voxel-box bounds, stepping a standard 3D-DDA until it hits a solid cell
+/// (occluded), leaves the box / exceeds `max_t` (lit), or hits the step cap.
+struct SamplerShadow<'s, 'a> {
+    sampler: &'s mut Sampler<'a>,
+    cell_size: f32,
+    lo_c: [i32; 3],
+    hi_c: [i32; 3],
+}
+
+impl ShadowTester for SamplerShadow<'_, '_> {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn occluded(&mut self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
+        let cs = self.cell_size;
+        let mut cellc = [
+            (origin[0] / cs).floor() as i32,
+            (origin[1] / cs).floor() as i32,
+            (origin[2] / cs).floor() as i32,
+        ];
+        let (step, mut t_max, t_delta) = dda_setup(origin, dir, cellc, cs);
+        let mut t_curr = 0.0f32;
+        for _ in 0..SHADOW_MAX_STEPS {
+            if cellc[0] < self.lo_c[0]
+                || cellc[0] >= self.hi_c[0]
+                || cellc[1] < self.lo_c[1]
+                || cellc[1] >= self.hi_c[1]
+                || cellc[2] < self.lo_c[2]
+                || cellc[2] >= self.hi_c[2]
+            {
+                return false; // left the voxel box → no occluder ahead
+            }
+            if t_curr > max_t {
+                return false; // past the cap / the light → unshadowed
+            }
+            if self.sampler.hit(cellc).is_some() {
+                return true; // a surface blocks the ray
+            }
+            let axis = min_axis(t_max);
+            t_curr = t_max[axis];
+            cellc[axis] += step[axis];
+            t_max[axis] += t_delta[axis];
+        }
+        false
+    }
+}
+
 /// Walk mip-cells along the ray within `[lo_c, hi_c)` and return the
 /// first solid hit, with leak-free empty-space skipping (DDA.7 redux).
 ///
@@ -1224,18 +1344,44 @@ fn cell_walk_skip(
         prof::CELLS.with(|x| x.set(x.get() + 1));
         if let Some(color) = sampler.hit(cellc) {
             let bright_sub = side_shade_sub(env, last_axis, step);
-            // CPU.1 — dynamic lighting (flat per voxel, no shadows) when a rig
-            // is active; else the baked-byte `shade` path (byte-identical).
+            // CPU.1 — dynamic lighting (flat per voxel) when a rig is active;
+            // else the baked-byte `shade` path (byte-identical). CPU.2 — a
+            // sun/point shadow march reuses this same `sampler` (occupancy +
+            // box bounds); only built when a caster is actually flagged so
+            // the no-shadow rig stays march-free.
             let shaded = if env.lights.enabled {
-                shade_lit_cpu(
-                    color,
-                    bright_sub,
-                    last_axis,
-                    step,
-                    cellc,
-                    cell_size,
-                    &env.lights,
-                )
+                let casts = env.lights.shadow_strength > 0.0
+                    && (env.lights.sun_casts_shadow
+                        || env.lights.points.iter().any(|p| p.casts_shadow));
+                if casts {
+                    let mut sh = SamplerShadow {
+                        sampler: &mut *sampler,
+                        cell_size,
+                        lo_c,
+                        hi_c,
+                    };
+                    shade_lit_cpu(
+                        color,
+                        bright_sub,
+                        last_axis,
+                        step,
+                        cellc,
+                        cell_size,
+                        &env.lights,
+                        Some(&mut sh),
+                    )
+                } else {
+                    shade_lit_cpu(
+                        color,
+                        bright_sub,
+                        last_axis,
+                        step,
+                        cellc,
+                        cell_size,
+                        &env.lights,
+                        None,
+                    )
+                }
             } else {
                 shade(color, bright_sub)
             };
@@ -1612,8 +1758,8 @@ mod tests {
             sun_dir: [0.0, 0.0, 1.0],
             ..base
         }; // sun below the face
-        let lit = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &facing);
-        let dark = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &back);
+        let lit = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &facing, None);
+        let dark = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &back, None);
         assert!(
             lum(lit) > lum(dark),
             "sun facing the surface must brighten it: {lit:#08x} vs {dark:#08x}",
@@ -1639,14 +1785,129 @@ mod tests {
                 ..CpuLights::default()
             }
         };
-        let smooth_a = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.8, 0));
-        let smooth_b = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.9, 0));
+        let smooth_a = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.8, 0), None);
+        let smooth_b = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.9, 0), None);
         assert_ne!(smooth_a, smooth_b, "smooth diffuse must vary with N·L");
-        let cel_a = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.8, 2));
-        let cel_b = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.9, 2));
+        let cel_a = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.8, 2), None);
+        let cel_b = shade_lit_cpu(color, 0, 2, step, [0, 0, 0], 1.0, &mk(0.9, 2), None);
         assert_eq!(
             cel_a, cel_b,
             "cel banding must terrace both N·L to one level"
+        );
+    }
+
+    /// CPU.2 — the shadow application math (independent of the march): an
+    /// occluded sun-lit sample keeps only `1 - shadow_strength` of the sun
+    /// key, and `shadow_strength == 0` makes shadows invisible.
+    #[test]
+    fn shade_dynamic_sun_shadow_darkens() {
+        struct Mock(bool);
+        impl ShadowTester for Mock {
+            fn occluded(&mut self, _: [f32; 3], _: [f32; 3], _: f32) -> bool {
+                self.0
+            }
+        }
+        let l = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_dir: [0.0, 0.0, -1.0], // up = toward the sun
+            sun_color: [1.0; 3],
+            sun_intensity: 1.0,
+            sun_casts_shadow: true,
+            ambient: [0.2; 3],
+            shadow_strength: 0.7,
+            shadow_bias: 1.5,
+            shadow_max_dist: 64.0,
+            ..CpuLights::default()
+        };
+        let albedo = [0.8; 3];
+        let n = [0.0, 0.0, -1.0]; // up face, faces the sun
+        let s = [0.5, 0.5, 0.5];
+        let lit = shade_dynamic(albedo, 1.0, n, s, &l, Some(&mut Mock(false)));
+        let shadowed = shade_dynamic(albedo, 1.0, n, s, &l, Some(&mut Mock(true)));
+        assert!(
+            lum(shadowed) < lum(lit),
+            "an occluded sun face must darken: shadowed={shadowed:#08x} lit={lit:#08x}",
+        );
+        // strength 0 ⇒ no visible shadow even when occluded.
+        let l0 = CpuLights {
+            shadow_strength: 0.0,
+            ..l
+        };
+        assert_eq!(
+            shade_dynamic(albedo, 1.0, n, s, &l0, Some(&mut Mock(true))),
+            shade_dynamic(albedo, 1.0, n, s, &l0, Some(&mut Mock(false))),
+            "shadow_strength 0 ⇒ shadows invisible",
+        );
+    }
+
+    /// CPU.2 — the actual [`SamplerShadow`] march casts a sun shadow through
+    /// the grid: a wall on a floor, lit by a grazing sun, darkens the floor
+    /// in the wall's shadow. Total scene luminance with shadows enabled is
+    /// strictly less than with them off (shadows only ever subtract), and
+    /// the gap is non-trivial (a real shadow, not FP noise).
+    #[test]
+    fn sampler_shadow_march_casts_sun_shadow() {
+        // Floor at z>=60; a thin wall at x==32 rising from the floor (z 30..60).
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, _y, z| {
+            if z >= 60 {
+                Some(0x80_80_80_80) // floor
+            } else if x == 32 && (30..60).contains(&z) {
+                Some(0x80_70_70_70) // wall (distinct so it's not a dead branch)
+            } else {
+                None
+            }
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+        // Straight-down camera over the floor (voxlap z-down: forward = +z).
+        let cam = Camera {
+            pos: [32.0, 32.0, 6.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        // Sun grazing from +x and above ⇒ the wall shadows the floor at x<32.
+        let inv = 1.0f32 / 2.0f32.sqrt();
+        let base = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_dir: [inv, 0.0, -inv],
+            sun_color: [1.0; 3],
+            sun_intensity: 1.0,
+            ambient: [0.25; 3],
+            shadow_strength: 0.8,
+            shadow_bias: 1.5,
+            shadow_max_dist: 128.0,
+            ..CpuLights::default()
+        };
+        let (w, h) = (96u32, 96u32);
+        let lit_env = DdaEnv {
+            lights: CpuLights {
+                sun_casts_shadow: false,
+                ..base
+            },
+            ..DdaEnv::default()
+        };
+        let shadow_env = DdaEnv {
+            lights: CpuLights {
+                sun_casts_shadow: true,
+                ..base
+            },
+            ..DdaEnv::default()
+        };
+        let (fb_lit, _) = render_brickmap_env(grid, &cam, w, h, &lit_env);
+        let (fb_sh, _) = render_brickmap_env(grid, &cam, w, h, &shadow_env);
+        let sum: fn(&[u32]) -> u64 = |fb| fb.iter().map(|&p| u64::from(lum(p))).sum();
+        let lit_sum = sum(&fb_lit);
+        let sh_sum = sum(&fb_sh);
+        assert!(
+            sh_sum < lit_sum,
+            "the wall's shadow must darken the floor: shadow_sum={sh_sum} lit_sum={lit_sum}",
+        );
+        // Non-trivial: at least a few % of the lit total was removed.
+        assert!(
+            (lit_sum - sh_sum) * 50 > lit_sum,
+            "shadow should remove >2% of total luminance: lit={lit_sum} shadow={sh_sum}",
         );
     }
 

@@ -1,10 +1,11 @@
 //! The **Lighting** scene (DL stage): runtime dynamic lighting — a sweeping
 //! coloured **sun** that casts hard shadows, plus three orbiting coloured
 //! **point lights** (two shadow-casting, one not). The diffuse stylized
-//! lighting (sun + points + cel + ramp, flat per voxel) runs on **both**
-//! backends (CPU.1); **shadows are GPU-only** (the per-pixel shadow march is
-//! too costly for the CPU fallback), so on CPU the geometry is lit but
-//! unshadowed.
+//! lighting (sun + points + cel + ramp, flat per voxel) **and** the hard
+//! voxel shadows run on **both** backends — GPU per-pixel (`shade_lit` +
+//! `shadow_occluded`), CPU per-(voxel,face) via the render Sampler (CPU.1 +
+//! CPU.2). The CPU shadow march is the slow fallback's slowest path but is
+//! on visual parity with the GPU.
 //!
 //! Layout (camera looks +y): a grass floor with four stone pillars and a
 //! central monument. The sun rotates overhead so the pillars' shadows sweep
@@ -12,8 +13,7 @@
 //! light that the shadow-casters occlude behind the pillars.
 //!
 //! The baked brightness byte acts as a dim **ambient** fill (locked
-//! decision #2); the sun + point lights are the runtime key/fill, composed
-//! in the GPU scene-DDA shader (`shade_lit` + `shadow_occluded`). See
+//! decision #2); the sun + point lights are the runtime key/fill. See
 //! `PORTING-DYNLIGHT.md`.
 //!
 //! Controls: WASD+mouse fly · `P` pause the sun · `K` toggle sun shadows ·
@@ -194,7 +194,7 @@ impl DemoScene for LightingScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD fly · P: pause sun · K: shadows (GPU) · L: points · J: stylized · [ ]: bands · N/M: AO depth"
+        "WASD fly · P: pause sun · K: shadows · L: points · J: stylized · [ ]: bands · N/M: AO depth"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -360,7 +360,7 @@ impl DemoScene for LightingScene {
                 },
             ),
             format!("baked AO depth {:.2} (N/M)", self.ao_strength),
-            "dynamic lighting both backends · shadows GPU-only".to_string(),
+            "dynamic lighting + shadows on both backends".to_string(),
         ]
     }
 }

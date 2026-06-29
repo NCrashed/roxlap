@@ -785,7 +785,8 @@ pub fn draw_sprite_dense_shaded(
                         ((color >> 8) & 0xff) as f32 / 255.0,
                         (color & 0xff) as f32 / 255.0,
                     ];
-                    shade_dynamic(albedo, 1.0, n_world, center, &dl)
+                    // No sprite shadows (matches the GPU) → no shadow tester.
+                    shade_dynamic(albedo, 1.0, n_world, center, &dl, None)
                 } else {
                     shade(color, 0)
                 };

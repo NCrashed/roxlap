@@ -845,20 +845,14 @@ impl CpuBackend {
             *z = f32::INFINITY;
         }
 
-        // CPU.1 — world-space dynamic lights for the diffuse stylized path
-        // (the scene renderer transforms them per grid). `None` ⇒ disabled
-        // (the baked-byte fallback, byte-identical to pre-DL). Shadows are
-        // GPU-only, so the CPU path never marches shadow rays.
+        // CPU.1/CPU.2 — world-space dynamic lights for the diffuse stylized
+        // path (the scene renderer transforms them per grid). `None` ⇒
+        // disabled (the baked-byte fallback, byte-identical to pre-DL).
+        // CPU.2 casts hard sun + point-light shadows; the per-pixel shadow
+        // march reuses the render Sampler, so it's the slow fallback's
+        // slowest path — but correct + on parity with the GPU look.
         let mut world_points: Vec<roxlap_core::CpuPointLight> = Vec::new();
         let cpu_lights = if let Some(rig) = frame.lights {
-            for p in rig.points {
-                world_points.push(roxlap_core::CpuPointLight {
-                    pos: p.position,
-                    color: p.color,
-                    intensity: p.intensity,
-                    radius: p.radius,
-                });
-            }
             let (sun, sun_dir, sun_color, sun_intensity) = match rig.sun {
                 Some(s) => {
                     // Direction TO the sun = normalized −travel.
@@ -873,16 +867,52 @@ impl CpuBackend {
                 }
                 None => (false, [0.0; 3], [0.0; 3], 0.0),
             };
+            let sun_casts = rig.sun.is_some_and(|s| s.casts_shadow);
+            // CPU.2 — mirror the GPU MAX_SHADOW_CASTERS cap (the sun is the
+            // first caster); demote the excess to shadowless, never silently.
+            let mut budget = roxlap_gpu::MAX_SHADOW_CASTERS;
+            if sun && sun_casts {
+                budget = budget.saturating_sub(1);
+            }
+            let mut demoted = 0usize;
+            for p in rig.points {
+                let allow = if p.casts_shadow && budget > 0 {
+                    budget -= 1;
+                    true
+                } else {
+                    if p.casts_shadow {
+                        demoted += 1;
+                    }
+                    false
+                };
+                world_points.push(roxlap_core::CpuPointLight {
+                    pos: p.position,
+                    color: p.color,
+                    intensity: p.intensity,
+                    radius: p.radius,
+                    casts_shadow: allow,
+                });
+            }
+            if demoted > 0 {
+                eprintln!(
+                    "roxlap CPU: {demoted} shadow-casting point lights > MAX_SHADOW_CASTERS ({}); demoting the excess to shadowless",
+                    roxlap_gpu::MAX_SHADOW_CASTERS
+                );
+            }
             roxlap_core::CpuLights {
                 enabled: true,
                 sun,
                 sun_dir,
                 sun_color,
                 sun_intensity,
+                sun_casts_shadow: sun && sun_casts,
                 points: &world_points,
                 ambient: rig.ambient,
                 bands: rig.bands,
                 shadow_tint: rig.shadow_tint,
+                shadow_strength: rig.shadow_strength,
+                shadow_bias: rig.shadow_bias_voxels,
+                shadow_max_dist: rig.shadow_max_dist,
             }
         } else {
             roxlap_core::CpuLights::default()

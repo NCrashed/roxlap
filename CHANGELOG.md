@@ -28,13 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of seeing fake air-above / bedrock-below at the boundary; the
   scene-graph `bake_lightmode` and the demo bakes use it.
 
-- **Dynamic lighting** (macro-stage DL; `PORTING-DYNLIGHT.md`) — runtime,
-  **GPU-only** lighting layered on the scene-DDA raymarcher: one coloured
-  directional **sun**, several coloured **point lights**, and **stylized hard
-  voxel shadows** cast by the sun and a chosen subset of point lights (the rest
-  shadowless). The baked brightness byte is reinterpreted as the ambient/AO
-  fill (`out = albedo·ambient + Σ direct`); the CPU backend ignores lights and
-  keeps the baked path. Lights are per-frame via `FrameParams.lights`
+- **Dynamic lighting** (macro-stage DL; `PORTING-DYNLIGHT.md`) — runtime
+  lighting layered on the scene-DDA raymarcher: one coloured directional
+  **sun**, several coloured **point lights**, and **stylized hard voxel
+  shadows** cast by the sun and a chosen subset of point lights (the rest
+  shadowless). Started GPU-only, then brought to full **CPU parity** (CPU.1 +
+  CPU.2 below). The baked brightness byte is reinterpreted as the ambient/AO
+  fill (`out = albedo·ambient + Σ direct`). Lights are per-frame via
+  `FrameParams.lights`
   (`LightRig { sun, points, ambient, shadow_strength, shadow_bias_voxels,
   shadow_max_dist }`); `None` ⇒ byte-identical to pre-DL. New `DirectionalLight`
   / `PointLight` / `LightRig` types in `roxlap-render`.
@@ -73,12 +74,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **CPU diffuse lighting** (CPU.1) — the dynamic lighting now also runs on the
     **CPU** backend (sun + point lights + cel + ramp, flat per voxel), terrain
     **and** sprites/clips, so the same `FrameParams.lights` rig lights both
-    backends. **Shadows stay GPU-only** (the per-pixel shadow march is too
-    costly for the CPU fallback), so CPU geometry is lit but unshadowed. Diffuse
-    is arithmetic-only, so it's effectively free on the (bandwidth-bound) CPU
-    path. `lights: None` keeps the CPU path byte-identical to the
-    baked-brightness render. (CPU sprites use the DDA face normal — flat per
-    voxel — since the CPU sprite store has no per-voxel normals.)
+    backends. Diffuse is arithmetic-only, so it's effectively free on the
+    (bandwidth-bound) CPU path. `lights: None` keeps the CPU path byte-identical
+    to the baked-brightness render. (CPU sprites use the DDA face normal — flat
+    per voxel — since the CPU sprite store has no per-voxel normals.)
+  - **CPU hard shadows** (CPU.2) — the CPU backend now casts the sun + point
+    shadows too, so both backends are on full parity. A shadow ray marches a
+    3D-DDA toward each caster through the same render `Sampler` occupancy the
+    camera ray uses (bounded by `shadow_max_dist` / the light distance), and an
+    occluded sample keeps `1 − shadow_strength` of that caster; the same
+    `MAX_SHADOW_CASTERS` cap as the GPU applies (excess point casters demoted
+    with a warning). Only marched when a caster is flagged and
+    `shadow_strength > 0`, so an unshadowed rig (and `lights: None`) stays
+    march-free and byte-identical. Sprites are unshadowed (matching the GPU).
+    This is the slow CPU fallback's slowest path, but correct and on visual
+    parity with the GPU.
 
 ## [0.17.0] — 2026-06-28
 
