@@ -281,6 +281,7 @@ impl GpuBackend {
                 transform: SpriteInstanceTransform::from_sprite(&s),
                 material: s.material,
                 alpha_mul: s.alpha_mul,
+                flags: s.flags,
             });
             basis.push(s);
         }
@@ -330,6 +331,7 @@ impl GpuBackend {
             transform: SpriteInstanceTransform::from_sprite(&s),
             material: s.material,
             alpha_mul: s.alpha_mul,
+            flags: s.flags,
         };
         self.gpu.append_sprite_instances(registry, &[inst]);
         self.sprite_instances.push(inst);
@@ -590,6 +592,7 @@ impl GpuBackend {
             transform: SpriteInstanceTransform::from_sprite(&s),
             material: s.material,
             alpha_mul: s.alpha_mul,
+            flags: s.flags,
         };
         self.gpu.append_sprite_instances(registry, &[inst]);
         self.sprite_instances.push(inst);
@@ -696,6 +699,7 @@ impl GpuBackend {
                     transform: SpriteInstanceTransform::from_sprite(limb),
                     material: limb.material,
                     alpha_mul: limb.alpha_mul,
+                    flags: limb.flags,
                 });
                 self.sprite_basis.push(limb.clone());
             }

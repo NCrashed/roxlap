@@ -45,8 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     receiving hard shadows via `SPRITE_FLAG_NO_SHADOW_CAST` /
     `SPRITE_FLAG_NO_SHADOW_RECEIVE` (both default to participating), with
     `Sprite::{casts_shadow, receives_shadow, with_casts_shadow,
-    with_receives_shadow}` helpers. Honored on the CPU backend (a non-caster is
-    excluded from the sprite occluder; a non-receiver isn't darkened).
+    with_receives_shadow}` helpers. Honored on both backends.
+  - **GPU sprites receive terrain shadows** (XS.4.2) — on devices that grant
+    enough storage buffers (`GpuRenderer::sprite_shadows_capable()`), the sprite
+    pass marches the terrain occupancy (the scene pass's exact ABI, spliced in
+    from `sprite_terrain_shadow.wgsl`) so a sprite is darkened where terrain (or
+    another grid) blocks the sun / a point light. Needed raising the device
+    storage-buffer request to 22 (`pick_required_limits`); devices below that
+    fall back to unshadowed GPU sprites. Per-instance `receives_shadow` honored.
 - **Voxel ambient occlusion** (macro-stage AO) — a CPU bake pass that writes
   per-voxel ambient occlusion into the brightness byte, which the dynamic
   lighting (DL) reads as its ambient/AO fill: open surfaces stay bright while

@@ -728,7 +728,20 @@ struct SpriteModelUniform {
     shadow_tint: [f32; 4],
     /// Cel band count; 0 = smooth.
     style_bands: u32,
-    _pad_dl2: [u32; 3],
+    // ── XS.4.2 — GPU sprite-shadow (receive) params. Mirror the scene pass's
+    // paging + shadow uniform fields so the sprite pass's duplicated terrain
+    // occupancy march reads the exact same ABI. All zero ⇒ no sprite shadows
+    // (the capability fallback / pre-XS.4 path). ──
+    occ_num_pages: u32,
+    occ_page_words: u32,
+    grid_count: u32,
+    max_outer_steps: u32,
+    shadow_max_steps: u32,
+    shadow_bias: f32,
+    shadow_max_dist: f32,
+    /// Fraction of a caster's light removed in shadow (`in_shadow = 1 - this`).
+    shadow_strength: f32,
+    _pad_xs: [u32; 3],
 }
 
 /// GPU.10.3 — sprite screen-tile edge in pixels for instance binning.
@@ -2547,13 +2560,19 @@ impl GpuRenderer {
                         radius: l.radius,
                         color: l.color,
                         intensity: l.intensity,
-                        casts_shadow: 0, // no sprite shadows in DL.4
+                        // XS.4.2 — honour the light's caster flag so a
+                        // receiving sprite is shadowed by it (capable devices).
+                        casts_shadow: u32::from(l.casts_shadow),
                         _pad: [0; 3],
                     })
                     .collect();
                 let sprite_point_count = sprite_pts.len() as u32;
                 let sprite_point_buf = upload_grid_point_lights(&self.device, &sprite_pts);
-                let sprite_sun_flags = u32::from(sprite_sun_enabled) | (u32::from(dl.enabled) << 2);
+                // sun_flags bit0 = sun enabled, bit1 = sun casts shadow (XS.4.2),
+                // bit2 = dynamic lighting active.
+                let sprite_sun_flags = u32::from(sprite_sun_enabled)
+                    | (u32::from(dl.sun_casts_shadow) << 1)
+                    | (u32::from(dl.enabled) << 2);
                 let uni = SpriteModelUniform {
                     cam_pos: cam.position,
                     _p0: 0.0,
@@ -2594,77 +2613,112 @@ impl GpuRenderer {
                     _pad_dl: [0; 2],
                     shadow_tint: [dl.shadow_tint[0], dl.shadow_tint[1], dl.shadow_tint[2], 0.0],
                     style_bands: dl.style_bands,
-                    _pad_dl2: [0; 3],
+                    // XS.4.2 — sprite-shadow (receive) ABI, mirroring the scene
+                    // pass. Only consulted when the device is sprite-shadow
+                    // capable (the shadowed shader variant is built); otherwise
+                    // the stub `sprite_shadow_occluded` ignores them.
+                    occ_num_pages: scene.occupancy_num_pages,
+                    occ_page_words: scene.occupancy_page_words,
+                    grid_count: scene.grid_count,
+                    max_outer_steps,
+                    shadow_max_steps: dl.shadow_max_steps,
+                    shadow_bias: dl.shadow_bias,
+                    shadow_max_dist: dl.shadow_max_dist,
+                    shadow_strength: dl.shadow_strength,
+                    _pad_xs: [0; 3],
                 };
                 self.queue
                     .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));
+                let mut sprite_entries = vec![
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: smd.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: reg.occupancy.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: reg.colors.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: reg.color_offsets.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: reg.model_meta.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: reg.instances.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: dda.depth_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: dda.framebuffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: reg.tile_ranges.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: reg.tile_instances.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: reg.dirs.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: reg.colmul.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 12,
+                        resource: smd.materials_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 13,
+                        resource: reg.materials_vox.as_entire_binding(),
+                    },
+                    // DL.7 — world point lights (15). (Binding 14 univec
+                    // normal table dropped — face-normal lighting now.)
+                    wgpu::BindGroupEntry {
+                        binding: 15,
+                        resource: sprite_point_buf.as_entire_binding(),
+                    },
+                ];
+                // XS.4.2 — when capable, bind the terrain occupancy set (the
+                // same resident buffers + the per-frame grid cameras the scene
+                // pass uses) so sprite shadow rays march terrain. Must match
+                // the BGL built in `build_sprite_model_dda`.
+                if self.sprite_shadows_capable {
+                    let terrain: [(u32, &wgpu::Buffer); 8] = [
+                        (16, &scene.occupancy_pages[0]),
+                        (17, &scene.occupancy_pages[1]),
+                        (18, &scene.occupancy_pages[2]),
+                        (19, &scene.occupancy_pages[3]),
+                        (20, &scene.all_chunk_occupancy),
+                        (21, &scene.all_slot_chunk_idx),
+                        (22, &scene.grid_static_meta),
+                        (23, &grid_cameras),
+                    ];
+                    for (binding, buf) in terrain {
+                        sprite_entries.push(wgpu::BindGroupEntry {
+                            binding,
+                            resource: buf.as_entire_binding(),
+                        });
+                    }
+                }
                 Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("roxlap-gpu sprite_model_dda.bg"),
                     layout: &smd.bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: smd.uniform_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: reg.occupancy.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: reg.colors.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: reg.color_offsets.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: reg.model_meta.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: reg.instances.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: dda.depth_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 7,
-                            resource: dda.framebuffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 8,
-                            resource: reg.tile_ranges.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 9,
-                            resource: reg.tile_instances.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 10,
-                            resource: reg.dirs.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 11,
-                            resource: reg.colmul.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 12,
-                            resource: smd.materials_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 13,
-                            resource: reg.materials_vox.as_entire_binding(),
-                        },
-                        // DL.7 — world point lights (15). (Binding 14 univec
-                        // normal table dropped — face-normal lighting now.)
-                        wgpu::BindGroupEntry {
-                            binding: 15,
-                            resource: sprite_point_buf.as_entire_binding(),
-                        },
-                    ],
+                    entries: &sprite_entries,
                 }))
             }
             _ => None,
@@ -4094,35 +4148,51 @@ impl GpuRenderer {
     /// GPU.10.1 — build the instanced model-DDA pipeline (one thread
     /// per pixel). Lazily invoked the first frame a registry is present.
     fn build_sprite_model_dda(&self) -> SpriteModelDdaResources {
+        // XS.4.2 — on sprite-shadow-capable devices, splice the terrain shadow
+        // snippet over the stub (`shadow_occluded_world` becomes a real terrain
+        // march; binds occupancy 16..23). Otherwise the stub keeps sprites
+        // unshadowed and the BGL stays at the base 14 storage buffers.
+        let capable = self.sprite_shadows_capable;
+        let src = sprite_shader_source(capable);
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("sprite_model_dda.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../shaders/sprite_model_dda.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
             });
+        let mut entries = vec![
+            bgl_uniform_entry(0),
+            bgl_storage_entry(1, true),  // occupancy
+            bgl_storage_entry(2, true),  // colors
+            bgl_storage_entry(3, true),  // color_offsets
+            bgl_storage_entry(4, true),  // model_meta
+            bgl_storage_entry(5, true),  // instances
+            bgl_storage_entry(6, true),  // scene depth
+            bgl_storage_entry(7, false), // framebuffer (read-write buffer)
+            bgl_storage_entry(8, true),  // tile_ranges
+            bgl_storage_entry(9, true),  // tile_instances
+            bgl_storage_entry(10, true), // per-voxel dir
+            bgl_storage_entry(11, true), // per-instance kv6colmul
+            bgl_storage_entry(12, true), // TV — material palette
+            bgl_storage_entry(13, true), // TV.3 — per-voxel material id
+            bgl_storage_entry(15, true), // DL.7 — world point lights
+        ];
+        if capable {
+            // XS.4.2 — terrain occupancy set for sprite RECEIVE shadows.
+            entries.push(bgl_storage_entry(16, true)); // occ_page0
+            entries.push(bgl_storage_entry(17, true)); // occ_page1
+            entries.push(bgl_storage_entry(18, true)); // occ_page2
+            entries.push(bgl_storage_entry(19, true)); // occ_page3
+            entries.push(bgl_storage_entry(20, true)); // all_chunk_occupancy
+            entries.push(bgl_storage_entry(21, true)); // all_slot_chunk_idx
+            entries.push(bgl_storage_entry(22, true)); // grid_static_meta
+            entries.push(bgl_storage_entry(23, true)); // grid_cameras
+        }
         let bgl = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("roxlap-gpu sprite_model_dda.bgl"),
-                entries: &[
-                    bgl_uniform_entry(0),
-                    bgl_storage_entry(1, true),  // occupancy
-                    bgl_storage_entry(2, true),  // colors
-                    bgl_storage_entry(3, true),  // color_offsets
-                    bgl_storage_entry(4, true),  // model_meta
-                    bgl_storage_entry(5, true),  // instances
-                    bgl_storage_entry(6, true),  // scene depth
-                    bgl_storage_entry(7, false), // framebuffer (read-write buffer)
-                    bgl_storage_entry(8, true),  // tile_ranges
-                    bgl_storage_entry(9, true),  // tile_instances
-                    bgl_storage_entry(10, true), // per-voxel dir
-                    bgl_storage_entry(11, true), // per-instance kv6colmul
-                    bgl_storage_entry(12, true), // TV — material palette
-                    bgl_storage_entry(13, true), // TV.3 — per-voxel material id
-                    bgl_storage_entry(15, true), // DL.7 — world point lights
-                ],
+                entries: &entries,
             });
         let pl = self
             .device
@@ -4774,6 +4844,32 @@ pub(crate) fn pick_required_limits(adapter_limits: &wgpu::Limits) -> wgpu::Limit
     }
 }
 
+/// XS.4.2 — build the sprite-pass shader source. On a sprite-shadow-capable
+/// device, splice `sprite_terrain_shadow.wgsl` over the `//XS4_STUB_BEGIN`..
+/// `//XS4_STUB_END` block so `shadow_occluded_world` becomes the real terrain
+/// march (+ the occupancy bindings 16..23); otherwise the stub keeps GPU
+/// sprites unshadowed. The base file is always valid WGSL (the stub variant),
+/// so `wgsl_shaders_validate` covers the fallback path.
+fn sprite_shader_source(capable: bool) -> String {
+    let base = include_str!("../shaders/sprite_model_dda.wgsl");
+    if !capable {
+        return base.to_string();
+    }
+    let snippet = include_str!("../shaders/sprite_terrain_shadow.wgsl");
+    const BEGIN: &str = "//XS4_STUB_BEGIN";
+    const END: &str = "//XS4_STUB_END";
+    let (Some(b), Some(e)) = (base.find(BEGIN), base.find(END)) else {
+        // Markers missing — fail loud rather than silently shipping the stub.
+        panic!("sprite_model_dda.wgsl: XS4 stub markers not found");
+    };
+    let e_end = e + END.len();
+    let mut out = String::with_capacity(base.len() + snippet.len());
+    out.push_str(&base[..b]);
+    out.push_str(snippet);
+    out.push_str(&base[e_end..]);
+    out
+}
+
 /// XS.4 — storage buffers per shader stage needed for GPU sprite shadows. The
 /// sprite pass binds its own 14 + the terrain occupancy set (occupancy pages
 /// 0..3, chunk occupancy, slot index, grid meta, per-grid cameras) to march
@@ -4893,6 +4989,19 @@ mod pixel_ray_tests {
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{name}: WGSL validation failed: {e:?}"));
         }
+        // XS.4.2 — the raw `sprite_model_dda.wgsl` above is the unshadowed STUB
+        // variant; also validate the sprite-shadow-CAPABLE spliced variant (the
+        // terrain-shadow snippet injected) that capable devices build.
+        let capable = super::sprite_shader_source(true);
+        let module = naga::front::wgsl::parse_str(&capable).unwrap_or_else(|e| {
+            panic!(
+                "sprite_model_dda.wgsl (capable): parse failed:\n{}",
+                e.emit_to_string(&capable)
+            )
+        });
+        validator.validate(&module).unwrap_or_else(|e| {
+            panic!("sprite_model_dda.wgsl (capable): validation failed: {e:?}")
+        });
     }
 
     /// A 2×2 world quad centred straight ahead projects to vertices whose

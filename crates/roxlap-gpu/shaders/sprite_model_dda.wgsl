@@ -28,7 +28,7 @@ struct Instance {
     model_id: u32,
     material: u32,    // TV: id into the material palette
     alpha_mul: f32,   // TV: per-instance alpha multiplier (0..1)
-    _pad0: u32,
+    flags: u32,       // XS.4: shadow bits (4=NO_CAST, 5=NO_RECEIVE); 0 = both
     _pad1: u32,
 };
 // TV: one global-palette material (binding 12). `mode` is the
@@ -61,10 +61,19 @@ struct Uniform {
     // ── DL.6 — stylized lighting for sprites (cel + ramp + flat per voxel) ──
     shadow_tint: vec4<f32>, // rgb = cool unlit end of the sun ramp
     style_bands: u32,       // 0 = smooth; ≥1 = quantize + gradient-map
-    // Scalar pads (NOT vec3<u32> — its 16-align would mismatch Rust [u32;3]).
-    _pad_dl2: u32,
-    _pad_dl3: u32,
-    _pad_dl4: u32,
+    // ── XS.4.2 — sprite-shadow (receive) ABI, mirroring scene_dda. The
+    // shadowed shader variant's terrain occupancy march reads these. ──
+    occ_num_pages: u32,
+    occ_page_words: u32,
+    grid_count: u32,
+    max_outer_steps: u32,
+    shadow_max_steps: u32,
+    shadow_bias: f32,
+    shadow_max_dist: f32,
+    shadow_strength: f32,    // in_shadow = 1 - this
+    _pad_xs0: u32,
+    _pad_xs1: u32,
+    _pad_xs2: u32,
 };
 // DL.4 — world-space point light (std430, 48 bytes). Mirrors GpuPointLight.
 struct PointLight {
@@ -108,6 +117,29 @@ struct PointLight {
 // voxlap univec normal table; dropped — sprite lighting uses the DDA hit-face
 // normal now, like terrain + CPU, for robustness + the flat-per-voxel look.)
 @group(0) @binding(15) var<storage, read> point_lights: array<PointLight>;
+
+// Defined before the XS.4.2 splice point: the injected terrain-shadow snippet
+// (and `march_instance`) call it, and WGSL has no forward declaration.
+fn shield_parallel(t: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
+    var o = t;
+    if (dir.x == 0.0) { o.x = T_INF; }
+    if (dir.y == 0.0) { o.y = T_INF; }
+    if (dir.z == 0.0) { o.z = T_INF; }
+    return o;
+}
+
+// ── XS.4.2 — sprites RECEIVE terrain shadows. This stub keeps GPU sprites
+// unshadowed (the default / capability-fallback path). On sprite-shadow-capable
+// devices the renderer SPLICES sprite_terrain_shadow.wgsl over the whole marker
+// block below (terrain occupancy bindings 16..23 + the real cross-grid
+// marcher), so shade_sprite_lit's call to shadow_occluded_world becomes a real
+// terrain shadow test. The splice keys on the marker comment lines, so they
+// must appear ONLY here (not in prose). ──
+//XS4_STUB_BEGIN
+fn shadow_occluded_world(origin_w: vec3<f32>, dir_w: vec3<f32>, max_t: f32) -> bool {
+    return false;
+}
+//XS4_STUB_END
 
 fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
     let fog_near = u.fog_color.w;
@@ -219,10 +251,26 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
     let vox_center = inst.pos + m2w * ((vec3<f32>(p) + vec3<f32>(0.5) - m.pivot) * m.voxel_world_size);
     let sample = select(hit_world, vox_center, styled);
 
-    // Sun key (0..1): N·L (no sprite shadows).
+    // XS.4.2 — this sprite receives shadows unless flagged NO_SHADOW_RECEIVE
+    // (bit5). The shadow ray is world-space (sprites are world-space); biased
+    // off the surface to avoid acne. `shadow_occluded_world` is the real
+    // terrain march on capable devices, else the stub (always unshadowed).
+    let recv = (inst.flags & 32u) == 0u;
+    let shadow_origin_w = sample + n_world * u.shadow_bias;
+    let in_shadow = 1.0 - u.shadow_strength;
+
+    // Sun key (0..1): N·L × shadow factor.
     var sun_key = 0.0;
     if ((u.sun_flags & 1u) != 0u) {
-        sun_key = max(0.0, dot(n_world, u.sun_dir.xyz));
+        let ndl = max(0.0, dot(n_world, u.sun_dir.xyz));
+        if (ndl > 0.0) {
+            var sh = 1.0;
+            if (recv && (u.sun_flags & 2u) != 0u
+                && shadow_occluded_world(shadow_origin_w, u.sun_dir.xyz, u.shadow_max_dist)) {
+                sh = in_shadow;
+            }
+            sun_key = ndl * sh;
+        }
     }
 
     var lit: vec3<f32>;
@@ -241,21 +289,21 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
         if (dist < pl.radius && dist > 1e-4) {
             let ndl = max(0.0, dot(n_world, d3 / dist));
             if (ndl > 0.0) {
-                var f = ndl * point_falloff(dist, pl.radius);
+                var sh = 1.0;
+                if (recv && pl.casts_shadow != 0u) {
+                    let to_light = pl.pos - shadow_origin_w;
+                    let mt = length(to_light);
+                    if (mt > 1e-4 && shadow_occluded_world(shadow_origin_w, to_light / mt, mt)) {
+                        sh = in_shadow;
+                    }
+                }
+                var f = ndl * point_falloff(dist, pl.radius) * sh;
                 if (styled) { f = cel_band(f, u.style_bands); }
                 lit = lit + albedo * pl.color * pl.intensity * f;
             }
         }
     }
     return lit;
-}
-
-fn shield_parallel(t: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
-    var o = t;
-    if (dir.x == 0.0) { o.x = T_INF; }
-    if (dir.y == 0.0) { o.y = T_INF; }
-    if (dir.z == 0.0) { o.z = T_INF; }
-    return o;
 }
 
 // March one instance; returns the hit t (or `limit` on miss) and

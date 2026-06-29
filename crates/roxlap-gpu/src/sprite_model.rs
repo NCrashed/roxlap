@@ -748,7 +748,7 @@ fn make_cull(registry: &SpriteModelRegistry, i: &SpriteInstance) -> CullInstance
             model_id: i.model_id, // placeholder; cull rewrites per frame
             material: u32::from(i.material),
             alpha_mul: f32::from(i.alpha_mul) / 255.0,
-            _pad0: 0,
+            flags: i.flags,
             _pad1: 0,
         },
         chain_id: i.model_id,
@@ -783,11 +783,15 @@ pub struct SpriteInstance {
     /// Per-instance alpha multiplier (TV stage), `0..=255` (`255` =
     /// unscaled, the default).
     pub alpha_mul: u8,
+    /// XS.4 — sprite shadow flags (`roxlap_formats::sprite` bits 4/5:
+    /// `NO_SHADOW_CAST` / `NO_SHADOW_RECEIVE`). `0` (default) ⇒ casts +
+    /// receives. Only honoured when the device is sprite-shadow capable.
+    pub flags: u32,
 }
 
 impl SpriteInstance {
     /// A model reference + pose with the default opaque material
-    /// (`material = 0`, `alpha_mul = 255`).
+    /// (`material = 0`, `alpha_mul = 255`) and shadows on (`flags = 0`).
     #[must_use]
     pub fn new(model_id: u32, transform: SpriteInstanceTransform) -> Self {
         Self {
@@ -795,6 +799,7 @@ impl SpriteInstance {
             transform,
             material: 0,
             alpha_mul: 255,
+            flags: 0,
         }
     }
 }
@@ -833,7 +838,9 @@ struct SpriteInstanceGpu {
     material: u32,
     /// TV: per-instance alpha multiplier, normalised to `0..=1`.
     alpha_mul: f32,
-    _pad0: u32,
+    /// XS.4 — sprite shadow flags (mirror of `roxlap_formats::sprite` bits 4/5):
+    /// bit4 = NO_SHADOW_CAST, bit5 = NO_SHADOW_RECEIVE. `0` ⇒ casts + receives.
+    flags: u32,
     _pad1: u32,
 }
 
