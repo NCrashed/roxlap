@@ -59,6 +59,34 @@ pub(crate) const ESTNORMRAD: i32 = 2;
 pub(crate) const AO_RAD: i32 = 1;
 const _: () = assert!(AO_RAD <= ESTNORMRAD);
 
+/// AO.0 — how dark a fully-occluded voxel gets, as a fraction removed from
+/// the open-voxel ambient. `0.8` ⇒ a deep crevice keeps 20% of the ambient.
+pub(crate) const AO_STRENGTH: f32 = 0.8;
+
+/// AO.2 — tunable ambient-occlusion bake parameters (the `lightmode == 3`
+/// knobs). [`Default`] matches the AO.0/AO.1 constants.
+#[derive(Clone, Copy, Debug)]
+pub struct AoParams {
+    /// Fraction of ambient removed at full occlusion (`0` = off, `1` = black
+    /// crevices before `min_floor`).
+    pub strength: f32,
+    /// Sampling reach in voxels (clamped to `ESTNORMRAD`). `1` = tight edge.
+    pub radius: i32,
+    /// Lower bound on the darkening factor — crevices never dim below
+    /// `min_floor` of the open ambient (`0` ⇒ governed by `strength` alone).
+    pub min_floor: f32,
+}
+
+impl Default for AoParams {
+    fn default() -> Self {
+        Self {
+            strength: AO_STRENGTH,
+            radius: AO_RAD,
+            min_floor: 0.0,
+        }
+    }
+}
+
 /// `bits k..31 set, low k bits clear` (`!0 << k`). Used by
 /// [`expandbit256`] to fill from an air→solid transition up to the
 /// top of a 32-bit word.
@@ -346,9 +374,11 @@ impl EstNormCache {
     /// `estnorm` gradient normal, which tilts near a convex edge and would make
     /// a voxel's own folded-over surface (e.g. a pillar's top above its side
     /// face) count as occlusion — the "pillow" border on every edge.
+    /// `radius` is the sampling reach (clamped to `ESTNORMRAD`, the cache's
+    /// padding); `1` = a tight 1-voxel concave edge, `2` = a wider contact.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
-    pub fn ambient_occlusion(&self, x: i32, y: i32, z: i32) -> f32 {
+    pub fn ambient_occlusion(&self, x: i32, y: i32, z: i32, radius: i32) -> f32 {
         const FACES: [[i32; 3]; 6] = [
             [-1, 0, 0],
             [1, 0, 0],
@@ -357,6 +387,7 @@ impl EstNormCache {
             [0, 0, -1],
             [0, 0, 1],
         ];
+        let r = radius.clamp(1, ESTNORMRAD);
         let cx = (x - self.origin_x) as i32;
         let cy = (y - self.origin_y) as i32;
         let mut occ = 0.0f32;
@@ -366,9 +397,9 @@ impl EstNormCache {
             if self.solid((cx + f[0]) as usize, (cy + f[1]) as usize, z + f[2]) {
                 continue;
             }
-            for dy in -AO_RAD..=AO_RAD {
-                for dx in -AO_RAD..=AO_RAD {
-                    for dz in -AO_RAD..=AO_RAD {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    for dz in -r..=r {
                         // Only the half-space strictly in front of this face.
                         if dx * f[0] + dy * f[1] + dz * f[2] <= 0 {
                             continue;
@@ -528,7 +559,19 @@ pub fn update_lighting(
             // free-list invariant), so no two threads write to
             // the same byte.
             let column = unsafe { world_view.column_slice(off_start, off_end) };
-            shade_column(column, x, y, z0p, z1p, lightmode, lights, &lightsub, &cache);
+            // AO (lightmode 3) via this engine entry uses default params.
+            shade_column(
+                column,
+                x,
+                y,
+                z0p,
+                z1p,
+                lightmode,
+                lights,
+                &lightsub,
+                &cache,
+                AoParams::default(),
+            );
         }
     };
 
@@ -607,6 +650,7 @@ pub fn update_lighting_chunk<'r>(
         &cache,
         lightmode,
         lights,
+        AoParams::default(),
     );
 }
 
@@ -641,6 +685,7 @@ pub fn apply_lighting_with_cache(
     cache: &EstNormCache,
     lightmode: u32,
     lights: &[LightSrc],
+    ao: AoParams,
 ) {
     if lightmode == 0 || x0 >= x1 || y0 >= y1 || z0 >= z1 {
         return;
@@ -671,7 +716,9 @@ pub fn apply_lighting_with_cache(
             // SAFETY: per-column byte ranges are pairwise disjoint
             // across distinct `(x, y)` (voxalloc invariant).
             let column = unsafe { world_view.column_slice(off_start, off_end) };
-            shade_column(column, x, y, z0, z1, lightmode, lights, &lightsub, cache);
+            shade_column(
+                column, x, y, z0, z1, lightmode, lights, &lightsub, cache, ao,
+            );
         }
     };
 
@@ -741,6 +788,7 @@ fn shade_column(
     lights: &[LightSrc],
     lightsub: &[f32],
     cache: &EstNormCache,
+    ao: AoParams,
 ) {
     let mut v_off: usize = 0;
     // cstat = false ⇒ top-of-slab phase (floor colours); true ⇒
@@ -795,7 +843,7 @@ fn shade_column(
             // (the DL ambient/AO channel; normal-free); other modes use the
             // estnorm surface normal for the directional / point-light bake.
             let brightness = if lightmode == 3 {
-                ao_byte(cache, x, y, z)
+                ao_byte(cache, x, y, z, ao)
             } else {
                 let normal = cache.estnorm(x, y, z);
                 compute_brightness(x, y, z, normal, lightmode, lights, lightsub)
@@ -808,17 +856,14 @@ fn shade_column(
     }
 }
 
-/// AO.0 — how dark a fully-occluded voxel gets, as a fraction of the
-/// open-voxel ambient. `0.8` ⇒ a deep crevice keeps 20% of the ambient.
-/// (AO.2 will make this a bake parameter.)
-const AO_STRENGTH: f32 = 0.8;
-
-/// AO.0 — map ambient occlusion to the brightness byte (the DL ambient/AO
-/// channel). Open voxels keep the neutral `128` (= full ambient, shader
-/// `byte/128 == 1.0`); occluded voxels darken toward `128·(1 − strength)`.
-fn ao_byte(cache: &EstNormCache, x: i32, y: i32, z: i32) -> u8 {
-    let ao = cache.ambient_occlusion(x, y, z);
-    clamp_to_byte(128.0 * (1.0 - AO_STRENGTH * ao))
+/// AO.0/AO.2 — map ambient occlusion to the brightness byte (the DL
+/// ambient/AO channel). Open voxels keep the neutral `128` (= full ambient,
+/// shader `byte/128 == 1.0`); occluded voxels darken by `params.strength`,
+/// never below `params.min_floor` of the open ambient.
+fn ao_byte(cache: &EstNormCache, x: i32, y: i32, z: i32, params: AoParams) -> u8 {
+    let ao = cache.ambient_occlusion(x, y, z, params.radius);
+    let factor = (1.0 - params.strength * ao).max(params.min_floor);
+    clamp_to_byte(128.0 * factor)
 }
 
 /// Per-voxel brightness math. Computes the `[0, 255]`
@@ -915,7 +960,7 @@ mod tests {
         offsets[(vsid * vsid) as usize] = data.len() as u32;
         let cache = EstNormCache::build(&data, &offsets, vsid, 0, 0, vsid as i32, vsid as i32);
 
-        let ao = |x, y, z| cache.ambient_occlusion(x, y, z);
+        let ao = |x, y, z| cache.ambient_occlusion(x, y, z, AO_RAD);
         let top_center = ao(4, 4, 15); // convex flat top
         let top_edge = ao(3, 4, 15); // convex top edge
         let base = ao(2, 4, 20); // concave: floor at the block's base
@@ -927,6 +972,23 @@ mod tests {
         );
         assert!(top_edge < 0.01, "convex edge must not occlude: {top_edge}");
         assert!(base > 0.1, "concave base must occlude: {base}");
+
+        // AO.2 — params: strength scales the darkening, min_floor clamps it.
+        let p = |strength, min_floor| AoParams {
+            strength,
+            radius: AO_RAD,
+            min_floor,
+        };
+        let off = ao_byte(&cache, 2, 4, 20, p(0.0, 0.0));
+        assert_eq!(off, 128, "strength 0 ⇒ no darkening (full ambient)");
+        let full = ao_byte(&cache, 2, 4, 20, p(1.0, 0.0));
+        assert!(full < 128, "strength 1 darkens the concave voxel: {full}");
+        // A high min_floor clamps the darkening factor up to ~0.8·128.
+        let floored = ao_byte(&cache, 2, 4, 20, p(1.0, 0.8));
+        assert!(
+            floored > full && floored >= 100,
+            "min_floor 0.8 clamps darkening to ≥ ~102: floored={floored} full={full}",
+        );
     }
 
     /// AO.0 — a floor voxel beside a wall is more occluded (darker) than an
@@ -956,8 +1018,8 @@ mod tests {
 
         let cache = EstNormCache::build(&data, &offsets, vsid, 0, 0, vsid as i32, vsid as i32);
         // (4,3) sits next to the wall at (5,3); (2,3) is in the open.
-        let near = cache.ambient_occlusion(4, 3, 20);
-        let open = cache.ambient_occlusion(2, 3, 20);
+        let near = cache.ambient_occlusion(4, 3, 20, AO_RAD);
+        let open = cache.ambient_occlusion(2, 3, 20, AO_RAD);
         assert!(
             open < 0.05,
             "open floor voxel should be ~unoccluded: {open}"

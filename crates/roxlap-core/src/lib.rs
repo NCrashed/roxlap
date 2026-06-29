@@ -75,5 +75,5 @@ pub use engine::{Engine, LightSrc, DEFAULT_KV6COL};
 pub use grid_view::{ChunkGrid, GridView};
 pub use opticast::OpticastSettings;
 pub use world_lighting::{
-    apply_lighting_with_cache, update_lighting, update_lighting_chunk, EstNormCache,
+    apply_lighting_with_cache, update_lighting, update_lighting_chunk, AoParams, EstNormCache,
 };

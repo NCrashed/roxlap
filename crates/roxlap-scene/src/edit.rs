@@ -409,7 +409,7 @@ mod tests {
             40,
             40,
         );
-        let ao = |x, y, z| cache.ambient_occlusion(x, y, z);
+        let ao = |x, y, z| cache.ambient_occlusion(x, y, z, 1);
 
         // Convex top face (z=30) + flat vertical faces (z 31..57, clear of the
         // floor at z60) must NOT occlude.

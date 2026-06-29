@@ -14,11 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lighting (DL) reads as its ambient/AO fill: open surfaces stay bright while
   crevices, inside corners, and contact points (pillar bases, the monument's
   foot) darken — even where no sun/point light directly shades them. Reuses the
-  existing lighting bake (`EstNormCache`): new `EstNormCache::ambient_occlusion`
-  (inverse-distance-weighted occupancy over the voxel's air-side neighbourhood)
-  + a new `lightmode == 3` AO bake. Both backends benefit at zero render cost
-  (it's the same byte they already multiply in). The "Lighting" demo bakes AO
-  into its floor/pillars/monument. (CPU bake; the byte feeds GPU + CPU alike.)
+  existing lighting bake (`EstNormCache`): `EstNormCache::ambient_occlusion` is
+  computed **per exposed face** (for each air-facing voxel face, how much solid
+  sits in front of it), so it darkens **only concave** edges — flat faces and
+  convex edges stay open, no "pillow" outline. A new `lightmode == 3` bakes it.
+  Both backends benefit at zero render cost (it's the same byte they already
+  multiply in). Tunable via `AoParams { strength, radius, min_floor }`
+  (`bake_ao_pub`); the "Lighting" demo bakes AO into its floor/pillars/monument
+  and retunes the depth live with `N`/`M`. (CPU bake; the byte feeds GPU + CPU
+  alike.)
 
 - **Dynamic lighting** (macro-stage DL; `PORTING-DYNLIGHT.md`) — runtime,
   **GPU-only** lighting layered on the scene-DDA raymarcher: one coloured

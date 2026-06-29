@@ -41,6 +41,10 @@ const GRID_ORIGIN: DVec3 = DVec3::new(-48.0, 30.0, 0.0);
 /// the camera stands above). World centre of the floor ≈ (0, 78, 60).
 const FLOOR_TOP_Z: i32 = 60;
 
+/// AO.2 — baked-AO depth (`N`/`M` retune live) + a fixed tight 1-voxel reach.
+const AO_STRENGTH_DEFAULT: f32 = 0.85;
+const AO_RADIUS: i32 = 1;
+
 // Four independent demo toggles (sun pause / sun shadows / point lights /
 // stylized) — each a distinct on/off control, not a state better modelled
 // as an enum.
@@ -56,6 +60,8 @@ pub struct LightingScene {
     stylized: bool,
     /// DL.6 — cel band count when stylized; `[` / `]` adjust (clamped 2..16).
     bands: u32,
+    /// AO.2 — baked AO depth; `N`/`M` retune (re-bakes the scene).
+    ao_strength: f32,
     /// The point lights, rebuilt each frame (orbit) — borrowed into the
     /// per-frame [`LightRig`] at render time.
     points: Vec<PointLight>,
@@ -65,20 +71,27 @@ impl LightingScene {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            scene: Self::build_terrain(),
+            scene: Self::build_terrain(AO_STRENGTH_DEFAULT),
             clock: 0.0,
             paused: false,
             sun_shadows: true,
             points_on: true,
             stylized: true,
             bands: 6,
+            ao_strength: AO_STRENGTH_DEFAULT,
             points: Vec::new(),
         }
     }
 
+    /// AO.2 — re-bake the scene's ambient occlusion at the current strength
+    /// (cheap: one 96×96 chunk). Called when `N`/`M` retune it.
+    fn rebake_ao(&mut self) {
+        crate::scene::bake_ao_pub(&mut self.scene, self.ao_strength, AO_RADIUS);
+    }
+
     /// A grass floor with four stone pillars + a central monument — enough
     /// vertical geometry for the sun's shadows to sweep across the ground.
-    fn build_terrain() -> Scene {
+    fn build_terrain(ao_strength: f32) -> Scene {
         let mut scene = Scene::new();
         let id = scene.add_grid(GridTransform::at(GRID_ORIGIN));
         let g = scene.grid_mut(id).expect("lighting grid present");
@@ -105,8 +118,8 @@ impl LightingScene {
         // AO stage — bake ambient occlusion into the brightness byte, which
         // the stylized dynamic lighting reads as its ambient/AO fill: pillar
         // bases, the monument's foot, and inner corners darken even where no
-        // sun/point light directly shades them.
-        crate::scene::bake_ao_pub(&mut scene);
+        // sun/point light directly shades them. `strength` (N/M) sets depth.
+        crate::scene::bake_ao_pub(&mut scene, ao_strength, AO_RADIUS);
         scene
     }
 
@@ -181,7 +194,7 @@ impl DemoScene for LightingScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD+mouse fly · P: pause sun · K: shadows (GPU) · L: points · J: stylized/smooth · [ ]: bands"
+        "WASD fly · P: pause sun · K: shadows (GPU) · L: points · J: stylized · [ ]: bands · N/M: AO depth"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -290,6 +303,16 @@ impl DemoScene for LightingScene {
                 self.bands = self.bands.saturating_sub(1).max(2);
                 eprintln!("cel bands = {}", self.bands);
             }
+            KeyCode::KeyM => {
+                self.ao_strength = (self.ao_strength + 0.1).min(1.0);
+                self.rebake_ao();
+                eprintln!("AO strength = {:.2}", self.ao_strength);
+            }
+            KeyCode::KeyN => {
+                self.ao_strength = (self.ao_strength - 0.1).max(0.0);
+                self.rebake_ao();
+                eprintln!("AO strength = {:.2}", self.ao_strength);
+            }
             _ => {}
         }
     }
@@ -336,7 +359,8 @@ impl DemoScene for LightingScene {
                     String::new()
                 },
             ),
-            "GPU-only dynamic lighting (CPU shows baked ambient)".to_string(),
+            format!("baked AO depth {:.2} (N/M)", self.ao_strength),
+            "dynamic lighting both backends · shadows GPU-only".to_string(),
         ]
     }
 }

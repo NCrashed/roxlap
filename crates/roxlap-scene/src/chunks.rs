@@ -199,6 +199,7 @@ impl Grid {
                 &cache,
                 lightmode,
                 &[],
+                roxlap_core::AoParams::default(),
             );
         }
     }
