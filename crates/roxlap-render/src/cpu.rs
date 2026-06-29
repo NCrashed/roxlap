@@ -931,16 +931,19 @@ impl CpuBackend {
         let shadows_active = cpu_lights.enabled
             && cpu_lights.shadow_strength > 0.0
             && (cpu_lights.sun_casts_shadow || cpu_lights.points.iter().any(|p| p.casts_shadow));
+        // XS.4 — a sprite contributes to the occluder (casts a shadow) unless
+        // it's invisible or flagged `NO_SHADOW_CAST`.
+        let invis = roxlap_formats::sprite::SPRITE_FLAG_INVISIBLE;
+        let casts = |s: &Sprite| s.flags & invis == 0 && s.casts_shadow();
         let sprite_occ = if shadows_active && frame.draw_sprites {
-            let invis = roxlap_formats::sprite::SPRITE_FLAG_INVISIBLE;
             let mut so = SpriteOccluder::new();
             for s in self.sprites.iter().chain(self.kfa_limbs.iter()) {
-                if s.flags & invis == 0 {
+                if casts(s) {
                     so.push(SpriteDense::from_kv6(&s.kv6), s.p, s.s, s.h, s.f);
                 }
             }
             for (i, s) in self.dyn_sprites.iter().enumerate() {
-                if s.flags & invis != 0 {
+                if !casts(s) {
                     continue;
                 }
                 if let Some((book, fr)) = self.dyn_clip[i] {
@@ -1050,8 +1053,9 @@ impl CpuBackend {
                 // DL.7 — world-space lights so opaque sprites/clips get the
                 // same stylized lighting as the terrain.
                 lights: cpu_lights,
-                // XS.2 — receive hard shadows from terrain + other sprites.
-                shadow: recv_occ,
+                // XS.2/XS.4 — receive hard shadows from terrain + other
+                // sprites, unless this sprite opted out (`NO_SHADOW_RECEIVE`).
+                shadow: if s.receives_shadow() { recv_occ } else { None },
             };
             // Static sprites + posed KFA limbs: plain KV6 sprites. All
             // z-test against the shared buffer so order doesn't matter.

@@ -38,6 +38,15 @@ pub const SPRITE_FLAG_KFA: u32 = 1 << 1;
 pub const SPRITE_FLAG_INVISIBLE: u32 = 1 << 2;
 /// Voxlap's sprite-flags bit 3: render without z-buffer test.
 pub const SPRITE_FLAG_NO_Z: u32 = 1 << 3;
+/// roxlap extension (XS.4), bit 4: this sprite does **not** cast a hard
+/// shadow onto terrain / other sprites. Clear (the default) ⇒ it casts.
+pub const SPRITE_FLAG_NO_SHADOW_CAST: u32 = 1 << 4;
+/// roxlap extension (XS.4), bit 5: this sprite does **not** receive hard
+/// shadows (it isn't darkened by occluders). Clear (the default) ⇒ it
+/// receives. Both shadow bits default to participating, matching the
+/// dynamic-lighting rig's "shadows on" intent; set a bit to opt a sprite
+/// out (e.g. a glowing effect that shouldn't be shadowed).
+pub const SPRITE_FLAG_NO_SHADOW_RECEIVE: u32 = 1 << 5;
 
 /// A KV6 voxel sprite positioned in world space.
 ///
@@ -123,6 +132,45 @@ impl Sprite {
         }
     }
 
+    /// XS.4 — whether this sprite casts a hard shadow (the [dynamic-lighting
+    /// stage](../../../PORTING-DYNLIGHT.md) decides it darkens terrain / other
+    /// sprites). `true` unless [`SPRITE_FLAG_NO_SHADOW_CAST`] is set.
+    #[must_use]
+    pub fn casts_shadow(&self) -> bool {
+        self.flags & SPRITE_FLAG_NO_SHADOW_CAST == 0
+    }
+
+    /// XS.4 — whether this sprite receives hard shadows (is darkened by
+    /// occluders). `true` unless [`SPRITE_FLAG_NO_SHADOW_RECEIVE`] is set.
+    #[must_use]
+    pub fn receives_shadow(&self) -> bool {
+        self.flags & SPRITE_FLAG_NO_SHADOW_RECEIVE == 0
+    }
+
+    /// XS.4 — set whether this sprite casts a hard shadow (clears/sets
+    /// [`SPRITE_FLAG_NO_SHADOW_CAST`]). Returns `self` for chaining.
+    #[must_use]
+    pub fn with_casts_shadow(mut self, casts: bool) -> Self {
+        if casts {
+            self.flags &= !SPRITE_FLAG_NO_SHADOW_CAST;
+        } else {
+            self.flags |= SPRITE_FLAG_NO_SHADOW_CAST;
+        }
+        self
+    }
+
+    /// XS.4 — set whether this sprite receives hard shadows (clears/sets
+    /// [`SPRITE_FLAG_NO_SHADOW_RECEIVE`]). Returns `self` for chaining.
+    #[must_use]
+    pub fn with_receives_shadow(mut self, receives: bool) -> Self {
+        if receives {
+            self.flags &= !SPRITE_FLAG_NO_SHADOW_RECEIVE;
+        } else {
+            self.flags |= SPRITE_FLAG_NO_SHADOW_RECEIVE;
+        }
+        self
+    }
+
     /// Carve a sphere out of this sprite's voxel model, controlling
     /// the colour of the interior the cut exposes. Thin delegate to
     /// [`Kv6::carve_sphere_with_colfunc`] — `centre` / `radius`,
@@ -147,6 +195,32 @@ impl Sprite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// XS.4 — sprite shadow flags default to participating and toggle cleanly,
+    /// independently of each other.
+    #[test]
+    fn sprite_shadow_flags_default_on_and_toggle() {
+        let kv6 = Kv6::from_fn_shaded(2, 2, 2, |_, _, _| Some(0x8033_4455));
+        let s = Sprite::axis_aligned(kv6, [0.0; 3]);
+        // Default: casts + receives.
+        assert!(s.casts_shadow() && s.receives_shadow());
+
+        let no_cast = s.clone().with_casts_shadow(false);
+        assert!(!no_cast.casts_shadow() && no_cast.receives_shadow());
+        assert_eq!(no_cast.flags & SPRITE_FLAG_NO_SHADOW_CAST, SPRITE_FLAG_NO_SHADOW_CAST);
+
+        let no_recv = s.clone().with_receives_shadow(false);
+        assert!(no_recv.casts_shadow() && !no_recv.receives_shadow());
+
+        // Toggling one bit leaves the other (and unrelated flags) untouched.
+        let neither = s
+            .clone()
+            .with_casts_shadow(false)
+            .with_receives_shadow(false);
+        assert!(!neither.casts_shadow() && !neither.receives_shadow());
+        let back = neither.with_casts_shadow(true);
+        assert!(back.casts_shadow() && !back.receives_shadow());
+    }
 
     #[test]
     fn carve_sphere_delegates_to_kv6_and_leaves_pose() {
