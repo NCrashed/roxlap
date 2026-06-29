@@ -136,9 +136,9 @@ struct Uniforms {
     // DL.6 — stylized lighting: cel banding + gradient-map ramp.
     shadow_tint: vec4<f32>, // rgb = cool unlit end of the sun ramp
     style_bands: u32,       // 0 = smooth; ≥1 = quantize to bands+1 levels
-    // Three scalar pads (NOT vec3<u32>, whose 16-byte align would add a
-    // gap the Rust `[u32; 3]` doesn't have → uniform size mismatch).
-    _pad7a: u32,
+    // XS.4.3 — visible sprite-instance count for the sprite-cast shadow march.
+    sprite_cast_count: u32,
+    // Two scalar pads (NOT vec2<u32> — keep the Rust `[u32; 2]` layout).
     _pad7b: u32,
     _pad7c: u32,
 };
@@ -561,7 +561,20 @@ fn world_dir_to_grid_local(g: u32, d: vec3<f32>) -> vec3<f32> {
 // grid (transformed into each grid's local frame), so a caster in one grid
 // shadows surfaces in another. Returns `true` on the first occluder. The grid
 // the ray came from is included (its self-shadow is the old intra-grid test).
+//
+// XS.4.3 — `sprites_occlude` also tests sprite volumes so sprites CAST onto
+// terrain. On sprite-shadow-capable devices the renderer splices
+// scene_sprite_shadow.wgsl over the stub below (binds the sprite registry at
+// 19..21 + the real march); otherwise the stub returns false (no sprite cast).
+//XS4C_STUB_BEGIN
+fn sprites_occlude(origin_w: vec3<f32>, dir_w: vec3<f32>, max_t: f32) -> bool {
+    return false;
+}
+//XS4C_STUB_END
 fn shadow_occluded_world(origin_w: vec3<f32>, dir_w: vec3<f32>, max_t: f32) -> bool {
+    if (sprites_occlude(origin_w, dir_w, max_t)) {
+        return true;
+    }
     for (var g: u32 = 0u; g < u.grid_count; g = g + 1u) {
         let o = world_to_grid_local(g, origin_w);
         let d = world_dir_to_grid_local(g, dir_w);

@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     another grid) blocks the sun / a point light. Needed raising the device
     storage-buffer request to 22 (`pick_required_limits`); devices below that
     fall back to unshadowed GPU sprites. Per-instance `receives_shadow` honored.
+  - **GPU sprites cast onto terrain** (XS.4.3) — the mirror: on a capable
+    device the scene pass's `shadow_occluded_world` also marches the visible
+    sprite volumes (the sprite registry bound at 19..21, spliced in from
+    `scene_sprite_shadow.wgsl`), so a sprite drops a shadow on the ground.
+    Per-instance `casts_shadow` honored. With XS.4.2 this completes
+    bidirectional GPU sprite shadows, at full CPU/GPU parity.
 - **Voxel ambient occlusion** (macro-stage AO) — a CPU bake pass that writes
   per-voxel ambient occlusion into the brightness byte, which the dynamic
   lighting (DL) reads as its ambient/AO fill: open surfaces stay bright while

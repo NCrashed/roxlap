@@ -671,6 +671,11 @@ struct SceneDdaResources {
     /// TV.6 — terrain colour→material map (`[rgb, material_id]` rows, binding
     /// 17); ≥1 element (wgpu rejects a zero-sized storage binding).
     terrain_map_buf: wgpu::Buffer,
+    /// XS.4.3 — placeholder bound at the sprite-cast bindings (19..21) on a
+    /// capable device when no sprite registry exists (or this frame has no
+    /// sprites). `sprite_cast_count == 0` keeps the shader from indexing it.
+    /// `None` on non-capable devices (those bindings aren't in the BGL).
+    sprite_cast_dummy: Option<wgpu::Buffer>,
 }
 
 /// GPU.10.0 — single-sprite model-DDA pipeline: one thread per pixel
@@ -1133,7 +1138,11 @@ struct SceneDdaUniform {
     shadow_tint: [f32; 4],
     /// DL.6 — cel band count; 0 = smooth (no banding / gradient map).
     style_bands: u32,
-    _pad7: [u32; 3],
+    /// XS.4.3 — visible sprite-instance count for the scene pass's
+    /// sprite-cast shadow march (sprites cast onto terrain). `0` ⇒ no sprite
+    /// casters (the loop is skipped); only consulted by the capable variant.
+    sprite_cast_count: u32,
+    _pad7: [u32; 2],
 }
 
 #[repr(C)]
@@ -2444,96 +2453,130 @@ impl GpuRenderer {
                 0.0,
             ],
             style_bands: lights.style_bands,
-            _pad7: [0; 3],
+            // XS.4.3 — visible sprite casters for the scene-pass cast march
+            // (only when the device is sprite-shadow capable; else the cast
+            // bindings/loop are absent).
+            sprite_cast_count: if self.sprite_shadows_capable {
+                sprite_pass.map_or(0, |(visible, _)| visible)
+            } else {
+                0
+            },
+            _pad7: [0; 2],
         };
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 
+        let mut dda_entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: dda.uniform_buf.as_entire_binding(),
+            },
+            // Occupancy page 0 at binding 1; pages 1..MAX_OCC_PAGES
+            // at bindings 12.. (see GPU.X occupancy paging).
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: scene.occupancy_pages[0].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: scene.all_color_offsets.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: scene.all_colors.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: scene.all_chunk_colors_base.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: scene.all_chunk_occupancy.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: scene.grid_static_meta.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: scene.all_slot_chunk_idx.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: dda.framebuffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(&self.sky_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::Sampler(&self.sky_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: dda.depth_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: scene.occupancy_pages[1].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: scene.occupancy_pages[2].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: scene.occupancy_pages[3].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: grid_cameras.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: dda.materials_pal_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: dda.terrain_map_buf.as_entire_binding(),
+            },
+            // DL — per-grid point lights (18). The per-grid sun dir
+            // rides in PerGridCamera.sun_dir (binding 15).
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: grid_point_lights.as_entire_binding(),
+            },
+        ];
+        // XS.4.3 — sprite-cast bindings (19..21). On a capable device the BGL
+        // has them, so bind the sprite registry when present (terrain shadow
+        // rays test sprite volumes), else the dummy (sprite_cast_count == 0).
+        if self.sprite_shadows_capable {
+            let dummy = dda
+                .sprite_cast_dummy
+                .as_ref()
+                .expect("capable scene_dda has a sprite-cast dummy");
+            let (insts, models, occ) = match &self.sprite_registry {
+                Some(reg) => (&reg.instances, &reg.model_meta, &reg.occupancy),
+                None => (dummy, dummy, dummy),
+            };
+            dda_entries.push(wgpu::BindGroupEntry {
+                binding: 19,
+                resource: insts.as_entire_binding(),
+            });
+            dda_entries.push(wgpu::BindGroupEntry {
+                binding: 20,
+                resource: models.as_entire_binding(),
+            });
+            dda_entries.push(wgpu::BindGroupEntry {
+                binding: 21,
+                resource: occ.as_entire_binding(),
+            });
+        }
         let dda_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("roxlap-gpu scene_dda.bg"),
             layout: &dda.bgl_dda,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: dda.uniform_buf.as_entire_binding(),
-                },
-                // Occupancy page 0 at binding 1; pages 1..MAX_OCC_PAGES
-                // at bindings 12.. (see GPU.X occupancy paging).
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: scene.occupancy_pages[0].as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: scene.all_color_offsets.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: scene.all_colors.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: scene.all_chunk_colors_base.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: scene.all_chunk_occupancy.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: scene.grid_static_meta.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: scene.all_slot_chunk_idx.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: dda.framebuffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(&self.sky_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::Sampler(&self.sky_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: dda.depth_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: scene.occupancy_pages[1].as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 13,
-                    resource: scene.occupancy_pages[2].as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 14,
-                    resource: scene.occupancy_pages[3].as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 15,
-                    resource: grid_cameras.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 16,
-                    resource: dda.materials_pal_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 17,
-                    resource: dda.terrain_map_buf.as_entire_binding(),
-                },
-                // DL — per-grid point lights (18). The per-grid sun dir
-                // rides in PerGridCamera.sun_dir (binding 15).
-                wgpu::BindGroupEntry {
-                    binding: 18,
-                    resource: grid_point_lights.as_entire_binding(),
-                },
-            ],
+            entries: &dda_entries,
         });
 
         // GPU.9 — when sprites are present, build both splatter bind
@@ -3588,62 +3631,73 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        // XS.4.3 — on sprite-shadow-capable devices, splice the sprite-cast
+        // snippet over the `sprites_occlude` stub (binds the sprite registry at
+        // 19..21 so terrain shadow rays test sprite volumes).
+        let capable = self.sprite_shadows_capable;
         let dda_shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("scene_dda.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/scene_dda.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(scene_shader_source(capable).into()),
             });
+        let mut dda_entries = vec![
+            bgl_uniform_entry(0),
+            bgl_storage_entry(1, true),
+            bgl_storage_entry(2, true),
+            bgl_storage_entry(3, true),
+            bgl_storage_entry(4, true),
+            bgl_storage_entry(5, true),
+            bgl_storage_entry(6, true),
+            bgl_storage_entry(7, true),
+            // Framebuffer storage buffer (read-write; the scene +
+            // sprite passes write packed pixels into it).
+            bgl_storage_entry(8, false),
+            // GPU.8 sky panorama + sampler.
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            // GPU.9 — read-write per-pixel depth buffer.
+            bgl_storage_entry(11, false),
+            // Occupancy pages 1..MAX_OCC_PAGES (page 0 is
+            // binding 1). Unused pages bind a dummy buffer.
+            bgl_storage_entry(12, true),
+            bgl_storage_entry(13, true),
+            bgl_storage_entry(14, true),
+            // Per-grid cameras (runtime-sized; one per grid).
+            bgl_storage_entry(15, true),
+            // TV.6 — material palette + terrain colour→material map.
+            bgl_storage_entry(16, true),
+            bgl_storage_entry(17, true),
+            // DL — per-grid point lights (18). Sun dir rides in
+            // PerGridCamera (binding 15) to stay within the 16
+            // storage-buffer limit.
+            bgl_storage_entry(18, true),
+        ];
+        if capable {
+            // XS.4.3 — sprite registry for the sprite-cast shadow march.
+            dda_entries.push(bgl_storage_entry(19, true)); // sprite_instances
+            dda_entries.push(bgl_storage_entry(20, true)); // sprite_models
+            dda_entries.push(bgl_storage_entry(21, true)); // sprite_occupancy
+        }
         let bgl_dda = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("roxlap-gpu scene_dda.bgl"),
-                entries: &[
-                    bgl_uniform_entry(0),
-                    bgl_storage_entry(1, true),
-                    bgl_storage_entry(2, true),
-                    bgl_storage_entry(3, true),
-                    bgl_storage_entry(4, true),
-                    bgl_storage_entry(5, true),
-                    bgl_storage_entry(6, true),
-                    bgl_storage_entry(7, true),
-                    // Framebuffer storage buffer (read-write; the scene +
-                    // sprite passes write packed pixels into it).
-                    bgl_storage_entry(8, false),
-                    // GPU.8 sky panorama + sampler.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 9,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 10,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // GPU.9 — read-write per-pixel depth buffer.
-                    bgl_storage_entry(11, false),
-                    // Occupancy pages 1..MAX_OCC_PAGES (page 0 is
-                    // binding 1). Unused pages bind a dummy buffer.
-                    bgl_storage_entry(12, true),
-                    bgl_storage_entry(13, true),
-                    bgl_storage_entry(14, true),
-                    // Per-grid cameras (runtime-sized; one per grid).
-                    bgl_storage_entry(15, true),
-                    // TV.6 — material palette + terrain colour→material map.
-                    bgl_storage_entry(16, true),
-                    bgl_storage_entry(17, true),
-                    // DL — per-grid point lights (18). Sun dir rides in
-                    // PerGridCamera (binding 15) to stay within the 16
-                    // storage-buffer limit.
-                    bgl_storage_entry(18, true),
-                ],
+                entries: &dda_entries,
             });
         let dda_pl = self
             .device
@@ -3788,6 +3842,16 @@ impl GpuRenderer {
             depth_readback,
             materials_pal_buf,
             terrain_map_buf,
+            // XS.4.3 — 80-byte dummy (≥ one Instance) for the sprite-cast
+            // bindings when capable but no sprite registry is bound this frame.
+            sprite_cast_dummy: capable.then(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("roxlap-gpu scene_dda.sprite_cast_dummy"),
+                    size: 80,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                })
+            }),
         }
     }
 
@@ -4633,7 +4697,8 @@ impl HeadlessSceneRenderer {
             _pad6: [0.0; 2],
             shadow_tint: [dl.shadow_tint[0], dl.shadow_tint[1], dl.shadow_tint[2], 0.0],
             style_bands: dl.style_bands,
-            _pad7: [0; 3],
+            sprite_cast_count: 0, // headless renderer has no sprite pass
+            _pad7: [0; 2],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 
@@ -4870,6 +4935,30 @@ fn sprite_shader_source(capable: bool) -> String {
     out
 }
 
+/// XS.4.3 — build the scene-pass shader source. On a sprite-shadow-capable
+/// device, splice `scene_sprite_shadow.wgsl` over the `//XS4C_STUB_BEGIN`..
+/// `//XS4C_STUB_END` block so `sprites_occlude` marches the sprite registry
+/// (+ bindings 19..21) and terrain receives sprite-cast shadows; otherwise the
+/// stub returns false. The base file is always valid WGSL (the stub variant).
+fn scene_shader_source(capable: bool) -> String {
+    let base = include_str!("../shaders/scene_dda.wgsl");
+    if !capable {
+        return base.to_string();
+    }
+    let snippet = include_str!("../shaders/scene_sprite_shadow.wgsl");
+    const BEGIN: &str = "//XS4C_STUB_BEGIN";
+    const END: &str = "//XS4C_STUB_END";
+    let (Some(b), Some(e)) = (base.find(BEGIN), base.find(END)) else {
+        panic!("scene_dda.wgsl: XS4C stub markers not found");
+    };
+    let e_end = e + END.len();
+    let mut out = String::with_capacity(base.len() + snippet.len());
+    out.push_str(&base[..b]);
+    out.push_str(snippet);
+    out.push_str(&base[e_end..]);
+    out
+}
+
 /// XS.4 — storage buffers per shader stage needed for GPU sprite shadows. The
 /// sprite pass binds its own 14 + the terrain occupancy set (occupancy pages
 /// 0..3, chunk occupancy, slot index, grid meta, per-grid cameras) to march
@@ -5002,6 +5091,17 @@ mod pixel_ray_tests {
         validator.validate(&module).unwrap_or_else(|e| {
             panic!("sprite_model_dda.wgsl (capable): validation failed: {e:?}")
         });
+        // XS.4.3 — the capable scene variant (sprite-cast snippet spliced in).
+        let scene_cap = super::scene_shader_source(true);
+        let module = naga::front::wgsl::parse_str(&scene_cap).unwrap_or_else(|e| {
+            panic!(
+                "scene_dda.wgsl (capable): parse failed:\n{}",
+                e.emit_to_string(&scene_cap)
+            )
+        });
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("scene_dda.wgsl (capable): validation failed: {e:?}"));
     }
 
     /// A 2×2 world quad centred straight ahead projects to vertices whose
