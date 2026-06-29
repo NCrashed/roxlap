@@ -367,6 +367,13 @@ fn cast_local_layers(
     fwd_dot: f32,
     max_t: f32,
     shade_ctx: SpriteShade,
+    // Instance basis (s,h,f) + world position — only used to light each layer
+    // (rotate the model-local face normal + voxel centre to world). Ignored
+    // when the rig is disabled (then every layer is the baked `shade`).
+    s: [f32; 3],
+    h: [f32; 3],
+    f: [f32; 3],
+    pos: [f32; 3],
 ) -> Option<LayerAccum> {
     #[allow(clippy::cast_precision_loss)]
     let hi = [
@@ -411,6 +418,42 @@ fn cast_local_layers(
     // Local ray length per ray-parameter unit — converts a cell's `t` span to
     // its path length in voxel units for the `Volumetric` Beer–Lambert weight.
     let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    // Model-local face normal of the cell currently being shaded (the face the
+    // ray crossed to enter it); zero for the AABB-entry voxel, matching
+    // `cast_local`. Updated after each step.
+    let mut normal = [0.0f32; 3];
+
+    // XS.0 — per-layer dynamic lighting (mirror of the opaque path): rotate the
+    // model-local face normal + voxel centre to world via the instance basis
+    // and call `shade_dynamic` (flat per voxel). Disabled rig ⇒ baked `shade`
+    // (byte-identical). No sprite shadows yet (tester `None`; added in XS.2).
+    let lights = shade_ctx.lights;
+    let shade_layer = |idx: usize, cell: [i32; 3], n_local: [f32; 3]| -> u32 {
+        if !lights.enabled {
+            return shade(dense.col[idx], 0);
+        }
+        let to_world = |v: [f32; 3]| {
+            [
+                v[0] * s[0] + v[1] * h[0] + v[2] * f[0],
+                v[0] * s[1] + v[1] * h[1] + v[2] * f[1],
+                v[0] * s[2] + v[1] * h[2] + v[2] * f[2],
+            ]
+        };
+        let n_world = to_world(n_local);
+        let rel = [
+            cell[0] as f32 + 0.5 - dense.pivot[0],
+            cell[1] as f32 + 0.5 - dense.pivot[1],
+            cell[2] as f32 + 0.5 - dense.pivot[2],
+        ];
+        let wc = to_world(rel);
+        let center = [pos[0] + wc[0], pos[1] + wc[1], pos[2] + wc[2]];
+        let albedo = [
+            ((dense.col[idx] >> 16) & 0xff) as f32 / 255.0,
+            ((dense.col[idx] >> 8) & 0xff) as f32 / 255.0,
+            (dense.col[idx] & 0xff) as f32 / 255.0,
+        ];
+        shade_dynamic(albedo, 1.0, n_world, center, &lights, None)
+    };
 
     for _ in 0..max_steps {
         if cell[0] < 0
@@ -443,7 +486,7 @@ fn cast_local_layers(
             };
             let m = shade_ctx.materials.get(mat_id);
             if m.is_opaque() {
-                acc.opaque = Some((shade(dense.col[idx], 0), t_curr));
+                acc.opaque = Some((shade_layer(idx, cell, normal), t_curr));
                 touched = true;
                 break;
             }
@@ -454,7 +497,7 @@ fn cast_local_layers(
                 // filled volume thickens smoothly with depth. Always occludes.
                 let seg_len = (t_exit - t_curr).max(0.0) * dir_len;
                 let eff_a = 1.0 - (1.0 - a).powf(seg_len);
-                let lit = rgb_to_f32(shade(dense.col[idx], 0));
+                let lit = rgb_to_f32(shade_layer(idx, cell, normal));
                 acc.rgb[0] += acc.trans * eff_a * lit[0];
                 acc.rgb[1] += acc.trans * eff_a * lit[1];
                 acc.rgb[2] += acc.trans * eff_a * lit[2];
@@ -467,7 +510,7 @@ fn cast_local_layers(
             } else if !prev_solid || mat_id != prev_mat {
                 // AlphaBlend / Additive: one alpha layer per solid-run entry or
                 // material change (thickness-independent — shells, glass).
-                let lit = rgb_to_f32(shade(dense.col[idx], 0));
+                let lit = rgb_to_f32(shade_layer(idx, cell, normal));
                 acc.rgb[0] += acc.trans * a * lit[0];
                 acc.rgb[1] += acc.trans * a * lit[1];
                 acc.rgb[2] += acc.trans * a * lit[2];
@@ -485,6 +528,8 @@ fn cast_local_layers(
         t_curr = t_exit;
         cell[exit_axis] += step[exit_axis];
         t_max[exit_axis] += t_delta[exit_axis];
+        normal = [0.0; 3];
+        normal[exit_axis] = -(step[exit_axis] as f32);
     }
 
     touched.then_some(acc)
@@ -706,9 +751,18 @@ pub fn draw_sprite_dense_shaded(
                 } else {
                     unsafe { target.read_depth(idx) }
                 };
-                let Some(acc) =
-                    cast_local_layers(dense, origin_local, dir_local, fwd_dot, max_t, shade_ctx)
-                else {
+                let Some(acc) = cast_local_layers(
+                    dense,
+                    origin_local,
+                    dir_local,
+                    fwd_dot,
+                    max_t,
+                    shade_ctx,
+                    s,
+                    h,
+                    f,
+                    pos,
+                ) else {
                     continue;
                 };
                 // SAFETY: idx in bounds; single-threaded writer.
@@ -1760,6 +1814,57 @@ mod tests {
         assert!(
             deep > shallow,
             "deeper Volumetric volume is more opaque: deep {deep:02x} > shallow {shallow:02x}"
+        );
+    }
+
+    /// XS.0 — translucent sprite layers are now **lit** (dynamic-lighting rig),
+    /// not flat-baked: with the rig enabled at a dim ambient (sun off), the
+    /// accumulated layer colour is darker than the disabled (baked, full-
+    /// brightness) path. Pins that `cast_local_layers` runs `shade_dynamic`.
+    #[test]
+    fn translucent_sprite_layers_are_lit() {
+        fn center_red(lights: CpuLights) -> u32 {
+            let mut table = MaterialTable::new();
+            table.set(1, Material::alpha_blend(160));
+            let dense = SpriteDense::from_kv6(&Kv6::solid_box(8, 8, 8, 0x80_E0_30_30));
+            let (w, h) = (64u32, 64u32);
+            let n = (w * h) as usize;
+            let mut fb = vec![0x80_10_10_10u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+            let sh = SpriteShade {
+                materials: &table,
+                lights,
+                material: 1,
+                alpha_mul: 255,
+            };
+            let _ = draw_sprite_dense_shaded(
+                &mut fb,
+                &mut zb,
+                w as usize,
+                w,
+                h,
+                &cs,
+                &settings(w, h),
+                &dense,
+                [0.0, 40.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                0,
+                Some(sh),
+            );
+            (fb[(h / 2 * w + w / 2) as usize] >> 16) & 0xff
+        }
+        let baked = center_red(CpuLights::default()); // disabled ⇒ full-brightness baked
+        let dim = center_red(CpuLights {
+            enabled: true,
+            ambient: [0.3; 3], // sun off, dim ambient ⇒ the layer should darken
+            ..CpuLights::default()
+        });
+        assert!(
+            dim < baked,
+            "lit translucent layer must respond to the rig (dim ambient darkens): dim={dim:#x} baked={baked:#x}",
         );
     }
 

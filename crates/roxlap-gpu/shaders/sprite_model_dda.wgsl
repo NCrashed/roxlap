@@ -398,6 +398,15 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
     var t_max = shield_parallel((next_b - o) * inv_d, d);
     var t_hit = t_enter;
     let max_steps = m.dims.x + m.dims.y + m.dims.z + 3u;
+    // XS.0 — face axis crossed to reach the current voxel (model-local), for
+    // the lit layer normal (mirror of `march_instance`). Seeded from the AABB
+    // entry face; each step overwrites it.
+    var hit_axis: i32 = 2;
+    if (tlo.x > tlo.y && tlo.x > tlo.z) {
+        hit_axis = 0;
+    } else if (tlo.y > tlo.z) {
+        hit_axis = 1;
+    }
 
     var prev_solid = false;
     var prev_mat = 0u;
@@ -409,11 +418,25 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
             let vidx = voxel_index(m, p);
             let mat_id = voxel_material(m, vidx, inst.material);
             let mm = materials[mat_id];
+            // XS.0 — each layer is lit when dynamic lighting is active (the
+            // flat-per-voxel `shade_sprite_lit`, model-local face normal on the
+            // crossed axis), else the baked `model_color`. Mirror of the opaque
+            // `march_instance` path so translucent sprite layers shade too.
+            var lc: vec3<f32>;
+            if ((u.sun_flags & 4u) != 0u) {
+                var n_model = vec3<f32>(0.0);
+                if (hit_axis == 0) { n_model.x = -f32(step.x); }
+                else if (hit_axis == 1) { n_model.y = -f32(step.y); }
+                else { n_model.z = -f32(step.z); }
+                lc = shade_sprite_lit(m, p, inst, ray_dir, t_hit, n_model);
+            } else {
+                lc = model_color(m, p, inst_idx);
+            }
             if (mm.mode == 0u) {
                 // Opaque voxel: the model's own surface — stop, it backs the
                 // translucent layers in front of it within this instance.
                 res.has_opaque = true;
-                res.opaque_color = model_color(m, p, inst_idx);
+                res.opaque_color = lc;
                 res.touched = true;
                 break;
             }
@@ -424,15 +447,13 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
                 let t_exit = min(t_max.x, min(t_max.y, t_max.z));
                 let seg_len = max(t_exit - t_hit, 0.0) * d_len;
                 let eff_a = 1.0 - pow(1.0 - a, seg_len);
-                let c = model_color(m, p, inst_idx);
-                res.rgb = res.rgb + res.trans * eff_a * c;
+                res.rgb = res.rgb + res.trans * eff_a * lc;
                 res.trans = res.trans * (1.0 - eff_a);
                 res.touched = true;
                 prev_mat = mat_id;
                 if (res.trans < (1.0 / 256.0)) { break; }
             } else if (!prev_solid || mat_id != prev_mat) {
-                let c = model_color(m, p, inst_idx);
-                res.rgb = res.rgb + res.trans * a * c;
+                res.rgb = res.rgb + res.trans * a * lc;
                 if (mm.mode != 2u) { // AlphaBlend occludes; Additive does not.
                     res.trans = res.trans * (1.0 - a);
                 }
@@ -444,12 +465,15 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
         prev_solid = solid_here;
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
             t_hit = t_max.x; p.x = p.x + step.x; t_max.x = t_max.x + t_delta.x;
+            hit_axis = 0;
             if (p.x < 0 || p.x >= dim_i.x) { break; }
         } else if (t_max.y < t_max.z) {
             t_hit = t_max.y; p.y = p.y + step.y; t_max.y = t_max.y + t_delta.y;
+            hit_axis = 1;
             if (p.y < 0 || p.y >= dim_i.y) { break; }
         } else {
             t_hit = t_max.z; p.z = p.z + step.z; t_max.z = t_max.z + t_delta.z;
+            hit_axis = 2;
             if (p.z < 0 || p.z >= dim_i.z) { break; }
         }
     }
