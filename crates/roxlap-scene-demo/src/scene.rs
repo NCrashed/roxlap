@@ -409,25 +409,29 @@ fn bake_lightmode(scene: &mut Scene, lightmode: u32, ao: roxlap_core::AoParams) 
             // neighbour chunk that owns that voxel-column. Padding
             // straddling unpopulated chunks returns None (= treat
             // as full air), matching the historical OOB behaviour.
-            // S4B.6.f: reader queries `target_chz` so stacked grids
-            // bake each chunk-z layer independently. Cross-chz
-            // neighbour reads (ESTNORMRAD padding extending into
-            // chz±1 at top/bottom of a chunk) still clip on the z
-            // boundary — that's a follow-up.
+            // S4B.6.f: reader queries `target_chz` (chz_delta 0) so
+            // stacked grids bake each chunk-z layer; chz_delta ±1
+            // resolves the chunk above/below so the ESTNORMRAD padding
+            // extending past a chunk's top/bottom face reads the
+            // stacked neighbour — AO + estnorm now continuous across
+            // the z-seam (no longer clipped at the z boundary).
             let cache = {
                 let grid_ref: &Grid = &*grid;
-                let reader = |px: i32, py: i32| -> Option<&[u8]> {
+                let reader = |px: i32, py: i32, chz_delta: i32| -> Option<&[u8]> {
                     let neighbour_chx = target_chx + px.div_euclid(cs_xy);
                     let neighbour_chy = target_chy + py.div_euclid(cs_xy);
                     let in_chunk_x = px.rem_euclid(cs_xy);
                     let in_chunk_y = py.rem_euclid(cs_xy);
-                    let chunk =
-                        grid_ref.chunk(IVec3::new(neighbour_chx, neighbour_chy, target_chz))?;
+                    let chunk = grid_ref.chunk(IVec3::new(
+                        neighbour_chx,
+                        neighbour_chy,
+                        target_chz + chz_delta,
+                    ))?;
                     let col_idx = (in_chunk_y as u32) * CHUNK_SIZE_XY + (in_chunk_x as u32);
                     let off = chunk.column_offset[col_idx as usize] as usize;
                     Some(&chunk.data[off..])
                 };
-                roxlap_core::EstNormCache::build_with_reader(reader, 0, 0, cs_xy, cs_xy)
+                roxlap_core::EstNormCache::build_with_reader_z(reader, 0, 0, cs_xy, cs_xy)
             };
             // Immutable grid borrow released.
 
@@ -598,17 +602,21 @@ fn bake_single_chunk_neighbour_aware(grid: &mut Grid, chunk_idx: IVec3) {
 
     let cache = {
         let grid_ref: &Grid = &*grid;
-        let reader = |px: i32, py: i32| -> Option<&[u8]> {
+        let reader = |px: i32, py: i32, chz_delta: i32| -> Option<&[u8]> {
             let neighbour_chx = target_chx + px.div_euclid(cs_xy);
             let neighbour_chy = target_chy + py.div_euclid(cs_xy);
             let in_chunk_x = px.rem_euclid(cs_xy);
             let in_chunk_y = py.rem_euclid(cs_xy);
-            let chunk = grid_ref.chunk(IVec3::new(neighbour_chx, neighbour_chy, target_chz))?;
+            let chunk = grid_ref.chunk(IVec3::new(
+                neighbour_chx,
+                neighbour_chy,
+                target_chz + chz_delta,
+            ))?;
             let col_idx = (in_chunk_y as u32) * CHUNK_SIZE_XY + (in_chunk_x as u32);
             let off = chunk.column_offset[col_idx as usize] as usize;
             Some(&chunk.data[off..])
         };
-        roxlap_core::EstNormCache::build_with_reader(reader, 0, 0, cs_xy, cs_xy)
+        roxlap_core::EstNormCache::build_with_reader_z(reader, 0, 0, cs_xy, cs_xy)
     };
 
     let target = grid

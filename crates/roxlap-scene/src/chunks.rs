@@ -153,12 +153,13 @@ impl Grid {
     /// chunks after a carve (then bump their versions so the GPU
     /// re-uploads — edits already do, via [`Grid::set_voxel`] &c.).
     ///
-    /// Each chunk is baked neighbour-aware on its own `chz`: estnorm's
-    /// ±2-voxel padding that crosses a chunk-XY face reads the actual
-    /// neighbour chunk (when populated), so brightness is continuous at
-    /// seams. Cross-`chz` padding still clips at the z boundary. Point
-    /// lights aren't applied (directional-only) — matching the demos'
-    /// bake. No-op for an empty grid.
+    /// Each chunk is baked neighbour-aware in all three axes: estnorm's
+    /// (and AO's) ±2-voxel padding that crosses a chunk face reads the
+    /// actual neighbour chunk (when populated) — XY neighbours and, for
+    /// stacked grids, the chunks above/below on `chz±1` — so brightness
+    /// / occlusion is continuous across every seam. Point lights aren't
+    /// applied (directional-only) — matching the demos' bake. No-op for
+    /// an empty grid.
     pub fn bake_lightmode(&mut self, lightmode: u32) {
         #[allow(clippy::cast_possible_wrap)]
         let cs_xy = CHUNK_SIZE_XY as i32;
@@ -173,17 +174,22 @@ impl Grid {
             // an unpopulated neighbour returns `None` (= treated as air).
             let cache = {
                 let grid_ref: &Self = &*self;
-                let reader = |px: i32, py: i32| -> Option<&[u8]> {
+                // `chz_delta` walks the stacked neighbour in z so the
+                // ESTNORMRAD padding crossing a chunk's top/bottom face
+                // reads the chunk above/below (continuous AO + estnorm
+                // across a z-seam); `0` is the target layer.
+                let reader = |px: i32, py: i32, chz_delta: i32| -> Option<&[u8]> {
                     let nb_chx = chunk_idx.x + px.div_euclid(cs_xy);
                     let nb_chy = chunk_idx.y + py.div_euclid(cs_xy);
                     let in_x = px.rem_euclid(cs_xy);
                     let in_y = py.rem_euclid(cs_xy);
-                    let chunk = grid_ref.chunk(IVec3::new(nb_chx, nb_chy, chunk_idx.z))?;
+                    let chunk =
+                        grid_ref.chunk(IVec3::new(nb_chx, nb_chy, chunk_idx.z + chz_delta))?;
                     let col_idx = (in_y as u32) * CHUNK_SIZE_XY + (in_x as u32);
                     let off = chunk.column_offset[col_idx as usize] as usize;
                     Some(&chunk.data[off..])
                 };
-                roxlap_core::EstNormCache::build_with_reader(reader, 0, 0, cs_xy, cs_xy)
+                roxlap_core::EstNormCache::build_with_reader_z(reader, 0, 0, cs_xy, cs_xy)
             };
             let target = self.chunks.get_mut(&chunk_idx).expect("populated chunk");
             roxlap_core::apply_lighting_with_cache(

@@ -22,7 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multiply in). Tunable via `AoParams { strength, radius, min_floor }`
   (`bake_ao_pub`); the "Lighting" demo bakes AO into its floor/pillars/monument
   and retunes the depth live with `N`/`M`. (CPU bake; the byte feeds GPU + CPU
-  alike.)
+  alike.) For **stacked grids**, `EstNormCache::build_with_reader_z` reads the
+  chunks above/below (`chz±1`) for the bake's `±ESTNORMRAD` z-padding, so AO
+  (and the directional `estnorm` bake) stay continuous across a chunk z-seam
+  instead of seeing fake air-above / bedrock-below at the boundary; the
+  scene-graph `bake_lightmode` and the demo bakes use it.
 
 - **Dynamic lighting** (macro-stage DL; `PORTING-DYNLIGHT.md`) — runtime,
   **GPU-only** lighting layered on the scene-DDA raymarcher: one coloured

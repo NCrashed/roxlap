@@ -186,6 +186,12 @@ pub(crate) fn expandbit256(column: &[u8], bits: &mut [u32; 8]) {
     }
 }
 
+/// Read bit `z` (`0..256`) of a `[u32; 8]` z-column bitset.
+#[inline]
+pub(crate) fn bit256(bits: &[u32; 8], z: usize) -> bool {
+    (bits[z >> 5] >> (z & 31)) & 1 != 0
+}
+
 /// Per-column solid/air bitset grid covering a 2D bounding region —
 /// `(x1 - x0 + 2*RAD) × (y1 - y0 + 2*RAD)` columns. Decoding each
 /// column to a bitset once turns the estnorm 5×5×5 neighbourhood query
@@ -208,6 +214,17 @@ pub struct EstNormCache {
     height: usize,
     /// Voxel-grid limit (= `vsid`) used for out-of-bounds clamps.
     vsid: i32,
+    /// AO cross-chunk z continuity (stacked grids, S4B.6). When
+    /// non-empty (a z-aware build via [`Self::build_with_reader_z`]),
+    /// these hold the solidity of the `ESTNORMRAD` voxels just outside
+    /// the `[0, MAXZDIM)` z-window — read from the chunks stacked above
+    /// (`chz-1`, world-z above) and below (`chz+1`, world-z below). Bit
+    /// `i` of `z_below[col]` ⇒ the voxel at `z = -1 - i` is solid; bit
+    /// `i` of `z_above[col]` ⇒ the voxel at `z = MAXZDIM + i` is solid.
+    /// Empty ⇒ single-layer bake, [`Self::solid`] uses the implicit
+    /// air-above / bedrock-below boundary (unchanged).
+    z_below: Vec<u8>,
+    z_above: Vec<u8>,
 }
 
 impl EstNormCache {
@@ -240,6 +257,80 @@ impl EstNormCache {
         };
         let mut cache = Self::build_with_reader(reader, x0, y0, x1, y1);
         cache.vsid = vsid_i;
+        cache
+    }
+
+    /// Z-aware variant of [`Self::build_with_reader`] for **stacked
+    /// grids**. `column_reader(x, y, chz_delta)` returns the slab bytes
+    /// of the column at cache-XY `(x, y)` in the chunk `chz_delta`
+    /// layers away in z (`0` = the target layer, `-1` = the layer above
+    /// in world-z, `+1` = below), or `None` for implicit-air / missing.
+    ///
+    /// The `chz_delta == 0` reads build the in-plane cache exactly like
+    /// [`Self::build_with_reader`]; the `±1` reads populate the
+    /// [`Self::z_below`] / [`Self::z_above`] overlays so [`Self::solid`]
+    /// — and therefore [`Self::ambient_occlusion`] / [`Self::estnorm`] —
+    /// see the neighbouring chunk's voxels across the z-seam instead of
+    /// the implicit air-above / bedrock-below boundary. Where a z-
+    /// neighbour is absent the overlay falls back to that same boundary
+    /// (air above, solid below), so a topmost/bottommost chunk bakes
+    /// identically to the single-layer path.
+    #[must_use]
+    pub fn build_with_reader_z<'r>(
+        column_reader: impl Fn(i32, i32, i32) -> Option<&'r [u8]>,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+    ) -> Self {
+        let mut cache = Self::build_with_reader(|x, y| column_reader(x, y, 0), x0, y0, x1, y1);
+
+        let n = cache.bits.len();
+        let mut z_below = vec![0u8; n];
+        let mut z_above = vec![0u8; n];
+        // `chz_delta = -1` is the chunk above in world-z; its bottom-most
+        // world-z voxels (its z-local `MAXZDIM-1, MAXZDIM-2`) sit at our
+        // `z = -1, -2`. `chz_delta = +1` is below; its top voxels (z-local
+        // `0, 1`) sit at our `z = MAXZDIM, MAXZDIM+1`.
+        let pad = ESTNORMRAD as usize;
+        for yi in 0..cache.height {
+            let y = cache.origin_y + yi as i32;
+            for xi in 0..cache.width {
+                let x = cache.origin_x + xi as i32;
+                let col = yi * cache.width + xi;
+
+                if let Some(column) = column_reader(x, y, -1) {
+                    let mut tmp = [0u32; 8];
+                    expandbit256(column, &mut tmp);
+                    for i in 0..pad {
+                        // world z = -1 - i  ⇐  neighbour z-local MAXZDIM-1-i.
+                        if bit256(&tmp, (MAXZDIM as usize) - 1 - i) {
+                            z_below[col] |= 1 << i;
+                        }
+                    }
+                }
+                // Absent neighbour above ⇒ leave bits clear (air), matching
+                // the implicit `z < 0 → air` boundary.
+
+                if let Some(column) = column_reader(x, y, 1) {
+                    let mut tmp = [0u32; 8];
+                    expandbit256(column, &mut tmp);
+                    for i in 0..pad {
+                        // world z = MAXZDIM + i  ⇐  neighbour z-local i.
+                        if bit256(&tmp, i) {
+                            z_above[col] |= 1 << i;
+                        }
+                    }
+                } else {
+                    // Absent neighbour below ⇒ solid (bedrock), matching the
+                    // implicit `z >= MAXZDIM → solid` boundary.
+                    z_above[col] = ((1u32 << pad) - 1) as u8;
+                }
+            }
+        }
+
+        cache.z_below = z_below;
+        cache.z_above = z_above;
         cache
     }
 
@@ -293,18 +384,32 @@ impl EstNormCache {
             width,
             height,
             vsid: 0,
+            z_below: Vec::new(),
+            z_above: Vec::new(),
         }
     }
 
     /// Whether the voxel at cache-column `(xi, yi)`, depth `z` is solid.
-    /// Out of the `[0, MAXZDIM)` z range: everything above the world is
-    /// air, everything below is solid (bedrock).
+    /// Out of the `[0, MAXZDIM)` z range: by default everything above
+    /// the world is air and everything below is solid (bedrock); a
+    /// z-aware build ([`Self::build_with_reader_z`]) instead reads the
+    /// stacked-neighbour chunk's voxels for the first `ESTNORMRAD`
+    /// levels past each boundary (the `z_below` / `z_above` overlays),
+    /// so AO is continuous across a chunk z-seam.
     #[inline]
     fn solid(&self, xi: usize, yi: usize, z: i32) -> bool {
         if z < 0 {
+            let i = (-1 - z) as usize;
+            if !self.z_below.is_empty() && i < ESTNORMRAD as usize {
+                return (self.z_below[yi * self.width + xi] >> i) & 1 != 0;
+            }
             return false;
         }
         if z >= MAXZDIM {
+            let i = (z - MAXZDIM) as usize;
+            if !self.z_above.is_empty() && i < ESTNORMRAD as usize {
+                return (self.z_above[yi * self.width + xi] >> i) & 1 != 0;
+            }
             return true;
         }
         let col = &self.bits[yi * self.width + xi];
@@ -619,11 +724,13 @@ pub fn update_lighting_chunk<'r>(
 
     // Padded region for the cache (cross-chunk reads via reader).
     // Z clamps to [0, MAXZDIM) because each chunk's slab data is
-    // chunk-local in z. For stacked grids (S4B.6) the caller
-    // invokes us once per chunk-z layer; cross-chz padding at the
-    // top/bottom of a chunk gets clipped here (a follow-up could
-    // pass z-aware columns to lift this). X/y intentionally don't
-    // clamp — the reader pulls from neighbour chunks via its own
+    // chunk-local in z. This XY-only reader leaves the top/bottom
+    // boundary at the implicit air-above / bedrock-below default;
+    // callers that bake stacked grids and want AO/estnorm continuous
+    // across the z-seam build the cache via
+    // [`EstNormCache::build_with_reader_z`] (a `chz`-aware reader) and
+    // call [`apply_lighting_with_cache`] directly. X/y intentionally
+    // don't clamp — the reader pulls from neighbour chunks via its own
     // coord translation.
     let z0p = (z0 - ESTNORMRAD).max(0);
     let z1p = (z1 + ESTNORMRAD).min(MAXZDIM);
@@ -988,6 +1095,53 @@ mod tests {
         assert!(
             floored > full && floored >= 100,
             "min_floor 0.8 clamps darkening to ≥ ~102: floored={floored} full={full}",
+        );
+    }
+
+    /// AO cross-chunk z-seam continuity (stacked grids). A solid voxel
+    /// sitting in the chunk **above** — one level past the target chunk's
+    /// top z-boundary — must count as occlusion for a side face at the
+    /// boundary. The plain (`build_with_reader`) cache can't see it (the
+    /// implicit `z < 0 → air` boundary), so a z-aware build
+    /// (`build_with_reader_z`) must occlude **more**.
+    #[test]
+    fn ao_z_seam_reads_stacked_neighbour() {
+        let mk = |z1: u8, z2: u8| -> Vec<u8> {
+            let mut c = vec![0u8, z1, z2, 0];
+            for _ in z1..=z2 {
+                c.extend([0x20, 0x20, 0x20, 0x80]);
+            }
+            c
+        };
+        // Target layer (chz_delta 0): (1,1) solid from the top boundary
+        // down; (2,1) a pit (air at z=0, solid z≥1) so (1,1)'s +x face is
+        // exposed. The chunk above (chz_delta -1) has a solid voxel at its
+        // bottom (z-local 255) over (2,1) — i.e. at our z = -1, in front of
+        // that +x face. Everything else is implicit air (reader → None).
+        let floor = mk(0, 0);
+        let pit = mk(1, 255);
+        let above = mk(255, 255);
+        let reader = |x: i32, y: i32, dz: i32| -> Option<&[u8]> {
+            match (x, y, dz) {
+                (1, 1, 0) => Some(&floor),
+                (2, 1, 0) => Some(&pit),
+                (2, 1, -1) => Some(&above),
+                _ => None,
+            }
+        };
+
+        let plain = EstNormCache::build_with_reader(|x, y| reader(x, y, 0), 0, 0, 3, 3);
+        let zaware = EstNormCache::build_with_reader_z(reader, 0, 0, 3, 3);
+
+        let ao_plain = plain.ambient_occlusion(1, 1, 0, AO_RAD);
+        let ao_z = zaware.ambient_occlusion(1, 1, 0, AO_RAD);
+        assert!(
+            ao_plain > 0.0,
+            "the in-layer pit wall should already occlude a little: {ao_plain}"
+        );
+        assert!(
+            ao_z > ao_plain + 0.01,
+            "the solid across the z-seam must add occlusion: z-aware={ao_z} plain={ao_plain}"
         );
     }
 
