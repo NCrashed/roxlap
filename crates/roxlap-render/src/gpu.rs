@@ -931,6 +931,10 @@ impl GpuBackend {
         // the voxlap directional `sprite_colmul` shading is not used.
 
         let cameras = self.grid_cameras(scene, camera);
+        // XS.3 — per-grid world transforms (parallel to `cameras`) so the
+        // scene shader can lift a shadow ray to world space and test it
+        // against every grid (cross-grid shadows).
+        let grid_world = self.grid_world_transforms(scene);
         // Sprites are world-space, so they project through the world
         // camera (identity transform), not any grid-local one. Without
         // this the GPU sprite pass used `cameras[0]` and shifted every
@@ -940,6 +944,7 @@ impl GpuBackend {
             self.gpu.render_scene(
                 resident,
                 &cameras,
+                &grid_world,
                 &sprite_camera,
                 frame.gpu_fov_y_rad,
                 frame.gpu_max_outer_steps,
@@ -958,6 +963,7 @@ impl GpuBackend {
             let empty = self.empty_resident.as_ref().expect("just built");
             self.gpu.render_scene(
                 empty,
+                &[],
                 &[],
                 &sprite_camera,
                 frame.gpu_fov_y_rad,
@@ -1375,6 +1381,30 @@ impl GpuBackend {
             ));
         }
         cameras
+    }
+
+    /// XS.3 — per-grid world transforms (parallel to [`Self::grid_cameras`]):
+    /// world origin + the local→world rotation columns, for cross-grid shadows.
+    #[allow(clippy::cast_possible_truncation)]
+    fn grid_world_transforms(&self, scene: &Scene) -> Vec<roxlap_gpu::GridWorldTransform> {
+        let mut out = Vec::with_capacity(self.grid_ids.len());
+        for gid in &self.grid_ids {
+            let Some(grid) = scene.grid(*gid) else {
+                out.push(roxlap_gpu::GridWorldTransform::default());
+                continue;
+            };
+            let o = grid.transform.origin;
+            let r = grid.transform.rotation;
+            let col = |v: DVec3| {
+                let w = r * v;
+                [w.x as f32, w.y as f32, w.z as f32]
+            };
+            out.push(roxlap_gpu::GridWorldTransform {
+                origin: [o.x as f32, o.y as f32, o.z as f32],
+                rot_cols: [col(DVec3::X), col(DVec3::Y), col(DVec3::Z)],
+            });
+        }
+        out
     }
 }
 

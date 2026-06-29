@@ -984,6 +984,15 @@ struct SceneDdaPerGridCamera {
     /// because the device's `max_storage_buffers_per_shader_stage` (16) is
     /// already saturated. Zero ⇒ no sun (the uniform's `sun_flags` gates).
     sun_dir: [f32; 4],
+    /// XS.3 — this grid's world transform, for cross-grid shadows: a shadow
+    /// ray (grid-local in the grid being shaded) is lifted to world space and
+    /// tested against every grid. `world_origin` (xyz) is the grid origin;
+    /// `rot0/1/2` (xyz) are the local→world rotation columns (world images of
+    /// grid-local axes x/y/z). Packed here for the same buffer-limit reason.
+    world_origin: [f32; 4],
+    rot0: [f32; 4],
+    rot1: [f32; 4],
+    rot2: [f32; 4],
 }
 
 impl SceneDdaPerGridCamera {
@@ -998,6 +1007,41 @@ impl SceneDdaPerGridCamera {
             forward: c.forward,
             _pad3: 0.0,
             sun_dir: [0.0; 4],
+            // Identity world transform by default; the per-grid build
+            // (`grid_cameras`) overwrites it with the grid's real transform.
+            world_origin: [0.0; 4],
+            rot0: [1.0, 0.0, 0.0, 0.0],
+            rot1: [0.0, 1.0, 0.0, 0.0],
+            rot2: [0.0, 0.0, 1.0, 0.0],
+        }
+    }
+
+    /// XS.3 — stamp this grid's world transform (for cross-grid shadows).
+    /// `rot_cols[i]` is the world image of grid-local axis `i` (the
+    /// local→world rotation's columns).
+    fn set_world_transform(&mut self, t: &GridWorldTransform) {
+        self.world_origin = [t.origin[0], t.origin[1], t.origin[2], 0.0];
+        self.rot0 = [t.rot_cols[0][0], t.rot_cols[0][1], t.rot_cols[0][2], 0.0];
+        self.rot1 = [t.rot_cols[1][0], t.rot_cols[1][1], t.rot_cols[1][2], 0.0];
+        self.rot2 = [t.rot_cols[2][0], t.rot_cols[2][1], t.rot_cols[2][2], 0.0];
+    }
+}
+
+/// XS.3 — a grid's world transform for cross-grid shadows: world origin +
+/// the local→world rotation columns (`rot_cols[i]` = world image of grid-local
+/// axis `i`). Built host-side per frame from the grid's `GridTransform` and
+/// handed to [`SceneRenderer::render_scene`] alongside the per-grid cameras.
+#[derive(Clone, Copy)]
+pub struct GridWorldTransform {
+    pub origin: [f32; 3],
+    pub rot_cols: [[f32; 3]; 3],
+}
+
+impl Default for GridWorldTransform {
+    fn default() -> Self {
+        Self {
+            origin: [0.0; 3],
+            rot_cols: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         }
     }
 }
@@ -2193,6 +2237,9 @@ impl GpuRenderer {
         &mut self,
         scene: &GpuSceneResident,
         cameras: &[Camera],
+        // XS.3 — per-grid world transforms (parallel to `cameras`) for
+        // cross-grid shadows. Empty ⇒ identity (shadows stay intra-grid).
+        grid_world: &[GridWorldTransform],
         sprite_camera: &Camera,
         fov_y_rad: f32,
         max_outer_steps: u32,
@@ -2288,6 +2335,10 @@ impl GpuRenderer {
             .iter()
             .map(SceneDdaPerGridCamera::from_camera)
             .collect();
+        // XS.3 — stamp each grid's world transform for cross-grid shadows.
+        for (c, t) in cam_vec.iter_mut().zip(grid_world.iter()) {
+            c.set_world_transform(t);
+        }
 
         // DL — pack the per-frame lights (already grid-local). The per-grid
         // sun direction rides in each `PerGridCamera.sun_dir` (binding 15);
@@ -4346,6 +4397,9 @@ impl HeadlessSceneRenderer {
     ///
     /// # Panics
     /// If `cameras.len() != scene.grid_count`.
+    /// Headless render with identity per-grid world transforms (shadows stay
+    /// intra-grid). See [`Self::render_with_transforms`] for the cross-grid
+    /// (XS.3) variant.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn render(
@@ -4354,6 +4408,34 @@ impl HeadlessSceneRenderer {
         queue: &wgpu::Queue,
         scene: &GpuSceneResident,
         cameras: &[Camera],
+        fov_y_rad: f32,
+        max_outer_steps: u32,
+        mip_scan_dist: f32,
+    ) -> Vec<u32> {
+        self.render_with_transforms(
+            device,
+            queue,
+            scene,
+            cameras,
+            &[],
+            fov_y_rad,
+            max_outer_steps,
+            mip_scan_dist,
+        )
+    }
+
+    /// XS.3 — headless render with explicit per-grid world transforms, so the
+    /// scene shader can lift a shadow ray to world space and test it against
+    /// every grid (cross-grid shadows). Empty `grid_world` ⇒ identity.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_transforms(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &GpuSceneResident,
+        cameras: &[Camera],
+        grid_world: &[GridWorldTransform],
         fov_y_rad: f32,
         max_outer_steps: u32,
         mip_scan_dist: f32,
@@ -4370,6 +4452,10 @@ impl HeadlessSceneRenderer {
             .iter()
             .map(SceneDdaPerGridCamera::from_camera)
             .collect();
+        // XS.3 — stamp world transforms for cross-grid shadows (identity if absent).
+        for (c, t) in cam_vec.iter_mut().zip(grid_world.iter()) {
+            c.set_world_transform(t);
+        }
         // TV.6 — opaque dummies for the material palette + terrain map
         // bindings (headless renders opaque-only: terrain_has_translucent=0).
         let (dummy_pal, dummy_map) = {

@@ -37,6 +37,15 @@ struct PerGridCamera {
     // (the 16 storage-buffer limit is already saturated). Zero ⇒ no sun
     // (the uniform's `sun_flags` gates whether it's used).
     sun_dir: vec4<f32>,
+    // XS.3 — this grid's world transform, for cross-grid shadows: a shadow
+    // ray (grid-local in the grid being shaded) is lifted to world space and
+    // tested against every grid. `world_origin.xyz` is the grid origin;
+    // `rot0/1/2.xyz` are the local→world rotation columns (world images of
+    // grid-local axes x/y/z). Packed here for the same buffer-limit reason.
+    world_origin: vec4<f32>,
+    rot0: vec4<f32>,
+    rot1: vec4<f32>,
+    rot2: vec4<f32>,
 };
 
 struct GridStaticMeta {
@@ -526,6 +535,43 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> boo
     return false;
 }
 
+// XS.3 — grid g local → world: `world = origin + R·local` (R columns = rot0/1/2).
+fn grid_local_to_world(g: u32, p: vec3<f32>) -> vec3<f32> {
+    let c = grid_cameras[g];
+    return c.world_origin.xyz + c.rot0.xyz * p.x + c.rot1.xyz * p.y + c.rot2.xyz * p.z;
+}
+// XS.3 — grid g local → world for a direction (rotation only).
+fn grid_dir_to_world(g: u32, d: vec3<f32>) -> vec3<f32> {
+    let c = grid_cameras[g];
+    return c.rot0.xyz * d.x + c.rot1.xyz * d.y + c.rot2.xyz * d.z;
+}
+// XS.3 — world → grid h local: `local = Rᵀ·(world − origin)` (Rᵀ rows = rot0/1/2).
+fn world_to_grid_local(g: u32, w: vec3<f32>) -> vec3<f32> {
+    let c = grid_cameras[g];
+    let v = w - c.world_origin.xyz;
+    return vec3<f32>(dot(c.rot0.xyz, v), dot(c.rot1.xyz, v), dot(c.rot2.xyz, v));
+}
+// XS.3 — world → grid h local for a direction (rotation only).
+fn world_dir_to_grid_local(g: u32, d: vec3<f32>) -> vec3<f32> {
+    let c = grid_cameras[g];
+    return vec3<f32>(dot(c.rot0.xyz, d), dot(c.rot1.xyz, d), dot(c.rot2.xyz, d));
+}
+
+// XS.3 — cross-grid hard shadow: a world-space shadow ray tested against EVERY
+// grid (transformed into each grid's local frame), so a caster in one grid
+// shadows surfaces in another. Returns `true` on the first occluder. The grid
+// the ray came from is included (its self-shadow is the old intra-grid test).
+fn shadow_occluded_world(origin_w: vec3<f32>, dir_w: vec3<f32>, max_t: f32) -> bool {
+    for (var g: u32 = 0u; g < u.grid_count; g = g + 1u) {
+        let o = world_to_grid_local(g, origin_w);
+        let d = world_dir_to_grid_local(g, dir_w);
+        if (shadow_occluded(g, o, d, max_t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // DL.6 — cel quantization: snap a 0..1 light factor to `bands + 1` discrete
 // levels (terraced light instead of a smooth gradient). `bands == 0` never
 // reaches here (the smooth path is taken instead).
@@ -571,8 +617,10 @@ fn shade_lit(
     // the retro look), smooth samples at the per-pixel hit (gradients).
     let sample = select(hit_pos, vox_center, styled);
     // Shadow-ray origin: bias off the surface along the normal to avoid
-    // self-shadow acne. Shared by every caster.
+    // self-shadow acne. Shared by every caster. XS.3 — also its world-space
+    // form, so the shadow ray can be tested against every grid (cross-grid).
     let shadow_origin = sample + n * u.shadow_bias;
+    let shadow_origin_w = grid_local_to_world(g, shadow_origin);
     // Light remaining in shadow (the strength floor); 1.0 ⇒ unshadowed.
     let in_shadow = 1.0 - u.ambient_color.w;
 
@@ -583,7 +631,8 @@ fn shade_lit(
         let ndl = max(0.0, dot(n, l));
         if (ndl > 0.0) {
             var sh = 1.0;
-            if ((u.sun_flags & 2u) != 0u && shadow_occluded(g, shadow_origin, l, u.shadow_max_dist)) {
+            if ((u.sun_flags & 2u) != 0u
+                && shadow_occluded_world(shadow_origin_w, grid_dir_to_world(g, l), u.shadow_max_dist)) {
                 sh = in_shadow;
             }
             sun_key = ndl * sh;
@@ -619,7 +668,8 @@ fn shade_lit(
                 if (pl.casts_shadow != 0u) {
                     let to_light = pl.pos - shadow_origin;
                     let max_t = length(to_light);
-                    if (max_t > 1e-4 && shadow_occluded(g, shadow_origin, to_light / max_t, max_t)) {
+                    if (max_t > 1e-4
+                        && shadow_occluded_world(shadow_origin_w, grid_dir_to_world(g, to_light / max_t), max_t)) {
                         sh = in_shadow;
                     }
                 }

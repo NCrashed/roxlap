@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use roxlap_formats::vxl::Vxl;
 use roxlap_gpu::{
     decompress_chunk, Camera, GpuInitError, GpuLight, GpuRendererSettings, GpuSceneResident,
-    GridUpload, HeadlessGpu, HeadlessSceneRenderer, SceneLights, SceneUpload,
+    GridUpload, GridWorldTransform, HeadlessGpu, HeadlessSceneRenderer, SceneLights, SceneUpload,
 };
 
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -775,6 +775,114 @@ fn scene_dda_sun_shadow_darkens_occluded_floor() {
     assert!(
         lum(shadowed) < lum(lit),
         "wall must cast a sun shadow on the floor: lit {lit:#08x} -> shadowed {shadowed:#08x}",
+    );
+}
+
+/// XS.3 — cross-grid sun shadow: a wall in grid **B** (placed at a world
+/// offset) shadows the floor of grid **A**. The shadow only appears if the
+/// shadow ray crosses from A into B in world space, so shadows-on must be
+/// darker than shadows-off. Exercises the per-grid world transform packing +
+/// `shadow_occluded_world`.
+#[test]
+fn scene_dda_cross_grid_sun_shadow() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    // Grid A: plain floor at z=100, world origin (0,0,0).
+    let grid_a = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], decompress_chunk(&floor_chunk(vsid)))],
+    };
+    // Grid B: a wall (x∈[16,18), z 90..100) — moved to world (+2,0,0) below, so
+    // its wall sits at world x∈[18,20), on the to-sun ray from A's floor point
+    // (the ray reaches it at z≈96, inside the wall's z-span).
+    let grid_b = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![(
+            [0, 0, 0],
+            decompress_chunk(&floor_with_wall_chunk(vsid, 16, 18, 90)),
+        )],
+    };
+    let scene = GpuSceneResident::upload(
+        &gpu.device,
+        &SceneUpload {
+            grids: vec![grid_a, grid_b],
+        },
+    );
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // Straight down over A's floor point (14,16). World camera.
+    let cam = Camera {
+        position: [14.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    // Per-grid local cameras: A is identity; B is offset by world (2,0,0).
+    let cam_b = Camera {
+        position: [14.0 - 2.0, 16.0, 50.0],
+        ..cam
+    };
+    // Per-grid world transforms: A identity, B translated +2 in x.
+    let xf_a = GridWorldTransform::default();
+    let xf_b = GridWorldTransform {
+        origin: [2.0, 0.0, 0.0],
+        ..GridWorldTransform::default()
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam, cam_b],
+            &[xf_a, xf_b],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
+    };
+
+    // Sun toward +x and up: reaches A's floor (14,16,100) only by crossing
+    // grid B's wall at world x≈24 → occluded when shadows cast.
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    let sun = |casts_shadow: bool| SceneLights {
+        enabled: true,
+        grid_sun_dirs: vec![[s, 0.0, -s], [s, 0.0, -s]], // both grids identity-rot
+        sun_color: [1.0; 3],
+        sun_intensity: 3.0,
+        sun_casts_shadow: casts_shadow,
+        ambient: [0.5; 3],
+        shadow_strength: 1.0,
+        shadow_bias: 1.5,
+        shadow_max_dist: 512.0,
+        shadow_max_steps: 256,
+        ..SceneLights::default()
+    };
+
+    renderer.set_scene_lights(sun(false));
+    let lit = render(&mut renderer);
+    renderer.set_scene_lights(sun(true));
+    let shadowed = render(&mut renderer);
+
+    let blue = |p: u32| (p >> 16) & 0xff;
+    assert!(
+        blue(lit) < 70 && blue(shadowed) < 70,
+        "expected A's floor, not sky: lit={lit:#08x} shadowed={shadowed:#08x}"
+    );
+    assert!(
+        lum(shadowed) < lum(lit),
+        "grid B's wall must cast a cross-grid sun shadow on grid A: lit {lit:#08x} -> shadowed {shadowed:#08x}",
     );
 }
 
