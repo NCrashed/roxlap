@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-instance sprite RGB tint** — each sprite instance carries a packed
+  `0x00RRGGBB` tint that multiplies its voxel colours (per channel), so
+  instances of one model can be recoloured cheaply. `0x00FF_FFFF` (white, the
+  default) is a no-op, so existing sprites render byte-identically. Set it on a
+  model via `Sprite::with_tint` / the `tint` field, or per dynamic instance via
+  `SceneRenderer::set_sprite_instance_tint`. Both backends (CPU
+  `dda_sprite` + GPU `sprite_model_dda`); no new bindings (packed into the
+  instance record's free slot). Tint is colour only — transparency stays on
+  the translucent-material + `alpha_mul` path.
+
 ## [0.18.0] — 2026-06-30
 
 ### Added

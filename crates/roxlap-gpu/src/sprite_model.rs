@@ -749,7 +749,7 @@ fn make_cull(registry: &SpriteModelRegistry, i: &SpriteInstance) -> CullInstance
             material: u32::from(i.material),
             alpha_mul: f32::from(i.alpha_mul) / 255.0,
             flags: i.flags,
-            _pad1: 0,
+            tint: i.tint,
         },
         chain_id: i.model_id,
         center: i.transform.pos,
@@ -787,11 +787,14 @@ pub struct SpriteInstance {
     /// `NO_SHADOW_CAST` / `NO_SHADOW_RECEIVE`). `0` (default) ⇒ casts +
     /// receives. Only honoured when the device is sprite-shadow capable.
     pub flags: u32,
+    /// Per-instance RGB tint, packed `0x00RRGGBB` (white `0x00FF_FFFF` = no-op).
+    pub tint: u32,
 }
 
 impl SpriteInstance {
     /// A model reference + pose with the default opaque material
-    /// (`material = 0`, `alpha_mul = 255`) and shadows on (`flags = 0`).
+    /// (`material = 0`, `alpha_mul = 255`), shadows on (`flags = 0`), and no
+    /// tint (`0x00FF_FFFF`).
     #[must_use]
     pub fn new(model_id: u32, transform: SpriteInstanceTransform) -> Self {
         Self {
@@ -800,6 +803,7 @@ impl SpriteInstance {
             material: 0,
             alpha_mul: 255,
             flags: 0,
+            tint: 0x00FF_FFFF,
         }
     }
 }
@@ -841,7 +845,8 @@ struct SpriteInstanceGpu {
     /// XS.4 — sprite shadow flags (mirror of `roxlap_formats::sprite` bits 4/5):
     /// bit4 = NO_SHADOW_CAST, bit5 = NO_SHADOW_RECEIVE. `0` ⇒ casts + receives.
     flags: u32,
-    _pad1: u32,
+    /// Per-instance RGB tint, packed `0x00RRGGBB` (white `0x00FF_FFFF` = no-op).
+    tint: u32,
 }
 
 /// Invert a 3×3 matrix given as basis columns `[c0, c1, c2]`,

@@ -576,6 +576,14 @@ impl CpuBackend {
         }
     }
 
+    /// Set dynamic instance `idx`'s per-instance RGB tint (`0x00RRGGBB`, white
+    /// = no-op). No-op if `idx` is out of range.
+    pub(crate) fn set_dyn_instance_tint(&mut self, idx: usize, tint: u32) {
+        if let Some(s) = self.dyn_sprites.get_mut(idx) {
+            s.tint = tint & 0x00FF_FFFF;
+        }
+    }
+
     /// Register a new model template (axis-aligned, kv6 cloned once) and
     /// return its positional index. The streaming-in counterpart to
     /// [`Self::add_dyn_instance_posed`] for unique generated geometry.
@@ -1050,6 +1058,8 @@ impl CpuBackend {
                 materials,
                 material: s.material,
                 alpha_mul: s.alpha_mul,
+                // Per-instance RGB tint (white ⇒ no-op).
+                tint: s.tint,
                 // DL.7 — world-space lights so opaque sprites/clips get the
                 // same stylized lighting as the terrain.
                 lights: cpu_lights,

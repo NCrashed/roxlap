@@ -444,6 +444,9 @@ pub struct SpriteShade<'a> {
     /// Per-instance opacity multiplier (`255` = unscaled), so an effect can
     /// fade out by cheap per-frame updates without re-uploading the volume.
     pub alpha_mul: u8,
+    /// Per-instance RGB colour tint, packed `0x00RRGGBB` — each rendered
+    /// voxel's colour is multiplied by it. `0x00FF_FFFF` (white) is a no-op.
+    pub tint: u32,
     /// DL.7 — world-space dynamic lights. When `enabled`, the opaque hit is
     /// lit (sun + point lights + cel + ramp, flat per voxel) instead of the
     /// baked `shade`. `CpuLights::default()` (disabled) ⇒ unchanged.
@@ -467,6 +470,22 @@ struct LayerAccum {
     /// ray exited (or fully attenuated) without an opaque voxel — then the
     /// background is whatever the framebuffer already holds (terrain/sky).
     opaque: Option<(u32, f32)>,
+}
+
+/// Per-instance RGB tint: multiply `color`'s RGB by `tint`'s (both packed,
+/// `tint`'s channels normalised by 255), preserving `color`'s high byte. White
+/// tint (`0x00FF_FFFF`) returns `color` unchanged. Mirrors the GPU `apply_tint`.
+#[inline]
+fn tint_packed(color: u32, tint: u32) -> u32 {
+    if tint & 0x00FF_FFFF == 0x00FF_FFFF {
+        return color;
+    }
+    let mul = |shift: u32| {
+        let c = (color >> shift) & 0xff;
+        let t = (tint >> shift) & 0xff;
+        ((c * t) / 255) & 0xff
+    };
+    (color & 0xff00_0000) | (mul(16) << 16) | (mul(8) << 8) | mul(0)
 }
 
 /// Unpack a packed `0x..RRGGBB` colour to linear-ish `0..1` float channels
@@ -565,12 +584,13 @@ fn cast_local_layers(
     // baked `shade` (byte-identical). XS.2 — when a scene occluder is present
     // the layer also receives hard shadows (world-space query, identity ctx).
     let lights = shade_ctx.lights;
+    let tint = shade_ctx.tint;
     let mut tester = shade_ctx.shadow.map(|occ| WorldShadow {
         ctx: WorldShadowCtx::identity(occ),
     });
     let mut shade_layer = |idx: usize, cell: [i32; 3], n_local: [f32; 3]| -> u32 {
         if !lights.enabled {
-            return shade(dense.col[idx], 0);
+            return tint_packed(shade(dense.col[idx], 0), tint);
         }
         let to_world = |v: [f32; 3]| {
             [
@@ -593,7 +613,10 @@ fn cast_local_layers(
             (dense.col[idx] & 0xff) as f32 / 255.0,
         ];
         let t = tester.as_mut().map(|t| t as &mut dyn ShadowTester);
-        shade_dynamic(albedo, 1.0, n_world, center, &lights, t)
+        tint_packed(
+            shade_dynamic(albedo, 1.0, n_world, center, &lights, t),
+            tint,
+        )
     };
 
     for _ in 0..max_steps {
@@ -991,6 +1014,8 @@ pub fn draw_sprite_dense_shaded(
                 } else {
                     shade(color, 0)
                 };
+                // Per-instance RGB tint (white ⇒ no-op).
+                let lit = tint_packed(lit, shade_ctx.map_or(0x00FF_FFFF, |s| s.tint));
                 // SAFETY: idx in-bounds for the rect within (width, height);
                 // single-threaded writer.
                 let wrote = unsafe {
@@ -1698,6 +1723,7 @@ mod tests {
             lights: CpuLights::default(),
             material: 1,
             alpha_mul,
+            tint: 0x00FF_FFFF,
             shadow: None,
         };
         let _ = draw_sprite_dense_shaded(
@@ -1816,6 +1842,7 @@ mod tests {
             lights: CpuLights::default(),
             material: 0, // opaque
             alpha_mul: 255,
+            tint: 0x00FF_FFFF,
             shadow: None,
         };
         let _ = draw_sprite_dense_shaded(
@@ -1876,6 +1903,7 @@ mod tests {
                 lights: CpuLights::default(),
                 material: 1,
                 alpha_mul: 255,
+                tint: 0x00FF_FFFF,
                 shadow: None,
             };
             let _ = draw_sprite_dense_shaded(
@@ -1934,6 +1962,7 @@ mod tests {
                 lights: CpuLights::default(),
                 material: 1,
                 alpha_mul: 255,
+                tint: 0x00FF_FFFF,
                 shadow: None,
             };
             let _ = draw_sprite_dense_shaded(
@@ -2052,6 +2081,7 @@ mod tests {
                 lights: base,
                 material: 0,
                 alpha_mul: 255,
+                tint: 0x00FF_FFFF,
                 shadow,
             };
             let _ = draw_sprite_dense_shaded(
@@ -2082,6 +2112,59 @@ mod tests {
         );
     }
 
+    /// Per-instance RGB tint multiplies the sprite's colour: a red tint on a
+    /// white cube zeroes green+blue and keeps red; a white tint is a no-op.
+    #[test]
+    fn sprite_rgb_tint_recolours() {
+        let table = MaterialTable::new();
+        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF));
+        let (w, h) = (64u32, 64u32);
+        let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+        let centre = |tint: u32| -> u32 {
+            let n = (w * h) as usize;
+            let mut fb = vec![0u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            let sh = SpriteShade {
+                materials: &table,
+                lights: CpuLights::default(),
+                material: 0,
+                alpha_mul: 255,
+                tint,
+                shadow: None,
+            };
+            let _ = draw_sprite_dense_shaded(
+                &mut fb,
+                &mut zb,
+                w as usize,
+                w,
+                h,
+                &cs,
+                &settings(w, h),
+                &dense,
+                [0.0, 40.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                0,
+                Some(sh),
+            );
+            fb[(h / 2 * w + w / 2) as usize]
+        };
+        let r = |p: u32| (p >> 16) & 0xff;
+        let g = |p: u32| (p >> 8) & 0xff;
+        let b = |p: u32| p & 0xff;
+        let white = centre(0x00FF_FFFF);
+        let red = centre(0x00FF_0000);
+        assert!(
+            g(white) > 180 && b(white) > 180 && r(white) > 180,
+            "white tint must be a no-op: {white:#08x}"
+        );
+        assert!(
+            r(red) > 180 && g(red) < 20 && b(red) < 20,
+            "red tint zeroes green/blue, keeps red: {red:#08x}"
+        );
+    }
+
     /// XS.0 — translucent sprite layers are now **lit** (dynamic-lighting rig),
     /// not flat-baked: with the rig enabled at a dim ambient (sun off), the
     /// accumulated layer colour is darker than the disabled (baked, full-
@@ -2102,6 +2185,7 @@ mod tests {
                 lights,
                 material: 1,
                 alpha_mul: 255,
+                tint: 0x00FF_FFFF,
                 shadow: None,
             };
             let _ = draw_sprite_dense_shaded(
@@ -2160,6 +2244,7 @@ mod tests {
             lights: CpuLights::default(),
             material: 0,
             alpha_mul: 255,
+            tint: 0x00FF_FFFF,
             shadow: None,
         };
         let _ = draw_sprite_dense_shaded(
@@ -2192,6 +2277,7 @@ mod tests {
             lights: CpuLights::default(),
             material: 1,
             alpha_mul: 255,
+            tint: 0x00FF_FFFF,
             shadow: None,
         };
         let wrote = draw_sprite_dense_shaded(
@@ -2279,6 +2365,7 @@ mod tests {
                 lights: CpuLights::default(),
                 material,
                 alpha_mul: 255,
+                tint: 0x00FF_FFFF,
                 shadow: None,
             };
             let _ = draw_sprite_dense_shaded(

@@ -1806,6 +1806,23 @@ impl SceneRenderer {
         }
     }
 
+    /// Set sprite instance `id`'s per-instance **RGB tint**, packed
+    /// `0x00RRGGBB`: every rendered voxel's colour is multiplied by it (per
+    /// channel), so instances of one model can be recoloured cheaply per frame.
+    /// `0x00FF_FFFF` (white, the default) is a no-op. Works on both backends;
+    /// stale handles are ignored. Tint is colour only — for transparency, use a
+    /// translucent material with
+    /// [`set_sprite_instance_alpha`](Self::set_sprite_instance_alpha).
+    pub fn set_sprite_instance_tint(&mut self, id: SpriteInstanceId, tint: u32) {
+        let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+            return;
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_dyn_instance_tint(dyn_index as usize, tint),
+            BackendImpl::Gpu(g) => g.set_dyn_instance_tint(dyn_index as usize, tint),
+        }
+    }
+
     // ---- animated voxel clips (VCL.4) ------------------------------------
 
     /// Register an animated voxel clip ("GIF/MP4 for voxels"): decode all

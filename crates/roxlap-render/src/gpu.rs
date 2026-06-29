@@ -282,6 +282,7 @@ impl GpuBackend {
                 material: s.material,
                 alpha_mul: s.alpha_mul,
                 flags: s.flags,
+                tint: s.tint,
             });
             basis.push(s);
         }
@@ -332,6 +333,7 @@ impl GpuBackend {
             material: s.material,
             alpha_mul: s.alpha_mul,
             flags: s.flags,
+            tint: s.tint,
         };
         self.gpu.append_sprite_instances(registry, &[inst]);
         self.sprite_instances.push(inst);
@@ -388,6 +390,21 @@ impl GpuBackend {
             b.alpha_mul = alpha_mul;
         }
         self.sprite_instances[gpu_index].alpha_mul = alpha_mul;
+        self.transforms_dirty = true;
+    }
+
+    /// Set dynamic instance `idx`'s per-instance RGB tint (`0x00RRGGBB`, white
+    /// = no-op). Same coalesced-flush path as the alpha/material setters.
+    pub(crate) fn set_dyn_instance_tint(&mut self, idx: usize, tint: u32) {
+        if idx >= self.dyn_count {
+            return;
+        }
+        let gpu_index = (self.sprite_instances.len() - self.dyn_count) + idx;
+        let tint = tint & 0x00FF_FFFF;
+        if let Some(b) = self.sprite_basis.get_mut(gpu_index) {
+            b.tint = tint;
+        }
+        self.sprite_instances[gpu_index].tint = tint;
         self.transforms_dirty = true;
     }
 
@@ -593,6 +610,7 @@ impl GpuBackend {
             material: s.material,
             alpha_mul: s.alpha_mul,
             flags: s.flags,
+            tint: s.tint,
         };
         self.gpu.append_sprite_instances(registry, &[inst]);
         self.sprite_instances.push(inst);
@@ -700,6 +718,7 @@ impl GpuBackend {
                     material: limb.material,
                     alpha_mul: limb.alpha_mul,
                     flags: limb.flags,
+                    tint: limb.tint,
                 });
                 self.sprite_basis.push(limb.clone());
             }

@@ -29,7 +29,7 @@ struct Instance {
     material: u32,    // TV: id into the material palette
     alpha_mul: f32,   // TV: per-instance alpha multiplier (0..1)
     flags: u32,       // XS.4: shadow bits (4=NO_CAST, 5=NO_RECEIVE); 0 = both
-    _pad1: u32,
+    tint: u32,        // per-instance RGB tint, packed 0x00RRGGBB (white = no-op)
 };
 // TV: one global-palette material (binding 12). `mode` is the
 // BlendMode discriminant: 0 = Opaque, 1 = AlphaBlend, 2 = Additive.
@@ -201,6 +201,18 @@ fn model_color(m: ModelMeta, p: vec3<i32>, inst_idx: u32) -> vec3<f32> {
     let g = min(255u, (((packed >> 8u) & 0xffu) * (lo >> 16u)) >> 8u);
     let b = min(255u, ((packed & 0xffu) * (lo & 0xffffu)) >> 8u);
     return vec3<f32>(f32(r), f32(g), f32(b)) / 255.0;
+}
+
+// Per-instance RGB tint: multiply a 0..1 colour by `tint`'s channels
+// (0x00RRGGBB / 255). White (0x00FFFFFF) is a no-op. Mirrors the CPU
+// `tint_packed`.
+fn apply_tint(c: vec3<f32>, tint: u32) -> vec3<f32> {
+    let t = vec3<f32>(
+        f32((tint >> 16u) & 0xffu),
+        f32((tint >> 8u) & 0xffu),
+        f32(tint & 0xffu),
+    ) / 255.0;
+    return c * t;
 }
 
 // DL.4 — point-light distance falloff (mirrors scene_dda's): smooth
@@ -375,6 +387,7 @@ fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32)
                 } else {
                     res.color = model_color(m, p, inst_idx);
                 }
+                res.color = apply_tint(res.color, inst.tint);
             }
             return res;
         }
@@ -480,6 +493,7 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
             } else {
                 lc = model_color(m, p, inst_idx);
             }
+            lc = apply_tint(lc, inst.tint);
             if (mm.mode == 0u) {
                 // Opaque voxel: the model's own surface — stop, it backs the
                 // translucent layers in front of it within this instance.

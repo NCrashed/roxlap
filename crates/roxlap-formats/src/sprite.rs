@@ -48,6 +48,10 @@ pub const SPRITE_FLAG_NO_SHADOW_CAST: u32 = 1 << 4;
 /// out (e.g. a glowing effect that shouldn't be shadowed).
 pub const SPRITE_FLAG_NO_SHADOW_RECEIVE: u32 = 1 << 5;
 
+/// The neutral (no-op) value for [`Sprite::tint`] — white, so every channel
+/// multiplies by 1.0.
+pub const NO_TINT: u32 = 0x00FF_FFFF;
+
 /// A KV6 voxel sprite positioned in world space.
 ///
 /// Mirror of voxlap's `vx5sprite` for the kv6 case
@@ -87,6 +91,12 @@ pub struct Sprite {
     /// unscaled, the default). Scales the material's alpha so an effect can
     /// fade out by cheap per-frame updates without re-uploading its volume.
     pub alpha_mul: u8,
+    /// Per-instance RGB colour tint, packed `0x00RRGGBB`. Each rendered voxel's
+    /// colour is multiplied by this (per channel, `out = c * tint / 255`), so a
+    /// host can recolour instances of one model cheaply. `0x00FF_FFFF` (white,
+    /// the default) is a no-op. Alpha is **not** carried here — use a
+    /// translucent material + [`alpha_mul`](Self::alpha_mul) for transparency.
+    pub tint: u32,
     /// Per-voxel material colour map (TV.3): `(rgb, material_id)` pairs that
     /// classify this model's voxels into materials by colour — a mixed model
     /// (opaque frame + glass, bottle + potion). **Empty** (the default) means
@@ -128,8 +138,17 @@ impl Sprite {
             flags: 0,
             material: 0,
             alpha_mul: 255,
+            tint: NO_TINT,
             material_map: Vec::new(),
         }
+    }
+
+    /// Set this sprite's RGB colour tint (`0x00RRGGBB`, white = no-op). Returns
+    /// `self` for chaining. See [`tint`](Self::tint).
+    #[must_use]
+    pub fn with_tint(mut self, tint: u32) -> Self {
+        self.tint = tint & 0x00FF_FFFF;
+        self
     }
 
     /// XS.4 — whether this sprite casts a hard shadow (the [dynamic-lighting
