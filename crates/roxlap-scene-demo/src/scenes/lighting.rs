@@ -102,6 +102,11 @@ impl LightingScene {
             IVec3::new(56, 56, FLOOR_TOP_Z),
             Some(MONUMENT),
         );
+        // AO stage — bake ambient occlusion into the brightness byte, which
+        // the stylized dynamic lighting reads as its ambient/AO fill: pillar
+        // bases, the monument's foot, and inner corners darken even where no
+        // sun/point light directly shades them.
+        crate::scene::bake_ao_pub(&mut scene);
         scene
     }
 

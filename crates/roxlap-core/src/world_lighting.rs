@@ -324,6 +324,53 @@ impl EstNormCache {
         [nx as f32 * inv, ny as f32 * inv, nz as f32 * inv]
     }
 
+    /// AO.0 — ambient occlusion at solid voxel `(x, y, z)` given its
+    /// surface normal `n` (from [`estnorm`](Self::estnorm), which points
+    /// toward the **solid** side). Returns `0.0` (fully open, e.g. a flat
+    /// floor under open sky) … `1.0` (fully enclosed).
+    ///
+    /// Samples the `±ESTNORMRAD` neighbourhood on the voxel's **air** side
+    /// (`offset · n < 0`, i.e. away from the solid the normal points into)
+    /// and measures how much of it is solid — crevices / inside corners
+    /// read occluded (dark), open faces read clear (bright). Each occluder
+    /// is inverse-distance weighted so contact darkening dominates. A
+    /// degenerate normal (`[0,0,0]`, all-solid/all-air) ⇒ `0.0` (no AO).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn ambient_occlusion(&self, x: i32, y: i32, z: i32, n: [f32; 3]) -> f32 {
+        if n == [0.0, 0.0, 0.0] {
+            return 0.0;
+        }
+        let cx = (x - self.origin_x) as i32;
+        let cy = (y - self.origin_y) as i32;
+        let mut occ = 0.0f32;
+        let mut total = 0.0f32;
+        for dy in -ESTNORMRAD..=ESTNORMRAD {
+            for dx in -ESTNORMRAD..=ESTNORMRAD {
+                for dz in -ESTNORMRAD..=ESTNORMRAD {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let d = [dx as f32, dy as f32, dz as f32];
+                    // Air side only: away from the solid the normal points into.
+                    if d[0] * n[0] + d[1] * n[1] + d[2] * n[2] >= 0.0 {
+                        continue;
+                    }
+                    let w = 1.0 / (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                    total += w;
+                    if self.solid((cx + dx) as usize, (cy + dy) as usize, z + dz) {
+                        occ += w;
+                    }
+                }
+            }
+        }
+        if total <= 0.0 {
+            0.0
+        } else {
+            occ / total
+        }
+    }
+
     /// Voxel-grid limit; used by callers to bound their iteration.
     #[must_use]
     #[allow(dead_code)]
@@ -344,11 +391,15 @@ impl EstNormCache {
 /// - `lightmode == 1`: directional sun-style bake — every visible
 ///   voxel gets `(tp.y * 0.5 + tp.z) * 64 + 103.5` clamped to
 ///   `[0, 255]` from its surface normal `tp`.
-/// - `lightmode >= 2`: per-light Lambertian bake — base
+/// - `lightmode == 2`: per-light Lambertian bake — base
 ///   `(tp.y * 0.5 + tp.z) * 16 + 47.5` minus, for each light in
 ///   range with surface normal facing it, `g * h * sc` where
 ///   `g = 1/(d·d²) - 1/(r·r²)` (cube falloff with hard radius
 ///   cutoff) and `h = tp · light_delta`.
+/// - `lightmode == 3` (AO): bake **ambient occlusion** into the byte
+///   (the DL ambient/AO channel) — open voxels keep `128`, crevices /
+///   inside corners darken (see [`EstNormCache::ambient_occlusion`]).
+///   The retro stylized lighting reads this byte as its ambient fill.
 ///
 /// The bbox is padded by `ESTNORMRAD` on each side internally
 /// to give estnorm enough neighbourhood; that's done here too.
@@ -722,13 +773,33 @@ fn shade_column(
         let hi = sz1.min(z_hi);
         for z in lo..hi {
             let normal = cache.estnorm(x, y, z);
-            let brightness = compute_brightness(x, y, z, normal, lightmode, lights, lightsub);
+            // AO.0 — `lightmode == 3` bakes ambient occlusion into the byte
+            // (the DL ambient/AO channel); other modes keep the directional /
+            // point-light brightness.
+            let brightness = if lightmode == 3 {
+                ao_byte(cache, x, y, z, normal)
+            } else {
+                compute_brightness(x, y, z, normal, lightmode, lights, lightsub)
+            };
             let byte_off = voxel_byte_offset_signed + ((z as isize) << 2);
             if byte_off >= 0 && (byte_off as usize) < column.len() {
                 column[byte_off as usize] = brightness;
             }
         }
     }
+}
+
+/// AO.0 — how dark a fully-occluded voxel gets, as a fraction of the
+/// open-voxel ambient. `0.8` ⇒ a deep crevice keeps 20% of the ambient.
+/// (AO.2 will make this a bake parameter.)
+const AO_STRENGTH: f32 = 0.8;
+
+/// AO.0 — map ambient occlusion to the brightness byte (the DL ambient/AO
+/// channel). Open voxels keep the neutral `128` (= full ambient, shader
+/// `byte/128 == 1.0`); occluded voxels darken toward `128·(1 − strength)`.
+fn ao_byte(cache: &EstNormCache, x: i32, y: i32, z: i32, n: [f32; 3]) -> u8 {
+    let ao = cache.ambient_occlusion(x, y, z, n);
+    clamp_to_byte(128.0 * (1.0 - AO_STRENGTH * ao))
 }
 
 /// Per-voxel brightness math. Computes the `[0, 255]`
@@ -796,6 +867,83 @@ fn clamp_to_byte(f: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AO.0 — a floor voxel beside a wall is more occluded (darker) than an
+    /// open floor voxel; an open voxel reads ≈0 occlusion.
+    #[test]
+    fn ambient_occlusion_darkens_next_to_a_wall() {
+        let vsid: u32 = 8;
+        // Per-column slab: `[nextptr=0, z1, z2, 0]` + (z2-z1+1) BGRA records.
+        let column = |z1: u8, z2: u8| -> Vec<u8> {
+            let mut c = vec![0u8, z1, z2, 0];
+            for _ in z1..=z2 {
+                c.extend([0x20, 0x20, 0x20, 0x80]);
+            }
+            c
+        };
+        let floor = column(20, 20); // single floor voxel at z=20
+        let wall = column(10, 20); // wall rising from z=10..20 (above the floor)
+        let mut data = Vec::new();
+        let mut offsets = vec![0u32; (vsid * vsid + 1) as usize];
+        for i in 0..(vsid * vsid) {
+            offsets[i as usize] = data.len() as u32;
+            // Tall wall at column (5, 3); floor everywhere else.
+            let col = if i == 3 * vsid + 5 { &wall } else { &floor };
+            data.extend_from_slice(col);
+        }
+        offsets[(vsid * vsid) as usize] = data.len() as u32;
+
+        let cache = EstNormCache::build(&data, &offsets, vsid, 0, 0, vsid as i32, vsid as i32);
+        // (4,3) sits next to the wall at (5,3); (2,3) is in the open.
+        let near = cache.ambient_occlusion(4, 3, 20, cache.estnorm(4, 3, 20));
+        let open = cache.ambient_occlusion(2, 3, 20, cache.estnorm(2, 3, 20));
+        assert!(
+            open < 0.05,
+            "open floor voxel should be ~unoccluded: {open}"
+        );
+        assert!(
+            near > open + 0.1,
+            "voxel beside the wall must be more occluded: near={near} open={open}",
+        );
+    }
+
+    /// AO.0 — `lightmode == 3` bakes occlusion into the alpha byte: the
+    /// floor voxel beside the wall ends up darker than an open one, which
+    /// stays at the neutral 128 (full ambient).
+    #[test]
+    fn lightmode3_bakes_ambient_occlusion() {
+        let vsid: u32 = 8;
+        let column = |z1: u8, z2: u8| -> Vec<u8> {
+            let mut c = vec![0u8, z1, z2, 0];
+            for _ in z1..=z2 {
+                c.extend([0x20, 0x20, 0x20, 0xab]); // alpha 0xab to see the rewrite
+            }
+            c
+        };
+        let floor = column(20, 20);
+        let wall = column(10, 20);
+        let mut data = Vec::new();
+        let mut offsets = vec![0u32; (vsid * vsid + 1) as usize];
+        for i in 0..(vsid * vsid) {
+            offsets[i as usize] = data.len() as u32;
+            let col = if i == 3 * vsid + 5 { &wall } else { &floor };
+            data.extend_from_slice(col);
+        }
+        offsets[(vsid * vsid) as usize] = data.len() as u32;
+
+        update_lighting(&mut data, &offsets, vsid, 0, 0, 0, 8, 8, 30, 3, &[]);
+
+        // Top floor voxel's alpha is at column offset + 7 (header 4 + BGR 3).
+        let alpha = |x: u32, y: u32| data[offsets[(y * vsid + x) as usize] as usize + 7];
+        let near = alpha(4, 3);
+        let open = alpha(2, 3);
+        assert_ne!(open, 0xab, "open voxel alpha rewritten by the AO bake");
+        assert_eq!(open, 128, "open floor voxel keeps full ambient (128)");
+        assert!(
+            near < open,
+            "voxel beside the wall is darker: near={near} open={open}"
+        );
+    }
 
     /// xbsflor(0) = -1 (all bits set), xbsflor(32) clamped to 0,
     /// xbsflor(5) = ~31 = 0xffff_ffe0.

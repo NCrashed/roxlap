@@ -138,7 +138,7 @@ pub fn build_demo() -> SceneAndCamera {
     // [[mip_attempt]] index-out-of-bounds for fragmented chunks.
     // Markers stay unlit (flat colour stripes) which is fine for
     // a LOD-tier visual validation demo.
-    bake_lightmode_1(&mut scene);
+    bake_lightmode(&mut scene, 1);
 
     // S6.6: 10 striped marker pillars along world +y. Built AFTER
     // `bake_lightmode_1` so the markers skip the bake's
@@ -352,13 +352,19 @@ impl SceneAndCamera {
 /// dead-code entry point.
 #[cfg(test)]
 pub fn bake_lightmode_1_pub(scene: &mut Scene) {
-    bake_lightmode_1(scene);
+    bake_lightmode(scene, 1);
+}
+
+/// AO stage — bake **ambient occlusion** (lightmode 3) into the scene's
+/// brightness bytes, which the DL stylized lighting reads as its ambient/AO
+/// fill (open voxels stay bright; crevices darken).
+pub fn bake_ao_pub(scene: &mut Scene) {
+    bake_lightmode(scene, 3);
 }
 
 // chx_v / chy_v are voxlap-canonical paired names.
 #[allow(clippy::cast_possible_wrap, clippy::similar_names)]
-fn bake_lightmode_1(scene: &mut Scene) {
-    const LIGHTMODE: u32 = 1;
+fn bake_lightmode(scene: &mut Scene, lightmode: u32) {
     // S7.6: skip streaming grids — they bake themselves on
     // stream-in inside their `ChunkGenerator::generate`. A
     // scene-wide bake here would only catch the few chunks that
@@ -429,7 +435,7 @@ fn bake_lightmode_1(scene: &mut Scene) {
                 cs_xy,
                 cs_z,
                 &cache,
-                LIGHTMODE,
+                lightmode,
                 &[],
             );
         }
