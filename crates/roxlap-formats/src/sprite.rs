@@ -207,7 +207,10 @@ mod tests {
 
         let no_cast = s.clone().with_casts_shadow(false);
         assert!(!no_cast.casts_shadow() && no_cast.receives_shadow());
-        assert_eq!(no_cast.flags & SPRITE_FLAG_NO_SHADOW_CAST, SPRITE_FLAG_NO_SHADOW_CAST);
+        assert_eq!(
+            no_cast.flags & SPRITE_FLAG_NO_SHADOW_CAST,
+            SPRITE_FLAG_NO_SHADOW_CAST
+        );
 
         let no_recv = s.clone().with_receives_shadow(false);
         assert!(no_recv.casts_shadow() && !no_recv.receives_shadow());

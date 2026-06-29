@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     existing per-grid camera buffer (binding 15) — no new storage buffer (the
     16-buffer limit is saturated) — via `GridWorldTransform`. Identity
     transforms reproduce the prior intra-grid shadows byte-for-byte.
+  - **Per-sprite shadow flags** (XS.4) — a sprite can opt out of casting and/or
+    receiving hard shadows via `SPRITE_FLAG_NO_SHADOW_CAST` /
+    `SPRITE_FLAG_NO_SHADOW_RECEIVE` (both default to participating), with
+    `Sprite::{casts_shadow, receives_shadow, with_casts_shadow,
+    with_receives_shadow}` helpers. Honored on the CPU backend (a non-caster is
+    excluded from the sprite occluder; a non-receiver isn't darkened).
 - **Voxel ambient occlusion** (macro-stage AO) — a CPU bake pass that writes
   per-voxel ambient occlusion into the brightness byte, which the dynamic
   lighting (DL) reads as its ambient/AO fill: open surfaces stay bright while

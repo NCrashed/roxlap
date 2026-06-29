@@ -547,6 +547,13 @@ pub struct GpuRenderer {
     /// `sprite_has_translucent` gates the shader's accumulate path.
     sprite_materials: Box<[MaterialGpu; 256]>,
     sprite_has_translucent: bool,
+    /// XS.4 — whether this device grants enough storage buffers per shader
+    /// stage for GPU sprite shadows (the cross-pass occupancy bindings push a
+    /// pass past the baseline 16). `false` ⇒ GPU sprites render unshadowed (the
+    /// pre-XS.4 path); the CPU backend always has sprite shadows. Computed once
+    /// at init from the granted device limits (see
+    /// [`SPRITE_SHADOW_MIN_STORAGE_BUFFERS`]).
+    sprite_shadows_capable: bool,
     /// GPU.10.4 — LOD aggressiveness: step a sprite to the next mip
     /// once a mip-0 voxel projects below this many screen pixels.
     /// Defaults to 4.0 (the empirical sweet spot); the host can tune
@@ -1374,6 +1381,12 @@ impl GpuRenderer {
             ..Default::default()
         });
 
+        // XS.4 — did the device grant enough storage buffers per stage for the
+        // GPU sprite-shadow cross-pass bindings? If not, sprites render
+        // unshadowed (the CPU backend still has full sprite shadows).
+        let sprite_shadows_capable = device.limits().max_storage_buffers_per_shader_stage
+            >= SPRITE_SHADOW_MIN_STORAGE_BUFFERS;
+
         Self {
             surface,
             surface_config,
@@ -1407,6 +1420,7 @@ impl GpuRenderer {
             fog_far: 1.0e30,
             sprite_registry: None,
             sprite_model_dda: None,
+            sprite_shadows_capable,
             sprite_materials: Box::new(
                 [MaterialGpu {
                     alpha: 1.0,
@@ -1463,6 +1477,15 @@ impl GpuRenderer {
     /// chunk uploads (`GpuChunkResident::upload(gpu.device(), …)`).
     pub fn device(&self) -> &wgpu::Device {
         &self.device
+    }
+
+    /// XS.4 — whether this device can run GPU sprite shadows (it granted
+    /// enough storage buffers per shader stage for the cross-pass occupancy
+    /// bindings). `false` ⇒ GPU sprites render unshadowed; the CPU backend
+    /// always has sprite shadows. Lets the facade/host report the fallback.
+    #[must_use]
+    pub fn sprite_shadows_capable(&self) -> bool {
+        self.sprite_shadows_capable
     }
 
     /// Borrow the wgpu queue — hosts use this for read-back paths
@@ -4738,14 +4761,24 @@ pub(crate) fn pick_required_limits(adapter_limits: &wgpu::Limits) -> wgpu::Limit
         max_buffer_size: adapter_limits.max_buffer_size,
         // Occupancy paging adds up to MAX_OCC_PAGES-1 extra storage
         // bindings; with the scene's other buffers + the GPU.9 depth
-        // buffer the scene_dda stage needs ~11. The default cap is 8.
-        // Both NVK and lavapipe advertise ≫16, so request 16.
+        // buffer the scene_dda stage needs 16. XS.4 GPU sprite shadows
+        // need more (the sprite pass binds the terrain occupancy set on
+        // top of its own — up to `SPRITE_SHADOW_MIN_STORAGE_BUFFERS`), so
+        // request that many when the adapter offers them; capable devices
+        // light up sprite shadows, others fall back (still ≥16 for the
+        // base renderer). Both NVK and lavapipe advertise ≫16.
         max_storage_buffers_per_shader_stage: adapter_limits
             .max_storage_buffers_per_shader_stage
-            .min(16),
+            .min(SPRITE_SHADOW_MIN_STORAGE_BUFFERS),
         ..wgpu::Limits::default()
     }
 }
+
+/// XS.4 — storage buffers per shader stage needed for GPU sprite shadows. The
+/// sprite pass binds its own 14 + the terrain occupancy set (occupancy pages
+/// 0..3, chunk occupancy, slot index, grid meta, per-grid cameras) to march
+/// terrain shadows. Devices granting fewer fall back to unshadowed GPU sprites.
+pub(crate) const SPRITE_SHADOW_MIN_STORAGE_BUFFERS: u32 = 22;
 
 fn pick_present_mode(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
     // Prefer Mailbox > Immediate > Fifo. Fifo is the universal
