@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-scene shadows + lit translucent sprites** (macro-stage XS, extends
+  DL). Three related gaps closed:
+  - **Lit translucent sprite layers** (XS.0) — translucent sprite/clip voxels
+    are now shaded by the dynamic-lighting rig (sun + point lights + cel +
+    ramp, flat per voxel) like opaque sprites and translucent *terrain*
+    already were, on both backends. Previously the accumulate paths used the
+    flat baked colour (`cast_local_layers` on the CPU, `march_instance_layers`
+    in `sprite_model_dda.wgsl`); both now light each layer via the model-local
+    face normal. A disabled rig is byte-identical.
+  - **Cross-grid hard shadows, CPU** (XS.1) — a shadow ray cast from a voxel
+    in one grid now tests *every* grid in the scene, so e.g. a ship grid drops
+    a shadow on the ground grid. A world-space `SceneOccluder`
+    (`roxlap-scene`) implements the new `roxlap_core::WorldOccluder` trait; the
+    CPU DDA reaches it through `DdaEnv::world_shadow` + the hit grid's
+    local→world transform. Built once per frame (only when a caster is active),
+    borrowing the scene immutably — the composed render loop was split into a
+    `&mut` cache-prep pass and an immutable render pass so the occluder can
+    coexist with it. No caster ⇒ no occluder built (unchanged).
 - **Voxel ambient occlusion** (macro-stage AO) — a CPU bake pass that writes
   per-voxel ambient occlusion into the brightness byte, which the dynamic
   lighting (DL) reads as its ambient/AO fill: open surfaces stay bright while

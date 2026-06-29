@@ -74,9 +74,13 @@ pub struct DdaEnv<'a> {
     /// stylized cel/ramp, evaluated flat per voxel. Disabled by default ⇒ the
     /// hit uses the baked-byte [`shade`] path, byte-identical to pre-DL. Lights
     /// here are already in the grid's **local** frame (the scene renderer
-    /// transforms them per grid). **No shadows** (the per-pixel shadow march is
-    /// GPU-only; see `PORTING-DYNLIGHT.md` CPU.2).
+    /// transforms them per grid). Shadows: see [`Self::world_shadow`].
     pub lights: CpuLights<'a>,
+    /// XS.1 — when set, shadow rays test the **whole scene** (all grids +
+    /// sprites) via this world-space occluder + the current grid's
+    /// local→world transform, instead of the single-grid [`SamplerShadow`].
+    /// `None` ⇒ single-grid shadows (the direct `render_dda` path / tests).
+    pub world_shadow: Option<WorldShadowCtx<'a>>,
 }
 
 /// CPU.1 — one point light in a grid's local frame for the CPU renderer.
@@ -143,6 +147,7 @@ impl Default for DdaEnv<'_> {
             materials: None,
             terrain_materials: &[],
             lights: CpuLights::default(),
+            world_shadow: None,
         }
     }
 }
@@ -292,10 +297,63 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// `occluded(origin, dir, max_t)` returns `true` if a solid voxel blocks
 /// the segment from `origin` (grid-local, already biased off the surface)
 /// in unit direction `dir` within `max_t` voxel units. Terrain hits pass
-/// a [`SamplerShadow`] (marches the grid voxels); sprites pass `None`
-/// (no sprite shadows, matching the GPU).
+/// a [`SamplerShadow`] (marches the current grid only) or a
+/// [`WorldShadow`] (cross-grid + sprites, XS.1/XS.2); sprites that don't
+/// cast/receive shadows pass `None`.
 pub(crate) trait ShadowTester {
     fn occluded(&mut self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool;
+}
+
+/// XS.1 — a **world-space** occlusion oracle over the whole scene (all grids,
+/// and sprites in XS.2). Implemented in `roxlap-scene` (it needs the grid /
+/// sprite stores); the CPU DDA reaches it through [`DdaEnv::world_shadow`] so
+/// shadow rays cross grid + object boundaries instead of stopping at the
+/// current grid. `occluded_world(origin, dir, max_t)` is in **world** voxel
+/// units: `true` iff any solid voxel anywhere blocks the segment.
+///
+/// `Sync` because [`DdaEnv`] (which borrows it) is shared across the
+/// rayon strip workers in [`render_dda_parallel`]; the occluder is a
+/// read-only borrow of the scene, so this holds.
+pub trait WorldOccluder: Sync {
+    fn occluded_world(&self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool;
+}
+
+/// XS.1 — per-grid context for a cross-scene shadow query: the scene-wide
+/// [`WorldOccluder`] plus the **current grid's** local→world transform, so a
+/// grid-local shadow ray (the frame `shade_dynamic` works in) can be lifted
+/// to world space before the scene-wide test. `cols[i]` is the world-space
+/// image of grid-local axis `i` (the grid rotation's columns); `origin` is the
+/// grid's world origin.
+#[derive(Clone, Copy)]
+pub struct WorldShadowCtx<'a> {
+    pub occluder: &'a dyn WorldOccluder,
+    pub origin: [f32; 3],
+    pub cols: [[f32; 3]; 3],
+}
+
+/// XS.1 — [`ShadowTester`] that lifts a grid-local shadow ray to world space
+/// (via [`WorldShadowCtx`]) and queries the scene-wide [`WorldOccluder`], so
+/// occlusion crosses grid + sprite boundaries.
+struct WorldShadow<'a> {
+    ctx: WorldShadowCtx<'a>,
+}
+
+impl ShadowTester for WorldShadow<'_> {
+    fn occluded(&mut self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
+        let c = &self.ctx.cols;
+        // world = grid_origin + R · local (R columns = `cols`); dir rotates only.
+        let wo = [
+            self.ctx.origin[0] + c[0][0] * origin[0] + c[1][0] * origin[1] + c[2][0] * origin[2],
+            self.ctx.origin[1] + c[0][1] * origin[0] + c[1][1] * origin[1] + c[2][1] * origin[2],
+            self.ctx.origin[2] + c[0][2] * origin[0] + c[1][2] * origin[1] + c[2][2] * origin[2],
+        ];
+        let wd = [
+            c[0][0] * dir[0] + c[1][0] * dir[1] + c[2][0] * dir[2],
+            c[0][1] * dir[0] + c[1][1] * dir[1] + c[2][1] * dir[2],
+            c[0][2] * dir[0] + c[1][2] * dir[1] + c[2][2] * dir[2],
+        ];
+        self.ctx.occluder.occluded_world(wo, wd, max_t)
+    }
 }
 
 /// CPU.1 — dynamic-lighting shade for a terrain voxel (the CPU mirror of the
@@ -1353,35 +1411,37 @@ fn cell_walk_skip(
                 let casts = env.lights.shadow_strength > 0.0
                     && (env.lights.sun_casts_shadow
                         || env.lights.points.iter().any(|p| p.casts_shadow));
-                if casts {
-                    let mut sh = SamplerShadow {
+                // Pick the shadow oracle: the scene-wide one (cross-grid +
+                // sprites, XS.1) when present, else the single-grid Sampler;
+                // `None` when no caster is flagged, so the rig stays
+                // march-free. The two testers live in branch-local slots so
+                // exactly one is borrowed for the `shade_lit_cpu` call.
+                let mut world_sh;
+                let mut sampler_sh;
+                let tester: Option<&mut dyn ShadowTester> = if !casts {
+                    None
+                } else if let Some(ctx) = env.world_shadow {
+                    world_sh = WorldShadow { ctx };
+                    Some(&mut world_sh)
+                } else {
+                    sampler_sh = SamplerShadow {
                         sampler: &mut *sampler,
                         cell_size,
                         lo_c,
                         hi_c,
                     };
-                    shade_lit_cpu(
-                        color,
-                        bright_sub,
-                        last_axis,
-                        step,
-                        cellc,
-                        cell_size,
-                        &env.lights,
-                        Some(&mut sh),
-                    )
-                } else {
-                    shade_lit_cpu(
-                        color,
-                        bright_sub,
-                        last_axis,
-                        step,
-                        cellc,
-                        cell_size,
-                        &env.lights,
-                        None,
-                    )
-                }
+                    Some(&mut sampler_sh)
+                };
+                shade_lit_cpu(
+                    color,
+                    bright_sub,
+                    last_axis,
+                    step,
+                    cellc,
+                    cell_size,
+                    &env.lights,
+                    tester,
+                )
             } else {
                 shade(color, bright_sub)
             };
@@ -2355,6 +2415,7 @@ mod tests {
             materials: None,
             terrain_materials: &[],
             lights: CpuLights::default(),
+            world_shadow: None,
         };
         let (w, h) = (64u32, 64u32);
         let (fog, _) = render_brickmap_env(grid, &cam, w, h, &env);
@@ -2394,6 +2455,7 @@ mod tests {
             materials: None,
             terrain_materials: &[],
             lights: CpuLights::default(),
+            world_shadow: None,
         };
         let cam = Camera::from_yaw_pitch([16.0, 16.0, 128.0], 0.3, -0.4);
         let (w, h) = (48u32, 48u32);
@@ -2481,6 +2543,7 @@ mod tests {
             materials: None,
             terrain_materials: &[],
             lights: CpuLights::default(),
+            world_shadow: None,
         };
         let (shaded, _) = render_brickmap_env(grid, &cam, 32, 32, &env);
         let lum = |c: u32| (c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff);
@@ -2844,6 +2907,7 @@ mod tests {
             materials: None,
             terrain_materials: &[],
             lights: CpuLights::default(),
+            world_shadow: None,
         };
 
         let (seq_fb, seq_zb) = render_brickmap_env(grid, &cam, w, h, &env);

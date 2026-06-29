@@ -32,6 +32,7 @@ pub mod cavegen;
 pub mod chunks;
 pub mod edit;
 pub mod lod;
+pub mod occluder;
 pub mod render;
 pub mod snapshot;
 pub mod streaming;

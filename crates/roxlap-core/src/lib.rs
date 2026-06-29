@@ -65,7 +65,7 @@ pub mod world_query;
 pub use camera::Camera;
 pub use dda::{
     effective_mip, pixel_ray, render_dda, render_dda_parallel, render_sky_fill, BrickCache,
-    CpuLights, CpuPointLight, DdaEnv, PixelSink, RasterSink,
+    CpuLights, CpuPointLight, DdaEnv, PixelSink, RasterSink, WorldOccluder, WorldShadowCtx,
 };
 pub use dda_sprite::{
     draw_sprite_dda, draw_sprite_dda_shaded, draw_sprite_dense, draw_sprite_dense_shaded,

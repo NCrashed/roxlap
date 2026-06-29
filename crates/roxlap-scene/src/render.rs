@@ -46,7 +46,10 @@ use roxlap_formats::material::MaterialTable;
 use crate::billboard::{self, BillboardCache, DEFAULT_RESOLUTION as BILLBOARD_RESOLUTION};
 use crate::chunks;
 use crate::lod::Lod;
-use crate::{GridTransform, Scene, CHUNK_SIZE_XY};
+use crate::occluder::SceneOccluder;
+use crate::{GridId, GridTransform, Scene, CHUNK_SIZE_XY};
+use roxlap_core::WorldShadowCtx;
+use std::collections::HashMap;
 
 /// Sentinel colour stamped into a `render_sky = false` grid's
 /// temporary framebuffer wherever the rasterizer would have drawn
@@ -302,6 +305,7 @@ pub fn render_scene(
             // The direct path is unlit (lighting flows through the composed
             // path); keep it on the baked-byte shade.
             lights: CpuLights::default(),
+            world_shadow: None,
         };
         render_dda_parallel(
             &local_cam,
@@ -595,7 +599,46 @@ fn render_scene_composed_scissored(
     let mut temp_fb = vec![sky_color; pixel_count];
     let mut temp_zb = vec![f32::INFINITY; pixel_count];
 
-    for (_id, grid) in scene.grids_mut() {
+    // XS.1 — phase A (`&mut`): materialise the per-frame caches the render
+    // reads — DDA brick caches (Near/Mid) and Far-tier billboard impostors —
+    // and record each grid's effective DDA mip. Hoisting these out of the
+    // render loop lets phase B run over `&Scene` immutably, so the cross-grid
+    // shadow occluder (which also borrows the scene) can coexist with it.
+    let cam_world = DVec3::from_array(camera.pos);
+    let mut eff_mips: HashMap<GridId, u32> = HashMap::new();
+    for (id, grid) in scene.grids_mut() {
+        let lod = grid.select_lod(cam_world);
+        if lod == Lod::Far {
+            if !grid.chunks.is_empty() && grid.billboards.is_none() {
+                let cache = BillboardCache::build(grid, BILLBOARD_RESOLUTION);
+                grid.billboards = Some(cache);
+            }
+            continue; // Far blits an impostor; no brick cache / mip needed.
+        }
+        let req = match lod {
+            Lod::Mid => grid
+                .lod_thresholds
+                .mid_mip_levels
+                .map_or(0, |n| n.saturating_sub(1)),
+            Lod::Near | Lod::Far => 0,
+        };
+        eff_mips.insert(id, grid.ensure_dda_bricks(req));
+    }
+
+    // Reborrow immutably for phase B + the shadow occluder.
+    let scene: &Scene = scene;
+
+    // XS.1 — cross-grid hard shadows: build the world-space scene occluder
+    // once when shadows are actually active (a caster flagged + non-zero
+    // strength), so the shadow ray at a terrain hit tests every grid, not
+    // just the one it hit. `None` ⇒ the single-grid `SamplerShadow` path.
+    let shadows_on = lights.enabled
+        && lights.shadow_strength > 0.0
+        && (lights.sun_casts_shadow || lights.points.iter().any(|p| p.casts_shadow));
+    let occluder = shadows_on.then(|| SceneOccluder::build(scene));
+    let occluder = occluder.filter(|o| !o.is_empty());
+
+    for (grid_id, grid) in scene.grids() {
         // S6.0/S6.1: per-grid LOD tier dispatch. The picker keys
         // off the grid's `lod_thresholds` and the world-space
         // camera. Default thresholds are `always_near` so every
@@ -618,19 +661,12 @@ fn render_scene_composed_scissored(
         let lod = grid.select_lod(DVec3::from_array(camera.pos));
 
         if lod == Lod::Far {
-            // S6.3: Far-tier billboard blit.
+            // S6.3: Far-tier billboard blit. The impostor cache was built in
+            // phase A (above); this immutable pass only reads it.
             //
-            // Empty grids have nothing to impostor; skip without
-            // touching `billboards` so a later edit + Far re-entry
-            // still builds a fresh cache.
+            // Empty grids have nothing to impostor; skip.
             if grid.chunks.is_empty() {
                 continue;
-            }
-            // Lazy populate: cleared by edits (see `edit.rs`),
-            // rebuilt on first Far entry after each edit cycle.
-            if grid.billboards.is_none() {
-                let cache = BillboardCache::build(grid, BILLBOARD_RESOLUTION);
-                grid.billboards = Some(cache);
             }
             // Grid bounds + world-space centre. Rotation preserves
             // length, so `bounds.radius` is the world-space radius.
@@ -650,13 +686,16 @@ fn render_scene_composed_scissored(
             }
             let query_dir_world = centre_to_cam_world / ctc_len;
             let query_dir_local = grid.transform.rotation.inverse() * query_dir_world;
-            // Cache is guaranteed Some here (populated above).
-            let cache = grid.billboards.as_ref().unwrap();
-            // pick_nearest only returns None for empty caches;
-            // we just built a 26-snapshot cache so unwrap is safe.
-            let snapshot = cache
-                .pick_nearest(query_dir_local)
-                .expect("billboard cache populated above");
+            // Cache was populated in phase A for non-empty Far grids; if it's
+            // somehow absent, skip (a future frame re-enters Far and builds).
+            let Some(cache) = grid.billboards.as_ref() else {
+                continue;
+            };
+            // pick_nearest only returns None for empty caches; the phase-A
+            // build produced a 26-snapshot cache so this resolves.
+            let Some(snapshot) = cache.pick_nearest(query_dir_local) else {
+                continue;
+            };
             billboard::billboard_blit_into(
                 fb,
                 zb,
@@ -685,16 +724,9 @@ fn render_scene_composed_scissored(
         // Mid tier: coarsen by the grid's `mid_mip_levels` override
         // (a level count → uniform DDA mip `n-1`). No override ⇒ mip
         // 0, i.e. byte-identical to Near (the override is opt-in).
-        let dda_eff_mip = {
-            let req = match lod {
-                Lod::Mid => grid
-                    .lod_thresholds
-                    .mid_mip_levels
-                    .map_or(0, |n| n.saturating_sub(1)),
-                Lod::Near | Lod::Far => 0,
-            };
-            grid.ensure_dda_bricks(req)
-        };
+        // Effective DDA mip: the brick cache was ensured in phase A; reuse the
+        // mip it resolved (Near/Mid grids are recorded; default 0 otherwise).
+        let dda_eff_mip = eff_mips.get(&grid_id).copied().unwrap_or(0);
         let Some(backing) = grid.chunk_xyz_backing() else {
             continue;
         };
@@ -874,6 +906,23 @@ fn render_scene_composed_scissored(
         // (point scratch lives for the grid's render below).
         let mut light_scratch: Vec<CpuPointLight> = Vec::new();
         let local_lights = grid_local_lights(&lights, &grid.transform, &mut light_scratch);
+        // XS.1 — cross-grid shadows: hand the shade the scene-wide occluder
+        // plus this grid's local→world transform, so a grid-local shadow ray
+        // is lifted to world space and tested against every grid. `cols[i]`
+        // is the world image of grid-local axis `i` (the rotation's columns).
+        let world_shadow = occluder.as_ref().map(|occ| {
+            let r = grid.transform.rotation;
+            let col = |v: DVec3| {
+                let w = r * v;
+                [w.x as f32, w.y as f32, w.z as f32]
+            };
+            let o = grid.transform.origin;
+            WorldShadowCtx {
+                occluder: occ as &dyn roxlap_core::WorldOccluder,
+                origin: [o.x as f32, o.y as f32, o.z as f32],
+                cols: [col(DVec3::X), col(DVec3::Y), col(DVec3::Z)],
+            }
+        });
         #[allow(clippy::cast_precision_loss)]
         let env = DdaEnv {
             sky: if owns_sky { sky } else { None },
@@ -887,6 +936,7 @@ fn render_scene_composed_scissored(
             materials,
             terrain_materials,
             lights: local_lights,
+            world_shadow,
         };
         // Effective render mip + brick cache were prepared above
         // (DDA.6 uniform per-grid mip, DDA.7 cross-frame cache).
@@ -998,6 +1048,95 @@ mod tests {
         );
         assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
         fb
+    }
+
+    /// XS.1 — cross-grid hard shadows: a block in grid **B** casts a sun
+    /// shadow onto the floor of grid **A**. Renders the two-grid scene with
+    /// the sun shadow-casting vs not; the shadow only exists if the shadow
+    /// ray from A's floor crossed into B, so the shadowed render must be
+    /// strictly (and non-trivially) darker.
+    #[test]
+    fn cross_grid_sun_shadow_darkens_other_grid() {
+        // Grid A: a wide floor at world z∈[60,62]. Grid B (same origin): a
+        // 10-tall block at x∈[50,60]. Sun grazes from +x and above, so B's
+        // shadow lands on A's floor at x≈[40,50] — visible to a straight-down
+        // camera (B itself occludes only x∈[50,60]).
+        let mut scene = Scene::new();
+        let a = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        scene.grid_mut(a).unwrap().set_rect(
+            IVec3::new(30, 30, 60),
+            IVec3::new(90, 90, 62),
+            Some(0x80_88_88_88),
+        );
+        let b = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        scene.grid_mut(b).unwrap().set_rect(
+            IVec3::new(50, 50, 40),
+            IVec3::new(60, 60, 50),
+            Some(0x80_60_60_60),
+        );
+
+        // Straight-down camera over the floor (voxlap z-down ⇒ forward +z).
+        let cam = Camera {
+            pos: [55.0, 55.0, 6.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let inv = 1.0f32 / 2.0f32.sqrt();
+        let base = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_dir: [inv, 0.0, -inv], // to-sun: +x and up
+            sun_color: [1.0; 3],
+            sun_intensity: 1.0,
+            ambient: [0.3; 3],
+            shadow_strength: 0.85,
+            shadow_bias: 1.5,
+            shadow_max_dist: 128.0,
+            ..CpuLights::default()
+        };
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let mut sum_lum = |lights: CpuLights| -> u64 {
+            let n = (XRES as usize) * (YRES as usize);
+            let mut fb = vec![0u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            render_scene_composed_scissored(
+                &mut fb,
+                &mut zb,
+                XRES as usize,
+                XRES,
+                YRES,
+                CpuFog::default(),
+                &mut scene,
+                &cam,
+                &settings,
+                0x0011_2233,
+                None,
+                false,
+                None,
+                &[],
+                lights,
+            );
+            fb.iter()
+                .map(|&p| u64::from((p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff)))
+                .sum()
+        };
+        let lit = sum_lum(CpuLights {
+            sun_casts_shadow: false,
+            ..base
+        });
+        let shadowed = sum_lum(CpuLights {
+            sun_casts_shadow: true,
+            ..base
+        });
+        assert!(
+            shadowed < lit,
+            "B's shadow must darken A's floor: shadowed={shadowed} lit={lit}"
+        );
+        assert!(
+            (lit - shadowed) * 200 > lit,
+            "cross-grid shadow should remove >0.5% of total luminance: lit={lit} shadowed={shadowed}"
+        );
     }
 
     // ---- S5.0: world_camera_to_grid_local helper ----

@@ -1,0 +1,246 @@
+//! XS.1 — a world-space scene occlusion oracle for cross-grid (and, in
+//! XS.2, cross-sprite) hard shadows.
+//!
+//! Dynamic-lighting shadow rays on the CPU were single-grid: a hit in grid
+//! A could only be shadowed by grid A's own voxels (`dda::SamplerShadow`).
+//! [`SceneOccluder`] lifts the test to **world space** over every grid in the
+//! scene: given a world-space shadow ray it transforms the ray into each
+//! grid's local frame and marches that grid's voxels, returning `true` on the
+//! first solid hit. The CPU DDA reaches it through
+//! [`roxlap_core::DdaEnv::world_shadow`] (a [`roxlap_core::WorldOccluder`]
+//! trait object) + the current grid's local→world transform, so a sun /
+//! point-light ray that leaves the hit grid keeps testing the rest of the
+//! scene — the ship drops a shadow on the ground, etc.
+//!
+//! Built once per frame, borrowing the scene immutably (it coexists with the
+//! immutable render pass). Only constructed when shadows are actually active,
+//! so the no-shadow path allocates nothing.
+
+use glam::{DQuat, DVec3, IVec3, Vec3};
+
+use crate::{Grid, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+
+/// Safety cap on a shadow ray's voxel steps within one grid (the `max_t` /
+/// AABB bound is the real limit; this only backstops a degenerate ray).
+const SHADOW_MAX_STEPS: u32 = 4096;
+
+/// One grid's contribution to the scene occluder: an immutable borrow plus
+/// the cached world→local transform and the grid-local voxel AABB (so a ray
+/// that never enters the grid is rejected without marching).
+struct GridOcc<'a> {
+    grid: &'a Grid,
+    /// Grid world origin.
+    origin: DVec3,
+    /// World→grid-local rotation (the inverse of the grid's rotation).
+    rot_inv: DQuat,
+    /// Grid-local voxel AABB `[lo, hi)` (mip-0 voxel coords) covering every
+    /// materialised chunk; the shadow march is clipped to it.
+    lo: [f32; 3],
+    hi: [f32; 3],
+}
+
+/// World-space scene occlusion oracle (see module docs).
+pub struct SceneOccluder<'a> {
+    grids: Vec<GridOcc<'a>>,
+}
+
+impl<'a> SceneOccluder<'a> {
+    /// Build the occluder over every materialised grid in `scene`. Cheap:
+    /// per grid it walks the chunk keys once for the AABB (the same cost the
+    /// render loop's `grid_bounds` early-out already pays).
+    #[must_use]
+    pub fn build(scene: &'a Scene) -> Self {
+        let mut grids = Vec::new();
+        for (_id, grid) in scene.grids() {
+            if let Some((lo, hi)) = grid_voxel_aabb(grid) {
+                grids.push(GridOcc {
+                    grid,
+                    origin: grid.transform.origin,
+                    rot_inv: grid.transform.rotation.inverse(),
+                    lo,
+                    hi,
+                });
+            }
+        }
+        Self { grids }
+    }
+
+    /// Whether the occluder holds anything (an empty scene casts no shadows).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.grids.is_empty()
+    }
+}
+
+impl roxlap_core::WorldOccluder for SceneOccluder<'_> {
+    fn occluded_world(&self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
+        let ow = DVec3::new(
+            f64::from(origin[0]),
+            f64::from(origin[1]),
+            f64::from(origin[2]),
+        );
+        let dw = DVec3::new(f64::from(dir[0]), f64::from(dir[1]), f64::from(dir[2]));
+        for g in &self.grids {
+            if occluded_in_grid(g, ow, dw, max_t) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// World-space voxel AABB → grid-local voxel AABB `[lo, hi)` from the grid's
+/// materialised chunk extent. `None` for an empty grid.
+fn grid_voxel_aabb(grid: &Grid) -> Option<([f32; 3], [f32; 3])> {
+    let mut min = IVec3::splat(i32::MAX);
+    let mut max = IVec3::splat(i32::MIN);
+    let mut any = false;
+    for idx in grid.chunks.keys() {
+        any = true;
+        min = min.min(*idx);
+        max = max.max(*idx);
+    }
+    if !any {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let cs_xy = CHUNK_SIZE_XY as i32;
+    #[allow(clippy::cast_precision_loss)]
+    let cs_z = CHUNK_SIZE_Z as i32;
+    let lo = [
+        (min.x * cs_xy) as f32,
+        (min.y * cs_xy) as f32,
+        (min.z * cs_z) as f32,
+    ];
+    let hi = [
+        ((max.x + 1) * cs_xy) as f32,
+        ((max.y + 1) * cs_xy) as f32,
+        ((max.z + 1) * cs_z) as f32,
+    ];
+    Some((lo, hi))
+}
+
+/// March one grid's voxels along a world-space ray (transformed to grid-local)
+/// and report whether a solid voxel blocks it within `max_t` world units.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
+    // World → grid-local (rotation is rigid, so `t` stays world distance).
+    let o: Vec3 = (g.rot_inv * (ow - g.origin)).as_vec3();
+    let d: Vec3 = (g.rot_inv * dw).as_vec3();
+    let o = [o.x, o.y, o.z];
+    let d = [d.x, d.y, d.z];
+
+    // Clip to the grid's voxel AABB — a ray that never enters can't occlude.
+    let Some((t0, t1)) = intersect_aabb(o, d, g.lo, g.hi) else {
+        return false;
+    };
+    let t_enter = t0.max(0.0);
+    let t_exit = t1.min(max_t);
+    if t_enter > t_exit {
+        return false;
+    }
+
+    let start = t_enter + 1e-4;
+    let p = [
+        o[0] + d[0] * start,
+        o[1] + d[1] * start,
+        o[2] + d[2] * start,
+    ];
+    let mut cell = [
+        (p[0].floor() as i32).clamp(g.lo[0] as i32, g.hi[0] as i32 - 1),
+        (p[1].floor() as i32).clamp(g.lo[1] as i32, g.hi[1] as i32 - 1),
+        (p[2].floor() as i32).clamp(g.lo[2] as i32, g.hi[2] as i32 - 1),
+    ];
+    let (step, mut t_max, t_delta) = dda_setup(o, d, cell);
+    let mut t_curr = t_enter;
+    let lo_i = [g.lo[0] as i32, g.lo[1] as i32, g.lo[2] as i32];
+    let hi_i = [g.hi[0] as i32, g.hi[1] as i32, g.hi[2] as i32];
+    for _ in 0..SHADOW_MAX_STEPS {
+        if cell[0] < lo_i[0]
+            || cell[0] >= hi_i[0]
+            || cell[1] < lo_i[1]
+            || cell[1] >= hi_i[1]
+            || cell[2] < lo_i[2]
+            || cell[2] >= hi_i[2]
+            || t_curr > t_exit
+        {
+            return false;
+        }
+        if grid_voxel_solid(g.grid, cell) {
+            return true;
+        }
+        let a = min_axis(t_max);
+        t_curr = t_max[a];
+        cell[a] += step[a];
+        t_max[a] += t_delta[a];
+    }
+    false
+}
+
+/// Solid test for one grid-local voxel (mip-0). Wraps [`Grid::voxel_solid`].
+#[inline]
+fn grid_voxel_solid(grid: &Grid, cell: [i32; 3]) -> bool {
+    grid.voxel_solid(IVec3::new(cell[0], cell[1], cell[2]))
+}
+
+/// Slab-method ray/AABB intersection (`[lo, hi]`, voxel units). Returns the
+/// entry/exit ray parameters, or `None` if the ray misses.
+fn intersect_aabb(o: [f32; 3], d: [f32; 3], lo: [f32; 3], hi: [f32; 3]) -> Option<(f32, f32)> {
+    let mut tmin = f32::NEG_INFINITY;
+    let mut tmax = f32::INFINITY;
+    for a in 0..3 {
+        if d[a].abs() < 1e-9 {
+            if o[a] < lo[a] || o[a] > hi[a] {
+                return None;
+            }
+        } else {
+            let inv = 1.0 / d[a];
+            let mut t0 = (lo[a] - o[a]) * inv;
+            let mut t1 = (hi[a] - o[a]) * inv;
+            if t0 > t1 {
+                std::mem::swap(&mut t0, &mut t1);
+            }
+            tmin = tmin.max(t0);
+            tmax = tmax.min(t1);
+            if tmin > tmax {
+                return None;
+            }
+        }
+    }
+    Some((tmin, tmax))
+}
+
+/// 3D-DDA setup for a 1-voxel grid: per-axis step, first boundary `t`, and
+/// per-cell `t` increment (mirror of `roxlap_core`'s private helper).
+fn dda_setup(o: [f32; 3], d: [f32; 3], cell: [i32; 3]) -> ([i32; 3], [f32; 3], [f32; 3]) {
+    let mut step = [0i32; 3];
+    let mut t_max = [f32::INFINITY; 3];
+    let mut t_delta = [f32::INFINITY; 3];
+    for a in 0..3 {
+        if d[a] > 1e-9 {
+            step[a] = 1;
+            #[allow(clippy::cast_precision_loss)]
+            let boundary = (cell[a] + 1) as f32;
+            t_max[a] = (boundary - o[a]) / d[a];
+            t_delta[a] = 1.0 / d[a];
+        } else if d[a] < -1e-9 {
+            step[a] = -1;
+            #[allow(clippy::cast_precision_loss)]
+            let boundary = cell[a] as f32;
+            t_max[a] = (boundary - o[a]) / d[a];
+            t_delta[a] = -1.0 / d[a];
+        }
+    }
+    (step, t_max, t_delta)
+}
+
+#[inline]
+fn min_axis(t: [f32; 3]) -> usize {
+    if t[0] < t[1] && t[0] < t[2] {
+        0
+    } else if t[1] < t[2] {
+        1
+    } else {
+        2
+    }
+}
