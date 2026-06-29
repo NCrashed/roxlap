@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     borrowing the scene immutably — the composed render loop was split into a
     `&mut` cache-prep pass and an immutable render pass so the occluder can
     coexist with it. No caster ⇒ no occluder built (unchanged).
+  - **Sprite shadows, CPU** (XS.2) — sprites now both **cast** and **receive**
+    hard shadows. A `SpriteOccluder` (decoded sprite volumes + world poses)
+    implements `WorldOccluder` and is composited with the grid occluder
+    (`CompositeOccluder`): the terrain render sees it (sprites darken the
+    ground), and the sprite pass queries it (a sprite is darkened by terrain or
+    another sprite between it and a caster). Built only when a caster is active.
 - **Voxel ambient occlusion** (macro-stage AO) — a CPU bake pass that writes
   per-voxel ambient occlusion into the brightness byte, which the dynamic
   lighting (DL) reads as its ambient/AO fill: open surfaces stay bright while

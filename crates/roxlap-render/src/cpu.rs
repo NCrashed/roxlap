@@ -11,14 +11,18 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use roxlap_core::camera_math;
-use roxlap_core::dda_sprite::{draw_sprite_dda_shaded, ClipFlipbook, SpriteDense, SpriteShade};
+use roxlap_core::dda_sprite::{
+    draw_sprite_dda_shaded, ClipFlipbook, SpriteDense, SpriteOccluder, SpriteShade,
+};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::render_sky_fill;
 use roxlap_core::Camera;
+use roxlap_core::{CompositeOccluder, WorldOccluder};
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
+use roxlap_scene::occluder::SceneOccluder;
 use roxlap_scene::render::{render_scene_composed_with_materials, CpuFog};
 use roxlap_scene::Scene;
 
@@ -918,6 +922,40 @@ impl CpuBackend {
             roxlap_core::CpuLights::default()
         };
 
+        // XS.2 — sprite shadows. A world-space occluder over the sprite
+        // volumes (decoded dense grids + world poses): passed into the terrain
+        // render so sprites **cast** hard shadows onto terrain, and reused for
+        // the sprite pass below so sprites **receive** them (from terrain +
+        // each other). Only built when a caster is active, to skip the decode
+        // cost on the common unshadowed path.
+        let shadows_active = cpu_lights.enabled
+            && cpu_lights.shadow_strength > 0.0
+            && (cpu_lights.sun_casts_shadow || cpu_lights.points.iter().any(|p| p.casts_shadow));
+        let sprite_occ = if shadows_active && frame.draw_sprites {
+            let invis = roxlap_formats::sprite::SPRITE_FLAG_INVISIBLE;
+            let mut so = SpriteOccluder::new();
+            for s in self.sprites.iter().chain(self.kfa_limbs.iter()) {
+                if s.flags & invis == 0 {
+                    so.push(SpriteDense::from_kv6(&s.kv6), s.p, s.s, s.h, s.f);
+                }
+            }
+            for (i, s) in self.dyn_sprites.iter().enumerate() {
+                if s.flags & invis != 0 {
+                    continue;
+                }
+                if let Some((book, fr)) = self.dyn_clip[i] {
+                    if let Some(d) = self.clip_books.get(book).and_then(|b| b.frame(fr)) {
+                        so.push(d.clone(), s.p, s.s, s.h, s.f);
+                    }
+                } else {
+                    so.push(SpriteDense::from_kv6(&s.kv6), s.p, s.s, s.h, s.f);
+                }
+            }
+            (!so.is_empty()).then_some(so)
+        } else {
+            None
+        };
+
         let _ = render_scene_composed_with_materials(
             fb,
             &mut self.zbuffer[..pixel_count],
@@ -933,6 +971,7 @@ impl CpuBackend {
             Some(&self.materials),
             &self.terrain_materials,
             cpu_lights,
+            sprite_occ.as_ref().map(|o| o as &dyn WorldOccluder),
         );
 
         // Paint the panorama sky into every background pixel (z still +INF):
@@ -984,6 +1023,26 @@ impl CpuBackend {
             // translucent material is defined) takes the unchanged first-hit
             // path; only translucent sprites accumulate.
             let materials = &self.materials;
+            // XS.2 — sprites RECEIVE shadows: the scene-wide occluder = grids
+            // (built now that the terrain render released the `&mut Scene`) +
+            // the sprite volumes. `composite_store` backs the borrow.
+            let grid_occ = shadows_active
+                .then(|| SceneOccluder::build(scene))
+                .filter(|o| !o.is_empty());
+            let composite_store;
+            let recv_occ: Option<&dyn WorldOccluder> =
+                match (grid_occ.as_ref(), sprite_occ.as_ref()) {
+                    (Some(g), Some(s)) => {
+                        composite_store = CompositeOccluder {
+                            a: g,
+                            b: s as &dyn WorldOccluder,
+                        };
+                        Some(&composite_store)
+                    }
+                    (Some(g), None) => Some(g as &dyn WorldOccluder),
+                    (None, Some(s)) => Some(s as &dyn WorldOccluder),
+                    (None, None) => None,
+                };
             let shade_of = |s: &Sprite| SpriteShade {
                 materials,
                 material: s.material,
@@ -991,6 +1050,8 @@ impl CpuBackend {
                 // DL.7 — world-space lights so opaque sprites/clips get the
                 // same stylized lighting as the terrain.
                 lights: cpu_lights,
+                // XS.2 — receive hard shadows from terrain + other sprites.
+                shadow: recv_occ,
             };
             // Static sprites + posed KFA limbs: plain KV6 sprites. All
             // z-test against the shared buffer so order doesn't matter.

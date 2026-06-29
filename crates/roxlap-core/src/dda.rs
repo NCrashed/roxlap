@@ -331,11 +331,39 @@ pub struct WorldShadowCtx<'a> {
     pub cols: [[f32; 3]; 3],
 }
 
+impl<'a> WorldShadowCtx<'a> {
+    /// Identity transform — for shading already in world space (sprites): the
+    /// grid-local ray IS the world ray.
+    #[must_use]
+    pub fn identity(occluder: &'a dyn WorldOccluder) -> Self {
+        Self {
+            occluder,
+            origin: [0.0; 3],
+            cols: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        }
+    }
+}
+
+/// XS.2 — a [`WorldOccluder`] that ORs two others (e.g. the grid occluder +
+/// the sprite occluder), so a single shadow query covers both. `true` if
+/// either blocks the ray.
+pub struct CompositeOccluder<'a> {
+    pub a: &'a dyn WorldOccluder,
+    pub b: &'a dyn WorldOccluder,
+}
+
+impl WorldOccluder for CompositeOccluder<'_> {
+    fn occluded_world(&self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
+        self.a.occluded_world(origin, dir, max_t) || self.b.occluded_world(origin, dir, max_t)
+    }
+}
+
 /// XS.1 — [`ShadowTester`] that lifts a grid-local shadow ray to world space
 /// (via [`WorldShadowCtx`]) and queries the scene-wide [`WorldOccluder`], so
-/// occlusion crosses grid + sprite boundaries.
-struct WorldShadow<'a> {
-    ctx: WorldShadowCtx<'a>,
+/// occlusion crosses grid + sprite boundaries. Sprites (already world-space)
+/// use an identity [`WorldShadowCtx`] (see [`WorldShadowCtx::identity`]).
+pub(crate) struct WorldShadow<'a> {
+    pub ctx: WorldShadowCtx<'a>,
 }
 
 impl ShadowTester for WorldShadow<'_> {

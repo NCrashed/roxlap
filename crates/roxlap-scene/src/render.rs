@@ -48,7 +48,7 @@ use crate::chunks;
 use crate::lod::Lod;
 use crate::occluder::SceneOccluder;
 use crate::{GridId, GridTransform, Scene, CHUNK_SIZE_XY};
-use roxlap_core::WorldShadowCtx;
+use roxlap_core::{CompositeOccluder, WorldOccluder, WorldShadowCtx};
 use std::collections::HashMap;
 
 /// Sentinel colour stamped into a `render_sky = false` grid's
@@ -522,6 +522,7 @@ pub fn render_scene_composed(
         None,
         &[],
         CpuLights::default(),
+        None,
     )
 }
 
@@ -546,6 +547,9 @@ pub fn render_scene_composed_with_materials(
     materials: Option<&MaterialTable>,
     terrain_materials: &[(u32, u8)],
     lights: CpuLights<'_>,
+    // XS.2 — sprite-cast shadow occluder (so sprites darken terrain). `None` ⇒
+    // grids-only shadows.
+    sprite_occluder: Option<&dyn WorldOccluder>,
 ) -> RenderOutcome {
     render_scene_composed_scissored(
         fb,
@@ -563,6 +567,7 @@ pub fn render_scene_composed_with_materials(
         materials,
         terrain_materials,
         lights,
+        sprite_occluder,
     )
 }
 
@@ -590,6 +595,10 @@ fn render_scene_composed_scissored(
     terrain_materials: &[(u32, u8)],
     // CPU.1 — world-space dynamic lights, transformed per grid in the loop.
     lights: CpuLights<'_>,
+    // XS.2 — world-space occluder for sprite volumes (so sprites cast shadows
+    // onto terrain). Composited with the per-frame grid occluder. `None` ⇒
+    // grids only.
+    sprite_occluder: Option<&dyn WorldOccluder>,
 ) -> RenderOutcome {
     debug_assert_eq!(fb.len(), zb.len());
     let pixel_count = (width as usize) * (height as usize);
@@ -635,8 +644,25 @@ fn render_scene_composed_scissored(
     let shadows_on = lights.enabled
         && lights.shadow_strength > 0.0
         && (lights.sun_casts_shadow || lights.points.iter().any(|p| p.casts_shadow));
-    let occluder = shadows_on.then(|| SceneOccluder::build(scene));
-    let occluder = occluder.filter(|o| !o.is_empty());
+    let grid_occ = shadows_on
+        .then(|| SceneOccluder::build(scene))
+        .filter(|o| !o.is_empty());
+    // XS.2 — combine the grid occluder with the sprite occluder (sprites cast
+    // onto terrain). `composite_store` backs the borrow when both are present.
+    let composite_store;
+    let active_occluder: Option<&dyn WorldOccluder> = if shadows_on {
+        match (grid_occ.as_ref(), sprite_occluder) {
+            (Some(g), Some(s)) => {
+                composite_store = CompositeOccluder { a: g, b: s };
+                Some(&composite_store)
+            }
+            (Some(g), None) => Some(g),
+            (None, Some(s)) => Some(s),
+            (None, None) => None,
+        }
+    } else {
+        None
+    };
 
     for (grid_id, grid) in scene.grids() {
         // S6.0/S6.1: per-grid LOD tier dispatch. The picker keys
@@ -910,7 +936,7 @@ fn render_scene_composed_scissored(
         // plus this grid's local→world transform, so a grid-local shadow ray
         // is lifted to world space and tested against every grid. `cols[i]`
         // is the world image of grid-local axis `i` (the rotation's columns).
-        let world_shadow = occluder.as_ref().map(|occ| {
+        let world_shadow = active_occluder.map(|occ| {
             let r = grid.transform.rotation;
             let col = |v: DVec3| {
                 let w = r * v;
@@ -918,7 +944,7 @@ fn render_scene_composed_scissored(
             };
             let o = grid.transform.origin;
             WorldShadowCtx {
-                occluder: occ as &dyn roxlap_core::WorldOccluder,
+                occluder: occ,
                 origin: [o.x as f32, o.y as f32, o.z as f32],
                 cols: [col(DVec3::X), col(DVec3::Y), col(DVec3::Z)],
             }
@@ -1116,6 +1142,7 @@ mod tests {
                 None,
                 &[],
                 lights,
+                None,
             );
             fb.iter()
                 .map(|&p| u64::from((p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff)))
@@ -1690,6 +1717,7 @@ mod tests {
                 None,
                 &[],
                 CpuLights::default(),
+                None,
             );
             fb
         };

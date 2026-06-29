@@ -25,7 +25,10 @@ use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_INVISIBLE, SPRITE_FLAG_NO_Z};
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 
 use crate::camera_math::CameraState;
-use crate::dda::{dda_setup, intersect_aabb, min_axis, pixel_ray, shade, shade_dynamic, CpuLights};
+use crate::dda::{
+    dda_setup, intersect_aabb, min_axis, pixel_ray, shade, shade_dynamic, CpuLights, ShadowTester,
+    WorldOccluder, WorldShadow, WorldShadowCtx,
+};
 use crate::opticast::OpticastSettings;
 use crate::raster_target::RasterTarget;
 
@@ -51,6 +54,7 @@ fn full_bright(col: u32) -> u32 {
 ///
 /// Both sources store only **surface** voxels (a from-air ray's first
 /// hit is the visible surface), so the grid is the visible hull.
+#[derive(Clone)]
 pub struct SpriteDense {
     dims: [i32; 3],
     occ: Vec<bool>,
@@ -297,6 +301,133 @@ fn cast_local(
     None
 }
 
+/// XS.2 — one sprite volume in the scene shadow occluder: its decoded dense
+/// voxels + world pose, with the cached inverse instance basis for
+/// world→sprite-local transforms.
+struct SpriteOccEntry {
+    dense: SpriteDense,
+    pos: [f32; 3],
+    pivot: [f32; 3],
+    minv: [[f32; 3]; 3],
+}
+
+/// XS.2 — a [`WorldOccluder`] over sprite volumes, so **sprites cast** hard
+/// shadows onto terrain and each other (and so a sprite-receive query also
+/// sees other sprites). Owns the decoded [`SpriteDense`] grids; populate with
+/// [`Self::push`].
+///
+/// A world-space shadow ray is transformed into each sprite's local frame and
+/// the dense occupancy is DDA-marched. Assumes orthonormal unit instance bases
+/// (as the sprite draw does); a non-uniform scale would skew the `max_t`
+/// distance bound. Empty ⇒ casts nothing.
+#[derive(Default)]
+pub struct SpriteOccluder {
+    entries: Vec<SpriteOccEntry>,
+}
+
+impl SpriteOccluder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the occluder holds any sprite volumes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Add a decoded sprite volume at a world pose (`pos` = world pivot;
+    /// `s`/`h`/`f` = model→world basis columns, the same pose the draw uses).
+    /// A degenerate (non-invertible) basis is skipped.
+    pub fn push(
+        &mut self,
+        dense: SpriteDense,
+        pos: [f32; 3],
+        s: [f32; 3],
+        h: [f32; 3],
+        f: [f32; 3],
+    ) {
+        let Some(minv) = invert_basis(s, h, f) else {
+            return;
+        };
+        let pivot = dense.pivot;
+        self.entries.push(SpriteOccEntry {
+            dense,
+            pos,
+            pivot,
+            minv,
+        });
+    }
+}
+
+impl WorldOccluder for SpriteOccluder {
+    fn occluded_world(&self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
+        self.entries
+            .iter()
+            .any(|e| sprite_entry_occluded(e, origin, dir, max_t))
+    }
+}
+
+/// March one sprite entry's dense occupancy along a world-space ray; `true` if
+/// a solid voxel blocks it within `max_t` world units.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn sprite_entry_occluded(e: &SpriteOccEntry, ow: [f32; 3], dw: [f32; 3], max_t: f32) -> bool {
+    // World → sprite-local voxel space (same transform as the draw).
+    let rel = [ow[0] - e.pos[0], ow[1] - e.pos[1], ow[2] - e.pos[2]];
+    let ol = mat_apply(&e.minv, rel);
+    let origin = [ol[0] + e.pivot[0], ol[1] + e.pivot[1], ol[2] + e.pivot[2]];
+    let dir = mat_apply(&e.minv, dw);
+
+    let hi = [
+        e.dense.dims[0] as f32,
+        e.dense.dims[1] as f32,
+        e.dense.dims[2] as f32,
+    ];
+    let Some((t0, t1)) = intersect_aabb(origin, dir, [0.0; 3], hi) else {
+        return false;
+    };
+    let t_enter = t0.max(0.0);
+    let t_exit = t1.min(max_t);
+    if t_enter > t_exit {
+        return false;
+    }
+    let start = t_enter + 1e-4;
+    let p = [
+        origin[0] + dir[0] * start,
+        origin[1] + dir[1] * start,
+        origin[2] + dir[2] * start,
+    ];
+    let mut cell = [
+        (p[0].floor() as i32).clamp(0, e.dense.dims[0] - 1),
+        (p[1].floor() as i32).clamp(0, e.dense.dims[1] - 1),
+        (p[2].floor() as i32).clamp(0, e.dense.dims[2] - 1),
+    ];
+    let (step, mut t_max, t_delta) = dda_setup(origin, dir, cell, 1.0);
+    let mut t_curr = t_enter;
+    let max_steps = (e.dense.dims[0] + e.dense.dims[1] + e.dense.dims[2]) as usize + 8;
+    for _ in 0..max_steps {
+        if cell[0] < 0
+            || cell[0] >= e.dense.dims[0]
+            || cell[1] < 0
+            || cell[1] >= e.dense.dims[1]
+            || cell[2] < 0
+            || cell[2] >= e.dense.dims[2]
+            || t_curr > t_exit
+        {
+            return false;
+        }
+        if e.dense.occ[e.dense.idx_of(cell)] {
+            return true;
+        }
+        let a = min_axis(t_max);
+        t_curr = t_max[a];
+        cell[a] += step[a];
+        t_max[a] += t_delta[a];
+    }
+    false
+}
+
 /// Material context for a translucent sprite draw (TV stage): the global
 /// [`MaterialTable`] plus this instance's uniform material id and per-frame
 /// alpha multiplier. Passed (as `Some`) to [`draw_sprite_dense_shaded`] /
@@ -317,6 +448,11 @@ pub struct SpriteShade<'a> {
     /// lit (sun + point lights + cel + ramp, flat per voxel) instead of the
     /// baked `shade`. `CpuLights::default()` (disabled) ⇒ unchanged.
     pub lights: CpuLights<'a>,
+    /// XS.2 — world-space scene occluder for **sprites receiving** hard
+    /// shadows: a lit sprite voxel marches a shadow ray (world space) against
+    /// this and is darkened where terrain / other sprites block the caster.
+    /// `None` (the default) ⇒ unshadowed sprites (the pre-XS.2 look).
+    pub shadow: Option<&'a dyn WorldOccluder>,
 }
 
 /// Accumulated front-to-back composite for one ray through a sprite.
@@ -423,12 +559,16 @@ fn cast_local_layers(
     // `cast_local`. Updated after each step.
     let mut normal = [0.0f32; 3];
 
-    // XS.0 — per-layer dynamic lighting (mirror of the opaque path): rotate the
-    // model-local face normal + voxel centre to world via the instance basis
-    // and call `shade_dynamic` (flat per voxel). Disabled rig ⇒ baked `shade`
-    // (byte-identical). No sprite shadows yet (tester `None`; added in XS.2).
+    // XS.0/XS.2 — per-layer dynamic lighting (mirror of the opaque path):
+    // rotate the model-local face normal + voxel centre to world via the
+    // instance basis and call `shade_dynamic` (flat per voxel). Disabled rig ⇒
+    // baked `shade` (byte-identical). XS.2 — when a scene occluder is present
+    // the layer also receives hard shadows (world-space query, identity ctx).
     let lights = shade_ctx.lights;
-    let shade_layer = |idx: usize, cell: [i32; 3], n_local: [f32; 3]| -> u32 {
+    let mut tester = shade_ctx.shadow.map(|occ| WorldShadow {
+        ctx: WorldShadowCtx::identity(occ),
+    });
+    let mut shade_layer = |idx: usize, cell: [i32; 3], n_local: [f32; 3]| -> u32 {
         if !lights.enabled {
             return shade(dense.col[idx], 0);
         }
@@ -452,7 +592,8 @@ fn cast_local_layers(
             ((dense.col[idx] >> 8) & 0xff) as f32 / 255.0,
             (dense.col[idx] & 0xff) as f32 / 255.0,
         ];
-        shade_dynamic(albedo, 1.0, n_world, center, &lights, None)
+        let t = tester.as_mut().map(|t| t as &mut dyn ShadowTester);
+        shade_dynamic(albedo, 1.0, n_world, center, &lights, t)
     };
 
     for _ in 0..max_steps {
@@ -839,8 +980,14 @@ pub fn draw_sprite_dense_shaded(
                         ((color >> 8) & 0xff) as f32 / 255.0,
                         (color & 0xff) as f32 / 255.0,
                     ];
-                    // No sprite shadows (matches the GPU) → no shadow tester.
-                    shade_dynamic(albedo, 1.0, n_world, center, &dl, None)
+                    // XS.2 — sprite receives shadows: a world-space query
+                    // against the scene occluder (sprite shading is already in
+                    // world space, so an identity transform). `None` ⇒ unshadowed.
+                    let mut ws = shade_ctx.and_then(|s| s.shadow).map(|occ| WorldShadow {
+                        ctx: WorldShadowCtx::identity(occ),
+                    });
+                    let tester = ws.as_mut().map(|t| t as &mut dyn ShadowTester);
+                    shade_dynamic(albedo, 1.0, n_world, center, &dl, tester)
                 } else {
                     shade(color, 0)
                 };
@@ -1551,6 +1698,7 @@ mod tests {
             lights: CpuLights::default(),
             material: 1,
             alpha_mul,
+            shadow: None,
         };
         let _ = draw_sprite_dense_shaded(
             &mut fb,
@@ -1668,6 +1816,7 @@ mod tests {
             lights: CpuLights::default(),
             material: 0, // opaque
             alpha_mul: 255,
+            shadow: None,
         };
         let _ = draw_sprite_dense_shaded(
             &mut fb_sh,
@@ -1727,6 +1876,7 @@ mod tests {
                 lights: CpuLights::default(),
                 material: 1,
                 alpha_mul: 255,
+                shadow: None,
             };
             let _ = draw_sprite_dense_shaded(
                 &mut fb,
@@ -1784,6 +1934,7 @@ mod tests {
                 lights: CpuLights::default(),
                 material: 1,
                 alpha_mul: 255,
+                shadow: None,
             };
             let _ = draw_sprite_dense_shaded(
                 &mut fb,
@@ -1817,6 +1968,120 @@ mod tests {
         );
     }
 
+    /// XS.2 — the sprite occluder reports a world ray blocked by a sprite
+    /// volume (the mechanism by which sprites **cast** shadows, and **receive**
+    /// them from each other). A ray through the cube is occluded; one well to
+    /// the side is not.
+    #[test]
+    fn sprite_occluder_blocks_ray_through_volume() {
+        use crate::dda::WorldOccluder;
+        // 8³ cube, identity pose at world origin; `from_fn` centres the pivot
+        // (4,4,4), so the cube spans world ≈ [-4, 4]³.
+        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF));
+        let mut occ = SpriteOccluder::new();
+        occ.push(
+            dense,
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        );
+        assert!(!occ.is_empty());
+        // Up the z-axis through the cube centre (world x=y=0 ⇒ local 4,4).
+        assert!(
+            occ.occluded_world([0.0, 0.0, -50.0], [0.0, 0.0, 1.0], 100.0),
+            "a ray through the cube must be occluded"
+        );
+        // Far to the side: never enters the cube's AABB.
+        assert!(
+            !occ.occluded_world([50.0, 0.0, -50.0], [0.0, 0.0, 1.0], 100.0),
+            "a ray missing the cube must not be occluded"
+        );
+        // Beyond max_t: the cube is at ~50 units, cap at 10 ⇒ unreached.
+        assert!(
+            !occ.occluded_world([0.0, 0.0, -50.0], [0.0, 0.0, 1.0], 10.0),
+            "max_t shorter than the distance to the cube ⇒ unoccluded"
+        );
+    }
+
+    /// XS.2 — a sprite **receives** a hard shadow: a blocker volume between the
+    /// drawn sprite and the sun darkens it. The blocker lives only in the
+    /// occluder (it isn't drawn), so the framebuffer difference is purely the
+    /// shadow it casts on the visible sprite.
+    #[test]
+    fn sprite_receives_hard_shadow() {
+        // Drawn target: a voxel sphere at world (0,40,0). A sphere (unlike a
+        // face-on cube, whose visible face is the normal-less AABB-entry voxel)
+        // gives real per-voxel normals, so its −y hemisphere is genuinely
+        // sunlit (to-sun = −y, toward the camera). A blocker cube at (0,25,0)
+        // between sphere and sun shadows that lit hemisphere.
+        let target = SpriteDense::from_kv6(&Kv6::from_fn(16, 16, 16, |x, y, z| {
+            let (dx, dy, dz) = (x as i32 - 8, y as i32 - 8, z as i32 - 8);
+            (dx * dx + dy * dy + dz * dz <= 49).then_some(0x80_C0_C0_C0)
+        }));
+        let mut occ = SpriteOccluder::new();
+        occ.push(
+            SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF)),
+            [0.0, 25.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        );
+        let table = MaterialTable::new();
+        let base = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_dir: [0.0, -1.0, 0.0], // to-sun: −y (toward the camera)
+            sun_color: [1.0; 3],
+            sun_intensity: 1.0,
+            sun_casts_shadow: true,
+            ambient: [0.3; 3],
+            shadow_strength: 0.85,
+            shadow_bias: 1.5,
+            shadow_max_dist: 128.0,
+            ..CpuLights::default()
+        };
+        let (w, h) = (64u32, 64u32);
+        let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+        let sum_lum = |shadow: Option<&dyn crate::dda::WorldOccluder>| -> u64 {
+            let n = (w * h) as usize;
+            let mut fb = vec![0u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            let sh = SpriteShade {
+                materials: &table,
+                lights: base,
+                material: 0,
+                alpha_mul: 255,
+                shadow,
+            };
+            let _ = draw_sprite_dense_shaded(
+                &mut fb,
+                &mut zb,
+                w as usize,
+                w,
+                h,
+                &cs,
+                &settings(w, h),
+                &target,
+                [0.0, 40.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                0,
+                Some(sh),
+            );
+            fb.iter()
+                .map(|&p| u64::from((p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff)))
+                .sum()
+        };
+        let lit = sum_lum(None);
+        let shadowed = sum_lum(Some(&occ));
+        assert!(
+            shadowed < lit,
+            "the blocker must shadow the drawn sprite: shadowed={shadowed} lit={lit}"
+        );
+    }
+
     /// XS.0 — translucent sprite layers are now **lit** (dynamic-lighting rig),
     /// not flat-baked: with the rig enabled at a dim ambient (sun off), the
     /// accumulated layer colour is darker than the disabled (baked, full-
@@ -1837,6 +2102,7 @@ mod tests {
                 lights,
                 material: 1,
                 alpha_mul: 255,
+                shadow: None,
             };
             let _ = draw_sprite_dense_shaded(
                 &mut fb,
@@ -1894,6 +2160,7 @@ mod tests {
             lights: CpuLights::default(),
             material: 0,
             alpha_mul: 255,
+            shadow: None,
         };
         let _ = draw_sprite_dense_shaded(
             &mut fb,
@@ -1925,6 +2192,7 @@ mod tests {
             lights: CpuLights::default(),
             material: 1,
             alpha_mul: 255,
+            shadow: None,
         };
         let wrote = draw_sprite_dense_shaded(
             &mut fb,
@@ -2011,6 +2279,7 @@ mod tests {
                 lights: CpuLights::default(),
                 material,
                 alpha_mul: 255,
+                shadow: None,
             };
             let _ = draw_sprite_dense_shaded(
                 &mut fb,
