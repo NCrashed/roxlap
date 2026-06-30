@@ -685,6 +685,142 @@ pub(crate) fn apply_shadow_flags(flags: &mut u32, casts: bool, receives: bool) {
     }
 }
 
+// ---- billboard actors (BB.4) --------------------------------------------
+
+/// Stable handle to a [`BillboardActor`](SceneRenderer::add_billboard_actor)
+/// — a high-level directional billboard managed by the renderer (it owns one
+/// clip instance, picks the directional clip by view angle, and plays a
+/// named-state animation). Reset by [`set_sprites`](SceneRenderer::set_sprites);
+/// a removed actor's handle is stale → a safe no-op.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BillboardActorId {
+    slot: u32,
+    gen: u32,
+}
+
+/// One animation state of a [`BillboardActorDef`]: its name plus the clips
+/// for each viewing direction. `dirs.len()` may be `1` (non-directional),
+/// `8` (classic Doom rotations), or any `N` (uniform angular bins). Index 0
+/// is the view-from-front (camera in the actor's facing direction),
+/// increasing counter-clockwise.
+pub struct ActorState {
+    pub name: &'static str,
+    pub dirs: Vec<VoxelClipId>,
+}
+
+/// Recipe for [`add_billboard_actor`](SceneRenderer::add_billboard_actor).
+pub struct BillboardActorDef {
+    /// Animation states (≥1, each with ≥1 directional clip). The first is
+    /// the initial state.
+    pub states: Vec<ActorState>,
+    /// How the slab turns to face the camera (default [`BillboardMode::Cylindrical`]).
+    pub mode: BillboardMode,
+    /// Playback rate of the state animation, Q8 (256 = 1×).
+    pub speed_q8: i32,
+    pub casts_shadow: bool,
+    pub receives_shadow: bool,
+}
+
+impl Default for BillboardActorDef {
+    fn default() -> Self {
+        Self {
+            states: Vec::new(),
+            mode: BillboardMode::Cylindrical,
+            speed_q8: 256,
+            casts_shadow: true,
+            receives_shadow: true,
+        }
+    }
+}
+
+/// A live directional billboard: one clip instance whose directional clip is
+/// reselected by view angle and whose animation plays a named state.
+struct BillboardActor {
+    inst: SpriteInstanceId,
+    states: Vec<ActorState>,
+    cur_state: usize,
+    pos: [f32; 3],
+    /// World yaw the actor "faces" (radians); the dir picker compares the
+    /// camera's bearing against it.
+    facing_yaw: f64,
+    mode: BillboardMode,
+    clock: ClipClock,
+    /// The directional clip currently shown, to avoid redundant clip swaps.
+    showing: Option<VoxelClipId>,
+    speed_q8: i32,
+}
+
+impl BillboardActor {
+    /// Pick the directional clip index for a camera at `cam` (world). See
+    /// [`dir_index`].
+    fn pick_dir(&self, cam: [f64; 3]) -> usize {
+        dir_index(
+            self.pos,
+            self.facing_yaw,
+            cam,
+            self.states[self.cur_state].dirs.len(),
+        )
+    }
+}
+
+/// Bin a camera's bearing (relative to an actor at `pos` facing `facing_yaw`)
+/// into one of `n` viewing-direction sectors. Index 0 = viewed-from-front
+/// (camera in the actor's facing direction), increasing counter-clockwise.
+/// `n <= 1` or a camera directly above/below ⇒ 0.
+fn dir_index(pos: [f32; 3], facing_yaw: f64, cam: [f64; 3], n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let dx = cam[0] - f64::from(pos[0]);
+    let dy = cam[1] - f64::from(pos[1]);
+    if dx * dx + dy * dy < 1e-12 {
+        return 0; // camera directly above/below → no horizontal bearing
+    }
+    let rel = (dy.atan2(dx) - facing_yaw).rem_euclid(std::f64::consts::TAU);
+    let sector = std::f64::consts::TAU / n as f64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let idx = (rel / sector).round() as usize % n;
+    idx
+}
+
+/// Facade-side slotmap for billboard actors — mirrors [`DynClipMap`]
+/// (append-only, tombstoned in place, epoch-bumped on `reset` so a
+/// pre-`set_sprites` handle resolves to `None`).
+#[derive(Default)]
+struct BillboardActorMap {
+    slots: Vec<(u32, bool)>,
+    epoch: u32,
+}
+
+impl BillboardActorMap {
+    fn alloc(&mut self, index: u32) -> BillboardActorId {
+        debug_assert_eq!(self.slots.len() as u32, index);
+        self.slots.push((self.epoch, true));
+        BillboardActorId {
+            slot: index,
+            gen: self.epoch,
+        }
+    }
+    fn index(&self, id: BillboardActorId) -> Option<usize> {
+        let (gen, live) = *self.slots.get(id.slot as usize)?;
+        (gen == id.gen && live).then_some(id.slot as usize)
+    }
+    fn remove(&mut self, id: BillboardActorId) -> bool {
+        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
+            return false;
+        };
+        if slot.0 != id.gen || !slot.1 {
+            return false;
+        }
+        slot.1 = false;
+        true
+    }
+    fn reset(&mut self) {
+        self.slots.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+}
+
 /// Backend-agnostic sprite description. The facade builds the CPU
 /// per-instance draw list and the GPU instanced registry from the
 /// same data, so both backends show identical sprites. The host owns
@@ -1125,6 +1261,12 @@ pub struct SceneRenderer {
     /// position + mode, re-oriented every [`Self::face_billboards_to`].
     /// Reset by [`Self::set_sprites`].
     billboards: Vec<BillboardRec>,
+    /// Handles for high-level directional billboard actors (BB.4). Reset by
+    /// [`Self::set_sprites`].
+    actor_map: BillboardActorMap,
+    /// Live billboard-actor runtimes, parallel to `actor_map` slots; `None`
+    /// once removed. Driven by [`Self::update_billboard_actors`].
+    billboard_actors: Vec<Option<BillboardActor>>,
 }
 
 impl SceneRenderer {
@@ -1162,6 +1304,8 @@ impl SceneRenderer {
                         clip_meta: Vec::new(),
                         clip_players: Vec::new(),
                         billboards: Vec::new(),
+                        actor_map: BillboardActorMap::default(),
+                        billboard_actors: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -1183,6 +1327,8 @@ impl SceneRenderer {
             clip_meta: Vec::new(),
             clip_players: Vec::new(),
             billboards: Vec::new(),
+            actor_map: BillboardActorMap::default(),
+            billboard_actors: Vec::new(),
         }
     }
 
@@ -1221,6 +1367,8 @@ impl SceneRenderer {
                         clip_meta: Vec::new(),
                         clip_players: Vec::new(),
                         billboards: Vec::new(),
+                        actor_map: BillboardActorMap::default(),
+                        billboard_actors: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -1243,6 +1391,8 @@ impl SceneRenderer {
             clip_meta: Vec::new(),
             clip_players: Vec::new(),
             billboards: Vec::new(),
+            actor_map: BillboardActorMap::default(),
+            billboard_actors: Vec::new(),
         }
     }
 
@@ -1596,6 +1746,8 @@ impl SceneRenderer {
         self.clip_meta.clear();
         self.clip_players.clear();
         self.billboards.clear();
+        self.actor_map.reset();
+        self.billboard_actors.clear();
         (0..set.models.len() as u32)
             .map(|slot| SpriteModelId { slot, gen: 0 })
             .collect()
@@ -2190,6 +2342,185 @@ impl SceneRenderer {
             true
         });
         self.set_sprite_instance_transforms(&updates);
+    }
+
+    // ---- billboard actors (BB.4) -----------------------------------------
+
+    /// Build a [`ClipClock`] seeded from `clip`'s timeline (durations + loop
+    /// mode), or an empty/looping clock if `clip` is `None`/stale.
+    fn clock_for_clip(&self, clip: Option<VoxelClipId>, speed_q8: i32) -> ClipClock {
+        let (durations, loop_mode) = clip.and_then(|c| self.clip_map.clip_index(c)).map_or_else(
+            || (Vec::new(), LoopMode::Loop),
+            |ci| {
+                (
+                    self.clip_meta[ci].durations.clone(),
+                    self.clip_meta[ci].loop_mode,
+                )
+            },
+        );
+        ClipClock {
+            durations,
+            loop_mode,
+            speed_q8,
+            clock_ms: 0.0,
+        }
+    }
+
+    /// Register a high-level **directional billboard actor** (BB.4): the
+    /// renderer owns one clip instance and, every
+    /// [`update_billboard_actors`](Self::update_billboard_actors), picks the
+    /// directional clip from the view angle, faces it to the camera, and
+    /// advances its state animation. The convenience layer over
+    /// [`add_billboard_instance`](Self::add_billboard_instance) +
+    /// [`set_clip_instance_clip`](Self::set_clip_instance_clip) + the clip
+    /// clock for Doom-style monsters.
+    ///
+    /// `pos` is the actor's world position; `facing_yaw` is the world yaw it
+    /// faces (radians; the dir picker compares the camera's bearing to it).
+    /// Returns a stale id if `def` has no states / a state with no dirs, or
+    /// the initial clip is stale.
+    pub fn add_billboard_actor(
+        &mut self,
+        def: BillboardActorDef,
+        pos: [f32; 3],
+        facing_yaw: f64,
+    ) -> BillboardActorId {
+        let stale = BillboardActorId {
+            slot: u32::MAX,
+            gen: u32::MAX,
+        };
+        if def.states.is_empty() || def.states.iter().any(|s| s.dirs.is_empty()) {
+            return stale;
+        }
+        let init_clip = def.states[0].dirs[0];
+        let xf = DynSpriteTransform {
+            pos,
+            ..Default::default()
+        };
+        let inst = self.add_clip_instance_posed(init_clip, xf);
+        if self.dyn_map.dyn_index(inst).is_none() {
+            return stale; // stale initial clip
+        }
+        self.set_sprite_instance_shadow_flags(inst, def.casts_shadow, def.receives_shadow);
+        let clock = self.clock_for_clip(Some(init_clip), def.speed_q8);
+        let actor = BillboardActor {
+            inst,
+            states: def.states,
+            cur_state: 0,
+            pos,
+            facing_yaw,
+            mode: def.mode,
+            clock,
+            showing: None,
+            speed_q8: def.speed_q8,
+        };
+        let index = self.billboard_actors.len() as u32;
+        self.billboard_actors.push(Some(actor));
+        self.actor_map.alloc(index)
+    }
+
+    /// Switch an actor to a named animation state, restarting its clock (the
+    /// directional clip is reselected on the next
+    /// [`update_billboard_actors`](Self::update_billboard_actors)). No-op on a
+    /// stale id or an unknown state name.
+    pub fn set_actor_state(&mut self, id: BillboardActorId, state: &str) -> bool {
+        let Some(idx) = self.actor_map.index(id) else {
+            return false;
+        };
+        let Some(a) = self.billboard_actors[idx].as_ref() else {
+            return false;
+        };
+        let Some(state_idx) = a.states.iter().position(|s| s.name == state) else {
+            return false;
+        };
+        let rep = a.states[state_idx].dirs.first().copied();
+        let speed = a.speed_q8;
+        let clock = self.clock_for_clip(rep, speed);
+        let a = self.billboard_actors[idx].as_mut().unwrap();
+        a.cur_state = state_idx;
+        a.clock = clock;
+        a.showing = None; // force a clip reselect next update
+        true
+    }
+
+    /// Move/turn an actor. Its orientation + directional clip update on the
+    /// next [`update_billboard_actors`](Self::update_billboard_actors). No-op
+    /// on a stale id.
+    pub fn set_actor_transform(&mut self, id: BillboardActorId, pos: [f32; 3], facing_yaw: f64) {
+        let Some(idx) = self.actor_map.index(id) else {
+            return;
+        };
+        if let Some(a) = self.billboard_actors[idx].as_mut() {
+            a.pos = pos;
+            a.facing_yaw = facing_yaw;
+        }
+    }
+
+    /// Remove an actor and its clip instance. Returns `false` on a stale id.
+    pub fn remove_billboard_actor(&mut self, id: BillboardActorId) -> bool {
+        let Some(idx) = self.actor_map.index(id) else {
+            return false;
+        };
+        if let Some(a) = self.billboard_actors[idx].take() {
+            self.remove_sprite_instance(a.inst);
+        }
+        self.actor_map.remove(id)
+    }
+
+    /// Drive every billboard actor by `dt` seconds (BB.4): for each, pick the
+    /// directional clip from the camera bearing (swapping clips only on
+    /// change), advance its state-animation clock, and face it to the camera.
+    /// Call once per frame before `render` (the actor analogue of
+    /// [`advance_voxel_clips`](Self::advance_voxel_clips) +
+    /// [`face_billboards_to`](Self::face_billboards_to)). Actors whose
+    /// instance was removed are pruned.
+    pub fn update_billboard_actors(&mut self, camera: &Camera, dt: f64) {
+        struct Action {
+            inst: SpriteInstanceId,
+            set_clip: Option<VoxelClipId>,
+            frame: u32,
+            xf: Option<DynSpriteTransform>,
+        }
+        let cam = camera.pos;
+        let dyn_map = &self.dyn_map;
+        let mut actions: Vec<Action> = Vec::new();
+        for slot in &mut self.billboard_actors {
+            let Some(a) = slot.as_mut() else {
+                continue;
+            };
+            if dyn_map.dyn_index(a.inst).is_none() {
+                *slot = None; // instance gone → drop the actor
+                continue;
+            }
+            let dir = a.pick_dir(cam);
+            let desired = a.states[a.cur_state].dirs[dir];
+            let set_clip = (a.showing != Some(desired)).then(|| {
+                a.showing = Some(desired);
+                desired
+            });
+            let frame = a.clock.tick(dt);
+            let xf = billboard_transform(a.pos, cam, a.mode);
+            actions.push(Action {
+                inst: a.inst,
+                set_clip,
+                frame,
+                xf,
+            });
+        }
+        // Apply (each call borrows self mutably; disjoint from the loop above).
+        let mut xforms: Vec<(SpriteInstanceId, DynSpriteTransform)> = Vec::new();
+        for act in actions {
+            if let Some(clip) = act.set_clip {
+                self.set_clip_instance_clip(act.inst, clip);
+            }
+            // After a clip swap the backend reset the frame to 0; set the
+            // clock's frame so the walk cycle stays continuous across turns.
+            self.set_clip_instance_frame(act.inst, act.frame);
+            if let Some(xf) = act.xf {
+                xforms.push((act.inst, xf));
+            }
+        }
+        self.set_sprite_instance_transforms(&xforms);
     }
 
     // ---- clip queries (editor inspector) ---------------------------------
@@ -3310,6 +3641,30 @@ mod tests {
         assert!(dot(xf.right, xf.up).abs() < 1e-5);
         assert!(dot(xf.up, xf.forward).abs() < 1e-5);
         assert!(dot(xf.right, xf.forward).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dir_index_bins_view_angle_front_ccw() {
+        let o = [0.0, 0.0, 0.0];
+        // N == 1 (non-directional) is always 0, regardless of camera.
+        assert_eq!(dir_index(o, 0.0, [5.0, 3.0, 0.0], 1), 0);
+        // 8-way, actor facing +x (yaw 0). Camera in front (+x) = front = 0.
+        assert_eq!(dir_index(o, 0.0, [10.0, 0.0, 0.0], 8), 0);
+        // Camera at +y (90° CCW from facing) → sector 2 (90° / 45°).
+        assert_eq!(dir_index(o, 0.0, [0.0, 10.0, 0.0], 8), 2);
+        // Camera behind (−x, 180°) → sector 4.
+        assert_eq!(dir_index(o, 0.0, [-10.0, 0.0, 0.0], 8), 4);
+        // Camera at −y (270°) → sector 6.
+        assert_eq!(dir_index(o, 0.0, [0.0, -10.0, 0.0], 8), 6);
+        // Rotating the actor's facing rotates the picked sector: facing +y
+        // (yaw 90°), camera at +y is now "front" → 0.
+        let fy = std::f64::consts::FRAC_PI_2;
+        assert_eq!(dir_index(o, fy, [0.0, 10.0, 0.0], 8), 0);
+        // Camera straight overhead (no horizontal bearing) → 0.
+        assert_eq!(dir_index(o, 0.0, [0.0, 0.0, -10.0], 8), 0);
+        // 4-way still bins front/left/back/right.
+        assert_eq!(dir_index(o, 0.0, [10.0, 0.0, 0.0], 4), 0);
+        assert_eq!(dir_index(o, 0.0, [0.0, 10.0, 0.0], 4), 1);
     }
 
     #[test]
