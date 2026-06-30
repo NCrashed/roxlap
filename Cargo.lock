@@ -2253,6 +2253,7 @@ version = "0.18.0"
 dependencies = [
  "egui",
  "egui-winit",
+ "gif",
  "glam",
  "png 0.17.16",
  "roxlap-core",

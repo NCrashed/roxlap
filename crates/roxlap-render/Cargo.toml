@@ -65,6 +65,9 @@ web-sys = { version = "0.3", features = [
 # paint_egui`). Pulls egui's tessellation types for the CPU
 # software-rasteriser and turns on roxlap-gpu's egui-wgpu paint path.
 hud = ["dep:egui", "roxlap-gpu/hud"]
+# BB — re-export the animated-GIF → VoxelClip importer (`gif_import`) for
+# Doom-style billboard sprites; forwards to roxlap-formats' `gif` feature.
+gif = ["roxlap-formats/gif"]
 
 [dev-dependencies]
 # Doctests/examples construct a winit window to drive the facade; the

@@ -23,9 +23,14 @@ roxlap-formats = { path = "../roxlap-formats", version = "0.18" }
 # Scene→GPU bridge + the CPU compositor; `ROXLAP_GPU=1` selects the
 # GPU backend with automatic CPU fallback. The demo no longer touches
 # roxlap-gpu or softbuffer directly.
-roxlap-render = { path = "../roxlap-render", features = ["hud"] }
+roxlap-render = { path = "../roxlap-render", features = ["hud", "gif"] }
 roxlap-scene = { path = "../roxlap-scene", version = "0.18" }
 winit = "0.30"
+# BB.5 — the "Doom" scene synthesises its billboard sprites as animated
+# GIFs at startup (the encoder), then feeds them back through the
+# roxlap-render `gif` importer (the decoder) — dogfooding the full
+# GIF → voxel-clip path without shipping a binary asset.
+gif = "0.13"
 # HUD overlay: the host runs egui itself and feeds the tessellated
 # output to `SceneRenderer::paint_egui`. egui-winit translates winit
 # events into egui input. Pinned to 0.29 to match roxlap-render's egui

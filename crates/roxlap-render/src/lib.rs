@@ -50,6 +50,10 @@ use roxlap_scene::Scene;
 
 pub use light::{DirectionalLight, LightRig, PointLight};
 pub use roxlap_formats::character::{Attachment, Character, MeshRef};
+/// Animated-GIF → [`VoxelClip`] importer for Doom-style billboard sprites
+/// (stage BB). Behind the `gif` feature; see `PORTING-BILLBOARD.md`.
+#[cfg(feature = "gif")]
+pub use roxlap_formats::gif_import;
 pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::kv6::Kv6;
 pub use roxlap_formats::material::{BlendMode, Material};

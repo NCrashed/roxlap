@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **GIF billboard sprites** (macro-stage BB) — Doom/Build-style flat,
+  camera-facing animated cutouts that are first-class lighting citizens (they
+  cast + receive the dynamic shadows + lighting from the DL/XS stages). Each
+  GIF frame is voxelized into a flat 1-voxel slab and played back as an
+  ordinary voxel clip, so shadows, lighting, materials, and playback all come
+  for free.
+  - **`gif_import`** (BB.0) — `voxel_clip_from_gif(bytes, &GifImportOpts)`
+    decodes an animated GIF (with disposal compositing) into a `VoxelClip` of
+    flat `[W, thickness, H]` slabs (transparent pixels → cutout, GIF delays →
+    clip durations). In `roxlap-formats` behind the `gif` feature, re-exported
+    from `roxlap-render` behind its own `gif` feature.
+  - **`set_clip_instance_clip`** (BB.1) — retarget a live clip instance onto a
+    different clip (restart at frame 0, keep transform + clock policy) via the
+    existing GPU model-swap — the primitive behind directional + state swaps,
+    no remove/respawn.
+  - **Billboard orientation** (BB.2) — `BillboardMode {None, Cylindrical,
+    Spherical}` + `add_billboard_instance` / `set_billboard_mode` /
+    `set_billboard_position` / `face_billboards_to(&camera)` (one batched
+    transform flush). Cylindrical (default) keeps the slab vertical so its cast
+    shadow stays sane as the camera orbits.
+  - **Per-instance shadow flags** (BB.3) —
+    `set_sprite_instance_shadow_flags(id, casts, receives)` toggles an
+    instance's XS.4 shadow participation live (the per-instance counterpart to
+    `Sprite::with_casts_shadow` / `with_receives_shadow`).
+  - **`BillboardActor`** (BB.4) — a high-level directional actor:
+    `add_billboard_actor` / `set_actor_state` / `set_actor_transform` /
+    `remove_billboard_actor` / `update_billboard_actors(&camera, dt)`. The
+    renderer picks the directional (N-way) clip from the view angle, plays a
+    named-state animation, and faces it to the camera.
+  - **"Doom" demo scene** (BB.5) — an 8-directional walking monster (casts +
+    receives the sun's shadows) + a flickering non-casting flame + a standalone
+    signpost billboard, all synthesised as GIFs at startup and imported through
+    `gif_import` (dogfooding the full path). New scene in `roxlap-scene-demo`.
+  - Deferred: **`BillboardLighting`** (BB.2b, per-instance shade-normal select
+    for camera-dependent-lighting control) — the default face-normal path is
+    today's behaviour.
 - **Per-instance sprite RGB tint** — each sprite instance carries a packed
   `0x00RRGGBB` tint that multiplies its voxel colours (per channel), so
   instances of one model can be recoloured cheaply. `0x00FF_FFFF` (white, the
