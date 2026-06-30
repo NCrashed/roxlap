@@ -26,6 +26,11 @@ pub mod edit;
 /// roxlap-core) so [`kv6`] model builders can fill per-voxel `dir`
 /// without a circular dependency; roxlap-core re-exports it.
 pub mod equivec;
+/// Animated-GIF → [`voxel_clip::VoxelClip`] importer for Doom-style
+/// billboard sprites (stage BB). Feature-gated behind `gif`; see
+/// [`gif_import`] + `PORTING-BILLBOARD.md`.
+#[cfg(feature = "gif")]
+pub mod gif_import;
 pub mod kfa;
 pub mod kv6;
 pub mod kvx;

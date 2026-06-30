@@ -17,6 +17,14 @@ categories = ["parser-implementations", "game-development", "graphics"]
 # compress well). Pure-Rust deflate, already in the tree transitively
 # (flate2 / png). The crate's only runtime dependency.
 miniz_oxide = { workspace = true }
+# BB — optional GIF decoder for the billboard-sprite importer
+# (`gif_import`). Pure-Rust (weezl LZW); behind the `gif` feature so the
+# core format crate stays dependency-light when unused.
+gif = { workspace = true, optional = true }
+
+[features]
+# BB.0 — animated-GIF → VoxelClip importer (`gif_import` module).
+gif = ["dep:gif"]
 
 [dev-dependencies]
 # R2.3: oracle.vxl.gz fixture is the procedurally-built world voxlaptest
