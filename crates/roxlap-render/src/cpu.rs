@@ -725,6 +725,20 @@ impl CpuBackend {
         }
     }
 
+    /// Retarget clip instance `idx` onto a *different* clip (BB.1): rebind its
+    /// `dyn_clip` to `(new_clip_idx, 0)` so subsequent draws read the new
+    /// flipbook from frame 0. The pose carrier is untouched. Returns `false`
+    /// if `idx` isn't a live clip instance or `new_clip_idx` is out of range.
+    pub(crate) fn set_clip_instance_clip(&mut self, idx: usize, new_clip_idx: usize) -> bool {
+        if !matches!(self.dyn_clip.get(idx), Some(Some(_)))
+            || self.clip_books.get(new_clip_idx).is_none()
+        {
+            return false;
+        }
+        self.dyn_clip[idx] = Some((new_clip_idx, 0));
+        true
+    }
+
     /// Replace one frame's cached dense grid of clip `clip_idx` (the editor's
     /// single-frame edit). Returns `false` if out of range.
     pub(crate) fn update_clip_frame(

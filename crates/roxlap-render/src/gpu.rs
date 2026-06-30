@@ -642,6 +642,28 @@ impl GpuBackend {
         self.dyn_clip[idx] = Some((clip_idx, frame));
     }
 
+    /// Retarget clip instance `idx` onto a *different* clip (BB.1): repoint
+    /// its model at the new clip's frame 0 and rebind its `dyn_clip` to
+    /// `(new_clip_idx, 0)`. The transform is untouched (same instance). No
+    /// volume re-upload — just a model-id swap, like [`Self::set_clip_frame`].
+    /// Returns `false` if `idx` isn't a live clip instance or the new clip
+    /// has no frames.
+    pub(crate) fn set_clip_instance_clip(&mut self, idx: usize, new_clip_idx: usize) -> bool {
+        if idx >= self.dyn_count || !matches!(self.dyn_clip.get(idx), Some(Some(_))) {
+            return false;
+        }
+        let Some(&chain0) = self.clips.get(new_clip_idx).and_then(|c| c.first()) else {
+            return false;
+        };
+        let gpu_index = (self.sprite_instances.len() - self.dyn_count) + idx;
+        self.sprite_instances[gpu_index].model_id = chain0;
+        if let Some(reg) = self.sprite_registry.as_ref() {
+            self.gpu.set_sprite_instance_model(reg, gpu_index, chain0);
+        }
+        self.dyn_clip[idx] = Some((new_clip_idx, 0));
+        true
+    }
+
     /// The frame a clip instance is currently showing, or `None` if `idx`
     /// isn't a (live) clip instance.
     pub(crate) fn clip_instance_frame(&self, idx: usize) -> Option<usize> {

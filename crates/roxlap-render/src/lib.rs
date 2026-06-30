@@ -449,6 +449,17 @@ impl ClipClock {
             self.clock_ms.max(0.0) as u32,
         ) as u32
     }
+
+    /// Retarget this clock to a different clip's timeline (BB.1): swap the
+    /// per-frame `durations` + `loop_mode` and restart at `0`, **preserving
+    /// the playback rate** (`speed_q8`). Used by
+    /// [`SceneRenderer::set_clip_instance_clip`] so swapping a billboard's
+    /// animation keeps its speed / pause policy.
+    fn retarget(&mut self, durations: Vec<u32>, loop_mode: LoopMode) {
+        self.durations = durations;
+        self.loop_mode = loop_mode;
+        self.clock_ms = 0.0;
+    }
 }
 
 /// Facade-side metadata captured for a registered flipbook clip, so editor
@@ -1938,6 +1949,46 @@ impl SceneRenderer {
         }
     }
 
+    /// Retarget a live clip instance onto a **different** registered clip,
+    /// restarting it at frame 0 while keeping its world transform and any
+    /// auto-playback clock *policy* (speed / paused). The per-frame primitive
+    /// for directional ("8-way") billboards and animation-state changes
+    /// (idle → walk → attack): far cheaper than `remove_sprite_instance` +
+    /// `add_clip_instance_*`, reusing the instance's existing GPU residency
+    /// (just a model-id swap, no volume re-upload).
+    ///
+    /// If the instance has a playback clock
+    /// ([`add_clip_instance_playing`](Self::add_clip_instance_playing)), its
+    /// timeline is retargeted to the new clip (durations + loop mode) and the
+    /// clock restarts at 0; the speed and paused state carry over.
+    ///
+    /// Returns `false` (a safe no-op) on a stale instance id, a stale `clip`,
+    /// or a non-clip instance.
+    pub fn set_clip_instance_clip(&mut self, id: SpriteInstanceId, clip: VoxelClipId) -> bool {
+        let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+            return false;
+        };
+        let Some(clip_index) = self.clip_map.clip_index(clip) else {
+            return false;
+        };
+        let ok = match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_clip_instance_clip(dyn_index as usize, clip_index),
+            BackendImpl::Gpu(g) => g.set_clip_instance_clip(dyn_index as usize, clip_index),
+        };
+        if ok {
+            // Retarget the auto-player's timeline to the new clip (different
+            // frame count / durations / loop), restart its clock, keep the
+            // playback policy (speed + paused). Clone metadata first so the
+            // immutable borrow ends before the mutable player borrow.
+            let durations = self.clip_meta[clip_index].durations.clone();
+            let loop_mode = self.clip_meta[clip_index].loop_mode;
+            if let Some(player) = self.flipbook_player_mut(id) {
+                player.clock.retarget(durations, loop_mode);
+            }
+        }
+        ok
+    }
+
     // ---- clip queries (editor inspector) ---------------------------------
 
     /// Frame count of a registered flipbook clip, or `None` if `id` is
@@ -2975,6 +3026,27 @@ mod tests {
         };
         assert_eq!(phased.tick(0.10), 0); // 50 - 100 = -50 → max(0)=0 → frame 0
         assert!(phased.clock_ms < 0.0); // kept signed
+    }
+
+    #[test]
+    fn clip_clock_retarget_swaps_timeline_restarts_keeps_speed() {
+        // BB.1: swapping a billboard's animation retargets the player's
+        // timeline (durations + loop) and restarts the clock, but keeps the
+        // playback rate (the clock policy).
+        let mut c = ClipClock {
+            durations: vec![100, 100, 100],
+            loop_mode: LoopMode::Loop,
+            speed_q8: 512, // 2×
+            clock_ms: 250.0,
+        };
+        c.retarget(vec![50, 50], LoopMode::Once);
+        assert_eq!(c.durations, vec![50, 50]); // new clip's timeline
+        assert_eq!(c.loop_mode, LoopMode::Once); // new clip's loop mode
+        assert!((c.clock_ms - 0.0).abs() < 1e-9); // restarted at frame 0
+        assert_eq!(c.speed_q8, 512); // playback rate preserved
+                                     // After retarget, ticking advances on the *new* timeline.
+        assert_eq!(c.tick(0.0), 0);
+        assert_eq!(c.tick(0.025), 1); // 25ms wall × 2× = 50ms → frame 1
     }
 
     #[test]
