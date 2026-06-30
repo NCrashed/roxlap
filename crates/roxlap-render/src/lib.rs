@@ -587,6 +587,87 @@ impl DynSpriteTransform {
     }
 }
 
+/// How a billboard instance turns to face the camera (BB.2). Set per
+/// instance via [`SceneRenderer::add_billboard_instance`] /
+/// [`set_billboard_mode`](SceneRenderer::set_billboard_mode); applied each
+/// [`face_billboards_to`](SceneRenderer::face_billboards_to).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BillboardMode {
+    /// Not auto-oriented — the host drives its transform directly. Default
+    /// (so a billboard record with no mode is inert).
+    #[default]
+    None,
+    /// Yaw-only: the slab stays vertical (image up = world up) and rotates
+    /// about the vertical axis to face the camera. The Doom/Build default —
+    /// its cast shadow stays sane (a vertical card) as the camera orbits.
+    Cylindrical,
+    /// Full face: the slab is always perpendicular to the camera direction
+    /// (pitches with the view). Ideal head-on, but its cast shadow rotates
+    /// as you orbit.
+    Spherical,
+}
+
+/// One camera-facing billboard instance (BB.2): the clip/sprite instance it
+/// drives, its world position, and how it orients.
+struct BillboardRec {
+    id: SpriteInstanceId,
+    pos: [f32; 3],
+    mode: BillboardMode,
+}
+
+/// roxlap world up — voxlap is z-down, so up is `-z` (matches the
+/// scene-demo camera builder + the lighting bake's z convention). Billboard
+/// orientation assumes this; an app with a different up convention would
+/// need this generalised (not exposed yet — YAGNI).
+const BILLBOARD_UP: [f32; 3] = [0.0, 0.0, -1.0];
+
+fn bb_norm(v: [f32; 3]) -> Option<[f32; 3]> {
+    let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    (m > 1e-6).then(|| [v[0] / m, v[1] / m, v[2] / m])
+}
+
+fn bb_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// The camera-facing basis for a billboard at `pos` (the slab's local axes:
+/// `+x` = image horizontal, `+y` = normal toward the camera, `+z` = image
+/// vertical). Returns `None` for [`BillboardMode::None`] or a degenerate
+/// pose (camera on the sprite's vertical axis for cylindrical; looking
+/// straight along world-up for spherical) — the caller then skips it.
+fn billboard_transform(
+    pos: [f32; 3],
+    cam: [f64; 3],
+    mode: BillboardMode,
+) -> Option<DynSpriteTransform> {
+    #[allow(clippy::cast_possible_truncation)]
+    let to_cam = [
+        cam[0] as f32 - pos[0],
+        cam[1] as f32 - pos[1],
+        cam[2] as f32 - pos[2],
+    ];
+    // `+y` = slab normal toward the camera (horizontal-only for cylindrical).
+    let ny = match mode {
+        BillboardMode::Cylindrical => bb_norm([to_cam[0], to_cam[1], 0.0])?,
+        BillboardMode::Spherical => bb_norm(to_cam)?,
+        BillboardMode::None => return None,
+    };
+    // `+x` = image horizontal = screen-right (non-mirrored): up × normal.
+    let nx = bb_norm(bb_cross(BILLBOARD_UP, ny))?;
+    // `+z` = image vertical (≈ world up; exactly world up for cylindrical).
+    let nz = bb_cross(ny, nx);
+    Some(DynSpriteTransform {
+        pos,
+        right: nx,
+        up: ny,
+        forward: nz,
+    })
+}
+
 /// Backend-agnostic sprite description. The facade builds the CPU
 /// per-instance draw list and the GPU instanced registry from the
 /// same data, so both backends show identical sprites. The host owns
@@ -1023,6 +1104,10 @@ pub struct SceneRenderer {
     /// Auto-advancing clip players (#6); ticked by
     /// [`Self::advance_voxel_clips`]. Reset by [`Self::set_sprites`].
     clip_players: Vec<ClipPlayer>,
+    /// Camera-facing billboard instances (BB.2): each carries its world
+    /// position + mode, re-oriented every [`Self::face_billboards_to`].
+    /// Reset by [`Self::set_sprites`].
+    billboards: Vec<BillboardRec>,
 }
 
 impl SceneRenderer {
@@ -1059,6 +1144,7 @@ impl SceneRenderer {
                         streaming_clips: Vec::new(),
                         clip_meta: Vec::new(),
                         clip_players: Vec::new(),
+                        billboards: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -1079,6 +1165,7 @@ impl SceneRenderer {
             streaming_clips: Vec::new(),
             clip_meta: Vec::new(),
             clip_players: Vec::new(),
+            billboards: Vec::new(),
         }
     }
 
@@ -1116,6 +1203,7 @@ impl SceneRenderer {
                         streaming_clips: Vec::new(),
                         clip_meta: Vec::new(),
                         clip_players: Vec::new(),
+                        billboards: Vec::new(),
                     };
                 }
                 Err(e) => {
@@ -1137,6 +1225,7 @@ impl SceneRenderer {
             streaming_clips: Vec::new(),
             clip_meta: Vec::new(),
             clip_players: Vec::new(),
+            billboards: Vec::new(),
         }
     }
 
@@ -1489,6 +1578,7 @@ impl SceneRenderer {
         self.streaming_clips.clear();
         self.clip_meta.clear();
         self.clip_players.clear();
+        self.billboards.clear();
         (0..set.models.len() as u32)
             .map(|slot| SpriteModelId { slot, gen: 0 })
             .collect()
@@ -1987,6 +2077,76 @@ impl SceneRenderer {
             }
         }
         ok
+    }
+
+    // ---- billboards (BB.2) -----------------------------------------------
+
+    /// Spawn a clip instance that auto-orients toward the camera every
+    /// [`face_billboards_to`](Self::face_billboards_to) — a Doom/Build-style
+    /// billboard. `pos` is its world position (the clip pivot maps here);
+    /// `mode` chooses cylindrical (the Doom default) or spherical facing.
+    /// Drive its animation through the clip player
+    /// ([`advance_voxel_clips`](Self::advance_voxel_clips)) and swap
+    /// animations with [`set_clip_instance_clip`](Self::set_clip_instance_clip).
+    ///
+    /// The instance starts axis-aligned until the first `face_billboards_to`,
+    /// so call that (with the frame's camera) before `render` — like
+    /// `advance_voxel_clips(dt)`. Returns a stale id on a stale `clip` (no
+    /// billboard recorded).
+    pub fn add_billboard_instance(
+        &mut self,
+        clip: VoxelClipId,
+        pos: [f32; 3],
+        mode: BillboardMode,
+    ) -> SpriteInstanceId {
+        let xf = DynSpriteTransform {
+            pos,
+            ..Default::default()
+        };
+        let id = self.add_clip_instance_posed(clip, xf);
+        if self.dyn_map.dyn_index(id).is_some() {
+            self.billboards.push(BillboardRec { id, pos, mode });
+        }
+        id
+    }
+
+    /// Change a billboard instance's facing mode. No-op on a non-billboard id.
+    pub fn set_billboard_mode(&mut self, id: SpriteInstanceId, mode: BillboardMode) {
+        if let Some(b) = self.billboards.iter_mut().find(|b| b.id == id) {
+            b.mode = mode;
+        }
+    }
+
+    /// Move a billboard instance. Its auto-orientation is preserved; the new
+    /// position takes effect on the next
+    /// [`face_billboards_to`](Self::face_billboards_to). No-op on a
+    /// non-billboard id.
+    pub fn set_billboard_position(&mut self, id: SpriteInstanceId, pos: [f32; 3]) {
+        if let Some(b) = self.billboards.iter_mut().find(|b| b.id == id) {
+            b.pos = pos;
+        }
+    }
+
+    /// Re-orient every billboard instance to face `camera` — one batched
+    /// transform flush (BB.2). Call once per frame before `render`, after
+    /// moving billboards / the camera (the billboard analogue of
+    /// [`advance_voxel_clips`](Self::advance_voxel_clips)). Billboards whose
+    /// instance was removed are pruned; a degenerate pose (camera on the
+    /// sprite's vertical axis) is skipped for that frame.
+    pub fn face_billboards_to(&mut self, camera: &Camera) {
+        let cam = camera.pos;
+        let dyn_map = &self.dyn_map;
+        let mut updates: Vec<(SpriteInstanceId, DynSpriteTransform)> = Vec::new();
+        self.billboards.retain(|b| {
+            if dyn_map.dyn_index(b.id).is_none() {
+                return false; // the instance was removed → drop the record
+            }
+            if let Some(xf) = billboard_transform(b.pos, cam, b.mode) {
+                updates.push((b.id, xf));
+            }
+            true
+        });
+        self.set_sprite_instance_transforms(&updates);
     }
 
     // ---- clip queries (editor inspector) ---------------------------------
@@ -3047,6 +3207,87 @@ mod tests {
                                      // After retarget, ticking advances on the *new* timeline.
         assert_eq!(c.tick(0.0), 0);
         assert_eq!(c.tick(0.025), 1); // 25ms wall × 2× = 50ms → frame 1
+    }
+
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+    fn unit(v: [f32; 3]) -> bool {
+        (dot(v, v) - 1.0).abs() < 1e-5
+    }
+
+    #[test]
+    fn billboard_cylindrical_faces_camera_upright_and_ignores_height() {
+        // Camera due +x of the sprite. Cylindrical normal (local +y) points
+        // at the camera horizontally; image vertical (local +z) is world up.
+        let xf = billboard_transform(
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            BillboardMode::Cylindrical,
+        )
+        .expect("non-degenerate");
+        assert_eq!(xf.up, [1.0, 0.0, 0.0]); // normal → toward camera
+        assert_eq!(xf.forward, BILLBOARD_UP); // image vertical → world up (-z)
+        assert_eq!(xf.right, [0.0, -1.0, 0.0]); // image horizontal = screen-right
+                                                // Cylindrical ignores camera height: a camera at a different z gives
+                                                // the same (vertical) basis.
+        let high = billboard_transform(
+            [0.0, 0.0, 0.0],
+            [10.0, 0.0, -50.0],
+            BillboardMode::Cylindrical,
+        )
+        .unwrap();
+        assert_eq!(high.up, xf.up);
+        assert_eq!(high.forward, xf.forward);
+        // Orthonormal basis.
+        for v in [xf.right, xf.up, xf.forward] {
+            assert!(unit(v));
+        }
+        assert!(dot(xf.right, xf.up).abs() < 1e-5);
+        assert!(dot(xf.up, xf.forward).abs() < 1e-5);
+        assert!(dot(xf.right, xf.forward).abs() < 1e-5);
+    }
+
+    #[test]
+    fn billboard_spherical_tilts_with_view_and_normal_points_at_camera() {
+        // Camera above (-z) and in front (+x): the normal tilts up; the
+        // image vertical gains an up-tilt too (unlike cylindrical).
+        let cam = [10.0, 0.0, -10.0];
+        let xf = billboard_transform([0.0, 0.0, 0.0], cam, BillboardMode::Spherical).unwrap();
+        // Normal (local +y) = normalized direction to the camera.
+        let n = bb_norm([cam[0] as f32, cam[1] as f32, cam[2] as f32]).unwrap();
+        for (u, ni) in xf.up.iter().zip(n.iter()) {
+            assert!((u - ni).abs() < 1e-5);
+        }
+        // Not vertical-locked: image vertical tilts off world up.
+        assert!(xf.forward != BILLBOARD_UP);
+        for v in [xf.right, xf.up, xf.forward] {
+            assert!(unit(v));
+        }
+        assert!(dot(xf.right, xf.up).abs() < 1e-5);
+        assert!(dot(xf.up, xf.forward).abs() < 1e-5);
+        assert!(dot(xf.right, xf.forward).abs() < 1e-5);
+    }
+
+    #[test]
+    fn billboard_degenerate_and_none_yield_no_transform() {
+        // Cylindrical with the camera straight overhead → no horizontal
+        // facing direction → skipped.
+        assert!(billboard_transform(
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, -10.0],
+            BillboardMode::Cylindrical
+        )
+        .is_none());
+        // Spherical looking straight along world-up → image-right degenerate.
+        assert!(
+            billboard_transform([0.0, 0.0, 0.0], [0.0, 0.0, -10.0], BillboardMode::Spherical)
+                .is_none()
+        );
+        // None mode is never auto-oriented.
+        assert!(
+            billboard_transform([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], BillboardMode::None).is_none()
+        );
     }
 
     #[test]
