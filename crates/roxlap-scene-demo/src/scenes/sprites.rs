@@ -6,7 +6,7 @@
 //! Controls: click to grab, then left-click shoots a sphere out of the
 //! blob ahead · `G` structurally carves the red model's next z-layer.
 
-use roxlap_render::{Sprite, SpriteInstanceDesc, SpriteModelId, SpriteSet};
+use roxlap_render::{Sprite, SpriteInstanceDesc, SpriteInstanceId, SpriteModelId, SpriteSet};
 use roxlap_scene::Scene;
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
@@ -28,6 +28,32 @@ pub struct SpritesScene {
     carve_id: Option<SpriteModelId>,
     /// Streaming sprite ring exercising the incremental add/remove API.
     spinner: Spinner,
+    /// A row of dynamic instances of the **same** green `coco` model, each
+    /// re-tinted to a cycling rainbow hue every frame — the per-instance tint
+    /// showcase (`set_sprite_instance_tint`).
+    tinted: Vec<SpriteInstanceId>,
+    /// Seconds elapsed, driving the tint cycle.
+    tint_clock: f64,
+}
+
+/// HSV (`s = v = 1`) → packed `0x00RRGGBB`, `h` in `0..1`. A tiny rainbow
+/// helper for the tint showcase.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn hue_rgb(h: f32) -> u32 {
+    let h6 = (h.rem_euclid(1.0)) * 6.0;
+    let i = h6.floor() as i32;
+    let f = h6 - i as f32;
+    let q = ((1.0 - f) * 255.0) as u32;
+    let t = (f * 255.0) as u32;
+    let (r, g, b) = match i.rem_euclid(6) {
+        0 => (255, t, 0),
+        1 => (q, 255, 0),
+        2 => (0, 255, t),
+        3 => (0, q, 255),
+        4 => (t, 0, 255),
+        _ => (255, 0, q),
+    };
+    (r << 16) | (g << 8) | b
 }
 
 impl SpritesScene {
@@ -39,6 +65,8 @@ impl SpritesScene {
             carve_target: CarveTarget::new(),
             carve_id: None,
             spinner: Spinner::default(),
+            tinted: Vec::new(),
+            tint_clock: 0.0,
         }
     }
 
@@ -139,7 +167,7 @@ impl DemoScene for SpritesScene {
     }
 
     fn controls(&self) -> &'static str {
-        "click to grab · left-click shoots the blob · G: carve the red coco"
+        "click to grab · left-click shoots the blob · G: carve the red coco · rainbow row = per-instance tint"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -161,12 +189,39 @@ impl DemoScene for SpritesScene {
             let ids = ctx.renderer.set_sprites(&set);
             self.carve_id = ids.get(target_model).copied();
             self.spinner.reset();
+
+            // Per-instance tint showcase: a row of dynamic instances of the
+            // SAME green `coco` model (id 0), each recoloured every frame via
+            // `set_sprite_instance_tint` — no extra models, just a tint.
+            self.tinted.clear();
+            self.tint_clock = 0.0;
+            if let Some(&green) = ids.first() {
+                let n = 6i32;
+                for i in 0..n {
+                    #[allow(clippy::cast_precision_loss)]
+                    let x = (i as f32 - (n as f32 - 1.0) * 0.5) * 44.0;
+                    // A row right in front of the start camera (looking +y),
+                    // near eye level, ahead of the green/red field.
+                    let id = ctx.renderer.add_sprite_instance(green, [x, -55.0, 45.0]);
+                    self.tinted.push(id);
+                }
+            }
         }
     }
 
     fn update(&mut self, ctx: &mut SceneCtx, dt: f64) {
         ctx.cam.fly_free(ctx.input, dt);
         self.spinner.update(ctx.renderer, dt);
+
+        // Cycle each tinted instance through the rainbow (staggered by index),
+        // proving per-instance `set_sprite_instance_tint` on one shared model.
+        self.tint_clock += dt;
+        let n = self.tinted.len().max(1) as f64;
+        for (i, &id) in self.tinted.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let hue = (self.tint_clock * 0.25 + i as f64 / n) as f32;
+            ctx.renderer.set_sprite_instance_tint(id, hue_rgb(hue));
+        }
     }
 
     fn on_input(&mut self, ctx: &mut SceneCtx, ev: &SceneInput) {

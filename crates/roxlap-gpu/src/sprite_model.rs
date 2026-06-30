@@ -1215,6 +1215,10 @@ impl SpriteRegistryResident {
             // update as the pose (set via the facade's per-instance setters).
             ci.gpu.material = u32::from(inst.material);
             ci.gpu.alpha_mul = f32::from(inst.alpha_mul) / 255.0;
+            // XS.4 shadow flags + per-instance RGB tint also ride this flush,
+            // so `set_dyn_instance_tint` (and any flag change) takes effect.
+            ci.gpu.flags = inst.flags;
+            ci.gpu.tint = inst.tint;
             // Bounding sphere follows the pivot; radius/chain unchanged.
             ci.center = inst.transform.pos;
         }
