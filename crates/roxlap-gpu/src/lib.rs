@@ -489,6 +489,15 @@ fn build_image_vertices(
     out
 }
 
+/// RP.2 — flat posterize config for the resolve pass uniform. `levels[c] <= 1`
+/// leaves that channel untouched; `dither` is `0`=none, `1`=Bayer4×4,
+/// `2`=blue-noise (IGN). Mirror of `roxlap_render::PosterizeConfig`.
+#[derive(Clone, Copy, Debug)]
+pub struct PosterizeGpu {
+    pub levels: [u32; 3],
+    pub dither: u32,
+}
+
 /// RP.0 — logical render resolution policy for the scene marcher, decoupled
 /// from the swapchain size. Mirror of `roxlap_render::RenderResolution` (kept
 /// here so `roxlap-gpu` has no upward dependency). See [`GpuRenderer::render_dims`].
@@ -546,6 +555,9 @@ pub struct GpuRenderer {
     /// marches at `logical × ssaa` into the framebuffer/depth and a resolve
     /// compute pass box-downfilters back to logical before the blit.
     ssaa: u32,
+    /// RP.2 — reduced-palette post applied in the resolve pass (at logical
+    /// resolution). `None` = off (`levels = [1,1,1]` ⇒ the RP.1 box-avg only).
+    posterize: Option<PosterizeGpu>,
     /// Lazy-built on first [`Self::render_chunk`] call; rebuilt when
     /// the swapchain resizes (storage texture must match).
     chunk_dda: Option<ChunkDdaResources>,
@@ -705,11 +717,14 @@ struct SceneDdaResources {
     uniform_buf: wgpu::Buffer,
     bgl_dda: wgpu::BindGroupLayout,
     pipeline_dda: wgpu::ComputePipeline,
-    /// RP.1 — box-downfilter compute pass (`scene_resolve.wgsl`):
-    /// framebuffer(march) → resolve_buf(logical). The bind group retains the
-    /// resolve buffer + dims uniform (so they aren't stored separately).
+    /// RP.1/RP.2 — box-downfilter + posterize compute pass
+    /// (`scene_resolve.wgsl`): framebuffer(march) → resolve_buf(logical). The
+    /// bind group retains the resolve buffer (not stored separately).
     pipeline_resolve: wgpu::ComputePipeline,
     resolve_bg: wgpu::BindGroup,
+    /// Resolve uniform `[src w,h, dst w,h, ssaa, levels r,g,b, dither, pad×3]`.
+    /// Retained so the posterize fields are re-written per frame (RP.2).
+    resolve_dims: wgpu::Buffer,
     /// Blit bind group — binds `resolve_buf` (logical) + `blit_dims`.
     blit_bg: wgpu::BindGroup,
     pipeline_blit: wgpu::RenderPipeline,
@@ -1480,6 +1495,7 @@ impl GpuRenderer {
             flip_x: false,
             render_res: RenderResolution::Native,
             ssaa: 1,
+            posterize: None,
             chunk_dda: None,
             grid_dda: None,
             scene_dda: None,
@@ -1663,6 +1679,12 @@ impl GpuRenderer {
     /// RP.1 — set the supersampling factor (clamped to `1..=4`). `1` = off.
     pub fn set_ssaa(&mut self, factor: u8) {
         self.ssaa = u32::from(factor).clamp(1, 4);
+    }
+
+    /// RP.2 — set (or clear) the posterize post. Applied per-frame via the
+    /// resolve uniform, so no pipeline rebuild is needed.
+    pub fn set_posterize(&mut self, cfg: Option<PosterizeGpu>) {
+        self.posterize = cfg;
     }
 
     /// RP.0 — the logical (retro) grid size the scene resolves to before the
@@ -2489,6 +2511,18 @@ impl GpuRenderer {
             &dda.blit_dims,
             16,
             bytemuck::bytes_of(&[u32::from(self.flip_x), 0u32]),
+        );
+        // RP.2 — refresh the resolve pass's posterize fields each frame (offset
+        // 20, after src/dst dims + ssaa). `None` ⇒ `levels = [1,1,1]`, `dither
+        // = 0` ⇒ the resolve does box-downfilter only (RP.1).
+        let (plevels, pdither) = match self.posterize {
+            Some(p) => (p.levels, p.dither),
+            None => ([1u32; 3], 0u32),
+        };
+        self.queue.write_buffer(
+            &dda.resolve_dims,
+            20,
+            bytemuck::bytes_of(&[plevels[0], plevels[1], plevels[2], pdither]),
         );
 
         // Pack per-grid cameras into a runtime-sized storage buffer
@@ -3745,19 +3779,19 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        // Resolve uniform: `[src(march) w,h, dst(logical) w,h, ssaa, pad×3]`.
+        // Resolve uniform: `[src(march) w,h, dst(logical) w,h, ssaa,
+        // levels r,g,b, dither, pad×3]` (48 B). Dims+ssaa written here; the
+        // posterize fields (offset 20) are re-written per frame in render_scene.
         let resolve_dims = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.resolve_dims"),
-            size: 32,
+            size: 48,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.queue.write_buffer(
             &resolve_dims,
             0,
-            bytemuck::bytes_of(&[
-                width, height, logical_w, logical_h, self.ssaa, 0u32, 0u32, 0u32,
-            ]),
+            bytemuck::bytes_of(&[width, height, logical_w, logical_h, self.ssaa]),
         );
         // Blit uniform `Dims`: logical (src) size, swapchain (dst) size, then
         // `flip_x` + pad (RP.0 nearest upscale). The flip flag (offset 16) is
@@ -4073,6 +4107,7 @@ impl GpuRenderer {
             pipeline_dda,
             pipeline_resolve,
             resolve_bg,
+            resolve_dims,
             blit_bg,
             pipeline_blit,
             blit_dims,

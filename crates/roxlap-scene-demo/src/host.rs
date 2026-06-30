@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use roxlap_core::Engine;
-use roxlap_render::{Backend, RenderOptions, RenderResolution, SceneRenderer, SpriteSet};
+use roxlap_render::{
+    Backend, DitherMode, PosterizeConfig, RenderOptions, RenderResolution, SceneRenderer, SpriteSet,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -75,6 +77,28 @@ fn parse_ssaa() -> u8 {
         .and_then(|s| s.trim().parse::<u8>().ok())
         .unwrap_or(1)
         .clamp(1, 4)
+}
+
+/// Parse `ROXLAP_POSTERIZE` (per-channel level count) + `ROXLAP_DITHER`
+/// (`none`|`bayer`|`blue`) into an optional [`PosterizeConfig`] (RP.2).
+/// Unset / `0` / `1` ⇒ disabled. Dither defaults to blue-noise.
+fn parse_posterize() -> Option<PosterizeConfig> {
+    let levels = std::env::var("ROXLAP_POSTERIZE")
+        .ok()
+        .and_then(|s| s.trim().parse::<u8>().ok())?;
+    if levels <= 1 {
+        return None;
+    }
+    let dither = match std::env::var("ROXLAP_DITHER")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("none") => DitherMode::None,
+        Some("bayer") => DitherMode::Bayer4x4,
+        _ => DitherMode::BlueNoise,
+    };
+    Some(PosterizeConfig::uniform(levels, dither))
 }
 
 /// An empty sprite set — used to reset the renderer's content layers
@@ -408,10 +432,14 @@ impl ApplicationHandler for Host {
         // full N² ray cost, so keep it opt-in.
         let ssaa = parse_ssaa();
         renderer.set_ssaa(ssaa);
+        // RP.2 — reduced-palette posterize. `ROXLAP_POSTERIZE=N` quantizes each
+        // channel to N levels; `ROXLAP_DITHER=none|bayer|blue` picks the dither.
+        let posterize = parse_posterize();
+        renderer.set_posterize(posterize);
         let (lw, lh) = renderer.logical_dims();
         let (rw, rh) = renderer.render_dims();
         eprintln!(
-            "roxlap-render: render resolution {render_res:?} → {lw}×{lh} logical, ssaa {ssaa} → {rw}×{rh} march"
+            "roxlap-render: render resolution {render_res:?} → {lw}×{lh} logical, ssaa {ssaa} → {rw}×{rh} march; posterize {posterize:?}"
         );
 
         self.title_base = if let Some(info) = renderer.adapter_info() {

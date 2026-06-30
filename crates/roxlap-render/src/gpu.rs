@@ -958,6 +958,24 @@ impl GpuBackend {
         self.gpu.set_ssaa(factor);
     }
 
+    /// RP.2 — set (or clear) the reduced-palette posterize post. Converts the
+    /// facade config to the engine's flat uniform representation.
+    pub(crate) fn set_posterize(&mut self, cfg: Option<crate::PosterizeConfig>) {
+        let g = cfg.map(|c| roxlap_gpu::PosterizeGpu {
+            levels: [
+                u32::from(c.levels_r),
+                u32::from(c.levels_g),
+                u32::from(c.levels_b),
+            ],
+            dither: match c.dither {
+                crate::DitherMode::None => 0,
+                crate::DitherMode::Bayer4x4 => 1,
+                crate::DitherMode::BlueNoise => 2,
+            },
+        });
+        self.gpu.set_posterize(g);
+    }
+
     /// RP.0 — the logical (retro) grid size before the upscale.
     pub(crate) fn logical_dims(&self) -> (u32, u32) {
         self.gpu.logical_dims()

@@ -306,6 +306,51 @@ fn downfilter_pixel(fb: &[u32], march_w: usize, lx: usize, ly: usize, s: usize) 
     (((ar + half) / n) << 16) | (((ag + half) / n) << 8) | ((ab + half) / n)
 }
 
+/// RP.2 — dither threshold in `[0, 1)` for the logical pixel `(x, y)`.
+/// [`DitherMode::None`] returns `0.5` so `floor(scaled + 0.5)` is a plain
+/// round-to-nearest. Bayer is the classic `4×4` ordered matrix; `BlueNoise`
+/// is interleaved-gradient noise (texture-free, non-repeating).
+fn dither_offset(mode: crate::DitherMode, x: usize, y: usize) -> f32 {
+    match mode {
+        crate::DitherMode::None => 0.5,
+        crate::DitherMode::Bayer4x4 => {
+            const B: [u8; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+            (f32::from(B[(y % 4) * 4 + (x % 4)]) + 0.5) / 16.0
+        }
+        crate::DitherMode::BlueNoise => {
+            // Jimenez interleaved-gradient noise.
+            #[allow(clippy::cast_precision_loss)]
+            let f = (x as f32) * 0.067_110_56 + (y as f32) * 0.005_837_15;
+            (52.982_918 * f.fract()).fract()
+        }
+    }
+}
+
+/// RP.2 — quantize one `0..=255` channel to `levels` evenly-spaced steps with
+/// the given dither `offset` (`[0, 1)`). `levels <= 1` leaves it untouched.
+fn quantize_channel(c: u32, levels: u8, offset: f32) -> u32 {
+    if levels <= 1 {
+        return c;
+    }
+    let m = f32::from(levels - 1);
+    #[allow(clippy::cast_precision_loss)]
+    let scaled = (c as f32 / 255.0) * m;
+    let q = (scaled + offset).floor().clamp(0.0, m);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let out = (q / m * 255.0).round() as u32;
+    out
+}
+
+/// RP.2 — posterize one `0x00RRGGBB` logical pixel: per-channel quantization
+/// with a per-pixel dither threshold (so banding becomes a stable pattern).
+fn posterize_pixel(rgb: u32, x: usize, y: usize, cfg: crate::PosterizeConfig) -> u32 {
+    let off = dither_offset(cfg.dither, x, y);
+    let r = quantize_channel((rgb >> 16) & 0xff, cfg.levels_r, off);
+    let g = quantize_channel((rgb >> 8) & 0xff, cfg.levels_g, off);
+    let b = quantize_channel(rgb & 0xff, cfg.levels_b, off);
+    (r << 16) | (g << 8) | b
+}
+
 /// RP.1 — which owned buffer a present/upscale step reads from. `Frame` is the
 /// march-or-logical scene framebuffer, `Resolve` the box-downfiltered logical
 /// buffer (`ssaa > 1`), `Output` the native-size composited buffer.
@@ -342,7 +387,11 @@ pub(crate) struct CpuBackend {
     ssaa: u32,
     /// RP.1 — logical-sized buffer holding the box-downfiltered scene when
     /// `ssaa > 1`. Empty when `ssaa == 1` (the framebuffer is already logical).
+    /// Also holds the posterized image (RP.2) when posterize is active.
     resolve: Vec<u32>,
+    /// RP.2 — reduced-palette post applied at logical resolution in the resolve
+    /// step. `None` = off (when `ssaa == 1` the framebuffer is presented as-is).
+    posterize: Option<crate::PosterizeConfig>,
     /// RP.0 — native-size scratch buffer the logical scene is nearest-upscaled
     /// into before present, in the non-`Native` path. The egui overlay
     /// rasterises here (at native res) so the HUD stays crisp. Empty in the
@@ -439,6 +488,7 @@ impl CpuBackend {
             render_res: crate::RenderResolution::Native,
             ssaa: 1,
             resolve: Vec::new(),
+            posterize: None,
             output: Vec::new(),
             zbuffer,
             last_dims: (w, h),
@@ -947,6 +997,16 @@ impl CpuBackend {
         self.ssaa = u32::from(factor).clamp(1, 4);
     }
 
+    /// RP.2 — set (or clear) the reduced-palette posterize post.
+    pub(crate) fn set_posterize(&mut self, cfg: Option<crate::PosterizeConfig>) {
+        self.posterize = cfg;
+    }
+
+    /// Whether the resolve step has work to do (SSAA downfilter or posterize).
+    fn resolve_active(&self) -> bool {
+        self.ssaa > 1 || self.posterize.is_some()
+    }
+
     /// RP.1 — the resolution the raycaster actually marches at:
     /// `logical × ssaa`. The framebuffer/zbuffer are sized to this.
     pub(crate) fn render_dims(&self) -> (u32, u32) {
@@ -1323,7 +1383,9 @@ impl CpuBackend {
     /// return [`CpuSrc::Resolve`]. When `ssaa == 1` the framebuffer is already
     /// the logical image, so this is a no-op returning [`CpuSrc::Frame`].
     fn resolve_scene(&mut self, logical: (u32, u32)) -> CpuSrc {
-        if self.ssaa <= 1 {
+        // `ssaa == 1` + no posterize ⇒ the framebuffer is already the final
+        // logical image (RP.0/RP.1 fast path, byte-identical).
+        if !self.resolve_active() {
             return CpuSrc::Frame;
         }
         let (lw, lh) = (logical.0 as usize, logical.1 as usize);
@@ -1336,6 +1398,7 @@ impl CpuBackend {
         if self.resolve.len() < lpc {
             self.resolve.resize(lpc, self.clear_sky);
         }
+        let post = self.posterize;
         let Self {
             framebuffer,
             resolve,
@@ -1343,7 +1406,13 @@ impl CpuBackend {
         } = self;
         for ly in 0..lh {
             for lx in 0..lw {
-                resolve[ly * lw + lx] = downfilter_pixel(framebuffer, mw, lx, ly, s);
+                // RP.1 box downfilter (1×1 = copy when ssaa==1), then RP.2
+                // posterize + dither at the logical resolution.
+                let mut px = downfilter_pixel(framebuffer, mw, lx, ly, s);
+                if let Some(cfg) = post {
+                    px = posterize_pixel(px, lx, ly, cfg);
+                }
+                resolve[ly * lw + lx] = px;
             }
         }
         CpuSrc::Resolve
@@ -1781,6 +1850,74 @@ impl CpuBackend {
             );
             self.blit_and_present_from(CpuSrc::Output, native);
         }
+    }
+}
+
+#[cfg(test)]
+mod posterize_tests {
+    use super::{posterize_pixel, quantize_channel};
+    use crate::{DitherMode, PosterizeConfig};
+
+    /// `levels <= 1` leaves a channel untouched (the byte-identical guard).
+    #[test]
+    fn levels_one_is_identity() {
+        for c in [0, 1, 127, 128, 200, 255] {
+            assert_eq!(quantize_channel(c, 1, 0.5), c);
+            assert_eq!(quantize_channel(c, 0, 0.5), c);
+        }
+    }
+
+    /// 2-level, no-dither quantization snaps to black/white at the midpoint.
+    #[test]
+    fn two_levels_round_to_nearest() {
+        assert_eq!(quantize_channel(0, 2, 0.5), 0);
+        assert_eq!(quantize_channel(127, 2, 0.5), 0);
+        assert_eq!(quantize_channel(128, 2, 0.5), 255);
+        assert_eq!(quantize_channel(255, 2, 0.5), 255);
+    }
+
+    /// 4 levels map to the evenly-spaced palette {0, 85, 170, 255}.
+    #[test]
+    fn four_levels_palette() {
+        let p = |c| quantize_channel(c, 4, 0.5);
+        assert_eq!(p(0), 0);
+        assert_eq!(p(255), 255);
+        assert_eq!(p(85), 85);
+        assert_eq!(p(170), 170);
+        // Every output is one of the 4 levels.
+        for c in 0..=255u32 {
+            assert!(matches!(p(c), 0 | 85 | 170 | 255), "c={c} → {}", p(c));
+        }
+    }
+
+    /// `None` posterize round-trips the whole pixel unchanged (per channel
+    /// `levels == 1`), and a uniform config touches every channel.
+    #[test]
+    fn posterize_pixel_per_channel() {
+        let cfg = PosterizeConfig::uniform(2, DitherMode::None);
+        // r=200→255, g=10→0, b=130→255.
+        assert_eq!(posterize_pixel(0x00_c8_0a_82, 0, 0, cfg), 0x00_ff_00_ff);
+    }
+
+    /// Dither pushes a near-boundary value across the threshold for some
+    /// pixels but not others (so a flat ramp breaks into a stable pattern).
+    #[test]
+    fn dither_varies_by_pixel() {
+        let cfg = PosterizeConfig::uniform(2, DitherMode::Bayer4x4);
+        // Mid-grey 0x80 sits right at the 2-level boundary; Bayer must yield
+        // both black and white across the 4×4 tile.
+        let mut blacks = 0;
+        let mut whites = 0;
+        for y in 0..4 {
+            for x in 0..4 {
+                match posterize_pixel(0x00_80_80_80, x, y, cfg) & 0xff {
+                    0 => blacks += 1,
+                    255 => whites += 1,
+                    other => panic!("unexpected {other}"),
+                }
+            }
+        }
+        assert!(blacks > 0 && whites > 0, "blacks={blacks} whites={whites}");
     }
 }
 

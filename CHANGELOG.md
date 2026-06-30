@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Posterize + dither** (RP.2) — `SceneRenderer::set_posterize(Option<PosterizeConfig>)`
+  applies a reduced-palette post at the logical resolution in the resolve step
+  (after the SSAA downfilter, before the nearest upscale), so each hard pixel
+  quantizes once. Per-channel `levels_r/g/b` (`<= 1` ⇒ untouched) +
+  `DitherMode {None, Bayer4x4, BlueNoise}` (blue-noise = texture-free
+  interleaved-gradient noise). GPU folds it into `scene_resolve.wgsl` (posterize
+  fields written per-frame in the resolve uniform — no pipeline rebuild); CPU
+  into `posterize_pixel` (exact per-channel quantization). `None` posterize +
+  `ssaa == 1` stays byte-identical. scene-demo: `ROXLAP_POSTERIZE=N` +
+  `ROXLAP_DITHER=none|bayer|blue`.
 - **SSAA + box-downfilter resolve** (RP.1) — `SceneRenderer::set_ssaa(factor)`
   (clamped `1..=4`) supersamples the retro grid: the raycaster marches at
   `logical × factor`, then a box-downfilter resolves back to the logical grid

@@ -1311,6 +1311,47 @@ impl RenderResolution {
     }
 }
 
+/// Dither applied before the posterize quantization (RP.2), to break up
+/// banding and turn it into a stable retro pattern instead of crawling edges.
+/// Indexed by the *logical* pixel, so each hard pixel still resolves to one
+/// colour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DitherMode {
+    /// No dither — plain round-to-nearest quantization (hard banding).
+    #[default]
+    None,
+    /// Classic `4×4` ordered (Bayer) dither — the cross-hatch console look.
+    Bayer4x4,
+    /// Interleaved-gradient noise — a cheap, texture-free blue-noise-ish
+    /// stochastic dither (finer than Bayer, no repeating grid).
+    BlueNoise,
+}
+
+/// Reduced-palette post (RP.2), applied at the logical resolution in the
+/// resolve step (after the SSAA box-downfilter, before the nearest upscale).
+/// Each channel is quantized to its own number of levels; `levels <= 1` leaves
+/// that channel untouched. `None` posterize ⇒ the RP.0/RP.1 paths verbatim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PosterizeConfig {
+    pub levels_r: u8,
+    pub levels_g: u8,
+    pub levels_b: u8,
+    pub dither: DitherMode,
+}
+
+impl PosterizeConfig {
+    /// Uniform per-channel level count with the given dither.
+    #[must_use]
+    pub fn uniform(levels: u8, dither: DitherMode) -> Self {
+        Self {
+            levels_r: levels,
+            levels_g: levels,
+            levels_b: levels,
+            dither,
+        }
+    }
+}
+
 /// Renderer-internal backend; never exposes wgpu or softbuffer types.
 /// The GPU variant owns the whole wgpu device/queue/pipelines, so
 /// it's boxed to keep the enum small.
@@ -1564,6 +1605,18 @@ impl SceneRenderer {
         match &self.inner {
             BackendImpl::Cpu(c) => c.render_dims(),
             BackendImpl::Gpu(g) => g.render_dims(),
+        }
+    }
+
+    /// Set the reduced-palette posterize post (RP.2), or `None` to disable it
+    /// (the default — RP.0/RP.1 paths verbatim). Quantization runs at the
+    /// logical resolution in the resolve step, after the SSAA downfilter and
+    /// before the nearest upscale, with the configured dither. Takes effect
+    /// from the next [`render`](Self::render).
+    pub fn set_posterize(&mut self, cfg: Option<PosterizeConfig>) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_posterize(cfg),
+            BackendImpl::Gpu(g) => g.set_posterize(cfg),
         }
     }
 
