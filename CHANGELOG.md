@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live render-pipeline HUD** (RP.3) — the scene-demo gains a "Render pipeline"
+  egui panel (top-right) that drives `set_render_resolution` / `set_ssaa` /
+  `set_posterize` at runtime: resolution mode (Native / Fixed `w×h` / Scale),
+  SSAA factor, posterize levels + dither (none / Bayer / blue-noise), with the
+  live logical + march sizes shown. The `ROXLAP_RENDER_RES` / `ROXLAP_SSAA` /
+  `ROXLAP_POSTERIZE` / `ROXLAP_DITHER` env vars now just seed the panel's
+  initial state. README + per-crate docs updated. Closes the RP pipeline
+  (RP.0 fixed target + RP.1 SSAA + RP.2 posterize + RP.3 controls).
 - **Posterize + dither** (RP.2) — `SceneRenderer::set_posterize(Option<PosterizeConfig>)`
   applies a reduced-palette post at the logical resolution in the resolve step
   (after the SSAA downfilter, before the nearest upscale), so each hard pixel

@@ -101,6 +101,77 @@ fn parse_posterize() -> Option<PosterizeConfig> {
     Some(PosterizeConfig::uniform(levels, dither))
 }
 
+/// RP.3 — which [`RenderResolution`] variant the HUD is editing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResMode {
+    Native,
+    Fixed,
+    Scale,
+}
+
+/// RP.3 — live-editable render-pipeline state backing the HUD controls
+/// (resolution / SSAA / posterize / dither). Seeded from the env vars, then
+/// mutated by the egui panel; changes are pushed to the renderer each frame.
+#[derive(Clone, Copy, PartialEq)]
+struct PipelineUi {
+    res_mode: ResMode,
+    fixed_w: u32,
+    fixed_h: u32,
+    scale: f32,
+    ssaa: u8,
+    posterize_on: bool,
+    levels: u8,
+    dither: DitherMode,
+}
+
+impl PipelineUi {
+    /// Seed from the `ROXLAP_*` env vars (the same parse the CLI uses).
+    fn from_env() -> Self {
+        let (res_mode, fixed_w, fixed_h, scale) = match parse_render_res() {
+            RenderResolution::Native => (ResMode::Native, RENDER_RES_W, RENDER_RES_H, 0.5),
+            RenderResolution::Fixed { w, h } => (ResMode::Fixed, w, h, 0.5),
+            RenderResolution::Scale(f) => (ResMode::Scale, RENDER_RES_W, RENDER_RES_H, f),
+        };
+        let (posterize_on, levels, dither) = match parse_posterize() {
+            Some(p) => (true, p.levels_r, p.dither),
+            None => (false, 4, DitherMode::BlueNoise),
+        };
+        Self {
+            res_mode,
+            fixed_w,
+            fixed_h,
+            scale,
+            ssaa: parse_ssaa(),
+            posterize_on,
+            levels,
+            dither,
+        }
+    }
+
+    fn resolution(&self) -> RenderResolution {
+        match self.res_mode {
+            ResMode::Native => RenderResolution::Native,
+            ResMode::Fixed => RenderResolution::Fixed {
+                w: self.fixed_w,
+                h: self.fixed_h,
+            },
+            ResMode::Scale => RenderResolution::Scale(self.scale),
+        }
+    }
+
+    fn posterize(&self) -> Option<PosterizeConfig> {
+        self.posterize_on
+            .then(|| PosterizeConfig::uniform(self.levels, self.dither))
+    }
+
+    /// Push the whole pipeline state to the renderer.
+    fn apply(&self, renderer: &mut SceneRenderer) {
+        renderer.set_render_resolution(self.resolution());
+        renderer.set_ssaa(self.ssaa);
+        renderer.set_posterize(self.posterize());
+    }
+}
+
 /// An empty sprite set — used to reset the renderer's content layers
 /// (static + dynamic + clip + character) when switching scenes.
 fn empty_sprite_set() -> SpriteSet {
@@ -135,6 +206,8 @@ pub struct Host {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     hud_on: bool,
+    /// RP.3 — live render-pipeline settings edited by the HUD panel.
+    pipe: PipelineUi,
     title_base: String,
     fps_frames: u32,
     fps_last: Instant,
@@ -181,6 +254,7 @@ impl Host {
             egui_ctx: egui::Context::default(),
             egui_state: None,
             hud_on: true,
+            pipe: PipelineUi::from_env(),
             title_base: "roxlap-scene-demo".to_string(),
             fps_frames: 0,
             fps_last: Instant::now(),
@@ -383,6 +457,16 @@ impl Host {
             sctrl,
             &slines,
         );
+        // RP.3 — live render-pipeline controls. Edit a local copy, then push
+        // any change to the renderer after the pass (keeps the `renderer`
+        // borrow disjoint from `self.pipe`).
+        let mut pipe = self.pipe;
+        pipeline_panel(
+            &self.egui_ctx,
+            &mut pipe,
+            renderer.logical_dims(),
+            renderer.render_dims(),
+        );
         if self.menu_open {
             if let Some(pick) = scene_menu(&self.egui_ctx, &names, self.active) {
                 self.pending_switch = Some(pick);
@@ -392,6 +476,10 @@ impl Host {
 
         let full = self.egui_ctx.end_pass();
         state.handle_platform_output(window, full.platform_output);
+        if pipe != self.pipe {
+            pipe.apply(renderer);
+            self.pipe = pipe;
+        }
         let ppp = self.egui_ctx.pixels_per_point();
         let jobs = self.egui_ctx.tessellate(full.shapes, ppp);
         renderer.paint_egui(&jobs, &full.textures_delta, ppp);
@@ -419,27 +507,18 @@ impl ApplicationHandler for Host {
         let init = window.inner_size();
         let mut renderer = SceneRenderer::new(window.clone(), (init.width, init.height), &opts);
 
-        // RP.0 — render into a fixed logical grid (nearest-upscaled to the
-        // window) so the marcher's cost — and the FPS — stops tracking the
-        // window size. Default 860×520; override with `ROXLAP_RENDER_RES`:
-        //   `native`      → window resolution (pre-RP behaviour)
-        //   `WxH`         → fixed grid, e.g. `640x360`
-        //   `<factor>`    → scale of the window, e.g. `0.5`
-        let render_res = parse_render_res();
-        renderer.set_render_resolution(render_res);
-        // RP.1 — supersampling factor (anti-aliases the retro grid). Default 1
-        // (off); `ROXLAP_SSAA=2` marches 2×2 and box-downfilters. CPU pays the
-        // full N² ray cost, so keep it opt-in.
-        let ssaa = parse_ssaa();
-        renderer.set_ssaa(ssaa);
-        // RP.2 — reduced-palette posterize. `ROXLAP_POSTERIZE=N` quantizes each
-        // channel to N levels; `ROXLAP_DITHER=none|bayer|blue` picks the dither.
-        let posterize = parse_posterize();
-        renderer.set_posterize(posterize);
+        // RP.0/1/2 — apply the render-pipeline settings (seeded from the
+        // `ROXLAP_RENDER_RES`/`SSAA`/`POSTERIZE`/`DITHER` env vars in
+        // `Host::new`, then live-editable from the HUD's "Render pipeline"
+        // panel): fixed logical grid + SSAA + posterize.
+        self.pipe.apply(&mut renderer);
         let (lw, lh) = renderer.logical_dims();
         let (rw, rh) = renderer.render_dims();
         eprintln!(
-            "roxlap-render: render resolution {render_res:?} → {lw}×{lh} logical, ssaa {ssaa} → {rw}×{rh} march; posterize {posterize:?}"
+            "roxlap-render: render resolution {:?} → {lw}×{lh} logical, ssaa {} → {rw}×{rh} march; posterize {:?}",
+            self.pipe.resolution(),
+            self.pipe.ssaa,
+            self.pipe.posterize()
         );
 
         self.title_base = if let Some(info) = renderer.adapter_info() {
@@ -629,6 +708,76 @@ fn hud_panel(
                 ui.separator();
                 ui.label("F1: HUD");
             });
+        });
+}
+
+/// RP.3 — the live render-pipeline panel (top-right). Mutates `p` in place;
+/// the caller diffs it against the previous state and pushes any change to the
+/// renderer. `logical`/`march` are shown for orientation.
+fn pipeline_panel(
+    ctx: &egui::Context,
+    p: &mut PipelineUi,
+    logical: (u32, u32),
+    march: (u32, u32),
+) {
+    egui::Window::new("Render pipeline")
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+        .default_open(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(format!(
+                "logical {}×{}  ·  march {}×{}",
+                logical.0, logical.1, march.0, march.1
+            ));
+            ui.separator();
+
+            ui.label("Resolution (RP.0)");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut p.res_mode, ResMode::Native, "Native");
+                ui.radio_value(&mut p.res_mode, ResMode::Fixed, "Fixed");
+                ui.radio_value(&mut p.res_mode, ResMode::Scale, "Scale");
+            });
+            match p.res_mode {
+                ResMode::Fixed => {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut p.fixed_w)
+                                .range(64..=4096)
+                                .prefix("w "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut p.fixed_h)
+                                .range(64..=4096)
+                                .prefix("h "),
+                        );
+                    });
+                }
+                ResMode::Scale => {
+                    ui.add(egui::Slider::new(&mut p.scale, 0.1..=1.0).text("scale"));
+                }
+                ResMode::Native => {}
+            }
+            ui.separator();
+
+            ui.label("SSAA (RP.1)");
+            ui.add(egui::Slider::new(&mut p.ssaa, 1..=4).text("×N² rays"));
+            ui.separator();
+
+            ui.checkbox(&mut p.posterize_on, "Posterize (RP.2)");
+            if p.posterize_on {
+                ui.add(egui::Slider::new(&mut p.levels, 2..=16).text("levels/ch"));
+                egui::ComboBox::from_label("dither")
+                    .selected_text(match p.dither {
+                        DitherMode::None => "none",
+                        DitherMode::Bayer4x4 => "bayer 4×4",
+                        DitherMode::BlueNoise => "blue noise",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut p.dither, DitherMode::None, "none");
+                        ui.selectable_value(&mut p.dither, DitherMode::Bayer4x4, "bayer 4×4");
+                        ui.selectable_value(&mut p.dither, DitherMode::BlueNoise, "blue noise");
+                    });
+            }
         });
 }
 
