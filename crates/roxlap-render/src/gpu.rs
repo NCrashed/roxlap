@@ -429,6 +429,21 @@ impl GpuBackend {
         self.transforms_dirty = true;
     }
 
+    /// Set dynamic instance `idx`'s lighting mode live (BB.2b), preserving its
+    /// other flag bits. Rides the coalesced transform flush (the per-instance
+    /// `flags` are re-uploaded with it). No-op if out of range.
+    pub(crate) fn set_dyn_instance_lighting(&mut self, idx: usize, mode: crate::BillboardLighting) {
+        if idx >= self.dyn_count {
+            return;
+        }
+        let gpu_index = (self.sprite_instances.len() - self.dyn_count) + idx;
+        if let Some(b) = self.sprite_basis.get_mut(gpu_index) {
+            crate::apply_lighting_flags(&mut b.flags, mode);
+        }
+        crate::apply_lighting_flags(&mut self.sprite_instances[gpu_index].flags, mode);
+        self.transforms_dirty = true;
+    }
+
     /// Register a new sprite model incrementally (its full LOD chain),
     /// returning its positional host index (== registry chain id). Lazily
     /// creates the registry + resident if none exists yet, so this works

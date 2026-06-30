@@ -611,6 +611,26 @@ pub enum BillboardMode {
     Spherical,
 }
 
+/// How a sprite/billboard instance derives its **shading normal** (BB.2b) —
+/// a per-instance choice that rides the sprite `flags`. A camera-facing
+/// billboard's DDA face normal tracks the camera, so its `N·L` would shift as
+/// you orbit; `WorldUp` / `AmbientOnly` tame that. Only affects the dynamic
+/// lighting path (a disabled rig is unaffected). Set via
+/// [`set_sprite_instance_lighting`](SceneRenderer::set_sprite_instance_lighting)
+/// or [`BillboardActorDef::lighting`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BillboardLighting {
+    /// The DDA hit-face normal — today's DL.7 look (default).
+    #[default]
+    FaceNormal,
+    /// A fixed world-up normal: stable directional shading regardless of the
+    /// camera angle.
+    WorldUp,
+    /// Ambient only — no sun / point-light direct term, the flattest,
+    /// most Doom-faithful cutout look.
+    AmbientOnly,
+}
+
 /// One camera-facing billboard instance (BB.2): the clip/sprite instance it
 /// drives, its world position, and how it orients.
 struct BillboardRec {
@@ -689,6 +709,19 @@ pub(crate) fn apply_shadow_flags(flags: &mut u32, casts: bool, receives: bool) {
     }
 }
 
+/// Apply a [`BillboardLighting`] mode to a sprite `flags` word in place
+/// (BB.2b bits 6/7), preserving the other bits. Shared by both backends'
+/// per-instance lighting setters.
+pub(crate) fn apply_lighting_flags(flags: &mut u32, mode: BillboardLighting) {
+    use roxlap_formats::sprite::{SPRITE_FLAG_LIGHT_AMBIENT_ONLY, SPRITE_FLAG_LIGHT_WORLD_UP};
+    *flags &= !(SPRITE_FLAG_LIGHT_WORLD_UP | SPRITE_FLAG_LIGHT_AMBIENT_ONLY);
+    match mode {
+        BillboardLighting::FaceNormal => {}
+        BillboardLighting::WorldUp => *flags |= SPRITE_FLAG_LIGHT_WORLD_UP,
+        BillboardLighting::AmbientOnly => *flags |= SPRITE_FLAG_LIGHT_AMBIENT_ONLY,
+    }
+}
+
 // ---- billboard actors (BB.4) --------------------------------------------
 
 /// Stable handle to a [`BillboardActor`](SceneRenderer::add_billboard_actor)
@@ -719,6 +752,8 @@ pub struct BillboardActorDef {
     pub states: Vec<ActorState>,
     /// How the slab turns to face the camera (default [`BillboardMode::Cylindrical`]).
     pub mode: BillboardMode,
+    /// Shading-normal mode (BB.2b; default [`BillboardLighting::FaceNormal`]).
+    pub lighting: BillboardLighting,
     /// Playback rate of the state animation, Q8 (256 = 1×).
     pub speed_q8: i32,
     pub casts_shadow: bool,
@@ -730,6 +765,7 @@ impl Default for BillboardActorDef {
         Self {
             states: Vec::new(),
             mode: BillboardMode::Cylindrical,
+            lighting: BillboardLighting::FaceNormal,
             speed_q8: 256,
             casts_shadow: true,
             receives_shadow: true,
@@ -2123,6 +2159,21 @@ impl SceneRenderer {
         }
     }
 
+    /// Set a sprite/clip instance's **lighting mode** live (BB.2b): how its
+    /// shading normal is derived ([`BillboardLighting`]). Useful for
+    /// camera-facing billboards whose face normal would otherwise track the
+    /// camera. Other flag bits are preserved; only affects the dynamic
+    /// lighting path. No-op on a stale id.
+    pub fn set_sprite_instance_lighting(&mut self, id: SpriteInstanceId, mode: BillboardLighting) {
+        let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+            return;
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_dyn_instance_lighting(dyn_index as usize, mode),
+            BackendImpl::Gpu(g) => g.set_dyn_instance_lighting(dyn_index as usize, mode),
+        }
+    }
+
     // ---- animated voxel clips (VCL.4) ------------------------------------
 
     /// Register an animated voxel clip ("GIF/MP4 for voxels"): decode all
@@ -2406,6 +2457,7 @@ impl SceneRenderer {
             return stale; // stale initial clip
         }
         self.set_sprite_instance_shadow_flags(inst, def.casts_shadow, def.receives_shadow);
+        self.set_sprite_instance_lighting(inst, def.lighting);
         let clock = self.clock_for_clip(Some(init_clip), def.speed_q8);
         let actor = BillboardActor {
             inst,
@@ -3688,6 +3740,27 @@ mod tests {
         apply_shadow_flags(&mut f, false, false); // neither
         assert_ne!(f & SPRITE_FLAG_NO_SHADOW_CAST, 0);
         assert_ne!(f & SPRITE_FLAG_NO_SHADOW_RECEIVE, 0);
+        assert_eq!(f & other, other, "unrelated bit preserved throughout");
+    }
+
+    #[test]
+    fn apply_lighting_flags_sets_exclusive_mode_and_preserves_others() {
+        use roxlap_formats::sprite::{
+            SPRITE_FLAG_LIGHT_AMBIENT_ONLY, SPRITE_FLAG_LIGHT_WORLD_UP, SPRITE_FLAG_NO_SHADOW_CAST,
+        };
+        let other = SPRITE_FLAG_NO_SHADOW_CAST; // a shadow bit must survive
+        let mut f = other;
+        apply_lighting_flags(&mut f, BillboardLighting::WorldUp);
+        assert_ne!(f & SPRITE_FLAG_LIGHT_WORLD_UP, 0);
+        assert_eq!(f & SPRITE_FLAG_LIGHT_AMBIENT_ONLY, 0);
+        apply_lighting_flags(&mut f, BillboardLighting::AmbientOnly);
+        assert_eq!(f & SPRITE_FLAG_LIGHT_WORLD_UP, 0, "modes are exclusive");
+        assert_ne!(f & SPRITE_FLAG_LIGHT_AMBIENT_ONLY, 0);
+        apply_lighting_flags(&mut f, BillboardLighting::FaceNormal);
+        assert_eq!(
+            f & (SPRITE_FLAG_LIGHT_WORLD_UP | SPRITE_FLAG_LIGHT_AMBIENT_ONLY),
+            0
+        );
         assert_eq!(f & other, other, "unrelated bit preserved throughout");
     }
 

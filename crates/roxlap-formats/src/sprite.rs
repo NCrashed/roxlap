@@ -48,6 +48,19 @@ pub const SPRITE_FLAG_NO_SHADOW_CAST: u32 = 1 << 4;
 /// out (e.g. a glowing effect that shouldn't be shadowed).
 pub const SPRITE_FLAG_NO_SHADOW_RECEIVE: u32 = 1 << 5;
 
+/// roxlap extension (BB.2b), bit 6: light this sprite with a fixed **world-up**
+/// surface normal instead of the DDA hit-face normal — stable directional
+/// shading for a camera-facing billboard (whose face normal would otherwise
+/// track the camera). Clear ⇒ the face normal (default). Ignored if
+/// [`SPRITE_FLAG_LIGHT_AMBIENT_ONLY`] is also set.
+pub const SPRITE_FLAG_LIGHT_WORLD_UP: u32 = 1 << 6;
+/// roxlap extension (BB.2b), bit 7: light this sprite with **ambient only**
+/// (no sun / point-light direct term) — the flattest, most Doom-faithful
+/// billboard look (a flat cutout that ignores the light direction). Clear ⇒
+/// direct lighting applies. Takes precedence over
+/// [`SPRITE_FLAG_LIGHT_WORLD_UP`].
+pub const SPRITE_FLAG_LIGHT_AMBIENT_ONLY: u32 = 1 << 7;
+
 /// The neutral (no-op) value for [`Sprite::tint`] — white, so every channel
 /// multiplies by 1.0.
 pub const NO_TINT: u32 = 0x00FF_FFFF;

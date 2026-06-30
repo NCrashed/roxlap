@@ -597,6 +597,14 @@ impl CpuBackend {
         }
     }
 
+    /// Set dynamic instance `idx`'s lighting mode live (BB.2b), preserving its
+    /// other flag bits. No-op if `idx` is out of range.
+    pub(crate) fn set_dyn_instance_lighting(&mut self, idx: usize, mode: crate::BillboardLighting) {
+        if let Some(s) = self.dyn_sprites.get_mut(idx) {
+            crate::apply_lighting_flags(&mut s.flags, mode);
+        }
+    }
+
     /// Register a new model template (axis-aligned, kv6 cloned once) and
     /// return its positional index. The streaming-in counterpart to
     /// [`Self::add_dyn_instance_posed`] for unique generated geometry.

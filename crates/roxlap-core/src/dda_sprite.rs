@@ -21,7 +21,10 @@
 
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::material::{material_for_color, BlendMode, MaterialTable};
-use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_INVISIBLE, SPRITE_FLAG_NO_Z};
+use roxlap_formats::sprite::{
+    Sprite, SPRITE_FLAG_INVISIBLE, SPRITE_FLAG_LIGHT_AMBIENT_ONLY, SPRITE_FLAG_LIGHT_WORLD_UP,
+    SPRITE_FLAG_NO_Z,
+};
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 
 use crate::camera_math::CameraState;
@@ -508,6 +511,64 @@ fn f32_to_rgb(c: [f32; 3]) -> u32 {
     0x8000_0000 | (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2])
 }
 
+/// roxlap world up — voxlap z-down, so up is `-z`. Used by
+/// [`SpriteLightMode::WorldUp`] as a fixed shading normal.
+const SPRITE_WORLD_UP: [f32; 3] = [0.0, 0.0, -1.0];
+
+/// Per-instance billboard lighting mode (BB.2b), decoded from the sprite
+/// `flags` (bits 6/7). Controls the surface normal / direct-light handling at
+/// the sprite shade site so a camera-facing billboard needn't suffer the
+/// camera-dependent N·L of its (camera-tracking) face normal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SpriteLightMode {
+    /// The DDA hit-face normal (default; today's DL.7 look).
+    FaceNormal,
+    /// A fixed world-up normal (stable directional shading).
+    WorldUp,
+    /// Ambient only — no sun / point-light direct term (flat cutout).
+    AmbientOnly,
+}
+
+impl SpriteLightMode {
+    #[must_use]
+    pub fn from_flags(flags: u32) -> Self {
+        if flags & SPRITE_FLAG_LIGHT_AMBIENT_ONLY != 0 {
+            Self::AmbientOnly
+        } else if flags & SPRITE_FLAG_LIGHT_WORLD_UP != 0 {
+            Self::WorldUp
+        } else {
+            Self::FaceNormal
+        }
+    }
+}
+
+/// Shade a sprite voxel under a [`SpriteLightMode`] (BB.2b): `FaceNormal` is
+/// the plain [`shade_dynamic`]; `WorldUp` swaps in a fixed world-up normal;
+/// `AmbientOnly` drops the sun + point lights (and stylization) for a flat
+/// ambient term. Shared by both sprite shade sites (opaque + translucent).
+fn shade_dynamic_mode(
+    mode: SpriteLightMode,
+    albedo: [f32; 3],
+    n_world: [f32; 3],
+    center: [f32; 3],
+    lights: &CpuLights<'_>,
+    tester: Option<&mut dyn ShadowTester>,
+) -> u32 {
+    match mode {
+        SpriteLightMode::FaceNormal => shade_dynamic(albedo, 1.0, n_world, center, lights, tester),
+        SpriteLightMode::WorldUp => {
+            shade_dynamic(albedo, 1.0, SPRITE_WORLD_UP, center, lights, tester)
+        }
+        SpriteLightMode::AmbientOnly => {
+            let mut amb = *lights;
+            amb.sun = false;
+            amb.points = &[];
+            amb.bands = 0; // smooth ambient (no cel ramp toward shadow_tint)
+            shade_dynamic(albedo, 1.0, n_world, center, &amb, None)
+        }
+    }
+}
+
 /// Cast one ray (in sprite-local voxel space) accumulating translucent
 /// voxels front-to-back until an opaque voxel, transmittance exhaustion, or
 /// the `max_t` cutoff (the terrain depth, so the march stops at geometry it
@@ -529,6 +590,7 @@ fn cast_local_layers(
     h: [f32; 3],
     f: [f32; 3],
     pos: [f32; 3],
+    light_mode: SpriteLightMode,
 ) -> Option<LayerAccum> {
     #[allow(clippy::cast_precision_loss)]
     let hi = [
@@ -614,7 +676,7 @@ fn cast_local_layers(
         ];
         let t = tester.as_mut().map(|t| t as &mut dyn ShadowTester);
         tint_packed(
-            shade_dynamic(albedo, 1.0, n_world, center, &lights, t),
+            shade_dynamic_mode(light_mode, albedo, n_world, center, &lights, t),
             tint,
         )
     };
@@ -871,6 +933,8 @@ pub fn draw_sprite_dense_shaded(
     };
     let pivot = dense.pivot;
     let no_z = flags & SPRITE_FLAG_NO_Z != 0;
+    // BB.2b — per-instance billboard lighting mode (flags bits 6/7).
+    let light_mode = SpriteLightMode::from_flags(flags);
 
     // Screen bounding box from the 8 corners of the local voxel box.
     let Some(rect) = project_screen_rect(dense, pos, s, h, f, cam, settings, width, height) else {
@@ -926,6 +990,7 @@ pub fn draw_sprite_dense_shaded(
                     h,
                     f,
                     pos,
+                    light_mode,
                 ) else {
                     continue;
                 };
@@ -1010,7 +1075,7 @@ pub fn draw_sprite_dense_shaded(
                         ctx: WorldShadowCtx::identity(occ),
                     });
                     let tester = ws.as_mut().map(|t| t as &mut dyn ShadowTester);
-                    shade_dynamic(albedo, 1.0, n_world, center, &dl, tester)
+                    shade_dynamic_mode(light_mode, albedo, n_world, center, &dl, tester)
                 } else {
                     shade(color, 0)
                 };
@@ -1274,6 +1339,73 @@ mod tests {
     use crate::Camera;
     use roxlap_formats::kv6::Kv6;
     use roxlap_formats::material::{Material, MaterialTable};
+
+    /// BB.2b — `WorldUp` lights a side-facing billboard as if it faced world
+    /// up (the sun directly overhead); `AmbientOnly` drops the sun term.
+    #[test]
+    fn sprite_light_mode_world_up_and_ambient_only() {
+        let lights = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_dir: [0.0, 0.0, -1.0], // toward the sun (world up, z-down)
+            sun_color: [1.0, 1.0, 1.0],
+            sun_intensity: 1.0,
+            sun_casts_shadow: false,
+            points: &[],
+            ambient: [0.2, 0.2, 0.2],
+            bands: 0,
+            shadow_tint: [0.0; 3],
+            shadow_strength: 0.0,
+            shadow_bias: 0.0,
+            shadow_max_dist: 0.0,
+        };
+        let a = [1.0, 1.0, 1.0];
+        let c = [0.0, 0.0, 0.0];
+        let g = |packed: u32| (packed >> 8) & 0xff; // green channel
+        let up_n = [0.0, 0.0, -1.0];
+        let side_n = [1.0, 0.0, 0.0];
+        let face_up = g(shade_dynamic_mode(
+            SpriteLightMode::FaceNormal,
+            a,
+            up_n,
+            c,
+            &lights,
+            None,
+        ));
+        let face_side = g(shade_dynamic_mode(
+            SpriteLightMode::FaceNormal,
+            a,
+            side_n,
+            c,
+            &lights,
+            None,
+        ));
+        let amb = g(shade_dynamic_mode(
+            SpriteLightMode::AmbientOnly,
+            a,
+            up_n,
+            c,
+            &lights,
+            None,
+        ));
+        let world_up = g(shade_dynamic_mode(
+            SpriteLightMode::WorldUp,
+            a,
+            side_n,
+            c,
+            &lights,
+            None,
+        ));
+        assert!(
+            face_up > face_side,
+            "a sun-facing face is brighter than a side face"
+        );
+        assert!(amb < face_up, "ambient-only drops the sun term");
+        assert_eq!(
+            world_up, face_up,
+            "world-up shades a side-facing billboard as if it faced up"
+        );
+    }
 
     /// DL.7 — `cast_local` reports the hit's model-local face normal (used to
     /// light sprites/clips). A ray crossing air then a solid block via the

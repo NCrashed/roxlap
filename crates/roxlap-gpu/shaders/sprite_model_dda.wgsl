@@ -246,6 +246,11 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
         f32((packed >> 8u) & 0xffu),
         f32(packed & 0xffu),
     ) / 255.0;
+    // BB.2b — per-instance billboard lighting mode (flags bits 6/7).
+    // Ambient-only (bit7): a flat cutout that ignores the light direction.
+    if ((inst.flags & 128u) != 0u) {
+        return albedo * u.ambient_color.rgb;
+    }
     // Surface normal from the DDA hit FACE (model-local), rotated to world.
     // `inv` is the world→model rotation (columns); model→world = its
     // transpose. The face normal is robust (no dependence on the model's
@@ -253,7 +258,12 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
     // matches the terrain + CPU paths — flat per voxel-face (the retro look).
     let inv = mat3x3<f32>(inst.inv_rot0.xyz, inst.inv_rot1.xyz, inst.inv_rot2.xyz);
     let m2w = transpose(inv);
-    let n_world = m2w * n_model;
+    var n_world = m2w * n_model;
+    // World-up (bit6): a fixed normal so a camera-facing billboard's shading
+    // doesn't track the camera as it orbits.
+    if ((inst.flags & 64u) != 0u) {
+        n_world = vec3<f32>(0.0, 0.0, -1.0);
+    }
     let styled = u.style_bands > 0u;
 
     // Sample point for point lights: world voxel centre (flat per voxel) when

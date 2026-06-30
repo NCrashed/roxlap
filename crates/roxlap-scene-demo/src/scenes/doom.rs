@@ -16,16 +16,17 @@
 //! - A **1-directional animated billboard actor** — a flickering flame that
 //!   does not cast a shadow (per-actor `casts_shadow = false`, BB.3).
 //! - A **standalone billboard** (BB.2) — a static signpost oriented by
-//!   `face_billboards_to`.
+//!   `face_billboards_to`, whose **lighting mode** (BB.2b: `FaceNormal` /
+//!   `WorldUp` / `AmbientOnly`) cycles with `L` (the flame uses `AmbientOnly`).
 //!
 //! Controls: WASD+mouse fly · `Q`/`E` turn the monster · `Space` walk/idle ·
-//! `K` toggle sun shadows.
+//! `K` toggle sun shadows · `L` cycle the signpost's lighting mode.
 
 use glam::{DVec3, IVec3};
 use roxlap_render::{
     gif_import::{voxel_clip_from_gif, GifImportOpts},
-    ActorState, BillboardActorDef, BillboardActorId, BillboardMode, DirectionalLight, LightRig,
-    SpriteInstanceId, VoxelClipId,
+    ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode,
+    DirectionalLight, LightRig, SpriteInstanceId, VoxelClipId,
 };
 use roxlap_scene::{GridTransform, Scene};
 use winit::keyboard::KeyCode;
@@ -58,6 +59,8 @@ pub struct DoomScene {
     monster_yaw: f64,
     walking: bool,
     standalone: Option<SpriteInstanceId>,
+    /// BB.2b — the standalone billboard's lighting mode, cycled by `L`.
+    standalone_light: BillboardLighting,
 }
 
 impl DoomScene {
@@ -72,6 +75,7 @@ impl DoomScene {
             monster_yaw: -std::f64::consts::FRAC_PI_2, // face the start camera
             walking: true,
             standalone: None,
+            standalone_light: BillboardLighting::FaceNormal,
         }
     }
 
@@ -134,7 +138,7 @@ impl DemoScene for DoomScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD fly · Q/E turn monster · Space walk/idle · K sun shadows"
+        "WASD fly · Q/E turn monster · Space walk/idle · K sun shadows · L signpost lighting"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -173,6 +177,7 @@ impl DemoScene for DoomScene {
                 },
             ],
             mode: BillboardMode::Cylindrical,
+            lighting: BillboardLighting::FaceNormal,
             speed_q8: 256,
             casts_shadow: true,
             receives_shadow: true,
@@ -193,6 +198,8 @@ impl DemoScene for DoomScene {
                 dirs: vec![flame],
             }],
             mode: BillboardMode::Cylindrical,
+            // A flat glow reads best lit by ambient only (it ignores the sun).
+            lighting: BillboardLighting::AmbientOnly,
             speed_q8: 256,
             casts_shadow: false,
             receives_shadow: false,
@@ -252,6 +259,19 @@ impl DemoScene for DoomScene {
                 ctx.renderer
                     .set_actor_state(monster, if self.walking { "walk" } else { "idle" });
             }
+            KeyCode::KeyL => {
+                // BB.2b — cycle the standalone billboard's shading-normal mode.
+                self.standalone_light = match self.standalone_light {
+                    BillboardLighting::FaceNormal => BillboardLighting::WorldUp,
+                    BillboardLighting::WorldUp => BillboardLighting::AmbientOnly,
+                    BillboardLighting::AmbientOnly => BillboardLighting::FaceNormal,
+                };
+                if let Some(s) = self.standalone {
+                    ctx.renderer
+                        .set_sprite_instance_lighting(s, self.standalone_light);
+                }
+                eprintln!("signpost lighting = {:?}", self.standalone_light);
+            }
             _ => {}
         }
     }
@@ -287,6 +307,7 @@ impl DemoScene for DoomScene {
                 if self.sun_shadows { "on" } else { "off" },
             ),
             "GIF billboards: import → flat voxel slab, cast + receive shadows".to_string(),
+            format!("signpost lighting: {:?} (L)", self.standalone_light),
         ]
     }
 }
