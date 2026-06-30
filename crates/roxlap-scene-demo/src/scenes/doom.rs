@@ -62,6 +62,9 @@ pub struct DoomScene {
     standalone: Option<SpriteInstanceId>,
     /// BB.2b — the standalone billboard's lighting mode, cycled by `L`.
     standalone_light: BillboardLighting,
+    /// BB.2b — the monster actor's lighting mode, cycled by `O` (dogfoods
+    /// the runtime `set_actor_lighting`).
+    monster_light: BillboardLighting,
 }
 
 impl DoomScene {
@@ -77,6 +80,7 @@ impl DoomScene {
             walking: true,
             standalone: None,
             standalone_light: BillboardLighting::FaceNormal,
+            monster_light: BillboardLighting::FaceNormal,
         }
     }
 
@@ -139,7 +143,7 @@ impl DemoScene for DoomScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD fly · Q/E turn monster · Space walk/idle · K sun shadows · L signpost lighting"
+        "WASD fly · Q/E turn monster · Space walk/idle · K sun shadows · L signpost light · O monster light"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -262,18 +266,19 @@ impl DemoScene for DoomScene {
                     .set_actor_state(monster, if self.walking { "walk" } else { "idle" });
             }
             KeyCode::KeyL => {
-                // BB.2b — cycle the standalone billboard's shading-normal mode.
-                self.standalone_light = match self.standalone_light {
-                    BillboardLighting::FaceNormal => BillboardLighting::WorldUp,
-                    BillboardLighting::WorldUp => BillboardLighting::AmbientOnly,
-                    BillboardLighting::AmbientOnly => BillboardLighting::FullBright,
-                    BillboardLighting::FullBright => BillboardLighting::FaceNormal,
-                };
+                // BB.2b — cycle the standalone billboard's lighting mode.
+                self.standalone_light = cycle_lighting(self.standalone_light);
                 if let Some(s) = self.standalone {
                     ctx.renderer
                         .set_sprite_instance_lighting(s, self.standalone_light);
                 }
                 eprintln!("signpost lighting = {:?}", self.standalone_light);
+            }
+            KeyCode::KeyO => {
+                // BB.2b — cycle the monster actor's lighting via set_actor_lighting.
+                self.monster_light = cycle_lighting(self.monster_light);
+                ctx.renderer.set_actor_lighting(monster, self.monster_light);
+                eprintln!("monster lighting = {:?}", self.monster_light);
             }
             _ => {}
         }
@@ -310,8 +315,22 @@ impl DemoScene for DoomScene {
                 if self.sun_shadows { "on" } else { "off" },
             ),
             "GIF billboards: import → flat voxel slab, cast + receive shadows".to_string(),
-            format!("signpost lighting: {:?} (L)", self.standalone_light),
+            format!(
+                "lighting — signpost {:?} (L) · monster {:?} (O)",
+                self.standalone_light, self.monster_light
+            ),
         ]
+    }
+}
+
+/// Cycle a [`BillboardLighting`] mode FaceNormal → WorldUp → AmbientOnly →
+/// FullBright → … (BB.2b demo toggles).
+fn cycle_lighting(m: BillboardLighting) -> BillboardLighting {
+    match m {
+        BillboardLighting::FaceNormal => BillboardLighting::WorldUp,
+        BillboardLighting::WorldUp => BillboardLighting::AmbientOnly,
+        BillboardLighting::AmbientOnly => BillboardLighting::FullBright,
+        BillboardLighting::FullBright => BillboardLighting::FaceNormal,
     }
 }
 

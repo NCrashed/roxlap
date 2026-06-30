@@ -68,6 +68,9 @@ hud = ["dep:egui", "roxlap-gpu/hud"]
 # BB — re-export the animated-GIF → VoxelClip importer (`gif_import`) for
 # Doom-style billboard sprites; forwards to roxlap-formats' `gif` feature.
 gif = ["roxlap-formats/gif"]
+# BB — re-export the PNG-sequence / APNG importer (`png_import`); forwards to
+# roxlap-formats' `png` feature.
+png = ["roxlap-formats/png"]
 
 [dev-dependencies]
 # Doctests/examples construct a winit window to drive the facade; the

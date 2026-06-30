@@ -54,6 +54,10 @@ pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 /// (stage BB). Behind the `gif` feature; see `PORTING-BILLBOARD.md`.
 #[cfg(feature = "gif")]
 pub use roxlap_formats::gif_import;
+/// PNG-sequence / APNG → [`VoxelClip`] importer (stage BB). Behind the `png`
+/// feature; see `PORTING-BILLBOARD.md`.
+#[cfg(feature = "png")]
+pub use roxlap_formats::png_import;
 pub use roxlap_formats::kfa::KfaSprite;
 pub use roxlap_formats::kv6::Kv6;
 pub use roxlap_formats::material::{BlendMode, Material};
@@ -2519,6 +2523,21 @@ impl SceneRenderer {
             a.pos = pos;
             a.facing_yaw = facing_yaw;
         }
+    }
+
+    /// Change an actor's lighting mode at runtime (BB.2b) — the per-actor
+    /// counterpart to [`BillboardActorDef::lighting`], routed to its clip
+    /// instance via [`set_sprite_instance_lighting`](Self::set_sprite_instance_lighting).
+    /// Returns `false` on a stale id.
+    pub fn set_actor_lighting(&mut self, id: BillboardActorId, mode: BillboardLighting) -> bool {
+        let Some(idx) = self.actor_map.index(id) else {
+            return false;
+        };
+        let Some(inst) = self.billboard_actors[idx].as_ref().map(|a| a.inst) else {
+            return false;
+        };
+        self.set_sprite_instance_lighting(inst, mode);
+        true
     }
 
     /// Remove an actor and its clip instance. Returns `false` on a stale id.
