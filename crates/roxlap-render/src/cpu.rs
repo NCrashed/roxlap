@@ -293,11 +293,22 @@ pub(crate) struct CpuBackend {
     /// display/window handles so the backend stays generic-free over
     /// the host's windowing library.
     present_target: Presenter,
-    /// Current framebuffer size in physical pixels. Seeded at
+    /// Current **window** (native) size in physical pixels. Seeded at
     /// construction, updated by [`Self::resize`] — replaces the old
     /// per-frame `window.inner_size()` poll so the backend never
-    /// touches a concrete window type.
+    /// touches a concrete window type. The scene marches at
+    /// [`Self::logical_dims`] (≤ this under a fixed [`RenderResolution`])
+    /// and is nearest-upscaled to this size at present (RP.0).
     current_dims: (u32, u32),
+    /// RP.0 — logical render resolution policy. `Native` ⇒ logical == window
+    /// (byte-identical to pre-RP). A `Fixed`/`Scale` value decouples the
+    /// marched pixel count from the window size.
+    render_res: crate::RenderResolution,
+    /// RP.0 — native-size scratch buffer the logical [`Self::framebuffer`] is
+    /// nearest-upscaled into before present, in the non-`Native` path. The
+    /// egui overlay rasterises here (at native res) so the HUD stays crisp.
+    /// Empty in the `Native` path (which presents `framebuffer` directly).
+    output: Vec<u32>,
     zbuffer: Vec<f32>,
     /// Framebuffer dimensions of the last `render` — the `zbuffer`
     /// stride for [`Self::pick_depth`].
@@ -386,6 +397,8 @@ impl CpuBackend {
         Self {
             present_target,
             current_dims: (w, h),
+            render_res: crate::RenderResolution::Native,
+            output: Vec::new(),
             zbuffer,
             last_dims: (w, h),
             last_hxyz: (0.0, 0.0, 0.0),
@@ -478,27 +491,56 @@ impl CpuBackend {
         if hz <= 0.0 {
             return None;
         }
+        // RP.0 — `(x, y)` are window pixels; the projection (`hx,hy,hz`) was
+        // derived at the logical size, so map window → logical first.
+        let (lx, ly) = self.window_to_logical_f(x, y);
         Some(setcamera_pixel_ray(
             camera.right,
             camera.down,
             camera.forward,
-            x,
-            y,
+            lx,
+            ly,
             hx,
             hy,
             hz,
         ))
     }
 
-    /// World-t depth at pixel `(x, y)` from the last frame's z-buffer
+    /// Map a window (native) pixel coordinate to the logical render-target
+    /// coordinate the last frame marched at. Identity under `Native`.
+    fn window_to_logical_f(&self, x: f64, y: f64) -> (f64, f64) {
+        let (lw, lh) = self.last_dims;
+        let (nw, nh) = self.current_dims;
+        if nw == 0 || nh == 0 || (lw, lh) == (nw, nh) {
+            return (x, y);
+        }
+        (
+            x * f64::from(lw) / f64::from(nw),
+            y * f64::from(lh) / f64::from(nh),
+        )
+    }
+
+    /// World-t depth at window pixel `(x, y)` from the last frame's z-buffer
     /// (already in CPU memory — no readback). `None` for out-of-bounds
     /// or sky (`+INF`). See [`SceneRenderer::pick_depth`].
     pub(crate) fn pick_depth(&self, x: u32, y: u32) -> Option<f32> {
-        let (w, h) = self.last_dims;
-        if x >= w || y >= h {
+        let (lw, lh) = self.last_dims;
+        let (nw, nh) = self.current_dims;
+        // Map the window pixel to the logical z-buffer grid (RP.0).
+        let (lx, ly) = if (lw, lh) == (nw, nh) {
+            (x, y)
+        } else if nw == 0 || nh == 0 {
+            return None;
+        } else {
+            (
+                (x * lw / nw).min(lw.saturating_sub(1)),
+                (y * lh / nh).min(lh.saturating_sub(1)),
+            )
+        };
+        if lx >= lw || ly >= lh {
             return None;
         }
-        let t = *self.zbuffer.get((y * w + x) as usize)?;
+        let t = *self.zbuffer.get((ly * lw + lx) as usize)?;
         if t.is_finite() {
             Some(t)
         } else {
@@ -845,21 +887,66 @@ impl CpuBackend {
         // softbuffer + the pool resize lazily inside `render`; we just
         // record the new size the host reported (replacing the old
         // per-frame `window.inner_size()` poll). The WebGL2 blitter's
-        // texture, by contrast, must be re-allocated eagerly.
+        // texture, by contrast, must be re-allocated eagerly — to the
+        // **native** size, since the present surface is the window (the
+        // logical→native upscale happens before the blitter sees pixels).
         self.current_dims = (width.max(1), height.max(1));
         #[cfg(target_arch = "wasm32")]
         self.present_target
             .resize(self.current_dims.0, self.current_dims.1);
     }
 
+    /// RP.0 — set the logical render resolution policy.
+    pub(crate) fn set_render_resolution(&mut self, res: crate::RenderResolution) {
+        self.render_res = res;
+    }
+
+    /// RP.0 — the logical size the scene marches at, resolved against the
+    /// current window size.
+    pub(crate) fn logical_dims(&self) -> (u32, u32) {
+        self.render_res.logical_for(self.current_dims)
+    }
+
     pub(crate) fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
-        let (width, height) = self.current_dims;
+        // RP.0 — march at the logical size (≤ window under a fixed
+        // `RenderResolution`); `present`/`paint_egui` nearest-upscale to the
+        // window. `Native` ⇒ logical == window ⇒ pre-RP behaviour verbatim.
+        let (width, height) = self.logical_dims();
         if width == 0 || height == 0 {
             return;
         }
         let pixel_count = (width as usize) * (height as usize);
         self.last_dims = (width, height);
-        self.last_hxyz = (frame.settings.hx, frame.settings.hy, frame.settings.hz);
+
+        // RP.0 — the host builds `OpticastSettings` for the *window*; the
+        // raster extent (`xres`/`yres`) and projection must instead match the
+        // logical render target the framebuffer is sized to, or the compositor
+        // indexes past the (smaller) framebuffer. Rescale: recentre `hx`/`hy`,
+        // scale the focal `hz` by the vertical ratio (preserving the vertical
+        // FOV — the GPU pinhole does the same via `gpu_fov_y_rad`), and march
+        // the full logical frame. Identity when the host already sized to
+        // logical (e.g. `Native`).
+        let settings = {
+            let src = frame.settings;
+            if (src.xres, src.yres) == (width, height) {
+                *src
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let sx = width as f32 / (src.xres.max(1) as f32);
+                #[allow(clippy::cast_precision_loss)]
+                let sy = height as f32 / (src.yres.max(1) as f32);
+                let mut s = *src;
+                s.xres = width;
+                s.yres = height;
+                s.y_start = 0;
+                s.y_end = height;
+                s.hx = src.hx * sx;
+                s.hy = src.hy * sy;
+                s.hz = src.hz * sy;
+                s
+            }
+        };
+        self.last_hxyz = (settings.hx, settings.hy, settings.hz);
 
         // Grow the z-buffer to follow a window resize.
         if self.zbuffer.len() < pixel_count {
@@ -1011,7 +1098,7 @@ impl CpuBackend {
             fog,
             scene,
             camera,
-            frame.settings,
+            &settings,
             frame.sky_color,
             frame.sky,
             Some(&self.materials),
@@ -1028,14 +1115,8 @@ impl CpuBackend {
         // full-frame sky. (`outcome` no longer gates this — a grid scene needs
         // it just as much as an empty one.)
         if let Some(sky) = frame.sky {
-            let cam_state = camera_math::derive(
-                camera,
-                width,
-                height,
-                frame.settings.hx,
-                frame.settings.hy,
-                frame.settings.hz,
-            );
+            let cam_state =
+                camera_math::derive(camera, width, height, settings.hx, settings.hy, settings.hz);
             render_sky_fill(
                 fb,
                 &self.zbuffer[..pixel_count],
@@ -1043,7 +1124,7 @@ impl CpuBackend {
                 width,
                 height,
                 &cam_state,
-                frame.settings,
+                &settings,
                 sky,
             );
         }
@@ -1056,14 +1137,8 @@ impl CpuBackend {
                 || !self.dyn_sprites.is_empty()
                 || !self.kfa_limbs.is_empty())
         {
-            let cam_state = camera_math::derive(
-                camera,
-                width,
-                height,
-                frame.settings.hx,
-                frame.settings.hy,
-                frame.settings.hz,
-            );
+            let cam_state =
+                camera_math::derive(camera, width, height, settings.hx, settings.hy, settings.hz);
             // Global voxel-material palette (TV stage). A sprite whose
             // material is opaque (the default, and all of them until a
             // translucent material is defined) takes the unchanged first-hit
@@ -1112,7 +1187,7 @@ impl CpuBackend {
                     width,
                     height,
                     &cam_state,
-                    frame.settings,
+                    &settings,
                     sprite,
                     Some(shade_of(sprite)),
                 );
@@ -1132,7 +1207,7 @@ impl CpuBackend {
                             width,
                             height,
                             &cam_state,
-                            frame.settings,
+                            &settings,
                             fr,
                             sprite.p,
                             sprite.s,
@@ -1150,7 +1225,7 @@ impl CpuBackend {
                         width,
                         height,
                         &cam_state,
-                        frame.settings,
+                        &settings,
                         sprite,
                         Some(shade),
                     );
@@ -1169,10 +1244,22 @@ impl CpuBackend {
     /// surface and present it. The no-UI counterpart to
     /// [`Self::paint_egui`]; both finish the frame `render` started.
     pub(crate) fn present(&mut self) {
+        // Flip is applied in logical space (the scene framebuffer) before any
+        // upscale, matching the pre-RP order.
         if self.flip_x {
             self.flip_framebuffer();
         }
-        self.blit_and_present(self.last_dims);
+        let logical = self.last_dims;
+        let native = self.current_dims;
+        if logical == native {
+            // Native path — present the logical framebuffer directly
+            // (byte-identical to pre-RP).
+            self.blit_and_present_from(false, native);
+        } else {
+            // Fixed/scaled — nearest-upscale logical → native, then present.
+            self.upscale_framebuffer_to_output(logical, native);
+            self.blit_and_present_from(true, native);
+        }
     }
 
     /// No GPU work in flight on the software backend — teardown is a plain
@@ -1451,41 +1538,94 @@ impl CpuBackend {
         }
     }
 
-    /// Shared tail of `present` / `paint_egui`: copy the framebuffer to
-    /// the window surface at `(width, height)` and present.
+    /// RP.0 — nearest-upscale the logical [`Self::framebuffer`] (`logical`
+    /// dims) into the native-size [`Self::output`] (`native` dims). Each
+    /// native pixel samples the logical texel at `floor(x·lw/nw, y·lh/nh)`
+    /// (hard pixels — the retro look). Only used when `logical != native`.
+    fn upscale_framebuffer_to_output(&mut self, logical: (u32, u32), native: (u32, u32)) {
+        let (lw, lh) = (logical.0 as usize, logical.1 as usize);
+        let (nw, nh) = (native.0 as usize, native.1 as usize);
+        let (npc, lpc) = (nw * nh, lw * lh);
+        if lw == 0 || lh == 0 || nw == 0 || nh == 0 || self.framebuffer.len() < lpc {
+            return;
+        }
+        if self.output.len() < npc {
+            self.output.resize(npc, self.clear_sky);
+        }
+        let Self {
+            framebuffer,
+            output,
+            ..
+        } = self;
+        for y in 0..nh {
+            let sy = (y * lh) / nh;
+            let src_row = sy * lw;
+            let dst_row = y * nw;
+            for x in 0..nw {
+                let sx = (x * lw) / nw;
+                output[dst_row + x] = framebuffer[src_row + sx];
+            }
+        }
+    }
+
+    /// Shared tail of `present` / `paint_egui`: copy the chosen source buffer
+    /// (the native [`Self::output`] when `from_output`, else the logical
+    /// [`Self::framebuffer`]) to the window surface at `(width, height)` and
+    /// present. The destructure gives disjoint borrows of `present_target`
+    /// and the source slice.
     #[cfg(not(target_arch = "wasm32"))]
-    fn blit_and_present(&mut self, dims: (u32, u32)) {
+    fn blit_and_present_from(&mut self, from_output: bool, dims: (u32, u32)) {
         let (width, height) = dims;
         let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
             return;
         };
         let pixel_count = (width as usize) * (height as usize);
-        if self.framebuffer.len() < pixel_count {
+        let Self {
+            present_target,
+            framebuffer,
+            output,
+            ..
+        } = self;
+        let src: &[u32] = if from_output { output } else { framebuffer };
+        if src.len() < pixel_count {
             return;
         }
-        self.present_target
+        present_target
             .resize(w_nz, h_nz)
             .expect("softbuffer: resize");
-        let mut buffer = self
-            .present_target
-            .buffer_mut()
-            .expect("softbuffer: buffer_mut");
-        buffer[..pixel_count].copy_from_slice(&self.framebuffer[..pixel_count]);
+        let mut buffer = present_target.buffer_mut().expect("softbuffer: buffer_mut");
+        buffer[..pixel_count].copy_from_slice(&src[..pixel_count]);
         buffer.present().expect("softbuffer: present");
     }
 
-    /// wasm counterpart: upload the framebuffer to the WebGL2 texture
+    /// wasm counterpart: upload the source buffer to the WebGL2 texture
     /// and draw the fullscreen quad on the canvas.
     #[cfg(target_arch = "wasm32")]
-    fn blit_and_present(&mut self, dims: (u32, u32)) {
+    fn blit_and_present_from(&mut self, from_output: bool, dims: (u32, u32)) {
         let (width, height) = dims;
         let pixel_count = (width as usize) * (height as usize);
-        if width == 0 || height == 0 || self.framebuffer.len() < pixel_count {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let have = if from_output {
+            self.output.len()
+        } else {
+            self.framebuffer.len()
+        };
+        if have < pixel_count {
             return;
         }
         self.present_target.resize(width, height);
-        self.present_target
-            .present(&self.framebuffer[..pixel_count]);
+        // Destructure so `present_target` (mut) and the source buffer
+        // (shared) don't alias through `self`.
+        let Self {
+            present_target,
+            framebuffer,
+            output,
+            ..
+        } = self;
+        let src: &[u32] = if from_output { output } else { framebuffer };
+        present_target.present(&src[..pixel_count]);
     }
 
     /// Software-rasterise the egui `jobs` over the composited
@@ -1498,26 +1638,44 @@ impl CpuBackend {
         textures: &egui::TexturesDelta,
         pixels_per_point: f32,
     ) {
-        let (width, height) = self.last_dims;
-        let pixel_count = (width as usize) * (height as usize);
-        if self.framebuffer.len() < pixel_count {
+        let logical = self.last_dims;
+        let native = self.current_dims;
+        let lpc = (logical.0 as usize) * (logical.1 as usize);
+        if self.framebuffer.len() < lpc {
             return;
         }
-        // Mirror the 3D scene before the UI is drawn over it, so the egui
-        // overlay stays upright.
+        // Mirror the 3D scene (in logical space) before the UI is drawn over
+        // it, so the egui overlay stays upright.
         if self.flip_x {
             self.flip_framebuffer();
         }
         self.egui_raster
             .update_textures(&textures.set, &textures.free);
-        self.egui_raster.paint(
-            &mut self.framebuffer[..pixel_count],
-            width,
-            height,
-            jobs,
-            pixels_per_point,
-        );
-        self.blit_and_present((width, height));
+        if logical == native {
+            // Native path — rasterise egui straight into the framebuffer at
+            // window res (byte-identical to pre-RP), then present it.
+            self.egui_raster.paint(
+                &mut self.framebuffer[..lpc],
+                native.0,
+                native.1,
+                jobs,
+                pixels_per_point,
+            );
+            self.blit_and_present_from(false, native);
+        } else {
+            // Fixed/scaled — upscale the scene first, then rasterise egui into
+            // the native-size output so the HUD stays crisp (RP.0 locked #6).
+            self.upscale_framebuffer_to_output(logical, native);
+            let npc = (native.0 as usize) * (native.1 as usize);
+            self.egui_raster.paint(
+                &mut self.output[..npc],
+                native.0,
+                native.1,
+                jobs,
+                pixels_per_point,
+            );
+            self.blit_and_present_from(true, native);
+        }
     }
 }
 

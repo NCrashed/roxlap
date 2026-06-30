@@ -1267,6 +1267,50 @@ fn resolve_quad(sprite: &ImageSprite, camera: &Camera) -> Option<QuadDraw> {
     })
 }
 
+/// Where the per-pixel raycaster actually runs, decoupled from the window
+/// size (RP.0). Both backends are per-pixel marchers, so frame cost scales
+/// with the pixel count — rendering into a fixed **logical** target and
+/// nearest-upscaling it to the window makes FPS independent of window size
+/// and creates the seam for the later posterize / SSAA post (RP.1/RP.2).
+///
+/// The default ([`Native`](RenderResolution::Native)) keeps `logical == window`
+/// and is **byte-identical** to the pre-RP straight blit.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum RenderResolution {
+    /// Logical resolution == window. Default. Identical to pre-RP behaviour.
+    #[default]
+    Native,
+    /// Fixed logical grid, independent of the window (the retro pixel grid).
+    /// Upscaled to the window with nearest sampling (hard pixels). A logical
+    /// aspect ratio different from the window's stretches non-uniformly — a
+    /// deliberate, classic fixed-res look (no letterbox in RP.0).
+    Fixed { w: u32, h: u32 },
+    /// Logical = `round(window * factor)`. `0.5` ⇒ a quarter of the pixels,
+    /// aspect preserved. Clamped to `>= 1px` per axis.
+    Scale(f32),
+}
+
+impl RenderResolution {
+    /// Resolve to a concrete logical pixel size given the current window
+    /// (native) size. Always `>= 1` per axis.
+    #[must_use]
+    pub(crate) fn logical_for(self, native: (u32, u32)) -> (u32, u32) {
+        let (nw, nh) = (native.0.max(1), native.1.max(1));
+        match self {
+            Self::Native => (nw, nh),
+            Self::Fixed { w, h } => (w.max(1), h.max(1)),
+            Self::Scale(f) => {
+                let s = f.max(1e-3);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let lw = ((nw as f32) * s).round() as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let lh = ((nh as f32) * s).round() as u32;
+                (lw.max(1), lh.max(1))
+            }
+        }
+    }
+}
+
 /// Renderer-internal backend; never exposes wgpu or softbuffer types.
 /// The GPU variant owns the whole wgpu device/queue/pipelines, so
 /// it's boxed to keep the enum small.
@@ -1484,6 +1528,37 @@ impl SceneRenderer {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.resize(width, height),
             BackendImpl::Gpu(g) => g.resize(width, height),
+        }
+    }
+
+    /// Set the logical (fixed) render resolution (RP.0). The scene marches at
+    /// the resolved logical size and is nearest-upscaled to the window, so the
+    /// raycaster's cost — and thus FPS — stops depending on the window size.
+    /// [`RenderResolution::Native`] (the default) keeps `logical == window`
+    /// and is byte-identical to pre-RP rendering. Takes effect from the next
+    /// [`render`](Self::render).
+    pub fn set_render_resolution(&mut self, res: RenderResolution) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_render_resolution(res),
+            BackendImpl::Gpu(g) => g.set_render_resolution(res),
+        }
+    }
+
+    /// The resolution the raycaster actually runs at this frame — the resolved
+    /// logical size (RP.0 has no SSAA yet, so `render_dims == logical_dims`).
+    /// Reflects the most recent window size + [`RenderResolution`].
+    #[must_use]
+    pub fn render_dims(&self) -> (u32, u32) {
+        self.logical_dims()
+    }
+
+    /// The logical (fixed) render-target size resolved against the current
+    /// window size, per the active [`RenderResolution`].
+    #[must_use]
+    pub fn logical_dims(&self) -> (u32, u32) {
+        match &self.inner {
+            BackendImpl::Cpu(c) => c.logical_dims(),
+            BackendImpl::Gpu(g) => g.logical_dims(),
         }
     }
 
@@ -3424,6 +3499,37 @@ impl SceneRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RP.0 — `Native` resolves to the window size verbatim (the byte-identical
+    /// gate), `Fixed` ignores the window, `Scale` scales + clamps, and every
+    /// result is `>= 1` per axis.
+    #[test]
+    fn render_resolution_logical_for() {
+        let win = (1920, 1080);
+        assert_eq!(RenderResolution::Native.logical_for(win), win);
+        assert_eq!(
+            RenderResolution::Fixed { w: 860, h: 520 }.logical_for(win),
+            (860, 520)
+        );
+        // Fixed is independent of the window.
+        assert_eq!(
+            RenderResolution::Fixed { w: 860, h: 520 }.logical_for((640, 480)),
+            (860, 520)
+        );
+        assert_eq!(RenderResolution::Scale(0.5).logical_for(win), (960, 540));
+        // Scale rounds, not truncates: 801 * 0.5 = 400.5 → 401.
+        assert_eq!(
+            RenderResolution::Scale(0.5).logical_for((801, 601)),
+            (401, 301)
+        );
+        // Degenerate inputs never produce a zero axis.
+        assert_eq!(RenderResolution::Scale(0.001).logical_for((1, 1)), (1, 1));
+        assert_eq!(
+            RenderResolution::Fixed { w: 0, h: 0 }.logical_for(win),
+            (1, 1)
+        );
+        assert_eq!(RenderResolution::Native.logical_for((0, 0)), (1, 1));
+    }
 
     /// The handle map must survive the backends' swap-remove indexing:
     /// drive a model `DynInstanceMap` against a `Vec` "backend" that

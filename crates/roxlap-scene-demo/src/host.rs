@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use roxlap_core::Engine;
-use roxlap_render::{Backend, RenderOptions, SceneRenderer, SpriteSet};
+use roxlap_render::{Backend, RenderOptions, RenderResolution, SceneRenderer, SpriteSet};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -28,6 +28,44 @@ use crate::{
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
+
+/// RP.0 default logical render grid (the marcher's fixed pixel grid; the
+/// window upscales onto it). Decouples FPS from window size.
+const RENDER_RES_W: u32 = 860;
+const RENDER_RES_H: u32 = 520;
+
+/// Parse `ROXLAP_RENDER_RES` into a [`RenderResolution`]. Accepts `native`,
+/// `WxH` (e.g. `640x360`), or a bare scale factor (e.g. `0.5`). Anything
+/// unset / unparseable falls back to the fixed [`RENDER_RES_W`]×[`RENDER_RES_H`]
+/// default.
+fn parse_render_res() -> RenderResolution {
+    let default = RenderResolution::Fixed {
+        w: RENDER_RES_W,
+        h: RENDER_RES_H,
+    };
+    let Some(raw) = std::env::var_os("ROXLAP_RENDER_RES") else {
+        return default;
+    };
+    let s = raw.to_string_lossy();
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("native") {
+        return RenderResolution::Native;
+    }
+    if let Some((w, h)) = s.split_once(['x', 'X']) {
+        if let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
+            if w > 0 && h > 0 {
+                return RenderResolution::Fixed { w, h };
+            }
+        }
+    }
+    if let Ok(f) = s.parse::<f32>() {
+        if f > 0.0 {
+            return RenderResolution::Scale(f);
+        }
+    }
+    eprintln!("roxlap-scene-demo: unparseable ROXLAP_RENDER_RES={s:?}; using default");
+    default
+}
 
 /// An empty sprite set — used to reset the renderer's content layers
 /// (static + dynamic + clip + character) when switching scenes.
@@ -346,6 +384,17 @@ impl ApplicationHandler for Host {
         };
         let init = window.inner_size();
         let mut renderer = SceneRenderer::new(window.clone(), (init.width, init.height), &opts);
+
+        // RP.0 — render into a fixed logical grid (nearest-upscaled to the
+        // window) so the marcher's cost — and the FPS — stops tracking the
+        // window size. Default 860×520; override with `ROXLAP_RENDER_RES`:
+        //   `native`      → window resolution (pre-RP behaviour)
+        //   `WxH`         → fixed grid, e.g. `640x360`
+        //   `<factor>`    → scale of the window, e.g. `0.5`
+        let render_res = parse_render_res();
+        renderer.set_render_resolution(render_res);
+        let (rw, rh) = renderer.logical_dims();
+        eprintln!("roxlap-render: render resolution {render_res:?} → {rw}×{rh} logical");
 
         self.title_base = if let Some(info) = renderer.adapter_info() {
             eprintln!("roxlap-render: GPU backend — {info}");

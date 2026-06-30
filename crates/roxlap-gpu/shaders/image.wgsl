@@ -14,6 +14,7 @@
 // the manual depth test against the scene-DDA depth buffer.
 
 struct Params {
+    // Target (swapchain) size — the range of the fragment's `clip.xy`.
     screen_w: u32,
     screen_h: u32,
     depth_bias: f32,
@@ -24,6 +25,12 @@ struct Params {
     // mirrors at read time), but our vertices carry the flipped NDC X, so
     // the fragment must mirror its lookup back to the unflipped column.
     flip_x: u32,
+    // RP.0 — the render (logical) size the depth buffer is stored at. The
+    // fragment scales its swapchain `clip.xy` into this grid. Equal to
+    // `screen_*` under `Native`.
+    depth_w: u32,
+    depth_h: u32,
+    _pad: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -68,14 +75,20 @@ fn vs_main(in: VsIn) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.depth_test > 0.5 && params.no_depth == 0u) {
-        var px = u32(in.clip.x);
+        let px = u32(in.clip.x);
         let py = u32(in.clip.y);
         if (px < params.screen_w && py < params.screen_h) {
+            // Scale the swapchain pixel into the render-grid the depth buffer
+            // is stored at (RP.0; identity under `Native`).
+            var dx = (px * params.depth_w) / params.screen_w;
+            var dy = (py * params.depth_h) / params.screen_h;
+            dx = min(dx, params.depth_w - 1u);
+            dy = min(dy, params.depth_h - 1u);
             // Mirror back to the unflipped column the marcher wrote.
             if (params.flip_x != 0u) {
-                px = params.screen_w - 1u - px;
+                dx = params.depth_w - 1u - dx;
             }
-            let scene_t = bitcast<f32>(depth_buf[py * params.screen_w + px]);
+            let scene_t = bitcast<f32>(depth_buf[dy * params.depth_w + dx]);
             if (in.depth > scene_t + params.depth_bias) {
                 discard;
             }

@@ -887,7 +887,10 @@ impl GpuBackend {
     /// screen→world picking). See [`SceneRenderer::pick_depth`].
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn pick_depth(&self, x: u32, y: u32) -> Option<f32> {
-        self.gpu.read_depth_pixel(x, y)
+        // RP.0 — map the window pixel to the render-target (logical) grid the
+        // depth buffer is stored at.
+        let (rx, ry) = self.window_to_render_u(x, y);
+        self.gpu.read_depth_pixel(rx, ry)
     }
 
     /// wasm: depth picking is deferred on the GPU path — WebGPU has no
@@ -903,12 +906,56 @@ impl GpuBackend {
     /// World-space view ray for pixel `(x, y)` under the GPU marcher's
     /// projection. See [`SceneRenderer::pixel_ray`].
     pub(crate) fn pixel_ray(&self, camera: &Camera, x: f64, y: f64) -> Option<[f64; 3]> {
+        let (rx, ry) = self.window_to_render_f(x, y);
         self.gpu
-            .pixel_ray(camera.right, camera.down, camera.forward, x, y)
+            .pixel_ray(camera.right, camera.down, camera.forward, rx, ry)
+    }
+
+    /// Map a window (native) pixel to the render-target (logical) grid.
+    /// Identity under `RenderResolution::Native`.
+    fn window_to_render_f(&self, x: f64, y: f64) -> (f64, f64) {
+        let (rw, rh) = self.gpu.render_dims();
+        let (nw, nh) = self.gpu.surface_dims();
+        if nw == 0 || nh == 0 || (rw, rh) == (nw, nh) {
+            return (x, y);
+        }
+        (
+            x * f64::from(rw) / f64::from(nw),
+            y * f64::from(rh) / f64::from(nh),
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn window_to_render_u(&self, x: u32, y: u32) -> (u32, u32) {
+        let (rw, rh) = self.gpu.render_dims();
+        let (nw, nh) = self.gpu.surface_dims();
+        if nw == 0 || nh == 0 || (rw, rh) == (nw, nh) {
+            return (x, y);
+        }
+        (
+            (x * rw / nw).min(rw.saturating_sub(1)),
+            (y * rh / nh).min(rh.saturating_sub(1)),
+        )
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         self.gpu.resize(width, height);
+    }
+
+    /// RP.0 — set the logical render resolution. Converts the facade policy
+    /// to the engine's mirror enum.
+    pub(crate) fn set_render_resolution(&mut self, res: crate::RenderResolution) {
+        let g = match res {
+            crate::RenderResolution::Native => roxlap_gpu::RenderResolution::Native,
+            crate::RenderResolution::Fixed { w, h } => roxlap_gpu::RenderResolution::Fixed { w, h },
+            crate::RenderResolution::Scale(f) => roxlap_gpu::RenderResolution::Scale(f),
+        };
+        self.gpu.set_render_resolution(g);
+    }
+
+    /// RP.0 — logical size the scene marches at this frame.
+    pub(crate) fn logical_dims(&self) -> (u32, u32) {
+        self.gpu.render_dims()
     }
 
     /// Upload a sky panorama for the GPU shader's sky sampling.

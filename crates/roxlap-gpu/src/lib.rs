@@ -195,6 +195,7 @@ struct LineVertex {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LineParams {
+    /// Target (swapchain) size — the range of the fragment's `clip.xy`.
     screen_w: u32,
     screen_h: u32,
     depth_bias: f32,
@@ -203,7 +204,12 @@ struct LineParams {
     /// unflipped (the blit mirrors at read time), but these passes flip the
     /// vertex NDC X, so the fragment must mirror its depth lookup to match.
     flip_x: u32,
-    _pad: [u32; 3],
+    /// RP.0 — the **render** (logical) size the depth buffer is stored at.
+    /// The fragment scales its swapchain `clip.xy` into this grid for the
+    /// depth lookup. Equal to `screen_*` under `Native` (identity).
+    depth_w: u32,
+    depth_h: u32,
+    _pad: u32,
 }
 
 /// Lazy-built debug-line pipeline (L3.2). The bind group is rebuilt each
@@ -483,6 +489,40 @@ fn build_image_vertices(
     out
 }
 
+/// RP.0 — logical render resolution policy for the scene marcher, decoupled
+/// from the swapchain size. Mirror of `roxlap_render::RenderResolution` (kept
+/// here so `roxlap-gpu` has no upward dependency). See [`GpuRenderer::render_dims`].
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum RenderResolution {
+    /// Logical == swapchain. Default; byte-identical to pre-RP rendering.
+    #[default]
+    Native,
+    /// Fixed logical grid, nearest-upscaled to the swapchain.
+    Fixed { w: u32, h: u32 },
+    /// Logical = `round(swapchain * factor)`, clamped to `>= 1px`.
+    Scale(f32),
+}
+
+impl RenderResolution {
+    /// Resolve to concrete logical pixels given the swapchain (native) size.
+    #[must_use]
+    fn logical_for(self, native: (u32, u32)) -> (u32, u32) {
+        let (nw, nh) = (native.0.max(1), native.1.max(1));
+        match self {
+            Self::Native => (nw, nh),
+            Self::Fixed { w, h } => (w.max(1), h.max(1)),
+            Self::Scale(f) => {
+                let s = f.max(1e-3);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let lw = ((nw as f32) * s).round() as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let lh = ((nh as f32) * s).round() as u32;
+                (lw.max(1), lh.max(1))
+            }
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)] // independent per-frame flags, not a state enum
 pub struct GpuRenderer {
     surface: wgpu::Surface<'static>,
@@ -496,6 +536,12 @@ pub struct GpuRenderer {
     /// samples `width-1-x`, and line/image overlays mirror their NDC x).
     /// The egui pass is unaffected. See [`Self::set_flip_x`].
     flip_x: bool,
+    /// RP.0 — logical render resolution. The scene/sprite passes march at
+    /// [`Self::render_dims`] (≤ the swapchain under a fixed value) into a
+    /// render-sized framebuffer + depth buffer; the blit nearest-upscales it
+    /// to the swapchain. `Native` keeps `render_dims == swapchain` ⇒ the
+    /// pre-RP straight blit, byte-identical.
+    render_res: RenderResolution,
     /// Lazy-built on first [`Self::render_chunk`] call; rebuilt when
     /// the swapchain resizes (storage texture must match).
     chunk_dda: Option<ChunkDdaResources>,
@@ -1418,6 +1464,7 @@ impl GpuRenderer {
             clear_colour: settings.clear_colour,
             frame_count: 0,
             flip_x: false,
+            render_res: RenderResolution::Native,
             chunk_dda: None,
             grid_dda: None,
             scene_dda: None,
@@ -1589,6 +1636,27 @@ impl GpuRenderer {
         self.chunk_dda = None;
         self.grid_dda = None;
         self.scene_dda = None;
+    }
+
+    /// RP.0 — set the logical render resolution. Rebuilds the scene-DDA
+    /// resources on the next [`Self::render_scene`] when the render size
+    /// changes.
+    pub fn set_render_resolution(&mut self, res: RenderResolution) {
+        self.render_res = res;
+    }
+
+    /// RP.0 — the logical size the scene/sprite passes march at, resolved
+    /// against the current swapchain size. `render_dims == surface_dims`
+    /// under [`RenderResolution::Native`].
+    #[must_use]
+    pub fn render_dims(&self) -> (u32, u32) {
+        self.render_res.logical_for(self.surface_dims())
+    }
+
+    /// RP.0 — the swapchain (native window) size.
+    #[must_use]
+    pub fn surface_dims(&self) -> (u32, u32) {
+        (self.surface_config.width, self.surface_config.height)
     }
 
     /// Acquire the next swapchain frame, or `None` to skip this frame.
@@ -2312,13 +2380,25 @@ impl GpuRenderer {
         let surface_w = self.surface_config.width;
         let surface_h = self.surface_config.height;
         let surface_format = self.surface_config.format;
+        // RP.0 — the scene + sprite passes march at the logical render size;
+        // the blit nearest-upscales to the swapchain. `Native` ⇒ render ==
+        // surface ⇒ pre-RP behaviour. The framebuffer/depth/occupancy + the
+        // per-pixel projection all key off the render size; only the blit
+        // target is the swapchain.
+        let (render_w, render_h) = self.render_res.logical_for((surface_w, surface_h));
 
         let needs_build = match &self.scene_dda {
-            Some(r) => r.storage_size != (surface_w, surface_h),
+            Some(r) => r.storage_size != (render_w, render_h),
             None => true,
         };
         if needs_build {
-            self.scene_dda = Some(self.build_scene_dda(surface_w, surface_h, surface_format));
+            self.scene_dda = Some(self.build_scene_dda(
+                render_w,
+                render_h,
+                surface_w,
+                surface_h,
+                surface_format,
+            ));
         }
         // GPU.9 — materialise the sprite pipeline the first frame
         // sprites are present (before the immutable `dda` borrow).
@@ -2336,8 +2416,10 @@ impl GpuRenderer {
                 // World camera — sprite positions/transforms are world-
                 // space (independent of any grid's transform).
                 let cam = sprite_camera;
+                // Aspect + tile binning are in render (logical) space — the
+                // sprite pass writes the render-sized framebuffer/depth.
                 #[allow(clippy::cast_precision_loss)]
-                let aspect = surface_w as f32 / surface_h as f32;
+                let aspect = render_w as f32 / render_h as f32;
                 let half_h = (fov_y_rad * 0.5).tan();
                 let frustum = sprite_model::ViewFrustum {
                     pos: cam.position,
@@ -2352,8 +2434,8 @@ impl GpuRenderer {
                     &self.device,
                     &self.queue,
                     &frustum,
-                    surface_w,
-                    surface_h,
+                    render_w,
+                    render_h,
                     SPRITE_TILE_SIZE,
                     self.sprite_lod_px,
                 );
@@ -2366,11 +2448,13 @@ impl GpuRenderer {
         };
         let dda = self.scene_dda.as_ref().expect("just built");
 
-        // Refresh the blit's flip flag each frame (offset 8, after the
-        // width/height), so toggling the flip applies without a resize.
+        // Refresh the blit's flip flag each frame (offset 16, after the
+        // src + dst vec2 sizes), so toggling the flip applies without a
+        // resize. The src/dst sizes themselves are written at build time
+        // (a render/surface size change forces a rebuild).
         self.queue.write_buffer(
             &dda.blit_dims,
-            8,
+            16,
             bytemuck::bytes_of(&[u32::from(self.flip_x), 0u32]),
         );
 
@@ -2403,7 +2487,7 @@ impl GpuRenderer {
             grid_count: scene.grid_count,
             max_outer_steps,
             _pad0: 0,
-            screen_size: [surface_w, surface_h],
+            screen_size: [render_w, render_h],
             _pad1: [0; 2],
             fog_color: [
                 self.fog_color[0],
@@ -2631,7 +2715,7 @@ impl GpuRenderer {
                         self.fog_color[2],
                         self.fog_near,
                     ],
-                    screen_size: [surface_w, surface_h],
+                    screen_size: [render_w, render_h],
                     instance_count: visible,
                     fog_far: self.fog_far,
                     fov_y_rad,
@@ -2779,7 +2863,7 @@ impl GpuRenderer {
             });
             cpass.set_pipeline(&dda.pipeline_dda);
             cpass.set_bind_group(0, &dda_bg, &[]);
-            cpass.dispatch_workgroups(surface_w.div_ceil(8), surface_h.div_ceil(8), 1);
+            cpass.dispatch_workgroups(render_w.div_ceil(8), render_h.div_ceil(8), 1);
         }
         // GPU.10 — sprite model-DDA pass: one thread per pixel marches
         // the tile's instances + composites against scene depth, after
@@ -2791,7 +2875,7 @@ impl GpuRenderer {
             });
             cpass.set_pipeline(&smd.pipeline);
             cpass.set_bind_group(0, bg, &[]);
-            cpass.dispatch_workgroups(surface_w.div_ceil(8), surface_h.div_ceil(8), 1);
+            cpass.dispatch_workgroups(render_w.div_ceil(8), render_h.div_ceil(8), 1);
         }
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2908,11 +2992,14 @@ impl GpuRenderer {
             return;
         }
         let (w, h) = (self.surface_config.width, self.surface_config.height);
+        // RP.0 — project with the render (logical) aspect so the lines align
+        // with the upscaled scene; the depth buffer is render-sized too.
+        let (rw, rh) = self.render_dims();
         let fov = self.last_fov_y_rad;
         if w == 0 || h == 0 || fov <= 0.0 {
             return; // no frame marched yet — no projection to reuse
         }
-        let verts = build_line_vertices(cam, lines, w, h, fov, self.flip_x);
+        let verts = build_line_vertices(cam, lines, rw, rh, fov, self.flip_x);
         if verts.is_empty() {
             return;
         }
@@ -2932,7 +3019,9 @@ impl GpuRenderer {
             depth_bias: LINE_DEPTH_BIAS,
             no_depth,
             flip_x: u32::from(self.flip_x),
-            _pad: [0; 3],
+            depth_w: rw,
+            depth_h: rh,
+            _pad: 0,
         };
         self.queue
             .write_buffer(&res.uniform_buf, 0, bytemuck::bytes_of(&params));
@@ -3193,6 +3282,9 @@ impl GpuRenderer {
             return;
         }
         let (w, h) = (self.surface_config.width, self.surface_config.height);
+        // RP.0 — project with the render (logical) aspect (see
+        // `draw_lines_deferred`); depth buffer is render-sized.
+        let (rw, rh) = self.render_dims();
         let fov = self.last_fov_y_rad;
         if w == 0 || h == 0 || fov <= 0.0 {
             return;
@@ -3206,7 +3298,7 @@ impl GpuRenderer {
             if !matches!(self.images.get(quad.image), Some(Some(_))) {
                 continue; // dropped / never-uploaded id
             }
-            let v = build_image_vertices(cam, quad, w, h, fov, self.flip_x);
+            let v = build_image_vertices(cam, quad, rw, rh, fov, self.flip_x);
             if v.is_empty() {
                 continue;
             }
@@ -3228,7 +3320,9 @@ impl GpuRenderer {
             depth_bias: LINE_DEPTH_BIAS,
             no_depth,
             flip_x: u32::from(self.flip_x),
-            _pad: [0; 3],
+            depth_w: rw,
+            depth_h: rh,
+            _pad: 0,
         };
         {
             let res = self.image_resources.as_ref().expect("just built");
@@ -3581,29 +3675,44 @@ impl GpuRenderer {
         &self,
         width: u32,
         height: u32,
+        surface_w: u32,
+        surface_h: u32,
         surface_format: wgpu::TextureFormat,
     ) -> SceneDdaResources {
-        // Framebuffer as a packed-`rgba8unorm` storage buffer (1 u32 per
-        // pixel, row stride = `width`). See the struct-field note.
+        // `width`/`height` are the **render** (logical) size — the scene +
+        // sprite passes march at it and the framebuffer/depth are sized to it.
+        // `surface_w`/`surface_h` are the swapchain the blit upscales onto
+        // (RP.0). Framebuffer is a packed-`rgba8unorm` storage buffer (1 u32
+        // per pixel, row stride = render `width`). See the struct-field note.
         let framebuffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.framebuffer"),
             size: u64::from(width) * u64::from(height) * 4,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        // Screen size + flip flag for the blit's pixel→index math
-        // (`vec2<u32>` size, then `flip_x` + pad). Re-written per frame in
-        // `render_scene` so a flip toggle takes effect without a resize.
+        // Blit uniform `Dims`: render (src) size, swapchain (dst) size, then
+        // `flip_x` + pad (RP.0 nearest upscale). The flip flag (offset 16) is
+        // re-written per frame in `render_scene`; a render/surface resize
+        // forces a full rebuild, so the sizes only need writing here.
         let blit_dims = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.blit_dims"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.queue.write_buffer(
             &blit_dims,
             0,
-            bytemuck::bytes_of(&[width, height, u32::from(self.flip_x), 0u32]),
+            bytemuck::bytes_of(&[
+                width,
+                height,
+                surface_w,
+                surface_h,
+                u32::from(self.flip_x),
+                0u32,
+                0u32,
+                0u32,
+            ]),
         );
 
         let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {

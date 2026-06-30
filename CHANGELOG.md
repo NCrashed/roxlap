@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Fixed-resolution render target** (macro-stage RP, RP.0) — the scene now
+  marches into a fixed **logical** render target that is nearest-upscaled to the
+  window, so the per-pixel raycaster's cost — and thus the frame rate — stops
+  depending on the window size. New `SceneRenderer::set_render_resolution`
+  (`RenderResolution {Native, Fixed {w, h}, Scale(f32)}`) plus
+  `render_dims()` / `logical_dims()` introspection. Mirrored on both backends:
+  the GPU scene/sprite passes + framebuffer/depth run at the render size and
+  `scene_blit.wgsl` integer-nearest-upscales to the swapchain; the CPU backend
+  upscales its logical framebuffer into a native-size output and rasterises the
+  egui HUD there so it stays crisp. Debug-line / image overlays + screen→world
+  picking map window pixels into the render grid. **`Native` (the default) is
+  byte-identical to pre-RP rendering.** The scene-demo defaults to an
+  `860×520` grid; override with `ROXLAP_RENDER_RES` (`native` | `WxH` |
+  `<scale>`). Foundation for the RP.1 SSAA + RP.2 posterize/dither passes.
+
 ## [0.19.0] — 2026-06-30
 
 ### Added

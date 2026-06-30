@@ -19,10 +19,16 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
+// RP.0 — the framebuffer is the **render** (logical) size `src`; this pass
+// renders to the swapchain `dst` and nearest-upscales. Native (`src == dst`)
+// maps every dst pixel to itself (integer math ⇒ byte-identical to pre-RP).
 struct Dims {
-    size: vec2<u32>,
+    src_size: vec2<u32>,   // render (compute) framebuffer size
+    dst_size: vec2<u32>,   // swapchain size
     flip_x: u32,
-    _pad: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var<storage, read> fb: array<u32>;
@@ -30,14 +36,19 @@ struct Dims {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // `in.clip.xy` is the framebuffer pixel centre (px + 0.5). The
-    // compute pass wrote `fb[py * width + px]`, so read the same texel —
-    // mirrored to `width-1-px` when the horizontal flip is on.
-    var px = u32(in.clip.x);
-    let py = u32(in.clip.y);
+    // `in.clip.xy` is the swapchain pixel centre (px + 0.5). Map it to the
+    // render-grid texel with integer nearest sampling (hard pixels).
+    let dx = u32(in.clip.x);
+    let dy = u32(in.clip.y);
+    var sx = (dx * dims.src_size.x) / dims.dst_size.x;
+    var sy = (dy * dims.src_size.y) / dims.dst_size.y;
+    sx = min(sx, dims.src_size.x - 1u);
+    sy = min(sy, dims.src_size.y - 1u);
+    // Mirror to `src_w-1-sx` when the horizontal flip is on (the compute
+    // pass wrote the framebuffer unflipped).
     if dims.flip_x != 0u {
-        px = dims.size.x - 1u - px;
+        sx = dims.src_size.x - 1u - sx;
     }
-    let idx = py * dims.size.x + px;
+    let idx = sy * dims.src_size.x + sx;
     return unpack4x8unorm(fb[idx]);
 }
