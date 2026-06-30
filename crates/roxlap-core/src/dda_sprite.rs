@@ -527,17 +527,21 @@ pub enum SpriteLightMode {
     WorldUp,
     /// Ambient only — no sun / point-light direct term (flat cutout).
     AmbientOnly,
+    /// Full-bright / emissive — the voxel colour at full intensity, ignoring
+    /// lighting (glows: fire, spell auras). Encoded as **both** flag bits set.
+    FullBright,
 }
 
 impl SpriteLightMode {
     #[must_use]
     pub fn from_flags(flags: u32) -> Self {
-        if flags & SPRITE_FLAG_LIGHT_AMBIENT_ONLY != 0 {
-            Self::AmbientOnly
-        } else if flags & SPRITE_FLAG_LIGHT_WORLD_UP != 0 {
-            Self::WorldUp
-        } else {
-            Self::FaceNormal
+        let world_up = flags & SPRITE_FLAG_LIGHT_WORLD_UP != 0;
+        let ambient_only = flags & SPRITE_FLAG_LIGHT_AMBIENT_ONLY != 0;
+        match (ambient_only, world_up) {
+            (true, true) => Self::FullBright, // both bits set
+            (true, false) => Self::AmbientOnly,
+            (false, true) => Self::WorldUp,
+            (false, false) => Self::FaceNormal,
         }
     }
 }
@@ -566,6 +570,8 @@ fn shade_dynamic_mode(
             amb.bands = 0; // smooth ambient (no cel ramp toward shadow_tint)
             shade_dynamic(albedo, 1.0, n_world, center, &amb, None)
         }
+        // Emissive: the voxel colour at full intensity, ignoring the rig.
+        SpriteLightMode::FullBright => f32_to_rgb(albedo),
     }
 }
 
@@ -1405,6 +1411,18 @@ mod tests {
             world_up, face_up,
             "world-up shades a side-facing billboard as if it faced up"
         );
+        let full = g(shade_dynamic_mode(
+            SpriteLightMode::FullBright,
+            a,
+            side_n,
+            c,
+            &lights,
+            None,
+        ));
+        // Full-bright = the albedo at full intensity, ignoring the rig (so a
+        // glow isn't dimmed by ambient like AmbientOnly is).
+        assert_eq!(full, 255, "full-bright emits the colour at full intensity");
+        assert!(full > amb, "full-bright glow is brighter than ambient-only");
     }
 
     /// DL.7 — `cast_local` reports the hit's model-local face normal (used to

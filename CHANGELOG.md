@@ -42,15 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     receives the sun's shadows) + a flickering non-casting flame + a standalone
     signpost billboard, all synthesised as GIFs at startup and imported through
     `gif_import` (dogfooding the full path). New scene in `roxlap-scene-demo`.
-  - **`BillboardLighting`** (BB.2b) — per-instance shading-normal mode
-    (`FaceNormal` / `WorldUp` / `AmbientOnly`, sprite `flags` bits 6/7) so a
-    camera-facing billboard needn't suffer the camera-dependent `N·L` of its
-    (camera-tracking) face normal: `WorldUp` shades with a fixed world-up
-    normal, `AmbientOnly` drops the direct term for a flat cutout. Both
-    backends (`shade_sprite_lit` WGSL + the CPU `shade_dynamic_mode` at both
-    sprite shade sites); set via `set_sprite_instance_lighting` /
-    `BillboardActorDef::lighting`. `FaceNormal` (default) is byte-identical to
-    the prior look.
+  - **`BillboardLighting`** (BB.2b) — per-instance shading mode (sprite
+    `flags` bits 6/7) so a camera-facing billboard needn't suffer the
+    camera-dependent `N·L` of its (camera-tracking) face normal: `FaceNormal`
+    (default), `WorldUp` (a fixed world-up normal — stable directional
+    shading), `AmbientOnly` (flat cutout, ambient term only), and `FullBright`
+    (**emissive** — the colour at full intensity, ignoring lighting; the right
+    look for glows like fire/spell auras). Both backends (`shade_sprite_lit`
+    WGSL + the CPU `shade_dynamic_mode` at both sprite shade sites); set via
+    `set_sprite_instance_lighting` / `BillboardActorDef::lighting`.
+    `FaceNormal` is byte-identical to the prior look.
 - **Per-instance sprite RGB tint** — each sprite instance carries a packed
   `0x00RRGGBB` tint that multiplies its voxel colours (per channel), so
   instances of one model can be recoloured cheaply. `0x00FF_FFFF` (white, the

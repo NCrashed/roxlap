@@ -627,8 +627,13 @@ pub enum BillboardLighting {
     /// camera angle.
     WorldUp,
     /// Ambient only — no sun / point-light direct term, the flattest,
-    /// most Doom-faithful cutout look.
+    /// most Doom-faithful cutout look (still scaled by the scene's ambient
+    /// level, so it dims in a dim scene).
     AmbientOnly,
+    /// Full-bright / **emissive** — the voxel colour at full intensity,
+    /// ignoring all lighting. The right look for glows (fire, spell auras,
+    /// muzzle flashes) and markers that shouldn't darken in shadow.
+    FullBright,
 }
 
 /// One camera-facing billboard instance (BB.2): the clip/sprite instance it
@@ -719,6 +724,10 @@ pub(crate) fn apply_lighting_flags(flags: &mut u32, mode: BillboardLighting) {
         BillboardLighting::FaceNormal => {}
         BillboardLighting::WorldUp => *flags |= SPRITE_FLAG_LIGHT_WORLD_UP,
         BillboardLighting::AmbientOnly => *flags |= SPRITE_FLAG_LIGHT_AMBIENT_ONLY,
+        // Full-bright is encoded as both bits set (the decoders check it first).
+        BillboardLighting::FullBright => {
+            *flags |= SPRITE_FLAG_LIGHT_WORLD_UP | SPRITE_FLAG_LIGHT_AMBIENT_ONLY;
+        }
     }
 }
 
@@ -3755,6 +3764,13 @@ mod tests {
         assert_eq!(f & SPRITE_FLAG_LIGHT_AMBIENT_ONLY, 0);
         apply_lighting_flags(&mut f, BillboardLighting::AmbientOnly);
         assert_eq!(f & SPRITE_FLAG_LIGHT_WORLD_UP, 0, "modes are exclusive");
+        assert_ne!(f & SPRITE_FLAG_LIGHT_AMBIENT_ONLY, 0);
+        apply_lighting_flags(&mut f, BillboardLighting::FullBright);
+        assert_ne!(
+            f & SPRITE_FLAG_LIGHT_WORLD_UP,
+            0,
+            "full-bright sets both bits"
+        );
         assert_ne!(f & SPRITE_FLAG_LIGHT_AMBIENT_ONLY, 0);
         apply_lighting_flags(&mut f, BillboardLighting::FaceNormal);
         assert_eq!(

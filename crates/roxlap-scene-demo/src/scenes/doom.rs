@@ -17,7 +17,8 @@
 //!   does not cast a shadow (per-actor `casts_shadow = false`, BB.3).
 //! - A **standalone billboard** (BB.2) — a static signpost oriented by
 //!   `face_billboards_to`, whose **lighting mode** (BB.2b: `FaceNormal` /
-//!   `WorldUp` / `AmbientOnly`) cycles with `L` (the flame uses `AmbientOnly`).
+//!   `WorldUp` / `AmbientOnly` / `FullBright`) cycles with `L` (the flame is
+//!   `FullBright` — emissive).
 //!
 //! Controls: WASD+mouse fly · `Q`/`E` turn the monster · `Space` walk/idle ·
 //! `K` toggle sun shadows · `L` cycle the signpost's lighting mode.
@@ -198,8 +199,9 @@ impl DemoScene for DoomScene {
                 dirs: vec![flame],
             }],
             mode: BillboardMode::Cylindrical,
-            // A flat glow reads best lit by ambient only (it ignores the sun).
-            lighting: BillboardLighting::AmbientOnly,
+            // A flame is emissive — full-bright so it glows instead of being
+            // dimmed by the scene's ambient/sun.
+            lighting: BillboardLighting::FullBright,
             speed_q8: 256,
             casts_shadow: false,
             receives_shadow: false,
@@ -264,7 +266,8 @@ impl DemoScene for DoomScene {
                 self.standalone_light = match self.standalone_light {
                     BillboardLighting::FaceNormal => BillboardLighting::WorldUp,
                     BillboardLighting::WorldUp => BillboardLighting::AmbientOnly,
-                    BillboardLighting::AmbientOnly => BillboardLighting::FaceNormal,
+                    BillboardLighting::AmbientOnly => BillboardLighting::FullBright,
+                    BillboardLighting::FullBright => BillboardLighting::FaceNormal,
                 };
                 if let Some(s) = self.standalone {
                     ctx.renderer

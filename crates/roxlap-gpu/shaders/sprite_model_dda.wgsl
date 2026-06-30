@@ -247,9 +247,14 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
         f32(packed & 0xffu),
     ) / 255.0;
     // BB.2b — per-instance billboard lighting mode (flags bits 6/7).
-    // Ambient-only (bit7): a flat cutout that ignores the light direction.
-    if ((inst.flags & 128u) != 0u) {
-        return albedo * u.ambient_color.rgb;
+    //   both bits = full-bright (emissive); bit7 = ambient-only; bit6 = world-up.
+    let lm_world_up = (inst.flags & 64u) != 0u;
+    let lm_ambient = (inst.flags & 128u) != 0u;
+    if (lm_ambient) {
+        if (lm_world_up) {
+            return albedo; // full-bright: the colour at full intensity
+        }
+        return albedo * u.ambient_color.rgb; // ambient-only flat cutout
     }
     // Surface normal from the DDA hit FACE (model-local), rotated to world.
     // `inv` is the world→model rotation (columns); model→world = its
@@ -259,9 +264,9 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
     let inv = mat3x3<f32>(inst.inv_rot0.xyz, inst.inv_rot1.xyz, inst.inv_rot2.xyz);
     let m2w = transpose(inv);
     var n_world = m2w * n_model;
-    // World-up (bit6): a fixed normal so a camera-facing billboard's shading
-    // doesn't track the camera as it orbits.
-    if ((inst.flags & 64u) != 0u) {
+    // World-up (bit6 only): a fixed normal so a camera-facing billboard's
+    // shading doesn't track the camera as it orbits.
+    if (lm_world_up) {
         n_world = vec3<f32>(0.0, 0.0, -1.0);
     }
     let styled = u.style_bands > 0u;
