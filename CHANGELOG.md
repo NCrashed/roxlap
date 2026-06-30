@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SSAA + box-downfilter resolve** (RP.1) — `SceneRenderer::set_ssaa(factor)`
+  (clamped `1..=4`) supersamples the retro grid: the raycaster marches at
+  `logical × factor`, then a box-downfilter resolves back to the logical grid
+  before the nearest upscale — anti-aliasing edges + reducing rotation/movement
+  shimmer while keeping hard pixels. `render_dims()` now reports the march size
+  (`logical × ssaa`); `logical_dims()` the resolved grid. GPU: a
+  `scene_resolve.wgsl` compute pass (framebuffer→resolve buffer; the blit reads
+  the logical resolve buffer). CPU: an exact integer box average
+  (`downfilter_pixel`). `ssaa == 1` is a byte-exact identity, so the RP.0 paths
+  are unchanged. scene-demo: `ROXLAP_SSAA` (default 1; CPU pays the full N² ray
+  cost, so opt-in).
 - **Fixed-resolution render target** (macro-stage RP, RP.0) — the scene now
   marches into a fixed **logical** render target that is nearest-upscaled to the
   window, so the per-pixel raycaster's cost — and thus the frame rate — stops

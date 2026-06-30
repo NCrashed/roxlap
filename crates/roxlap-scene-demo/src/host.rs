@@ -67,6 +67,16 @@ fn parse_render_res() -> RenderResolution {
     default
 }
 
+/// Parse `ROXLAP_SSAA` into a supersampling factor (clamped `1..=4`).
+/// Default `1` (off). RP.1.
+fn parse_ssaa() -> u8 {
+    std::env::var("ROXLAP_SSAA")
+        .ok()
+        .and_then(|s| s.trim().parse::<u8>().ok())
+        .unwrap_or(1)
+        .clamp(1, 4)
+}
+
 /// An empty sprite set — used to reset the renderer's content layers
 /// (static + dynamic + clip + character) when switching scenes.
 fn empty_sprite_set() -> SpriteSet {
@@ -393,8 +403,16 @@ impl ApplicationHandler for Host {
         //   `<factor>`    → scale of the window, e.g. `0.5`
         let render_res = parse_render_res();
         renderer.set_render_resolution(render_res);
-        let (rw, rh) = renderer.logical_dims();
-        eprintln!("roxlap-render: render resolution {render_res:?} → {rw}×{rh} logical");
+        // RP.1 — supersampling factor (anti-aliases the retro grid). Default 1
+        // (off); `ROXLAP_SSAA=2` marches 2×2 and box-downfilters. CPU pays the
+        // full N² ray cost, so keep it opt-in.
+        let ssaa = parse_ssaa();
+        renderer.set_ssaa(ssaa);
+        let (lw, lh) = renderer.logical_dims();
+        let (rw, rh) = renderer.render_dims();
+        eprintln!(
+            "roxlap-render: render resolution {render_res:?} → {lw}×{lh} logical, ssaa {ssaa} → {rw}×{rh} march"
+        );
 
         self.title_base = if let Some(info) = renderer.adapter_info() {
             eprintln!("roxlap-render: GPU backend — {info}");

@@ -285,6 +285,37 @@ pub(crate) fn setcamera_pixel_ray(
     ]
 }
 
+/// RP.1 — box-average one `s × s` march block into a single logical pixel.
+/// `fb` is the march framebuffer (`0x00RRGGBB`, row stride `march_w`); the
+/// block's top-left is `(lx·s, ly·s)`. Per-channel round-to-nearest via integer
+/// `(sum + n/2) / n` (matches round-half-away-from-zero). `s == 1` is the
+/// identity (returns the source pixel unchanged).
+fn downfilter_pixel(fb: &[u32], march_w: usize, lx: usize, ly: usize, s: usize) -> u32 {
+    let (mut ar, mut ag, mut ab) = (0u32, 0u32, 0u32);
+    for j in 0..s {
+        let row = (ly * s + j) * march_w;
+        for i in 0..s {
+            let px = fb[row + lx * s + i];
+            ar += (px >> 16) & 0xff;
+            ag += (px >> 8) & 0xff;
+            ab += px & 0xff;
+        }
+    }
+    let n = (s * s) as u32;
+    let half = n / 2;
+    (((ar + half) / n) << 16) | (((ag + half) / n) << 8) | ((ab + half) / n)
+}
+
+/// RP.1 — which owned buffer a present/upscale step reads from. `Frame` is the
+/// march-or-logical scene framebuffer, `Resolve` the box-downfiltered logical
+/// buffer (`ssaa > 1`), `Output` the native-size composited buffer.
+#[derive(Clone, Copy, PartialEq)]
+enum CpuSrc {
+    Frame,
+    Resolve,
+    Output,
+}
+
 pub(crate) struct CpuBackend {
     /// Framebuffer presenter — native `softbuffer` window surface, or
     /// the wasm WebGL2 canvas blitter (see [`Presenter`]). On native,
@@ -304,10 +335,18 @@ pub(crate) struct CpuBackend {
     /// (byte-identical to pre-RP). A `Fixed`/`Scale` value decouples the
     /// marched pixel count from the window size.
     render_res: crate::RenderResolution,
-    /// RP.0 — native-size scratch buffer the logical [`Self::framebuffer`] is
-    /// nearest-upscaled into before present, in the non-`Native` path. The
-    /// egui overlay rasterises here (at native res) so the HUD stays crisp.
-    /// Empty in the `Native` path (which presents `framebuffer` directly).
+    /// RP.1 — supersampling factor. `1` = off (the raycaster marches at the
+    /// logical size). `>1` marches at `logical × ssaa` and box-downfilters back
+    /// to logical before the upscale — anti-aliasing the retro grid. The
+    /// [`Self::framebuffer`] is sized to the march resolution (`logical × ssaa`).
+    ssaa: u32,
+    /// RP.1 — logical-sized buffer holding the box-downfiltered scene when
+    /// `ssaa > 1`. Empty when `ssaa == 1` (the framebuffer is already logical).
+    resolve: Vec<u32>,
+    /// RP.0 — native-size scratch buffer the logical scene is nearest-upscaled
+    /// into before present, in the non-`Native` path. The egui overlay
+    /// rasterises here (at native res) so the HUD stays crisp. Empty in the
+    /// `Native` path (which presents the logical buffer directly).
     output: Vec<u32>,
     zbuffer: Vec<f32>,
     /// Framebuffer dimensions of the last `render` — the `zbuffer`
@@ -398,6 +437,8 @@ impl CpuBackend {
             present_target,
             current_dims: (w, h),
             render_res: crate::RenderResolution::Native,
+            ssaa: 1,
+            resolve: Vec::new(),
             output: Vec::new(),
             zbuffer,
             last_dims: (w, h),
@@ -901,17 +942,30 @@ impl CpuBackend {
         self.render_res = res;
     }
 
-    /// RP.0 — the logical size the scene marches at, resolved against the
-    /// current window size.
+    /// RP.1 — set the supersampling factor (clamped to `1..=4`). `1` = off.
+    pub(crate) fn set_ssaa(&mut self, factor: u8) {
+        self.ssaa = u32::from(factor).clamp(1, 4);
+    }
+
+    /// RP.1 — the resolution the raycaster actually marches at:
+    /// `logical × ssaa`. The framebuffer/zbuffer are sized to this.
+    pub(crate) fn render_dims(&self) -> (u32, u32) {
+        let (lw, lh) = self.logical_dims();
+        (lw * self.ssaa, lh * self.ssaa)
+    }
+
+    /// RP.0 — the logical (retro) grid size the scene resolves to before the
+    /// nearest upscale to the window, resolved against the current window size.
     pub(crate) fn logical_dims(&self) -> (u32, u32) {
         self.render_res.logical_for(self.current_dims)
     }
 
     pub(crate) fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
-        // RP.0 — march at the logical size (≤ window under a fixed
-        // `RenderResolution`); `present`/`paint_egui` nearest-upscale to the
-        // window. `Native` ⇒ logical == window ⇒ pre-RP behaviour verbatim.
-        let (width, height) = self.logical_dims();
+        // RP.0/RP.1 — march at the *render* size (`logical × ssaa`), then
+        // box-downfilter to logical (RP.1) + nearest-upscale to the window
+        // (RP.0) at present. `Native` + `ssaa==1` ⇒ render == window ⇒ pre-RP
+        // behaviour verbatim.
+        let (width, height) = self.render_dims();
         if width == 0 || height == 0 {
             return;
         }
@@ -1244,22 +1298,55 @@ impl CpuBackend {
     /// surface and present it. The no-UI counterpart to
     /// [`Self::paint_egui`]; both finish the frame `render` started.
     pub(crate) fn present(&mut self) {
-        // Flip is applied in logical space (the scene framebuffer) before any
-        // upscale, matching the pre-RP order.
+        // Flip is applied in render (march) space before any resolve/upscale,
+        // matching the pre-RP order (a box downfilter commutes with the flip).
         if self.flip_x {
             self.flip_framebuffer();
         }
-        let logical = self.last_dims;
+        let logical = self.logical_dims();
         let native = self.current_dims;
+        // RP.1 — resolve march → logical (box downfilter) when supersampling;
+        // otherwise the framebuffer is already the logical image.
+        let logical_src = self.resolve_scene(logical);
         if logical == native {
-            // Native path — present the logical framebuffer directly
-            // (byte-identical to pre-RP).
-            self.blit_and_present_from(false, native);
+            // Present the logical buffer directly (Native + ssaa==1 ⇒ pre-RP).
+            self.blit_and_present_from(logical_src, native);
         } else {
-            // Fixed/scaled — nearest-upscale logical → native, then present.
-            self.upscale_framebuffer_to_output(logical, native);
-            self.blit_and_present_from(true, native);
+            // Nearest-upscale logical → native, then present.
+            self.upscale_to_output(logical_src, logical, native);
+            self.blit_and_present_from(CpuSrc::Output, native);
         }
+    }
+
+    /// RP.1 — box-downfilter the march-resolution [`Self::framebuffer`]
+    /// (`logical × ssaa`) into the logical-size [`Self::resolve`] buffer and
+    /// return [`CpuSrc::Resolve`]. When `ssaa == 1` the framebuffer is already
+    /// the logical image, so this is a no-op returning [`CpuSrc::Frame`].
+    fn resolve_scene(&mut self, logical: (u32, u32)) -> CpuSrc {
+        if self.ssaa <= 1 {
+            return CpuSrc::Frame;
+        }
+        let (lw, lh) = (logical.0 as usize, logical.1 as usize);
+        let s = self.ssaa as usize;
+        let (mw, mh) = (lw * s, lh * s);
+        let lpc = lw * lh;
+        if self.framebuffer.len() < mw * mh {
+            return CpuSrc::Frame; // not yet rendered at this size; nothing to do
+        }
+        if self.resolve.len() < lpc {
+            self.resolve.resize(lpc, self.clear_sky);
+        }
+        let Self {
+            framebuffer,
+            resolve,
+            ..
+        } = self;
+        for ly in 0..lh {
+            for lx in 0..lw {
+                resolve[ly * lw + lx] = downfilter_pixel(framebuffer, mw, lx, ly, s);
+            }
+        }
+        CpuSrc::Resolve
     }
 
     /// No GPU work in flight on the software backend — teardown is a plain
@@ -1538,15 +1625,30 @@ impl CpuBackend {
         }
     }
 
-    /// RP.0 — nearest-upscale the logical [`Self::framebuffer`] (`logical`
-    /// dims) into the native-size [`Self::output`] (`native` dims). Each
-    /// native pixel samples the logical texel at `floor(x·lw/nw, y·lh/nh)`
-    /// (hard pixels — the retro look). Only used when `logical != native`.
-    fn upscale_framebuffer_to_output(&mut self, logical: (u32, u32), native: (u32, u32)) {
+    /// Borrow the owned buffer a [`CpuSrc`] names (disjoint from the rest of
+    /// `self` via destructure at the call site).
+    fn src_slice<'a>(
+        framebuffer: &'a [u32],
+        resolve: &'a [u32],
+        output: &'a [u32],
+        src: CpuSrc,
+    ) -> &'a [u32] {
+        match src {
+            CpuSrc::Frame => framebuffer,
+            CpuSrc::Resolve => resolve,
+            CpuSrc::Output => output,
+        }
+    }
+
+    /// RP.0/RP.1 — nearest-upscale the logical scene buffer `src` (`logical`
+    /// dims) into the native-size [`Self::output`] (`native` dims). Each native
+    /// pixel samples the logical texel at `floor(x·lw/nw, y·lh/nh)` (hard
+    /// pixels — the retro look). Only used when `logical != native`.
+    fn upscale_to_output(&mut self, src: CpuSrc, logical: (u32, u32), native: (u32, u32)) {
         let (lw, lh) = (logical.0 as usize, logical.1 as usize);
         let (nw, nh) = (native.0 as usize, native.1 as usize);
         let (npc, lpc) = (nw * nh, lw * lh);
-        if lw == 0 || lh == 0 || nw == 0 || nh == 0 || self.framebuffer.len() < lpc {
+        if lw == 0 || lh == 0 || nw == 0 || nh == 0 {
             return;
         }
         if self.output.len() < npc {
@@ -1554,27 +1656,30 @@ impl CpuBackend {
         }
         let Self {
             framebuffer,
+            resolve,
             output,
             ..
         } = self;
+        let src_buf = Self::src_slice(framebuffer, resolve, &[], src);
+        if src_buf.len() < lpc {
+            return;
+        }
         for y in 0..nh {
             let sy = (y * lh) / nh;
             let src_row = sy * lw;
             let dst_row = y * nw;
             for x in 0..nw {
                 let sx = (x * lw) / nw;
-                output[dst_row + x] = framebuffer[src_row + sx];
+                output[dst_row + x] = src_buf[src_row + sx];
             }
         }
     }
 
-    /// Shared tail of `present` / `paint_egui`: copy the chosen source buffer
-    /// (the native [`Self::output`] when `from_output`, else the logical
-    /// [`Self::framebuffer`]) to the window surface at `(width, height)` and
-    /// present. The destructure gives disjoint borrows of `present_target`
-    /// and the source slice.
+    /// Shared tail of `present` / `paint_egui`: copy the [`CpuSrc`] buffer to
+    /// the window surface at `(width, height)` and present. The destructure
+    /// gives disjoint borrows of `present_target` and the source slice.
     #[cfg(not(target_arch = "wasm32"))]
-    fn blit_and_present_from(&mut self, from_output: bool, dims: (u32, u32)) {
+    fn blit_and_present_from(&mut self, src: CpuSrc, dims: (u32, u32)) {
         let (width, height) = dims;
         let (Some(w_nz), Some(h_nz)) = (NonZeroU32::new(width), NonZeroU32::new(height)) else {
             return;
@@ -1583,10 +1688,11 @@ impl CpuBackend {
         let Self {
             present_target,
             framebuffer,
+            resolve,
             output,
             ..
         } = self;
-        let src: &[u32] = if from_output { output } else { framebuffer };
+        let src: &[u32] = Self::src_slice(framebuffer, resolve, output, src);
         if src.len() < pixel_count {
             return;
         }
@@ -1601,18 +1707,10 @@ impl CpuBackend {
     /// wasm counterpart: upload the source buffer to the WebGL2 texture
     /// and draw the fullscreen quad on the canvas.
     #[cfg(target_arch = "wasm32")]
-    fn blit_and_present_from(&mut self, from_output: bool, dims: (u32, u32)) {
+    fn blit_and_present_from(&mut self, src: CpuSrc, dims: (u32, u32)) {
         let (width, height) = dims;
         let pixel_count = (width as usize) * (height as usize);
         if width == 0 || height == 0 {
-            return;
-        }
-        let have = if from_output {
-            self.output.len()
-        } else {
-            self.framebuffer.len()
-        };
-        if have < pixel_count {
             return;
         }
         self.present_target.resize(width, height);
@@ -1621,10 +1719,14 @@ impl CpuBackend {
         let Self {
             present_target,
             framebuffer,
+            resolve,
             output,
             ..
         } = self;
-        let src: &[u32] = if from_output { output } else { framebuffer };
+        let src: &[u32] = Self::src_slice(framebuffer, resolve, output, src);
+        if src.len() < pixel_count {
+            return;
+        }
         present_target.present(&src[..pixel_count]);
     }
 
@@ -1638,34 +1740,37 @@ impl CpuBackend {
         textures: &egui::TexturesDelta,
         pixels_per_point: f32,
     ) {
-        let logical = self.last_dims;
+        let logical = self.logical_dims();
         let native = self.current_dims;
         let lpc = (logical.0 as usize) * (logical.1 as usize);
-        if self.framebuffer.len() < lpc {
-            return;
-        }
-        // Mirror the 3D scene (in logical space) before the UI is drawn over
+        // Mirror the 3D scene (in render space) before the UI is drawn over
         // it, so the egui overlay stays upright.
         if self.flip_x {
             self.flip_framebuffer();
         }
+        // RP.1 — resolve march → logical (box downfilter) when supersampling.
+        let logical_src = self.resolve_scene(logical);
         self.egui_raster
             .update_textures(&textures.set, &textures.free);
         if logical == native {
-            // Native path — rasterise egui straight into the framebuffer at
-            // window res (byte-identical to pre-RP), then present it.
-            self.egui_raster.paint(
-                &mut self.framebuffer[..lpc],
-                native.0,
-                native.1,
-                jobs,
-                pixels_per_point,
-            );
-            self.blit_and_present_from(false, native);
+            // Logical == window — rasterise egui straight into the logical
+            // buffer at window res (Native + ssaa==1 ⇒ pre-RP), then present.
+            let Self {
+                framebuffer,
+                resolve,
+                egui_raster,
+                ..
+            } = self;
+            let buf: &mut [u32] = match logical_src {
+                CpuSrc::Resolve => &mut resolve[..lpc],
+                _ => &mut framebuffer[..lpc],
+            };
+            egui_raster.paint(buf, native.0, native.1, jobs, pixels_per_point);
+            self.blit_and_present_from(logical_src, native);
         } else {
             // Fixed/scaled — upscale the scene first, then rasterise egui into
             // the native-size output so the HUD stays crisp (RP.0 locked #6).
-            self.upscale_framebuffer_to_output(logical, native);
+            self.upscale_to_output(logical_src, logical, native);
             let npc = (native.0 as usize) * (native.1 as usize);
             self.egui_raster.paint(
                 &mut self.output[..npc],
@@ -1674,8 +1779,40 @@ impl CpuBackend {
                 jobs,
                 pixels_per_point,
             );
-            self.blit_and_present_from(true, native);
+            self.blit_and_present_from(CpuSrc::Output, native);
         }
+    }
+}
+
+#[cfg(test)]
+mod downfilter_tests {
+    use super::downfilter_pixel;
+
+    /// `ssaa == 1` is the identity — every source pixel passes through
+    /// unchanged (the byte-identical guarantee for the non-SSAA path).
+    #[test]
+    fn ssaa1_is_identity() {
+        let fb = [0x00_12_34_56, 0x00_ab_cd_ef, 0x00_00_00_00, 0x00_ff_ff_ff];
+        for (i, &px) in fb.iter().enumerate() {
+            assert_eq!(downfilter_pixel(&fb, 2, i % 2, i / 2, 1), px);
+        }
+    }
+
+    /// A uniform `s × s` block resolves to that exact colour (no drift).
+    #[test]
+    fn uniform_block_is_exact() {
+        let fb = vec![0x00_40_80_c0_u32; 16]; // 4×4 march
+        assert_eq!(downfilter_pixel(&fb, 4, 0, 0, 2), 0x00_40_80_c0);
+        assert_eq!(downfilter_pixel(&fb, 4, 1, 1, 2), 0x00_40_80_c0);
+    }
+
+    /// 2×2 average with round-to-nearest, per channel independently.
+    #[test]
+    fn averages_with_rounding() {
+        // Red: 0,0,0,2 → 2/4 = 0.5 → 1. Green: 10,10,10,10 → 10.
+        // Blue: 0,1,2,3 → 6/4 = 1.5 → 2.
+        let fb = [0x00_00_0a_00, 0x00_00_0a_01, 0x00_00_0a_02, 0x00_02_0a_03];
+        assert_eq!(downfilter_pixel(&fb, 2, 0, 0, 2), 0x00_01_0a_02);
     }
 }
 

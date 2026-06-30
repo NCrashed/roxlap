@@ -1544,12 +1544,27 @@ impl SceneRenderer {
         }
     }
 
-    /// The resolution the raycaster actually runs at this frame — the resolved
-    /// logical size (RP.0 has no SSAA yet, so `render_dims == logical_dims`).
-    /// Reflects the most recent window size + [`RenderResolution`].
+    /// Set the supersampling factor (RP.1). `1` = off; `2` marches `2×2`
+    /// samples per logical pixel and box-downfilters back before the upscale,
+    /// anti-aliasing the retro grid. Clamped to `1..=4`. The marcher then runs
+    /// at `logical_dims × factor` — predictable cost, independent of the window
+    /// size. Takes effect from the next [`render`](Self::render).
+    pub fn set_ssaa(&mut self, factor: u8) {
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.set_ssaa(factor),
+            BackendImpl::Gpu(g) => g.set_ssaa(factor),
+        }
+    }
+
+    /// The resolution the raycaster actually runs at this frame —
+    /// `logical_dims × ssaa` (RP.1). Reflects the most recent window size,
+    /// [`RenderResolution`], and SSAA factor.
     #[must_use]
     pub fn render_dims(&self) -> (u32, u32) {
-        self.logical_dims()
+        match &self.inner {
+            BackendImpl::Cpu(c) => c.render_dims(),
+            BackendImpl::Gpu(g) => g.render_dims(),
+        }
     }
 
     /// The logical (fixed) render-target size resolved against the current

@@ -953,8 +953,18 @@ impl GpuBackend {
         self.gpu.set_render_resolution(g);
     }
 
-    /// RP.0 — logical size the scene marches at this frame.
+    /// RP.1 — set the supersampling factor.
+    pub(crate) fn set_ssaa(&mut self, factor: u8) {
+        self.gpu.set_ssaa(factor);
+    }
+
+    /// RP.0 — the logical (retro) grid size before the upscale.
     pub(crate) fn logical_dims(&self) -> (u32, u32) {
+        self.gpu.logical_dims()
+    }
+
+    /// RP.1 — the resolution the scene marches at (`logical × ssaa`).
+    pub(crate) fn render_dims(&self) -> (u32, u32) {
         self.gpu.render_dims()
     }
 

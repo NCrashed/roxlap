@@ -542,6 +542,10 @@ pub struct GpuRenderer {
     /// to the swapchain. `Native` keeps `render_dims == swapchain` ⇒ the
     /// pre-RP straight blit, byte-identical.
     render_res: RenderResolution,
+    /// RP.1 — supersampling factor. `1` = off (march at logical size). `>1`
+    /// marches at `logical × ssaa` into the framebuffer/depth and a resolve
+    /// compute pass box-downfilters back to logical before the blit.
+    ssaa: u32,
     /// Lazy-built on first [`Self::render_chunk`] call; rebuilt when
     /// the swapchain resizes (storage texture must match).
     chunk_dda: Option<ChunkDdaResources>,
@@ -687,20 +691,30 @@ struct GridDdaResources {
 }
 
 struct SceneDdaResources {
+    /// RP.1 — the **march** framebuffer size (`logical × ssaa`); the scene +
+    /// sprite + depth passes run at this. Used for the rebuild check.
     storage_size: (u32, u32),
+    /// RP.1 — the **logical** (resolved) size: `resolve_buf` + the blit src.
+    logical_size: (u32, u32),
     /// Framebuffer as a packed-`rgba8unorm` storage **buffer** (row
-    /// stride = width), written by the scene + sprite compute passes
-    /// and read by the blit. A buffer (not a storage texture) dodges
+    /// stride = march width), written by the scene + sprite compute passes
+    /// and read by the resolve pass. A buffer (not a storage texture) dodges
     /// Chrome-Dawn's tiled write-texture layout (which produced a
     /// 128×256-tiled image); linear + explicit stride is portable.
     framebuffer: wgpu::Buffer,
     uniform_buf: wgpu::Buffer,
     bgl_dda: wgpu::BindGroupLayout,
     pipeline_dda: wgpu::ComputePipeline,
+    /// RP.1 — box-downfilter compute pass (`scene_resolve.wgsl`):
+    /// framebuffer(march) → resolve_buf(logical). The bind group retains the
+    /// resolve buffer + dims uniform (so they aren't stored separately).
+    pipeline_resolve: wgpu::ComputePipeline,
+    resolve_bg: wgpu::BindGroup,
+    /// Blit bind group — binds `resolve_buf` (logical) + `blit_dims`.
     blit_bg: wgpu::BindGroup,
     pipeline_blit: wgpu::RenderPipeline,
-    /// Blit uniform: `[width, height, flip_x, _pad]`. Retained so the flip
-    /// flag (offset 8) can be re-written per frame.
+    /// Blit uniform `Dims`: `[src(logical) w,h, dst(swapchain) w,h, flip_x,
+    /// pad×3]`. Retained so the flip flag (offset 16) is re-written per frame.
     blit_dims: wgpu::Buffer,
     /// GPU.9 — per-pixel world-t depth (f32 bits as u32), sized
     /// `width * height * 4`. The scene pass writes it when sprites
@@ -1465,6 +1479,7 @@ impl GpuRenderer {
             frame_count: 0,
             flip_x: false,
             render_res: RenderResolution::Native,
+            ssaa: 1,
             chunk_dda: None,
             grid_dda: None,
             scene_dda: None,
@@ -1645,12 +1660,25 @@ impl GpuRenderer {
         self.render_res = res;
     }
 
-    /// RP.0 — the logical size the scene/sprite passes march at, resolved
-    /// against the current swapchain size. `render_dims == surface_dims`
-    /// under [`RenderResolution::Native`].
+    /// RP.1 — set the supersampling factor (clamped to `1..=4`). `1` = off.
+    pub fn set_ssaa(&mut self, factor: u8) {
+        self.ssaa = u32::from(factor).clamp(1, 4);
+    }
+
+    /// RP.0 — the logical (retro) grid size the scene resolves to before the
+    /// upscale, resolved against the swapchain size. `logical_dims ==
+    /// surface_dims` under [`RenderResolution::Native`].
+    #[must_use]
+    pub fn logical_dims(&self) -> (u32, u32) {
+        self.render_res.logical_for(self.surface_dims())
+    }
+
+    /// RP.1 — the resolution the scene/sprite passes actually march at:
+    /// `logical_dims × ssaa`. The framebuffer + depth buffer are sized to this.
     #[must_use]
     pub fn render_dims(&self) -> (u32, u32) {
-        self.render_res.logical_for(self.surface_dims())
+        let (lw, lh) = self.logical_dims();
+        (lw * self.ssaa, lh * self.ssaa)
     }
 
     /// RP.0 — the swapchain (native window) size.
@@ -2380,21 +2408,26 @@ impl GpuRenderer {
         let surface_w = self.surface_config.width;
         let surface_h = self.surface_config.height;
         let surface_format = self.surface_config.format;
-        // RP.0 — the scene + sprite passes march at the logical render size;
-        // the blit nearest-upscales to the swapchain. `Native` ⇒ render ==
-        // surface ⇒ pre-RP behaviour. The framebuffer/depth/occupancy + the
-        // per-pixel projection all key off the render size; only the blit
-        // target is the swapchain.
-        let (render_w, render_h) = self.render_res.logical_for((surface_w, surface_h));
+        // RP.0/RP.1 — the scene + sprite + depth passes march at the *render*
+        // size (`logical × ssaa`); a resolve pass box-downfilters to the
+        // logical grid; the blit nearest-upscales to the swapchain. The
+        // framebuffer/depth/occupancy + per-pixel projection key off the render
+        // (march) size. `Native` + `ssaa==1` ⇒ render == logical == surface.
+        let (logical_w, logical_h) = self.logical_dims();
+        let (render_w, render_h) = self.render_dims();
 
         let needs_build = match &self.scene_dda {
-            Some(r) => r.storage_size != (render_w, render_h),
+            Some(r) => {
+                r.storage_size != (render_w, render_h) || r.logical_size != (logical_w, logical_h)
+            }
             None => true,
         };
         if needs_build {
             self.scene_dda = Some(self.build_scene_dda(
                 render_w,
                 render_h,
+                logical_w,
+                logical_h,
                 surface_w,
                 surface_h,
                 surface_format,
@@ -2876,6 +2909,18 @@ impl GpuRenderer {
             cpass.set_pipeline(&smd.pipeline);
             cpass.set_bind_group(0, bg, &[]);
             cpass.dispatch_workgroups(render_w.div_ceil(8), render_h.div_ceil(8), 1);
+        }
+        // RP.1 — resolve pass: box-downfilter framebuffer(march) →
+        // resolve_buf(logical). One thread per logical pixel. `ssaa == 1` ⇒
+        // exact 1×1 copy (byte-identical), so the blit always reads resolve_buf.
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("roxlap-gpu scene_dda resolve"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&dda.pipeline_resolve);
+            cpass.set_bind_group(0, &dda.resolve_bg, &[]);
+            cpass.dispatch_workgroups(logical_w.div_ceil(8), logical_h.div_ceil(8), 1);
         }
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3675,22 +3720,46 @@ impl GpuRenderer {
         &self,
         width: u32,
         height: u32,
+        logical_w: u32,
+        logical_h: u32,
         surface_w: u32,
         surface_h: u32,
         surface_format: wgpu::TextureFormat,
     ) -> SceneDdaResources {
-        // `width`/`height` are the **render** (logical) size — the scene +
-        // sprite passes march at it and the framebuffer/depth are sized to it.
-        // `surface_w`/`surface_h` are the swapchain the blit upscales onto
-        // (RP.0). Framebuffer is a packed-`rgba8unorm` storage buffer (1 u32
-        // per pixel, row stride = render `width`). See the struct-field note.
+        // `width`/`height` are the **march** size (`logical × ssaa`) — the
+        // scene + sprite + depth passes run at it. `logical_*` is the resolved
+        // (retro) grid the resolve pass downfilters into and the blit reads.
+        // `surface_*` is the swapchain the blit upscales onto. Framebuffer is a
+        // packed-`rgba8unorm` storage buffer (row stride = march `width`).
         let framebuffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.framebuffer"),
             size: u64::from(width) * u64::from(height) * 4,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        // Blit uniform `Dims`: render (src) size, swapchain (dst) size, then
+        // RP.1 — logical-resolution buffer the resolve pass writes; the blit
+        // reads it (so the blit src is the *logical* size, not the march size).
+        let resolve_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu scene_dda.resolve_buf"),
+            size: u64::from(logical_w) * u64::from(logical_h) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        // Resolve uniform: `[src(march) w,h, dst(logical) w,h, ssaa, pad×3]`.
+        let resolve_dims = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu scene_dda.resolve_dims"),
+            size: 32,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(
+            &resolve_dims,
+            0,
+            bytemuck::bytes_of(&[
+                width, height, logical_w, logical_h, self.ssaa, 0u32, 0u32, 0u32,
+            ]),
+        );
+        // Blit uniform `Dims`: logical (src) size, swapchain (dst) size, then
         // `flip_x` + pad (RP.0 nearest upscale). The flip flag (offset 16) is
         // re-written per frame in `render_scene`; a render/surface resize
         // forces a full rebuild, so the sizes only need writing here.
@@ -3704,8 +3773,8 @@ impl GpuRenderer {
             &blit_dims,
             0,
             bytemuck::bytes_of(&[
-                width,
-                height,
+                logical_w,
+                logical_h,
                 surface_w,
                 surface_h,
                 u32::from(self.flip_x),
@@ -3826,6 +3895,62 @@ impl GpuRenderer {
                 cache: None,
             });
 
+        // RP.1 — box-downfilter resolve pass (framebuffer march → resolve_buf
+        // logical). `ssaa == 1` is a 1×1 copy; the blit always reads resolve_buf.
+        let resolve_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("scene_resolve.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("../shaders/scene_resolve.wgsl").into(),
+                ),
+            });
+        let bgl_resolve = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("roxlap-gpu scene_dda.resolve_bgl"),
+                entries: &[
+                    bgl_storage_entry(0, true),  // src framebuffer (read)
+                    bgl_storage_entry(1, false), // dst resolve_buf (read-write)
+                    bgl_uniform_entry(2),        // resolve dims
+                ],
+            });
+        let resolve_pl = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("roxlap-gpu scene_dda.resolve_layout"),
+                bind_group_layouts: &[Some(&bgl_resolve)],
+                immediate_size: 0,
+            });
+        let pipeline_resolve =
+            self.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("roxlap-gpu scene_dda.resolve_pipeline"),
+                    layout: Some(&resolve_pl),
+                    module: &resolve_shader,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+        let resolve_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("roxlap-gpu scene_dda.resolve_bg"),
+            layout: &bgl_resolve,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: framebuffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: resolve_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: resolve_dims.as_entire_binding(),
+                },
+            ],
+        });
+
         let blit_shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3901,7 +4026,8 @@ impl GpuRenderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: framebuffer.as_entire_binding(),
+                    // RP.1 — blit reads the logical resolve buffer.
+                    resource: resolve_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -3940,10 +4066,13 @@ impl GpuRenderer {
 
         SceneDdaResources {
             storage_size: (width, height),
+            logical_size: (logical_w, logical_h),
             framebuffer,
             uniform_buf,
             bgl_dda,
             pipeline_dda,
+            pipeline_resolve,
+            resolve_bg,
             blit_bg,
             pipeline_blit,
             blit_dims,
@@ -5171,6 +5300,10 @@ mod pixel_ray_tests {
             (
                 "scene_blit.wgsl",
                 include_str!("../shaders/scene_blit.wgsl"),
+            ),
+            (
+                "scene_resolve.wgsl",
+                include_str!("../shaders/scene_resolve.wgsl"),
             ),
             ("line.wgsl", include_str!("../shaders/line.wgsl")),
             ("image.wgsl", include_str!("../shaders/image.wgsl")),
