@@ -584,6 +584,19 @@ impl CpuBackend {
         }
     }
 
+    /// Set dynamic instance `idx`'s shadow cast/receive flags live (XS.4 /
+    /// BB.3), preserving its other flag bits. No-op if `idx` is out of range.
+    pub(crate) fn set_dyn_instance_shadow_flags(
+        &mut self,
+        idx: usize,
+        casts: bool,
+        receives: bool,
+    ) {
+        if let Some(s) = self.dyn_sprites.get_mut(idx) {
+            crate::apply_shadow_flags(&mut s.flags, casts, receives);
+        }
+    }
+
     /// Register a new model template (axis-aligned, kv6 cloned once) and
     /// return its positional index. The streaming-in counterpart to
     /// [`Self::add_dyn_instance_posed`] for unique generated geometry.

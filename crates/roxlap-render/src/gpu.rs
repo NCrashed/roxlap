@@ -408,6 +408,27 @@ impl GpuBackend {
         self.transforms_dirty = true;
     }
 
+    /// Set dynamic instance `idx`'s shadow cast/receive flags live (XS.4 /
+    /// BB.3), preserving its other flag bits. The change rides the next
+    /// [`Self::render`] flush (the per-instance `flags` are re-uploaded with
+    /// the coalesced transform write). No-op if out of range.
+    pub(crate) fn set_dyn_instance_shadow_flags(
+        &mut self,
+        idx: usize,
+        casts: bool,
+        receives: bool,
+    ) {
+        if idx >= self.dyn_count {
+            return;
+        }
+        let gpu_index = (self.sprite_instances.len() - self.dyn_count) + idx;
+        if let Some(b) = self.sprite_basis.get_mut(gpu_index) {
+            crate::apply_shadow_flags(&mut b.flags, casts, receives);
+        }
+        crate::apply_shadow_flags(&mut self.sprite_instances[gpu_index].flags, casts, receives);
+        self.transforms_dirty = true;
+    }
+
     /// Register a new sprite model incrementally (its full LOD chain),
     /// returning its positional host index (== registry chain id). Lazily
     /// creates the registry + resident if none exists yet, so this works

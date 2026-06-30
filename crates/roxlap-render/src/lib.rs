@@ -668,6 +668,23 @@ fn billboard_transform(
     })
 }
 
+/// Apply shadow cast/receive booleans to a sprite `flags` word in place
+/// (XS.4 bits 4/5), preserving the other bits. Shared by both backends'
+/// per-instance shadow-flag setters (BB.3).
+pub(crate) fn apply_shadow_flags(flags: &mut u32, casts: bool, receives: bool) {
+    use roxlap_formats::sprite::{SPRITE_FLAG_NO_SHADOW_CAST, SPRITE_FLAG_NO_SHADOW_RECEIVE};
+    if casts {
+        *flags &= !SPRITE_FLAG_NO_SHADOW_CAST;
+    } else {
+        *flags |= SPRITE_FLAG_NO_SHADOW_CAST;
+    }
+    if receives {
+        *flags &= !SPRITE_FLAG_NO_SHADOW_RECEIVE;
+    } else {
+        *flags |= SPRITE_FLAG_NO_SHADOW_RECEIVE;
+    }
+}
+
 /// Backend-agnostic sprite description. The facade builds the CPU
 /// per-instance draw list and the GPU instanced registry from the
 /// same data, so both backends show identical sprites. The host owns
@@ -1921,6 +1938,32 @@ impl SceneRenderer {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.set_dyn_instance_tint(dyn_index as usize, tint),
             BackendImpl::Gpu(g) => g.set_dyn_instance_tint(dyn_index as usize, tint),
+        }
+    }
+
+    /// Toggle a sprite/clip instance's shadow participation **live** (XS.4
+    /// flags, BB.3): whether it **casts** a shadow onto the world and whether
+    /// it **receives** shadows. Both default on at spawn. The per-instance
+    /// counterpart to the template-level `Sprite::with_casts_shadow` /
+    /// `with_receives_shadow` — e.g. a flat additive glow billboard that
+    /// should not cast, or a UI marker that ignores shadows. Other flag bits
+    /// are preserved. No-op on a stale id.
+    pub fn set_sprite_instance_shadow_flags(
+        &mut self,
+        id: SpriteInstanceId,
+        casts: bool,
+        receives: bool,
+    ) {
+        let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
+            return;
+        };
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => {
+                c.set_dyn_instance_shadow_flags(dyn_index as usize, casts, receives);
+            }
+            BackendImpl::Gpu(g) => {
+                g.set_dyn_instance_shadow_flags(dyn_index as usize, casts, receives);
+            }
         }
     }
 
@@ -3267,6 +3310,26 @@ mod tests {
         assert!(dot(xf.right, xf.up).abs() < 1e-5);
         assert!(dot(xf.up, xf.forward).abs() < 1e-5);
         assert!(dot(xf.right, xf.forward).abs() < 1e-5);
+    }
+
+    #[test]
+    fn apply_shadow_flags_toggles_bits_and_preserves_others() {
+        use roxlap_formats::sprite::{SPRITE_FLAG_NO_SHADOW_CAST, SPRITE_FLAG_NO_SHADOW_RECEIVE};
+        let other = 1u32 << 2; // an unrelated flag bit must survive every call
+        let mut f = other;
+        apply_shadow_flags(&mut f, true, true); // both on ⇒ no NO_* bits
+        assert_eq!(f & SPRITE_FLAG_NO_SHADOW_CAST, 0);
+        assert_eq!(f & SPRITE_FLAG_NO_SHADOW_RECEIVE, 0);
+        apply_shadow_flags(&mut f, false, true); // no cast
+        assert_ne!(f & SPRITE_FLAG_NO_SHADOW_CAST, 0);
+        assert_eq!(f & SPRITE_FLAG_NO_SHADOW_RECEIVE, 0);
+        apply_shadow_flags(&mut f, true, false); // no receive
+        assert_eq!(f & SPRITE_FLAG_NO_SHADOW_CAST, 0);
+        assert_ne!(f & SPRITE_FLAG_NO_SHADOW_RECEIVE, 0);
+        apply_shadow_flags(&mut f, false, false); // neither
+        assert_ne!(f & SPRITE_FLAG_NO_SHADOW_CAST, 0);
+        assert_ne!(f & SPRITE_FLAG_NO_SHADOW_RECEIVE, 0);
+        assert_eq!(f & other, other, "unrelated bit preserved throughout");
     }
 
     #[test]
