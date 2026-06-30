@@ -16,7 +16,7 @@ categories = ["game-development", "graphics", "rendering::engine"]
 # The .vxl/.kv6/.kfa parsers + edit API + sprite types this crate's
 # renderer and lighting consume. Path used during local development;
 # version is what cargo publish records for downstream resolution.
-roxlap-formats = { path = "../roxlap-formats", version = "0.19" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.20" }
 
 # rayon's par_iter for the parallel DDA render bands + the world-voxel
 # lighting bake. Single-threaded callers skip the parallel branch; rayon's

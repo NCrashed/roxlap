@@ -714,12 +714,7 @@ fn hud_panel(
 /// RP.3 — the live render-pipeline panel (top-right). Mutates `p` in place;
 /// the caller diffs it against the previous state and pushes any change to the
 /// renderer. `logical`/`march` are shown for orientation.
-fn pipeline_panel(
-    ctx: &egui::Context,
-    p: &mut PipelineUi,
-    logical: (u32, u32),
-    march: (u32, u32),
-) {
+fn pipeline_panel(ctx: &egui::Context, p: &mut PipelineUi, logical: (u32, u32), march: (u32, u32)) {
     egui::Window::new("Render pipeline")
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
         .default_open(false)

@@ -2131,7 +2131,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "roxlap-cave-demo"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "glam",
  "roxlap-cavegen",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-cave-web"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "console_error_panic_hook",
  "glam",
@@ -2161,14 +2161,14 @@ dependencies = [
 
 [[package]]
 name = "roxlap-cavegen"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "roxlap-formats",
 ]
 
 [[package]]
 name = "roxlap-core"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "flate2",
  "rayon",
@@ -2177,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-formats"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "flate2",
  "gif",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-gpu"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "bytemuck",
  "egui",
@@ -2204,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-host"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "flate2",
  "png 0.17.16",
@@ -2217,7 +2217,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-render"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "bytemuck",
  "egui",
@@ -2236,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-scene"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "bincode",
  "crossbeam-channel",
@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-scene-demo"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "egui",
  "egui-winit",
@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-sdl-demo"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "glam",
  "raw-window-handle",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-web"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "console_error_panic_hook",
  "glam",
