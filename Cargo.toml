@@ -36,6 +36,10 @@ miniz_oxide = "0.8"
 # (roxlap-formats `gif_import`, behind its `gif` feature). Pure-Rust
 # (weezl LZW + color_quant), no native build deps.
 gif = "0.13"
+# BB — PNG / APNG decoder + encoder for the billboard-sprite importer
+# (roxlap-formats `png_import`, behind its `png` feature). Pure-Rust
+# (miniz_oxide), no native build deps; matches the host's sky-PNG dep.
+png = "0.17"
 # R12 multicore rendering — rayon's work-stealing pool, par_iter, and
 # join cover every parallelism axis we need (per-quadrant in R12.2,
 # per-tile in R12.3, per-column lighting bake in R12.4). Declared

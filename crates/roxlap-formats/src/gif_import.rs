@@ -28,30 +28,11 @@
 //! on the clip instance (`set_sprite_instance_material`) — so the importer
 //! stays a pure geometry bridge.
 
-use crate::voxel_clip::{occ_words_per_col, LoopMode, VoxelClip, VoxelFrame};
+use crate::slab;
+use crate::voxel_clip::{LoopMode, VoxelClip, VoxelFrame};
 
-/// Where the clip's pivot sits in the slab (the point that maps to the
-/// instance's world position). `z = 0` is the bottom of the image.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Pivot {
-    /// Bottom-centre — feet on the ground (the Doom-sprite default).
-    BottomCenter,
-    /// Geometric centre of the slab.
-    Center,
-    /// An explicit pivot in voxel units.
-    Custom([f32; 3]),
-}
-
-impl Pivot {
-    fn resolve(self, dims: [u32; 3]) -> [f32; 3] {
-        let (w, t, h) = (dims[0] as f32, dims[1] as f32, dims[2] as f32);
-        match self {
-            Self::BottomCenter => [w * 0.5, t * 0.5, 0.0],
-            Self::Center => [w * 0.5, t * 0.5, h * 0.5],
-            Self::Custom(p) => p,
-        }
-    }
-}
+/// Re-exported from [`crate::slab`] — where the clip's pivot sits in the slab.
+pub use crate::slab::Pivot;
 
 /// Options for [`voxel_clip_from_gif`].
 #[derive(Debug, Clone)]
@@ -190,7 +171,9 @@ pub fn voxel_clip_from_gif(
             }
         }
 
-        frames.push(voxelize_canvas(&canvas, lw, lh, thickness));
+        // GIF transparency is 1-bit (alpha 0 or 255), so cutoff 1 = "any
+        // non-transparent pixel is solid".
+        frames.push(slab::voxelize_rgba(&canvas, lw, lh, thickness, 1));
         let delay_ms = (frame.delay as u32).saturating_mul(10);
         durations.push(if delay_ms == 0 {
             opts.default_frame_ms
@@ -229,10 +212,9 @@ pub fn voxel_clip_from_gif(
         return Err(GifImportError::Empty);
     }
 
-    let pivot = opts.pivot.resolve(dims);
-    Ok(VoxelClip::from_frames_auto(
+    Ok(slab::assemble_clip(
         dims,
-        pivot,
+        opts.pivot,
         opts.voxel_world_size,
         opts.loop_mode,
         &frames,
@@ -240,61 +222,6 @@ pub fn voxel_clip_from_gif(
         opts.default_frame_ms,
         opts.keyframe_gap,
     ))
-}
-
-/// Voxelize one composited RGBA canvas (`lw × lh`) into a flat
-/// `[lw, thickness, lh]` [`VoxelFrame`]. Column order is x-fastest then
-/// depth (`col = x + depth·lw`), z ascending within a column.
-#[allow(clippy::cast_possible_truncation)]
-fn voxelize_canvas(canvas: &[u8], lw: usize, lh: usize, thickness: u32) -> VoxelFrame {
-    let dims = [lw as u32, thickness, lh as u32];
-    let owpc = occ_words_per_col(dims) as usize;
-
-    // Per image column x: ascending-z (z, colour) runs. The same content is
-    // reused for every depth layer (a straight extrusion along +y).
-    let mut img_col: Vec<Vec<(u32, u32)>> = vec![Vec::new(); lw];
-    for row in 0..lh {
-        let z = (lh - 1 - row) as u32; // top image row → highest z
-        for (x, run) in img_col.iter_mut().enumerate() {
-            let i = (row * lw + x) * 4;
-            if canvas[i + 3] == 0 {
-                continue; // transparent ⇒ cutout
-            }
-            let mut rgb = (u32::from(canvas[i]) << 16)
-                | (u32::from(canvas[i + 1]) << 8)
-                | u32::from(canvas[i + 2]);
-            if rgb == 0 {
-                rgb = 0x0001_0101; // avoid the air/empty sentinel (rgb == 0)
-            }
-            run.push((z, 0x8000_0000 | rgb));
-        }
-    }
-    for run in &mut img_col {
-        run.sort_unstable_by_key(|&(z, _)| z);
-    }
-
-    let cols = lw * thickness as usize;
-    let mut occupancy = vec![0u32; cols * owpc];
-    let mut colors: Vec<u32> = Vec::new();
-    let mut color_offsets: Vec<u32> = Vec::with_capacity(cols + 1);
-    color_offsets.push(0);
-    for depth in 0..thickness as usize {
-        for (x, run) in img_col.iter().enumerate() {
-            let col = x + depth * lw;
-            for &(z, c) in run {
-                let zi = z as usize;
-                occupancy[col * owpc + zi / 32] |= 1u32 << (zi % 32);
-                colors.push(c);
-            }
-            color_offsets.push(colors.len() as u32);
-        }
-    }
-
-    VoxelFrame {
-        occupancy,
-        colors,
-        color_offsets,
-    }
 }
 
 #[cfg(test)]

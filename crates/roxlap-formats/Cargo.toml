@@ -21,10 +21,15 @@ miniz_oxide = { workspace = true }
 # (`gif_import`). Pure-Rust (weezl LZW); behind the `gif` feature so the
 # core format crate stays dependency-light when unused.
 gif = { workspace = true, optional = true }
+# BB — optional PNG / APNG decoder for the billboard-sprite importer
+# (`png_import`). Pure-Rust (miniz_oxide backend); behind the `png` feature.
+png = { workspace = true, optional = true }
 
 [features]
 # BB.0 — animated-GIF → VoxelClip importer (`gif_import` module).
 gif = ["dep:gif"]
+# BB — PNG-sequence / APNG → VoxelClip importer (`png_import` module).
+png = ["dep:png"]
 
 [dev-dependencies]
 # R2.3: oracle.vxl.gz fixture is the procedurally-built world voxlaptest

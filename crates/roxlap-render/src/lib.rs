@@ -54,13 +54,13 @@ pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 /// (stage BB). Behind the `gif` feature; see `PORTING-BILLBOARD.md`.
 #[cfg(feature = "gif")]
 pub use roxlap_formats::gif_import;
+pub use roxlap_formats::kfa::KfaSprite;
+pub use roxlap_formats::kv6::Kv6;
+pub use roxlap_formats::material::{BlendMode, Material};
 /// PNG-sequence / APNG → [`VoxelClip`] importer (stage BB). Behind the `png`
 /// feature; see `PORTING-BILLBOARD.md`.
 #[cfg(feature = "png")]
 pub use roxlap_formats::png_import;
-pub use roxlap_formats::kfa::KfaSprite;
-pub use roxlap_formats::kv6::Kv6;
-pub use roxlap_formats::material::{BlendMode, Material};
 pub use roxlap_formats::sprite::Sprite;
 pub use roxlap_formats::voxel_clip::{
     DecodeError, DecodedClip, LoopMode, StreamingClip, VoxelClip, VoxelFrame,

@@ -2182,6 +2182,7 @@ dependencies = [
  "flate2",
  "gif",
  "miniz_oxide",
+ "png 0.17.16",
 ]
 
 [[package]]

@@ -50,8 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (**emissive** — the colour at full intensity, ignoring lighting; the right
     look for glows like fire/spell auras). Both backends (`shade_sprite_lit`
     WGSL + the CPU `shade_dynamic_mode` at both sprite shade sites); set via
-    `set_sprite_instance_lighting` / `BillboardActorDef::lighting`.
+    `set_sprite_instance_lighting` / `BillboardActorDef::lighting`. Also
+    `set_actor_lighting` to change a `BillboardActor`'s mode at runtime.
     `FaceNormal` is byte-identical to the prior look.
+  - **PNG / APNG importer** (`png_import`, `png` feature on `roxlap-formats` /
+    re-exported from `roxlap-render`) — the truecolor counterpart of
+    `gif_import`: `voxel_clip_from_png_frames` (a sequence of independent PNG
+    files, same size) and `voxel_clip_from_apng` (a single animated PNG, with
+    dispose/blend compositing). PNG's 8-bit alpha is resolved as a cutout at a
+    configurable `alpha_cutoff`. The voxelization core is shared with
+    `gif_import` (`slab` module).
 - **Per-instance sprite RGB tint** — each sprite instance carries a packed
   `0x00RRGGBB` tint that multiplies its voxel colours (per channel), so
   instances of one model can be recoloured cheaply. `0x00FF_FFFF` (white, the

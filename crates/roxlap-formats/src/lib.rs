@@ -39,6 +39,14 @@ pub mod kvx;
 /// + `PORTING-TRANSPARENCY.md`.
 pub mod material;
 pub mod palette;
+/// PNG-sequence / APNG → [`voxel_clip::VoxelClip`] importer for billboard
+/// sprites (stage BB). Feature-gated behind `png`; see [`png_import`].
+#[cfg(feature = "png")]
+pub mod png_import;
+/// Shared image → flat-voxel-slab voxelization for the billboard importers
+/// (BB). Internal; the `gif`/`png` decoders feed composited RGBA frames in.
+#[cfg(any(feature = "gif", feature = "png"))]
+mod slab;
 pub mod sprite;
 /// Animated voxel-sprite clips (`.rvc`) — keyframe + diff "GIF/MP4 for
 /// voxel models" for effects (flame, spells). Frames use the GPU sprite
