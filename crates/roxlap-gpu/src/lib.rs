@@ -649,6 +649,9 @@ pub struct GpuRenderer {
     /// UI pass between the marcher and present. `None` between present
     /// and the next render.
     pending_frame: Option<(wgpu::SurfaceTexture, wgpu::TextureView)>,
+    /// PF.4 — persistent per-frame camera/light buffers + cached scene and
+    /// sprite bind groups. Lazily built on the first `render_scene`.
+    frame_pack: Option<FramePackBuffers>,
     /// Lazy-built debug-line pipeline (L3.2) — built on the first
     /// [`Self::draw_lines_deferred`] call.
     line_resources: Option<LineResources>,
@@ -751,6 +754,187 @@ struct SceneDdaResources {
     /// sprites). `sprite_cast_count == 0` keeps the shader from indexing it.
     /// `None` on non-capable devices (those bindings aren't in the BGL).
     sprite_cast_dummy: Option<wgpu::Buffer>,
+}
+
+/// PF.4 — persistent per-frame pack state for `render_scene`: the per-grid
+/// camera + point-light storage buffers (previously `create_buffer_init`-ed
+/// EVERY frame, which also forced rebuilding the 22/23-entry bind groups
+/// every frame) plus the cached bind groups themselves.
+///
+/// Buffers are grow-only (pow2, like `line_vbuf`) with `COPY_DST`, updated
+/// via `queue.write_buffer`; wgpu zero-initialises fresh buffers, so the
+/// empty-scene "one zeroed element" padding of the old path is implicit.
+/// The shaders only index `0..grid_count` / `0..count*grid_count`, so stale
+/// bytes past the current write are never read.
+///
+/// Bind groups are cached against the exact resources they bound (wgpu 23+
+/// resources compare by identity): any regrow, scene-resident swap,
+/// `scene_dda` rebuild, sky replacement, or sprite-registry buffer growth
+/// changes some handle and misses the cache — no manual event tracking.
+struct FramePackBuffers {
+    grid_cameras: wgpu::Buffer,
+    grid_cameras_cap: u64,
+    point_lights: wgpu::Buffer,
+    point_lights_cap: u64,
+    /// World-space lights for the sprite pass (binding 15 there).
+    sprite_lights: wgpu::Buffer,
+    sprite_lights_cap: u64,
+    dda_bg: Option<CachedBindGroup>,
+    sprite_bg: Option<CachedBindGroup>,
+}
+
+/// A cached bind group plus the exact resources it bound, in binding order.
+/// Cheap to compare (identity) and to clone (refcounts).
+struct CachedBindGroup {
+    bufs: Vec<(u32, wgpu::Buffer)>,
+    views: Vec<(u32, wgpu::TextureView)>,
+    bg: wgpu::BindGroup,
+}
+
+impl FramePackBuffers {
+    fn new(device: &wgpu::Device) -> Self {
+        let mk = |label: &str, cap: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        // Seed capacities: a few grids' cameras / a few dozen lights — most
+        // scenes never regrow past these.
+        let cam_cap = 4 * 144;
+        let light_cap = 4096;
+        Self {
+            grid_cameras: mk("roxlap-gpu scene_dda.grid_cameras", cam_cap),
+            grid_cameras_cap: cam_cap,
+            point_lights: mk("roxlap-gpu scene_dda.grid_point_lights", light_cap),
+            point_lights_cap: light_cap,
+            sprite_lights: mk("roxlap-gpu sprite_model_dda.point_lights", light_cap),
+            sprite_lights_cap: light_cap,
+            dda_bg: None,
+            sprite_bg: None,
+        }
+    }
+
+    /// Write `bytes` into the selected persistent buffer, regrowing (pow2)
+    /// when capacity is exceeded. Regrowth replaces the buffer handle, which
+    /// the bind-group cache detects by identity on its next lookup.
+    fn write_grow(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buf: &mut wgpu::Buffer,
+        cap: &mut u64,
+        label: &str,
+        bytes: &[u8],
+    ) {
+        let needed = bytes.len() as u64;
+        if needed > *cap {
+            let new_cap = needed.next_power_of_two();
+            *buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: new_cap,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            *cap = new_cap;
+        }
+        if !bytes.is_empty() {
+            queue.write_buffer(buf, 0, bytes);
+        }
+    }
+
+    fn write_cameras(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cams: &[SceneDdaPerGridCamera],
+    ) {
+        Self::write_grow(
+            device,
+            queue,
+            &mut self.grid_cameras,
+            &mut self.grid_cameras_cap,
+            "roxlap-gpu scene_dda.grid_cameras",
+            bytemuck::cast_slice(cams),
+        );
+    }
+
+    fn write_point_lights(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        lights: &[GpuPointLight],
+    ) {
+        Self::write_grow(
+            device,
+            queue,
+            &mut self.point_lights,
+            &mut self.point_lights_cap,
+            "roxlap-gpu scene_dda.grid_point_lights",
+            bytemuck::cast_slice(lights),
+        );
+    }
+
+    fn write_sprite_lights(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        lights: &[GpuPointLight],
+    ) {
+        Self::write_grow(
+            device,
+            queue,
+            &mut self.sprite_lights,
+            &mut self.sprite_lights_cap,
+            "roxlap-gpu sprite_model_dda.point_lights",
+            bytemuck::cast_slice(lights),
+        );
+    }
+}
+
+/// PF.4 — return the cached bind group when it bound exactly `bufs` +
+/// `views` (identity compare), else build + cache a fresh one.
+/// `samplers` are bound but NOT part of the key: every sampler we bind
+/// (`sky_sampler`) is created once at init and never replaced
+/// (`set_sky_panorama` swaps the texture + view only).
+fn cached_bind_group<'a>(
+    slot: &'a mut Option<CachedBindGroup>,
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::BindGroupLayout,
+    bufs: Vec<(u32, wgpu::Buffer)>,
+    views: Vec<(u32, wgpu::TextureView)>,
+    samplers: &[(u32, &wgpu::Sampler)],
+) -> &'a wgpu::BindGroup {
+    let hit = slot
+        .as_ref()
+        .is_some_and(|c| c.bufs == bufs && c.views == views);
+    if !hit {
+        let mut entries: Vec<wgpu::BindGroupEntry> = bufs
+            .iter()
+            .map(|(binding, b)| wgpu::BindGroupEntry {
+                binding: *binding,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        entries.extend(views.iter().map(|(binding, v)| wgpu::BindGroupEntry {
+            binding: *binding,
+            resource: wgpu::BindingResource::TextureView(v),
+        }));
+        entries.extend(samplers.iter().map(|&(binding, s)| wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::Sampler(s),
+        }));
+        entries.sort_by_key(|e| e.binding);
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &entries,
+        });
+        *slot = Some(CachedBindGroup { bufs, views, bg });
+    }
+    &slot.as_ref().expect("just cached").bg
 }
 
 /// GPU.10.0 — single-sprite model-DDA pipeline: one thread per pixel
@@ -985,17 +1169,18 @@ fn upload_grid_point_lights(device: &wgpu::Device, lights: &[GpuPointLight]) -> 
 
 /// DL — pack `lights` for the scene-DDA pass, shared by the surface and
 /// headless paths. Injects each grid's sun direction into
-/// `cam_vec[g].sun_dir` (binding 15), builds the grid-major point-light
-/// buffer (binding 18), and returns `(point_light_buffer, sun_flags,
-/// point_count)`. `sun_flags`: bit0 = sun enabled, bit1 = sun casts shadow,
+/// `cam_vec[g].sun_dir` (binding 15), packs the grid-major point-light
+/// rows (binding 18), and returns `(packed_lights, sun_flags,
+/// point_count)`. PF.4 — packing only; the caller uploads (the surface
+/// path into a persistent buffer, headless via `create_buffer_init`).
+/// `sun_flags`: bit0 = sun enabled, bit1 = sun casts shadow,
 /// bit2 = dynamic lighting active. Over-cap point lights are dropped with a
 /// warning (never silently truncated).
 fn pack_scene_lights(
-    device: &wgpu::Device,
     lights: &SceneLights,
     grid_count: usize,
     cam_vec: &mut [SceneDdaPerGridCamera],
-) -> (wgpu::Buffer, u32, u32) {
+) -> (Vec<GpuPointLight>, u32, u32) {
     let sun_enabled = !lights.grid_sun_dirs.is_empty();
     if sun_enabled {
         for (g, cam) in cam_vec.iter_mut().enumerate() {
@@ -1061,11 +1246,10 @@ fn pack_scene_lights(
             }));
         }
     }
-    let buf = upload_grid_point_lights(device, &packed);
     let sun_flags = u32::from(sun_enabled)
         | (u32::from(sun_enabled && lights.sun_casts_shadow) << 1)
         | (u32::from(lights.enabled) << 2);
-    (buf, sun_flags, point_count as u32)
+    (packed, sun_flags, point_count as u32)
 }
 
 /// Build the per-grid camera storage buffer bound at `scene_dda.wgsl`
@@ -1561,6 +1745,7 @@ impl GpuRenderer {
             scene_lights: SceneLights::default(),
             last_fov_y_rad: 0.0,
             pending_frame: None,
+            frame_pack: None,
             line_resources: None,
             line_vbuf: None,
             line_vbuf_cap: 0,
@@ -2561,16 +2746,20 @@ impl GpuRenderer {
 
         // DL — pack the per-frame lights (already grid-local). The per-grid
         // sun direction rides in each `PerGridCamera.sun_dir` (binding 15);
-        // point lights go in one new storage buffer (binding 18). All-zero
+        // point lights go in one storage buffer (binding 18). All-zero
         // ⇒ the pre-DL render. Shared with the headless path.
-        let lights = self.scene_lights.clone();
-        let (grid_point_lights, sun_flags, point_count) = pack_scene_lights(
-            &self.device,
-            &lights,
-            scene.grid_count as usize,
-            &mut cam_vec,
-        );
-        let grid_cameras = upload_grid_cameras(&self.device, &cam_vec);
+        // PF.4 — pack CPU-side (no clone of `scene_lights`), then write into
+        // the persistent grow-only buffers instead of `create_buffer_init`-ing
+        // fresh ones (which also forced a bind-group rebuild) every frame.
+        if self.frame_pack.is_none() {
+            self.frame_pack = Some(FramePackBuffers::new(&self.device));
+        }
+        let lights = &self.scene_lights;
+        let (packed_lights, sun_flags, point_count) =
+            pack_scene_lights(lights, scene.grid_count as usize, &mut cam_vec);
+        let fp = self.frame_pack.as_mut().expect("just built");
+        fp.write_cameras(&self.device, &self.queue, &cam_vec);
+        fp.write_point_lights(&self.device, &self.queue, &packed_lights);
 
         let uniform = SceneDdaUniform {
             fov_y_rad,
@@ -2640,87 +2829,28 @@ impl GpuRenderer {
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 
-        let mut dda_entries = vec![
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: dda.uniform_buf.as_entire_binding(),
-            },
-            // Occupancy page 0 at binding 1; pages 1..MAX_OCC_PAGES
-            // at bindings 12.. (see GPU.X occupancy paging).
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: scene.occupancy_pages[0].as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: scene.all_color_offsets.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: scene.all_colors.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: scene.all_chunk_colors_base.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: scene.all_chunk_occupancy.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: scene.grid_static_meta.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: scene.all_slot_chunk_idx.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 8,
-                resource: dda.framebuffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: wgpu::BindingResource::TextureView(&self.sky_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 10,
-                resource: wgpu::BindingResource::Sampler(&self.sky_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 11,
-                resource: dda.depth_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 12,
-                resource: scene.occupancy_pages[1].as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 13,
-                resource: scene.occupancy_pages[2].as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 14,
-                resource: scene.occupancy_pages[3].as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 15,
-                resource: grid_cameras.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 16,
-                resource: dda.materials_pal_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 17,
-                resource: dda.terrain_map_buf.as_entire_binding(),
-            },
-            // DL — per-grid point lights (18). The per-grid sun dir
-            // rides in PerGridCamera.sun_dir (binding 15).
-            wgpu::BindGroupEntry {
-                binding: 18,
-                resource: grid_point_lights.as_entire_binding(),
-            },
+        // PF.4 — cached bind group, keyed on the exact resources bound.
+        // Occupancy page 0 at binding 1; pages 1..MAX_OCC_PAGES at 12..
+        // (GPU.X paging). Per-grid point lights at 18 (DL); the per-grid
+        // sun dir rides in PerGridCamera.sun_dir (binding 15).
+        let mut dda_bufs: Vec<(u32, wgpu::Buffer)> = vec![
+            (0, dda.uniform_buf.clone()),
+            (1, scene.occupancy_pages[0].clone()),
+            (2, scene.all_color_offsets.clone()),
+            (3, scene.all_colors.clone()),
+            (4, scene.all_chunk_colors_base.clone()),
+            (5, scene.all_chunk_occupancy.clone()),
+            (6, scene.grid_static_meta.clone()),
+            (7, scene.all_slot_chunk_idx.clone()),
+            (8, dda.framebuffer.clone()),
+            (11, dda.depth_buffer.clone()),
+            (12, scene.occupancy_pages[1].clone()),
+            (13, scene.occupancy_pages[2].clone()),
+            (14, scene.occupancy_pages[3].clone()),
+            (15, fp.grid_cameras.clone()),
+            (16, dda.materials_pal_buf.clone()),
+            (17, dda.terrain_map_buf.clone()),
+            (18, fp.point_lights.clone()),
         ];
         // XS.4.3 — sprite-cast bindings (19..21). On a capable device the BGL
         // has them, so bind the sprite registry when present (terrain shadow
@@ -2734,24 +2864,20 @@ impl GpuRenderer {
                 Some(reg) => (&reg.instances, &reg.model_meta, &reg.occupancy),
                 None => (dummy, dummy, dummy),
             };
-            dda_entries.push(wgpu::BindGroupEntry {
-                binding: 19,
-                resource: insts.as_entire_binding(),
-            });
-            dda_entries.push(wgpu::BindGroupEntry {
-                binding: 20,
-                resource: models.as_entire_binding(),
-            });
-            dda_entries.push(wgpu::BindGroupEntry {
-                binding: 21,
-                resource: occ.as_entire_binding(),
-            });
+            dda_bufs.push((19, insts.clone()));
+            dda_bufs.push((20, models.clone()));
+            dda_bufs.push((21, occ.clone()));
         }
-        let dda_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("roxlap-gpu scene_dda.bg"),
-            layout: &dda.bgl_dda,
-            entries: &dda_entries,
-        });
+        let dda_bg = cached_bind_group(
+            &mut fp.dda_bg,
+            &self.device,
+            "roxlap-gpu scene_dda.bg",
+            &dda.bgl_dda,
+            dda_bufs,
+            vec![(9, self.sky_view.clone())],
+            &[(10, &self.sky_sampler)],
+        )
+        .clone();
 
         // GPU.9 — when sprites are present, build both splatter bind
         // groups up front (the splat pass writes the key buffer; the
@@ -2787,7 +2913,8 @@ impl GpuRenderer {
                     })
                     .collect();
                 let sprite_point_count = sprite_pts.len() as u32;
-                let sprite_point_buf = upload_grid_point_lights(&self.device, &sprite_pts);
+                // PF.4 — persistent buffer instead of a per-frame allocation.
+                fp.write_sprite_lights(&self.device, &self.queue, &sprite_pts);
                 // sun_flags bit0 = sun enabled, bit1 = sun casts shadow (XS.4.2),
                 // bit2 = dynamic lighting active.
                 let sprite_sun_flags = u32::from(sprite_sun_enabled)
@@ -2849,69 +2976,25 @@ impl GpuRenderer {
                 };
                 self.queue
                     .write_buffer(&smd.uniform_buf, 0, bytemuck::bytes_of(&uni));
-                let mut sprite_entries = vec![
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: smd.uniform_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: reg.occupancy.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: reg.colors.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: reg.color_offsets.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: reg.model_meta.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: reg.instances.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: dda.depth_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: dda.framebuffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: reg.tile_ranges.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 9,
-                        resource: reg.tile_instances.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 10,
-                        resource: reg.dirs.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 11,
-                        resource: reg.colmul.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 12,
-                        resource: smd.materials_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 13,
-                        resource: reg.materials_vox.as_entire_binding(),
-                    },
-                    // DL.7 — world point lights (15). (Binding 14 univec
-                    // normal table dropped — face-normal lighting now.)
-                    wgpu::BindGroupEntry {
-                        binding: 15,
-                        resource: sprite_point_buf.as_entire_binding(),
-                    },
+                // PF.4 — cached bind group (identity-keyed, like the scene
+                // pass's). World point lights at 15 (DL.7; binding 14 univec
+                // normal table dropped — face-normal lighting now).
+                let mut sprite_bufs: Vec<(u32, wgpu::Buffer)> = vec![
+                    (0, smd.uniform_buf.clone()),
+                    (1, reg.occupancy.clone()),
+                    (2, reg.colors.clone()),
+                    (3, reg.color_offsets.clone()),
+                    (4, reg.model_meta.clone()),
+                    (5, reg.instances.clone()),
+                    (6, dda.depth_buffer.clone()),
+                    (7, dda.framebuffer.clone()),
+                    (8, reg.tile_ranges.clone()),
+                    (9, reg.tile_instances.clone()),
+                    (10, reg.dirs.clone()),
+                    (11, reg.colmul.clone()),
+                    (12, smd.materials_buf.clone()),
+                    (13, reg.materials_vox.clone()),
+                    (15, fp.sprite_lights.clone()),
                 ];
                 // XS.4.2 — when capable, bind the terrain occupancy set (the
                 // same resident buffers + the per-frame grid cameras the scene
@@ -2926,20 +3009,24 @@ impl GpuRenderer {
                         (20, &scene.all_chunk_occupancy),
                         (21, &scene.all_slot_chunk_idx),
                         (22, &scene.grid_static_meta),
-                        (23, &grid_cameras),
+                        (23, &fp.grid_cameras),
                     ];
                     for (binding, buf) in terrain {
-                        sprite_entries.push(wgpu::BindGroupEntry {
-                            binding,
-                            resource: buf.as_entire_binding(),
-                        });
+                        sprite_bufs.push((binding, buf.clone()));
                     }
                 }
-                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("roxlap-gpu sprite_model_dda.bg"),
-                    layout: &smd.bgl,
-                    entries: &sprite_entries,
-                }))
+                Some(
+                    cached_bind_group(
+                        &mut fp.sprite_bg,
+                        &self.device,
+                        "roxlap-gpu sprite_model_dda.bg",
+                        &smd.bgl,
+                        sprite_bufs,
+                        Vec::new(),
+                        &[],
+                    )
+                    .clone(),
+                )
             }
             _ => None,
         };
@@ -4940,8 +5027,9 @@ impl HeadlessSceneRenderer {
         // and builds the point-light buffer (binding 18). Shared with the
         // surface path.
         let dl = self.lights.clone();
-        let (dummy_point_lights, sun_flags, point_count) =
-            pack_scene_lights(device, &dl, scene.grid_count as usize, &mut cam_vec);
+        let (packed_lights, sun_flags, point_count) =
+            pack_scene_lights(&dl, scene.grid_count as usize, &mut cam_vec);
+        let dummy_point_lights = upload_grid_point_lights(device, &packed_lights);
         let grid_cameras = upload_grid_cameras(device, &cam_vec);
         let uniform = SceneDdaUniform {
             fov_y_rad,
