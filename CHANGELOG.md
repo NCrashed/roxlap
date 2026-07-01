@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-actor runtime tint** — `SceneRenderer::set_actor_tint(BillboardActorId, tint)`,
+  the per-actor counterpart to `set_sprite_instance_tint`, routes an
+  `0x00RRGGBB` colour multiply to the actor's clip instance (works on both
+  backends). `0x00FF_FFFF` (white) is a no-op; returns `false` on a stale id.
+
 ## [0.20.0] — 2026-07-01
 
 ### Added

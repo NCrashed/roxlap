@@ -2683,6 +2683,21 @@ impl SceneRenderer {
         true
     }
 
+    /// Tint an actor at runtime — the per-actor counterpart to
+    /// [`set_sprite_instance_tint`](Self::set_sprite_instance_tint), routed to
+    /// its clip instance. `tint` is an `0x00RR_GGBB` colour multiply
+    /// (`0x00FF_FFFF` = white = no-op). Returns `false` on a stale id.
+    pub fn set_actor_tint(&mut self, id: BillboardActorId, tint: u32) -> bool {
+        let Some(idx) = self.actor_map.index(id) else {
+            return false;
+        };
+        let Some(inst) = self.billboard_actors[idx].as_ref().map(|a| a.inst) else {
+            return false;
+        };
+        self.set_sprite_instance_tint(inst, tint);
+        true
+    }
+
     /// Remove an actor and its clip instance. Returns `false` on a stale id.
     pub fn remove_billboard_actor(&mut self, id: BillboardActorId) -> bool {
         let Some(idx) = self.actor_map.index(id) else {
