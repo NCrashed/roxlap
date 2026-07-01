@@ -699,6 +699,102 @@ fn scene_dda_point_light_brightens_by_distance_and_facing() {
     );
 }
 
+/// SL — spot (cone) lights. Same floor-viewed-straight-down setup as the
+/// point-light test. A spot hovering just above the centre and aimed straight
+/// down (on-axis, `cd == 1`, inside the inner cone) must render **identically**
+/// to the equivalent point light — proving the fold passes colour/intensity
+/// and that the cone factor saturates to 1 inside the inner half-angle. The
+/// same spot aimed sideways puts the centre outside the cone, so it masks to
+/// zero and matches the unlit baked baseline (masking + the early-out).
+#[test]
+fn scene_dda_spot_cone_matches_point_on_axis_and_masks_off_axis() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&floor_chunk(vsid)); // floor at z=100
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
+    };
+
+    // Light 2 units above the floor top (z=98 < 100), over the centre (16,16).
+    let pos = [16.0, 16.0, 98.0];
+    // A wide cone: the light sits close to the surface, so the centre pixel's
+    // exact hit is a few degrees off the axis — well inside a 40° inner angle
+    // (cone == 1), while a sideways-aimed copy leaves it ~90° off (masked).
+    let cos_inner = 40f32.to_radians().cos();
+    let cos_outer = 60f32.to_radians().cos();
+    let light = |spot_dir: [f32; 3], ci: f32, co: f32| SceneLights {
+        enabled: true,
+        ambient: [1.0; 3],
+        grid_point_lights: vec![vec![GpuLight {
+            position: pos,
+            radius: 64.0,
+            color: [1.0; 3],
+            intensity: 2.0,
+            casts_shadow: false,
+            spot_dir,
+            cos_inner: ci,
+            cos_outer: co,
+        }]],
+        ..SceneLights::default()
+    };
+
+    let baked = render(&mut renderer); // no lights set yet ⇒ ambient/baked only
+                                       // A pure point light (cone disabled, cos_outer = -1).
+    renderer.set_scene_lights(light([0.0, 0.0, 1.0], -1.0, -1.0));
+    let point = render(&mut renderer);
+    // A real cone aimed straight down (+z) at the floor ⇒ centre on-axis.
+    renderer.set_scene_lights(light([0.0, 0.0, 1.0], cos_inner, cos_outer));
+    let spot_on = render(&mut renderer);
+    // The same cone aimed sideways ⇒ the centre is outside it.
+    renderer.set_scene_lights(light([1.0, 0.0, 0.0], cos_inner, cos_outer));
+    let spot_off = render(&mut renderer);
+
+    assert!(
+        lum(point) > lum(baked),
+        "sanity: the point light must brighten the floor: {baked:#08x} -> {point:#08x}",
+    );
+    assert_eq!(
+        spot_on, point,
+        "on-axis spot (cd=1, inside inner cone) must equal the point light: \
+         {spot_on:#08x} vs {point:#08x}",
+    );
+    assert_eq!(
+        spot_off, baked,
+        "off-cone spot must contribute nothing (masked to zero): \
+         {spot_off:#08x} vs baked {baked:#08x}",
+    );
+}
+
 /// DL.3 — stylized hard shadows. A short wall stands on the floor at x≈16;
 /// the camera looks straight down at the floor point (14,16) — which the
 /// wall does NOT block from above. An angled sun (toward +x and up) is
