@@ -192,8 +192,10 @@ fn voxel_material(m: ModelMeta, vidx: u32, inst_material: u32) -> u32 {
     return inst_material;
 }
 
-fn model_color(m: ModelMeta, p: vec3<i32>, inst_idx: u32) -> vec3<f32> {
-    let vidx = voxel_index(m, p);
+// PF.3 — takes the pre-computed `vidx` (`voxel_index` is a popcount rank
+// scan): the hit sites compute it exactly once and share it with the
+// material lookup / lit path.
+fn model_color(m: ModelMeta, vidx: u32, inst_idx: u32) -> vec3<f32> {
     let packed = colors[vidx];
     let dir = dirs[vidx] & 0xffu;
 
@@ -253,8 +255,8 @@ fn cel_band(x: f32, bands: u32) -> f32 {
 // world voxel centre). No kv6colmul in this path and no sprite shadows
 // (deferred). Used only when `sun_flags` bit 2 is set; else the marcher keeps
 // `model_color` (flat / kv6colmul), unchanged.
-fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f32>, t_hit: f32, n_model: vec3<f32>) -> vec3<f32> {
-    let vidx = voxel_index(m, p);
+// PF.3 — `vidx` is pre-computed by the hit site (single rank scan per hit).
+fn shade_sprite_lit(m: ModelMeta, vidx: u32, p: vec3<i32>, inst: Instance, ray_dir: vec3<f32>, t_hit: f32, n_model: vec3<f32>) -> vec3<f32> {
     let packed = colors[vidx];
     let albedo = vec3<f32>(
         f32((packed >> 16u) & 0xffu),
@@ -325,10 +327,15 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
     }
 
     for (var i: u32 = 0u; i < u.point_light_count; i = i + 1u) {
-        let pl = point_lights[i];
-        let d3 = pl.pos - sample;
-        let dist = length(d3);
-        if (dist < pl.radius && dist > 1e-4) {
+        // PF.3 (G5) — cheap radius reject first: read only pos+radius (16 B,
+        // not the whole 64-B light), squared-distance compare (no sqrt).
+        let lpos = point_lights[i].pos;
+        let lrad = point_lights[i].radius;
+        let d3 = lpos - sample;
+        let d2 = dot(d3, d3);
+        if (d2 < lrad * lrad && d2 > 1e-8) {
+            let pl = point_lights[i];
+            let dist = sqrt(d2);
             let l = d3 / dist;
             let ndl = max(0.0, dot(n_world, l));
             // SL — spot cone mask (1.0 for a pure point light); computed
@@ -337,13 +344,15 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
             if (ndl > 0.0 && cone > 0.0) {
                 var sh = 1.0;
                 if (recv && pl.casts_shadow != 0u) {
-                    let to_light = pl.pos - shadow_origin_w;
-                    let mt = length(to_light);
-                    if (mt > 1e-4 && shadow_occluded_world(shadow_origin_w, to_light / mt, mt)) {
+                    // PF.3 — `origin + t·(to_light/dist)` lands exactly on the
+                    // light at `t == dist`, so `dist` replaces the old
+                    // `length(to_light)` (one sqrt saved per caster).
+                    let to_light = lpos - shadow_origin_w;
+                    if (shadow_occluded_world(shadow_origin_w, to_light / dist, dist)) {
                         sh = in_shadow;
                     }
                 }
-                var f = ndl * point_falloff(dist, pl.radius) * cone * sh;
+                var f = ndl * point_falloff(dist, lrad) * cone * sh;
                 if (styled) { f = cel_band(f, u.style_bands); }
                 lit = lit + albedo * pl.color * pl.intensity * f;
             }
@@ -409,6 +418,7 @@ fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32)
             if (t_hit < limit) {
                 res.hit = true;
                 res.t = t_hit;
+                let vidx = voxel_index(m, p); // PF.3 — one rank scan per hit
                 // DL.4/DL.7 — lit path when dynamic lighting is active; else the
                 // unchanged flat/kv6colmul colour. The model-local face normal
                 // points back toward the ray on the crossed axis.
@@ -417,9 +427,9 @@ fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32)
                     if (hit_axis == 0) { n_model.x = -f32(step.x); }
                     else if (hit_axis == 1) { n_model.y = -f32(step.y); }
                     else { n_model.z = -f32(step.z); }
-                    res.color = shade_sprite_lit(m, p, inst, ray_dir, t_hit, n_model);
+                    res.color = shade_sprite_lit(m, vidx, p, inst, ray_dir, t_hit, n_model);
                 } else {
-                    res.color = model_color(m, p, inst_idx);
+                    res.color = model_color(m, vidx, inst_idx);
                 }
                 res.color = apply_tint(res.color, inst.tint);
             }
@@ -523,9 +533,9 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
                 if (hit_axis == 0) { n_model.x = -f32(step.x); }
                 else if (hit_axis == 1) { n_model.y = -f32(step.y); }
                 else { n_model.z = -f32(step.z); }
-                lc = shade_sprite_lit(m, p, inst, ray_dir, t_hit, n_model);
+                lc = shade_sprite_lit(m, vidx, p, inst, ray_dir, t_hit, n_model);
             } else {
-                lc = model_color(m, p, inst_idx);
+                lc = model_color(m, vidx, inst_idx);
             }
             lc = apply_tint(lc, inst.tint);
             if (mm.mode == 0u) {

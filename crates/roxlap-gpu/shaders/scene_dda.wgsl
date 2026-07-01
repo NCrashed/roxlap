@@ -314,8 +314,10 @@ fn voxel_packed_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> u32 {
         + chunk_local_offset + color_index];
 }
 
-fn voxel_color_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>, face_shade: f32) -> vec3<f32> {
-    let packed = voxel_packed_in(g, meta_id, mip, p_voxel);
+// PF.3 — takes the pre-fetched packed voxel colour: the hit site fetches it
+// exactly once (`voxel_packed_in` is a popcount rank scan of up to 8 occ
+// words + 3 dependent loads) and shares it with the material lookup.
+fn voxel_color_in(packed: u32, face_shade: f32) -> vec3<f32> {
     let a = f32((packed >> 24u) & 0xffu);
     let r = f32((packed >> 16u) & 0xffu);
     let g_chan = f32((packed >> 8u) & 0xffu);
@@ -656,9 +658,7 @@ fn cel_band(x: f32, bands: u32) -> f32 {
 // lighting is active (`sun_flags` bit 2); else `voxel_color_in` verbatim.
 fn shade_lit(
     g: u32,
-    meta_id: u32,
-    mip: u32,
-    p_voxel: vec3<i32>,
+    packed: u32, // PF.3 — pre-fetched by the hit site (single voxel fetch)
     face_shade: f32,
     hit_axis: i32,
     ray_dir: vec3<f32>,
@@ -666,7 +666,6 @@ fn shade_lit(
     vox_center: vec3<f32>,
     t_hit: f32,
 ) -> vec3<f32> {
-    let packed = voxel_packed_in(g, meta_id, mip, p_voxel);
     let a = f32((packed >> 24u) & 0xffu);
     let albedo = vec3<f32>(
         f32((packed >> 16u) & 0xffu),
@@ -731,29 +730,36 @@ fn shade_lit(
     let count = u.point_light_count;
     let base = g * count;
     for (var i: u32 = 0u; i < count; i = i + 1u) {
-        let pl = grid_point_lights[base + i];
-        let d3 = pl.pos - sample;
-        let dist = length(d3);
-        if (dist < pl.radius && dist > 1e-4) {
+        // PF.3 (G5) — cheap radius reject first: read only pos+radius (16 B,
+        // not the whole 64-B light) and compare SQUARED distances (no sqrt
+        // for the common out-of-range light).
+        let lpos = grid_point_lights[base + i].pos;
+        let lrad = grid_point_lights[base + i].radius;
+        let d3 = lpos - sample;
+        let d2 = dot(d3, d3);
+        if (d2 < lrad * lrad && d2 > 1e-8) {
+            let pl = grid_point_lights[base + i];
+            let dist = sqrt(d2);
             let l = d3 / dist;
             let ndl = max(0.0, dot(n, l));
             // SL — spot cone mask (1.0 for a pure point light). Computed
             // before the shadow march so a spot skips it entirely off-cone.
             let cone = spot_cone(l, pl.spot_dir, pl.cos_inner, pl.cos_outer);
             if (ndl > 0.0 && cone > 0.0) {
-                let atten = point_falloff(dist, pl.radius);
+                let atten = point_falloff(dist, lrad);
                 var sh = 1.0;
                 if (pl.casts_shadow != 0u) {
-                    let to_light = pl.pos - shadow_origin;
-                    let max_t = length(to_light);
-                    if (max_t > 1e-4) {
-                        if (!sow_ready) {
-                            shadow_origin_w = grid_local_to_world(g, shadow_origin);
-                            sow_ready = true;
-                        }
-                        if (shadow_occluded_world(shadow_origin_w, grid_dir_to_world(g, to_light / max_t), max_t, t_hit)) {
-                            sh = in_shadow;
-                        }
+                    // PF.3 — the ray origin is biased off the surface, but the
+                    // parameterisation `origin + t·(to_light/dist)` still lands
+                    // exactly on the light at `t == dist`, so `dist` replaces
+                    // the old `length(to_light)` (one sqrt saved per caster).
+                    let to_light = lpos - shadow_origin;
+                    if (!sow_ready) {
+                        shadow_origin_w = grid_local_to_world(g, shadow_origin);
+                        sow_ready = true;
+                    }
+                    if (shadow_occluded_world(shadow_origin_w, grid_dir_to_world(g, to_light / dist), dist, t_hit)) {
+                        sh = in_shadow;
                     }
                 }
                 var f = ndl * atten * cone * sh;
@@ -811,9 +817,6 @@ fn march_grid(
     let aabb_mn = grid_static_meta[g].aabb_min;
     let aabb_mx = grid_static_meta[g].aabb_max;
     let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z));
-    // World ray length per `t` unit; divided by a voxel's size it turns a
-    // cell's `t` span into its path length in voxel units (Volumetric weight).
-    let ray_dir_len = length(ray_dir);
 
     var p_chunk = vec3<i32>(floor(ray_origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(ray_dir));
@@ -929,6 +932,10 @@ fn march_grid(
                         return finalize_sky_grid(touched, accum, trans, ray_dir);
                     }
                     let shade = side_shade_for(hit_axis, ray_dir);
+                    // PF.3 — ONE voxel fetch per hit (rank scan + 3 dependent
+                    // loads), shared by the shade paths and the material
+                    // lookup (previously fetched twice on translucent scenes).
+                    let packed = voxel_packed_in(g, slot_id, mip, p_voxel);
                     // DL — lit path (ambient + sun + point lights) when
                     // dynamic lighting is active (sun_flags bit 2); else the
                     // baked-only path, byte-identical to pre-DL. The hit
@@ -940,9 +947,9 @@ fn march_grid(
                         // lighting; ignored by the smooth path.
                         let vox_center = chunk_origin_world
                             + (vec3<f32>(p_voxel) + vec3<f32>(0.5)) * vsize;
-                        base_color = shade_lit(g, slot_id, mip, p_voxel, shade, hit_axis, ray_dir, hit_pos, vox_center, t_hit);
+                        base_color = shade_lit(g, packed, shade, hit_axis, ray_dir, hit_pos, vox_center, t_hit);
                     } else {
-                        base_color = voxel_color_in(g, slot_id, mip, p_voxel, shade);
+                        base_color = voxel_color_in(packed, shade);
                     }
                     let lit = apply_fog(base_color, t_hit);
                     if (u.terrain_has_translucent == 0u) {
@@ -952,7 +959,6 @@ fn march_grid(
                         out.color = lit;
                         return out;
                     }
-                    let packed = voxel_packed_in(g, slot_id, mip, p_voxel);
                     let mat_id = terrain_material_id(packed);
                     let mm = materials_pal[mat_id];
                     if (mm.mode == 0u) {
@@ -966,8 +972,10 @@ fn march_grid(
                     if (mm.mode == 3u) {
                         // Volumetric (Beer–Lambert): per-cell opacity weighted
                         // by the ray's path length (voxel units); occludes.
+                        // PF.3 — `ray_dir` is unit (normalized in render_scene),
+                        // so the t-span IS the world path length; /vsize only.
                         let t_exit = min(t_max_voxel.x, min(t_max_voxel.y, t_max_voxel.z));
-                        let seg_len = max(t_exit - t_hit, 0.0) * ray_dir_len / vsize;
+                        let seg_len = max(t_exit - t_hit, 0.0) / vsize;
                         let eff_a = 1.0 - pow(1.0 - a, seg_len);
                         accum = accum + trans * eff_a * lit;
                         trans = trans * (1.0 - eff_a);
