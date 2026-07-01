@@ -20,8 +20,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 use crate::scene_api::{CameraRig, DemoScene, InputState, SceneCtx, SceneInput};
 use crate::scenes::{
     animation::AnimationScene, doom::DoomScene, empty::EmptyScene, lighting::LightingScene,
-    picking::PickingScene, primitives::PrimitivesScene, sprites::SpritesScene,
-    transparency::TransparencyScene, world::WorldScene,
+    picking::PickingScene, primitives::PrimitivesScene, spotlight::SpotlightScene,
+    sprites::SpritesScene, transparency::TransparencyScene, world::WorldScene,
 };
 use crate::{
     load_png_sky, load_png_sky_rgba, MAX_GRID_VSID, RENDER_THREADS, SCAN_DIST_INITIAL,
@@ -230,6 +230,7 @@ impl Host {
             Box::new(AnimationScene::new()),
             Box::new(TransparencyScene::new()),
             Box::new(LightingScene::new()),
+            Box::new(SpotlightScene::new()),
             Box::new(DoomScene::new()),
             Box::new(PickingScene::new()),
             Box::new(PrimitivesScene::new()),

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Spot (cone) lights** (stage SL) — a runtime directional cone light on
+  **both** backends: `LightRig.spots: &[SpotLight]` alongside the sun +
+  point lights. A `SpotLight` is a point light with a `direction` (cone axis)
+  and soft `inner_angle_deg` / `outer_angle_deg` half-angles (a `smoothstep`
+  falloff; `outer == inner` ⇒ a hard edge; `>= 180°` ⇒ an omnidirectional
+  point light). Internally each spot folds into the same per-grid point-light
+  array / GPU buffer (`GpuPointLight` grew 48→64 B) / shader loop, so spots
+  reuse the distance falloff, hard voxel shadows, per-grid transform, and cel
+  banding, and share the point-light count + shadow-caster budgets (points
+  take priority). The cone factor gates the loop before the shadow march, so
+  an off-cone spot skips it. Point-light-only rigs stay byte-identical. A new
+  **Spotlight** scene-demo scene showcases it on its own — a near-dark room lit
+  by a single spot, with a flashlight mode (`F`, the cone rides the camera), a
+  sweeping searchlight, and a live-adjustable cone angle (`[` / `]`). See
+  `PORTING-SPOTLIGHT.md`.
 - **Per-actor runtime tint** — `SceneRenderer::set_actor_tint(BillboardActorId, tint)`,
   the per-actor counterpart to `set_sprite_instance_tint`, routes an
   `0x00RRGGBB` colour multiply to the actor's clip instance (works on both

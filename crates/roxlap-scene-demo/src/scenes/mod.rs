@@ -12,6 +12,7 @@ pub mod empty;
 pub mod lighting;
 pub mod picking;
 pub mod primitives;
+pub mod spotlight;
 pub mod sprites;
 pub mod transparency;
 pub mod world;
