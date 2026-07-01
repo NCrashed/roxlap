@@ -257,24 +257,14 @@ fn col_word_base_mip(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> u32 
     return occ_base + col_idx * occ_words_per_col_for_mip(mip);
 }
 
-// Within-slot word stride of one mip's textured occupancy block; the
-// SOLID occupancy block sits immediately after it (cliff-face fix). So
-// the solid word base for a column == its textured base + this.
-fn mip_occ_block_words(g: u32, mip: u32) -> u32 {
-    let vsid_mip = grid_static_meta[g].vsid >> mip;
-    return vsid_mip * vsid_mip * occ_words_per_col_for_mip(mip);
-}
-
-// GPU — hit-test against the SOLID bitmap (textured surfaces + bedrock
-// interior) so vertical wall/cliff faces are opaque. The textured
-// bitmap (used for colour rank) is the first block; solid is the
-// second.
-fn voxel_solid_in(g: u32, meta_id: u32, mip: u32, p_voxel: vec3<i32>) -> bool {
-    let solid_base = col_word_base_mip(g, meta_id, mip, p_voxel) + mip_occ_block_words(g, mip);
-    let z_word = u32(p_voxel.z) >> 5u;
-    let z_bit = u32(p_voxel.z) & 31u;
-    return (occ_word(solid_base + z_word) & (1u << z_bit)) != 0u;
-}
+// GPU — hit-tests read the SOLID bitmap (textured surfaces + bedrock
+// interior) so vertical wall/cliff faces are opaque. Within a slot each
+// mip stores the textured block first (used by `voxel_packed_in` for the
+// colour rank), then the same-size SOLID block
+// (`vsid_mip² · occ_words_per_col`) immediately after it. PF.1: both
+// marchers compute the solid word base once per (chunk, mip) and test
+// bits inline with a last-word cache, instead of re-deriving the whole
+// address chain from `grid_static_meta` on every DDA step.
 
 // Per-face side-shade intensity for a voxel hit, mirroring the CPU's
 // gcsub-lane selection: z-faces → top/bot (ceiling/floor), x-faces →
@@ -367,14 +357,16 @@ fn spot_cone(ldir: vec3<f32>, axis: vec3<f32>, cos_inner: f32, cos_outer: f32) -
 // on the host), so `chunk_idx & (pool_dims - 1)` is the slot index
 // per axis. Slot identity must be verified against
 // `all_slot_chunk_idx` — multiple chunk_idx values can map to the
-// same slot under the pool's collision invariant.
-fn slot_idx_of(g: u32, chunk_idx: vec3<i32>) -> u32 {
-    let m = grid_static_meta[g];
-    let mask = vec3<i32>(m.pool_dims) - vec3<i32>(1, 1, 1);
+// same slot under the pool's collision invariant. PF.1: takes the
+// caller-hoisted `pool_dims` instead of `g` — `grid_static_meta[g]`
+// here made naga materialise the full 144-byte struct (both mip
+// arrays included) once per outer DDA step.
+fn slot_idx_of(pool_dims: vec3<u32>, chunk_idx: vec3<i32>) -> u32 {
+    let mask = vec3<i32>(pool_dims) - vec3<i32>(1, 1, 1);
     let s = chunk_idx & mask;
     return u32(s.x)
-        + u32(s.y) * m.pool_dims.x
-        + u32(s.z) * m.pool_dims.x * m.pool_dims.y;
+        + u32(s.y) * pool_dims.x
+        + u32(s.z) * pool_dims.x * pool_dims.y;
 }
 
 // GPU.13.0 — has the outer DDA left the grid's occupied chunk-AABB
@@ -386,9 +378,9 @@ fn slot_idx_of(g: u32, chunk_idx: vec3<i32>) -> u32 {
 // entirely. Either way the caller returns `out` (sky / no closer hit).
 // The empty-grid sentinel (min = i32::MAX, max = i32::MIN) makes every
 // branch fire immediately, so an empty grid contributes nothing.
-fn aabb_passed(g: u32, p: vec3<i32>, step: vec3<i32>) -> bool {
-    let mn = grid_static_meta[g].aabb_min;
-    let mx = grid_static_meta[g].aabb_max;
+// PF.1: `mn`/`mx` are caller-hoisted (they're loop-invariant; reading
+// them from storage per outer step was pure waste).
+fn aabb_passed(mn: vec3<i32>, mx: vec3<i32>, p: vec3<i32>, step: vec3<i32>) -> bool {
     if (step.x > 0 && p.x > mx.x) { return true; }
     if (step.x < 0 && p.x < mn.x) { return true; }
     if (step.x == 0 && (p.x < mn.x || p.x > mx.x)) { return true; }
@@ -401,18 +393,18 @@ fn aabb_passed(g: u32, p: vec3<i32>, step: vec3<i32>) -> bool {
     return false;
 }
 
-fn chunk_has_content(g: u32, slot_idx: u32, chunk_idx: vec3<i32>) -> bool {
-    let m = grid_static_meta[g];
+// PF.1: `slot_base` = the caller-hoisted `slot_chunk_idx_offset / 4`
+// (vec3<i32> entries use 16-byte stride, hence the /4), `chunk_occ_off`
+// = the hoisted `chunk_occupancy_offset` — both loop-invariant.
+fn chunk_has_content(slot_base: u32, chunk_occ_off: u32, slot_idx: u32, chunk_idx: vec3<i32>) -> bool {
     // Identity check: does this slot actually hold the chunk the
     // outer DDA is visiting? An empty slot's sentinel
     // (i32::MIN, i32::MIN, i32::MIN) fails this check.
-    // vec3<i32> entries are at `slot_chunk_idx_offset/4 + slot_idx`
-    // since WGSL `array<vec3<i32>>` uses 16-byte stride.
-    let stored = all_slot_chunk_idx[m.slot_chunk_idx_offset / 4u + slot_idx];
+    let stored = all_slot_chunk_idx[slot_base + slot_idx];
     if (stored.x != chunk_idx.x || stored.y != chunk_idx.y || stored.z != chunk_idx.z) {
         return false;
     }
-    return (all_chunk_occupancy[m.chunk_occupancy_offset + (slot_idx >> 5u)]
+    return (all_chunk_occupancy[chunk_occ_off + (slot_idx >> 5u)]
         & (1u << (slot_idx & 31u))) != 0u;
 }
 
@@ -469,14 +461,29 @@ fn pick_mip(t: f32, mip_count: u32) -> u32 {
 // DL.3 — stylized hard shadow test. Is the segment from `origin` along unit
 // `dir` blocked by a solid voxel within grid `g` before `max_t`? Intra-grid
 // only (locked decision): outer chunk DDA skips empty chunks, inner voxel
-// DDA marches mip-0 and hit-tests the solid bitmap. Bounded by
-// `u.max_outer_steps` chunks and `u.shadow_max_steps` total voxel steps, so
-// it always terminates. Returns `true` on the first occluder.
-fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> bool {
-    let m = grid_static_meta[g];
-    let chunk_dim = vec3<f32>(f32(m.vsid), f32(m.vsid), f32(CHUNK_Z));
-    let vsid_i = i32(m.vsid);
-    let cz_i = i32(CHUNK_Z);
+// DDA hit-tests the solid bitmap. Bounded by `u.max_outer_steps` chunks and
+// `u.shadow_max_steps` total voxel steps, so it always terminates. Returns
+// `true` on the first occluder.
+//
+// PF.2 — the march follows the primary ray's LOD policy: each chunk is
+// marched at `pick_mip(t_base + t_enter)`, where `t_base` is the shaded
+// pixel's own world-t. Near shadows (inside `mip_scan_dist`) stay
+// mip-0-exact; far shadows step coarser cells (2-8× fewer steps).
+// `mip_scan_dist == 0` (LOD off) keeps the pre-PF.2 all-mip-0 march.
+fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base: f32) -> bool {
+    // PF.1 — hoist every loop-invariant meta field ONCE per march. Field
+    // reads (not `let m = grid_static_meta[g]`): the whole-struct copy
+    // makes naga materialise both 6-word mip arrays.
+    let vsid = grid_static_meta[g].vsid;
+    let mip_count = grid_static_meta[g].mip_count;
+    let occ_off = grid_static_meta[g].occupancy_offset;
+    let occ_words_slot = grid_static_meta[g].occ_words_per_slot;
+    let pool_dims = grid_static_meta[g].pool_dims;
+    let slot_base = grid_static_meta[g].slot_chunk_idx_offset / 4u;
+    let chunk_occ_off = grid_static_meta[g].chunk_occupancy_offset;
+    let aabb_mn = grid_static_meta[g].aabb_min;
+    let aabb_mx = grid_static_meta[g].aabb_max;
+    let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z));
 
     var p_chunk = vec3<i32>(floor(origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(dir));
@@ -493,44 +500,72 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> boo
     for (var oc: u32 = 0u; oc < u.max_outer_steps; oc = oc + 1u) {
         if (t_enter > max_t) { return false; }
         // Left the occupied chunk-AABB along the ray ⇒ nothing ahead.
-        if (aabb_passed(g, p_chunk, step_chunk)) { return false; }
-        let slot_id = slot_idx_of(g, p_chunk);
-        if (chunk_has_content(g, slot_id, p_chunk)) {
-            // Inner voxel DDA at mip-0 (voxel size 1).
+        if (aabb_passed(aabb_mn, aabb_mx, p_chunk, step_chunk)) { return false; }
+        let slot_id = slot_idx_of(pool_dims, p_chunk);
+        if (chunk_has_content(slot_base, chunk_occ_off, slot_id, p_chunk)) {
+            // PF.2 — mip for this chunk from the receiver's screen distance
+            // plus the travel along the shadow ray (mirrors march_grid).
+            let mip = pick_mip(t_base + t_enter, mip_count);
+            let vsize = f32(1u << mip);
+            let vsid_mip_u = vsid >> mip;
+            let vsid_mip = i32(vsid_mip_u);
+            let cz_mip = i32(CHUNK_Z >> mip);
+            // PF.1 — solid word base for this (slot, mip), hoisted out of
+            // the inner loop, plus a last-word cache.
+            let wpc = occ_words_per_col_for_mip(mip);
+            let solid_col_base = occ_off
+                + slot_id * occ_words_slot
+                + grid_static_meta[g].mip_occ_rel[mip]
+                + vsid_mip_u * vsid_mip_u * wpc;
+            var occ_idx_cached: u32 = 0xffffffffu;
+            var occ_word_cached: u32 = 0u;
             let entry_world = origin + t_enter * dir;
             let chunk_origin_world = vec3<f32>(p_chunk) * chunk_dim;
             let entry_in_chunk = entry_world - chunk_origin_world;
             var p_voxel = clamp(
-                vec3<i32>(floor(entry_in_chunk)),
+                vec3<i32>(floor(entry_in_chunk / vsize)),
                 vec3<i32>(0),
-                vec3<i32>(vsid_i - 1, vsid_i - 1, cz_i - 1),
+                vec3<i32>(vsid_mip - 1, vsid_mip - 1, cz_mip - 1),
             );
             let next_voxel_world = vec3<f32>(
-                select(f32(p_voxel.x), f32(p_voxel.x + 1), step_chunk.x > 0) + chunk_origin_world.x,
-                select(f32(p_voxel.y), f32(p_voxel.y + 1), step_chunk.y > 0) + chunk_origin_world.y,
-                select(f32(p_voxel.z), f32(p_voxel.z + 1), step_chunk.z > 0) + chunk_origin_world.z,
+                select(f32(p_voxel.x), f32(p_voxel.x + 1), step_chunk.x > 0) * vsize
+                    + chunk_origin_world.x,
+                select(f32(p_voxel.y), f32(p_voxel.y + 1), step_chunk.y > 0) * vsize
+                    + chunk_origin_world.y,
+                select(f32(p_voxel.z), f32(p_voxel.z + 1), step_chunk.z > 0) * vsize
+                    + chunk_origin_world.z,
             );
             var t_max_voxel = shield_parallel((next_voxel_world - origin) / dir, dir);
-            let t_delta_voxel = abs(vec3<f32>(1.0) / dir);
+            let t_delta_voxel = abs(vsize / dir);
             loop {
-                if (voxel_solid_in(g, slot_id, 0u, p_voxel)) { return true; }
+                // Solid-bit test with a last-word cache: consecutive
+                // z-steps land in the same 32-voxel word up to 32 times.
+                let z_u = u32(p_voxel.z);
+                let widx = solid_col_base
+                    + (u32(p_voxel.x) + u32(p_voxel.y) * vsid_mip_u) * wpc
+                    + (z_u >> 5u);
+                if (widx != occ_idx_cached) {
+                    occ_idx_cached = widx;
+                    occ_word_cached = occ_word(widx);
+                }
+                if ((occ_word_cached & (1u << (z_u & 31u))) != 0u) { return true; }
                 steps = steps + 1u;
                 if (steps >= u.shadow_max_steps) { return false; }
                 if (t_max_voxel.x < t_max_voxel.y && t_max_voxel.x < t_max_voxel.z) {
                     if (t_max_voxel.x > max_t) { return false; }
                     p_voxel.x = p_voxel.x + step_chunk.x;
                     t_max_voxel.x = t_max_voxel.x + t_delta_voxel.x;
-                    if (p_voxel.x < 0 || p_voxel.x >= vsid_i) { break; }
+                    if (p_voxel.x < 0 || p_voxel.x >= vsid_mip) { break; }
                 } else if (t_max_voxel.y < t_max_voxel.z) {
                     if (t_max_voxel.y > max_t) { return false; }
                     p_voxel.y = p_voxel.y + step_chunk.y;
                     t_max_voxel.y = t_max_voxel.y + t_delta_voxel.y;
-                    if (p_voxel.y < 0 || p_voxel.y >= vsid_i) { break; }
+                    if (p_voxel.y < 0 || p_voxel.y >= vsid_mip) { break; }
                 } else {
                     if (t_max_voxel.z > max_t) { return false; }
                     p_voxel.z = p_voxel.z + step_chunk.z;
                     t_max_voxel.z = t_max_voxel.z + t_delta_voxel.z;
-                    if (p_voxel.z < 0 || p_voxel.z >= cz_i) { break; }
+                    if (p_voxel.z < 0 || p_voxel.z >= cz_mip) { break; }
                 }
             }
         }
@@ -587,14 +622,16 @@ fn sprites_occlude(origin_w: vec3<f32>, dir_w: vec3<f32>, max_t: f32) -> bool {
     return false;
 }
 //XS4C_STUB_END
-fn shadow_occluded_world(origin_w: vec3<f32>, dir_w: vec3<f32>, max_t: f32) -> bool {
+// PF.2 — `t_base` = the shaded pixel's own world-t, driving the shadow
+// march's mip pick (sprite volumes have no mips; `sprites_occlude` ignores it).
+fn shadow_occluded_world(origin_w: vec3<f32>, dir_w: vec3<f32>, max_t: f32, t_base: f32) -> bool {
     if (sprites_occlude(origin_w, dir_w, max_t)) {
         return true;
     }
     for (var g: u32 = 0u; g < u.grid_count; g = g + 1u) {
         let o = world_to_grid_local(g, origin_w);
         let d = world_dir_to_grid_local(g, dir_w);
-        if (shadow_occluded(g, o, d, max_t)) {
+        if (shadow_occluded(g, o, d, max_t, t_base)) {
             return true;
         }
     }
@@ -627,6 +664,7 @@ fn shade_lit(
     ray_dir: vec3<f32>,
     hit_pos: vec3<f32>,
     vox_center: vec3<f32>,
+    t_hit: f32,
 ) -> vec3<f32> {
     let packed = voxel_packed_in(g, meta_id, mip, p_voxel);
     let a = f32((packed >> 24u) & 0xffu);
@@ -648,8 +686,11 @@ fn shade_lit(
     // Shadow-ray origin: bias off the surface along the normal to avoid
     // self-shadow acne. Shared by every caster. XS.3 — also its world-space
     // form, so the shadow ray can be tested against every grid (cross-grid).
+    // PF.2 (G6) — the world-space lift (4 vec4 reads of grid_cameras[g] +
+    // 9 fma) is computed lazily, only when a caster actually fires a ray.
     let shadow_origin = sample + n * u.shadow_bias;
-    let shadow_origin_w = grid_local_to_world(g, shadow_origin);
+    var shadow_origin_w = vec3<f32>(0.0);
+    var sow_ready = false;
     // Light remaining in shadow (the strength floor); 1.0 ⇒ unshadowed.
     let in_shadow = 1.0 - u.ambient_color.w;
 
@@ -660,9 +701,14 @@ fn shade_lit(
         let ndl = max(0.0, dot(n, l));
         if (ndl > 0.0) {
             var sh = 1.0;
-            if ((u.sun_flags & 2u) != 0u
-                && shadow_occluded_world(shadow_origin_w, grid_dir_to_world(g, l), u.shadow_max_dist)) {
-                sh = in_shadow;
+            if ((u.sun_flags & 2u) != 0u) {
+                if (!sow_ready) {
+                    shadow_origin_w = grid_local_to_world(g, shadow_origin);
+                    sow_ready = true;
+                }
+                if (shadow_occluded_world(shadow_origin_w, grid_dir_to_world(g, l), u.shadow_max_dist, t_hit)) {
+                    sh = in_shadow;
+                }
             }
             sun_key = ndl * sh;
         }
@@ -700,9 +746,14 @@ fn shade_lit(
                 if (pl.casts_shadow != 0u) {
                     let to_light = pl.pos - shadow_origin;
                     let max_t = length(to_light);
-                    if (max_t > 1e-4
-                        && shadow_occluded_world(shadow_origin_w, grid_dir_to_world(g, to_light / max_t), max_t)) {
-                        sh = in_shadow;
+                    if (max_t > 1e-4) {
+                        if (!sow_ready) {
+                            shadow_origin_w = grid_local_to_world(g, shadow_origin);
+                            sow_ready = true;
+                        }
+                        if (shadow_occluded_world(shadow_origin_w, grid_dir_to_world(g, to_light / max_t), max_t, t_hit)) {
+                            sh = in_shadow;
+                        }
                     }
                 }
                 var f = ndl * atten * cone * sh;
@@ -745,8 +796,21 @@ fn march_grid(
     ray_dir: vec3<f32>,
     best_t: f32,
 ) -> GridHit {
-    let m = grid_static_meta[g];
-    let chunk_dim = vec3<f32>(f32(m.vsid), f32(m.vsid), f32(CHUNK_Z));
+    // PF.1 — hoist loop-invariant meta fields once per march; a whole-struct
+    // `let m = grid_static_meta[g]` would make naga materialise both 6-word
+    // mip arrays (mip_occ_rel is instead read per chunk entry, where `mip`
+    // is known — WGSL forbids dynamically indexing an array member of a
+    // value copy anyway).
+    let vsid = grid_static_meta[g].vsid;
+    let mip_count = grid_static_meta[g].mip_count;
+    let occ_off = grid_static_meta[g].occupancy_offset;
+    let occ_words_slot = grid_static_meta[g].occ_words_per_slot;
+    let pool_dims = grid_static_meta[g].pool_dims;
+    let slot_base = grid_static_meta[g].slot_chunk_idx_offset / 4u;
+    let chunk_occ_off = grid_static_meta[g].chunk_occupancy_offset;
+    let aabb_mn = grid_static_meta[g].aabb_min;
+    let aabb_mx = grid_static_meta[g].aabb_max;
+    let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z));
     // World ray length per `t` unit; divided by a voxel's size it turns a
     // cell's `t` span into its path length in voxel units (Volumetric weight).
     let ray_dir_len = length(ray_dir);
@@ -793,19 +857,31 @@ fn march_grid(
         // GPU.13.0 — once the ray has left the occupied chunk-AABB
         // along its travel direction, no resident chunk lies ahead:
         // stop instead of stepping empty space to max_outer_steps.
-        if (aabb_passed(g, p_chunk, step_chunk)) {
+        if (aabb_passed(aabb_mn, aabb_mx, p_chunk, step_chunk)) {
             return finalize_sky_grid(touched, accum, trans, ray_dir);
         }
-        let slot_id = slot_idx_of(g, p_chunk);
+        let slot_id = slot_idx_of(pool_dims, p_chunk);
         prev_solid = false; // fresh chunk: start a new solid run
-        if (chunk_has_content(g, slot_id, p_chunk)) {
+        if (chunk_has_content(slot_base, chunk_occ_off, slot_id, p_chunk)) {
             // GPU.11.1 — pick the mip for this chunk by entry distance.
             // Voxels are `vsize` world units; the chunk holds
             // `vsid>>mip` × `vsid>>mip` × `CHUNK_Z>>mip` of them.
-            let mip = pick_mip(t_enter, m.mip_count);
+            let mip = pick_mip(t_enter, mip_count);
             let vsize = f32(1u << mip);
-            let vsid_mip = i32(m.vsid >> mip);
+            let vsid_mip_u = vsid >> mip;
+            let vsid_mip = i32(vsid_mip_u);
             let cz_mip = i32(CHUNK_Z >> mip);
+            // PF.1 — solid-occupancy word base for this (slot, mip), hoisted
+            // out of the inner loop (textured block first, solid after it),
+            // plus a last-word cache: consecutive z-steps land in the same
+            // 32-voxel occupancy word up to 32 times.
+            let wpc = occ_words_per_col_for_mip(mip);
+            let solid_col_base = occ_off
+                + slot_id * occ_words_slot
+                + grid_static_meta[g].mip_occ_rel[mip]
+                + vsid_mip_u * vsid_mip_u * wpc;
+            var occ_idx_cached: u32 = 0xffffffffu;
+            var occ_word_cached: u32 = 0u;
 
             let entry_world = ray_origin + t_enter * ray_dir;
             let chunk_origin_world = vec3<f32>(p_chunk) * chunk_dim;
@@ -840,7 +916,15 @@ fn march_grid(
             var hit_axis: i32 = entry_axis;
 
             for (var iv: u32 = 0u; iv < MAX_INNER_STEPS; iv = iv + 1u) {
-                if (voxel_solid_in(g, slot_id, mip, p_voxel)) {
+                let z_u = u32(p_voxel.z);
+                let widx = solid_col_base
+                    + (u32(p_voxel.x) + u32(p_voxel.y) * vsid_mip_u) * wpc
+                    + (z_u >> 5u);
+                if (widx != occ_idx_cached) {
+                    occ_idx_cached = widx;
+                    occ_word_cached = occ_word(widx);
+                }
+                if ((occ_word_cached & (1u << (z_u & 31u))) != 0u) {
                     if (t_hit >= best_t) {
                         return finalize_sky_grid(touched, accum, trans, ray_dir);
                     }
@@ -856,7 +940,7 @@ fn march_grid(
                         // lighting; ignored by the smooth path.
                         let vox_center = chunk_origin_world
                             + (vec3<f32>(p_voxel) + vec3<f32>(0.5)) * vsize;
-                        base_color = shade_lit(g, slot_id, mip, p_voxel, shade, hit_axis, ray_dir, hit_pos, vox_center);
+                        base_color = shade_lit(g, slot_id, mip, p_voxel, shade, hit_axis, ray_dir, hit_pos, vox_center, t_hit);
                     } else {
                         base_color = voxel_color_in(g, slot_id, mip, p_voxel, shade);
                     }
