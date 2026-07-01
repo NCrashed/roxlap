@@ -1139,6 +1139,12 @@ impl CpuBackend {
                     intensity: p.intensity,
                     radius: p.radius,
                     casts_shadow: allow,
+                    // SL.0 — the facade only produces point lights yet; a
+                    // `-1.0` outer cosine (180° cone) marks "not a spot", so
+                    // the cone mask is skipped. SL.2 folds real spots in here.
+                    spot_dir: [0.0, 0.0, 1.0],
+                    cos_inner: -1.0,
+                    cos_outer: -1.0,
                 });
             }
             if demoted > 0 {

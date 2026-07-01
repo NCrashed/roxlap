@@ -892,6 +892,16 @@ pub struct GpuLight {
     pub color: [f32; 3],
     pub intensity: f32,
     pub casts_shadow: bool,
+    /// SL — spot (cone) axis: unit direction the light shines **along**,
+    /// in the same frame as [`Self::position`] (grid-local for the scene
+    /// pass, world for the sprite pass). Ignored when [`Self::cos_outer`]
+    /// is `-1.0`.
+    pub spot_dir: [f32; 3],
+    /// SL — cosine of the inner cone half-angle (full brightness within it).
+    pub cos_inner: f32,
+    /// SL — cosine of the outer cone half-angle (zero past it; soft between).
+    /// `-1.0` (180° cone) ⇒ a pure point light: the cone mask is skipped.
+    pub cos_outer: f32,
 }
 
 /// The whole per-frame light environment, already transformed per grid.
@@ -936,8 +946,10 @@ pub struct SceneLights {
     pub shadow_tint: [f32; 3],
 }
 
-/// One point light packed for the GPU (binding 18, std430, 48 bytes).
-/// Mirrors `PointLight` in `scene_dda.wgsl`.
+/// One point light packed for the GPU (binding 18, std430, 64 bytes —
+/// four `vec4<f32>`). Mirrors `PointLight` in `scene_dda.wgsl` and
+/// `sprite_model_dda.wgsl`. SL grew this 48→64 for the spot (cone) fields;
+/// a `-1.0` `cos_outer` marks a pure point light (cone mask skipped).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuPointLight {
@@ -945,9 +957,17 @@ struct GpuPointLight {
     radius: f32,
     color: [f32; 3],
     intensity: f32,
+    // SL — spot (cone) fields. `cos_outer == -1.0` ⇒ omnidirectional point.
+    spot_dir: [f32; 3],
+    cos_outer: f32,
+    cos_inner: f32,
     casts_shadow: u32,
-    _pad: [u32; 3],
+    _pad: [u32; 2],
 }
+
+// SL — the std430 stride must stay locked to the WGSL `PointLight` (four
+// `vec4<f32>`); a mismatch silently corrupts every light past the first.
+const _: () = assert!(core::mem::size_of::<GpuPointLight>() == 64);
 
 /// Build the per-grid point-light storage buffer (binding 18), grid-major:
 /// grid `g`'s lights occupy `[g*count .. (g+1)*count]`. Pads to one zeroed
@@ -1033,8 +1053,11 @@ fn pack_scene_lights(
                 radius: l.radius,
                 color: l.color,
                 intensity: l.intensity,
+                spot_dir: l.spot_dir,
+                cos_outer: l.cos_outer,
+                cos_inner: l.cos_inner,
                 casts_shadow: u32::from(l.casts_shadow && allow),
-                _pad: [0; 3],
+                _pad: [0; 2],
             }));
         }
     }
@@ -2754,10 +2777,13 @@ impl GpuRenderer {
                         radius: l.radius,
                         color: l.color,
                         intensity: l.intensity,
+                        spot_dir: l.spot_dir,
+                        cos_outer: l.cos_outer,
+                        cos_inner: l.cos_inner,
                         // XS.4.2 — honour the light's caster flag so a
                         // receiving sprite is shadowed by it (capable devices).
                         casts_shadow: u32::from(l.casts_shadow),
-                        _pad: [0; 3],
+                        _pad: [0; 2],
                     })
                     .collect();
                 let sprite_point_count = sprite_pts.len() as u32;

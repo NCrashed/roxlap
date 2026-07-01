@@ -670,6 +670,10 @@ fn scene_dda_point_light_brightens_by_distance_and_facing() {
             color: [1.0; 3],
             intensity: 2.0,
             casts_shadow: false,
+            // SL — `-1.0` outer cosine ⇒ a pure point light (no cone mask).
+            spot_dir: [0.0, 0.0, 1.0],
+            cos_inner: -1.0,
+            cos_outer: -1.0,
         }]],
         ..SceneLights::default()
     };

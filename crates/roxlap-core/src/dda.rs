@@ -98,6 +98,15 @@ pub struct CpuPointLight {
     /// GPU's per-light `casts_shadow`; the renderer applies the same
     /// caster cap before building the CPU rig.
     pub casts_shadow: bool,
+    /// SL — spot (cone) axis: grid-local unit direction the light shines
+    /// **along**. Ignored for a pure point light (see [`Self::cos_outer`]).
+    pub spot_dir: [f32; 3],
+    /// SL — cosine of the inner cone half-angle (full brightness within it).
+    pub cos_inner: f32,
+    /// SL — cosine of the outer cone half-angle (zero past it; soft
+    /// `smoothstep` between the two). `-1.0` (a 180° cone) ⇒ a pure point
+    /// light: the cone mask is skipped entirely and the light is omnidirectional.
+    pub cos_outer: f32,
 }
 
 /// CPU.1 — the per-frame dynamic-light environment for one grid (grid-local).

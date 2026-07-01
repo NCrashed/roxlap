@@ -1496,6 +1496,12 @@ impl GpuBackend {
                     color: p.color,
                     intensity: p.intensity,
                     casts_shadow: p.casts_shadow,
+                    // SL.0 — point lights only yet; `cos_outer = -1.0` marks
+                    // "not a spot" so the shader skips the cone mask. SL.2
+                    // folds `rig.spots` in here (axis inverse-rotated per grid).
+                    spot_dir: [0.0, 0.0, 1.0],
+                    cos_inner: -1.0,
+                    cos_outer: -1.0,
                 });
             }
             lights.grid_point_lights.push(pts);
@@ -1515,6 +1521,10 @@ impl GpuBackend {
                 color: p.color,
                 intensity: p.intensity,
                 casts_shadow: p.casts_shadow,
+                // SL.0 — point lights only (see the per-grid copy above).
+                spot_dir: [0.0, 0.0, 1.0],
+                cos_inner: -1.0,
+                cos_outer: -1.0,
             })
             .collect();
         self.gpu.set_scene_lights(lights);

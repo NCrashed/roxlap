@@ -188,16 +188,19 @@ struct Mat { alpha: f32, mode: u32 };
 // material id. A hit voxel's colour is matched here to find its material.
 @group(0) @binding(17) var<storage, read> terrain_map: array<vec2<u32>>;
 // DL — dynamic lighting. One point light in a grid's local frame (std430,
-// 48 bytes). Mirrors `GpuPointLight` in lib.rs.
+// 64 bytes — four vec4). Mirrors `GpuPointLight` in lib.rs. SL added the
+// spot (cone) fields; `cos_outer == -1.0` marks an omnidirectional point.
 struct PointLight {
     pos: vec3<f32>,
     radius: f32,
     color: vec3<f32>,
     intensity: f32,
+    spot_dir: vec3<f32>,
+    cos_outer: f32,
+    cos_inner: f32,
     casts_shadow: u32,
     _p0: u32,
     _p1: u32,
-    _p2: u32,
 };
 // DL binding 18 — per-grid point lights, grid-major: grid g's lights at
 // [g*point_light_count .. (g+1)*point_light_count]. DL.0 binds the buffer

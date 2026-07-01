@@ -75,16 +75,20 @@ struct Uniform {
     _pad_xs1: u32,
     _pad_xs2: u32,
 };
-// DL.4 — world-space point light (std430, 48 bytes). Mirrors GpuPointLight.
+// DL.4 — world-space point light (std430, 64 bytes — four vec4). Mirrors
+// GpuPointLight. SL added the spot (cone) fields; `cos_outer == -1.0` marks
+// an omnidirectional point light (the cone mask is skipped).
 struct PointLight {
     pos: vec3<f32>,
     radius: f32,
     color: vec3<f32>,
     intensity: f32,
+    spot_dir: vec3<f32>,
+    cos_outer: f32,
+    cos_inner: f32,
     casts_shadow: u32,
     _p0: u32,
     _p1: u32,
-    _p2: u32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniform;

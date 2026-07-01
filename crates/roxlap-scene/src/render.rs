@@ -146,6 +146,13 @@ fn grid_local_lights<'a>(
                 f64::from(p.pos[1]),
                 f64::from(p.pos[2]),
             ) - transform.origin);
+        // SL — the cone axis is a vector: inverse-rotate only (no origin).
+        let sd = inv
+            * DVec3::new(
+                f64::from(p.spot_dir[0]),
+                f64::from(p.spot_dir[1]),
+                f64::from(p.spot_dir[2]),
+            );
         #[allow(clippy::cast_possible_truncation)]
         scratch.push(CpuPointLight {
             pos: [lp.x as f32, lp.y as f32, lp.z as f32],
@@ -153,6 +160,9 @@ fn grid_local_lights<'a>(
             intensity: p.intensity,
             radius: p.radius,
             casts_shadow: p.casts_shadow,
+            spot_dir: [sd.x as f32, sd.y as f32, sd.z as f32],
+            cos_inner: p.cos_inner,
+            cos_outer: p.cos_outer,
         });
     }
     CpuLights {
