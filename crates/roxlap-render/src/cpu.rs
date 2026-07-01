@@ -1123,28 +1123,46 @@ impl CpuBackend {
                 budget = budget.saturating_sub(1);
             }
             let mut demoted = 0usize;
-            for p in rig.points {
-                let allow = if p.casts_shadow && budget > 0 {
+            // Shared greedy caster grant (points take priority over spots).
+            let mut grant = |casts: bool| -> bool {
+                if casts && budget > 0 {
                     budget -= 1;
                     true
                 } else {
-                    if p.casts_shadow {
+                    if casts {
                         demoted += 1;
                     }
                     false
-                };
+                }
+            };
+            for p in rig.points {
+                let allow = grant(p.casts_shadow);
                 world_points.push(roxlap_core::CpuPointLight {
                     pos: p.position,
                     color: p.color,
                     intensity: p.intensity,
                     radius: p.radius,
                     casts_shadow: allow,
-                    // SL.0 — the facade only produces point lights yet; a
-                    // `-1.0` outer cosine (180° cone) marks "not a spot", so
-                    // the cone mask is skipped. SL.2 folds real spots in here.
+                    // `-1.0` outer cosine (180° cone) marks "not a spot" ⇒ the
+                    // cone mask is skipped (an omnidirectional point light).
                     spot_dir: [0.0, 0.0, 1.0],
                     cos_inner: -1.0,
                     cos_outer: -1.0,
+                });
+            }
+            // SL.2 — spots fold into the same world-space array; the cone axis
+            // stays world-space here (render.rs inverse-rotates it per grid).
+            for s in rig.spots {
+                let allow = grant(s.casts_shadow);
+                world_points.push(roxlap_core::CpuPointLight {
+                    pos: s.position,
+                    color: s.color,
+                    intensity: s.intensity,
+                    radius: s.radius,
+                    casts_shadow: allow,
+                    spot_dir: s.axis(),
+                    cos_inner: s.cos_inner(),
+                    cos_outer: s.cos_outer(),
                 });
             }
             if demoted > 0 {

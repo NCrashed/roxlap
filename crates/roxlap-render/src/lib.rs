@@ -48,7 +48,7 @@ use roxlap_core::Camera;
 use roxlap_formats::voxel_clip::frame_at;
 use roxlap_scene::Scene;
 
-pub use light::{DirectionalLight, LightRig, PointLight};
+pub use light::{DirectionalLight, LightRig, PointLight, SpotLight};
 pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 /// Animated-GIF → [`VoxelClip`] importer for Doom-style billboard sprites
 /// (stage BB). Behind the `gif` feature; see `PORTING-BILLBOARD.md`.

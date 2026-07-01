@@ -329,6 +329,7 @@ impl DemoScene for LightingScene {
         frame.lights = Some(LightRig {
             sun: Some(sun),
             points: &self.points,
+            spots: &[],
             // Dim ambient so the runtime sun/points read as the key light
             // (the baked byte is the ambient/AO channel, locked decision #2).
             ambient: [0.32, 0.34, 0.4],

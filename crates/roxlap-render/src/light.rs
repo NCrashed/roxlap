@@ -68,6 +68,85 @@ impl Default for PointLight {
     }
 }
 
+/// A spot (cone) light — a [`PointLight`] with a direction and a soft
+/// angular cutoff, so it lights only a cone. World space. Internally folded
+/// into the point-light path (a point light is the 180°-cone degenerate), so
+/// spots share the point-light count + shadow-caster budgets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpotLight {
+    /// World-space position (voxel units).
+    pub position: [f32; 3],
+    /// Cone **axis** — the direction the light shines **along** (the way the
+    /// light travels). Need not be normalized; the backend normalizes.
+    pub direction: [f32; 3],
+    /// Linear RGB, `0..1`.
+    pub color: [f32; 3],
+    /// Scalar brightness multiplier on `color`.
+    pub intensity: f32,
+    /// Hard cutoff distance in world units; past it the light is zero.
+    pub radius: f32,
+    /// Inner half-angle in **degrees**: within it the cone is at full
+    /// brightness. Clamped to `0..=outer_angle_deg`.
+    pub inner_angle_deg: f32,
+    /// Outer half-angle in **degrees**: past it the cone is zero; between the
+    /// two it soft-falls off (`smoothstep`). `outer == inner` ⇒ a hard edge;
+    /// `>= 180` ⇒ omnidirectional (a plain point light). Clamped to `0..=180`.
+    pub outer_angle_deg: f32,
+    /// Whether this spot casts a stylized hard shadow (shares the
+    /// shadow-caster cap with the sun + point lights; excess demoted with a
+    /// warning, never truncated).
+    pub casts_shadow: bool,
+}
+
+impl Default for SpotLight {
+    fn default() -> Self {
+        Self {
+            position: [0.0; 3],
+            direction: [0.0, 0.0, 1.0],
+            color: [1.0; 3],
+            intensity: 1.0,
+            radius: 32.0,
+            inner_angle_deg: 20.0,
+            outer_angle_deg: 30.0,
+            casts_shadow: false,
+        }
+    }
+}
+
+impl SpotLight {
+    /// The clamped `(inner, outer)` half-angles in degrees (`0 <= inner <=
+    /// outer <= 180`). Shared by both backends so the cone is identical.
+    fn clamped_angles(&self) -> (f32, f32) {
+        let outer = self.outer_angle_deg.clamp(0.0, 180.0);
+        let inner = self.inner_angle_deg.clamp(0.0, outer);
+        (inner, outer)
+    }
+
+    /// The normalized world-space cone axis (travel direction). `[0,0,1]`
+    /// if `direction` is degenerate.
+    pub(crate) fn axis(&self) -> [f32; 3] {
+        let d = self.direction;
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if len > 1e-6 {
+            [d[0] / len, d[1] / len, d[2] / len]
+        } else {
+            [0.0, 0.0, 1.0]
+        }
+    }
+
+    /// Cosine of the clamped inner half-angle (`>= cos_outer`).
+    pub(crate) fn cos_inner(&self) -> f32 {
+        self.clamped_angles().0.to_radians().cos()
+    }
+
+    /// Cosine of the clamped outer half-angle. `<= -0.999` (a `>= ~177°`
+    /// cone) makes the shader/CPU skip the cone mask — an omnidirectional
+    /// point light.
+    pub(crate) fn cos_outer(&self) -> f32 {
+        self.clamped_angles().1.to_radians().cos()
+    }
+}
+
 /// The whole per-frame light environment, borrowed into
 /// [`crate::FrameParams`]. GPU-only.
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +156,9 @@ pub struct LightRig<'a> {
     /// Point lights. The backend caps the count (excess dropped with a
     /// log warning), so this slice may be longer than the GPU honours.
     pub points: &'a [PointLight],
+    /// Spot (cone) lights. Folded into the point-light path, so they share
+    /// the point-light count + shadow-caster budgets (points take priority).
+    pub spots: &'a [SpotLight],
     /// Multiplier applied to the baked ambient byte — the global ambient
     /// level / tint. `[1.0; 3]` uses the baked byte as-is.
     pub ambient: [f32; 3],
@@ -109,6 +191,7 @@ impl Default for LightRig<'_> {
         Self {
             sun: None,
             points: &[],
+            spots: &[],
             ambient: [1.0; 3],
             shadow_strength: 0.7,
             shadow_bias_voxels: 1.5,
@@ -116,5 +199,54 @@ impl Default for LightRig<'_> {
             bands: 0,
             shadow_tint: [0.12, 0.14, 0.2],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spot_angles_convert_and_clamp() {
+        // cos is decreasing in angle ⇒ inner (smaller angle) has the larger
+        // cosine; the two bracket the smoothstep the backends run.
+        let s = SpotLight {
+            inner_angle_deg: 20.0,
+            outer_angle_deg: 30.0,
+            ..SpotLight::default()
+        };
+        assert!(s.cos_inner() > s.cos_outer());
+        assert!((s.cos_inner() - 20.0f32.to_radians().cos()).abs() < 1e-6);
+
+        // inner > outer is clamped to outer ⇒ a hard edge (equal cosines).
+        let hard = SpotLight {
+            inner_angle_deg: 40.0,
+            outer_angle_deg: 25.0,
+            ..SpotLight::default()
+        };
+        assert!((hard.cos_inner() - hard.cos_outer()).abs() < 1e-6);
+
+        // A 180° outer cone reads as an omnidirectional point (mask skipped:
+        // the backends treat `cos_outer <= -0.999` as "not a spot").
+        let wide = SpotLight {
+            outer_angle_deg: 180.0,
+            ..SpotLight::default()
+        };
+        assert!(wide.cos_outer() <= -0.999);
+    }
+
+    #[test]
+    fn spot_axis_normalizes() {
+        let s = SpotLight {
+            direction: [0.0, 0.0, 5.0],
+            ..SpotLight::default()
+        };
+        assert_eq!(s.axis(), [0.0, 0.0, 1.0]);
+        // Degenerate direction falls back to a defined axis.
+        let z = SpotLight {
+            direction: [0.0; 3],
+            ..SpotLight::default()
+        };
+        assert_eq!(z.axis(), [0.0, 0.0, 1.0]);
     }
 }

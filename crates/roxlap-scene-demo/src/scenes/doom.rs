@@ -296,6 +296,7 @@ impl DemoScene for DoomScene {
         frame.lights = Some(LightRig {
             sun: Some(sun),
             points: &[],
+            spots: &[],
             ambient: [0.34, 0.36, 0.42],
             shadow_strength: 0.85,
             shadow_bias_voxels: 1.5,

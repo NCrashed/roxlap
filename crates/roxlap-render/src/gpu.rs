@@ -1488,7 +1488,7 @@ impl GpuBackend {
                     .grid_sun_dirs
                     .push(grid_local_sun_dir(rotation, sun.direction));
             }
-            let mut pts = Vec::with_capacity(rig.points.len());
+            let mut pts = Vec::with_capacity(rig.points.len() + rig.spots.len());
             for p in rig.points {
                 pts.push(roxlap_gpu::GpuLight {
                     position: grid_local_point(rotation, origin, p.position),
@@ -1496,12 +1496,26 @@ impl GpuBackend {
                     color: p.color,
                     intensity: p.intensity,
                     casts_shadow: p.casts_shadow,
-                    // SL.0 — point lights only yet; `cos_outer = -1.0` marks
-                    // "not a spot" so the shader skips the cone mask. SL.2
-                    // folds `rig.spots` in here (axis inverse-rotated per grid).
+                    // `cos_outer = -1.0` marks "not a spot" ⇒ the shader skips
+                    // the cone mask (an omnidirectional point light).
                     spot_dir: [0.0, 0.0, 1.0],
                     cos_inner: -1.0,
                     cos_outer: -1.0,
+                });
+            }
+            // SL.2 — spots fold into the same per-grid array (so they share the
+            // point-count + shadow-caster budgets). The cone axis is a vector:
+            // inverse-rotated only (no origin), NOT negated (travel direction).
+            for s in rig.spots {
+                pts.push(roxlap_gpu::GpuLight {
+                    position: grid_local_point(rotation, origin, s.position),
+                    radius: s.radius,
+                    color: s.color,
+                    intensity: s.intensity,
+                    casts_shadow: s.casts_shadow,
+                    spot_dir: grid_local_dir(rotation, s.direction),
+                    cos_inner: s.cos_inner(),
+                    cos_outer: s.cos_outer(),
                 });
             }
             lights.grid_point_lights.push(pts);
@@ -1512,6 +1526,8 @@ impl GpuBackend {
             let to_sun = (-DVec3::from_array(sun.direction.map(f64::from))).normalize_or_zero();
             lights.world_sun_dir = [to_sun.x as f32, to_sun.y as f32, to_sun.z as f32];
         }
+        // World-space copies keep the axis in world space (sprites shade in
+        // world space); spots chain after points, mirroring the per-grid order.
         lights.world_points = rig
             .points
             .iter()
@@ -1521,11 +1537,20 @@ impl GpuBackend {
                 color: p.color,
                 intensity: p.intensity,
                 casts_shadow: p.casts_shadow,
-                // SL.0 — point lights only (see the per-grid copy above).
                 spot_dir: [0.0, 0.0, 1.0],
                 cos_inner: -1.0,
                 cos_outer: -1.0,
             })
+            .chain(rig.spots.iter().map(|s| roxlap_gpu::GpuLight {
+                position: s.position,
+                radius: s.radius,
+                color: s.color,
+                intensity: s.intensity,
+                casts_shadow: s.casts_shadow,
+                spot_dir: s.axis(),
+                cos_inner: s.cos_inner(),
+                cos_outer: s.cos_outer(),
+            }))
             .collect();
         self.gpu.set_scene_lights(lights);
     }
@@ -1634,6 +1659,14 @@ pub(crate) fn grid_local_point(
 ) -> [f32; 3] {
     let local = rotation.inverse() * (DVec3::from_array(pos_world.map(f64::from)) - origin);
     [local.x as f32, local.y as f32, local.z as f32]
+}
+
+/// SL — a world-space spot cone axis (travel direction) → its grid-local
+/// frame. Like [`grid_local_sun_dir`] but WITHOUT the negation: the shader's
+/// `spot_cone` wants the travel direction, not the toward-light vector.
+pub(crate) fn grid_local_dir(rotation: glam::DQuat, dir_world: [f32; 3]) -> [f32; 3] {
+    let d = (rotation.inverse() * DVec3::from_array(dir_world.map(f64::from))).normalize_or_zero();
+    [d.x as f32, d.y as f32, d.z as f32]
 }
 
 #[cfg(test)]
