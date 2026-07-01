@@ -283,6 +283,31 @@ fn point_falloff(d: f32, radius: f32) -> f32 {
     x * x
 }
 
+// SL — Hermite `smoothstep` (mirror of WGSL's), with a defined hard-edge case:
+// when `edge0 == edge1` WGSL is undefined, so we step at the shared threshold.
+#[inline]
+fn smoothstep_scalar(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge1 <= edge0 {
+        return if x < edge0 { 0.0 } else { 1.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+// SL — spot (cone) angular mask (mirror of the shaders' `spot_cone`). `ldir` is
+// the unit direction from the surface TO the light; `axis` the cone axis (the
+// way the light shines). Returns 1.0 for a pure point light (`cos_outer <=
+// -0.999`, the 180° degenerate); else a soft `smoothstep` from 0 at the outer
+// half-angle to 1 at the inner (hard step when the two coincide).
+#[inline]
+fn spot_cone(ldir: [f32; 3], axis: [f32; 3], cos_inner: f32, cos_outer: f32) -> f32 {
+    if cos_outer <= -0.999 {
+        return 1.0;
+    }
+    let cd = -dot3(ldir, axis);
+    smoothstep_scalar(cos_outer, cos_inner, cd)
+}
+
 // CPU.1 — face normal (grid-local) from the crossed axis + step: points back
 // toward the incoming ray. `axis == 3` (entry voxel, no face) falls back to up
 // (-z, voxlap z-down).
@@ -498,7 +523,10 @@ pub(crate) fn shade_dynamic(
             let inv = 1.0 / dist;
             let ldir = [d3[0] * inv, d3[1] * inv, d3[2] * inv];
             let ndl = dot3(n, ldir).max(0.0);
-            if ndl > 0.0 {
+            // SL — spot cone mask (1.0 for a pure point light). Computed
+            // before the shadow march so an off-cone spot skips it entirely.
+            let cone = spot_cone(ldir, p.spot_dir, p.cos_inner, p.cos_outer);
+            if ndl > 0.0 && cone > 0.0 {
                 // Shadow ray marches from the surface to the light (`dist`).
                 let sh = if p.casts_shadow
                     && shadow
@@ -509,7 +537,7 @@ pub(crate) fn shade_dynamic(
                 } else {
                     1.0
                 };
-                let mut f = ndl * point_falloff(dist, p.radius) * sh;
+                let mut f = ndl * point_falloff(dist, p.radius) * cone * sh;
                 if styled {
                     f = cel_band(f, l.bands);
                 }
@@ -1861,6 +1889,54 @@ mod tests {
             lum(lit) > lum(dark),
             "sun facing the surface must brighten it: {lit:#08x} vs {dark:#08x}",
         );
+    }
+
+    #[test]
+    fn shade_dynamic_spot_cone_masks_off_axis() {
+        // Surface at the origin, up-facing normal (-z, voxlap z-down); a light
+        // 10 units "above" it (at -z). No ambient/AO ⇒ only the light shows.
+        let albedo = [0.5, 0.5, 0.5];
+        let n = [0.0, 0.0, -1.0];
+        let sample = [0.0, 0.0, 0.0];
+        let inner = 10.0f32.to_radians().cos();
+        let outer = 15.0f32.to_radians().cos();
+        let shade = |spot_dir: [f32; 3], cos_inner: f32, cos_outer: f32| {
+            let pts = [CpuPointLight {
+                pos: [0.0, 0.0, -10.0],
+                color: [1.0; 3],
+                intensity: 1.0,
+                radius: 64.0,
+                casts_shadow: false,
+                spot_dir,
+                cos_inner,
+                cos_outer,
+            }];
+            let l = CpuLights {
+                enabled: true,
+                ambient: [0.0; 3],
+                points: &pts,
+                ..CpuLights::default()
+            };
+            shade_dynamic(albedo, 0.0, n, sample, &l, None)
+        };
+        // A pure point light (cos_outer = -1) ignores the axis entirely.
+        let point = shade([0.0, 0.0, 1.0], -1.0, -1.0);
+        // A spot whose axis shines straight down onto the surface (on-axis).
+        let on_axis = shade([0.0, 0.0, 1.0], inner, outer);
+        // Same spot aimed sideways ⇒ the surface is outside the cone.
+        let off_axis = shade([1.0, 0.0, 0.0], inner, outer);
+
+        // On-axis (cd == 1) is fully inside the cone ⇒ identical to a point.
+        assert_eq!(
+            on_axis, point,
+            "on-axis spot must equal the point light: {on_axis:#08x} vs {point:#08x}",
+        );
+        // Off-axis is masked to zero ⇒ only the (zero) ambient remains.
+        assert!(
+            lum(on_axis) > lum(off_axis),
+            "off-axis spot must be darker: {on_axis:#08x} vs {off_axis:#08x}",
+        );
+        assert_eq!(lum(off_axis), 0, "off-cone spot contributes nothing");
     }
 
     #[test]

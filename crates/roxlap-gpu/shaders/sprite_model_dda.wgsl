@@ -226,6 +226,17 @@ fn point_falloff(d: f32, radius: f32) -> f32 {
     return x * x;
 }
 
+// SL — spot (cone) angular mask (mirror of scene_dda's). `ldir` = unit dir
+// from surface TO light; `axis` = cone axis. 1.0 for a pure point light
+// (`cos_outer <= -0.999`); else soft smoothstep outer→inner, hard `step`
+// when the angles coincide (WGSL smoothstep is undefined for equal edges).
+fn spot_cone(ldir: vec3<f32>, axis: vec3<f32>, cos_inner: f32, cos_outer: f32) -> f32 {
+    if (cos_outer <= -0.999) { return 1.0; }
+    let cd = dot(-ldir, axis);
+    if (cos_inner <= cos_outer) { return step(cos_outer, cd); }
+    return smoothstep(cos_outer, cos_inner, cd);
+}
+
 // DL.6 — cel quantization (mirror of scene_dda's): snap a 0..1 factor to
 // `bands + 1` discrete levels.
 fn cel_band(x: f32, bands: u32) -> f32 {
@@ -318,8 +329,12 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
         let d3 = pl.pos - sample;
         let dist = length(d3);
         if (dist < pl.radius && dist > 1e-4) {
-            let ndl = max(0.0, dot(n_world, d3 / dist));
-            if (ndl > 0.0) {
+            let l = d3 / dist;
+            let ndl = max(0.0, dot(n_world, l));
+            // SL — spot cone mask (1.0 for a pure point light); computed
+            // before the shadow march so an off-cone spot skips it.
+            let cone = spot_cone(l, pl.spot_dir, pl.cos_inner, pl.cos_outer);
+            if (ndl > 0.0 && cone > 0.0) {
                 var sh = 1.0;
                 if (recv && pl.casts_shadow != 0u) {
                     let to_light = pl.pos - shadow_origin_w;
@@ -328,7 +343,7 @@ fn shade_sprite_lit(m: ModelMeta, p: vec3<i32>, inst: Instance, ray_dir: vec3<f3
                         sh = in_shadow;
                     }
                 }
-                var f = ndl * point_falloff(dist, pl.radius) * sh;
+                var f = ndl * point_falloff(dist, pl.radius) * cone * sh;
                 if (styled) { f = cel_band(f, u.style_bands); }
                 lit = lit + albedo * pl.color * pl.intensity * f;
             }

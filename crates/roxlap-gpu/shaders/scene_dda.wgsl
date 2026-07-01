@@ -350,6 +350,19 @@ fn point_falloff(d: f32, radius: f32) -> f32 {
     return x * x;
 }
 
+// SL — spot (cone) angular mask. `ldir` = unit direction from the surface TO
+// the light; `axis` = the cone axis (the way the light shines). Returns 1.0
+// for a pure point light (`cos_outer <= -0.999`, the 180° degenerate). Else a
+// soft `smoothstep` from 0 at the outer half-angle to 1 at the inner, falling
+// back to a hard `step` when the two angles coincide (`outer == inner` — WGSL
+// `smoothstep` is undefined for equal edges).
+fn spot_cone(ldir: vec3<f32>, axis: vec3<f32>, cos_inner: f32, cos_outer: f32) -> f32 {
+    if (cos_outer <= -0.999) { return 1.0; }
+    let cd = dot(-ldir, axis);
+    if (cos_inner <= cos_outer) { return step(cos_outer, cd); }
+    return smoothstep(cos_outer, cos_inner, cd);
+}
+
 // GPU.7 modular slot lookup. `pool_dims` are powers of 2 (asserted
 // on the host), so `chunk_idx & (pool_dims - 1)` is the slot index
 // per axis. Slot identity must be verified against
@@ -678,7 +691,10 @@ fn shade_lit(
         if (dist < pl.radius && dist > 1e-4) {
             let l = d3 / dist;
             let ndl = max(0.0, dot(n, l));
-            if (ndl > 0.0) {
+            // SL — spot cone mask (1.0 for a pure point light). Computed
+            // before the shadow march so a spot skips it entirely off-cone.
+            let cone = spot_cone(l, pl.spot_dir, pl.cos_inner, pl.cos_outer);
+            if (ndl > 0.0 && cone > 0.0) {
                 let atten = point_falloff(dist, pl.radius);
                 var sh = 1.0;
                 if (pl.casts_shadow != 0u) {
@@ -689,7 +705,7 @@ fn shade_lit(
                         sh = in_shadow;
                     }
                 }
-                var f = ndl * atten * sh;
+                var f = ndl * atten * cone * sh;
                 if (styled) { f = cel_band(f, u.style_bands); }
                 lit = lit + albedo * pl.color * pl.intensity * f;
             }
