@@ -638,6 +638,22 @@ pub struct GpuRenderer {
     /// [`Self::set_scene_lights`]; [`SceneLights::default`] = no lights
     /// (the pre-DL render). Consumed by `render_scene` each frame.
     scene_lights: SceneLights,
+    /// PF.5 — set when [`Self::set_scene_lights`] stores a DIFFERENT rig;
+    /// `render_scene` re-packs + re-uploads the scene point lights only
+    /// then (a static rig costs nothing per frame). Starts `true`.
+    scene_lights_dirty: bool,
+    /// PF.5 — like `scene_lights_dirty` but cleared by the SPRITE pass's
+    /// world-light upload (which only runs when sprites are visible, so it
+    /// needs its own flag or a lights change while no sprite is on screen
+    /// would be lost).
+    sprite_lights_dirty: bool,
+    /// PF.5 — cached results of the last `pack_scene_lights` (they feed the
+    /// per-frame uniform even on pack-skipped frames).
+    lights_sun_flags: u32,
+    lights_point_count: u32,
+    /// PF.5 — grid count the lights were last packed for (the grid-major
+    /// rows depend on it, so a grid-count change forces a re-pack).
+    lights_packed_grids: u32,
     /// Vertical FOV (radians) the last `render_scene` marched with —
     /// cached so [`Self::pixel_ray`] reconstructs the matching view ray
     /// for picking. `0` until the first scene render.
@@ -730,6 +746,9 @@ struct SceneDdaResources {
     resolve_dims: wgpu::Buffer,
     /// Blit bind group — binds `resolve_buf` (logical) + `blit_dims`.
     blit_bg: wgpu::BindGroup,
+    /// PF.5 (H6) — blit variant reading `framebuffer` directly, used when
+    /// the resolve pass would be an identity copy (ssaa 1, posterize off).
+    blit_bg_direct: wgpu::BindGroup,
     pipeline_blit: wgpu::RenderPipeline,
     /// Blit uniform `Dims`: `[src(logical) w,h, dst(swapchain) w,h, flip_x,
     /// pad×3]`. Retained so the flip flag (offset 16) is re-written per frame.
@@ -1066,7 +1085,7 @@ pub const MAX_SHADOW_CASTERS: usize = 4;
 /// A point light in a grid's **local** space, as handed to
 /// [`GpuRenderer::set_scene_lights`]. The facade transforms world-space
 /// [`roxlap_render::PointLight`]s into each grid's frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GpuLight {
     /// Grid-local position (voxel units).
     pub position: [f32; 3],
@@ -1093,7 +1112,7 @@ pub struct GpuLight {
 /// length == `grid_count`); empty ⇒ that light type is off. Set each frame
 /// via [`GpuRenderer::set_scene_lights`]; [`Default`] = no lights (the
 /// pre-DL render).
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct SceneLights {
     /// Whether a dynamic-lighting rig is active this frame. `false` (the
     /// default) ⇒ the shader takes the unchanged baked-only path
@@ -1167,27 +1186,31 @@ fn upload_grid_point_lights(device: &wgpu::Device, lights: &[GpuPointLight]) -> 
     })
 }
 
-/// DL — pack `lights` for the scene-DDA pass, shared by the surface and
-/// headless paths. Injects each grid's sun direction into
-/// `cam_vec[g].sun_dir` (binding 15), packs the grid-major point-light
-/// rows (binding 18), and returns `(packed_lights, sun_flags,
-/// point_count)`. PF.4 — packing only; the caller uploads (the surface
-/// path into a persistent buffer, headless via `create_buffer_init`).
-/// `sun_flags`: bit0 = sun enabled, bit1 = sun casts shadow,
-/// bit2 = dynamic lighting active. Over-cap point lights are dropped with a
-/// warning (never silently truncated).
-fn pack_scene_lights(
-    lights: &SceneLights,
-    grid_count: usize,
-    cam_vec: &mut [SceneDdaPerGridCamera],
-) -> (Vec<GpuPointLight>, u32, u32) {
-    let sun_enabled = !lights.grid_sun_dirs.is_empty();
-    if sun_enabled {
-        for (g, cam) in cam_vec.iter_mut().enumerate() {
-            let d = lights.grid_sun_dirs.get(g).copied().unwrap_or([0.0; 3]);
-            cam.sun_dir = [d[0], d[1], d[2], 0.0];
-        }
+/// DL — inject each grid's sun direction into `cam_vec[g].sun_dir`
+/// (binding 15). PF.5 — split from [`pack_scene_lights`]: the camera
+/// vector is rebuilt every frame, so the injection must run every frame,
+/// while the point-light pack is gated behind the lights dirty flag.
+fn inject_grid_sun_dirs(lights: &SceneLights, cam_vec: &mut [SceneDdaPerGridCamera]) {
+    if lights.grid_sun_dirs.is_empty() {
+        return;
     }
+    for (g, cam) in cam_vec.iter_mut().enumerate() {
+        let d = lights.grid_sun_dirs.get(g).copied().unwrap_or([0.0; 3]);
+        cam.sun_dir = [d[0], d[1], d[2], 0.0];
+    }
+}
+
+/// DL — pack `lights` for the scene-DDA pass, shared by the surface and
+/// headless paths: the grid-major point-light rows (binding 18), returned
+/// as `(packed_lights, sun_flags, point_count)`. PF.4 — packing only; the
+/// caller uploads (the surface path into a persistent buffer, headless via
+/// `create_buffer_init`). PF.5 — the surface path calls this only when the
+/// lights changed (so the over-cap warnings below also fire once per
+/// change, not per frame). `sun_flags`: bit0 = sun enabled, bit1 = sun
+/// casts shadow, bit2 = dynamic lighting active. Over-cap point lights are
+/// dropped with a warning (never silently truncated).
+fn pack_scene_lights(lights: &SceneLights, grid_count: usize) -> (Vec<GpuPointLight>, u32, u32) {
+    let sun_enabled = !lights.grid_sun_dirs.is_empty();
     // Point-light count per grid (same across grids); capped + warned.
     let mut point_count = lights
         .grid_point_lights
@@ -1743,6 +1766,11 @@ impl GpuRenderer {
             scene_mip_scan_dist: 64.0,
             scene_side_shades: [[0; 4]; 2],
             scene_lights: SceneLights::default(),
+            scene_lights_dirty: true,
+            sprite_lights_dirty: true,
+            lights_sun_flags: 0,
+            lights_point_count: 0,
+            lights_packed_grids: 0,
             last_fov_y_rad: 0.0,
             pending_frame: None,
             frame_pack: None,
@@ -2755,11 +2783,22 @@ impl GpuRenderer {
             self.frame_pack = Some(FramePackBuffers::new(&self.device));
         }
         let lights = &self.scene_lights;
-        let (packed_lights, sun_flags, point_count) =
-            pack_scene_lights(lights, scene.grid_count as usize, &mut cam_vec);
+        // Sun dirs ride in the per-frame camera vector — inject every frame.
+        inject_grid_sun_dirs(lights, &mut cam_vec);
         let fp = self.frame_pack.as_mut().expect("just built");
         fp.write_cameras(&self.device, &self.queue, &cam_vec);
-        fp.write_point_lights(&self.device, &self.queue, &packed_lights);
+        // PF.5 — re-pack + re-upload the grid-major point lights only when
+        // the rig changed (or the grid count did — the rows depend on it).
+        if self.scene_lights_dirty || self.lights_packed_grids != scene.grid_count {
+            let (packed_lights, sun_flags, point_count) =
+                pack_scene_lights(lights, scene.grid_count as usize);
+            fp.write_point_lights(&self.device, &self.queue, &packed_lights);
+            self.lights_sun_flags = sun_flags;
+            self.lights_point_count = point_count;
+            self.lights_packed_grids = scene.grid_count;
+            self.scene_lights_dirty = false;
+        }
+        let (sun_flags, point_count) = (self.lights_sun_flags, self.lights_point_count);
 
         let uniform = SceneDdaUniform {
             fov_y_rad,
@@ -2894,27 +2933,34 @@ impl GpuRenderer {
                 // world-space, not grid-local). No sprite shadows (deferred).
                 let dl = &self.scene_lights;
                 let sprite_sun_enabled = dl.world_sun_dir != [0.0; 3];
-                let sprite_pts: Vec<GpuPointLight> = dl
-                    .world_points
-                    .iter()
-                    .take(MAX_POINT_LIGHTS)
-                    .map(|l| GpuPointLight {
-                        pos: l.position,
-                        radius: l.radius,
-                        color: l.color,
-                        intensity: l.intensity,
-                        spot_dir: l.spot_dir,
-                        cos_outer: l.cos_outer,
-                        cos_inner: l.cos_inner,
-                        // XS.4.2 — honour the light's caster flag so a
-                        // receiving sprite is shadowed by it (capable devices).
-                        casts_shadow: u32::from(l.casts_shadow),
-                        _pad: [0; 2],
-                    })
-                    .collect();
-                let sprite_point_count = sprite_pts.len() as u32;
+                let sprite_point_count = dl.world_points.len().min(MAX_POINT_LIGHTS) as u32;
                 // PF.4 — persistent buffer instead of a per-frame allocation.
-                fp.write_sprite_lights(&self.device, &self.queue, &sprite_pts);
+                // PF.5 — rebuilt + re-uploaded only when the rig changed;
+                // this pass's own dirty flag (it only runs with sprites on
+                // screen, so it can't ride the scene pack's flag).
+                if self.sprite_lights_dirty {
+                    let sprite_pts: Vec<GpuPointLight> = dl
+                        .world_points
+                        .iter()
+                        .take(MAX_POINT_LIGHTS)
+                        .map(|l| GpuPointLight {
+                            pos: l.position,
+                            radius: l.radius,
+                            color: l.color,
+                            intensity: l.intensity,
+                            spot_dir: l.spot_dir,
+                            cos_outer: l.cos_outer,
+                            cos_inner: l.cos_inner,
+                            // XS.4.2 — honour the light's caster flag so a
+                            // receiving sprite is shadowed by it (capable
+                            // devices).
+                            casts_shadow: u32::from(l.casts_shadow),
+                            _pad: [0; 2],
+                        })
+                        .collect();
+                    fp.write_sprite_lights(&self.device, &self.queue, &sprite_pts);
+                    self.sprite_lights_dirty = false;
+                }
                 // sun_flags bit0 = sun enabled, bit1 = sun casts shadow (XS.4.2),
                 // bit2 = dynamic lighting active.
                 let sprite_sun_flags = u32::from(sprite_sun_enabled)
@@ -3058,9 +3104,13 @@ impl GpuRenderer {
             cpass.dispatch_workgroups(render_w.div_ceil(8), render_h.div_ceil(8), 1);
         }
         // RP.1 — resolve pass: box-downfilter framebuffer(march) →
-        // resolve_buf(logical). One thread per logical pixel. `ssaa == 1` ⇒
-        // exact 1×1 copy (byte-identical), so the blit always reads resolve_buf.
-        {
+        // resolve_buf(logical). One thread per logical pixel.
+        // PF.5 (H6) — with ssaa == 1 AND posterize off the resolve is an
+        // identity copy: skip the whole full-screen pass and blit straight
+        // from the framebuffer instead (byte-identical output).
+        let identity_resolve =
+            (render_w, render_h) == (logical_w, logical_h) && self.posterize.is_none();
+        if !identity_resolve {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("roxlap-gpu scene_dda resolve"),
                 timestamp_writes: None,
@@ -3087,7 +3137,15 @@ impl GpuRenderer {
                 multiview_mask: None,
             });
             rpass.set_pipeline(&dda.pipeline_blit);
-            rpass.set_bind_group(0, &dda.blit_bg, &[]);
+            rpass.set_bind_group(
+                0,
+                if identity_resolve {
+                    &dda.blit_bg_direct
+                } else {
+                    &dda.blit_bg
+                },
+                &[],
+            );
             rpass.draw(0..3, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -4182,6 +4240,24 @@ impl GpuRenderer {
                 },
             ],
         });
+        // PF.5 (H6) — direct-blit variant reading the march framebuffer:
+        // used when the resolve pass would be an identity copy (ssaa == 1,
+        // posterize off ⇒ march size == logical size), letting render_scene
+        // skip that full-screen pass entirely.
+        let blit_bg_direct = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("roxlap-gpu scene_dda.blit_bg_direct"),
+            layout: &bgl_blit,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: framebuffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: blit_dims.as_entire_binding(),
+                },
+            ],
+        });
 
         // TV.6 — material palette + terrain map buffers, seeded from the
         // renderer's current scene-material state (so a map defined before the
@@ -4222,6 +4298,7 @@ impl GpuRenderer {
             resolve_bg,
             resolve_dims,
             blit_bg,
+            blit_bg_direct,
             pipeline_blit,
             blit_dims,
             depth_buffer,
@@ -4277,11 +4354,15 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("roxlap-gpu depth readback"),
             });
-        let size = u64::from(w) * u64::from(h) * 4;
-        enc.copy_buffer_to_buffer(&dda.depth_buffer, 0, &dda.depth_readback, 0, size);
+        // PF.5 (H4) — copy ONLY the picked pixel's 4 bytes, not the whole
+        // depth buffer (8+ MB at high res): the pick still blocks on the
+        // poll below, but the copy + map are now O(1). The 4-byte offset
+        // meets wgpu's copy alignment.
+        let offset = (u64::from(y) * u64::from(w) + u64::from(x)) * 4;
+        enc.copy_buffer_to_buffer(&dda.depth_buffer, offset, &dda.depth_readback, 0, 4);
         self.queue.submit(std::iter::once(enc.finish()));
 
-        let slice = dda.depth_readback.slice(..);
+        let slice = dda.depth_readback.slice(..4);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -4291,8 +4372,7 @@ impl GpuRenderer {
 
         let t = {
             let data = slice.get_mapped_range();
-            let idx = ((y * w + x) * 4) as usize;
-            let bytes: [u8; 4] = data[idx..idx + 4].try_into().ok()?;
+            let bytes: [u8; 4] = data[0..4].try_into().ok()?;
             f32::from_le_bytes(bytes)
         };
         dda.depth_readback.unmap();
@@ -4591,8 +4671,15 @@ impl GpuRenderer {
     /// [`Self::render_scene`] (the facade does this from
     /// `FrameParams::lights`). [`SceneLights::default`] clears all lights —
     /// the pre-DL render. GPU-only; the CPU backend has no analogue.
+    /// PF.5 — an unchanged rig is a no-op: `render_scene` re-packs +
+    /// re-uploads the light buffers only when this actually stores
+    /// something different, so a static rig costs nothing per frame.
     pub fn set_scene_lights(&mut self, lights: SceneLights) {
-        self.scene_lights = lights;
+        if self.scene_lights != lights {
+            self.scene_lights = lights;
+            self.scene_lights_dirty = true;
+            self.sprite_lights_dirty = true;
+        }
     }
 
     /// GPU.10.1 — build the instanced model-DDA pipeline (one thread
@@ -5027,8 +5114,9 @@ impl HeadlessSceneRenderer {
         // and builds the point-light buffer (binding 18). Shared with the
         // surface path.
         let dl = self.lights.clone();
+        inject_grid_sun_dirs(&dl, &mut cam_vec);
         let (packed_lights, sun_flags, point_count) =
-            pack_scene_lights(&dl, scene.grid_count as usize, &mut cam_vec);
+            pack_scene_lights(&dl, scene.grid_count as usize);
         let dummy_point_lights = upload_grid_point_lights(device, &packed_lights);
         let grid_cameras = upload_grid_cameras(device, &cam_vec);
         let uniform = SceneDdaUniform {

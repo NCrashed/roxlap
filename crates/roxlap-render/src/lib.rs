@@ -429,6 +429,11 @@ struct StreamingClipState {
     /// Re-applied on every per-frame re-upload so the streamed model keeps
     /// its per-voxel materials as it advances.
     material_map: Vec<(u32, u8)>,
+    /// PF.5 — the clip frame currently resident on `model`. A player driven
+    /// at render rate re-applies the same clip frame most ticks (10 fps clip
+    /// on a 144 fps render = 14×); when it matches, the dense `to_kv6`
+    /// rebuild + LOD chain + GPU re-upload are skipped entirely.
+    last_applied: Option<usize>,
 }
 
 /// Per-clip-attachment playback clock (VCL.6): the timing it needs to
@@ -2880,6 +2885,7 @@ impl SceneRenderer {
         let dims = cursor.dims();
         let pivot = cursor.pivot();
         let kv6 = cursor.current_frame().to_kv6(dims, pivot);
+        let resident_frame = cursor.current_index();
         let model = self.add_sprite_model_with_materials(&kv6, material_map);
         let index = self.streaming_clips.len() as u32;
         self.streaming_clips.push(Some(StreamingClipState {
@@ -2888,6 +2894,8 @@ impl SceneRenderer {
             dims,
             pivot,
             material_map: material_map.to_vec(),
+            // The model was just built from the cursor's current frame.
+            last_applied: Some(resident_frame),
         }));
         Ok(self.streaming_map.alloc(index))
     }
@@ -2945,7 +2953,16 @@ impl SceneRenderer {
             return;
         };
         let Some((model, kv6, material_map)) = self.streaming_clips[idx].as_mut().and_then(|s| {
-            let vf = s.cursor.seek(frame as usize).ok()?;
+            s.cursor.seek(frame as usize).ok()?;
+            // PF.5 — same-frame guard on the RESOLVED (clamped) index: skip
+            // the dense rebuild + re-upload when this frame is already
+            // resident on the model.
+            let resolved = s.cursor.current_index();
+            if s.last_applied == Some(resolved) {
+                return None;
+            }
+            s.last_applied = Some(resolved);
+            let vf = s.cursor.current_frame();
             Some((s.model, vf.to_kv6(s.dims, s.pivot), s.material_map.clone()))
         }) else {
             return;

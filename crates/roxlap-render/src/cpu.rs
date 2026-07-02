@@ -440,6 +440,9 @@ pub(crate) struct CpuBackend {
     /// refreshed by [`Self::update_kfa_poses`] and drawn after the
     /// static sprites each frame via `draw_sprite`.
     kfa_limbs: Vec<Sprite>,
+    /// PF.5 — the shadow-caster demotion count last warned about, so the
+    /// over-cap `eprintln` fires once per change instead of every frame.
+    shadow_demote_warned: usize,
     /// `F`-capture: when set, the next frame copies its composited
     /// buffer into `captured` before presenting.
     capture_next: bool,
@@ -502,6 +505,7 @@ impl CpuBackend {
             dyn_clip: Vec::new(),
             clip_books: Vec::new(),
             kfa_limbs: Vec::new(),
+            shadow_demote_warned: 0,
             capture_next: false,
             captured: None,
             framebuffer,
@@ -1165,11 +1169,16 @@ impl CpuBackend {
                     cos_outer: s.cos_outer(),
                 });
             }
-            if demoted > 0 {
-                eprintln!(
-                    "roxlap CPU: {demoted} shadow-casting point lights > MAX_SHADOW_CASTERS ({}); demoting the excess to shadowless",
-                    roxlap_gpu::MAX_SHADOW_CASTERS
-                );
+            // PF.5 — warn once per change, not per frame (this runs in the
+            // frame loop; an over-cap rig otherwise spams stderr at 60 Hz).
+            if demoted != self.shadow_demote_warned {
+                if demoted > 0 {
+                    eprintln!(
+                        "roxlap CPU: {demoted} shadow-casting point lights > MAX_SHADOW_CASTERS ({}); demoting the excess to shadowless",
+                        roxlap_gpu::MAX_SHADOW_CASTERS
+                    );
+                }
+                self.shadow_demote_warned = demoted;
             }
             roxlap_core::CpuLights {
                 enabled: true,

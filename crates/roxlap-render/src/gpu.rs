@@ -156,6 +156,11 @@ pub(crate) struct GpuBackend {
     /// TV: terrain colour→material map. Retained for the TV.6 GPU terrain
     /// path; the CPU backend already composites with it.
     terrain_materials: Vec<(u32, u8)>,
+    /// PF.5 — set when `materials` / `terrain_materials` change; `render`
+    /// mirrors them to the device only then (was: two `write_buffer`s +
+    /// palette rebuilds every frame). Starts `true` so the first frame
+    /// seeds the device palettes.
+    materials_dirty: bool,
 }
 
 impl GpuBackend {
@@ -189,6 +194,7 @@ impl GpuBackend {
             transforms_dirty: false,
             materials: MaterialTable::new(),
             terrain_materials: Vec::new(),
+            materials_dirty: true,
         }
     }
 
@@ -519,7 +525,11 @@ impl GpuBackend {
     /// table is held authoritatively here; device upload + blending land in
     /// a later TV sub-stage.
     pub(crate) fn define_material(&mut self, id: u8, mat: Material) -> bool {
-        self.materials.set(id, mat)
+        let changed = self.materials.set(id, mat);
+        if changed {
+            self.materials_dirty = true;
+        }
+        changed
     }
 
     /// The material at `id` ([`Material::OPAQUE`] for any never-defined id).
@@ -530,7 +540,10 @@ impl GpuBackend {
     /// Set the terrain colour→material map (TV.4). Retained for the TV.6 GPU
     /// terrain transparency path.
     pub(crate) fn set_terrain_materials(&mut self, map: &[(u32, u8)]) {
-        self.terrain_materials = map.to_vec();
+        if self.terrain_materials != map {
+            self.terrain_materials = map.to_vec();
+            self.materials_dirty = true;
+        }
     }
 
     /// Remove the dynamic instance at dynamic-sublist index `idx` by
@@ -664,9 +677,14 @@ impl GpuBackend {
         if idx >= self.dyn_count {
             return;
         }
-        let Some(Some((clip_idx, _))) = self.dyn_clip.get(idx).copied() else {
+        let Some(Some((clip_idx, cur_frame))) = self.dyn_clip.get(idx).copied() else {
             return;
         };
+        // PF.5 — same-frame guard: a player ticking at render rate re-applies
+        // the same clip frame most ticks; skip the instance + GPU writes.
+        if cur_frame == frame {
+            return;
+        }
         let Some(&chain) = self.clips.get(clip_idx).and_then(|c| c.get(frame)) else {
             return;
         };
@@ -1074,13 +1092,15 @@ impl GpuBackend {
         self.sync_lights(scene, frame);
 
         // TV — mirror the global voxel-material palette to the sprite pass
-        // (cheap; the shader only leaves the opaque fast-path once a
-        // translucent material is defined).
-        self.gpu.set_sprite_materials(&self.materials);
-        // TV.6 — and the terrain palette + colour→material map to the scene
-        // pass (glass/water as world geometry).
-        self.gpu
-            .set_scene_terrain_materials(&self.materials, &self.terrain_materials);
+        // and the terrain palette + colour→material map to the scene pass
+        // (glass/water as world geometry). PF.5 — only when something
+        // actually changed (materials are effectively static at runtime).
+        if self.materials_dirty {
+            self.gpu.set_sprite_materials(&self.materials);
+            self.gpu
+                .set_scene_terrain_materials(&self.materials, &self.terrain_materials);
+            self.materials_dirty = false;
+        }
 
         // Sprites render flat-lit (identity `kv6colmul`, the GPU default)
         // to match the CPU backend's clean-room DDA sprite raycaster —
