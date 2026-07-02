@@ -122,6 +122,19 @@ fn grid_voxel_aabb(grid: &Grid) -> Option<([f32; 3], [f32; 3])> {
 
 /// March one grid's voxels along a world-space ray (transformed to grid-local)
 /// and report whether a solid voxel blocks it within `max_t` world units.
+///
+/// PF.9 — three-tier empty-space skip, mirroring the primary DDA's
+/// leak-free fast-forward: an ABSENT chunk jumps its whole
+/// 128×128×256 box; a present chunk with an empty 64³ super-brick /
+/// 8³ brick (from the grid's `dda_brick_cache`, mip 0) jumps that box.
+/// Skipping only guaranteed-empty boxes can never hide an occluder; the
+/// landing cell pins the exit axis to the integer boundary so the next
+/// box's entry cell is visited densely (the `cell_walk_skip` contract).
+/// The step budget is consumed in Manhattan cell distance — exactly
+/// what the dense walk would have spent — so the `SHADOW_MAX_STEPS`
+/// truncation fires at the identical point (bit-compatible results).
+/// Chunks with no cached mip-0 brick map (e.g. Mid-LOD grids) fall back
+/// to the dense per-voxel walk — conservative, never wrong.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
     // World → grid-local (rotation is rigid, so `t` stays world distance).
@@ -152,14 +165,24 @@ fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
         (p[2].floor() as i32).clamp(g.lo[2] as i32, g.hi[2] as i32 - 1),
     ];
     let (step, mut t_max, t_delta) = dda_setup(o, d, cell);
+    // Reciprocal direction: box-boundary `t`s and the post-jump t_max
+    // refresh use multiplies (0.0 where step == 0 — those axes stay +∞).
+    let inv = [
+        if step[0] != 0 { 1.0 / d[0] } else { 0.0 },
+        if step[1] != 0 { 1.0 / d[1] } else { 0.0 },
+        if step[2] != 0 { 1.0 / d[2] } else { 0.0 },
+    ];
     let mut t_curr = t_enter;
     let lo_i = [g.lo[0] as i32, g.lo[1] as i32, g.lo[2] as i32];
     let hi_i = [g.hi[0] as i32, g.hi[1] as i32, g.hi[2] as i32];
+    let (cs_xy, cs_z) = (CHUNK_SIZE_XY as i32, CHUNK_SIZE_Z as i32);
     // PF.6 — chunk-cached sampler: one HashMap probe per chunk crossing
     // (not per step), and the solid test walks the slab chain in place
     // (no per-step allocation / whole-column decode).
     let mut sampler = g.grid.solid_sampler();
-    for _ in 0..SHADOW_MAX_STEPS {
+    let cache = &g.grid.dda_brick_cache;
+    let mut used = 0u32;
+    while used < SHADOW_MAX_STEPS {
         if cell[0] < lo_i[0]
             || cell[0] >= hi_i[0]
             || cell[1] < lo_i[1]
@@ -170,13 +193,101 @@ fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
         {
             return false;
         }
-        if sampler.solid(IVec3::new(cell[0], cell[1], cell[2])) {
-            return true;
+        let (chunk_idx, in_chunk) = crate::voxel_split(IVec3::new(cell[0], cell[1], cell[2]));
+        // Empty-box tier: absent chunk → whole chunk box; else the brick
+        // cache's super/brick blocks (global 8/64 alignment coincides with
+        // the chunk-local maps because chunk dims are multiples of 64,
+        // and `>>` floors for negative coords).
+        let vxl = sampler.chunk_at(chunk_idx);
+        let skip_box: Option<([i32; 3], [i32; 3])> = if vxl.is_none() {
+            let lo = [chunk_idx.x * cs_xy, chunk_idx.y * cs_xy, chunk_idx.z * cs_z];
+            Some((lo, [lo[0] + cs_xy, lo[1] + cs_xy, lo[2] + cs_z]))
+        } else {
+            let ch = [chunk_idx.x, chunk_idx.y, chunk_idx.z];
+            let in_c = [in_chunk.x as i32, in_chunk.y as i32, in_chunk.z as i32];
+            if cache.super_occupied_at(ch, 0, in_c) == Some(false) {
+                let lo = [
+                    (cell[0] >> 6) << 6,
+                    (cell[1] >> 6) << 6,
+                    (cell[2] >> 6) << 6,
+                ];
+                Some((lo, [lo[0] + 64, lo[1] + 64, lo[2] + 64]))
+            } else if cache.brick_occupied_at(ch, 0, in_c) == Some(false) {
+                let lo = [
+                    (cell[0] >> 3) << 3,
+                    (cell[1] >> 3) << 3,
+                    (cell[2] >> 3) << 3,
+                ];
+                Some((lo, [lo[0] + 8, lo[1] + 8, lo[2] + 8]))
+            } else {
+                None
+            }
+        };
+        if let Some((blo, bhi)) = skip_box {
+            let mut best_t = f32::INFINITY;
+            let mut best_axis = 3usize;
+            let mut plane = [0i32; 3];
+            for a in 0..3 {
+                if step[a] == 0 {
+                    continue;
+                }
+                plane[a] = if step[a] > 0 { bhi[a] } else { blo[a] };
+                let tb = (plane[a] as f32 - o[a]) * inv[a];
+                if tb < best_t {
+                    best_t = tb;
+                    best_axis = a;
+                }
+            }
+            if best_axis == 3 {
+                return false;
+            }
+            let pb = [
+                o[0] + d[0] * (best_t + 1e-4),
+                o[1] + d[1] * (best_t + 1e-4),
+                o[2] + d[2] * (best_t + 1e-4),
+            ];
+            let mut nc = [
+                pb[0].floor() as i32,
+                pb[1].floor() as i32,
+                pb[2].floor() as i32,
+            ];
+            nc[best_axis] = if step[best_axis] > 0 {
+                plane[best_axis]
+            } else {
+                plane[best_axis] - 1
+            };
+            // Budget: the dense walk would have spent one step per crossed
+            // cell; if it runs out inside the empty box it would have
+            // returned `false` there (nothing solid inside to find).
+            let crossed =
+                cell[0].abs_diff(nc[0]) + cell[1].abs_diff(nc[1]) + cell[2].abs_diff(nc[2]);
+            if used.saturating_add(crossed) >= SHADOW_MAX_STEPS {
+                return false;
+            }
+            used += crossed;
+            cell = nc;
+            for a in 0..3 {
+                if step[a] > 0 {
+                    t_max[a] = ((cell[a] + 1) as f32 - o[a]) * inv[a];
+                } else if step[a] < 0 {
+                    t_max[a] = (cell[a] as f32 - o[a]) * inv[a];
+                }
+            }
+            t_curr = best_t.max(t_curr);
+            continue;
+        }
+        // Occupied brick (or no cached map): dense per-voxel test through
+        // the already-probed chunk.
+        if let Some(vxl) = vxl {
+            if crate::chunks::vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z) {
+                return true;
+            }
         }
         let a = min_axis(t_max);
         t_curr = t_max[a];
         cell[a] += step[a];
         t_max[a] += t_delta[a];
+        used += 1;
     }
     false
 }
@@ -240,5 +351,154 @@ fn min_axis(t: [f32; 3]) -> usize {
         1
     } else {
         2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{GridTransform, Scene};
+
+    /// The pre-PF.9 dense per-voxel shadow march, kept verbatim as the
+    /// equivalence oracle for the skipping version (`Grid::voxel_solid`
+    /// per cell, one step per iteration).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn occluded_dense(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
+        let o: Vec3 = (g.rot_inv * (ow - g.origin)).as_vec3();
+        let d: Vec3 = (g.rot_inv * dw).as_vec3();
+        let o = [o.x, o.y, o.z];
+        let d = [d.x, d.y, d.z];
+        let Some((t0, t1)) = intersect_aabb(o, d, g.lo, g.hi) else {
+            return false;
+        };
+        let t_enter = t0.max(0.0);
+        let t_exit = t1.min(max_t);
+        if t_enter > t_exit {
+            return false;
+        }
+        let start = t_enter + 1e-4;
+        let p = [
+            o[0] + d[0] * start,
+            o[1] + d[1] * start,
+            o[2] + d[2] * start,
+        ];
+        let mut cell = [
+            (p[0].floor() as i32).clamp(g.lo[0] as i32, g.hi[0] as i32 - 1),
+            (p[1].floor() as i32).clamp(g.lo[1] as i32, g.hi[1] as i32 - 1),
+            (p[2].floor() as i32).clamp(g.lo[2] as i32, g.hi[2] as i32 - 1),
+        ];
+        let (step, mut t_max, t_delta) = dda_setup(o, d, cell);
+        let mut t_curr = t_enter;
+        let lo_i = [g.lo[0] as i32, g.lo[1] as i32, g.lo[2] as i32];
+        let hi_i = [g.hi[0] as i32, g.hi[1] as i32, g.hi[2] as i32];
+        for _ in 0..SHADOW_MAX_STEPS {
+            if cell[0] < lo_i[0]
+                || cell[0] >= hi_i[0]
+                || cell[1] < lo_i[1]
+                || cell[1] >= hi_i[1]
+                || cell[2] < lo_i[2]
+                || cell[2] >= hi_i[2]
+                || t_curr > t_exit
+            {
+                return false;
+            }
+            if g.grid.voxel_solid(IVec3::new(cell[0], cell[1], cell[2])) {
+                return true;
+            }
+            let a = min_axis(t_max);
+            t_curr = t_max[a];
+            cell[a] += step[a];
+            t_max[a] += t_delta[a];
+        }
+        false
+    }
+
+    /// PF.9 — the three-tier skipping march must agree with the dense
+    /// reference for every ray: hits, misses, AND the step-budget
+    /// truncation point (Manhattan accounting). The scene has caves,
+    /// thin diagonal walls, an ABSENT chunk gap (exercises the
+    /// chunk-box jump), and chunks with no brick maps until
+    /// `ensure_dda_bricks` runs (exercises the dense fallback first).
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn skip_march_matches_dense_reference() {
+        let mut scene = Scene::new();
+        let gid = scene.add_grid(GridTransform::identity());
+        let grid = scene.grid_mut(gid).unwrap();
+        // Terrain across chunks (0,0,0), (1,0,0) and (3,0,0) — chunk
+        // (2,0,0) is deliberately ABSENT (air gap the skip must jump).
+        grid.set_rect(
+            IVec3::new(0, 0, 160),
+            IVec3::new(255, 127, 255),
+            Some(0x80_55_66_77),
+        );
+        grid.set_rect(
+            IVec3::new(384, 0, 160),
+            IVec3::new(511, 127, 255),
+            Some(0x80_55_66_77),
+        );
+        // Caves + pillars for thin/diagonal occluders.
+        for i in 0..14 {
+            let (x, y) = (29 * i % 220 + 10, 41 * i % 100 + 10);
+            grid.set_sphere(IVec3::new(x, y, 170), 7, None);
+            grid.set_rect(
+                IVec3::new(x + 3, y + 3, 120),
+                IVec3::new(x + 4, y + 4, 159),
+                Some(0x80_99_88_77),
+            );
+        }
+
+        // Phase 1: no brick maps yet → every present chunk takes the
+        // dense fallback; absent-chunk jumps still fire.
+        let run = |scene: &Scene| {
+            let occ = SceneOccluder::build(scene);
+            let g = &occ.grids[0];
+            // Deterministic LCG ray sweep: origins above/inside the
+            // terrain band, directions over the sphere (incl. near-axis).
+            let mut seed = 0x1234_5678u64;
+            #[allow(clippy::cast_possible_truncation)]
+            let mut rng = move || {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                // Top 24 bits → uniform [0, 1).
+                ((seed >> 40) as u32) as f32 / 16_777_216.0
+            };
+            let mut hits = 0u32;
+            for i in 0..4000u32 {
+                let ox = rng() * 560.0 - 20.0;
+                let oy = rng() * 160.0 - 16.0;
+                let oz = rng() * 240.0;
+                let dx = rng() * 2.0 - 1.0;
+                let dy = rng() * 2.0 - 1.0;
+                // Bias some rays to near-axis / horizontal (worst cases).
+                let dz = match i % 5 {
+                    0 => 0.0,
+                    1 => 1e-6,
+                    _ => rng() * 2.0 - 1.0,
+                };
+                let ow = DVec3::new(f64::from(ox), f64::from(oy), f64::from(oz));
+                let dw = DVec3::new(f64::from(dx), f64::from(dy), f64::from(dz));
+                if dw.length() < 1e-9 {
+                    continue;
+                }
+                let max_t = if i % 3 == 0 { 96.0 } else { 512.0 };
+                let dense = occluded_dense(g, ow, dw, max_t);
+                let skip = occluded_in_grid(g, ow, dw, max_t);
+                assert_eq!(
+                    skip, dense,
+                    "ray {i}: o={ow:?} d={dw:?} max_t={max_t} skip={skip} dense={dense}",
+                );
+                hits += u32::from(dense);
+            }
+            hits
+        };
+        let hits_no_maps = run(&scene);
+
+        // Phase 2: with mip-0 brick maps → super/brick jumps active.
+        scene.grid_mut(gid).unwrap().ensure_dda_bricks(0);
+        let hits_with_maps = run(&scene);
+        assert_eq!(hits_no_maps, hits_with_maps, "map presence changed results");
+        assert!(hits_with_maps > 200, "sweep should hit terrain often");
     }
 }

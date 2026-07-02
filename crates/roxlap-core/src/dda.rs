@@ -983,6 +983,25 @@ impl BrickCache {
     pub fn retain_chunks(&mut self, keep: impl Fn([i32; 3]) -> bool) {
         self.maps.retain(|k, _| keep([k.0, k.1, k.2]));
     }
+
+    /// PF.9 — occupancy of the `BRICK`³ block containing chunk-local
+    /// mip-`mip` cell `cell` of `chunk`. `None` when no map is cached for
+    /// that (chunk, mip) — the caller must fall back to dense stepping.
+    /// `Some(false)` guarantees the whole 8³ block holds no solid voxel,
+    /// so an external shadow march may skip it wholesale.
+    #[must_use]
+    pub fn brick_occupied_at(&self, chunk: [i32; 3], mip: u32, cell: [i32; 3]) -> Option<bool> {
+        self.get(chunk, mip)
+            .map(|m| m.occupied([cell[0] >> 3, cell[1] >> 3, cell[2] >> 3]))
+    }
+
+    /// PF.9 — like [`Self::brick_occupied_at`] for the `SUPER`³ (64³ at
+    /// mip 0) super-brick level.
+    #[must_use]
+    pub fn super_occupied_at(&self, chunk: [i32; 3], mip: u32, cell: [i32; 3]) -> Option<bool> {
+        self.get(chunk, mip)
+            .map(|m| m.occupied_super([cell[0] >> 6, cell[1] >> 6, cell[2] >> 6]))
+    }
 }
 
 /// Build a throwaway [`BrickCache`] covering every populated chunk of
@@ -1228,14 +1247,31 @@ impl ShadowTester for SamplerShadow<'_, '_> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn occluded(&mut self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
         let cs = self.cell_size;
+        // PF.9 (C3) — the shadow march gets the primary ray's empty-space
+        // skip: fast-forward across empty super-bricks / bricks (skipping
+        // an EMPTY box can never hide an occluder). The step budget is
+        // consumed in Manhattan cell distance — exactly what the dense
+        // walk would have spent crossing the same span — so the
+        // `SHADOW_MAX_STEPS` truncation fires at the identical point and
+        // hit/no-hit stays bit-compatible with the pre-skip march.
+        let has_super =
+            self.sampler.cells_per_chunk_xy() >= SUPER && self.sampler.cells_per_chunk_z() >= SUPER;
+        let has_brick =
+            self.sampler.cells_per_chunk_xy() >= BRICK && self.sampler.cells_per_chunk_z() >= BRICK;
         let mut cellc = [
             (origin[0] / cs).floor() as i32,
             (origin[1] / cs).floor() as i32,
             (origin[2] / cs).floor() as i32,
         ];
         let (step, mut t_max, t_delta) = dda_setup(origin, dir, cellc, cs);
+        let inv = [
+            if step[0] != 0 { 1.0 / dir[0] } else { 0.0 },
+            if step[1] != 0 { 1.0 / dir[1] } else { 0.0 },
+            if step[2] != 0 { 1.0 / dir[2] } else { 0.0 },
+        ];
         let mut t_curr = 0.0f32;
-        for _ in 0..SHADOW_MAX_STEPS {
+        let mut used = 0u32;
+        while used < SHADOW_MAX_STEPS {
             if cellc[0] < self.lo_c[0]
                 || cellc[0] >= self.hi_c[0]
                 || cellc[1] < self.lo_c[1]
@@ -1248,6 +1284,83 @@ impl ShadowTester for SamplerShadow<'_, '_> {
             if t_curr > max_t {
                 return false; // past the cap / the light → unshadowed
             }
+            // Empty-space skip (mirrors `cell_walk_skip`'s landing logic:
+            // the exit axis is pinned to the integer boundary cell so the
+            // next box's entry cell is always visited densely).
+            let skip_shift = if has_super
+                && !self
+                    .sampler
+                    .super_occupied([cellc[0] >> 6, cellc[1] >> 6, cellc[2] >> 6])
+            {
+                Some(6u32)
+            } else if has_brick
+                && !self
+                    .sampler
+                    .brick_occupied([cellc[0] >> 3, cellc[1] >> 3, cellc[2] >> 3])
+            {
+                Some(3u32)
+            } else {
+                None
+            };
+            if let Some(sh) = skip_shift {
+                let mut best_t = f32::INFINITY;
+                let mut best_axis = 3usize;
+                let mut plane = [0i32; 3];
+                for a in 0..3 {
+                    if step[a] == 0 {
+                        continue;
+                    }
+                    let idx = cellc[a] >> sh;
+                    plane[a] = if step[a] > 0 {
+                        (idx + 1) << sh
+                    } else {
+                        idx << sh
+                    };
+                    let tb = (plane[a] as f32 * cs - origin[a]) * inv[a];
+                    if tb < best_t {
+                        best_t = tb;
+                        best_axis = a;
+                    }
+                }
+                if best_axis == 3 {
+                    return false;
+                }
+                let pb = [
+                    origin[0] + dir[0] * (best_t + 1e-4),
+                    origin[1] + dir[1] * (best_t + 1e-4),
+                    origin[2] + dir[2] * (best_t + 1e-4),
+                ];
+                let mut nc = [
+                    (pb[0] / cs).floor() as i32,
+                    (pb[1] / cs).floor() as i32,
+                    (pb[2] / cs).floor() as i32,
+                ];
+                nc[best_axis] = if step[best_axis] > 0 {
+                    plane[best_axis]
+                } else {
+                    plane[best_axis] - 1
+                };
+                // Budget: the dense walk would have spent one step per
+                // cell (Manhattan distance). If it runs out inside the
+                // empty box the dense walk would have returned `false`
+                // there — nothing solid to find inside it.
+                let crossed =
+                    cellc[0].abs_diff(nc[0]) + cellc[1].abs_diff(nc[1]) + cellc[2].abs_diff(nc[2]);
+                if used.saturating_add(crossed) >= SHADOW_MAX_STEPS {
+                    return false;
+                }
+                used += crossed;
+                cellc = nc;
+                for a in 0..3 {
+                    if step[a] > 0 {
+                        t_max[a] = ((cellc[a] + 1) as f32 * cs - origin[a]) * inv[a];
+                    } else if step[a] < 0 {
+                        t_max[a] = (cellc[a] as f32 * cs - origin[a]) * inv[a];
+                    }
+                }
+                t_curr = best_t.max(t_curr);
+                continue;
+            }
             if self.sampler.hit(cellc).is_some() {
                 return true; // a surface blocks the ray
             }
@@ -1255,6 +1368,7 @@ impl ShadowTester for SamplerShadow<'_, '_> {
             t_curr = t_max[axis];
             cellc[axis] += step[axis];
             t_max[axis] += t_delta[axis];
+            used += 1;
         }
         false
     }

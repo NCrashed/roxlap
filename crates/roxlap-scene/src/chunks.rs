@@ -146,15 +146,6 @@ impl<'a> SolidSampler<'a> {
         }
         self.cached
     }
-
-    /// [`Grid::voxel_solid`] through the cache.
-    pub(crate) fn solid(&mut self, voxel: IVec3) -> bool {
-        let (chunk_idx, in_chunk) = crate::voxel_split(voxel);
-        match self.chunk_at(chunk_idx) {
-            Some(vxl) => vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z),
-            None => false,
-        }
-    }
 }
 
 impl Grid {
