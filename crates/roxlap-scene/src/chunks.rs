@@ -212,53 +212,171 @@ impl Grid {
     /// applied (directional-only) — matching the demos' bake. No-op for
     /// an empty grid.
     pub fn bake_lightmode(&mut self, lightmode: u32) {
+        self.bake_lightmode_with_ao(lightmode, roxlap_core::AoParams::default());
+    }
+
+    /// [`Self::bake_lightmode`] with explicit [`AoParams`] — the AO bake
+    /// (lightmode 3) tunes `strength`/`radius` through these.
+    ///
+    /// [`AoParams`]: roxlap_core::AoParams
+    pub fn bake_lightmode_with_ao(&mut self, lightmode: u32, ao: roxlap_core::AoParams) {
+        if lightmode == 0 {
+            return;
+        }
         #[allow(clippy::cast_possible_wrap)]
         let cs_xy = CHUNK_SIZE_XY as i32;
         #[allow(clippy::cast_possible_wrap)]
         let cs_z = CHUNK_SIZE_Z as i32;
         let chunk_idxs: Vec<IVec3> = self.chunks.keys().copied().collect();
-        for chunk_idx in chunk_idxs {
-            // Build the estnorm cache from an immutable grid borrow: the
-            // reader resolves a chunk-local `(px, py)` (which may extend
-            // ±ESTNORMRAD outside the target chunk) into the neighbour
-            // chunk that owns that voxel column, same `chz`. Padding over
-            // an unpopulated neighbour returns `None` (= treated as air).
-            let cache = {
-                let grid_ref: &Self = &*self;
-                // `chz_delta` walks the stacked neighbour in z so the
-                // ESTNORMRAD padding crossing a chunk's top/bottom face
-                // reads the chunk above/below (continuous AO + estnorm
-                // across a z-seam); `0` is the target layer.
-                let reader = |px: i32, py: i32, chz_delta: i32| -> Option<&[u8]> {
-                    let nb_chx = chunk_idx.x + px.div_euclid(cs_xy);
-                    let nb_chy = chunk_idx.y + py.div_euclid(cs_xy);
-                    let in_x = px.rem_euclid(cs_xy);
-                    let in_y = py.rem_euclid(cs_xy);
-                    let chunk =
-                        grid_ref.chunk(IVec3::new(nb_chx, nb_chy, chunk_idx.z + chz_delta))?;
-                    let col_idx = (in_y as u32) * CHUNK_SIZE_XY + (in_x as u32);
-                    let off = chunk.column_offset[col_idx as usize] as usize;
-                    Some(&chunk.data[off..])
-                };
-                roxlap_core::EstNormCache::build_with_reader_z(reader, 0, 0, cs_xy, cs_xy)
-            };
-            let target = self.chunks.get_mut(&chunk_idx).expect("populated chunk");
-            roxlap_core::apply_lighting_with_cache(
-                &mut target.data,
-                &target.column_offset,
-                CHUNK_SIZE_XY,
-                0,
-                0,
-                0,
-                cs_xy,
-                cs_xy,
-                cs_z,
-                &cache,
-                lightmode,
-                &[],
-                roxlap_core::AoParams::default(),
-            );
+        // PF.11 — wave-parallel cache phase: each chunk's estnorm cache
+        // reads the grid immutably and is independent of the others, so a
+        // wave of `current_num_threads` caches builds in parallel; the
+        // apply phase (itself row-parallel inside
+        // `apply_lighting_with_cache`) then runs per chunk. Waves bound
+        // the resident cache memory. Byte-identical to the serial bake —
+        // caches are pure functions of the (unmodified-during-the-wave)
+        // grid, and each apply writes only its own chunk.
+        use rayon::prelude::*;
+        let wave = rayon::current_num_threads().max(1);
+        for batch in chunk_idxs.chunks(wave) {
+            let caches: Vec<(IVec3, roxlap_core::EstNormCache)> = batch
+                .par_iter()
+                .map(|&chunk_idx| {
+                    (
+                        chunk_idx,
+                        self.build_chunk_estnorm_cache(chunk_idx, 0, 0, cs_xy, cs_xy),
+                    )
+                })
+                .collect();
+            for (chunk_idx, cache) in caches {
+                let target = self.chunks.get_mut(&chunk_idx).expect("populated chunk");
+                roxlap_core::apply_lighting_with_cache(
+                    &mut target.data,
+                    &target.column_offset,
+                    CHUNK_SIZE_XY,
+                    0,
+                    0,
+                    0,
+                    cs_xy,
+                    cs_xy,
+                    cs_z,
+                    &cache,
+                    lightmode,
+                    &[],
+                    ao,
+                );
+            }
         }
+    }
+
+    /// PF.11 — re-bake lighting over just the grid-local voxel bbox
+    /// `[lo, hi]` (inclusive), neighbour-aware across chunk seams in all
+    /// three axes: the write region is padded by `±ESTNORMRAD` internally
+    /// (an edit changes the estnorm of nearby voxels too — pass only the
+    /// geometric edit extent, mirroring `update_lighting`'s convention),
+    /// and any chunk the padded region touches gets its strip re-baked.
+    /// Touched chunks get their versions bumped so the GPU re-uploads.
+    ///
+    /// This is the runtime-edit primitive the full-grid
+    /// [`Self::bake_lightmode`] is far too heavy for: a bullet-hole
+    /// rebake touches a few hundred columns instead of a whole chunk
+    /// (the cave demo measured ~0.04 ms vs 4–7 ms). Mip regeneration is
+    /// NOT performed — near-field renders read mip 0; callers streaming
+    /// distant edited chunks should remip as they already do for edits.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn bake_lightmode_bbox(&mut self, lo: IVec3, hi: IVec3, lightmode: u32) {
+        if lightmode == 0 {
+            return;
+        }
+        let cs_xy = CHUNK_SIZE_XY as i32;
+        let cs_z = CHUNK_SIZE_Z as i32;
+        let pad = roxlap_core::ESTNORMRAD;
+        // Padded half-open apply region in grid-local voxel coords.
+        let a_lo = IVec3::new(lo.x - pad, lo.y - pad, lo.z - pad);
+        let a_hi = IVec3::new(hi.x + pad + 1, hi.y + pad + 1, hi.z + pad + 1);
+        if a_lo.x >= a_hi.x || a_lo.y >= a_hi.y || a_lo.z >= a_hi.z {
+            return;
+        }
+        // Chunk range the padded region touches (inclusive).
+        let c_lo = IVec3::new(
+            a_lo.x.div_euclid(cs_xy),
+            a_lo.y.div_euclid(cs_xy),
+            a_lo.z.div_euclid(cs_z),
+        );
+        let c_hi = IVec3::new(
+            (a_hi.x - 1).div_euclid(cs_xy),
+            (a_hi.y - 1).div_euclid(cs_xy),
+            (a_hi.z - 1).div_euclid(cs_z),
+        );
+        for chz in c_lo.z..=c_hi.z {
+            for chy in c_lo.y..=c_hi.y {
+                for chx in c_lo.x..=c_hi.x {
+                    let chunk_idx = IVec3::new(chx, chy, chz);
+                    if !self.chunks.contains_key(&chunk_idx) {
+                        continue;
+                    }
+                    // Clip the padded region to this chunk, chunk-local.
+                    let base = IVec3::new(chx * cs_xy, chy * cs_xy, chz * cs_z);
+                    let lx0 = (a_lo.x - base.x).max(0);
+                    let ly0 = (a_lo.y - base.y).max(0);
+                    let lz0 = (a_lo.z - base.z).max(0);
+                    let lx1 = (a_hi.x - base.x).min(cs_xy);
+                    let ly1 = (a_hi.y - base.y).min(cs_xy);
+                    let lz1 = (a_hi.z - base.z).min(cs_z);
+                    if lx0 >= lx1 || ly0 >= ly1 || lz0 >= lz1 {
+                        continue;
+                    }
+                    let cache = self.build_chunk_estnorm_cache(chunk_idx, lx0, ly0, lx1, ly1);
+                    let target = self.chunks.get_mut(&chunk_idx).expect("populated chunk");
+                    roxlap_core::apply_lighting_with_cache(
+                        &mut target.data,
+                        &target.column_offset,
+                        CHUNK_SIZE_XY,
+                        lx0,
+                        ly0,
+                        lz0,
+                        lx1,
+                        ly1,
+                        lz1,
+                        &cache,
+                        lightmode,
+                        &[],
+                        roxlap_core::AoParams::default(),
+                    );
+                    self.bump_chunk_version(chunk_idx);
+                }
+            }
+        }
+    }
+
+    /// PF.11 — build the neighbour-aware estnorm cache for a chunk-local
+    /// region of `chunk_idx` from an immutable grid borrow: the reader
+    /// resolves a chunk-local `(px, py)` (which may extend `±ESTNORMRAD`
+    /// outside the region / the target chunk) into the neighbour chunk
+    /// owning that column, and `chz_delta` walks the stacked neighbour in
+    /// z (continuous AO + estnorm across every seam). Padding over an
+    /// unpopulated neighbour returns `None` (= treated as air).
+    #[allow(clippy::cast_possible_wrap)]
+    fn build_chunk_estnorm_cache(
+        &self,
+        chunk_idx: IVec3,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+    ) -> roxlap_core::EstNormCache {
+        let cs_xy = CHUNK_SIZE_XY as i32;
+        let reader = |px: i32, py: i32, chz_delta: i32| -> Option<&[u8]> {
+            let nb_chx = chunk_idx.x + px.div_euclid(cs_xy);
+            let nb_chy = chunk_idx.y + py.div_euclid(cs_xy);
+            let in_x = px.rem_euclid(cs_xy);
+            let in_y = py.rem_euclid(cs_xy);
+            let chunk = self.chunk(IVec3::new(nb_chx, nb_chy, chunk_idx.z + chz_delta))?;
+            let col_idx = (in_y as u32) * CHUNK_SIZE_XY + (in_x as u32);
+            let off = chunk.column_offset[col_idx as usize] as usize;
+            Some(&chunk.data[off..])
+        };
+        roxlap_core::EstNormCache::build_with_reader_z(reader, x0, y0, x1, y1)
     }
 
     /// Mutably borrow a materialised chunk. Returns `None` for
@@ -646,6 +764,46 @@ pub(crate) mod tests {
         assert!(backing.chunks[0].is_some(), "chz=-2 → dz=0");
         assert!(backing.chunks[1].is_none(), "chz=-1 → dz=1 implicit-air");
         assert!(backing.chunks[2].is_some(), "chz=0 → dz=2");
+    }
+
+    /// PF.11 — `bake_lightmode_bbox` around an edit must reproduce, byte
+    /// for byte, what a full-grid re-bake would write: the padded write
+    /// region covers every voxel whose estnorm the edit could change
+    /// (±ESTNORMRAD), including strips in neighbour chunks across seams.
+    #[test]
+    fn bbox_rebake_matches_full_rebake() {
+        // Terrain spanning a 2×2 chunk seam, with relief so estnorm is
+        // non-trivial around the edit.
+        let build = || {
+            let mut g = Grid::new(GridTransform::identity());
+            g.set_rect(IVec3::new(0, 0, 160), IVec3::new(255, 255, 255), Some(0x80_66_77_88));
+            for i in 0..10 {
+                let (x, y) = (23 * i % 240 + 8, 37 * i % 240 + 8);
+                g.set_sphere(IVec3::new(x, y, 165), 6, None);
+            }
+            g.bake_lightmode(1);
+            g
+        };
+        let mut full = build();
+        let mut bbox = build();
+
+        // Identical edit in both, straddling the chunk (0,0)/(1,0) seam
+        // so the neighbour-strip rebake is exercised.
+        let (lo, hi) = (IVec3::new(120, 60, 158), IVec3::new(136, 76, 200));
+        full.set_rect(lo, hi, None);
+        bbox.set_rect(lo, hi, None);
+
+        // Ground truth: full re-bake. Candidate: bbox-only re-bake.
+        full.bake_lightmode(1);
+        bbox.bake_lightmode_bbox(lo, hi, 1);
+
+        for (idx, a) in &full.chunks {
+            let b = bbox.chunks.get(idx).expect("same chunk set");
+            assert_eq!(
+                a.data, b.data,
+                "chunk {idx:?} bytes diverge between full and bbox rebake",
+            );
+        }
     }
 
     /// PF.6 — the in-place slab walk in `vxl_voxel_solid` must agree

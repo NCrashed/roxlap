@@ -8,7 +8,7 @@
 use glam::{DQuat, DVec3, IVec3};
 use roxlap_core::Camera;
 use roxlap_scene::{Grid, GridId, GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// Angular velocity (rad/s) of the ship grid's Z-axis spin when
@@ -395,64 +395,10 @@ fn bake_lightmode(scene: &mut Scene, lightmode: u32, ao: roxlap_core::AoParams) 
         if chunk_idxs.is_empty() {
             continue;
         }
-        let cs_xy = CHUNK_SIZE_XY as i32;
-        let cs_z = CHUNK_SIZE_Z as i32;
-
-        for chunk_idx in &chunk_idxs {
-            let target_chx = chunk_idx.x;
-            let target_chy = chunk_idx.y;
-            let target_chz = chunk_idx.z;
-
-            // Cache build (immutable grid borrow). The closure
-            // resolves chunk-local `(px, py)` — which can extend
-            // `±ESTNORMRAD` outside the target chunk — into the
-            // neighbour chunk that owns that voxel-column. Padding
-            // straddling unpopulated chunks returns None (= treat
-            // as full air), matching the historical OOB behaviour.
-            // S4B.6.f: reader queries `target_chz` (chz_delta 0) so
-            // stacked grids bake each chunk-z layer; chz_delta ±1
-            // resolves the chunk above/below so the ESTNORMRAD padding
-            // extending past a chunk's top/bottom face reads the
-            // stacked neighbour — AO + estnorm now continuous across
-            // the z-seam (no longer clipped at the z boundary).
-            let cache = {
-                let grid_ref: &Grid = &*grid;
-                let reader = |px: i32, py: i32, chz_delta: i32| -> Option<&[u8]> {
-                    let neighbour_chx = target_chx + px.div_euclid(cs_xy);
-                    let neighbour_chy = target_chy + py.div_euclid(cs_xy);
-                    let in_chunk_x = px.rem_euclid(cs_xy);
-                    let in_chunk_y = py.rem_euclid(cs_xy);
-                    let chunk = grid_ref.chunk(IVec3::new(
-                        neighbour_chx,
-                        neighbour_chy,
-                        target_chz + chz_delta,
-                    ))?;
-                    let col_idx = (in_chunk_y as u32) * CHUNK_SIZE_XY + (in_chunk_x as u32);
-                    let off = chunk.column_offset[col_idx as usize] as usize;
-                    Some(&chunk.data[off..])
-                };
-                roxlap_core::EstNormCache::build_with_reader_z(reader, 0, 0, cs_xy, cs_xy)
-            };
-            // Immutable grid borrow released.
-
-            // Mutable target-chunk borrow + write phase.
-            let target_chunk = grid.chunks.get_mut(chunk_idx).expect("populated");
-            roxlap_core::apply_lighting_with_cache(
-                &mut target_chunk.data,
-                &target_chunk.column_offset,
-                CHUNK_SIZE_XY,
-                0,
-                0,
-                0,
-                cs_xy,
-                cs_xy,
-                cs_z,
-                &cache,
-                lightmode,
-                &[],
-                ao,
-            );
-        }
+        // PF.11 — the per-chunk neighbour-aware bake now lives on the
+        // Grid (wave-parallel estnorm-cache phase); this demo driver
+        // keeps only its mip pass.
+        grid.bake_lightmode_with_ao(lightmode, ao);
 
         // S4B.5 (2026-05-12): generate per-chunk mips after the
         // lighting bake. 6 levels covers a 2048-voxel ray-depth
@@ -493,13 +439,34 @@ pub struct StreamingBakeTracker {
     /// eviction (the tracker's `process` retains only currently-
     /// present indices).
     baked: HashMap<GridId, HashSet<IVec3>>,
+    /// PF.11 — per-grid FIFO of chunks awaiting a (re)bake. A streaming
+    /// burst used to rebake every affected chunk in ONE frame (5–25
+    /// full-chunk bakes ≈ 7 ms each = up to ~175 ms hitches); the queue
+    /// spreads them over frames at [`budget`](Self::budget) per call. A
+    /// queued-but-unbaked chunk renders with flat (unbaked) brightness
+    /// for those few frames — invisible next to the hitch it replaces.
+    pending: HashMap<GridId, VecDeque<IVec3>>,
+    /// Max bakes per grid per [`Self::process`] call.
+    budget: usize,
 }
+
+/// PF.11 — default per-frame bake budget (~4 × 7 ms worst case).
+const DEFAULT_BAKE_BUDGET: usize = 4;
 
 impl StreamingBakeTracker {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_budget(DEFAULT_BAKE_BUDGET)
+    }
+
+    /// A tracker with a custom per-frame bake budget (`usize::MAX` ⇒ the
+    /// pre-PF.11 bake-everything-now behaviour).
+    #[must_use]
+    pub fn with_budget(budget: usize) -> Self {
         Self {
             baked: HashMap::new(),
+            pending: HashMap::new(),
+            budget: budget.max(1),
         }
     }
 
@@ -530,36 +497,40 @@ impl StreamingBakeTracker {
 
         let baked_set = self.baked.entry(id).or_default();
         // Drop evicted chunks from the tracker so re-streaming
-        // re-bakes from scratch.
+        // re-bakes from scratch — from the queue too.
         baked_set.retain(|idx| current.contains(idx));
+        let queue = self.pending.entry(id).or_default();
+        queue.retain(|idx| current.contains(idx));
 
+        // PF.11 — enqueue rather than bake immediately: newly installed
+        // chunks (not yet baked, not yet queued) + their loaded cardinal
+        // neighbours. The neighbour rebake resolves the pre-existing
+        // chunks' "I had no neighbour over there" estnorm gradient now
+        // that a real neighbour is present.
         let newly_installed: Vec<IVec3> = current
             .iter()
-            .filter(|idx| !baked_set.contains(*idx))
+            .filter(|idx| !baked_set.contains(*idx) && !queue.contains(*idx))
             .copied()
             .collect();
-        if newly_installed.is_empty() {
-            return;
-        }
-
-        // Rebake set: newly installed + their 4 cardinal neighbours
-        // that are also loaded. The neighbour rebake resolves the
-        // pre-existing chunks' "I had no neighbour over there"
-        // estnorm gradient now that a real neighbour is present.
-        // Dedupe via the HashSet.
-        let mut to_bake: HashSet<IVec3> = HashSet::new();
         for &idx in &newly_installed {
-            to_bake.insert(idx);
+            queue.push_back(idx);
             for delta in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)] {
                 let n = IVec3::new(idx.x + delta.0, idx.y + delta.1, idx.z + delta.2);
-                if current.contains(&n) {
-                    to_bake.insert(n);
+                if current.contains(&n) && !queue.contains(&n) {
+                    queue.push_back(n);
                 }
             }
         }
+        if queue.is_empty() {
+            return;
+        }
 
+        // Drain up to `budget` bakes this frame.
         let grid = scene.grid_mut(id).expect("grid present");
-        for &target_idx in &to_bake {
+        for _ in 0..self.budget {
+            let Some(target_idx) = queue.pop_front() else {
+                break;
+            };
             bake_single_chunk_neighbour_aware(grid, target_idx);
             // Regenerate mips since alpha bytes (the brightness
             // byte) drive the mip lookup tables.

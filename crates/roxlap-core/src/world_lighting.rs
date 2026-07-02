@@ -49,7 +49,7 @@ pub(crate) const MAXZDIM: i32 = 256;
 /// Estnorm neighbourhood radius. The surface normal at a voxel is
 /// estimated from the solid/air pattern in the surrounding
 /// `(2*RAD+1)³ = 5×5×5` cube.
-pub(crate) const ESTNORMRAD: i32 = 2;
+pub const ESTNORMRAD: i32 = 2;
 
 /// AO.2 — ambient-occlusion sampling radius (≤ `ESTNORMRAD`, so the same
 /// cache padding suffices). The per-exposed-face method (see
