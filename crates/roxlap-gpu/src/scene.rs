@@ -257,6 +257,14 @@ pub struct GpuSceneResident {
     /// streamed re-upload addresses colours with the same stride the
     /// initial upload used.
     pub(crate) colors_stride_shadow: Vec<u32>,
+    /// PF.12.c — CPU mirror of each installed slot's per-mip
+    /// `color_offsets` tables (`offsets_words_per_slot` words, the exact
+    /// content of the GPU window). [`Self::refresh_chunk_partial`] reads
+    /// it to (a) place a dirty column's colours at the resident offset
+    /// and (b) verify the column's colour COUNT is unchanged — a count
+    /// change reflows the packed colour block and forces the full-path
+    /// fallback. ~87 KB per 128² chunk; dropped on evict.
+    pub(crate) color_offsets_shadow: Vec<std::collections::HashMap<usize, Vec<u32>>>,
 }
 
 impl GpuSceneResident {
@@ -277,6 +285,8 @@ impl GpuSceneResident {
         let mut static_meta: Vec<GridStaticMeta> = Vec::with_capacity(info.grids.len());
         let mut chunk_occupancy_shadow: Vec<Vec<u32>> = Vec::with_capacity(info.grids.len());
         let mut slot_chunk_idx_shadow: Vec<Vec<[i32; 4]>> = Vec::with_capacity(info.grids.len());
+        let mut color_offsets_shadow: Vec<std::collections::HashMap<usize, Vec<u32>>> =
+            Vec::with_capacity(info.grids.len());
         // Per-grid colour stride (words/slot) — adaptive to the grid's
         // densest chunk (see the in-loop derivation). `refresh_chunk`
         // reads it back so streamed re-uploads use the same stride.
@@ -337,6 +347,8 @@ impl GpuSceneResident {
             // bytes (4 u32 words: x, y, z, _pad). Initialise every
             // slot to the empty sentinel; populated slots overwrite
             // with the actual chunk_idx below.
+            let mut grid_offsets_shadow: std::collections::HashMap<usize, Vec<u32>> =
+                std::collections::HashMap::new();
             let mut grid_slot_chunk_idx: Vec<[i32; 4]> = Vec::with_capacity(total_slots);
             for _ in 0..total_slots {
                 grid_slot_chunk_idx.push([
@@ -400,6 +412,11 @@ impl GpuSceneResident {
                     grid_chunk_occupancy[slot_idx >> 5] |= 1u32 << (slot_idx & 31);
                 }
                 grid_slot_chunk_idx[slot_idx] = [chunk_idx[0], chunk_idx[1], chunk_idx[2], 0];
+                // PF.12.c — mirror the slot's color_offsets window.
+                grid_offsets_shadow.insert(
+                    slot_idx,
+                    grid_color_offsets[off_start..off_start + offsets_words_per_slot].to_vec(),
+                );
             }
 
             // Slot_chunk_idx storage offset: each entry is 4 u32
@@ -432,6 +449,7 @@ impl GpuSceneResident {
 
             chunk_occupancy_shadow.push(grid_chunk_occupancy.clone());
             slot_chunk_idx_shadow.push(grid_slot_chunk_idx.clone());
+            color_offsets_shadow.push(grid_offsets_shadow);
 
             all_occupancy.extend_from_slice(&grid_occupancy);
             all_color_offsets.extend_from_slice(&grid_color_offsets);
@@ -518,14 +536,18 @@ impl GpuSceneResident {
         let all_slot_chunk_idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("roxlap-gpu scene.slot_chunk_idx"),
             contents: bytemuck::cast_slice(&all_slot_chunk_idx),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
         });
         let grid_static_meta = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("roxlap-gpu scene.grid_static_meta"),
             contents: bytemuck::cast_slice(&static_meta),
             // GPU.13.0 — COPY_DST so the live chunk-AABB can be patched
             // into a grid's meta on refresh_chunk / evict_chunk.
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
         });
 
         Self {
@@ -543,6 +565,7 @@ impl GpuSceneResident {
             static_meta,
             chunk_occupancy_shadow,
             slot_chunk_idx_shadow,
+            color_offsets_shadow,
             colors_stride_shadow: grid_colors_strides,
         }
     }
@@ -658,6 +681,16 @@ impl GpuSceneResident {
         // ---- slot_chunk_idx (identity for the shader) ----
         self.set_slot_chunk_idx(queue, scene_idx, &meta, slot_idx, chunk_idx);
 
+        // ---- PF.12.c — mirror the slot's color_offsets window ----
+        // (`refresh_chunk_partial` verifies counts + places colours
+        // against it). Rebuilt exactly as the GPU windows were written.
+        let mut window = vec![0u32; offsets_words_per_slot];
+        for (m, mip) in chunk.mips.iter().enumerate() {
+            let coff = layout.mip_coff_rel[m] as usize;
+            window[coff..coff + mip.color_offsets.len()].copy_from_slice(&mip.color_offsets);
+        }
+        self.color_offsets_shadow[scene_idx].insert(slot_idx, window);
+
         // ---- GPU.13.0 grid-AABB early-out box ----
         self.sync_aabb(queue, scene_idx);
 
@@ -671,6 +704,158 @@ impl GpuSceneResident {
     ///
     /// Returns `false` if `scene_idx` is past `grid_count` (no-op);
     /// `true` otherwise.
+    /// PF.12.c — partial refresh: re-derive + re-upload ONLY the columns
+    /// inside the inclusive chunk-local mip-0 column rect `[x0..=x1] ×
+    /// [y0..=y1]` (pre-padded by the caller with the edit's ±1 adjacency
+    /// reach), for every mip. Requires the slot to already hold
+    /// `chunk_idx` with a mirrored offsets table, and every dirty
+    /// column's colour COUNT to be unchanged (a count change reflows the
+    /// packed colour block). Returns `false` — with **nothing written**
+    /// — when any precondition fails; the caller falls back to the full
+    /// [`Self::refresh_chunk`] path.
+    ///
+    /// The count-stable case is the streaming bake tracker's per-frame
+    /// path (brightness-byte rewrites) and recolour edits: those now
+    /// upload a few KB instead of decompressing + rewriting the whole
+    /// ~1–2 MB chunk ladder.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    pub fn refresh_chunk_partial(
+        &mut self,
+        queue: &wgpu::Queue,
+        scene_idx: usize,
+        chunk_idx: [i32; 3],
+        vxl: &roxlap_formats::vxl::Vxl,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+    ) -> bool {
+        let Some(meta) = self.static_meta.get(scene_idx).copied() else {
+            return false;
+        };
+        let layout = MipLayout::for_vsid(meta.vsid);
+        if vxl.mip_count() < layout.mip_count {
+            return false;
+        }
+        let slot_idx = modular_slot_idx(chunk_idx, meta.pool_dims);
+        // The slot must currently hold THIS chunk (modular pools reuse
+        // slots; a partial write over another chunk's data = garbage).
+        let held = self.slot_chunk_idx_shadow[scene_idx][slot_idx];
+        if held[0] != chunk_idx[0] || held[1] != chunk_idx[1] || held[2] != chunk_idx[2] {
+            return false;
+        }
+        let Some(offs_shadow) = self.color_offsets_shadow[scene_idx].get(&slot_idx) else {
+            return false;
+        };
+        let colors_stride = self
+            .colors_stride_shadow
+            .get(scene_idx)
+            .map_or(COLORS_PER_CHUNK_WORDS as usize, |&s| s as usize);
+
+        // Phase 1 — recompute every dirty column per mip into row-run
+        // buffers (rows are contiguous in both the occupancy layout and
+        // the packed colour block), verifying colour counts. NOTHING is
+        // written until the whole extent verifies.
+        struct RowRun {
+            /// Textured-occupancy word offset within the slot.
+            occ_word: usize,
+            /// Solid block sits `block_words` after the textured one.
+            block_words: usize,
+            occ: Vec<u32>,
+            solid: Vec<u32>,
+            /// Colour word offset within the slot's colour block.
+            color_word: usize,
+            colors: Vec<u32>,
+        }
+        let mut runs: Vec<RowRun> = Vec::new();
+        for m in 0..layout.mip_count {
+            let vsid_m = (meta.vsid >> m).max(1) as i32;
+            let cz_m = crate::decompress::CHUNK_Z >> m;
+            let wpc = occ_words_per_column_for_mip(m) as usize;
+            let block_words = (vsid_m as usize) * (vsid_m as usize) * wpc;
+            let rx0 = (x0 >> m).clamp(0, vsid_m - 1);
+            let ry0 = (y0 >> m).clamp(0, vsid_m - 1);
+            let rx1 = (x1 >> m).clamp(0, vsid_m - 1);
+            let ry1 = (y1 >> m).clamp(0, vsid_m - 1);
+            let coff_base = layout.mip_coff_rel[m as usize] as usize;
+            for y in ry0..=ry1 {
+                let row_col0 = (y * vsid_m + rx0) as usize;
+                let n_cols = (rx1 - rx0 + 1) as usize;
+                let mut occ = vec![0u32; n_cols * wpc];
+                let mut solid = vec![0u32; n_cols * wpc];
+                let mut colors: Vec<u32> = Vec::new();
+                for i in 0..n_cols {
+                    let col_idx = row_col0 + i;
+                    let slab = vxl.column_data_for_mip(m, col_idx);
+                    let before = colors.len();
+                    // vsid=1 / (0,0) → the column scratch windows index
+                    // from word 0 of the per-column slices.
+                    crate::decompress::decompress_column(
+                        slab,
+                        0,
+                        0,
+                        1,
+                        cz_m,
+                        wpc as u32,
+                        &mut occ[i * wpc..(i + 1) * wpc],
+                        &mut solid[i * wpc..(i + 1) * wpc],
+                        &mut colors,
+                    );
+                    // Count stability vs the mirrored offsets table.
+                    let old_count = offs_shadow[coff_base + col_idx + 1]
+                        .saturating_sub(offs_shadow[coff_base + col_idx])
+                        as usize;
+                    if colors.len() - before != old_count {
+                        return false; // reflow → full path
+                    }
+                }
+                let color_word = offs_shadow[coff_base + row_col0] as usize;
+                if color_word + colors.len() > colors_stride {
+                    return false; // stride overflow → full path handles
+                }
+                runs.push(RowRun {
+                    occ_word: layout.mip_occ_rel[m as usize] as usize + row_col0 * wpc,
+                    block_words,
+                    occ,
+                    solid,
+                    color_word,
+                    colors,
+                });
+            }
+        }
+
+        // Phase 2 — verified: write the row runs.
+        let occ_words_per_slot = layout.occ_words_per_slot as usize;
+        let slot_occ_base = meta.occupancy_offset as usize + slot_idx * occ_words_per_slot;
+        let page_words = self.occupancy_page_words as usize;
+        let page = slot_occ_base / page_words;
+        let slot_local_word = slot_occ_base % page_words;
+        let col_slot_base = meta.colors_offset as usize + slot_idx * colors_stride;
+        for run in &runs {
+            let tex = slot_local_word + run.occ_word;
+            queue.write_buffer(
+                &self.occupancy_pages[page],
+                (tex * 4) as u64,
+                bytemuck::cast_slice(&run.occ),
+            );
+            queue.write_buffer(
+                &self.occupancy_pages[page],
+                ((tex + run.block_words) * 4) as u64,
+                bytemuck::cast_slice(&run.solid),
+            );
+            if !run.colors.is_empty() {
+                queue.write_buffer(
+                    &self.all_colors,
+                    ((col_slot_base + run.color_word) * 4) as u64,
+                    bytemuck::cast_slice(&run.colors),
+                );
+            }
+        }
+        // Counts unchanged ⇒ offsets, chunk-occupancy bit, AABB and the
+        // mirrors all stay valid untouched.
+        true
+    }
+
     pub fn evict_chunk(
         &mut self,
         queue: &wgpu::Queue,
@@ -693,6 +878,8 @@ impl GpuSceneResident {
         }
         self.set_chunk_occupancy_bit(queue, scene_idx, &meta, slot_idx, false);
         self.set_slot_chunk_idx(queue, scene_idx, &meta, slot_idx, SLOT_EMPTY_SENTINEL);
+        // PF.12.c — drop the evicted slot's offsets mirror.
+        self.color_offsets_shadow[scene_idx].remove(&slot_idx);
         // GPU.13.0 — eviction may shrink the occupied box; recompute.
         self.sync_aabb(queue, scene_idx);
         true
@@ -829,7 +1016,9 @@ fn create_storage(device: &wgpu::Device, label: &str, data: &[u32]) -> wgpu::Buf
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some(label),
         contents: bytemuck::cast_slice(data),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
     })
 }
 

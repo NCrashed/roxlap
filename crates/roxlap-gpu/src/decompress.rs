@@ -311,7 +311,7 @@ fn decompress_mip(src: &Vxl, mip: u32, color_base: u32) -> MipUpload {
 /// floor/ceiling). `cz` is the column z-extent at this mip; the runs
 /// from [`expand_solid_runs`] already exclude overhang air gaps.
 #[allow(clippy::too_many_arguments)]
-fn decompress_column(
+pub(crate) fn decompress_column(
     slab: &[u8],
     x: u32,
     y: u32,

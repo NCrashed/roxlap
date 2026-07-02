@@ -1434,25 +1434,67 @@ impl GpuBackend {
             // budget — the rest stay dirty and ride the next frames, so a
             // big streamed-in batch spreads its upload cost instead of
             // freezing one frame.
-            let mut refreshed: Vec<IVec3> = Vec::new();
-            for (chunk_ivec3, vxl) in &grid.chunks {
+            //
+            // PF.12.c — three phases per grid: (1) collect this frame's
+            // budgeted candidates, (2) consume their accumulated
+            // [`DirtyExtent`]s, (3) refresh — PARTIALLY when the chunk is
+            // already resident and the extent is a bbox (the resident
+            // verifies colour-count stability and falls back by returning
+            // `false` with nothing written).
+            let mut cand: Vec<(IVec3, u64)> = Vec::new();
+            for chunk_ivec3 in grid.chunks.keys() {
                 let cur = grid.chunk_version(*chunk_ivec3);
                 if tracker.get(chunk_ivec3).copied() == Some(cur) {
                     continue;
                 }
-                if decompressed >= self.chunk_upload_budget {
+                if cand.len() as u32 >= self.chunk_upload_budget.saturating_sub(decompressed) {
                     break;
                 }
+                cand.push((*chunk_ivec3, cur));
+            }
+            let extents: Vec<Option<roxlap_scene::DirtyExtent>> = {
+                let Some(grid) = scene.grid_mut(*gid) else {
+                    continue;
+                };
+                cand.iter()
+                    .map(|(c, _)| grid.take_chunk_dirty(*c))
+                    .collect()
+            };
+            let Some(grid) = scene.grid(*gid) else {
+                continue;
+            };
+            for ((chunk_ivec3, cur), extent) in cand.iter().zip(extents) {
+                let Some(vxl) = grid.chunks.get(chunk_ivec3) else {
+                    continue;
+                };
+                let idx3 = [chunk_ivec3.x, chunk_ivec3.y, chunk_ivec3.z];
+                // Partial path: known bounded extent + previously-synced
+                // chunk (the slot already holds this chunk's data). The
+                // extent is already ±1-padded by the producers; pad once
+                // more to mirror `remip_bbox`'s defensive belt so the GPU
+                // covers every column the re-mip may have rewritten.
+                if let (Some(roxlap_scene::DirtyExtent::Bbox(lo, hi)), true) =
+                    (extent, tracker.contains_key(chunk_ivec3))
+                {
+                    if resident.refresh_chunk_partial(
+                        queue,
+                        scene_idx,
+                        idx3,
+                        vxl,
+                        lo.x - 1,
+                        lo.y - 1,
+                        hi.x + 1,
+                        hi.y + 1,
+                    ) {
+                        tracker.insert(*chunk_ivec3, *cur);
+                        decompressed += 1;
+                        continue;
+                    }
+                }
                 let upload = roxlap_gpu::decompress_chunk(vxl);
-                let outcome = resident.refresh_chunk(
-                    queue,
-                    scene_idx,
-                    [chunk_ivec3.x, chunk_ivec3.y, chunk_ivec3.z],
-                    &upload,
-                );
+                let outcome = resident.refresh_chunk(queue, scene_idx, idx3, &upload);
                 if outcome != roxlap_gpu::RefreshOutcome::ChunkOutOfBbox {
-                    tracker.insert(*chunk_ivec3, cur);
-                    refreshed.push(*chunk_ivec3);
+                    tracker.insert(*chunk_ivec3, *cur);
                     decompressed += 1;
                 }
             }
@@ -1468,15 +1510,7 @@ impl GpuBackend {
                 tracker.remove(&c);
                 evicted += 1;
             }
-            // PF.12 — consume the refreshed chunks' dirty extents (the
-            // GPU is now in sync with them).
-            if !refreshed.is_empty() {
-                if let Some(grid) = scene.grid_mut(*gid) {
-                    for c in refreshed {
-                        let _ = grid.take_chunk_dirty(c);
-                    }
-                }
-            }
+            // (PF.12.c — dirty extents were consumed in the candidate phase.)
         }
         if decompressed > 8 || evicted > 0 {
             eprintln!("roxlap-render: refreshed {decompressed} chunks, evicted {evicted}");
