@@ -70,7 +70,10 @@ impl Grid {
                 color,
             );
             // S7.2: bump only on actual write. Insert always writes.
-            self.bump_chunk_version(chunk_idx);
+            // PF.12 — single-voxel extent (`dirty_pad` covers the
+            // adjacent columns whose exposed faces the edit rewrites).
+            let (lo, hi) = dirty_pad(in_chunk.as_ivec3(), in_chunk.as_ivec3());
+            self.bump_chunk_version_bbox(chunk_idx, lo, hi);
         } else if let Some(vxl) = self.chunks.get_mut(&chunk_idx) {
             #[allow(clippy::cast_possible_wrap)]
             set_cube(
@@ -82,7 +85,8 @@ impl Grid {
             );
             // S7.2: carve only writes when the chunk pre-existed
             // (we're inside the `if let Some` branch).
-            self.bump_chunk_version(chunk_idx);
+            let (lo, hi) = dirty_pad(in_chunk.as_ivec3(), in_chunk.as_ivec3());
+            self.bump_chunk_version_bbox(chunk_idx, lo, hi);
         }
     }
 
@@ -290,8 +294,9 @@ fn apply_set_rect(
     }
     if wrote {
         // S7.2: only writes bump. Carve on a missing chunk is a
-        // pure no-op (no entry to advance).
-        grid.bump_chunk_version(chunk_idx);
+        // pure no-op (no entry to advance). PF.12 — chunk-local extent.
+        let (lo, hi) = dirty_pad(local_lo, local_hi);
+        grid.bump_chunk_version_bbox(chunk_idx, lo, hi);
     }
 }
 
@@ -312,9 +317,27 @@ fn apply_set_sphere(
         wrote = true;
     }
     if wrote {
-        // S7.2: see apply_set_rect rationale.
-        grid.bump_chunk_version(chunk_idx);
+        // S7.2: see apply_set_rect rationale. PF.12 — the sphere's
+        // chunk-local AABB.
+        #[allow(clippy::cast_possible_wrap)]
+        let r = radius as i32;
+        let (lo, hi) = dirty_pad(
+            local_centre - IVec3::splat(r),
+            local_centre + IVec3::splat(r),
+        );
+        grid.bump_chunk_version_bbox(chunk_idx, lo, hi);
     }
+}
+
+/// PF.12 — pad an edit's geometric extent by one voxel (an edit rewrites
+/// the exposed-face records of ADJACENT columns/voxels too) and clamp it
+/// to the chunk footprint.
+fn dirty_pad(lo: IVec3, hi: IVec3) -> (IVec3, IVec3) {
+    let cs = chunk_size_ivec3();
+    (
+        (lo - IVec3::ONE).max(IVec3::ZERO),
+        (hi + IVec3::ONE).min(cs - IVec3::ONE),
+    )
 }
 
 /// Convenience: forward a [`GridLocalPos`]-style decomposition

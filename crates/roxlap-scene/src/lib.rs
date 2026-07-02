@@ -442,6 +442,21 @@ pub struct Grid {
     /// chunk's brick map is built once and reused every frame. Skipped
     /// entirely on the voxlap render path. Not serialised.
     pub dda_brick_cache: roxlap_core::BrickCache,
+    /// PF.12 — per-chunk change extent accumulated since a consumer
+    /// last [`Self::take_chunk_dirty`]'d it: the partial-refresh /
+    /// incremental-remip companion to [`Self::chunk_versions`]. Bounded
+    /// by the chunk count (one merged entry per chunk). Not serialised.
+    chunk_dirty: HashMap<IVec3, DirtyExtent>,
+}
+
+/// PF.12 — how much of a chunk changed since a consumer last synced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyExtent {
+    /// Unknown / whole-chunk change (installs, wholesale replaces,
+    /// extent-less [`Grid::bump_chunk_version`] calls).
+    Full,
+    /// Inclusive CHUNK-LOCAL voxel bbox covering every change.
+    Bbox(IVec3, IVec3),
 }
 
 impl Grid {
@@ -462,6 +477,7 @@ impl Grid {
             chunk_versions: HashMap::new(),
             pending_gen: HashSet::new(),
             dda_brick_cache: roxlap_core::BrickCache::new(),
+            chunk_dirty: HashMap::new(),
         }
     }
 
@@ -531,6 +547,35 @@ impl Grid {
     pub fn bump_chunk_version(&mut self, chunk_idx: IVec3) {
         let entry = self.chunk_versions.entry(chunk_idx).or_insert(0);
         *entry = entry.saturating_add(1);
+        // PF.12 — no extent information ⇒ the whole chunk must be
+        // treated as changed by partial-refresh consumers.
+        self.chunk_dirty.insert(chunk_idx, DirtyExtent::Full);
+    }
+
+    /// PF.12 — [`Self::bump_chunk_version`] with the edit's CHUNK-LOCAL
+    /// voxel extent (inclusive), so partial-refresh consumers (the GPU
+    /// facade) and incremental re-mip know how little actually changed.
+    /// Extents accumulate (bbox union) until a consumer
+    /// [`Self::take_chunk_dirty`]s them; an extent-less bump upgrades
+    /// the entry to [`DirtyExtent::Full`].
+    pub fn bump_chunk_version_bbox(&mut self, chunk_idx: IVec3, lo: IVec3, hi: IVec3) {
+        let entry = self.chunk_versions.entry(chunk_idx).or_insert(0);
+        *entry = entry.saturating_add(1);
+        let merged = match self.chunk_dirty.get(&chunk_idx) {
+            Some(DirtyExtent::Full) => DirtyExtent::Full,
+            Some(DirtyExtent::Bbox(l, h)) => DirtyExtent::Bbox(l.min(lo), h.max(hi)),
+            None => DirtyExtent::Bbox(lo, hi),
+        };
+        self.chunk_dirty.insert(chunk_idx, merged);
+    }
+
+    /// PF.12 — take (and clear) the extent accumulated for `chunk_idx`
+    /// since the last take. `None` ⇒ no recorded change (a consumer that
+    /// still observed a version bump should treat that as
+    /// [`DirtyExtent::Full`] — e.g. a change recorded before the
+    /// consumer first synced the chunk).
+    pub fn take_chunk_dirty(&mut self, chunk_idx: IVec3) -> Option<DirtyExtent> {
+        self.chunk_dirty.remove(&chunk_idx)
     }
 
     /// Attach (or detach) the procedural generator used by

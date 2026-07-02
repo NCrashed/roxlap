@@ -932,6 +932,11 @@ fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
         epoch,
     }) = job_rx.recv()
     {
+        // PF.12 — the batch's edit extent: carve spheres plus the
+        // relight's internal ±ESTNORMRAD brightness writes. Feeds the
+        // incremental `remip_bbox` below.
+        let mut lo = IVec3::splat(i32::MAX);
+        let mut hi = IVec3::splat(i32::MIN);
         for hit in impacts {
             // Newly-exposed crater walls (previously buried solid) take
             // CARVE_COLOR; a plain carve would leave them black.
@@ -943,11 +948,18 @@ fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
                 |_, _, _| CARVE_COLOR,
             );
             relight_bbox(&mut chunk, hit, FIRE_RADIUS);
+            let pad = FIRE_RADIUS as i32 + roxlap_core::ESTNORMRAD;
+            lo = lo.min(hit - IVec3::splat(pad));
+            hi = hi.max(hit + IVec3::splat(pad));
         }
-        // Rebuild the GPU mip ladder so the facade's re-decompress stays
-        // on the cheap read-path. This is the ~45 ms cost moved off the
-        // main thread.
-        chunk.generate_mips(GPU_MIP_LEVELS);
+        // PF.12 — incremental re-mip: byte-identical to the old full
+        // `generate_mips(GPU_MIP_LEVELS)` but only the edited columns'
+        // mip data is recomputed (clean columns memcpy their old bytes).
+        // This was the ~45 ms per-batch cost that forced the whole
+        // worker-thread + whole-chunk-clone design.
+        if lo.x <= hi.x {
+            chunk.remip_bbox(lo.x, lo.y, hi.x, hi.y, GPU_MIP_LEVELS);
+        }
         if done_tx.send(CarveDone { chunk, epoch }).is_err() {
             break; // main thread gone
         }

@@ -1412,7 +1412,12 @@ impl GpuBackend {
     /// Re-upload any chunk whose `chunk_version` bumped since last
     /// frame; evict chunks the streamer dropped. Moved verbatim from
     /// the scene-demo's `refresh_dirty_chunks`.
-    fn refresh_dirty(&mut self, scene: &Scene) {
+    ///
+    /// PF.12 — takes `&mut Scene` so each refreshed chunk's accumulated
+    /// [`DirtyExtent`](roxlap_scene::DirtyExtent) is consumed at sync
+    /// time (the future partial-refresh path keys on it; consuming now
+    /// keeps the "changes since the GPU last synced" contract exact).
+    fn refresh_dirty(&mut self, scene: &mut Scene) {
         let Some(resident) = self.resident.as_mut() else {
             return;
         };
@@ -1429,6 +1434,7 @@ impl GpuBackend {
             // budget — the rest stay dirty and ride the next frames, so a
             // big streamed-in batch spreads its upload cost instead of
             // freezing one frame.
+            let mut refreshed: Vec<IVec3> = Vec::new();
             for (chunk_ivec3, vxl) in &grid.chunks {
                 let cur = grid.chunk_version(*chunk_ivec3);
                 if tracker.get(chunk_ivec3).copied() == Some(cur) {
@@ -1446,6 +1452,7 @@ impl GpuBackend {
                 );
                 if outcome != roxlap_gpu::RefreshOutcome::ChunkOutOfBbox {
                     tracker.insert(*chunk_ivec3, cur);
+                    refreshed.push(*chunk_ivec3);
                     decompressed += 1;
                 }
             }
@@ -1460,6 +1467,15 @@ impl GpuBackend {
                 resident.evict_chunk(queue, scene_idx, [c.x, c.y, c.z]);
                 tracker.remove(&c);
                 evicted += 1;
+            }
+            // PF.12 — consume the refreshed chunks' dirty extents (the
+            // GPU is now in sync with them).
+            if !refreshed.is_empty() {
+                if let Some(grid) = scene.grid_mut(*gid) {
+                    for c in refreshed {
+                        let _ = grid.take_chunk_dirty(c);
+                    }
+                }
             }
         }
         if decompressed > 8 || evicted > 0 {

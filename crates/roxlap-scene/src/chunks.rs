@@ -343,7 +343,13 @@ impl Grid {
                         &[],
                         roxlap_core::AoParams::default(),
                     );
-                    self.bump_chunk_version(chunk_idx);
+                    // PF.12 — brightness bytes changed within the clipped
+                    // region only.
+                    self.bump_chunk_version_bbox(
+                        chunk_idx,
+                        IVec3::new(lx0, ly0, lz0),
+                        IVec3::new(lx1 - 1, ly1 - 1, lz1 - 1),
+                    );
                 }
             }
         }
@@ -776,7 +782,11 @@ pub(crate) mod tests {
         // non-trivial around the edit.
         let build = || {
             let mut g = Grid::new(GridTransform::identity());
-            g.set_rect(IVec3::new(0, 0, 160), IVec3::new(255, 255, 255), Some(0x80_66_77_88));
+            g.set_rect(
+                IVec3::new(0, 0, 160),
+                IVec3::new(255, 255, 255),
+                Some(0x80_66_77_88),
+            );
             for i in 0..10 {
                 let (x, y) = (23 * i % 240 + 8, 37 * i % 240 + 8);
                 g.set_sphere(IVec3::new(x, y, 165), 6, None);
@@ -803,6 +813,71 @@ pub(crate) mod tests {
                 a.data, b.data,
                 "chunk {idx:?} bytes diverge between full and bbox rebake",
             );
+        }
+    }
+
+    /// PF.12 — `remip_bbox` must be byte-identical to a full
+    /// `generate_mips` when the bbox covers the edits: data bytes,
+    /// column offsets, and the mip table all match — across repeated
+    /// incremental rounds, corner-of-chunk edits, and voxalloc-scattered
+    /// columns.
+    #[test]
+    fn remip_bbox_matches_generate_mips() {
+        use roxlap_formats::edit::{set_sphere_with_colfunc, SpanOp};
+
+        // Realistic chunk: terrain + caves, then a full initial ladder.
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_rect(
+            IVec3::new(0, 0, 150),
+            IVec3::new(127, 127, 255),
+            Some(0x80_66_77_88),
+        );
+        for i in 0..8 {
+            let (x, y) = (29 * i % 100 + 12, 41 * i % 100 + 12);
+            g.set_sphere(IVec3::new(x, y, 158), 5, None);
+        }
+        let base = g.chunks.get_mut(&IVec3::ZERO).expect("chunk");
+        base.generate_mips(6);
+
+        let mut full = base.clone();
+        let mut inc = base.clone();
+
+        // Round 1: a carve straddling brick/column-group boundaries plus
+        // a corner edit (exercises clamping at the chunk edge).
+        let edits: [(IVec3, u32); 3] = [
+            (IVec3::new(63, 64, 170), 7),
+            (IVec3::new(0, 0, 155), 4),
+            (IVec3::new(126, 100, 165), 5),
+        ];
+        for round in 0..2 {
+            let mut lo = IVec3::splat(i32::MAX);
+            let mut hi = IVec3::splat(i32::MIN);
+            for (k, &(c, r)) in edits.iter().enumerate() {
+                if k % 2 != round % 2 {
+                    continue; // vary the edit set per round
+                }
+                #[allow(clippy::cast_possible_wrap)]
+                let ri = r as i32;
+                for v in [&mut full, &mut inc] {
+                    set_sphere_with_colfunc(v, c.into(), r, SpanOp::Carve, |_, _, _| {
+                        0x80_31_41_59_u32 as i32
+                    });
+                }
+                lo = lo.min(c - IVec3::splat(ri));
+                hi = hi.max(c + IVec3::splat(ri));
+            }
+            full.generate_mips(6);
+            inc.remip_bbox(lo.x, lo.y, hi.x, hi.y, 6);
+
+            assert_eq!(
+                full.mip_base_offsets, inc.mip_base_offsets,
+                "round {round}: mip tables diverge",
+            );
+            assert_eq!(
+                full.column_offset, inc.column_offset,
+                "round {round}: column offsets diverge",
+            );
+            assert_eq!(full.data, inc.data, "round {round}: data bytes diverge");
         }
     }
 

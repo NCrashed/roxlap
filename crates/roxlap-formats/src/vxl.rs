@@ -386,6 +386,58 @@ impl Vxl {
     /// Production builds skip the assert.
     #[allow(clippy::missing_panics_doc)] // covered above
     pub fn generate_mips(&mut self, max_mips: u32) {
+        self.rebuild_mips(max_mips, &[], None);
+    }
+
+    /// PF.12 — incremental re-mip: byte-identical to
+    /// [`Self::generate_mips`]`(max_mips)` when every edit since the mips
+    /// were last built lies inside the **inclusive** mip-0 voxel bbox
+    /// `[x0..=x1] × [y0..=y1]` (z never affects column boundaries — a
+    /// column is re-derived wholesale). Columns outside the bbox reuse
+    /// their previous mip bytes verbatim (a memcpy) instead of re-running
+    /// the 2×2 downsampler, which is where `generate_mips`' cost lives —
+    /// a bullet-sized edit re-mips in microseconds instead of tens of
+    /// milliseconds.
+    ///
+    /// Falls back to the full rebuild when no ladder exists yet. The
+    /// caller passes the **geometric** edit extent; the dirty column set
+    /// is padded by one column internally, because an edit exposes /
+    /// hides faces of its ADJACENT columns too (their slab colour
+    /// records change — e.g. a carve adds wall-surface records to the
+    /// ring around it). Brightness-byte rewrites from a lighting re-bake
+    /// must still be inside the bbox the caller reports — an
+    /// under-reported bbox leaves stale mip data for the missed columns.
+    pub fn remip_bbox(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, max_mips: u32) {
+        let have = self.mip_count();
+        if have <= 1 {
+            self.generate_mips(max_mips);
+            return;
+        }
+        // Snapshot the old levels (offsets + data segments) before the
+        // rebuild resets the pool. Level offsets are tight + monotonic
+        // (always built by `build_mip_level`), so a level's bytes span
+        // `[offsets[0] .. offsets[last]]`.
+        let old_levels: Vec<OldMipLevel> = (1..have)
+            .map(|l| {
+                let lo = self.mip_base_offsets[l as usize];
+                let hi = self.mip_base_offsets[(l + 1) as usize];
+                let offsets = self.column_offset[lo..hi].to_vec();
+                let d0 = offsets[0] as usize;
+                let d1 = *offsets.last().expect("level has a sentinel") as usize;
+                OldMipLevel {
+                    offsets,
+                    data: self.data[d0..d1].to_vec(),
+                }
+            })
+            .collect();
+        self.rebuild_mips(max_mips, &old_levels, Some([x0, y0, x1, y1]));
+    }
+
+    /// Shared driver of [`Self::generate_mips`] / [`Self::remip_bbox`]:
+    /// reset to mip-0, then rebuild levels 1.. — recomputing a column via
+    /// the 2×2 downsampler when it's dirty (or no old level exists) and
+    /// memcpy-ing its old bytes otherwise.
+    fn rebuild_mips(&mut self, max_mips: u32, old_levels: &[OldMipLevel], bbox: Option<[i32; 4]>) {
         self.reset_to_single_mip();
         if max_mips <= 1 {
             return;
@@ -407,9 +459,35 @@ impl Vxl {
             let src_offsets_hi = self.mip_base_offsets[mipnum as usize];
             let src_offsets = self.column_offset[src_offsets_lo..src_offsets_hi].to_vec();
 
+            // PF.12 — reuse the old level's bytes for clean columns. The
+            // dirty rect at level N is the mip-0 bbox halved N times
+            // (inclusive); every dst column with ≥1 dirty source column
+            // lands inside it.
+            let reuse_store;
+            let reuse = match (bbox, old_levels.get((mipnum - 1) as usize)) {
+                (Some(b), Some(old)) => {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let hi = dst_vsid as i32 - 1;
+                    // ±1 column pad: an edit rewrites the slab records of
+                    // its adjacent columns too (exposed/hidden faces).
+                    reuse_store = MipReuse {
+                        offsets: &old.offsets,
+                        data: &old.data,
+                        dirty: [
+                            ((b[0] - 1) >> mipnum).clamp(0, hi),
+                            ((b[1] - 1) >> mipnum).clamp(0, hi),
+                            ((b[2] + 1) >> mipnum).clamp(0, hi),
+                            ((b[3] + 1) >> mipnum).clamp(0, hi),
+                        ],
+                    };
+                    Some(&reuse_store)
+                }
+                _ => None,
+            };
+
             // Build the new mip into fresh buffers; merge afterwards.
             let (new_data_segment, new_offsets) =
-                build_mip_level(&self.data, &src_offsets, src_vsid, dst_vsid);
+                build_mip_level(&self.data, &src_offsets, src_vsid, dst_vsid, reuse);
 
             // Splice into self. New offsets are returned in absolute
             // byte coords (the source-data prefix is unchanged so
@@ -442,6 +520,44 @@ impl Vxl {
             src_vsid = dst_vsid;
             src_z_bound = dst_z_bound;
         }
+
+        // PF.12 — re-sync the edit-pool allocator bitmap to the rebuilt
+        // layout. The reset truncated the pool and the loop appended
+        // fresh level segments; a stale `vbit` would mark those level
+        // bytes as FREE, and the next `voxalloc` edit would silently
+        // clobber them (a latent pre-remip landmine: `generate_mips`
+        // self-healed by rebuilding levels from mip-0 every time, but
+        // renders between the clobber and the next full re-mip read
+        // corrupt mip data — and the incremental `remip_bbox` trusts old
+        // level bytes outright). No-op for read-only pools (empty vbit).
+        if !self.vbit.is_empty() {
+            self.resync_vbit();
+        }
+    }
+
+    /// PF.12 — rebuild [`Vxl::vbit`] from the CURRENT pool layout: every
+    /// mip's every column marked allocated by its true `slng` extent
+    /// (mip-0 columns scatter after `voxalloc` edits, so
+    /// [`Self::reserve_edit_capacity`]'s consecutive-offset window trick
+    /// — valid only for freshly-packed tables — cannot be used here).
+    /// Everything else, including interior gaps freed by column
+    /// relocations, becomes allocatable free space.
+    fn resync_vbit(&mut self) {
+        let total_dwords = self.data.len() / 4;
+        let n_words = total_dwords.div_ceil(32);
+        let mut vbit = vec![0u32; n_words].into_boxed_slice();
+        for mip in 0..self.mip_count() {
+            let table = self.column_offset_for_mip(mip);
+            for &off in &table[..table.len() - 1] {
+                let start = off as usize;
+                let len = slng(&self.data[start..]);
+                for d in start / 4..(start + len).div_ceil(4) {
+                    vbit[d >> 5] |= 1u32 << (d & 31);
+                }
+            }
+        }
+        self.vbit = vbit;
+        self.vbiti = 0;
     }
 
     // ---- slab allocator (CD.2 cave-demo edit API) ---------------------
@@ -483,10 +599,15 @@ impl Vxl {
         let new_len = old_len + headroom_aligned;
         u32::try_from(new_len).expect("vbuf size fits in u32");
 
-        let mut new_data = Vec::with_capacity(new_len);
-        new_data.extend_from_slice(&self.data);
-        new_data.resize(new_len, 0);
-        self.data = new_data.into_boxed_slice();
+        // PF.12 — `headroom_bytes == 0` = "re-sync the allocator bitmap
+        // to the current pool layout" (mip rebuilds call this): skip the
+        // pointless whole-pool copy.
+        if headroom_aligned > 0 {
+            let mut new_data = Vec::with_capacity(new_len);
+            new_data.extend_from_slice(&self.data);
+            new_data.resize(new_len, 0);
+            self.data = new_data.into_boxed_slice();
+        }
 
         let total_dwords = new_len / 4;
         let n_words = total_dwords.div_ceil(32);
@@ -748,11 +869,30 @@ fn average_packed_colours(lanes: &[i32], n: usize) -> i32 {
     clippy::unnecessary_cast,
     clippy::needless_range_loop
 )]
+/// PF.12 — one old mip level snapshotted for [`Vxl::remip_bbox`]'s
+/// clean-column reuse: the level's (absolute, tight, sentinel-terminated)
+/// offsets plus its data bytes copied out before the rebuild reset them.
+struct OldMipLevel {
+    offsets: Vec<u32>,
+    data: Vec<u8>,
+}
+
+/// PF.12 — clean-column reuse view for [`build_mip_level`]: `dirty` is
+/// the inclusive dst-column rect that must be recomputed; everything
+/// outside copies its old bytes (`offsets[i] - offsets[0]` indexes
+/// `data`).
+struct MipReuse<'a> {
+    offsets: &'a [u32],
+    data: &'a [u8],
+    dirty: [i32; 4],
+}
+
 fn build_mip_level(
     data: &[u8],
     src_offsets: &[u32],
     src_vsid: u32,
     dst_vsid: u32,
+    reuse: Option<&MipReuse<'_>>,
 ) -> (Vec<u8>, Vec<u32>) {
     let src_vsid_us = src_vsid as usize;
     let dst_vsid_us = dst_vsid as usize;
@@ -772,6 +912,23 @@ fn build_mip_level(
 
     for y in 0..dst_vsid_us {
         for x in 0..dst_vsid_us {
+            // PF.12 — clean column under an incremental re-mip: its 2×2
+            // source columns are untouched, so its old bytes are exactly
+            // what the downsampler would recompute — memcpy them.
+            if let Some(r) = reuse {
+                #[allow(clippy::cast_possible_wrap)]
+                let (xi, yi) = (x as i32, y as i32);
+                if xi < r.dirty[0] || xi > r.dirty[2] || yi < r.dirty[1] || yi > r.dirty[3] {
+                    let i = y * dst_vsid_us + x;
+                    let s = (r.offsets[i] - r.offsets[0]) as usize;
+                    let e = (r.offsets[i + 1] - r.offsets[0]) as usize;
+                    let col_start =
+                        data_base + u32::try_from(new_data.len()).expect("mip data fits in u32");
+                    new_offsets.push(col_start);
+                    new_data.extend_from_slice(&r.data[s..e]);
+                    continue;
+                }
+            }
             // Reset per-cell scratch.
             mixn.fill(0);
             tbuf.clear();
@@ -957,7 +1114,7 @@ fn build_mip_level(
                 }
 
                 // State machine update for besti.
-                let bit_pos = (besti << 2) as i32;
+                let bit_pos = besti << 2;
                 cstat = ((1i32 << bit_pos).wrapping_add(cstat)) & 0x3333;
                 let state = (cstat >> bit_pos) & 3;
                 let bi = besti as usize;
