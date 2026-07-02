@@ -1564,9 +1564,21 @@ impl GpuRenderer {
         compatible_surface: Option<&wgpu::Surface<'static>>,
         settings: GpuRendererSettings,
     ) -> Result<wgpu::Adapter, GpuInitError> {
-        let power_preference = match settings.power_preference {
-            PowerPreference::Low => wgpu::PowerPreference::LowPower,
-            PowerPreference::High => wgpu::PowerPreference::HighPerformance,
+        // `ROXLAP_GPU_POWER=low|high` overrides the host's adapter
+        // preference — an escape hatch for broken hybrid-GPU (PRIME)
+        // driver stacks, where rendering on the display-owning iGPU
+        // avoids the cross-GPU present entirely. (A nixos mesa update
+        // deadlocked the nouveau↔i915 explicit-sync fences: dGPU frames
+        // hit the drm job timeout and the channel was killed; `low` kept
+        // the demo alive.) Init-time only — never read per frame; on
+        // wasm `env::var` errs and the settings value applies.
+        let power_preference = match std::env::var("ROXLAP_GPU_POWER").as_deref() {
+            Ok("low") => wgpu::PowerPreference::LowPower,
+            Ok("high") => wgpu::PowerPreference::HighPerformance,
+            _ => match settings.power_preference {
+                PowerPreference::Low => wgpu::PowerPreference::LowPower,
+                PowerPreference::High => wgpu::PowerPreference::HighPerformance,
+            },
         };
         instance
             .request_adapter(&wgpu::RequestAdapterOptions {
