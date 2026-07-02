@@ -447,6 +447,16 @@ pub struct Grid {
     /// incremental-remip companion to [`Self::chunk_versions`]. Bounded
     /// by the chunk count (one merged entry per chunk). Not serialised.
     chunk_dirty: HashMap<IVec3, DirtyExtent>,
+    /// PF.13 (H9) — monotonic counter bumped by EVERY chunk-set /
+    /// chunk-content mutation (edits, installs, evictions). Per-frame
+    /// consumers (the GPU dirty poll, the brick-cache sweep) compare it
+    /// against their last-seen value and skip their O(all chunks) scans
+    /// outright on quiet frames. Not serialised.
+    mutations: u64,
+    /// PF.13 (H9) — `(mutation counter, requested mip, effective mip)`
+    /// of the last [`Self::ensure_dda_bricks`] sweep; a matching pair
+    /// skips the whole per-chunk ensure + retain pass.
+    last_bricks: Option<(u64, u32, u32)>,
 }
 
 /// PF.12 — how much of a chunk changed since a consumer last synced it.
@@ -478,6 +488,8 @@ impl Grid {
             pending_gen: HashSet::new(),
             dda_brick_cache: roxlap_core::BrickCache::new(),
             chunk_dirty: HashMap::new(),
+            mutations: 0,
+            last_bricks: None,
         }
     }
 
@@ -490,6 +502,14 @@ impl Grid {
     pub fn ensure_dda_bricks(&mut self, requested_mip: u32) -> u32 {
         // Split-borrow disjoint fields so the cache mutates while the
         // chunks + versions are read.
+        // PF.13 (H9) — quiet frame at the same requested mip ⇒ nothing
+        // in the cache can be stale: skip the whole O(chunks) sweep.
+        if let Some((counter, req, eff)) = self.last_bricks {
+            if counter == self.mutations && req == requested_mip {
+                return eff;
+            }
+        }
+        let mutations = self.mutations;
         let Self {
             chunks,
             chunk_versions,
@@ -509,6 +529,7 @@ impl Grid {
             dda_brick_cache.ensure([idx.x, idx.y, idx.z], mip, version, &view);
         }
         dda_brick_cache.retain_chunks(|c| chunks.contains_key(&IVec3::new(c[0], c[1], c[2])));
+        self.last_bricks = Some((mutations, requested_mip, mip));
         mip
     }
 
@@ -550,6 +571,15 @@ impl Grid {
         // PF.12 — no extent information ⇒ the whole chunk must be
         // treated as changed by partial-refresh consumers.
         self.chunk_dirty.insert(chunk_idx, DirtyExtent::Full);
+        self.mutations = self.mutations.wrapping_add(1);
+    }
+
+    /// PF.13 (H9) — the grid's monotonic mutation counter: bumped by
+    /// every chunk edit, install, and eviction. Per-frame consumers
+    /// snapshot it to skip their whole-grid scans on quiet frames.
+    #[must_use]
+    pub fn mutation_counter(&self) -> u64 {
+        self.mutations
     }
 
     /// PF.12 — [`Self::bump_chunk_version`] with the edit's CHUNK-LOCAL
@@ -567,6 +597,7 @@ impl Grid {
             None => DirtyExtent::Bbox(lo, hi),
         };
         self.chunk_dirty.insert(chunk_idx, merged);
+        self.mutations = self.mutations.wrapping_add(1);
     }
 
     /// PF.12 — take (and clear) the extent accumulated for `chunk_idx`
@@ -623,6 +654,7 @@ impl Grid {
         }
         let chunk = generator.generate(chunk_idx);
         self.chunks.insert(chunk_idx, chunk);
+        self.mutations = self.mutations.wrapping_add(1);
         // S7.4: a fresh chunk grows the populated AABB → the
         // bounding sphere shifts/expands → existing impostor
         // projections become wrong. Match the eviction (S7.1) +
@@ -926,6 +958,7 @@ impl Scene {
                 continue;
             }
             grid.chunks.insert(result.chunk_idx, result.vxl);
+            grid.mutations = grid.mutations.wrapping_add(1);
             // S7.4: same invalidation contract as the sync
             // `ensure_chunk_generated` path — installing a new
             // chunk can grow the bounding sphere, so the
@@ -1046,6 +1079,7 @@ fn evict_grid_chunks_with_cam(grid: &mut Grid, cam_local: DVec3) {
     }
     for idx in &to_evict {
         grid.chunks.remove(idx);
+        grid.mutations = grid.mutations.wrapping_add(1);
         // S7.2: keep chunk_versions in sync with chunks so the
         // map stays bounded. A future re-stream of the same idx
         // restarts at 0 — that's fine because any in-flight

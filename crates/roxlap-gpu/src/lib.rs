@@ -677,6 +677,11 @@ pub struct GpuRenderer {
     /// is its capacity in bytes.
     line_vbuf: Option<wgpu::Buffer>,
     line_vbuf_cap: u64,
+    /// PF.13 (H7-lite) — cached line-overlay bind group + the scene
+    /// depth buffer it was built against (`None` = the dummy depth).
+    /// Rebuilt only when that identity changes (resize / scene swap)
+    /// instead of every `draw_lines_deferred` call.
+    line_bg_cache: Option<(wgpu::BindGroup, Option<wgpu::Buffer>)>,
     /// Lazy-built image-sprite pipeline — built on the first
     /// [`Self::draw_images_deferred`] call.
     image_resources: Option<ImageResources>,
@@ -684,6 +689,13 @@ pub struct GpuRenderer {
     /// across frames (like [`Self::line_vbuf`]).
     image_vbuf: Option<wgpu::Buffer>,
     image_vbuf_cap: u64,
+    /// PF.13 (H7-lite) — image-overlay bind groups keyed by image id,
+    /// valid only while the depth-buffer identity in
+    /// [`image_bg_depth`](Self::image_bg_depth) holds. Entries are
+    /// evicted on image drop / slot re-upload; the whole map clears
+    /// when the depth buffer is swapped.
+    image_bg_cache: std::collections::HashMap<usize, wgpu::BindGroup>,
+    image_bg_depth: Option<wgpu::Buffer>,
     /// Retained image-sprite textures, indexed by the id
     /// [`Self::upload_image`] returns. A dropped slot is `None` and is
     /// re-used by a later upload.
@@ -1789,9 +1801,12 @@ impl GpuRenderer {
             line_resources: None,
             line_vbuf: None,
             line_vbuf_cap: 0,
+            line_bg_cache: None,
             image_resources: None,
             image_vbuf: None,
             image_vbuf_cap: 0,
+            image_bg_cache: std::collections::HashMap::new(),
+            image_bg_depth: None,
             images: Vec::new(),
             #[cfg(feature = "hud")]
             egui_renderer: None,
@@ -3288,24 +3303,34 @@ impl GpuRenderer {
         self.queue
             .write_buffer(&res.uniform_buf, 0, bytemuck::bytes_of(&params));
 
-        let depth_resource = match &self.scene_dda {
-            Some(dda) => dda.depth_buffer.as_entire_binding(),
-            None => res.dummy_depth.as_entire_binding(),
-        };
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("roxlap-gpu line.bg"),
-            layout: &res.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: res.uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: depth_resource,
-                },
-            ],
-        });
+        // PF.13 (H7-lite) — the bind group depends only on the uniform
+        // buffer (stable) and the depth buffer identity, so cache it and
+        // rebuild only when the depth buffer is swapped (resize / scene
+        // rebuild). wgpu buffers compare by identity.
+        let depth_key: Option<wgpu::Buffer> =
+            self.scene_dda.as_ref().map(|dda| dda.depth_buffer.clone());
+        if !matches!(&self.line_bg_cache, Some((_, key)) if *key == depth_key) {
+            let depth_resource = match &self.scene_dda {
+                Some(dda) => dda.depth_buffer.as_entire_binding(),
+                None => res.dummy_depth.as_entire_binding(),
+            };
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("roxlap-gpu line.bg"),
+                layout: &res.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: res.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: depth_resource,
+                    },
+                ],
+            });
+            self.line_bg_cache = Some((bg, depth_key));
+        }
+        let bg = &self.line_bg_cache.as_ref().expect("just ensured").0;
 
         // Grow-only persistent vertex buffer (L3.3): one `write_buffer`
         // per overlay, reused across frames. Power-of-two capacity keeps
@@ -3351,7 +3376,7 @@ impl GpuRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&res.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, bg, &[]);
             pass.set_vertex_buffer(0, vbuf.slice(..));
             pass.draw(0..verts.len() as u32, 0..1);
         }
@@ -3515,6 +3540,9 @@ impl GpuRenderer {
         };
         if let Some(slot) = self.images.iter().position(Option::is_none) {
             self.images[slot] = Some(resident);
+            // PF.13 (H7-lite) — the slot now holds a different texture;
+            // any cached bind group for the old occupant is stale.
+            self.image_bg_cache.remove(&slot);
             slot
         } else {
             self.images.push(Some(resident));
@@ -3527,6 +3555,7 @@ impl GpuRenderer {
     pub fn drop_image(&mut self, id: usize) {
         if let Some(slot) = self.images.get_mut(id) {
             *slot = None;
+            self.image_bg_cache.remove(&id);
         }
     }
 
@@ -3608,40 +3637,51 @@ impl GpuRenderer {
         self.queue
             .write_buffer(vbuf, 0, bytemuck::cast_slice(&verts));
 
-        // One bind group per draw (the texture view differs per quad).
+        // One bind group per image id (the texture view differs per
+        // image). PF.13 (H7-lite) — cached across frames keyed by image
+        // id, valid while the depth buffer identity holds; a static HUD
+        // costs zero bind-group creations per frame. Entries evict on
+        // image drop / slot re-upload.
         let res = self.image_resources.as_ref().expect("just built");
+        let depth_key: Option<wgpu::Buffer> =
+            self.scene_dda.as_ref().map(|dda| dda.depth_buffer.clone());
+        if self.image_bg_depth != depth_key {
+            self.image_bg_cache.clear();
+            self.image_bg_depth = depth_key;
+        }
         let depth_resource = match &self.scene_dda {
             Some(dda) => dda.depth_buffer.as_entire_binding(),
             None => res.dummy_depth.as_entire_binding(),
         };
-        let bind_groups: Vec<wgpu::BindGroup> = draws
-            .iter()
-            .map(|&(_, _, image_id)| {
-                let resident = self.images[image_id].as_ref().expect("checked present");
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("roxlap-gpu image.bg"),
-                    layout: &res.bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: res.uniform_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: depth_resource.clone(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&resident.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::Sampler(&res.sampler),
-                        },
-                    ],
-                })
-            })
-            .collect();
+        for &(_, _, image_id) in &draws {
+            if self.image_bg_cache.contains_key(&image_id) {
+                continue;
+            }
+            let resident = self.images[image_id].as_ref().expect("checked present");
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("roxlap-gpu image.bg"),
+                layout: &res.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: res.uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: depth_resource.clone(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&resident.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&res.sampler),
+                    },
+                ],
+            });
+            self.image_bg_cache.insert(image_id, bg);
+        }
 
         let view = &self.pending_frame.as_ref().expect("checked above").1;
         let mut encoder = self
@@ -3668,7 +3708,8 @@ impl GpuRenderer {
             });
             pass.set_pipeline(&res.pipeline);
             pass.set_vertex_buffer(0, vbuf.slice(..));
-            for (&(start, end, _), bg) in draws.iter().zip(&bind_groups) {
+            for &(start, end, image_id) in &draws {
+                let bg = self.image_bg_cache.get(&image_id).expect("just ensured");
                 pass.set_bind_group(0, bg, &[]);
                 pass.draw(start..end, 0..1);
             }

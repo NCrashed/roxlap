@@ -438,6 +438,56 @@ pub fn frame_at(durations: &[u32], loop_mode: LoopMode, elapsed_ms: u32) -> usiz
     n - 1
 }
 
+/// Inclusive prefix sums of `durations` (ms, u64) — `prefix[i]` is the
+/// clip time at which frame `i` ENDS. Build once per timeline and feed
+/// [`frame_at_prefix`] so a per-frame playback clock resolves its frame
+/// by binary search instead of re-summing the whole duration list
+/// (PF.13 / S4).
+#[must_use]
+pub fn duration_prefix_sums(durations: &[u32]) -> Vec<u64> {
+    let mut acc = 0u64;
+    durations
+        .iter()
+        .map(|&d| {
+            acc += u64::from(d);
+            acc
+        })
+        .collect()
+}
+
+/// [`frame_at`] over precomputed [`duration_prefix_sums`] — identical
+/// results (including zero-duration frame skipping and the `n-1` hold
+/// past the end), but O(log n) per call. `prefix` must be the inclusive
+/// prefix-sum vector of the same duration list.
+#[must_use]
+pub fn frame_at_prefix(prefix: &[u64], loop_mode: LoopMode, elapsed_ms: u32) -> usize {
+    let n = prefix.len();
+    if n <= 1 {
+        return 0;
+    }
+    let total = prefix[n - 1];
+    if total == 0 {
+        return 0;
+    }
+    let elapsed = u64::from(elapsed_ms);
+    let t = match loop_mode {
+        LoopMode::Loop => elapsed % total,
+        LoopMode::Once => elapsed.min(total - 1),
+        LoopMode::PingPong => {
+            let p = elapsed % (2 * total);
+            if p < total {
+                p
+            } else {
+                2 * total - 1 - p
+            }
+        }
+    };
+    // First frame whose (inclusive) end time exceeds `t` — the same
+    // frame the linear walk in `frame_at` lands on, because the prefix
+    // is non-decreasing.
+    prefix.partition_point(|&acc| acc <= t).min(n - 1)
+}
+
 /// u32 occupancy words per `(x, y)` column for a clip of `dims`.
 #[must_use]
 pub fn occ_words_per_col(dims: [u32; 3]) -> u32 {
@@ -2310,5 +2360,35 @@ mod tests {
         // Loop + Once likewise.
         assert!(frame_at(&durations, LoopMode::Loop, u32::MAX) < durations.len());
         assert!(frame_at(&durations, LoopMode::Once, u32::MAX) < durations.len());
+    }
+
+    /// PF.13 (S4): `frame_at_prefix` over `duration_prefix_sums` must agree
+    /// with the linear-walk `frame_at` everywhere — including zero-duration
+    /// frames (skipped), the exact frame-boundary instants, past-the-end
+    /// holds, and degenerate (empty / single / all-zero) timelines.
+    #[test]
+    fn frame_at_prefix_matches_linear_walk() {
+        let timelines: [&[u32]; 7] = [
+            &[],
+            &[100],
+            &[100, 100, 100],
+            &[50, 0, 50, 200],
+            &[0, 0, 0],
+            &[1, 1, 1, 1, 1],
+            &[u32::MAX / 2, u32::MAX / 2],
+        ];
+        let modes = [LoopMode::Loop, LoopMode::Once, LoopMode::PingPong];
+        for durations in timelines {
+            let prefix = duration_prefix_sums(durations);
+            for mode in modes {
+                for t in (0u32..700).chain([u32::MAX - 1, u32::MAX]) {
+                    assert_eq!(
+                        frame_at_prefix(&prefix, mode, t),
+                        frame_at(durations, mode, t),
+                        "durations={durations:?} mode={mode:?} t={t}"
+                    );
+                }
+            }
+        }
     }
 }

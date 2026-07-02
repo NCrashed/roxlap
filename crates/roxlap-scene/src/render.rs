@@ -901,19 +901,23 @@ fn render_scene_composed_scissored(
         }
 
         // Per-grid screen-space scissor: confine this grid's opticast +
-        // temp reset + compose to the vertical band its projection spans
-        // (full width), and skip the grid entirely when it projects fully
-        // off-screen on EITHER axis. `project_sphere_to_screen` is
+        // temp reset + compose to the true screen rect its projection
+        // spans, and skip the grid entirely when it projects fully
+        // off-screen on either axis. `project_sphere_to_screen` is
         // conservative (over-estimates the footprint), so the rendered
         // pixels stay byte-identical to the full-frame path — only the
-        // work shrinks. The horizontal extent is used for the lateral
-        // cull but NOT to clip opticast: the radar's column-indexed
-        // `angstart` isn't reset per grid, so x-clipping reads stale
-        // entries at extreme poses (a crash reproduced at the `z=-19`
-        // pose — same angular-projection fragility that closed the
-        // cf-narrowing investigation). `None` (camera inside/near the
-        // sphere) renders full-frame. `scissor = false` disables it all
-        // for the regression test.
+        // work shrinks.
+        //
+        // PF.13 (C7) — the horizontal extent now clips the render too.
+        // The historical full-width-only constraint guarded the deleted
+        // voxlap radar's column-indexed `angstart` (never reset per
+        // grid, so x-clipping read stale entries at extreme poses); the
+        // DDA renderer's pixels are fully independent, so the x band is
+        // as safe as the long-proven y band. Small grids (markers,
+        // pickups, ships) stop paying full-width rows of render + fill
+        // + compose. `None` (camera inside/near the sphere) renders
+        // full-frame; `scissor = false` disables it all for the
+        // byte-identity regression test.
         let full_rect = ScreenRect {
             x0: 0,
             x1: width,
@@ -924,14 +928,7 @@ fn render_scene_composed_scissored(
             match project_sphere_to_screen(camera, centre_world, bounds.radius, settings) {
                 // Off-screen on either axis → the grid can't appear.
                 Some(r) if r.is_empty() => continue,
-                // Vertical band only (full width); lateral extent already
-                // served the cull above.
-                Some(r) => ScreenRect {
-                    x0: 0,
-                    x1: width,
-                    y0: r.y0,
-                    y1: r.y1,
-                },
+                Some(r) => r,
                 None => full_rect,
             }
         } else {
@@ -1030,16 +1027,14 @@ fn render_scene_composed_scissored(
             }
         };
 
-        // Vertical scissor: restrict the render to the grid's screen
-        // y-band (full width). `rect` is always full-width here (see
-        // the rect computation), so this is the proven `y_start /
-        // y_end` strip path — byte-identical to the full frame when
-        // the band is `0..height`. The lateral cull happened above;
-        // a horizontal opticast scissor is unsafe (the radar's
-        // column-indexed `angstart` isn't reset per grid, so column
-        // clipping reads stale entries at extreme poses — see the
-        // `cpu-grid-scissor` memo).
-        let scissored = (*active_settings).with_y_range(rect.y0, rect.y1);
+        // PF.13 (C7) — 2D scissor: restrict the render to the grid's
+        // true screen rect. The y strip is the long-proven path; the x
+        // band joins it now that the radar-era `angstart` fragility is
+        // gone (see the rect computation above). Byte-identical to the
+        // full frame when the rect is `0..width × 0..height`.
+        let scissored = (*active_settings)
+            .with_y_range(rect.y0, rect.y1)
+            .with_x_range(rect.x0, rect.x1);
         // DDA backend. temp_fb / temp_zb are already pre-filled with
         // sky / INFINITY for this grid's rect, so a miss with no
         // textured sky yields the correct solid sky.

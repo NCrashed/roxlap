@@ -1798,7 +1798,7 @@ pub fn render_dda(
 
     for py in settings.y_start..settings.y_end {
         let row = py as usize * pitch_pixels;
-        for px in 0..settings.xres {
+        for px in settings.x_start..settings.x_end {
             if let Some((color, dist)) = pixel_result(&cs, settings, &mut sampler, env, px, py) {
                 sink.put(row + px as usize, color, dist);
             }
@@ -1884,7 +1884,7 @@ pub fn render_dda_parallel(
         let mut sampler = Sampler::new(grid, cache, mip);
         for py in by0..by1 {
             let row = py as usize * pitch_pixels;
-            for px in 0..settings.xres {
+            for px in settings.x_start..settings.x_end {
                 if let Some((color, dist)) = pixel_result(&cs, settings, &mut sampler, env, px, py)
                 {
                     let idx = row + px as usize;

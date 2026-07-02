@@ -45,7 +45,7 @@ use roxlap_core::kfa_draw::{compose_attachment, solve_kfa_limbs};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
-use roxlap_formats::voxel_clip::frame_at;
+use roxlap_formats::voxel_clip::{duration_prefix_sums, frame_at_prefix};
 use roxlap_scene::Scene;
 
 pub use light::{DirectionalLight, LightRig, PointLight, SpotLight};
@@ -439,7 +439,10 @@ struct StreamingClipState {
 /// Per-clip-attachment playback clock (VCL.6): the timing it needs to
 /// resolve a frame, plus its own accumulating clock.
 struct ClipClock {
-    durations: Vec<u32>,
+    /// PF.13 (S4) — inclusive duration prefix sums (ms), built once per
+    /// timeline via [`duration_prefix_sums`] so every tick resolves its
+    /// frame by binary search instead of re-summing the duration list.
+    prefix: Vec<u64>,
     loop_mode: LoopMode,
     /// Playback rate, Q8 (256 = 1×).
     speed_q8: i32,
@@ -449,6 +452,23 @@ struct ClipClock {
 }
 
 impl ClipClock {
+    /// Build a clock over `durations` starting at `clock_ms`.
+    fn new(durations: &[u32], loop_mode: LoopMode, speed_q8: i32, clock_ms: f64) -> Self {
+        Self {
+            prefix: duration_prefix_sums(durations),
+            loop_mode,
+            speed_q8,
+            clock_ms,
+        }
+    }
+
+    /// Frame shown at `elapsed_ms` on this clock's timeline —
+    /// [`frame_at`](roxlap_formats::voxel_clip::frame_at) over the
+    /// cached prefix sums.
+    fn frame_for(&self, elapsed_ms: u32) -> u32 {
+        frame_at_prefix(&self.prefix, self.loop_mode, elapsed_ms) as u32
+    }
+
     /// Advance the clock by `dt` seconds at its Q8 `speed` and return the
     /// frame to show. Shared by character attachments and standalone clip
     /// players. A negative clock (rewind past 0) reads as frame 0 but is
@@ -456,11 +476,7 @@ impl ClipClock {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn tick(&mut self, dt: f64) -> u32 {
         self.clock_ms += dt * 1000.0 * f64::from(self.speed_q8) / 256.0;
-        frame_at(
-            &self.durations,
-            self.loop_mode,
-            self.clock_ms.max(0.0) as u32,
-        ) as u32
+        self.frame_for(self.clock_ms.max(0.0) as u32)
     }
 
     /// Retarget this clock to a different clip's timeline (BB.1): swap the
@@ -468,8 +484,8 @@ impl ClipClock {
     /// the playback rate** (`speed_q8`). Used by
     /// [`SceneRenderer::set_clip_instance_clip`] so swapping a billboard's
     /// animation keeps its speed / pause policy.
-    fn retarget(&mut self, durations: Vec<u32>, loop_mode: LoopMode) {
-        self.durations = durations;
+    fn retarget(&mut self, durations: &[u32], loop_mode: LoopMode) {
+        self.prefix = duration_prefix_sums(durations);
         self.loop_mode = loop_mode;
         self.clock_ms = 0.0;
     }
@@ -2484,7 +2500,7 @@ impl SceneRenderer {
             let durations = self.clip_meta[clip_index].durations.clone();
             let loop_mode = self.clip_meta[clip_index].loop_mode;
             if let Some(player) = self.flipbook_player_mut(id) {
-                player.clock.retarget(durations, loop_mode);
+                player.clock.retarget(&durations, loop_mode);
             }
         }
         ok
@@ -2574,12 +2590,7 @@ impl SceneRenderer {
                 )
             },
         );
-        ClipClock {
-            durations,
-            loop_mode,
-            speed_q8,
-            clock_ms: 0.0,
-        }
+        ClipClock::new(&durations, loop_mode, speed_q8, 0.0)
     }
 
     /// Register a high-level **directional billboard actor** (BB.4): the
@@ -3009,12 +3020,12 @@ impl SceneRenderer {
             };
         };
         let meta = &self.clip_meta[clip_index];
-        let clock = ClipClock {
-            durations: meta.durations.clone(),
-            loop_mode: meta.loop_mode,
+        let clock = ClipClock::new(
+            &meta.durations,
+            meta.loop_mode,
             speed_q8,
-            clock_ms: f64::from(start_phase_ms),
-        };
+            f64::from(start_phase_ms),
+        );
         let inst = self.add_clip_instance_posed(clip, xf);
         self.clip_players.push(ClipPlayer {
             target: PlayerTarget::Flipbook(inst),
@@ -3050,12 +3061,12 @@ impl SceneRenderer {
         let Some(state) = self.streaming_clips[idx].as_ref() else {
             return;
         };
-        let clock = ClipClock {
-            durations: state.cursor.durations().to_vec(),
-            loop_mode: state.cursor.loop_mode(),
+        let clock = ClipClock::new(
+            state.cursor.durations(),
+            state.cursor.loop_mode(),
             speed_q8,
-            clock_ms: f64::from(start_phase_ms),
-        };
+            f64::from(start_phase_ms),
+        );
         self.clip_players.push(ClipPlayer {
             target: PlayerTarget::Streaming(clip),
             clock,
@@ -3146,11 +3157,7 @@ impl SceneRenderer {
         let Some((target, frame)) = self.flipbook_player_mut(id).map(|p| {
             p.clock.clock_ms = clock_ms;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let frame = frame_at(
-                &p.clock.durations,
-                p.clock.loop_mode,
-                clock_ms.max(0.0) as u32,
-            ) as u32;
+            let frame = p.clock.frame_for(clock_ms.max(0.0) as u32);
             (p.target, frame)
         }) else {
             return;
@@ -3210,11 +3217,7 @@ impl SceneRenderer {
         let Some((target, frame)) = self.streaming_player_mut(clip).map(|p| {
             p.clock.clock_ms = clock_ms;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let frame = frame_at(
-                &p.clock.durations,
-                p.clock.loop_mode,
-                clock_ms.max(0.0) as u32,
-            ) as u32;
+            let frame = p.clock.frame_for(clock_ms.max(0.0) as u32);
             (p.target, frame)
         }) else {
             return;
@@ -3294,12 +3297,12 @@ impl SceneRenderer {
                                 bone: bi,
                                 local_offset: att.local_offset,
                                 inst,
-                                clip: Some(ClipClock {
-                                    durations: durations.clone(),
-                                    loop_mode: *loop_mode,
-                                    speed_q8: att.playback.speed_q8,
-                                    clock_ms: f64::from(att.playback.start_phase_ms),
-                                }),
+                                clip: Some(ClipClock::new(
+                                    durations,
+                                    *loop_mode,
+                                    att.playback.speed_q8,
+                                    f64::from(att.playback.start_phase_ms),
+                                )),
                             });
                         }
                     }
@@ -3821,33 +3824,19 @@ mod tests {
     #[test]
     fn clip_clock_tick_advances_and_resolves_frames() {
         // 3 frames, 100 ms each → total 300 ms, looping.
-        let mut c = ClipClock {
-            durations: vec![100, 100, 100],
-            loop_mode: LoopMode::Loop,
-            speed_q8: 256, // 1×
-            clock_ms: 0.0,
-        };
+        let mut c = ClipClock::new(&[100, 100, 100], LoopMode::Loop, 256, 0.0); // 1×
         assert_eq!(c.tick(0.0), 0); // t=0 → frame 0
         assert_eq!(c.tick(0.10), 1); // t=100 → frame 1 (100 is not < 100)
         assert_eq!(c.clock_ms as u32, 100);
         assert_eq!(c.tick(0.15), 2); // t=250 → frame 2
         assert_eq!(c.tick(0.10), 0); // t=350 → 350%300=50 → frame 0
                                      // 0.5× speed advances half as fast.
-        let mut slow = ClipClock {
-            durations: vec![100, 100],
-            loop_mode: LoopMode::Once,
-            speed_q8: 128, // 0.5×
-            clock_ms: 0.0,
-        };
+        let mut slow = ClipClock::new(&[100, 100], LoopMode::Once, 128, 0.0); // 0.5×
         assert_eq!(slow.tick(0.20), 1); // 200ms wall → 100ms clock → frame 1
         assert!((slow.clock_ms - 100.0).abs() < 1e-6);
         // start_phase seeds the clock; negative clock reads as frame 0.
-        let mut phased = ClipClock {
-            durations: vec![50, 50, 50],
-            loop_mode: LoopMode::Loop,
-            speed_q8: -256, // rewind
-            clock_ms: 50.0, // start mid frame 1
-        };
+        // rewind at -1×, clock seeded mid frame 1
+        let mut phased = ClipClock::new(&[50, 50, 50], LoopMode::Loop, -256, 50.0);
         assert_eq!(phased.tick(0.10), 0); // 50 - 100 = -50 → max(0)=0 → frame 0
         assert!(phased.clock_ms < 0.0); // kept signed
     }
@@ -3857,14 +3846,9 @@ mod tests {
         // BB.1: swapping a billboard's animation retargets the player's
         // timeline (durations + loop) and restarts the clock, but keeps the
         // playback rate (the clock policy).
-        let mut c = ClipClock {
-            durations: vec![100, 100, 100],
-            loop_mode: LoopMode::Loop,
-            speed_q8: 512, // 2×
-            clock_ms: 250.0,
-        };
-        c.retarget(vec![50, 50], LoopMode::Once);
-        assert_eq!(c.durations, vec![50, 50]); // new clip's timeline
+        let mut c = ClipClock::new(&[100, 100, 100], LoopMode::Loop, 512, 250.0); // 2×
+        c.retarget(&[50, 50], LoopMode::Once);
+        assert_eq!(c.prefix, vec![50, 100]); // new clip's timeline (prefix sums)
         assert_eq!(c.loop_mode, LoopMode::Once); // new clip's loop mode
         assert!((c.clock_ms - 0.0).abs() < 1e-9); // restarted at frame 0
         assert_eq!(c.speed_q8, 512); // playback rate preserved

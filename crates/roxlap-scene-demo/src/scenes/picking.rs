@@ -6,7 +6,7 @@
 //! Controls: move the mouse to place the cursor · left-click drops a
 //! marker · WASD pans the top-down camera.
 
-use roxlap_render::{Sprite, SpriteInstanceDesc, SpriteSet};
+use roxlap_render::{DynSpriteTransform, Sprite, SpriteInstanceId, SpriteModelId, SpriteSet};
 use winit::event::MouseButton;
 
 use crate::scene::{build_demo, SceneAndCamera, StreamingBakeTracker};
@@ -21,6 +21,13 @@ pub struct PickingScene {
     bake: StreamingBakeTracker,
     /// `[cursor (cyan), marker (yellow)]`, recoloured from the base coco.
     pick_models: Vec<Sprite>,
+    /// PF.13 (S5) — the marker model handle from this scene's `enter`
+    /// registration; markers spawn as incremental instances instead of
+    /// rebuilding the whole sprite set every frame.
+    marker_model: Option<SpriteModelId>,
+    /// The one cursor instance; per-frame motion is a single
+    /// `set_sprite_instance_transform`, not a registry rebuild.
+    cursor_inst: Option<SpriteInstanceId>,
     /// Ground-plane point under the cursor this frame.
     cursor_world: [f32; 3],
     /// Dropped marker positions.
@@ -47,6 +54,8 @@ impl PickingScene {
             world: build_demo(),
             bake: StreamingBakeTracker::new(),
             pick_models,
+            marker_model: None,
+            cursor_inst: None,
             cursor_world: [0.0, 0.0, PICK_GROUND_Z as f32],
             placed: Vec::new(),
             mouse_px: (0.0, 0.0),
@@ -71,9 +80,29 @@ impl DemoScene for PickingScene {
         }
     }
 
-    fn enter(&mut self, _ctx: &mut SceneCtx) {
-        if self.pick_models.is_empty() {
+    fn enter(&mut self, ctx: &mut SceneCtx) {
+        if self.pick_models.len() < 2 {
             eprintln!("Picking: no base sprite loaded — cursor disabled");
+            return;
+        }
+        // PF.13 (S5) — register the two models ONCE per activation.
+        // `set_sprites` also wipes whatever sprite set the previous scene
+        // left behind; from here on everything is incremental — no more
+        // per-frame registry rebuild + kv6 clones + GPU re-upload.
+        let models = ctx.renderer.set_sprites(&SpriteSet {
+            models: self.pick_models.clone(),
+            instances: Vec::new(),
+            carve_model: None,
+        });
+        self.marker_model = models.get(1).copied();
+        self.cursor_inst = models
+            .first()
+            .map(|m| ctx.renderer.add_sprite_instance(*m, self.cursor_world));
+        // Re-materialise markers dropped on a previous visit.
+        if let Some(marker) = self.marker_model {
+            for p in &self.placed {
+                ctx.renderer.add_sprite_instance(marker, *p);
+            }
         }
     }
 
@@ -98,19 +127,17 @@ impl DemoScene for PickingScene {
                 self.cursor_world = w;
             }
         }
-        // Rebuild the cursor + marker sprite field (cursor follows the mouse).
-        let mut instances = vec![SpriteInstanceDesc {
-            model: 0,
-            pos: self.cursor_world,
-        }];
-        for p in &self.placed {
-            instances.push(SpriteInstanceDesc { model: 1, pos: *p });
+        // PF.13 (S5) — the cursor follows the mouse via one incremental
+        // pose write; markers were already added on click.
+        if let Some(inst) = self.cursor_inst {
+            ctx.renderer.set_sprite_instance_transform(
+                inst,
+                DynSpriteTransform {
+                    pos: self.cursor_world,
+                    ..DynSpriteTransform::default()
+                },
+            );
         }
-        ctx.renderer.set_sprites(&SpriteSet {
-            models: self.pick_models.clone(),
-            instances,
-            carve_model: None,
-        });
     }
 
     fn on_input(&mut self, ctx: &mut SceneCtx, ev: &SceneInput) {
@@ -145,6 +172,10 @@ impl DemoScene for PickingScene {
                             self.placed.len(),
                         );
                     }
+                }
+                // PF.13 (S5) — spawn the marker incrementally.
+                if let (Some(marker), Some(p)) = (self.marker_model, self.placed.last()) {
+                    ctx.renderer.add_sprite_instance(marker, *p);
                 }
             }
             _ => {}

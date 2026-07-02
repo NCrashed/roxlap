@@ -257,20 +257,10 @@ fn render_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
             t_max_chunk.z = t_max_chunk.z + t_delta_chunk.z;
         }
 
-        // Bail early once we leave the grid's bounding box and the
-        // ray is moving AWAY from it on every axis (can't re-enter).
-        let rel = p_chunk - u.origin_chunk;
-        let outside_lo = rel.x < 0 || rel.y < 0 || rel.z < 0;
-        let outside_hi = u32(rel.x) >= u.chunks_dims.x ||
-                         u32(rel.y) >= u.chunks_dims.y ||
-                         u32(rel.z) >= u.chunks_dims.z;
-        if (outside_lo || outside_hi) {
-            // Don't bail — the ray may have left the grid through
-            // one face while still moving toward voxels through
-            // another. Just keep marching. The `max_outer_steps`
-            // cap (from the host scan-dist slider) terminates
-            // wayward rays.
-        }
+        // (PF.13/G8 — no outside-the-bbox early-out here on purpose:
+        // a ray can leave through one face while still moving toward
+        // voxels behind another; `max_outer_steps` terminates wayward
+        // rays. A dead per-step bounds computation used to sit here.)
     }
 
     textureStore(output, vec2<i32>(gid.xy), vec4<f32>(hit_color, 1.0));

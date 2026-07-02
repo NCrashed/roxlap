@@ -219,6 +219,7 @@ impl Scene {
                 let n_cols = (vxl.vsid as usize) * (vxl.vsid as usize);
                 vxl.reserve_edit_capacity(n_cols * RESTORE_EDIT_HEADROOM_PER_COLUMN);
                 grid.chunks.insert(*addr, vxl);
+                grid.mutations = grid.mutations.wrapping_add(1);
             }
             // S7.2: restore per-chunk versions. Pre-S7.2 snapshots
             // carry an empty Vec (via #[serde(default)]) → no

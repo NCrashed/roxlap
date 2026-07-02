@@ -27,6 +27,14 @@ pub struct OpticastSettings {
     pub y_start: u32,
     /// One past the last y-row (exclusive). `yres` for full-frame.
     pub y_end: u32,
+    /// PF.13 (C7) — first x-column covered (inclusive). `0` for
+    /// full-frame. The DDA renderer's pixels are fully independent, so
+    /// an x sub-range is as safe as the y strip (the historical
+    /// full-width-only constraint came from the deleted voxlap radar's
+    /// column-indexed `angstart`).
+    pub x_start: u32,
+    /// One past the last x-column (exclusive). `xres` for full-frame.
+    pub x_end: u32,
     pub hx: f32,
     pub hy: f32,
     pub hz: f32,
@@ -53,6 +61,8 @@ impl OpticastSettings {
             yres: height,
             y_start: 0,
             y_end: height,
+            x_start: 0,
+            x_end: width,
             hx: half_w,
             hy: half_h,
             hz: half_w,
@@ -71,6 +81,18 @@ impl OpticastSettings {
     pub fn with_y_range(mut self, y_start: u32, y_end: u32) -> Self {
         self.y_start = y_start;
         self.y_end = y_end;
+        self
+    }
+
+    /// PF.13 (C7) — restrict to the `[x_start, x_end)` vertical band;
+    /// the per-grid screen scissor pairs this with
+    /// [`Self::with_y_range`] so a small grid renders only its true
+    /// screen rect instead of full-width rows. Caller ensures
+    /// `x_start < x_end <= xres`.
+    #[must_use]
+    pub fn with_x_range(mut self, x_start: u32, x_end: u32) -> Self {
+        self.x_start = x_start;
+        self.x_end = x_end;
         self
     }
 }

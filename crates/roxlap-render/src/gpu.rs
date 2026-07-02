@@ -68,6 +68,15 @@ pub(crate) struct GpuBackend {
     resident_scene_grids: Vec<u32>,
     /// Per-grid `chunk_idx → last-uploaded version` for the dirty poll.
     versions: Vec<HashMap<IVec3, u64>>,
+    /// PF.13 (H9) — per-grid [`Grid::mutation_counter`] value as of the
+    /// last COMPLETE `refresh_dirty` sync (parallel to
+    /// [`grid_ids`](Self::grid_ids)). A matching counter means nothing
+    /// changed since, so the O(chunks) version poll + stale-eviction
+    /// scan are skipped for that grid. Entries hold `u64::MAX` (never a
+    /// live counter value right after upload) until the first full
+    /// pass, and are NOT updated when a pass is cut short by the upload
+    /// budget or a failed refresh.
+    grid_mutations: Vec<u64>,
     /// Instanced sprite registry + the uploaded instance list; `None`
     /// until [`set_sprites`](Self::set_sprites).
     sprite_registry: Option<SpriteModelRegistry>,
@@ -174,6 +183,7 @@ impl GpuBackend {
             grid_ids: Vec::new(),
             resident_scene_grids: Vec::new(),
             versions: Vec::new(),
+            grid_mutations: Vec::new(),
             sprite_registry: None,
             sprite_instances: Vec::new(),
             sprite_basis: Vec::new(),
@@ -1404,6 +1414,10 @@ impl GpuBackend {
             versions.push(gv);
         }
 
+        // PF.13 (H9) — u64::MAX forces one full refresh_dirty pass per
+        // grid; that pass finds everything already synced and records
+        // the real counter, arming the quiet-frame skip from frame 2.
+        self.grid_mutations = vec![u64::MAX; grid_ids.len()];
         self.resident = Some(resident);
         self.grid_ids = grid_ids;
         self.versions = versions;
@@ -1428,6 +1442,13 @@ impl GpuBackend {
             let Some(grid) = scene.grid(*gid) else {
                 continue;
             };
+            // PF.13 (H9) — quiet grid (no edits / installs / evictions
+            // since the last COMPLETE sync): skip the whole O(chunks)
+            // version poll + stale-eviction scan.
+            let mutations = grid.mutation_counter();
+            if self.grid_mutations.get(scene_idx).copied() == Some(mutations) {
+                continue;
+            }
             let tracker = &mut self.versions[scene_idx];
 
             // Install / refresh current chunks, up to the per-frame
@@ -1442,12 +1463,17 @@ impl GpuBackend {
             // verifies colour-count stability and falls back by returning
             // `false` with nothing written).
             let mut cand: Vec<(IVec3, u64)> = Vec::new();
+            // PF.13 (H9) — `complete` records whether this pass fully
+            // synced the grid; only then may the mutation counter be
+            // stored (a budget-deferred chunk must keep the scans alive).
+            let mut complete = true;
             for chunk_ivec3 in grid.chunks.keys() {
                 let cur = grid.chunk_version(*chunk_ivec3);
                 if tracker.get(chunk_ivec3).copied() == Some(cur) {
                     continue;
                 }
                 if cand.len() as u32 >= self.chunk_upload_budget.saturating_sub(decompressed) {
+                    complete = false;
                     break;
                 }
                 cand.push((*chunk_ivec3, cur));
@@ -1465,6 +1491,7 @@ impl GpuBackend {
             };
             for ((chunk_ivec3, cur), extent) in cand.iter().zip(extents) {
                 let Some(vxl) = grid.chunks.get(chunk_ivec3) else {
+                    complete = false;
                     continue;
                 };
                 let idx3 = [chunk_ivec3.x, chunk_ivec3.y, chunk_ivec3.z];
@@ -1493,7 +1520,9 @@ impl GpuBackend {
                 }
                 let upload = roxlap_gpu::decompress_chunk(vxl);
                 let outcome = resident.refresh_chunk(queue, scene_idx, idx3, &upload);
-                if outcome != roxlap_gpu::RefreshOutcome::ChunkOutOfBbox {
+                if outcome == roxlap_gpu::RefreshOutcome::ChunkOutOfBbox {
+                    complete = false;
+                } else {
                     tracker.insert(*chunk_ivec3, *cur);
                     decompressed += 1;
                 }
@@ -1511,6 +1540,13 @@ impl GpuBackend {
                 evicted += 1;
             }
             // (PF.12.c — dirty extents were consumed in the candidate phase.)
+            // PF.13 (H9) — grid fully synced at counter `mutations`:
+            // arm the quiet-frame skip.
+            if complete {
+                if let Some(slot) = self.grid_mutations.get_mut(scene_idx) {
+                    *slot = mutations;
+                }
+            }
         }
         if decompressed > 8 || evicted > 0 {
             eprintln!("roxlap-render: refreshed {decompressed} chunks, evicted {evicted}");

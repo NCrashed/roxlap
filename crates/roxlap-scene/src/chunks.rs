@@ -397,6 +397,10 @@ impl Grid {
     /// is valid for editing via [`roxlap_formats::edit`] — the new
     /// chunk has [`Vxl::reserve_edit_capacity`] already applied.
     pub fn ensure_chunk(&mut self, chunk_idx: IVec3) -> &mut Vxl {
+        // PF.13 (H9) — materialising a chunk mutates the chunk set.
+        if !self.chunks.contains_key(&chunk_idx) {
+            self.mutations = self.mutations.wrapping_add(1);
+        }
         self.chunks.entry(chunk_idx).or_insert_with(empty_chunk_vxl)
     }
 

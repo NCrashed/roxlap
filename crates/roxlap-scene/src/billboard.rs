@@ -456,6 +456,8 @@ fn snapshot_settings(resolution: u32, d: f64, r: f64, max_scan_dist: i32) -> Opt
         yres: resolution,
         y_start: 0,
         y_end: resolution,
+        x_start: 0,
+        x_end: resolution,
         hx: half_n,
         hy: half_n,
         hz,
