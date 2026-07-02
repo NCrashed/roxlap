@@ -27,6 +27,8 @@ use roxlap_formats::sprite::{
 };
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 
+use std::sync::Arc;
+
 use crate::camera_math::CameraState;
 use crate::dda::{
     dda_setup, intersect_aabb, min_axis, pixel_ray, shade, shade_dynamic, CpuLights, ShadowTester,
@@ -306,9 +308,11 @@ fn cast_local(
 
 /// XS.2 — one sprite volume in the scene shadow occluder: its decoded dense
 /// voxels + world pose, with the cached inverse instance basis for
-/// world→sprite-local transforms.
+/// world→sprite-local transforms. PF.8 — the dense grid is shared
+/// (`Arc`) with the draw path's per-model cache instead of deep-cloned
+/// per occluder rebuild.
 struct SpriteOccEntry {
-    dense: SpriteDense,
+    dense: Arc<SpriteDense>,
     pos: [f32; 3],
     pivot: [f32; 3],
     minv: [[f32; 3]; 3],
@@ -342,10 +346,12 @@ impl SpriteOccluder {
 
     /// Add a decoded sprite volume at a world pose (`pos` = world pivot;
     /// `s`/`h`/`f` = model→world basis columns, the same pose the draw uses).
-    /// A degenerate (non-invertible) basis is skipped.
+    /// A degenerate (non-invertible) basis is skipped. PF.8 — takes the
+    /// dense grid by `Arc` (an occluder rebuild shares the draw path's
+    /// cached decodes instead of re-densifying every caster per frame).
     pub fn push(
         &mut self,
-        dense: SpriteDense,
+        dense: Arc<SpriteDense>,
         pos: [f32; 3],
         s: [f32; 3],
         h: [f32; 3],
@@ -957,8 +963,11 @@ pub fn draw_sprite_dense_shaded(
 
     debug_assert_eq!(fb.len(), zb.len());
     let target = RasterTarget::new(fb, zb);
-    let mut written = 0u32;
-    for py in rect.1..rect.3 {
+    // PF.8 — one row of the sprite's screen rect; rows are disjoint, every
+    // pixel reads/writes only its own index, so rows parallelise safely
+    // (the terrain DDA's `RasterTarget` band contract).
+    let draw_row = |py: u32| -> u32 {
+        let mut written = 0u32;
         let row = py as usize * pitch_pixels;
         for px in rect.0..rect.2 {
             let (origin, dir) = pixel_ray(cam, settings, px, py);
@@ -1101,8 +1110,21 @@ pub fn draw_sprite_dense_shaded(
                 written += u32::from(wrote);
             }
         }
+        written
+    };
+    // PF.8 — the sprite pass was entirely single-threaded after the
+    // rayon-parallel terrain; large footprints (a close-up character,
+    // a big translucent volume) now use the same worker pool. Small
+    // rects stay serial — per-sprite rayon overhead would dominate.
+    let rows = rect.3.saturating_sub(rect.1) as usize;
+    let cols = rect.2.saturating_sub(rect.0) as usize;
+    const SPRITE_PAR_MIN_PIXELS: usize = 64 * 64;
+    if rows >= 2 && rows * cols >= SPRITE_PAR_MIN_PIXELS {
+        use rayon::prelude::*;
+        (rect.1..rect.3).into_par_iter().map(draw_row).sum()
+    } else {
+        (rect.1..rect.3).map(draw_row).sum()
     }
-    written
 }
 
 /// Project the sprite's local voxel AABB to a clamped screen rectangle
@@ -1191,7 +1213,9 @@ fn project_screen_rect(
 /// a [`DecodedClip`], then [`draw_frame`](ClipFlipbook::draw_frame) the
 /// active frame each render.
 pub struct ClipFlipbook {
-    frames: Vec<SpriteDense>,
+    /// PF.8 — `Arc` per frame so the shadow occluder shares the cached
+    /// decode instead of deep-cloning the current frame per rebuild.
+    frames: Vec<Arc<SpriteDense>>,
 }
 
 impl ClipFlipbook {
@@ -1219,12 +1243,12 @@ impl ClipFlipbook {
             .frames
             .iter()
             .map(|frame| {
-                SpriteDense::from_voxel_frame_with_materials(
+                Arc::new(SpriteDense::from_voxel_frame_with_materials(
                     frame,
                     clip.dims,
                     clip.pivot,
                     material_map,
-                )
+                ))
             })
             .collect();
         Self { frames }
@@ -1238,7 +1262,14 @@ impl ClipFlipbook {
     /// Borrow frame `frame`'s cached dense grid, if in range.
     #[must_use]
     pub fn frame(&self, frame: usize) -> Option<&SpriteDense> {
-        self.frames.get(frame)
+        self.frames.get(frame).map(Arc::as_ref)
+    }
+
+    /// Share frame `frame`'s cached dense grid (PF.8) — a cheap refcount
+    /// clone for the shadow occluder (was a deep clone per rebuild).
+    #[must_use]
+    pub fn frame_arc(&self, frame: usize) -> Option<Arc<SpriteDense>> {
+        self.frames.get(frame).cloned()
     }
 
     /// Replace one frame's cached dense grid in place — the CPU side of an
@@ -1247,7 +1278,7 @@ impl ClipFlipbook {
     pub fn set_frame(&mut self, frame: usize, dense: SpriteDense) -> bool {
         match self.frames.get_mut(frame) {
             Some(slot) => {
-                *slot = dense;
+                *slot = Arc::new(dense);
                 true
             }
             None => false,
@@ -2156,7 +2187,7 @@ mod tests {
         use crate::dda::WorldOccluder;
         // 8³ cube, identity pose at world origin; `from_fn` centres the pivot
         // (4,4,4), so the cube spans world ≈ [-4, 4]³.
-        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF));
+        let dense = Arc::new(SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF)));
         let mut occ = SpriteOccluder::new();
         occ.push(
             dense,
@@ -2200,7 +2231,7 @@ mod tests {
         }));
         let mut occ = SpriteOccluder::new();
         occ.push(
-            SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF)),
+            Arc::new(SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF))),
             [0.0, 25.0, 0.0],
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],

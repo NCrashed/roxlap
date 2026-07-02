@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use roxlap_core::camera_math;
 use roxlap_core::dda_sprite::{
-    draw_sprite_dda_shaded, ClipFlipbook, SpriteDense, SpriteOccluder, SpriteShade,
+    draw_sprite_dense_shaded, ClipFlipbook, SpriteDense, SpriteOccluder, SpriteShade,
 };
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::render_sky_fill;
@@ -363,6 +363,47 @@ enum CpuSrc {
     Output,
 }
 
+/// PF.8 — one cached dense decode plus the shape key of the kv6 it was
+/// decoded from. The key (`dims + voxel count`) backstops the explicit
+/// invalidations: a lingering instance whose kv6 no longer matches the
+/// template (e.g. spawned before a `remove_model` tombstone) misses the
+/// cache and falls back to its own inline decode instead of drawing the
+/// wrong volume.
+struct DenseCacheEntry {
+    key: (u32, u32, u32, usize),
+    dense: std::sync::Arc<SpriteDense>,
+}
+
+/// Shape key of a kv6 for [`DenseCacheEntry`] staleness checks.
+fn kv6_key(k: &Kv6) -> (u32, u32, u32, usize) {
+    (k.xsiz, k.ysiz, k.zsiz, k.voxels.len())
+}
+
+/// Decode a sprite's kv6 (with its material map when present) — the
+/// single decode the PF.8 caches hold.
+fn decode_dense(s: &Sprite) -> SpriteDense {
+    if s.material_map.is_empty() {
+        SpriteDense::from_kv6(&s.kv6)
+    } else {
+        SpriteDense::from_kv6_with_materials(&s.kv6, &s.material_map)
+    }
+}
+
+/// Fetch the cached dense for model/limb slot `m` when its key matches
+/// `sprite`'s kv6, else decode inline (the pre-PF.8 per-draw behaviour).
+fn dense_or_decode(
+    cache: &[Option<DenseCacheEntry>],
+    m: usize,
+    sprite: &Sprite,
+) -> std::sync::Arc<SpriteDense> {
+    if let Some(Some(e)) = cache.get(m) {
+        if e.key == kv6_key(&sprite.kv6) {
+            return e.dense.clone();
+        }
+    }
+    std::sync::Arc::new(decode_dense(sprite))
+}
+
 pub(crate) struct CpuBackend {
     /// Framebuffer presenter — native `softbuffer` window surface, or
     /// the wasm WebGL2 canvas blitter (see [`Presenter`]). On native,
@@ -448,6 +489,16 @@ pub(crate) struct CpuBackend {
     /// PF.7 — reusable composed-render scratch (temp fb/zb pair + per-grid
     /// light scratch): kills two full-frame allocations per frame.
     scene_scratch: SceneRenderScratch,
+    /// PF.8 — cached dense decodes per model template (parallel to
+    /// [`models`](Self::models)): the draw + shadow-occluder paths share
+    /// one `Arc<SpriteDense>` per model instead of re-densifying every
+    /// instance every frame. Explicitly invalidated on model changes; the
+    /// stored kv6 shape key backstops any missed path (a mismatching
+    /// instance falls back to an inline decode).
+    model_dense: Vec<Option<DenseCacheEntry>>,
+    /// PF.8 — cached dense decodes per posed KFA limb (flat, parallel to
+    /// [`kfa_limbs`](Self::kfa_limbs)); limb voxels are pose-invariant.
+    limb_dense: Vec<Option<DenseCacheEntry>>,
     /// `F`-capture: when set, the next frame copies its composited
     /// buffer into `captured` before presenting.
     capture_next: bool,
@@ -512,6 +563,8 @@ impl CpuBackend {
             kfa_limbs: Vec::new(),
             shadow_demote_warned: 0,
             scene_scratch: SceneRenderScratch::default(),
+            model_dense: Vec::new(),
+            limb_dense: Vec::new(),
             capture_next: false,
             captured: None,
             framebuffer,
@@ -673,6 +726,8 @@ impl CpuBackend {
         // clip indices restart at 0 on both backends (and the old volumes
         // don't leak).
         self.clip_books.clear();
+        // PF.8 — a fresh model set invalidates every cached decode.
+        self.model_dense.clear();
     }
 
     /// Append one dynamic instance of `model_index` pre-posed by `xf`;
@@ -779,6 +834,12 @@ impl CpuBackend {
     /// own kv6 clones and draw until removed via
     /// [`Self::remove_dyn_instance`]. No-op if `host_idx` is out of range.
     pub(crate) fn remove_model(&mut self, host_idx: usize) {
+        // PF.8 — drop the cached decode; lingering instances (which keep
+        // their own kv6 clones) fall back to inline decodes via the shape
+        // key mismatch.
+        if let Some(slot) = self.model_dense.get_mut(host_idx) {
+            *slot = None;
+        }
         if let Some(t) = self.models.get_mut(host_idx) {
             *t = Sprite::axis_aligned(empty_kv6(), [0.0, 0.0, 0.0]);
         }
@@ -965,22 +1026,90 @@ impl CpuBackend {
                 t.material_map = map.to_vec();
             }
         }
+        // PF.8 — the swapped kv6 invalidates the cached decode (explicit:
+        // the shape key alone can collide across e.g. streaming-clip
+        // frames with equal dims + voxel counts).
+        if let Some(slot) = self.model_dense.get_mut(model_index) {
+            *slot = None;
+        }
     }
 
-    /// Register KFA sprites — for the CPU backend this is the same as a
-    /// pose refresh: solve every limb's world transform from its
-    /// current `kfaval[]` and cache the resulting [`Sprite`]s.
+    /// Register KFA sprites: solve every limb's world transform and cache
+    /// the posed [`Sprite`]s (full clone, including each limb's kv6 —
+    /// once, at registration). PF.8 — also resets the limb dense cache.
     pub(crate) fn set_kfa_sprites(&mut self, kfas: &mut [KfaSprite]) {
-        self.update_kfa_poses(kfas);
-    }
-
-    /// Re-solve every KFA limb's world transform and cache the posed
-    /// [`Sprite`]s for the next [`Self::render`].
-    pub(crate) fn update_kfa_poses(&mut self, kfas: &mut [KfaSprite]) {
         self.kfa_limbs.clear();
+        self.limb_dense.clear();
         for kfa in kfas.iter_mut() {
             solve_kfa_limbs(kfa);
             self.kfa_limbs.extend(kfa.limbs.iter().cloned());
+        }
+    }
+
+    /// Re-solve every KFA limb's world transform for the next
+    /// [`Self::render`]. PF.8 — pose-only: limb voxel data is animation-
+    /// invariant, so only the transform + display fields are copied (the
+    /// old full-clone path deep-copied every limb's kv6 EVERY pose
+    /// update). A limb-count mismatch (re-registration) falls back to the
+    /// full rebuild.
+    pub(crate) fn update_kfa_poses(&mut self, kfas: &mut [KfaSprite]) {
+        let total: usize = kfas.iter().map(|k| k.limbs.len()).sum();
+        if total != self.kfa_limbs.len() {
+            self.set_kfa_sprites(kfas);
+            return;
+        }
+        let mut i = 0usize;
+        for kfa in kfas.iter_mut() {
+            solve_kfa_limbs(kfa);
+            for limb in &kfa.limbs {
+                let dst = &mut self.kfa_limbs[i];
+                dst.p = limb.p;
+                dst.s = limb.s;
+                dst.h = limb.h;
+                dst.f = limb.f;
+                dst.flags = limb.flags;
+                dst.material = limb.material;
+                dst.alpha_mul = limb.alpha_mul;
+                dst.tint = limb.tint;
+                i += 1;
+            }
+        }
+    }
+
+    /// PF.8 — refresh the dense-decode caches for everything the frame
+    /// will draw: model templates referenced by static/dynamic instances,
+    /// and posed KFA limbs. One decode per model/limb, reused by the draw
+    /// AND the shadow-occluder build.
+    fn ensure_dense_caches(&mut self) {
+        if self.model_dense.len() < self.models.len() {
+            self.model_dense.resize_with(self.models.len(), || None);
+        }
+        for &m in self.sprite_models.iter().chain(self.dyn_models.iter()) {
+            let Some(slot) = self.model_dense.get_mut(m) else {
+                continue; // usize::MAX clip sentinel / stale index
+            };
+            let Some(t) = self.models.get(m) else {
+                continue;
+            };
+            let key = kv6_key(&t.kv6);
+            if slot.as_ref().map_or(true, |e| e.key != key) {
+                *slot = Some(DenseCacheEntry {
+                    key,
+                    dense: std::sync::Arc::new(decode_dense(t)),
+                });
+            }
+        }
+        if self.limb_dense.len() != self.kfa_limbs.len() {
+            self.limb_dense = (0..self.kfa_limbs.len()).map(|_| None).collect();
+        }
+        for (slot, limb) in self.limb_dense.iter_mut().zip(&self.kfa_limbs) {
+            let key = kv6_key(&limb.kv6);
+            if slot.as_ref().map_or(true, |e| e.key != key) {
+                *slot = Some(DenseCacheEntry {
+                    key,
+                    dense: std::sync::Arc::new(decode_dense(limb)),
+                });
+            }
         }
     }
 
@@ -1075,6 +1204,15 @@ impl CpuBackend {
         // Grow the z-buffer to follow a window resize.
         if self.zbuffer.len() < pixel_count {
             self.zbuffer.resize(pixel_count, f32::INFINITY);
+        }
+
+        // PF.8 — one dense decode per model/limb, shared (`Arc`) by the
+        // shadow-occluder build and the sprite draw pass below (was: every
+        // caster re-densified per occluder rebuild, every instance
+        // re-densified again per draw call, every frame). Refreshed before
+        // the framebuffer borrow below.
+        if frame.draw_sprites {
+            self.ensure_dense_caches();
         }
 
         // Per-frame DDA fog config (engine sky/fog → renderer). Fog is
@@ -1220,9 +1358,14 @@ impl CpuBackend {
         let casts = |s: &Sprite| s.flags & invis == 0 && s.casts_shadow();
         let sprite_occ = if shadows_active && frame.draw_sprites {
             let mut so = SpriteOccluder::new();
-            for s in self.sprites.iter().chain(self.kfa_limbs.iter()) {
+            for (s, &m) in self.sprites.iter().zip(&self.sprite_models) {
                 if casts(s) {
-                    so.push(SpriteDense::from_kv6(&s.kv6), s.p, s.s, s.h, s.f);
+                    so.push(dense_or_decode(&self.model_dense, m, s), s.p, s.s, s.h, s.f);
+                }
+            }
+            for (i, s) in self.kfa_limbs.iter().enumerate() {
+                if casts(s) {
+                    so.push(dense_or_decode(&self.limb_dense, i, s), s.p, s.s, s.h, s.f);
                 }
             }
             for (i, s) in self.dyn_sprites.iter().enumerate() {
@@ -1230,11 +1373,17 @@ impl CpuBackend {
                     continue;
                 }
                 if let Some((book, fr)) = self.dyn_clip[i] {
-                    if let Some(d) = self.clip_books.get(book).and_then(|b| b.frame(fr)) {
-                        so.push(d.clone(), s.p, s.s, s.h, s.f);
+                    if let Some(d) = self.clip_books.get(book).and_then(|b| b.frame_arc(fr)) {
+                        so.push(d, s.p, s.s, s.h, s.f);
                     }
                 } else {
-                    so.push(SpriteDense::from_kv6(&s.kv6), s.p, s.s, s.h, s.f);
+                    so.push(
+                        dense_or_decode(&self.model_dense, self.dyn_models[i], s),
+                        s.p,
+                        s.s,
+                        s.h,
+                        s.f,
+                    );
                 }
             }
             (!so.is_empty()).then_some(so)
@@ -1334,8 +1483,14 @@ impl CpuBackend {
             };
             // Static sprites + posed KFA limbs: plain KV6 sprites. All
             // z-test against the shared buffer so order doesn't matter.
-            for sprite in self.sprites.iter().chain(self.kfa_limbs.iter()) {
-                let _written = draw_sprite_dda_shaded(
+            // PF.8 — draw from the cached per-model/per-limb dense decode
+            // (was: `draw_sprite_dda_shaded` re-densified per call).
+            for (sprite, &m) in self.sprites.iter().zip(&self.sprite_models) {
+                if sprite.flags & invis != 0 {
+                    continue;
+                }
+                let dense = dense_or_decode(&self.model_dense, m, sprite);
+                let _written = draw_sprite_dense_shaded(
                     fb,
                     &mut self.zbuffer[..pixel_count],
                     width as usize,
@@ -1343,7 +1498,34 @@ impl CpuBackend {
                     height,
                     &cam_state,
                     &settings,
-                    sprite,
+                    &dense,
+                    sprite.p,
+                    sprite.s,
+                    sprite.h,
+                    sprite.f,
+                    sprite.flags,
+                    Some(shade_of(sprite)),
+                );
+            }
+            for (i, sprite) in self.kfa_limbs.iter().enumerate() {
+                if sprite.flags & invis != 0 {
+                    continue;
+                }
+                let dense = dense_or_decode(&self.limb_dense, i, sprite);
+                let _written = draw_sprite_dense_shaded(
+                    fb,
+                    &mut self.zbuffer[..pixel_count],
+                    width as usize,
+                    width,
+                    height,
+                    &cam_state,
+                    &settings,
+                    &dense,
+                    sprite.p,
+                    sprite.s,
+                    sprite.h,
+                    sprite.f,
+                    sprite.flags,
                     Some(shade_of(sprite)),
                 );
             }
@@ -1373,7 +1555,11 @@ impl CpuBackend {
                         );
                     }
                 } else {
-                    let _written = draw_sprite_dda_shaded(
+                    if sprite.flags & invis != 0 {
+                        continue;
+                    }
+                    let dense = dense_or_decode(&self.model_dense, self.dyn_models[i], sprite);
+                    let _written = draw_sprite_dense_shaded(
                         fb,
                         zb,
                         width as usize,
@@ -1381,7 +1567,12 @@ impl CpuBackend {
                         height,
                         &cam_state,
                         &settings,
-                        sprite,
+                        &dense,
+                        sprite.p,
+                        sprite.s,
+                        sprite.h,
+                        sprite.f,
+                        sprite.flags,
                         Some(shade),
                     );
                 }
