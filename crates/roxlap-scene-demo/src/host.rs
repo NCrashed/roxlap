@@ -508,6 +508,23 @@ impl ApplicationHandler for Host {
         let init = window.inner_size();
         let mut renderer = SceneRenderer::new(window.clone(), (init.width, init.height), &opts);
 
+        // The default fixed grid targets a discrete GPU; on modest
+        // hardware (CPU backend / integrated GPU) halve it so the demos
+        // stay interactive. An explicit `ROXLAP_RENDER_RES` always wins,
+        // and the HUD panel can still raise it live.
+        if std::env::var_os("ROXLAP_RENDER_RES").is_none()
+            && renderer.is_low_power()
+            && self.pipe.res_mode == ResMode::Fixed
+            && (self.pipe.fixed_w, self.pipe.fixed_h) == (RENDER_RES_W, RENDER_RES_H)
+        {
+            self.pipe.fixed_w = RENDER_RES_W / 2;
+            self.pipe.fixed_h = RENDER_RES_H / 2;
+            eprintln!(
+                "roxlap-scene-demo: low-power renderer — render resolution defaults to {}×{}",
+                self.pipe.fixed_w, self.pipe.fixed_h
+            );
+        }
+
         // RP.0/1/2 — apply the render-pipeline settings (seeded from the
         // `ROXLAP_RENDER_RES`/`SSAA`/`POSTERIZE`/`DITHER` env vars in
         // `Host::new`, then live-editable from the HUD's "Render pipeline"

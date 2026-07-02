@@ -1574,6 +1574,18 @@ impl SceneRenderer {
         }
     }
 
+    /// `true` when this renderer runs on modest hardware: the CPU
+    /// backend, or a GPU adapter that is not a discrete card
+    /// (integrated / software / virtual). A hint for hosts to pick a
+    /// lighter default render resolution — never consulted internally.
+    #[must_use]
+    pub fn is_low_power(&self) -> bool {
+        match &self.inner {
+            BackendImpl::Cpu(_) => true,
+            BackendImpl::Gpu(g) => g.low_power(),
+        }
+    }
+
     /// Upload an equirectangular sky panorama (RGBA8, `w×h`) for the
     /// GPU marcher's sky sampling. No-op on the CPU backend, which
     /// samples the [`Sky`] passed in each [`FrameParams`] instead.

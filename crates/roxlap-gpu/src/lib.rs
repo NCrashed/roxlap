@@ -539,6 +539,10 @@ pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     adapter_info: String,
+    /// Whether the adapter is a low-power device (integrated / software)
+    /// rather than a discrete GPU — hosts use this to pick lighter
+    /// render-resolution defaults. See [`Self::low_power`].
+    low_power: bool,
     clear_colour: [f64; 3],
     frame_count: u32,
     /// Mirror the marched scene horizontally on present (the scene blit
@@ -1642,6 +1646,7 @@ impl GpuRenderer {
             backend = info.backend,
             device_type = info.device_type,
         );
+        let low_power = info.device_type != wgpu::DeviceType::DiscreteGpu;
 
         let caps = surface.get_capabilities(adapter);
         // Pick a NON-sRGB, 8-bit swapchain format. Voxlap colours are
@@ -1744,6 +1749,7 @@ impl GpuRenderer {
             device,
             queue,
             adapter_info,
+            low_power,
             clear_colour: settings.clear_colour,
             frame_count: 0,
             flip_x: false,
@@ -1834,6 +1840,13 @@ impl GpuRenderer {
     /// device type. The demo host prints this in the title bar.
     pub fn adapter_info(&self) -> &str {
         &self.adapter_info
+    }
+
+    /// `true` when the adapter is NOT a discrete GPU (integrated,
+    /// software rasterizer, virtual, unknown) — a hint that hosts
+    /// should default to a lighter render resolution.
+    pub fn low_power(&self) -> bool {
+        self.low_power
     }
 
     /// Borrow the underlying wgpu device — hosts use this to build
