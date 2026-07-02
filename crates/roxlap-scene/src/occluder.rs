@@ -155,6 +155,10 @@ fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
     let mut t_curr = t_enter;
     let lo_i = [g.lo[0] as i32, g.lo[1] as i32, g.lo[2] as i32];
     let hi_i = [g.hi[0] as i32, g.hi[1] as i32, g.hi[2] as i32];
+    // PF.6 — chunk-cached sampler: one HashMap probe per chunk crossing
+    // (not per step), and the solid test walks the slab chain in place
+    // (no per-step allocation / whole-column decode).
+    let mut sampler = g.grid.solid_sampler();
     for _ in 0..SHADOW_MAX_STEPS {
         if cell[0] < lo_i[0]
             || cell[0] >= hi_i[0]
@@ -166,7 +170,7 @@ fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
         {
             return false;
         }
-        if grid_voxel_solid(g.grid, cell) {
+        if sampler.solid(IVec3::new(cell[0], cell[1], cell[2])) {
             return true;
         }
         let a = min_axis(t_max);
@@ -175,12 +179,6 @@ fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
         t_max[a] += t_delta[a];
     }
     false
-}
-
-/// Solid test for one grid-local voxel (mip-0). Wraps [`Grid::voxel_solid`].
-#[inline]
-fn grid_voxel_solid(grid: &Grid, cell: [i32; 3]) -> bool {
-    grid.voxel_solid(IVec3::new(cell[0], cell[1], cell[2]))
 }
 
 /// Slab-method ray/AABB intersection (`[lo, hi]`, voxel units). Returns the

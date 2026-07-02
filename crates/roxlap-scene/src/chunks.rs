@@ -9,7 +9,7 @@
 //! [`Grid::chunks`]: crate::Grid::chunks
 
 use glam::IVec3;
-use roxlap_formats::edit::{expandrle, set_spans, Vspan};
+use roxlap_formats::edit::{set_spans, Vspan};
 use roxlap_formats::vxl::Vxl;
 
 use crate::{Grid, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
@@ -85,28 +85,76 @@ pub(crate) fn empty_chunk_vxl() -> Vxl {
 }
 
 /// True if voxel `(x, y, z)` is solid within one chunk's [`Vxl`] —
-/// i.e. covered by a solid run in column `(x, y)`. Walks the column's
-/// expanded `[top, bot)` run list (voxlap b2 convention). `(x, y)` are
+/// i.e. covered by a solid run in column `(x, y)`. `(x, y)` are
 /// `< CHUNK_SIZE_XY`, `z < CHUNK_SIZE_Z`.
+///
+/// PF.6 — walks the slab chain in place with an early-out at `z`,
+/// mirroring `expandrle`'s run derivation ONE RUN AT A TIME instead of
+/// heap-allocating a 516-int buffer and decoding the whole column per
+/// query (this sits on every CPU shadow-ray step and every
+/// `Scene::raycast` step). Run k spans `[top_k, bot_k)` where `top_0 =
+/// slab[1]`, each following non-degenerate slab header closes the
+/// previous run at `slab[v+3]` and opens the next at `slab[v+1]`, and
+/// the final run extends to the column bottom — exactly the list
+/// `expandrle` would emit.
 #[allow(clippy::cast_possible_wrap)]
 pub(crate) fn vxl_voxel_solid(vxl: &Vxl, x: u32, y: u32, z: u32) -> bool {
     let idx = (y * vxl.vsid + x) as usize;
-    let column = vxl.column_data(idx);
-    // Pre-fill with the MAXZDIM sentinel so unwritten slots terminate
-    // the walk (matches voxlap's b2 init convention).
-    let maxzdim = CHUNK_SIZE_Z as i32;
-    let mut b2 = vec![maxzdim; 2 * (CHUNK_SIZE_Z as usize) + 4];
-    expandrle(column, &mut b2);
+    let slab = vxl.column_data(idx);
     let z = z as i32;
-    let mut i = 0;
-    while b2[i] < maxzdim {
-        let (top, bot) = (b2[i], b2[i + 1]);
-        if z >= top && z < bot {
-            return true;
+    let mut top = i32::from(slab[1]);
+    let mut v = 0usize;
+    while slab[v] != 0 {
+        v += usize::from(slab[v]) * 4;
+        if slab[v + 3] >= slab[v + 1] {
+            // Degenerate slab (no air gap above): merges into the
+            // current run — same skip `expandrle` takes.
+            continue;
         }
-        i += 2;
+        let bot = i32::from(slab[v + 3]);
+        if z < bot {
+            // z is above this run's bottom: solid iff inside the run
+            // (below `top` would be the preceding air gap).
+            return z >= top;
+        }
+        top = i32::from(slab[v + 1]);
     }
-    false
+    // Last run extends to the column bottom (bedrock).
+    z >= top
+}
+
+/// PF.6 — chunk-cached solid sampler for DDA marches. Consecutive steps
+/// almost always stay inside one chunk; caching the last `chunks`
+/// HashMap probe turns the per-step cost into one compare + the in-place
+/// slab walk. `chunk_at` exposes presence so callers can skip absent
+/// (all-air) chunks wholesale.
+pub(crate) struct SolidSampler<'a> {
+    grid: &'a Grid,
+    cached_idx: IVec3,
+    cached: Option<&'a Vxl>,
+    primed: bool,
+}
+
+impl<'a> SolidSampler<'a> {
+    /// The chunk holding grid-local voxel-space chunk index `chunk_idx`,
+    /// through the one-entry cache.
+    pub(crate) fn chunk_at(&mut self, chunk_idx: IVec3) -> Option<&'a Vxl> {
+        if !self.primed || chunk_idx != self.cached_idx {
+            self.cached = self.grid.chunk(chunk_idx);
+            self.cached_idx = chunk_idx;
+            self.primed = true;
+        }
+        self.cached
+    }
+
+    /// [`Grid::voxel_solid`] through the cache.
+    pub(crate) fn solid(&mut self, voxel: IVec3) -> bool {
+        let (chunk_idx, in_chunk) = crate::voxel_split(voxel);
+        match self.chunk_at(chunk_idx) {
+            Some(vxl) => vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z),
+            None => false,
+        }
+    }
 }
 
 impl Grid {
@@ -122,6 +170,18 @@ impl Grid {
         match self.chunk(chunk_idx) {
             Some(vxl) => vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z),
             None => false,
+        }
+    }
+
+    /// PF.6 — a chunk-cached [`SolidSampler`] over this grid, for DDA
+    /// marches that issue many [`Self::voxel_solid`]-style queries with
+    /// strong chunk locality (shadow rays, `Scene::raycast`).
+    pub(crate) fn solid_sampler(&self) -> SolidSampler<'_> {
+        SolidSampler {
+            grid: self,
+            cached_idx: IVec3::ZERO,
+            cached: None,
+            primed: false,
         }
     }
 
@@ -595,5 +655,48 @@ pub(crate) mod tests {
         assert!(backing.chunks[0].is_some(), "chz=-2 → dz=0");
         assert!(backing.chunks[1].is_none(), "chz=-1 → dz=1 implicit-air");
         assert!(backing.chunks[2].is_some(), "chz=0 → dz=2");
+    }
+
+    /// PF.6 — the in-place slab walk in `vxl_voxel_solid` must agree
+    /// with the `expandrle` run list (the pre-PF.6 reference decoder)
+    /// for every z, on columns with multiple slabs (caves), single
+    /// slabs, and untouched bedrock.
+    #[test]
+    fn vxl_voxel_solid_matches_expandrle_reference() {
+        use roxlap_formats::edit::expandrle;
+
+        let mut g = Grid::new(GridTransform::identity());
+        // Carve two separate air pockets into one column (multi-slab)
+        // plus a sphere for varied neighbours.
+        g.set_rect(IVec3::new(3, 4, 40), IVec3::new(4, 5, 60), None);
+        g.set_rect(IVec3::new(3, 4, 100), IVec3::new(4, 5, 140), None);
+        g.set_voxel(IVec3::new(3, 4, 120), Some(0x80_11_22_33)); // island inside the pocket
+        g.set_sphere(IVec3::new(8, 8, 80), 6, None);
+        let vxl = g.chunk(IVec3::ZERO).expect("chunk materialised");
+
+        let maxzdim = CHUNK_SIZE_Z as i32;
+        for (x, y) in [(3u32, 4u32), (8, 8), (0, 0), (8, 2), (12, 8)] {
+            // Reference: full expandrle decode → run-list scan.
+            let column = vxl.column_data((y * vxl.vsid + x) as usize);
+            let mut b2 = vec![maxzdim; 2 * (CHUNK_SIZE_Z as usize) + 4];
+            expandrle(column, &mut b2);
+            for z in 0..CHUNK_SIZE_Z {
+                let zi = z as i32;
+                let mut reference = false;
+                let mut i = 0;
+                while b2[i] < maxzdim {
+                    if zi >= b2[i] && zi < b2[i + 1] {
+                        reference = true;
+                        break;
+                    }
+                    i += 2;
+                }
+                assert_eq!(
+                    vxl_voxel_solid(vxl, x, y, z),
+                    reference,
+                    "column ({x}, {y}) z={z} disagrees with expandrle",
+                );
+            }
+        }
     }
 }

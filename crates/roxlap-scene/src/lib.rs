@@ -92,89 +92,174 @@ pub struct RayHit {
     pub color: Option<u32>,
 }
 
+/// Ray/AABB slab intersection in f64 (`[lo, hi)` box). Returns the
+/// entry/exit ray parameters, or `None` on a miss. PF.6 helper for the
+/// raycast pre-clip + absent-chunk exit.
+fn ray_box(o: DVec3, d: DVec3, blo: DVec3, bhi: DVec3) -> Option<(f64, f64)> {
+    let mut tmin = f64::NEG_INFINITY;
+    let mut tmax = f64::INFINITY;
+    for a in 0..3 {
+        if d[a].abs() < 1e-12 {
+            if o[a] < blo[a] || o[a] > bhi[a] {
+                return None;
+            }
+        } else {
+            let inv = 1.0 / d[a];
+            let (t0, t1) = ((blo[a] - o[a]) * inv, (bhi[a] - o[a]) * inv);
+            tmin = tmin.max(t0.min(t1));
+            tmax = tmax.min(t0.max(t1));
+            if tmin > tmax {
+                return None;
+            }
+        }
+    }
+    Some((tmin, tmax))
+}
+
+/// The populated chunk extent of `grid` as a grid-local voxel-space AABB
+/// `[lo, hi)`, or `None` for an empty grid. O(chunks) HashMap key walk —
+/// fine for per-call raycast use.
+fn grid_voxel_aabb_f64(grid: &Grid) -> Option<(DVec3, DVec3)> {
+    let mut min = IVec3::splat(i32::MAX);
+    let mut max = IVec3::splat(i32::MIN);
+    let mut any = false;
+    for idx in grid.chunks.keys() {
+        any = true;
+        min = min.min(*idx);
+        max = max.max(*idx);
+    }
+    if !any {
+        return None;
+    }
+    let (cs_xy, cs_z) = (
+        i64::from(CHUNK_SIZE_XY as i32),
+        i64::from(CHUNK_SIZE_Z as i32),
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let v = |i: IVec3, add: i64| {
+        DVec3::new(
+            ((i64::from(i.x) + add) * cs_xy) as f64,
+            ((i64::from(i.y) + add) * cs_xy) as f64,
+            ((i64::from(i.z) + add) * cs_z) as f64,
+        )
+    };
+    Some((v(min, 0), v(max, 1)))
+}
+
 /// Voxel DDA (Amanatides-Woo) in a grid's local space. `lo` / `ld` are
 /// the ray origin + unit direction already transformed into grid-local
 /// coords. Returns the first [`Grid::voxel_solid`] cell and its world-
-/// equal distance `t`, or `None` past `max_t`. The step budget is
-/// `~3·max_t` so a near-axis ray through empty space still terminates.
+/// equal distance `t`, or `None` past `max_t`.
+///
+/// PF.6 — three upgrades over the naive from-origin march:
+/// - the ray is pre-clipped to the grid's populated chunk AABB (a miss
+///   costs one slab test; a distant grid is marched AT the box, not from
+///   the origin);
+/// - chunk lookups go through the chunk-cached [`SolidSampler`]-style
+///   probe (one HashMap hit per chunk crossing) and the solid test walks
+///   the slab chain in place (no per-step allocation);
+/// - a voxel in an absent (all-air) chunk fast-forwards the march to
+///   that chunk's exit face instead of stepping its up-to-128 voxels.
+#[allow(clippy::cast_possible_truncation)]
 fn voxel_dda(grid: &Grid, lo: DVec3, ld: DVec3, max_t: f64) -> Option<(IVec3, f64)> {
-    #[allow(clippy::cast_possible_truncation)]
-    let mut p = IVec3::new(
-        lo.x.floor() as i32,
-        lo.y.floor() as i32,
-        lo.z.floor() as i32,
-    );
-    if grid.voxel_solid(p) {
-        return Some((p, 0.0)); // origin already inside a solid voxel
+    // Clip to the populated chunk AABB: everything outside is air.
+    let (blo, bhi) = grid_voxel_aabb_f64(grid)?;
+    let (t0, t1) = ray_box(lo, ld, blo, bhi)?;
+    let t_enter = t0.max(0.0);
+    let t_exit = t1.min(max_t);
+    if t_enter > t_exit {
+        return None;
     }
-    let sign = |d: f64| -> i32 {
-        if d > 0.0 {
-            1
-        } else if d < 0.0 {
-            -1
-        } else {
-            0
-        }
-    };
-    let step = IVec3::new(sign(ld.x), sign(ld.y), sign(ld.z));
+
+    let step = IVec3::new(
+        i32::from(ld.x > 0.0) - i32::from(ld.x < 0.0),
+        i32::from(ld.y > 0.0) - i32::from(ld.y < 0.0),
+        i32::from(ld.z > 0.0) - i32::from(ld.z < 0.0),
+    );
     // Distance to advance one whole voxel along each axis (∞ if parallel).
-    let t_delta = DVec3::new(
-        if ld.x == 0.0 {
-            f64::INFINITY
-        } else {
-            (1.0 / ld.x).abs()
-        },
-        if ld.y == 0.0 {
-            f64::INFINITY
-        } else {
-            (1.0 / ld.y).abs()
-        },
-        if ld.z == 0.0 {
-            f64::INFINITY
-        } else {
-            (1.0 / ld.z).abs()
-        },
-    );
-    // Distance to the first voxel boundary on each axis.
-    let boundary = |o: f64, d: f64| -> f64 {
-        if d > 0.0 {
-            (o.floor() + 1.0 - o) / d
-        } else if d < 0.0 {
-            (o - o.floor()) / -d
-        } else {
-            f64::INFINITY
-        }
-    };
-    let mut t_max = DVec3::new(
-        boundary(lo.x, ld.x),
-        boundary(lo.y, ld.y),
-        boundary(lo.z, ld.z),
-    );
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let max_steps = (max_t * 3.0) as u64 + 8;
-    for _ in 0..max_steps {
-        // Advance across the nearest voxel boundary.
-        let t = if t_max.x <= t_max.y && t_max.x <= t_max.z {
-            p.x += step.x;
-            let t = t_max.x;
-            t_max.x += t_delta.x;
-            t
-        } else if t_max.y <= t_max.z {
-            p.y += step.y;
-            let t = t_max.y;
-            t_max.y += t_delta.y;
-            t
-        } else {
-            p.z += step.z;
-            let t = t_max.z;
-            t_max.z += t_delta.z;
-            t
+    let inv_abs = |d: f64| if d == 0.0 { f64::INFINITY } else { (1.0 / d).abs() };
+    let t_delta = DVec3::new(inv_abs(ld.x), inv_abs(ld.y), inv_abs(ld.z));
+    // Absolute-`t` of the next voxel boundary from cell `p`, per axis
+    // (also the re-seed after an absent-chunk jump).
+    let seed_t_max = |p: IVec3| -> DVec3 {
+        let axis = |pa: i32, oa: f64, da: f64| -> f64 {
+            if da > 0.0 {
+                (f64::from(pa) + 1.0 - oa) / da
+            } else if da < 0.0 {
+                (f64::from(pa) - oa) / da
+            } else {
+                f64::INFINITY
+            }
         };
-        if t > max_t {
-            return None;
-        }
-        if grid.voxel_solid(p) {
-            return Some((p, t));
+        DVec3::new(
+            axis(p.x, lo.x, ld.x),
+            axis(p.y, lo.y, ld.y),
+            axis(p.z, lo.z, ld.z),
+        )
+    };
+
+    // Start at the AABB entry (t stays measured from the true origin;
+    // t_enter == 0 ⇒ the original from-origin start, bit-identical).
+    let start = lo + ld * t_enter;
+    let mut p = IVec3::new(
+        start.x.floor() as i32,
+        start.y.floor() as i32,
+        start.z.floor() as i32,
+    );
+    let mut t_max = seed_t_max(p);
+    let mut t_curr = t_enter;
+    let mut sampler = grid.solid_sampler();
+
+    #[allow(clippy::cast_sign_loss)]
+    let max_steps = (max_t * 3.0) as u64 + 8;
+    let (cs_xy, cs_z) = (f64::from(CHUNK_SIZE_XY as i32), f64::from(CHUNK_SIZE_Z as i32));
+    for _ in 0..max_steps {
+        let (chunk_idx, in_chunk) = voxel_split(p);
+        if let Some(vxl) = sampler.chunk_at(chunk_idx) {
+            if chunks::vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z) {
+                return Some((p, t_curr));
+            }
+            // Advance across the nearest voxel boundary.
+            let t = if t_max.x <= t_max.y && t_max.x <= t_max.z {
+                p.x += step.x;
+                let t = t_max.x;
+                t_max.x += t_delta.x;
+                t
+            } else if t_max.y <= t_max.z {
+                p.y += step.y;
+                let t = t_max.y;
+                t_max.y += t_delta.y;
+                t
+            } else {
+                p.z += step.z;
+                let t = t_max.z;
+                t_max.z += t_delta.z;
+                t
+            };
+            if t > t_exit {
+                return None;
+            }
+            t_curr = t;
+        } else {
+            // Absent chunk ⇒ guaranteed air: jump to its exit face.
+            let clo = DVec3::new(
+                f64::from(chunk_idx.x) * cs_xy,
+                f64::from(chunk_idx.y) * cs_xy,
+                f64::from(chunk_idx.z) * cs_z,
+            );
+            let chi = clo + DVec3::new(cs_xy, cs_xy, cs_z);
+            let exit = match ray_box(lo, ld, clo, chi) {
+                // Nudge past the face so the floor lands in the next chunk.
+                Some((_, t1)) => t1.max(t_curr) + 1e-4,
+                None => return None, // degenerate (shouldn't happen: p is inside)
+            };
+            if exit > t_exit {
+                return None;
+            }
+            let q = lo + ld * exit;
+            p = IVec3::new(q.x.floor() as i32, q.y.floor() as i32, q.z.floor() as i32);
+            t_max = seed_t_max(p);
+            t_curr = exit;
         }
     }
     None
