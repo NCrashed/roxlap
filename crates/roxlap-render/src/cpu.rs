@@ -23,7 +23,9 @@ use roxlap_formats::material::{Material, MaterialTable};
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_scene::occluder::SceneOccluder;
-use roxlap_scene::render::{render_scene_composed_with_materials, CpuFog};
+use roxlap_scene::render::{
+    render_scene_composed_with_materials_scratch, CpuFog, SceneRenderScratch,
+};
 use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -443,6 +445,9 @@ pub(crate) struct CpuBackend {
     /// PF.5 — the shadow-caster demotion count last warned about, so the
     /// over-cap `eprintln` fires once per change instead of every frame.
     shadow_demote_warned: usize,
+    /// PF.7 — reusable composed-render scratch (temp fb/zb pair + per-grid
+    /// light scratch): kills two full-frame allocations per frame.
+    scene_scratch: SceneRenderScratch,
     /// `F`-capture: when set, the next frame copies its composited
     /// buffer into `captured` before presenting.
     capture_next: bool,
@@ -506,6 +511,7 @@ impl CpuBackend {
             clip_books: Vec::new(),
             kfa_limbs: Vec::new(),
             shadow_demote_warned: 0,
+            scene_scratch: SceneRenderScratch::default(),
             capture_next: false,
             captured: None,
             framebuffer,
@@ -1236,7 +1242,7 @@ impl CpuBackend {
             None
         };
 
-        let _ = render_scene_composed_with_materials(
+        let _ = render_scene_composed_with_materials_scratch(
             fb,
             &mut self.zbuffer[..pixel_count],
             width as usize,
@@ -1252,6 +1258,8 @@ impl CpuBackend {
             &self.terrain_materials,
             cpu_lights,
             sprite_occ.as_ref().map(|o| o as &dyn WorldOccluder),
+            // PF.7 — persistent temp-buffer pair + per-grid scratch.
+            &mut self.scene_scratch,
         );
 
         // Paint the panorama sky into every background pixel (z still +INF):

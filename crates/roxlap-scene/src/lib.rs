@@ -177,7 +177,13 @@ fn voxel_dda(grid: &Grid, lo: DVec3, ld: DVec3, max_t: f64) -> Option<(IVec3, f6
         i32::from(ld.z > 0.0) - i32::from(ld.z < 0.0),
     );
     // Distance to advance one whole voxel along each axis (∞ if parallel).
-    let inv_abs = |d: f64| if d == 0.0 { f64::INFINITY } else { (1.0 / d).abs() };
+    let inv_abs = |d: f64| {
+        if d == 0.0 {
+            f64::INFINITY
+        } else {
+            (1.0 / d).abs()
+        }
+    };
     let t_delta = DVec3::new(inv_abs(ld.x), inv_abs(ld.y), inv_abs(ld.z));
     // Absolute-`t` of the next voxel boundary from cell `p`, per axis
     // (also the re-seed after an absent-chunk jump).
@@ -212,7 +218,10 @@ fn voxel_dda(grid: &Grid, lo: DVec3, ld: DVec3, max_t: f64) -> Option<(IVec3, f6
 
     #[allow(clippy::cast_sign_loss)]
     let max_steps = (max_t * 3.0) as u64 + 8;
-    let (cs_xy, cs_z) = (f64::from(CHUNK_SIZE_XY as i32), f64::from(CHUNK_SIZE_Z as i32));
+    let (cs_xy, cs_z) = (
+        f64::from(CHUNK_SIZE_XY as i32),
+        f64::from(CHUNK_SIZE_Z as i32),
+    );
     for _ in 0..max_steps {
         let (chunk_idx, in_chunk) = voxel_split(p);
         if let Some(vxl) = sampler.chunk_at(chunk_idx) {

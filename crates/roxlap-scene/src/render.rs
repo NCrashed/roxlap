@@ -117,10 +117,18 @@ fn world_camera_to_grid_local(camera: &Camera, transform: &GridTransform) -> Cam
 /// point positions are points (origin-relative + inverse-rotated); the sun
 /// direction is a vector (inverse-rotated only). Point lights land in `scratch`
 /// so the returned [`CpuLights`] can borrow them for the grid's render.
+///
+/// PF.7 (C4) — `grid_sphere` is the grid's world-space bounding sphere
+/// `(centre, radius)`: a light whose reach-sphere can't touch it (with
+/// slack for the shadow-bias sample offset) is dropped BEFORE the
+/// transform, so the per-hit light loop never sees it. Conservative ⇒
+/// byte-identical (a dropped light's `point_falloff` would be 0 at every
+/// reachable sample anyway). `None` skips the cull.
 fn grid_local_lights<'a>(
     world: &CpuLights<'_>,
     transform: &GridTransform,
     scratch: &'a mut Vec<CpuPointLight>,
+    grid_sphere: Option<(DVec3, f64)>,
 ) -> CpuLights<'a> {
     scratch.clear();
     if !world.enabled {
@@ -139,7 +147,21 @@ fn grid_local_lights<'a>(
     } else {
         [0.0; 3]
     };
+    // Shade samples sit on voxel surfaces inside the bounding sphere,
+    // nudged up to `shadow_bias` along the normal — expand by that plus
+    // a unit of float slack.
+    let cull_slack = f64::from(world.shadow_bias) + 1.0;
     for p in world.points {
+        if let Some((centre, radius)) = grid_sphere {
+            let lp = DVec3::new(
+                f64::from(p.pos[0]),
+                f64::from(p.pos[1]),
+                f64::from(p.pos[2]),
+            );
+            if (lp - centre).length() > f64::from(p.radius) + radius + cull_slack {
+                continue;
+            }
+        }
         let lp = inv
             * (DVec3::new(
                 f64::from(p.pos[0]),
@@ -453,6 +475,10 @@ fn fill_rect_f32(buf: &mut [f32], pitch: usize, rect: ScreenRect, val: f32) {
 /// Min-z compose `temp_*` into `fb`/`zb` over `rect` only — the
 /// scissored analogue of [`compose_into`]. A `temp` pixel wins where its
 /// `z` is strictly smaller than the destination's.
+///
+/// PF.7 (C6) — rayon rows: a memory-bandwidth loop repeated per grid per
+/// frame; rows are disjoint (`par_chunks_mut` of both destinations),
+/// sources read-only. Bit-identical.
 fn compose_rect(
     fb: &mut [u32],
     zb: &mut [f32],
@@ -461,15 +487,45 @@ fn compose_rect(
     pitch: usize,
     rect: ScreenRect,
 ) {
-    for y in rect.y0..rect.y1 {
-        let row = y as usize * pitch;
-        for i in row + rect.x0 as usize..row + rect.x1 as usize {
-            if temp_zb[i] < zb[i] {
-                zb[i] = temp_zb[i];
-                fb[i] = temp_fb[i];
-            }
-        }
+    use rayon::prelude::*;
+    let (y0, y1) = (rect.y0 as usize, rect.y1 as usize);
+    let (x0, x1) = (rect.x0 as usize, rect.x1 as usize);
+    if y0 >= y1 {
+        return;
     }
+    // The last row may be short of a full `pitch` when the buffer is
+    // exactly `width*height` — clamp the slice end.
+    let end = (y1 * pitch).min(fb.len());
+    fb[y0 * pitch..end]
+        .par_chunks_mut(pitch)
+        .zip(zb[y0 * pitch..end].par_chunks_mut(pitch))
+        .enumerate()
+        .for_each(|(dy, (frow, zrow))| {
+            let row = (y0 + dy) * pitch;
+            for x in x0..x1 {
+                if temp_zb[row + x] < zrow[x] {
+                    zrow[x] = temp_zb[row + x];
+                    frow[x] = temp_fb[row + x];
+                }
+            }
+        });
+}
+
+/// PF.7 (C6) — reusable scratch for the composed scene render: the
+/// per-grid temp framebuffer/z-buffer pair (was two full-frame `vec!`
+/// allocations + initialising writes per call — ≈7.4 MB at 720p, ×16
+/// under 4×SSAA), the per-grid light scratch, and the phase-A mip map.
+/// Own one per renderer and pass it to
+/// [`render_scene_composed_with_materials_scratch`]; the buffers grow to
+/// the frame size on first use and are reused verbatim afterwards (every
+/// pixel the render reads is filled per grid first, so no per-frame
+/// clear is needed).
+#[derive(Default)]
+pub struct SceneRenderScratch {
+    temp_fb: Vec<u32>,
+    temp_zb: Vec<f32>,
+    lights: Vec<CpuPointLight>,
+    eff_mips: HashMap<GridId, u32>,
 }
 
 /// Render every grid in `scene` with per-grid temporary buffers +
@@ -533,6 +589,7 @@ pub fn render_scene_composed(
         &[],
         CpuLights::default(),
         None,
+        &mut SceneRenderScratch::default(),
     )
 }
 
@@ -578,6 +635,51 @@ pub fn render_scene_composed_with_materials(
         terrain_materials,
         lights,
         sprite_occluder,
+        &mut SceneRenderScratch::default(),
+    )
+}
+
+/// [`render_scene_composed_with_materials`] with a caller-owned
+/// [`SceneRenderScratch`] (PF.7) — the per-frame render path: the temp
+/// buffer pair and per-grid scratch are reused across frames instead of
+/// re-allocated per call.
+#[allow(clippy::too_many_arguments)]
+pub fn render_scene_composed_with_materials_scratch(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
+    fog: CpuFog,
+    scene: &mut Scene,
+    camera: &Camera,
+    settings: &OpticastSettings,
+    sky_color: u32,
+    sky: Option<&Sky>,
+    materials: Option<&MaterialTable>,
+    terrain_materials: &[(u32, u8)],
+    lights: CpuLights<'_>,
+    sprite_occluder: Option<&dyn WorldOccluder>,
+    scratch: &mut SceneRenderScratch,
+) -> RenderOutcome {
+    render_scene_composed_scissored(
+        fb,
+        zb,
+        pitch_pixels,
+        width,
+        height,
+        fog,
+        scene,
+        camera,
+        settings,
+        sky_color,
+        sky,
+        true,
+        materials,
+        terrain_materials,
+        lights,
+        sprite_occluder,
+        scratch,
     )
 }
 
@@ -609,14 +711,24 @@ fn render_scene_composed_scissored(
     // onto terrain). Composited with the per-frame grid occluder. `None` ⇒
     // grids only.
     sprite_occluder: Option<&dyn WorldOccluder>,
+    // PF.7 — caller-owned reusable buffers (see [`SceneRenderScratch`]).
+    scratch: &mut SceneRenderScratch,
 ) -> RenderOutcome {
     debug_assert_eq!(fb.len(), zb.len());
     let pixel_count = (width as usize) * (height as usize);
     debug_assert_eq!(fb.len(), pixel_count);
 
     let mut grids_drawn = 0usize;
-    let mut temp_fb = vec![sky_color; pixel_count];
-    let mut temp_zb = vec![f32::INFINITY; pixel_count];
+    // PF.7 (C6) — size (don't clear) the temp pair: every pixel the
+    // render reads inside a grid's rect is `fill_rect_*`-initialised for
+    // that grid first, and `compose_rect` reads only within the rect, so
+    // stale contents outside are never observed. This removes two
+    // full-frame allocations AND their initialising writes per call.
+    let scratch = &mut *scratch;
+    scratch.temp_fb.resize(pixel_count, 0);
+    scratch.temp_zb.resize(pixel_count, f32::INFINITY);
+    let temp_fb = &mut scratch.temp_fb[..pixel_count];
+    let temp_zb = &mut scratch.temp_zb[..pixel_count];
 
     // XS.1 — phase A (`&mut`): materialise the per-frame caches the render
     // reads — DDA brick caches (Near/Mid) and Far-tier billboard impostors —
@@ -624,7 +736,8 @@ fn render_scene_composed_scissored(
     // render loop lets phase B run over `&Scene` immutably, so the cross-grid
     // shadow occluder (which also borrows the scene) can coexist with it.
     let cam_world = DVec3::from_array(camera.pos);
-    let mut eff_mips: HashMap<GridId, u32> = HashMap::new();
+    let eff_mips = &mut scratch.eff_mips;
+    eff_mips.clear();
     for (id, grid) in scene.grids_mut() {
         let lod = grid.select_lod(cam_world);
         if lod == Lod::Far {
@@ -844,8 +957,8 @@ fn render_scene_composed_scissored(
         // Reset temp to sky / INFINITY so each grid starts fresh —
         // only within the grid's screen rect (opticast writes nothing
         // outside it, and the rect-limited compose reads nothing there).
-        fill_rect_u32(&mut temp_fb, pitch_pixels, rect, local_sky_color);
-        fill_rect_f32(&mut temp_zb, pitch_pixels, rect, f32::INFINITY);
+        fill_rect_u32(temp_fb, pitch_pixels, rect, local_sky_color);
+        fill_rect_f32(temp_zb, pitch_pixels, rect, f32::INFINITY);
 
         let local_cam = world_camera_to_grid_local(camera, &grid.transform);
         let cg = roxlap_core::ChunkGrid {
@@ -939,9 +1052,16 @@ fn render_scene_composed_scissored(
         // the sentinel.
         let fog_on = fog.max_scan_dist > 0;
         // CPU.1 — transform the world lights into this grid's local frame
-        // (point scratch lives for the grid's render below).
-        let mut light_scratch: Vec<CpuPointLight> = Vec::new();
-        let local_lights = grid_local_lights(&lights, &grid.transform, &mut light_scratch);
+        // (the reused point scratch lives for the grid's render below).
+        // PF.7 — lights that can't reach the grid's bounding sphere are
+        // culled (`bounds`/`centre_world` computed for the distance cull
+        // above).
+        let local_lights = grid_local_lights(
+            &lights,
+            &grid.transform,
+            &mut scratch.lights,
+            Some((centre_world, bounds.radius)),
+        );
         // XS.1 — cross-grid shadows: hand the shade the scene-wide occluder
         // plus this grid's local→world transform, so a grid-local shadow ray
         // is lifted to world space and tested against every grid. `cols[i]`
@@ -980,8 +1100,8 @@ fn render_scene_composed_scissored(
             &local_cam,
             &scissored,
             grid_view,
-            &mut temp_fb,
-            &mut temp_zb,
+            temp_fb,
+            temp_zb,
             pitch_pixels,
             &env,
             &grid.dda_brick_cache,
@@ -1001,7 +1121,7 @@ fn render_scene_composed_scissored(
             }
         }
 
-        compose_rect(fb, zb, &temp_fb, &temp_zb, pitch_pixels, rect);
+        compose_rect(fb, zb, temp_fb, temp_zb, pitch_pixels, rect);
         grids_drawn += 1;
     }
 
@@ -1153,6 +1273,7 @@ mod tests {
                 &[],
                 lights,
                 None,
+                &mut SceneRenderScratch::default(),
             );
             fb.iter()
                 .map(|&p| u64::from((p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff)))
@@ -1728,6 +1849,7 @@ mod tests {
                 &[],
                 CpuLights::default(),
                 None,
+                &mut SceneRenderScratch::default(),
             );
             fb
         };

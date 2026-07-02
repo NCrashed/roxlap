@@ -518,8 +518,11 @@ pub(crate) fn shade_dynamic(
             p.pos[1] - sample[1],
             p.pos[2] - sample[2],
         ];
-        let dist = (d3[0] * d3[0] + d3[1] * d3[1] + d3[2] * d3[2]).sqrt();
-        if dist < p.radius && dist > 1e-4 {
+        // PF.7 (C4) — squared-distance reject first: the sqrt only runs
+        // for lights actually within radius (same thresholds squared).
+        let d2 = d3[0] * d3[0] + d3[1] * d3[1] + d3[2] * d3[2];
+        if d2 < p.radius * p.radius && d2 > 1e-8 {
+            let dist = d2.sqrt();
             let inv = 1.0 / dist;
             let ldir = [d3[0] * inv, d3[1] * inv, d3[2] * inv];
             let ndl = dot3(n, ldir).max(0.0);
@@ -570,20 +573,6 @@ fn apply_fog(color: u32, depth: f32, env: &DdaEnv<'_>) -> u32 {
         ((src * g + dst * f) >> 8).min(255)
     };
     0x8000_0000 | (mix(16) << 16) | (mix(8) << 8) | mix(0)
-}
-
-/// TV: resolve a terrain voxel's [`Material`] from its colour via the env's
-/// colour→material map + palette. Returns [`Material::OPAQUE`] when no
-/// material table is set, the map is empty, or the colour is unmapped — so
-/// the march stays on the opaque first-hit path.
-#[inline]
-fn terrain_material(env: &DdaEnv<'_>, color: u32) -> Material {
-    match env.materials {
-        Some(table) if !env.terrain_materials.is_empty() => {
-            table.get(material_for_color(env.terrain_materials, color))
-        }
-        _ => Material::OPAQUE,
-    }
 }
 
 /// Composite premultiplied `accum` (+ remaining `trans`) over a packed
@@ -704,17 +693,26 @@ pub fn render_sky_fill(
     settings: &OpticastSettings,
     sky: &Sky,
 ) {
-    for py in 0..height {
-        let row = py as usize * pitch_pixels;
-        for px in 0..width {
-            let idx = row + px as usize;
-            if zb[idx].is_finite() {
-                continue; // a grid/terrain hit owns this pixel
+    // PF.7 (C6) — rayon rows: this was a full-frame single-threaded pass
+    // with an `acos` + `atan2` per background pixel (an entire serial
+    // frame on sky-dominant views). Rows are disjoint (`by_ref` chunks of
+    // the framebuffer); `zb` is read-only. Bit-identical.
+    fb.par_chunks_mut(pitch_pixels)
+        .take(height as usize)
+        .enumerate()
+        .for_each(|(py, frow)| {
+            let row = py * pitch_pixels;
+            #[allow(clippy::cast_possible_truncation)]
+            let py = py as u32;
+            for px in 0..width {
+                let idx = row + px as usize;
+                if zb[idx].is_finite() {
+                    continue; // a grid/terrain hit owns this pixel
+                }
+                let (_origin, dir) = pixel_ray(cam, settings, px, py);
+                frow[px as usize] = sample_sky(sky, dir);
             }
-            let (_origin, dir) = pixel_ray(cam, settings, px, py);
-            fb[idx] = sample_sky(sky, dir);
-        }
-    }
+        });
 }
 
 /// World-space ray for screen pixel `(px, py)` under opticast's
@@ -1329,6 +1327,12 @@ fn cell_walk_skip(
     // World ray length per ray-parameter unit; divided by `cell_size` it turns
     // a cell's `t` span into its path length in voxel units (Volumetric weight).
     let dir_len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    // PF.7 (C4) — hoisted out of the hit block: "does anything cast a
+    // shadow?" is ray-invariant, and the O(lights) `any()` scan ran per
+    // hit (per translucent layer on glass/water rays).
+    let shadow_casts = env.lights.enabled
+        && env.lights.shadow_strength > 0.0
+        && (env.lights.sun_casts_shadow || env.lights.points.iter().any(|p| p.casts_shadow));
 
     // TV: front-to-back translucent accumulation. While no translucent voxel
     // is hit (`touched` stays false) every return is unchanged — the opaque
@@ -1473,9 +1477,7 @@ fn cell_walk_skip(
             // box bounds); only built when a caster is actually flagged so
             // the no-shadow rig stays march-free.
             let shaded = if env.lights.enabled {
-                let casts = env.lights.shadow_strength > 0.0
-                    && (env.lights.sun_casts_shadow
-                        || env.lights.points.iter().any(|p| p.casts_shadow));
+                let casts = shadow_casts;
                 // Pick the shadow oracle: the scene-wide one (cross-grid +
                 // sprites, XS.1) when present, else the single-grid Sampler;
                 // `None` when no caster is flagged, so the rig stays
@@ -1511,7 +1513,16 @@ fn cell_walk_skip(
                 shade(color, bright_sub)
             };
             let lit = apply_fog(shaded, depth.max(0.0), env);
-            let m = terrain_material(env, color);
+            // PF.7 (C4) — one colour→material scan per hit: resolve the id
+            // and the material together (the id was previously re-scanned
+            // for the translucent path below).
+            let (m, mat_id) = match env.materials {
+                Some(table) if !env.terrain_materials.is_empty() => {
+                    let id = material_for_color(env.terrain_materials, color);
+                    (table.get(id), id)
+                }
+                _ => (Material::OPAQUE, 0),
+            };
             if m.is_opaque() {
                 // Opaque surface: the background. Return the first hit verbatim
                 // when nothing translucent preceded it (bit-identical), else
@@ -1526,7 +1537,6 @@ fn cell_walk_skip(
                     dist: depth.max(0.0),
                 });
             }
-            let mat_id = material_for_color(env.terrain_materials, color);
             let a = f32::from(m.alpha) / 255.0;
             if matches!(m.mode, roxlap_formats::material::BlendMode::Volumetric) {
                 // Per-cell Beer–Lambert: opacity weighted by the ray's path
@@ -1744,10 +1754,13 @@ pub fn render_dda_parallel(
     );
     let target = RasterTarget::new(fb, zb);
 
-    // Split the y-range into ~one band per worker thread.
-    let nthreads = rayon::current_num_threads().max(1);
-    let rows = (y1 - y0) as usize;
-    let band = rows.div_ceil(nthreads).max(1) as u32;
+    // PF.7 (C5) — small fixed bands + rayon work-stealing instead of one
+    // equal band per thread: sky-heavy rows finish instantly while
+    // horizon/terrain rows dominate, so an equal split left threads idle
+    // for the tail of every frame. 8 rows amortises the per-band
+    // `Sampler` construction while staying fine-grained enough to
+    // balance. Bit-identical (pixels are independent; rows disjoint).
+    let band = 8u32;
     let bands: Vec<(u32, u32)> = (y0..y1)
         .step_by(band as usize)
         .map(|s| (s, (s + band).min(y1)))
