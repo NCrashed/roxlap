@@ -733,6 +733,56 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// PF.10 — everything `cull_bin_upload`'s result depends on besides the
+/// registry contents (float fields compared bitwise). Paired with the
+/// "registry changed" invalidation (`last_cull = None` in every mutating
+/// method): when the key matches the previous frame's, the cull, the
+/// binning, and all four buffer uploads are skipped — the buffers already
+/// hold exactly this frame's data.
+#[derive(Clone, Copy, PartialEq)]
+struct CullKey {
+    frustum: [u32; 15],
+    screen: [u32; 4],
+}
+
+impl CullKey {
+    fn new(f: &ViewFrustum, screen_w: u32, screen_h: u32, tile_size: u32, lod_px: f32) -> Self {
+        let b = |v: f32| v.to_bits();
+        Self {
+            frustum: [
+                b(f.pos[0]),
+                b(f.pos[1]),
+                b(f.pos[2]),
+                b(f.right[0]),
+                b(f.right[1]),
+                b(f.right[2]),
+                b(f.down[0]),
+                b(f.down[1]),
+                b(f.down[2]),
+                b(f.forward[0]),
+                b(f.forward[1]),
+                b(f.forward[2]),
+                b(f.half_w),
+                b(f.half_h),
+                b(f.far),
+            ],
+            screen: [screen_w, screen_h, tile_size, lod_px.to_bits()],
+        }
+    }
+}
+
+/// PF.10 — reusable cull/bin workspace (was 6+ fresh `Vec`s per frame).
+#[derive(Default)]
+struct CullScratch {
+    visible: Vec<SpriteInstanceGpu>,
+    boxes: Vec<[i32; 4]>,
+    colmul: Vec<u32>,
+    counts: Vec<u32>,
+    tile_ranges: Vec<u32>,
+    tile_instances: Vec<u32>,
+    cursor: Vec<u32>,
+}
+
 /// Build one CPU cull record from a user [`SpriteInstance`]: pack the
 /// transform, seed the bounding sphere from the chain's finest model, and
 /// start `colmul` at identity. Shared by the full
@@ -930,6 +980,20 @@ pub struct SpriteRegistryResident {
     /// shared buffers (drives both; same offsets/ranks). Lets an edit
     /// re-upload one model's data without touching the others.
     colors_alloc: ColorsAllocator,
+    /// PF.10 — the (frustum, screen) key + result of the last
+    /// `cull_bin_upload`; `None` after any registry mutation. A matching
+    /// key skips the whole cull/bin/upload (buffers already current).
+    last_cull: Option<(CullKey, (u32, u32, u32))>,
+    /// PF.10 — true once ANY per-instance colmul table was set. While
+    /// false every table is identity, so the 2 KiB-per-visible-instance
+    /// rebuild + upload is skipped; the buffer is identity-filled lazily
+    /// instead (`colmul_identity`).
+    any_colmul: bool,
+    /// PF.10 — whether the whole `colmul` buffer currently holds the
+    /// identity pattern (reset on growth).
+    colmul_identity: bool,
+    /// PF.10 — reusable cull/bin workspace.
+    scratch: CullScratch,
     /// Per-entry word length of the dims-fixed `occupancy` and
     /// `color_offsets` arrays, kept so [`Self::update_model`] can assert a
     /// carve never changed dims (which would invalidate the in-place
@@ -1094,6 +1158,10 @@ impl SpriteRegistryResident {
             tile_instances_cap: 1,
             cull,
             chains: registry.chains.clone(),
+            last_cull: None,
+            any_colmul: false,
+            colmul_identity: false,
+            scratch: CullScratch::default(),
             occ_used: all_occ.len() as u32,
             occ_cap: all_occ.len() as u32,
             coloff_used: all_offsets.len() as u32,
@@ -1144,6 +1212,7 @@ impl SpriteRegistryResident {
         if instances.is_empty() {
             return base;
         }
+        self.last_cull = None; // PF.10 — instance set changed
         for i in instances {
             debug_assert!(
                 (i.model_id as usize) < self.chains.len(),
@@ -1177,6 +1246,7 @@ impl SpriteRegistryResident {
         if index >= self.cull.len() {
             return None;
         }
+        self.last_cull = None; // PF.10 — instance set changed
         let last = self.cull.len() - 1;
         self.cull.swap_remove(index);
         (index != last).then_some(last)
@@ -1188,6 +1258,10 @@ impl SpriteRegistryResident {
     /// [`Self::cull_bin_upload`] packs the visible subset to the GPU.
     /// Instances beyond `tables.len()` keep their previous tables.
     pub fn set_instance_colmul(&mut self, tables: &[[u64; 256]]) {
+        // PF.10 — leaves the identity fast path for good: from here on the
+        // per-visible tables are rebuilt + uploaded each cull.
+        self.any_colmul = true;
+        self.last_cull = None;
         for (ci, t) in self.cull.iter_mut().zip(tables) {
             ci.colmul.copy_from_slice(t);
         }
@@ -1206,6 +1280,7 @@ impl SpriteRegistryResident {
             self.cull.len(),
             "update_transforms instance count must match upload"
         );
+        self.last_cull = None; // PF.10 — poses changed
         for (ci, inst) in self.cull.iter_mut().zip(instances) {
             ci.gpu.inv_rot0 = inst.transform.inv_rot[0];
             ci.gpu.inv_rot1 = inst.transform.inv_rot[1];
@@ -1244,9 +1319,10 @@ impl SpriteRegistryResident {
         idx: usize,
         chain_id: u32,
     ) {
-        // Guard `chain_id` (the `cull.get_mut` below only covers `idx`): a
-        // public caller could pass an out-of-range / tombstoned chain, which
-        // `registry.model` would index-panic on.
+        self.last_cull = None; // PF.10 — model binding changed
+                               // Guard `chain_id` (the `cull.get_mut` below only covers `idx`): a
+                               // public caller could pass an out-of-range / tombstoned chain, which
+                               // `registry.model` would index-panic on.
         let Some(radius) = registry
             .model_checked(chain_id)
             .map(SpriteModel::bound_radius)
@@ -1287,6 +1363,7 @@ impl SpriteRegistryResident {
         registry: &SpriteModelRegistry,
         chain_id: u32,
     ) {
+        self.last_cull = None; // PF.10 — model volume changed
         let entries = self.chains[chain_id as usize].clone();
         let mut grew = false;
         for &e in &entries {
@@ -1456,6 +1533,7 @@ impl SpriteRegistryResident {
         registry: &SpriteModelRegistry,
         chain_id: u32,
     ) {
+        self.last_cull = None; // PF.10 — chain set changed
         let entries = registry.chains[chain_id as usize].clone();
         debug_assert_eq!(
             chain_id as usize,
@@ -1633,6 +1711,7 @@ impl SpriteRegistryResident {
         if entries.is_empty() {
             return; // already removed
         }
+        self.last_cull = None; // PF.10 — tombstone changes visibility
         for &e in &entries {
             let e = e as usize;
             self.dead[e] = true;
@@ -1656,8 +1735,9 @@ impl SpriteRegistryResident {
         queue: &wgpu::Queue,
         registry: &SpriteModelRegistry,
     ) {
-        // occupancy + color_offsets: re-pack live entries tightly, rewrite
-        // each live entry's meta offset, zero the dead ones.
+        self.last_cull = None; // PF.10 — entry ids / chains renumbered
+                               // occupancy + color_offsets: re-pack live entries tightly, rewrite
+                               // each live entry's meta offset, zero the dead ones.
         self.compact_concat(device, registry, ConcatBuf::Occupancy);
         self.compact_concat(device, registry, ConcatBuf::ColorOffsets);
         // colors/dirs: the dead-aware repack already drops dead entries.
@@ -1737,6 +1817,16 @@ impl SpriteRegistryResident {
         let tiles_y = screen_h.div_ceil(tile_size).max(1);
         let n_tiles = (tiles_x * tiles_y) as usize;
 
+        // PF.10 — nothing changed since the last cull (same registry
+        // state, same view, same screen): the four buffers already hold
+        // exactly this frame's data — skip the whole cull/bin/upload.
+        let key = CullKey::new(f, screen_w, screen_h, tile_size, lod_px);
+        if let Some((k, res)) = self.last_cull {
+            if k == key {
+                return res;
+            }
+        }
+
         let nw = (1.0 + f.half_w * f.half_w).sqrt();
         let nh = (1.0 + f.half_h * f.half_h).sqrt();
         let cx = screen_w as f32 * 0.5;
@@ -1746,14 +1836,25 @@ impl SpriteRegistryResident {
         let tx_max = tiles_x as i32 - 1;
         let ty_max = tiles_y as i32 - 1;
 
-        let mut visible: Vec<SpriteInstanceGpu> = Vec::with_capacity(self.cull.len());
+        // PF.10 — reused workspace (was 6+ fresh Vecs per frame).
+        let scratch = &mut self.scratch;
+        let visible = &mut scratch.visible;
+        visible.clear();
         // Per-visible tile AABB (tx0, tx1, ty0, ty1) for the bin pass.
-        let mut boxes: Vec<[i32; 4]> = Vec::with_capacity(self.cull.len());
+        let boxes = &mut scratch.boxes;
+        boxes.clear();
         // Per-visible kv6colmul tables, flattened to two u32 per u64
         // entry (lanes 0|1, then 2|3), packed in visible order so the
-        // shader indexes `colmul[inst_idx*512 + dir*2 + {0,1}]`.
-        let mut visible_colmul: Vec<u32> = Vec::with_capacity(self.cull.len() * 512);
-        let mut counts = vec![0u32; n_tiles];
+        // shader indexes `colmul[inst_idx*512 + dir*2 + {0,1}]`. PF.10 —
+        // built ONLY once a non-identity table exists (`any_colmul`);
+        // until then the buffer holds a lazily-written identity fill and
+        // the ~2 KiB-per-visible-instance rebuild + upload is skipped.
+        let visible_colmul = &mut scratch.colmul;
+        visible_colmul.clear();
+        let counts = &mut scratch.counts;
+        counts.clear();
+        counts.resize(n_tiles, 0u32);
+        let pack_colmul = self.any_colmul;
 
         for ci in &self.cull {
             // Skip instances of a removed model (tombstoned chain) — they
@@ -1812,9 +1913,11 @@ impl SpriteRegistryResident {
             g.model_id = chain[level];
             visible.push(g);
             boxes.push([tx0, tx1, ty0, ty1]);
-            for &w in ci.colmul.iter() {
-                visible_colmul.push((w & 0xffff_ffff) as u32);
-                visible_colmul.push((w >> 32) as u32);
+            if pack_colmul {
+                for &w in ci.colmul.iter() {
+                    visible_colmul.push((w & 0xffff_ffff) as u32);
+                    visible_colmul.push((w >> 32) as u32);
+                }
             }
             for ty in ty0..=ty1 {
                 for tx in tx0..=tx1 {
@@ -1824,12 +1927,16 @@ impl SpriteRegistryResident {
         }
 
         if visible.is_empty() {
-            return (0, tiles_x, tiles_y);
+            let res = (0, tiles_x, tiles_y);
+            self.last_cull = Some((key, res));
+            return res;
         }
 
         // Prefix-sum counts → per-tile offsets; build the flat grouped
         // index list.
-        let mut tile_ranges = vec![0u32; n_tiles * 2];
+        let tile_ranges = &mut scratch.tile_ranges;
+        tile_ranges.clear();
+        tile_ranges.resize(n_tiles * 2, 0u32);
         let mut running = 0u32;
         for t in 0..n_tiles {
             tile_ranges[2 * t] = running; // offset
@@ -1837,8 +1944,12 @@ impl SpriteRegistryResident {
             running += counts[t];
         }
         let total = running as usize;
-        let mut tile_instances = vec![0u32; total.max(1)];
-        let mut cursor: Vec<u32> = (0..n_tiles).map(|t| tile_ranges[2 * t]).collect();
+        let tile_instances = &mut scratch.tile_instances;
+        tile_instances.clear();
+        tile_instances.resize(total.max(1), 0u32);
+        let cursor = &mut scratch.cursor;
+        cursor.clear();
+        cursor.extend((0..n_tiles).map(|t| tile_ranges[2 * t]));
         for (vis_idx, b) in boxes.iter().enumerate() {
             for ty in b[2]..=b[3] {
                 for tx in b[0]..=b[1] {
@@ -1852,7 +1963,7 @@ impl SpriteRegistryResident {
         // Upload: instances + (grown) tile buffers. Grow a tile buffer
         // only when this frame needs more than its capacity (wgpu has
         // no Clone on Buffer, so we replace the field in place).
-        queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&visible));
+        queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(visible));
         let need_ranges = tile_ranges.len() as u32;
         if need_ranges > self.tile_ranges_cap {
             self.tile_ranges_cap = need_ranges.next_power_of_two();
@@ -1871,20 +1982,46 @@ impl SpriteRegistryResident {
                 self.tile_instances_cap,
             );
         }
-        queue.write_buffer(&self.tile_ranges, 0, bytemuck::cast_slice(&tile_ranges));
+        queue.write_buffer(&self.tile_ranges, 0, bytemuck::cast_slice(tile_ranges));
         queue.write_buffer(
             &self.tile_instances,
             0,
-            bytemuck::cast_slice(&tile_instances),
+            bytemuck::cast_slice(tile_instances),
         );
-        let need_colmul = visible_colmul.len() as u32;
-        if need_colmul > self.colmul_cap {
-            self.colmul_cap = need_colmul.next_power_of_two();
-            self.colmul = storage_dst_u32(device, "roxlap-gpu sprite_reg.colmul", self.colmul_cap);
+        if pack_colmul {
+            let need_colmul = visible_colmul.len() as u32;
+            if need_colmul > self.colmul_cap {
+                self.colmul_cap = need_colmul.next_power_of_two();
+                self.colmul =
+                    storage_dst_u32(device, "roxlap-gpu sprite_reg.colmul", self.colmul_cap);
+                self.colmul_identity = false;
+            }
+            queue.write_buffer(&self.colmul, 0, bytemuck::cast_slice(visible_colmul));
+        } else {
+            // PF.10 — identity fast path: every table is identity, so the
+            // buffer content is a constant repeating pattern. (Re)fill it
+            // only on first use / growth; per-frame upload skipped.
+            let need_colmul = visible.len() as u32 * 512;
+            if need_colmul > self.colmul_cap {
+                self.colmul_cap = need_colmul.next_power_of_two();
+                self.colmul =
+                    storage_dst_u32(device, "roxlap-gpu sprite_reg.colmul", self.colmul_cap);
+                self.colmul_identity = false;
+            }
+            if !self.colmul_identity {
+                let w = identity_colmul()[0];
+                let (lo, hi) = ((w & 0xffff_ffff) as u32, (w >> 32) as u32);
+                let fill: Vec<u32> = (0..self.colmul_cap)
+                    .map(|i| if i & 1 == 0 { lo } else { hi })
+                    .collect();
+                queue.write_buffer(&self.colmul, 0, bytemuck::cast_slice(&fill));
+                self.colmul_identity = true;
+            }
         }
-        queue.write_buffer(&self.colmul, 0, bytemuck::cast_slice(&visible_colmul));
 
-        (visible.len() as u32, tiles_x, tiles_y)
+        let res = (visible.len() as u32, tiles_x, tiles_y);
+        self.last_cull = Some((key, res));
+        res
     }
 }
 
@@ -2084,7 +2221,11 @@ fn storage_dst_u32(device: &wgpu::Device, label: &str, cap: u32) -> wgpu::Buffer
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: u64::from(cap.max(1)) * 4,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        // COPY_SRC so test/debug harnesses can read the contents back
+        // (PF.10's cull gate does); free at runtime.
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })
 }
