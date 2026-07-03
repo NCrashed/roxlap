@@ -13,12 +13,15 @@
 //!   [`Grid::set_rect`], [`Grid::set_sphere`], …) which decomposes
 //!   multi-chunk operations and delegates to [`roxlap_formats::edit`];
 //! - [`render`] — multi-grid raycast composition for the CPU renderer;
-//! - [`snapshot`] — a serde-friendly view of the scene that
-//!   round-trips through `Serialize` + `Deserialize` (chunks encode
-//!   via [`roxlap_formats::vxl::serialize`] / [`parse`]);
+//! - [`snapshot`] — save/load: the versioned wire format
+//!   ([`Scene::save_snapshot`] / [`Scene::load_snapshot`], QE.5b)
+//!   plus the underlying serde-friendly [`snapshot::SceneSnapshot`]
+//!   value (chunks encode via [`roxlap_formats::vxl::serialize`] /
+//!   [`parse`]);
 //! - [`streaming`] — chunk streaming + procedural generation
 //!   ([`streaming::ChunkGenerator`], radius-driven install/evict,
-//!   async generation on a rayon pool);
+//!   async generation on a rayon pool) and persistence for edited
+//!   chunks ([`streaming::ChunkStore`], QE.5a);
 //! - [`lod`] / [`billboard`] / [`occluder`] — far-LOD billboards and
 //!   render culling helpers;
 //! - world queries — [`Scene::raycast`], [`Scene::resolve_voxel`],
@@ -55,7 +58,7 @@ pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_loc
 pub use billboard::{canonical_viewpoints, BillboardCache, BillboardSnapshot};
 pub use edit::SpanOp;
 pub use lod::{select_lod, Lod, LodThresholds};
-pub use streaming::{ChunkGenerator, StreamRadius};
+pub use streaming::{ChunkGenerator, ChunkStore, StreamRadius};
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
 /// chunks compact (~2 MB worst-case dense-slab footprint inside
@@ -411,6 +414,19 @@ pub struct Grid {
     /// of the grid. Trait bound `Send + Sync` (required at S7.0)
     /// already makes `Arc<dyn ChunkGenerator>` `Send + Sync`.
     pub generator: Option<Arc<dyn ChunkGenerator>>,
+    /// QE.5b - optional host-assigned tag, carried through snapshots.
+    /// Grid ids are runtime-opaque, so a save/load cycle gives hosts
+    /// nothing to rebind their own per-grid data (generators, stores,
+    /// gameplay state) against; a stable name closes that gap. Not
+    /// interpreted by the engine.
+    pub name: Option<String>,
+    /// QE.5a - optional persistence for edited streamed chunks: the
+    /// eviction pass hands every `chunk_version != 0` chunk to
+    /// [`ChunkStore::store`] before dropping it, and stream-in asks
+    /// [`ChunkStore::load`] before running the generator. `None` (the
+    /// default) keeps the pre-QE.5 behaviour: evicting an edited
+    /// chunk discards the edits.
+    pub store: Option<Arc<dyn ChunkStore>>,
     /// Streaming activity / eviction radii used by
     /// [`Scene::pump_streaming_sync`] (S7.1). Defaults to
     /// [`StreamRadius::DISABLED`] so existing grids see no change
@@ -499,6 +515,8 @@ impl Grid {
             lod_thresholds: LodThresholds::always_near(),
             billboards: None,
             generator: None,
+            name: None,
+            store: None,
             stream_radius: StreamRadius::DISABLED,
             chunk_versions: HashMap::new(),
             pending_gen: HashSet::new(),
@@ -673,6 +691,13 @@ impl Grid {
         self.generator = generator;
     }
 
+    /// Attach (or detach) the persistence store for edited streamed
+    /// chunks (QE.5a; see [`ChunkStore`]). Without one, evicting an
+    /// edited chunk **discards the edits** — the pre-QE.5 default.
+    pub fn set_chunk_store(&mut self, store: Option<Arc<dyn ChunkStore>>) {
+        self.store = store;
+    }
+
     /// Materialise the chunk at `chunk_idx` by running [`Self::generator`]
     /// if (a) the chunk is not already present and (b) a generator
     /// is attached. Returns `true` iff a chunk was newly generated.
@@ -684,13 +709,26 @@ impl Grid {
     ///   the existing convention — does NOT fall through to
     ///   [`Self::ensure_chunk`]'s empty-chunk constructor).
     ///
-    /// This is the synchronous S7.0 path. S7.3 will add an async
-    /// counterpart that dispatches the generator call to a
-    /// dedicated rayon pool and installs the result on the next
-    /// `pump_streaming` call.
+    /// This is the synchronous S7.0 path; [`Scene::pump_streaming`]
+    /// is the async counterpart (generation + store loads on a
+    /// dedicated rayon pool).
+    ///
+    /// QE.5a: with a [`ChunkStore`] attached, a stored chunk is
+    /// installed (with its persisted edit version) **before** the
+    /// generator is consulted — including for indices the generator's
+    /// [`ChunkGenerator::should_generate`] declines, since edits can
+    /// materialise chunks the generator never would.
     pub fn ensure_chunk_generated(&mut self, chunk_idx: IVec3) -> bool {
         if self.chunks.contains_key(&chunk_idx) {
             return false;
+        }
+        // QE.5a — persisted edits win over regeneration.
+        if let Some((vxl, version)) = self.store.as_ref().and_then(|store| store.load(chunk_idx)) {
+            self.chunks.insert(chunk_idx, vxl);
+            self.restore_chunk_version(chunk_idx, version);
+            self.note_chunk_set_changed();
+            self.billboards = None; // same invalidation as below
+            return true;
         }
         let Some(generator) = self.generator.as_ref() else {
             return false;
@@ -1007,7 +1045,17 @@ impl Scene {
                 // generation.
                 continue;
             }
-            grid.chunks.insert(result.chunk_idx, result.vxl);
+            let Some(vxl) = result.vxl else {
+                // QE.5a — nothing to install (store miss + generator
+                // declined); the pending entry is already cleared.
+                continue;
+            };
+            grid.chunks.insert(result.chunk_idx, vxl);
+            if let Some(version) = result.restored_version {
+                // QE.5a — a store-restored chunk keeps its persisted
+                // edit version (consumers see it as edited content).
+                grid.restore_chunk_version(result.chunk_idx, version);
+            }
             grid.note_chunk_set_changed();
             // S7.4: same invalidation contract as the sync
             // `ensure_chunk_generated` path — installing a new
@@ -1073,7 +1121,9 @@ fn pump_grid_streaming_sync(grid: &mut Grid, camera_world_pos: DVec3) {
     let cam_local = streaming::world_to_grid_local_pos(camera_world_pos, &grid.transform);
 
     // --- Pass 1: stream in active chunks (sync) ---------------
-    if radius.r_active > 0.0 && grid.generator.is_some() {
+    // QE.5a — a ChunkStore alone (no generator) still restores
+    // persisted edited chunks.
+    if radius.r_active > 0.0 && (grid.generator.is_some() || grid.store.is_some()) {
         for_each_chunk_in_radius(cam_local, radius.r_active, |idx| {
             grid.ensure_chunk_generated(idx);
         });
@@ -1128,6 +1178,18 @@ fn evict_grid_chunks_with_cam(grid: &mut Grid, cam_local: DVec3) {
         return;
     }
     for idx in &to_evict {
+        // QE.5a — an edited chunk (version != 0) is handed to the
+        // ChunkStore before it drops, so the edits survive evict +
+        // re-stream. Pristine generator output (version 0) is
+        // regenerable and skips the store.
+        if let Some(store) = grid.store.as_ref() {
+            let version = grid.chunk_version(*idx);
+            if version != 0 {
+                if let Some(vxl) = grid.chunks.get(idx) {
+                    store.store(*idx, vxl, version);
+                }
+            }
+        }
         grid.chunks.remove(idx);
         grid.note_chunk_set_changed();
         // S7.2/QE.3b: drop the chunk's version + dirty-extent tracking
@@ -1135,7 +1197,8 @@ fn evict_grid_chunks_with_cam(grid: &mut Grid, cam_local: DVec3) {
         // restarts at 0 — that's fine because any in-flight gen-result
         // tagged with the pre-eviction version is unreachable (no chunk
         // to install onto) and gets discarded by the new "version
-        // still 0" check anyway.
+        // still 0" check anyway. (A stored edited chunk re-enters with
+        // its persisted version via the QE.5a load path instead.)
         grid.forget_chunk_tracking(*idx);
         // S7.3: drop pending entry for the same chunk too. If a
         // background task is still running, its result will be
@@ -1208,9 +1271,13 @@ fn dispatch_grid_async(
     if radius.is_disabled() || radius.r_active <= 0.0 {
         return;
     }
-    let Some(generator) = grid.generator.as_ref().map(Arc::clone) else {
+    // QE.5a — a ChunkStore alone (no generator) still restores
+    // persisted edited chunks on the background pool.
+    let generator = grid.generator.as_ref().map(Arc::clone);
+    let store = grid.store.as_ref().map(Arc::clone);
+    if generator.is_none() && store.is_none() {
         return;
-    };
+    }
     let cam_local = streaming::world_to_grid_local_pos(camera_world_pos, &grid.transform);
     for_each_chunk_in_radius(cam_local, radius.r_active, |idx| {
         if grid.chunks.contains_key(&idx) {
@@ -1226,15 +1293,28 @@ fn dispatch_grid_async(
         // chunks at chz != 0 so the camera-above-grid path doesn't
         // create chz < 0 entries that would shift `origin_chunk_z`
         // and trigger the S4B.6.j cross-chunk look-down bug).
-        if !generator.should_generate(idx) {
+        // QE.5a — with a store attached the chunk is still
+        // dispatched: a persisted edit wins over the decline (edits
+        // can materialise chunks the generator never would); the
+        // background task falls back to "nothing" on a store miss.
+        let declined = !generator.as_ref().is_some_and(|g| g.should_generate(idx));
+        if declined && store.is_none() {
             return;
         }
         grid.pending_gen.insert(idx);
         let version_at_dispatch = grid.chunk_version(idx);
         let tx_clone = tx.clone();
-        let gen_clone = Arc::clone(&generator);
+        let gen_clone = generator.clone();
+        let store_clone = store.clone();
         pool.spawn(move || {
-            let vxl = gen_clone.generate(idx);
+            // QE.5a — persisted edits win over regeneration; the
+            // store load runs here on the pool so blocking IO never
+            // stalls the render thread.
+            let (vxl, restored_version) = match store_clone.as_ref().and_then(|s| s.load(idx)) {
+                Some((vxl, version)) => (Some(vxl), Some(version)),
+                None if declined => (None, None),
+                None => (gen_clone.map(|g| g.generate(idx)), None),
+            };
             // Send is non-blocking on unbounded channel; if the
             // receiver was dropped (Scene drop), the send fails
             // silently — that's fine.
@@ -1243,6 +1323,7 @@ fn dispatch_grid_async(
                 chunk_idx: idx,
                 version_at_dispatch,
                 vxl,
+                restored_version,
             });
         });
     });

@@ -18,6 +18,14 @@ roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.21" }
 roxlap-core = { path = "../roxlap-core", version = "0.21" }
 roxlap-formats = { path = "../roxlap-formats", version = "0.21" }
 serde = { workspace = true }
+# QE.5b — the versioned snapshot wire format
+# (`Scene::save_snapshot` / `load_snapshot`: magic + u32 version +
+# bincode payload) makes the payload codec concrete, so bincode
+# graduates from dev-dependency to dependency. Hosts wanting another
+# payload codec still serialise `Scene::to_snapshot`'s serde value
+# themselves. Pinned to 1.x for wire stability.
+bincode = "1"
+
 # S7.3: background chunk-generation pool + result channel. Both are
 # native-only — on wasm32 the streaming pump short-circuits to the
 # synchronous path (no rayon::ThreadPool::build there without the
@@ -25,13 +33,6 @@ serde = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = { workspace = true }
 crossbeam-channel = { workspace = true }
-
-[dev-dependencies]
-# S2.3 round-trip test serialises through a real binary codec to
-# exercise the snapshot end-to-end (not just the field-by-field
-# Serialize impls). bincode is the most common choice in the rust
-# game-engine ecosystem; pinned to 1.x for stability.
-bincode = "1"
 
 [lints]
 workspace = true

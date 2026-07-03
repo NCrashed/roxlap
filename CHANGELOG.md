@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — QE.5: streamed-edit persistence + versioned save files
+
+- **`ChunkStore`** (roxlap-scene, QE.5a) — the persistence hook that
+  makes edit-the-world games possible on streamed grids. Previously,
+  walking away from an edited chunk and coming back **silently
+  reverted the player's edits** to generator output (evict +
+  deterministic re-generate). With a store attached
+  (`Grid::set_chunk_store`): the eviction pass hands every edited
+  chunk (`chunk_version != 0`) to `ChunkStore::store` before dropping
+  it, and stream-in consults `ChunkStore::load` **before** the
+  generator — a stored chunk restores with its persisted edit version,
+  and wins even where `should_generate` declines the index. Pristine
+  chunks (version 0) are regenerable and skip the store. Under
+  `Scene::pump_streaming` the loads run on the background pool
+  (blocking IO is fine there); `store` runs inline during eviction —
+  keep it cheap. A store alone (no generator) also works. Default
+  (`None`) keeps the old behaviour.
+- **Versioned snapshot wire format** (QE.5b) —
+  `Scene::save_snapshot() -> Vec<u8>` / `Scene::load_snapshot(bytes)`:
+  magic `RXSS` + little-endian `u32` version + bincode payload.
+  Loading dispatches on the version, so an old save either loads
+  correctly or fails loudly (`SnapshotLoadError::UnsupportedVersion`)
+  — never the silent misparse that bare positional bincode gave. A
+  checked-in v1 fixture test freezes backward compatibility.
+  Migration: saves written before QE.5b (bare bincode, no envelope)
+  fail with `BadMagic` — decode them with the engine version that
+  wrote them and re-save. `Scene::to_snapshot`'s plain serde value
+  stays available for custom codecs.
+- **Snapshots now carry grid configuration** (QE.5b) —
+  `GridSnapshot` gained `name`, `render_sky`, `mip_levels_override`,
+  `lod_thresholds`, `stream_radius` (all restored by
+  `from_snapshot`; previously every config field silently reset to
+  defaults on load). The `generator`/`store` hooks are host code and
+  can't serialise — rebind them after loading, keyed on the new
+  **`Grid::name`** tag (grid ids are runtime-opaque, so `name` is the
+  stable save-file identity hosts rebind against).
+  `LodThresholds` + `StreamRadius` now derive serde.
+  **Payload-shape note:** the `SceneSnapshot` serde shape changed;
+  pre-QE.5 *bare-bincode* blobs are not decodable by this version
+  (see the envelope migration note above). Self-describing formats
+  (JSON etc.) of old snapshots still deserialise (`#[serde(default)]`
+  on every new field).
+
 ### Changed — internal (QE.3): one `SceneState`, one dirty-tracking entry point
 
 No API change; two structural debts retired while small:

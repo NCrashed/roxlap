@@ -74,6 +74,48 @@ pub trait ChunkGenerator: fmt::Debug + Send + Sync {
     }
 }
 
+/// Pluggable persistence for **edited** streamed chunks (QE.5a).
+///
+/// The [`ChunkGenerator`] contract makes evict + re-stream sound for
+/// *pristine* chunks (generation is deterministic), but an edited
+/// chunk (`chunk_version != 0` — the player dug, built, or a bake
+/// wrote into it) would silently revert to generator output when the
+/// camera walks away and comes back. A `ChunkStore` closes that hole:
+///
+/// - **Eviction** ([`crate::Scene::pump_streaming`] /
+///   [`pump_streaming_sync`](crate::Scene::pump_streaming_sync)):
+///   every evicted chunk whose version is non-zero is handed to
+///   [`store`](Self::store) *before* it is dropped.
+/// - **Stream-in**: before running the generator for a missing chunk,
+///   the streaming layer asks [`load`](Self::load); a hit installs
+///   the stored chunk (with its persisted edit version) and the
+///   generator is not called. A stored chunk wins even where
+///   [`ChunkGenerator::should_generate`] declines the index (edits
+///   can materialise chunks the generator never would).
+///
+/// Implementations own the actual storage — an in-memory map, a
+/// save-file region, a database. `load` runs on the streaming pool's
+/// background threads under [`crate::Scene::pump_streaming`] (so
+/// blocking IO is fine there) but **inline** under the synchronous
+/// paths ([`pump_streaming_sync`](crate::Scene::pump_streaming_sync)
+/// / [`Grid::ensure_chunk_generated`](crate::Grid::ensure_chunk_generated));
+/// `store` always runs inline during the eviction pass — keep it
+/// cheap (e.g. queue bytes for a writer thread).
+///
+/// Note [`crate::Scene::to_snapshot`] serialises only *materialised*
+/// chunks — chunks living solely in the store are the host's to save
+/// alongside the snapshot.
+pub trait ChunkStore: fmt::Debug + Send + Sync {
+    /// Persist an edited chunk that is about to be evicted. `version`
+    /// is its [`crate::Grid::chunk_version`] (always non-zero here).
+    fn store(&self, chunk_idx: IVec3, vxl: &Vxl, version: u64);
+
+    /// Load a previously stored chunk. `Some((vxl, version))` installs
+    /// it (restoring `version` as the chunk's edit version) instead of
+    /// generating; `None` falls through to the generator.
+    fn load(&self, chunk_idx: IVec3) -> Option<(Vxl, u64)>;
+}
+
 /// Per-grid streaming activity / eviction radii (S7.1).
 ///
 /// Both values are in **grid-local voxel units** — the same scale
@@ -97,7 +139,7 @@ pub trait ChunkGenerator: fmt::Debug + Send + Sync {
 /// `r_evict = ∞`: [`crate::Scene::pump_streaming_sync`] is a no-op.
 /// Existing grids keep the pre-S7 "absent stays absent, present
 /// stays present" behaviour until a caller opts in.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StreamRadius {
     /// Chunks closer than this (grid-local voxels, AABB distance)
     /// are streamed in.
@@ -223,7 +265,13 @@ mod native {
         /// install; mismatch ⇒ an edit happened mid-generation,
         /// discard the result.
         pub version_at_dispatch: u64,
-        pub vxl: Vxl,
+        /// The produced chunk, or `None` when the task had nothing
+        /// to install (QE.5a: store miss + generator declined the
+        /// index) — the drain then just clears the pending entry.
+        pub vxl: Option<Vxl>,
+        /// QE.5a — set when `vxl` came from the [`ChunkStore`]: the
+        /// persisted edit version to restore on install.
+        pub restored_version: Option<u64>,
     }
 
     /// Per-scene streaming state: dedicated rayon `ThreadPool` plus
@@ -1238,5 +1286,109 @@ pub(crate) mod tests {
         let g = scene.grid(id).unwrap();
         assert_eq!(g.chunk_count(), 0, "chunk should have been evicted");
         assert!(g.billboards.is_none(), "billboard cache should be cleared");
+    }
+
+    // ---- QE.5a: ChunkStore persistence across evict + re-stream ----
+
+    /// In-memory [`ChunkStore`] for the persistence tests.
+    #[derive(Debug, Default)]
+    struct MemStore {
+        slots: std::sync::Mutex<std::collections::HashMap<IVec3, (Vxl, u64)>>,
+    }
+
+    impl ChunkStore for MemStore {
+        fn store(&self, chunk_idx: IVec3, vxl: &Vxl, version: u64) {
+            self.slots
+                .lock()
+                .unwrap()
+                .insert(chunk_idx, (vxl.clone(), version));
+        }
+        fn load(&self, chunk_idx: IVec3) -> Option<(Vxl, u64)> {
+            self.slots
+                .lock()
+                .unwrap()
+                .get(&chunk_idx)
+                .map(|(vxl, version)| (vxl.clone(), *version))
+        }
+    }
+
+    #[test]
+    fn chunk_store_round_trips_edits_across_evict_and_restream() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let store = Arc::new(MemStore::default());
+        {
+            let g = scene.grid_mut(id).unwrap();
+            g.set_generator(Some(Arc::new(StubGenerator::new())));
+            g.set_chunk_store(Some(store.clone()));
+            g.stream_radius = StreamRadius::new(50.0, 200.0);
+        }
+
+        // Stream in around the origin, then edit chunk (0, 0, 0).
+        scene.pump_streaming_sync(DVec3::ZERO);
+        let edited_voxel = IVec3::new(1, 1, 40);
+        let edited_version = {
+            let g = scene.grid_mut(id).unwrap();
+            assert!(g.chunks.contains_key(&IVec3::ZERO), "chunk streamed in");
+            g.set_voxel(edited_voxel, Some(0x8011_2233));
+            assert!(g.voxel_solid(edited_voxel));
+            let v = g.chunk_version(IVec3::ZERO);
+            assert!(v > 0, "edit bumps the version");
+            v
+        };
+
+        // Walk far away: the edited chunk must land in the store; a
+        // pristine (version 0) neighbour must NOT be stored.
+        scene.pump_streaming_sync(DVec3::new(10_000.0, 10_000.0, 0.0));
+        assert!(
+            !scene.grid(id).unwrap().chunks.contains_key(&IVec3::ZERO),
+            "edited chunk evicted"
+        );
+        let stored = store.load(IVec3::ZERO).expect("edited chunk persisted");
+        assert_eq!(stored.1, edited_version, "persisted edit version");
+        assert!(
+            store.load(IVec3::new(1, 0, 0)).is_none(),
+            "pristine generator chunks are regenerable and skip the store"
+        );
+
+        // Walk back: the chunk restores from the store — edits intact,
+        // version restored (not regenerated at version 0).
+        scene.pump_streaming_sync(DVec3::ZERO);
+        let g = scene.grid(id).unwrap();
+        assert!(
+            g.voxel_solid(edited_voxel),
+            "player edit survived evict + re-stream"
+        );
+        assert_eq!(
+            g.chunk_version(IVec3::ZERO),
+            edited_version,
+            "persisted edit version restored"
+        );
+    }
+
+    #[test]
+    fn chunk_store_alone_restores_without_generator() {
+        // A grid with ONLY a store (no generator) still restores
+        // persisted chunks — edits can outlive their generator.
+        let store = Arc::new(MemStore::default());
+        {
+            // Seed the store from a throwaway grid.
+            let mut g = Grid::new(GridTransform::identity());
+            g.set_voxel(IVec3::new(2, 2, 50), Some(0x8044_5566));
+            let vxl = g.chunks.get(&IVec3::ZERO).expect("materialised");
+            store.store(IVec3::ZERO, vxl, 7);
+        }
+
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        {
+            let g = scene.grid_mut(id).unwrap();
+            g.set_chunk_store(Some(store));
+            g.stream_radius = StreamRadius::new(50.0, 200.0);
+        }
+        scene.pump_streaming_sync(DVec3::ZERO);
+        let g = scene.grid(id).unwrap();
+        assert!(g.voxel_solid(IVec3::new(2, 2, 50)));
+        assert_eq!(g.chunk_version(IVec3::ZERO), 7);
     }
 }

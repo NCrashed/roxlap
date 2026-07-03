@@ -92,7 +92,7 @@ pub enum Lod {
 /// - [`crate::Grid::mip_levels_override`] continues to apply on
 ///   top as a global per-grid cap regardless of tier (the ship
 ///   anti-beam workaround is preserved at all LOD tiers).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LodThresholds {
     /// Maximum world-distance at which the grid renders at
     /// [`Lod::Near`]. Grids closer than this are full voxel.

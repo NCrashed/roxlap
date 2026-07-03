@@ -25,7 +25,7 @@ use glam::IVec3;
 use roxlap_formats::vxl::{self, ParseError, Vxl};
 use serde::{Deserialize, Serialize};
 
-use crate::{Grid, GridId, GridTransform, Scene};
+use crate::{Grid, GridId, GridTransform, LodThresholds, Scene, StreamRadius};
 
 /// Re-encode a [`Vxl`]'s mip-0 columns into a contiguous bytes
 /// blob that round-trips through [`vxl::parse`].
@@ -89,7 +89,14 @@ pub struct SceneSnapshot {
     pub grids: Vec<(GridId, GridSnapshot)>,
 }
 
-/// One grid's snapshot: transform + flattened chunks.
+/// One grid's snapshot: transform + flattened chunks + the grid's
+/// runtime configuration (QE.5b — pre-QE.5 snapshots restored every
+/// config field to its default, so a loaded save silently lost
+/// `render_sky` / LOD / streaming settings).
+///
+/// The `generator` and `store` hooks are host code and cannot be
+/// serialised — rebind them after [`Scene::load_snapshot`], keyed on
+/// [`name`](Self::name).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GridSnapshot {
     /// The grid's world placement (position + rotation).
@@ -100,11 +107,33 @@ pub struct GridSnapshot {
     pub chunks: Vec<(IVec3, Vec<u8>)>,
     /// S7.2: per-chunk edit version counters, sorted by chunk
     /// index. Chunks absent from this list restore as version 0 —
-    /// the same as a freshly generated or pre-S7.2 snapshot. The
-    /// `#[serde(default)]` attribute lets a pre-S7.2 snapshot
-    /// deserialise into this newer struct shape cleanly.
+    /// the same as a freshly generated or pre-S7.2 snapshot.
+    /// (`#[serde(default)]` covers self-describing formats; the
+    /// wire-format compatibility story is the QE.5b envelope
+    /// version in [`Scene::save_snapshot`].)
     #[serde(default)]
     pub chunk_versions: Vec<(IVec3, u64)>,
+    /// QE.5b — the grid's host-assigned rebind tag ([`crate::Grid::name`]).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// QE.5b — [`crate::Grid::render_sky`].
+    #[serde(default = "default_render_sky")]
+    pub render_sky: bool,
+    /// QE.5b — [`crate::Grid::mip_levels_override`].
+    #[serde(default)]
+    pub mip_levels_override: Option<u32>,
+    /// QE.5b — [`crate::Grid::lod_thresholds`].
+    #[serde(default = "LodThresholds::always_near")]
+    pub lod_thresholds: LodThresholds,
+    /// QE.5b — [`crate::Grid::stream_radius`].
+    #[serde(default)]
+    pub stream_radius: StreamRadius,
+}
+
+/// `render_sky`'s [`crate::Grid::new`] default, for
+/// `#[serde(default)]` on self-describing formats.
+fn default_render_sky() -> bool {
+    true
 }
 
 /// Errors from [`Scene::from_snapshot`]. Wraps the per-chunk
@@ -189,6 +218,11 @@ impl Scene {
                     transform: grid.transform,
                     chunks,
                     chunk_versions,
+                    name: grid.name.clone(),
+                    render_sky: grid.render_sky,
+                    mip_levels_override: grid.mip_levels_override,
+                    lod_thresholds: grid.lod_thresholds,
+                    stream_radius: grid.stream_radius,
                 },
             ));
         }
@@ -231,9 +265,119 @@ impl Scene {
             for (addr, ver) in &gsnap.chunk_versions {
                 grid.restore_chunk_version(*addr, *ver);
             }
+            // QE.5b — restore the grid's runtime configuration (the
+            // `generator` / `store` hooks are host code: rebind them
+            // after loading, keyed on `name`).
+            grid.name.clone_from(&gsnap.name);
+            grid.render_sky = gsnap.render_sky;
+            grid.mip_levels_override = gsnap.mip_levels_override;
+            grid.lod_thresholds = gsnap.lod_thresholds;
+            grid.stream_radius = gsnap.stream_radius;
             scene.grids.insert(*id, grid);
         }
         Ok(scene)
+    }
+}
+
+/// The QE.5b wire envelope's magic — identifies a byte blob as a
+/// roxlap scene snapshot before any deserialisation runs.
+pub const SNAPSHOT_MAGIC: [u8; 4] = *b"RXSS";
+
+/// Current snapshot wire version. Bumped whenever the
+/// [`SceneSnapshot`] payload shape changes; [`Scene::load_snapshot`]
+/// dispatches on it, so an old save either loads correctly or fails
+/// with [`SnapshotLoadError::UnsupportedVersion`] — never a silent
+/// misparse (the pre-QE.5 failure mode of bare positional bincode).
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// Errors from [`Scene::load_snapshot`].
+#[derive(Debug)]
+pub enum SnapshotLoadError {
+    /// The bytes don't start with [`SNAPSHOT_MAGIC`] — not a roxlap
+    /// snapshot (or a pre-QE.5 bare-bincode save; see the
+    /// [`Scene::load_snapshot`] migration note).
+    BadMagic,
+    /// A snapshot from a newer (or unknown) wire version.
+    UnsupportedVersion(u32),
+    /// The payload failed to decode (truncated / corrupted bytes).
+    Decode(String),
+    /// The payload decoded but a chunk failed to restore.
+    Restore(FromSnapshotError),
+}
+
+impl std::fmt::Display for SnapshotLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadMagic => write!(f, "not a roxlap scene snapshot (bad magic)"),
+            Self::UnsupportedVersion(v) => {
+                write!(
+                    f,
+                    "unsupported snapshot version {v} (this build reads <= {SNAPSHOT_VERSION})"
+                )
+            }
+            Self::Decode(msg) => write!(f, "snapshot payload decode failed: {msg}"),
+            Self::Restore(e) => write!(f, "snapshot restore failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Restore(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl Scene {
+    /// Serialise the scene to the versioned snapshot **wire format**
+    /// (QE.5b): [`SNAPSHOT_MAGIC`] + little-endian
+    /// [`SNAPSHOT_VERSION`] + a bincode [`SceneSnapshot`] payload.
+    /// This is the save-file API — a blob written today stays
+    /// loadable by future engine versions ([`Self::load_snapshot`]
+    /// dispatches on the version), which bare serde values can't
+    /// promise under positional codecs.
+    ///
+    /// Hosts that want a different payload codec (JSON for debugging,
+    /// postcard for size) can still serialise
+    /// [`Self::to_snapshot`]'s value themselves — and then own their
+    /// format's evolution story.
+    #[must_use]
+    pub fn save_snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(&SNAPSHOT_MAGIC);
+        out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        bincode::serialize_into(&mut out, &self.to_snapshot())
+            .expect("bincode into Vec<u8> cannot fail");
+        out
+    }
+
+    /// Load a scene from [`Self::save_snapshot`] bytes, dispatching
+    /// on the embedded wire version.
+    ///
+    /// Migration note: saves written **before** QE.5b (bare bincode
+    /// of a [`SceneSnapshot`], no envelope) fail with
+    /// [`SnapshotLoadError::BadMagic`]; decode those with the engine
+    /// version that wrote them and re-save.
+    ///
+    /// # Errors
+    /// [`SnapshotLoadError`] — bad magic, unknown version, corrupted
+    /// payload, or a failing chunk restore.
+    pub fn load_snapshot(bytes: &[u8]) -> Result<Self, SnapshotLoadError> {
+        let (Some(magic), Some(version)) = (bytes.get(..4), bytes.get(4..8)) else {
+            return Err(SnapshotLoadError::BadMagic);
+        };
+        if magic != SNAPSHOT_MAGIC {
+            return Err(SnapshotLoadError::BadMagic);
+        }
+        let version = u32::from_le_bytes(version.try_into().expect("4-byte slice"));
+        if version != 1 {
+            return Err(SnapshotLoadError::UnsupportedVersion(version));
+        }
+        let snap: SceneSnapshot = bincode::deserialize(&bytes[8..])
+            .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?;
+        Self::from_snapshot(&snap).map_err(SnapshotLoadError::Restore)
     }
 }
 
