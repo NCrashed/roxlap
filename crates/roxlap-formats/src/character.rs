@@ -9,8 +9,9 @@
 //! local offset — so e.g. a flame can hang off a hand. It is the build
 //! target of the **demiurg** editor and
 //! the load source for **monada** at runtime; both sides go through
-//! [`parse`] / [`serialize`], and [`Character::to_kfa_sprite`] turns a
-//! parsed character into a renderable [`KfaSprite`].
+//! [`parse`](crate::character::parse) / [`serialize`](crate::character::serialize),
+//! and [`Character::to_kfa_sprite`](crate::character::Character::to_kfa_sprite) turns a
+//! parsed character into a renderable [`KfaSprite`](crate::kfa::KfaSprite).
 //!
 //! # Layout
 //!

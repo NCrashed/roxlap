@@ -1,30 +1,37 @@
 //! roxlap scene-graph layer — many independent chunked voxel
 //! grids in a single 3D scene.
 //!
-//! See `PORTING-SCENE.md` at the workspace root for the substage
-//! roadmap. This crate is the layer **above** voxlap's per-chunk
-//! renderer (`roxlap-core`): a [`Scene`] holds a sparse set of
-//! [`Grid`]s, each with its own f64 world position + arbitrary 3D
-//! rotation. Future stages will add per-grid raycast composition
-//! (S3), cross-chunk gline within a grid (S4), per-grid rotation
-//! (S5), far-LOD billboards / planet proxies (S6), and streaming +
-//! procedural generation (S7).
+//! This crate is the layer **above** the per-chunk renderer
+//! (`roxlap-core`): a [`Scene`] holds a sparse set of [`Grid`]s, each
+//! with its own f64 world position + arbitrary 3D rotation
+//! ([`GridTransform`]). Around that core sit:
 //!
-//! S2.0 lands the **type skeleton + grid registration only**.
-//! S2.1 adds the [`addr`] module — world ↔ grid-local ↔ chunk +
-//! voxel-in-chunk decomposition, the canonical f64↔i32 boundary
-//! helper called out by risk R5 in `PORTING-SCENE.md`. S2.2 adds
-//! the [`chunks`] module (sparse storage with on-demand chunk
-//! allocation) and the [`Grid`] edit API ([`Grid::set_voxel`],
-//! [`Grid::set_rect`], [`Grid::set_sphere`]) which decompose
-//! multi-chunk operations and delegate to
-//! [`roxlap_formats::edit`]. S2.3 adds the [`snapshot`] module —
-//! a serde-friendly view of the scene that round-trips through
-//! `Serialize` + `Deserialize` (chunks encode via
-//! [`roxlap_formats::vxl::serialize`] / [`parse`]). Rendering
-//! composition is still owed (S3+).
+//! - [`addr`] — world ↔ grid-local ↔ chunk + voxel-in-chunk
+//!   decomposition, the canonical f64↔i32 boundary helpers;
+//! - [`chunks`] — sparse chunk storage with on-demand materialisation,
+//!   plus the [`Grid`] edit API ([`Grid::set_voxel`],
+//!   [`Grid::set_rect`], [`Grid::set_sphere`], …) which decomposes
+//!   multi-chunk operations and delegates to [`roxlap_formats::edit`];
+//! - [`render`] — multi-grid raycast composition for the CPU renderer;
+//! - [`snapshot`] — a serde-friendly view of the scene that
+//!   round-trips through `Serialize` + `Deserialize` (chunks encode
+//!   via [`roxlap_formats::vxl::serialize`] / [`parse`]);
+//! - [`streaming`] — chunk streaming + procedural generation
+//!   ([`streaming::ChunkGenerator`], radius-driven install/evict,
+//!   async generation on a rayon pool);
+//! - [`lod`] / [`billboard`] / [`occluder`] — far-LOD billboards and
+//!   render culling helpers;
+//! - world queries — [`Scene::raycast`], [`Scene::resolve_voxel`],
+//!   [`Grid::voxel_solid`] / [`Grid::voxel_color`].
+//!
+//! `docs/porting/PORTING-SCENE.md` in the repository records the
+//! original substage roadmap (S1..S7, all landed).
 //!
 //! [`parse`]: roxlap_formats::vxl::parse
+
+// QE.0 — the scene crate's public surface is fully documented; keep it
+// that way (CI's `-D warnings` turns this into a hard gate).
+#![warn(missing_docs)]
 
 pub mod addr;
 pub mod billboard;
@@ -282,7 +289,9 @@ fn voxel_dda(grid: &Grid, lo: DVec3, ld: DVec3, max_t: f64) -> Option<(IVec3, f6
 /// Voxel size is fixed at 1 world unit / voxel for v1.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GridTransform {
+    /// The grid's local-space origin, in world coordinates.
     pub origin: DVec3,
+    /// The grid's orientation about `origin`.
     pub rotation: DQuat,
 }
 
@@ -323,8 +332,11 @@ impl Default for GridTransform {
 /// `(voxel.x, voxel.y) < CHUNK_SIZE_XY` and `voxel.z < CHUNK_SIZE_Z`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GridAddr {
+    /// The owning grid.
     pub grid: GridId,
+    /// Signed chunk index within the grid.
     pub chunk: IVec3,
+    /// Voxel offset inside `chunk` (see the bounds above).
     pub voxel: UVec3,
 }
 
@@ -426,7 +438,7 @@ pub struct Grid {
     ///
     /// Populated by [`Scene::pump_streaming`] when it dispatches a
     /// generator call onto the streaming rayon pool, drained when
-    /// the corresponding [`ChunkResult`] is received and processed
+    /// the corresponding `ChunkResult` is received and processed
     /// (either installed or discarded). The set is consulted to
     /// avoid re-dispatching the same chunk while a previous task
     /// is still running.
@@ -434,8 +446,6 @@ pub struct Grid {
     /// Stays empty when only the synchronous
     /// [`Scene::pump_streaming_sync`] is used — that path generates
     /// inline on the calling thread.
-    ///
-    /// [`ChunkResult`]: streaming::ChunkResult
     pub pending_gen: HashSet<IVec3>,
     /// Cross-frame DDA brick-occupancy cache (Substage DDA.7 perf).
     /// Keyed by `(chunk, mip)` + the chunk's edit version, so a static

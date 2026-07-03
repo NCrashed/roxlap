@@ -341,26 +341,10 @@ impl App {
 
     /// Build a [`Camera`] from the current `cam_pos` + `yaw` + `pitch`.
     fn camera(&self) -> Camera {
-        // Voxlap's right-handed basis with z growing downward. Per
-        // `feedback_voxlap_basis_chirality.md`: the camera's down vector
-        // must satisfy `right × down == forward`. The cyclic relation is
-        // `forward × right = down`.
-        let (sy, cy) = self.yaw.sin_cos();
-        let (sp, cp) = self.pitch.sin_cos();
-        let forward = [cy * cp, sy * cp, sp];
-        let right = [-sy, cy, 0.0];
-        // down = forward × right
-        let down = [
-            forward[1] * right[2] - forward[2] * right[1],
-            forward[2] * right[0] - forward[0] * right[2],
-            forward[0] * right[1] - forward[1] * right[0],
-        ];
-        Camera {
-            pos: self.cam_pos,
-            right,
-            down,
-            forward,
-        }
+        // The canonical right-handed voxlap basis (`right × down ==
+        // forward`) — always via `Camera::from_yaw_pitch`, never
+        // hand-rolled (a chirality mistake silently culls sprites).
+        Camera::from_yaw_pitch(self.cam_pos, self.yaw, self.pitch)
     }
 
     /// Advance camera position by `dt` seconds based on which movement

@@ -35,8 +35,8 @@ use roxlap_formats::vxl::Vxl;
 /// is a borrow or a `u32`.
 ///
 /// Fields are public on purpose. External callers usually go
-/// through the [`from_single_vxl`](Self::from_single_vxl) /
-/// [`from_parts`](Self::from_parts) constructors, but the engine's
+/// through the [`from_single_vxl`](GridView::from_single_vxl) /
+/// [`from_parts`](GridView::from_parts) constructors, but the engine's
 /// internals destructure directly. Keeping the fields exposed
 /// avoids a layer of accessor methods that the borrow checker
 /// would otherwise force at every read.

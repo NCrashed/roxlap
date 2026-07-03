@@ -1,6 +1,6 @@
 //! Animated voxel-sprite clips (`.rvc`) — a "GIF/MP4 for voxel models".
 //!
-//! A [`VoxelClip`] is a fixed-bounding-box sequence of voxel frames,
+//! A [`VoxelClip`](crate::voxel_clip::VoxelClip) is a fixed-bounding-box sequence of voxel frames,
 //! encoded as **keyframes + inter-frame diffs** (like video I/P frames),
 //! for effects such as flame, spells, and muzzle flashes. See
 //! `PORTING-VOXEL-CLIP.md` for the full design (stage VCL).
@@ -11,10 +11,10 @@
 //! model uses ([`roxlap-gpu`'s `SpriteModel`]): a per-`(x, y)`-column
 //! occupancy bitmask plus per-column ascending-z colour runs. Columns
 //! are indexed `col = x + y * dims[0]`; a column's occupancy is
-//! [`occ_words_per_col`](VoxelClip::occ_words_per_col) u32 words, bit
+//! [`occ_words_per_col`](crate::voxel_clip::VoxelClip::occ_words_per_col) u32 words, bit
 //! `z & 31` of word `z >> 5`. This makes GPU upload a field move (no
 //! bucket-sort) and makes diffs clean (per column). Surface-normal
-//! `dir` indices are **recomputed at [`decode`](VoxelClip::decode)** from
+//! `dir` indices are **recomputed at [`decode`](crate::voxel_clip::VoxelClip::decode)** from
 //! the reconstructed occupancy, so the on-disk codec carries only
 //! occupancy + colour.
 //!
@@ -1001,7 +1001,7 @@ impl VoxelClip {
     /// Encode a sequence of full frames, **auto-choosing** keyframe vs. delta
     /// per frame (VCL.1) instead of a fixed interval — the codec's I-frame
     /// decision. A frame is stored as a keyframe when its delta would be
-    /// large (a "scene change": at least [`KEYFRAME_COST_PCT`]% of the
+    /// large (a "scene change": at least `KEYFRAME_COST_PCT`% of the
     /// keyframe's size — a delta that big is barely a saving and a keyframe
     /// is independently seekable), or when `max_keyframe_gap` frames have
     /// passed since the last keyframe (a seekability cap; `0` = no cap, fully

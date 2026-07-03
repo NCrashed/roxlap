@@ -2,7 +2,7 @@
 //!
 //! A [`Camera`] carries an `f64` world position and an orthonormal
 //! `right` / `down` / `forward` basis. Rendering happens in `f32`, so
-//! [`derive`] narrows the basis once per frame and precomputes the four
+//! [`derive`](fn@derive) narrows the basis once per frame and precomputes the four
 //! view-frustum corner ray directions.
 //!
 //! ## Pinhole model

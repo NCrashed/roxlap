@@ -4,7 +4,8 @@
 //! 3D-DDA over an 8³ brickmap ([`dda`] + [`dda_sprite`]); it reads the
 //! voxlap-compatible `.vxl` / KV6 / KFA formats from `roxlap-formats`
 //! but the rendering algorithm is not voxlap-derived. See
-//! `PORTING-RUST.md` at the workspace root for the project history.
+//! `docs/porting/PORTING-RUST.md` in the repository for the project
+//! history.
 //!
 //! # World handedness and the horizontal mirror
 //!

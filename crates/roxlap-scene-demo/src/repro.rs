@@ -33,14 +33,7 @@ const W: u32 = 800;
 const H: u32 = 600;
 
 fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
-    let (sy, cy) = yaw.sin_cos();
-    let (sp, cp) = pitch.sin_cos();
-    Camera {
-        pos,
-        right: [-sy, cy, 0.0],
-        down: [-cy * sp, -sy * sp, cp],
-        forward: [cy * cp, sy * cp, sp],
-    }
+    Camera::from_yaw_pitch(pos, yaw, pitch)
 }
 
 /// Render `scene` from `camera` via `render_scene_composed` with

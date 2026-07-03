@@ -19,7 +19,7 @@ runner = "wasm-bindgen-test-runner"
 # `memory.atomic.wait/notify`, shared-memory grow). The std crate
 # is not built with these by default on wasm32-unknown-unknown,
 # so `[unstable] build-std` below rebuilds it from `rust-src`
-# (provided via the nightly toolchain in `rust-toolchain.toml`).
+# (provided via the nightly toolchain in the web crates' `rust-toolchain.toml`).
 # Wasm threads also require browser-side cross-origin isolation
 # (COOP `same-origin` + COEP `require-corp`); see each web
 # crate's `Trunk.toml`.
@@ -60,6 +60,6 @@ rustflags = [
 # R10.X.2: rebuild std with the threading-enabled features above
 # so rayon's `std::thread::Thread`-using code paths compile under
 # wasm-bindgen-rayon's Worker-backed pool. Requires nightly cargo
-# (the channel pinned in `rust-toolchain.toml`).
+# (the channel pinned in `crates/roxlap-web/rust-toolchain.toml` — build from inside a web crate dir so rustup picks it up).
 [unstable]
 build-std = ["std", "panic_abort"]

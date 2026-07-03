@@ -16,7 +16,7 @@
 //! occluded by DDA terrain correctly.
 //!
 //! Shading reads the KV6 voxel's baked brightness byte (high byte of
-//! the packed colour) via [`crate::dda::shade`] — the clean-room
+//! the packed colour) via `crate::dda::shade` — the clean-room
 //! brightness model, not voxlap's `dir`-LUT reflection shading.
 
 use roxlap_formats::kv6::Kv6;
@@ -110,7 +110,7 @@ impl SpriteDense {
     /// Like [`from_kv6`](Self::from_kv6) but classifies each voxel into a
     /// material id by colour (TV.3 mixed models) via `material_map`
     /// (`(rgb, material_id)` pairs; see
-    /// [`material_for_color`](roxlap_formats::material::material_for_color)).
+    /// [`material_for_color`]).
     /// The resulting per-voxel `mat` array is consulted by the
     /// [`draw_sprite_dense_shaded`] accumulate path. An empty map yields the
     /// same all-opaque (uniform) result as `from_kv6`.

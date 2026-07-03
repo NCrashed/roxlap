@@ -29,17 +29,12 @@ pub const SHIP_SPIN_RATE_XY: f64 = 0.15;
 
 use crate::{markers, ship, terrain};
 
-/// Camera basis for "yaw=0, pitch=0 looks +x, voxlap-z down".
-/// Same convention as the existing `roxlap-host` demo.
+/// Camera basis for "yaw=0, pitch=0 looks +x, voxlap-z down" — a
+/// demo-local alias for the canonical [`Camera::from_yaw_pitch`]
+/// constructor (never hand-roll this basis; chirality mistakes here
+/// silently cull every sprite).
 pub fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
-    let (sy, cy) = yaw.sin_cos();
-    let (sp, cp) = pitch.sin_cos();
-    Camera {
-        pos,
-        right: [-sy, cy, 0.0],
-        down: [-cy * sp, -sy * sp, cp],
-        forward: [cy * cp, sy * cp, sp],
-    }
+    Camera::from_yaw_pitch(pos, yaw, pitch)
 }
 
 /// Build the demo scene + initial camera state.
@@ -195,7 +190,7 @@ pub fn build_demo() -> SceneAndCamera {
 /// S5.2: `ship_id` + `ship_angle` + `spin_enabled` drive the
 /// per-frame ship rotation. Toggling `spin_enabled` (R hotkey)
 /// makes the saucer slowly rotate about its own Z axis via
-/// [`tick_ship_spin`].
+/// [`tick_ship_spin`](SceneAndCamera::tick_ship_spin).
 pub struct SceneAndCamera {
     pub scene: Scene,
     // `camera` / `cam_pos` / `yaw` / `pitch` and `refresh_camera` are
@@ -269,7 +264,7 @@ impl SceneAndCamera {
     /// non-axis-aligned, continuously-changing orientation.
     /// Composition order: `R_z · R_y · R_x` (X applied first to
     /// any grid-local vector, then Y, then Z).
-    /// S6.6: flip the marker grids' [`LodThresholds`] between
+    /// S6.6: flip the marker grids' [`LodThresholds`](roxlap_scene::LodThresholds) between
     /// the always-Near default and the tuned billboards config.
     /// Toggles [`Self::lod_billboards_on`] and returns the new
     /// value so the caller can echo it to the console.
@@ -416,7 +411,7 @@ fn bake_lightmode(scene: &mut Scene, lightmode: u32, ao: roxlap_core::AoParams) 
 /// Per-chunk lighting + mip bake driver for streaming grids.
 ///
 /// The post-S7.6-hills patch: removed the in-isolation bake from
-/// [`crate::terrain::HillsChunkGenerator::generate`] because the
+/// [`crate::terrain::HillsChunkGenerator::generate`](roxlap_scene::ChunkGenerator::generate) because the
 /// generator runs on the streaming rayon pool with no access to
 /// the live [`Grid`] — its estnorm reader had to return `None` for
 /// every voxel past its chunk's own face, producing visible
@@ -556,7 +551,7 @@ impl Default for StreamingBakeTracker {
 /// Run lightmode-1 directional bake on `chunk_idx` of `grid` using a
 /// reader that resolves to neighbour chunks via [`Grid::chunk`].
 ///
-/// Same shape as the inner loop body of [`bake_lightmode_1`]; pulled
+/// Same shape as the inner loop body of `bake_lightmode_1`; pulled
 /// out so [`StreamingBakeTracker`] can call it per-install. Unlike
 /// the in-generator bake this previously replaced, queries past the
 /// target chunk's own faces resolve to the actual neighbour's data

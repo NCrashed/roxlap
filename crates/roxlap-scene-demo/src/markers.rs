@@ -27,11 +27,11 @@
 //! `B` hotkey — LOD on: every marker grid's thresholds switch to
 //! `r_near = 400, r_mid = 400` (no Mid band — just Near vs Far).
 //! The closer pillars stay Near (full voxel); the farther pillars
-//! flip to [`Lod::Far`] and render via S6.3's billboard impostor
+//! flip to [`Lod::Far`](roxlap_scene::Lod::Far) and render via S6.3's billboard impostor
 //! blit. The Mid tier is deliberately skipped here because the
 //! `set_rect + generate_mips` chunk currently hits the known
 //! all-sky-at-distant-mip bug
-//! ([[project_mip_attempt]]); when that's fixed, the demo's
+//! (`project_mip_attempt`); when that's fixed, the demo's
 //! thresholds can grow a real Mid band.
 
 use glam::{DVec3, IVec3};
@@ -110,7 +110,7 @@ const PALETTE: [(u32, u32); NUM_MARKERS] = [
 /// (4-on, 4-off).
 ///
 /// **No `generate_mips` call.** A `set_rect`-built chunk with this
-/// shape hits the [[mip_attempt]] bug — `Vxl::generate_mips` reads
+/// shape hits the `mip_attempt` bug — `Vxl::generate_mips` reads
 /// past the slab buffer after the cumulative stripes grow it past
 /// the initial capacity. The demo's `B` toggle skips Mid (Near vs
 /// Far only — see module doc), so the multi-mip ladder is dead

@@ -4,7 +4,7 @@
 //! module lands incrementally:
 //!
 //! - **S7.0** (this commit): the [`ChunkGenerator`] trait and the
-//!   synchronous [`Grid::ensure_chunk_generated`] helper. Generators
+//!   synchronous [`Grid::ensure_chunk_generated`](crate::Grid::ensure_chunk_generated) helper. Generators
 //!   are plain `Box<dyn ChunkGenerator>` — no rayon, no channels,
 //!   no async dispatch yet.
 //! - S7.1: per-grid `StreamRadius { r_active, r_evict }` policy and

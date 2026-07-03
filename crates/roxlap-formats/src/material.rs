@@ -31,7 +31,7 @@ pub enum BlendMode {
     /// fire, magic auras, muzzle flashes.
     Additive = 2,
     /// Thickness-aware Beer–Lambert absorption for **filled** volumes (true
-    /// smoke, fog, murky water). Unlike [`AlphaBlend`] (which composites one
+    /// smoke, fog, murky water). Unlike [`AlphaBlend`](BlendMode::AlphaBlend) (which composites one
     /// alpha per surface run, so opacity is independent of thickness — ideal
     /// for shells/glass), `Volumetric` weights each voxel's opacity by the
     /// ray's path length through it: the per-cell effective opacity is

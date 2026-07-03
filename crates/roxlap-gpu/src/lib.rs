@@ -140,8 +140,8 @@ impl From<wgpu::RequestDeviceError> for GpuInitError {
 }
 
 /// WGPU-backed renderer. Owns the device, queue, and surface
-/// bound to the host's window. [`Self::render`] is the GPU.1
-/// clear-to-colour path; [`Self::render_chunk`] is GPU.3's
+/// bound to the host's window. [`GpuRenderer::render`] is the GPU.1
+/// clear-to-colour path; [`GpuRenderer::render_chunk`] is GPU.3's
 /// single-chunk DDA marcher.
 ///
 /// The window is consumed only at construction — `wgpu`'s
@@ -1100,7 +1100,7 @@ pub const MAX_SHADOW_CASTERS: usize = 4;
 
 /// A point light in a grid's **local** space, as handed to
 /// [`GpuRenderer::set_scene_lights`]. The facade transforms world-space
-/// [`roxlap_render::PointLight`]s into each grid's frame.
+/// `roxlap_render::PointLight`s into each grid's frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GpuLight {
     /// Grid-local position (voxel units).
@@ -1376,7 +1376,7 @@ impl SceneDdaPerGridCamera {
 /// XS.3 — a grid's world transform for cross-grid shadows: world origin +
 /// the local→world rotation columns (`rot_cols[i]` = world image of grid-local
 /// axis `i`). Built host-side per frame from the grid's `GridTransform` and
-/// handed to [`SceneRenderer::render_scene`] alongside the per-grid cameras.
+/// handed to `SceneRenderer::render_scene` alongside the per-grid cameras.
 #[derive(Clone, Copy)]
 pub struct GridWorldTransform {
     pub origin: [f32; 3],
@@ -1878,7 +1878,7 @@ impl GpuRenderer {
     /// equirectangular layout (top of image = zenith for voxlap's
     /// `+z = down` basis).
     /// Mirror the marched scene (and its line/image overlays) horizontally
-    /// on present, leaving the egui overlay upright. See [`Self::flip_x`].
+    /// on present, leaving the egui overlay upright. See `Self::flip_x`.
     pub fn set_flip_x(&mut self, flip: bool) {
         self.flip_x = flip;
     }
@@ -4546,7 +4546,7 @@ impl GpuRenderer {
     /// new geometry (unique asteroids, generated meshes).
     ///
     /// Usage mirrors `update_sprite_model`: you own the
-    /// [`SpriteModelRegistry`](sprite_model::SpriteModelRegistry), append
+    /// [`SpriteModelRegistry`], append
     /// the model with [`add_lod`](sprite_model::SpriteModelRegistry::add_lod)
     /// (or `add`), then pass the returned `chain_id` here to sync that one
     /// chain to the GPU. Afterwards [`Self::append_sprite_instances`] may

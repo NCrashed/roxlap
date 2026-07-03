@@ -13,6 +13,23 @@ members = [
     "crates/roxlap-sdl-demo",
     "crates/roxlap-web",
 ]
+# QE.0 — everything except `roxlap-sdl-demo`, which links system SDL2
+# (`-lSDL2`) and breaks a plain `cargo build` on machines without the
+# SDL dev headers. Build it explicitly with `-p roxlap-sdl-demo` (or
+# `--workspace`, as CI's clippy job does).
+default-members = [
+    "crates/roxlap-cave-demo",
+    "crates/roxlap-cave-web",
+    "crates/roxlap-cavegen",
+    "crates/roxlap-core",
+    "crates/roxlap-formats",
+    "crates/roxlap-gpu",
+    "crates/roxlap-host",
+    "crates/roxlap-render",
+    "crates/roxlap-scene",
+    "crates/roxlap-scene-demo",
+    "crates/roxlap-web",
+]
 resolver = "2"
 
 [workspace.package]
@@ -67,6 +84,11 @@ serde = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
+# QE.0: `missing_docs` is enabled per-crate (`#![warn(missing_docs)]`
+# in roxlap-scene + roxlap-render, the two crates a game host reads
+# first). Workspace-wide enablement is owed once roxlap-gpu /
+# roxlap-formats / roxlap-core document their remaining struct fields
+# (~250 items, mostly voxlap-parity field names).
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

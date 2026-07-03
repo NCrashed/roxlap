@@ -8,7 +8,7 @@ the sky.
 ## Vision (full-power demo)
 
 Once the scene-graph stage closes (S7 in
-[`PORTING-SCENE.md`](../../PORTING-SCENE.md)) the demo will
+[`PORTING-SCENE.md`](../../docs/porting/PORTING-SCENE.md)) the demo will
 showcase every load-bearing capability of the engine:
 
 - **Streamed planet surface** — effectively infinite procedural

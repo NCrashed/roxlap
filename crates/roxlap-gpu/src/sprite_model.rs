@@ -77,7 +77,7 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
 /// Build the DDA volume from a KV6, classifying each voxel into a per-voxel
 /// **material id** by colour (TV.3 mixed models) via `material_map`
 /// (`(rgb, material_id)` pairs; see
-/// [`material_for_color`](roxlap_formats::material::material_for_color)).
+/// [`material_for_color`]).
 /// An empty map produces a model with no per-voxel materials (identical to
 /// [`build_sprite_model`]).
 ///

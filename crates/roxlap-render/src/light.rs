@@ -1,7 +1,7 @@
-//! Dynamic lighting (stage DL) — runtime sun + point lights + stylized
-//! voxel shadows. **GPU-only**: the CPU rasterizer ignores everything
-//! here (it keeps multiplying the baked ambient byte). See
-//! `PORTING-DYNLIGHT.md`.
+//! Dynamic lighting (stages DL + SL) — runtime sun + point + spot
+//! lights with stylized voxel shadows, on **both** backends (the GPU
+//! shaders since DL, the CPU renderer since CPU.1/CPU.2). See
+//! `PORTING-DYNLIGHT.md` + `PORTING-SPOTLIGHT.md`.
 //!
 //! Lighting is per-frame: a host builds a [`LightRig`] each frame and
 //! hands it to the renderer via [`crate::FrameParams::lights`]. There are

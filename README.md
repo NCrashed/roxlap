@@ -41,6 +41,59 @@ renderer** (`roxlap-gpu`, WGPU/WGSL) renders the same scene at much higher
 frame rates — the same retro look, the CPU budget freed for game logic. A
 unified `roxlap-render` facade picks CPU or GPU and falls back automatically.
 
+## Use it in your game
+
+Depend on the facade + the scene graph (the other crates come in
+transitively):
+
+```toml
+[dependencies]
+roxlap-render = "0.21"   # SceneRenderer — one renderer over CPU + GPU
+roxlap-scene  = "0.21"   # Scene / Grid / edits / streaming
+roxlap-core   = "0.21"   # Camera + per-frame render settings
+glam          = "0.30"
+```
+
+The core loop is: build a [`Scene`], place voxels on a `Grid`, then
+hand the scene + a `Camera` to `SceneRenderer::render` each frame —
+the facade picks the GPU compute backend and falls back to the CPU
+renderer automatically.
+
+```rust,no_run
+use glam::{DVec3, IVec3};
+use roxlap_core::{opticast::OpticastSettings, Camera};
+use roxlap_render::{FrameParams, RenderOptions, SceneRenderer};
+use roxlap_scene::{GridTransform, Scene};
+
+// `window` is anything raw-window-handle: winit, SDL, GLFW, …
+fn run(window: std::sync::Arc<winit::window::Window>) {
+    // A one-grid world: a plain + a dome. +z points DOWN (voxlap
+    // convention); colours are voxlap-packed 0x80_RR_GG_BB.
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
+    let grid = scene.grid_mut(id).unwrap();
+    grid.set_rect(IVec3::new(-128, -128, 210), IVec3::new(127, 127, 254), Some(0x80_4d_8a_3a));
+    grid.set_sphere(IVec3::new(0, 0, 205), 30, Some(0x80_40_60_c0));
+
+    let opts = RenderOptions { want_gpu: true, ..RenderOptions::default() };
+    let mut renderer = SceneRenderer::new(window, (960, 600), &opts);
+
+    // Per frame:
+    let camera = Camera::orbit(0.4, 0.35, 220.0, [0.0, 0.0, 195.0]);
+    let settings = OpticastSettings::for_oracle_framebuffer(960, 600);
+    let frame = FrameParams::new(&settings);
+    renderer.render(&mut scene, &camera, &frame);
+    renderer.present();
+}
+```
+
+The complete runnable version (winit window + event loop + orbit
+camera, ~140 lines) ships as an example:
+
+```sh
+cargo run --release -p roxlap-render --example quickstart
+```
+
 ## Quick start
 
 Try the procedural-cave demo — generates a Worley + Perlin cave
@@ -127,12 +180,18 @@ won't spin up. Full setup + per-host header config in
 | [`roxlap-render`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-render) | Unified renderer facade — one `SceneRenderer` over the CPU opticast and the GPU marcher with **automatic CPU fallback**. Owns presentation, the Scene→GPU bridge, sprites + animated voxel clips, **Doom-style GIF billboard sprites** (`gif` feature: `gif_import` + `add_billboard_instance` / `BillboardActor` — camera-facing animated cutouts that cast + receive shadows), screen→world picking (`pick` / `pixel_ray` / `view_ray` / `pick_depth`), depth-tested overlay lines (`draw_lines` — editor gizmos occluded by the scene), and a **fixed-resolution post pipeline** (`set_render_resolution` renders into a fixed logical grid nearest-upscaled to the window so FPS stops tracking window size; `set_ssaa` supersamples; `set_posterize` reduced-palette + dither for the retro look). Hosts stay thin: build a `Scene`, advance it, call `render`. |
 | [`roxlap-cave-demo`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cave-demo) | Procedural-cave showcase binary (winit + softbuffer). Cave-gen on startup, real-time edits via plasma bullets, fog, F/R preset+seed toggles. |
 | [`roxlap-scene-demo`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-scene-demo) | Scene-graph + GPU showcase binary: a menu of scenes (World, Sprites, Animation, Transparency, Lighting, **Doom** GIF billboards, Picking, …) on the unified renderer (`ROXLAP_GPU=1` selects the GPU backend). Mouse-pick mode, runtime carving, top-down vantage, and a live **Render pipeline** HUD panel (resolution / SSAA / posterize + dither). |
-| [`roxlap-host`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). |
+| [`roxlap-host`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). Despite the name it is **not** a host-integration helper — for embedding the engine in your own window/event loop, see `roxlap-render` + the `quickstart` example. |
 | [`roxlap-web`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-web) | Engine demo for the browser (wasm32 + wasm-bindgen + canvas). Oracle world + WebAssembly SIMD batches, ~360 KB wasm bundle. Run via `trunk serve` for dev / `trunk build --release` for deploy. |
 | [`roxlap-cave-web`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cave-web) | Cave demo for the browser — Worley + Perlin cave-gen, fly + fire + carve with local relight on impact, all on wasm32. ~130 KB wasm bundle (no embedded asset; cave is generated client-side). |
 
-The library API surface is documented at [docs.rs/roxlap-core](https://docs.rs/roxlap-core)
-and [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
+The library API surface is documented on docs.rs — start with
+[docs.rs/roxlap-render](https://docs.rs/roxlap-render) (the facade your
+game talks to) and [docs.rs/roxlap-scene](https://docs.rs/roxlap-scene)
+(the world you build), then
+[docs.rs/roxlap-core](https://docs.rs/roxlap-core) /
+[docs.rs/roxlap-formats](https://docs.rs/roxlap-formats) /
+[docs.rs/roxlap-gpu](https://docs.rs/roxlap-gpu) for the layers
+underneath.
 
 ## Why roxlap?
 
@@ -169,7 +228,7 @@ and [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
   glass models — for static sprites **and** animated clips), and
   world-terrain (glass walls, water) translucency; `Volumetric` weights
   opacity by the ray's path length so a filled cloud reads denser at its
-  core. See `PORTING-TRANSPARENCY.md`.
+  core. See `docs/porting/PORTING-TRANSPARENCY.md`.
 
 ## Status
 
@@ -190,52 +249,35 @@ reference walk (including a leak-free empty-space-skip regression), and
 by design and is validated by a headless render-diff harness rather than
 byte-goldens.
 
-See [PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md)
+See [PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/docs/porting/PORTING-RUST.md)
 for the CPU-port substage roadmap, plus `PORTING-SCENE.md` (scene graph) and
-`PORTING-GPU.md` (GPU renderer) for the later arcs.
+`PORTING-GPU.md` (GPU renderer) for the later arcs — all under
+[docs/porting/](https://github.com/NCrashed/roxlap/tree/master/docs/porting).
 
 ## Multicore
 
-Three parallelism axes ship out of the box, all rayon-backed:
-
-```rust
-// 1. Per-strip render — split the framebuffer into N row strips,
-//    each runs an independent opticast pass. Pool size = strip count.
-let mut pool = ScratchPool::new_parallel(xres, yres, vsid, 4);
-
-// 2. World-voxel lighting bake — outer y-loop is rayon::par_iter.
-//    Honours RAYON_NUM_THREADS env var.
-roxlap_core::update_lighting(world, offsets, vsid, x0, y0, z0, x1, y1, z1, mode, &lights);
-
-// 3. Sprite batch — par_iter over &[Sprite], z-test arbitrates writes.
-let target = DrawTarget::new(fb, zb, pitch, w, h);
-draw_sprites_parallel(target, &cam_state, &settings, &lighting, &sprites);
-```
-
-Measured on Intel i7-12700H (6 P-cores + 8 E-cores, 24 MB L3):
-
-| workload | sequential | parallel (best) | speedup | RAYON_NUM_THREADS |
-|---|---|---|---|---|
-| opticast per-strip render (oracle, 12 poses, 640×480) | 10.98 ms | 7.36 ms | **1.49×** | 4 |
-| update_lighting (448×448×200 bake) | 38.11 ms | 11.38 ms | **3.35×** | default (20) |
-| draw_sprites (64 sprites, synthetic grid) | 1.19 ms | 0.27 ms | **4.42×** | 16 |
-| draw_sprites (256 sprites) | 2.48 ms | 0.42 ms | **6.13×** | default (20) |
-
-The opticast hot path has limited parallelism headroom (per-strip
-ray fans discretise differently per N — geometrically valid but
-not byte-stable across strip counts; CI freezes goldens at N=1).
-update_lighting and the sprite batch scale near-linearly past 8
-threads — they're the right axes for dynamic-light or
-massive-sprite scenes.
-
-Full design + tradeoffs in
-[PORTING-MULTICORE.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-MULTICORE.md).
+CPU rendering is rayon-parallel out of the box — no API to call. The
+per-pixel DDA renderer splits the frame into row strips, the
+world-voxel lighting bake fans out per column batch, and the sprite
+pass batches per sprite; all of it is internal to
+`SceneRenderer::render` / `Grid::bake_lightmode`. Bound the pool with
+the standard `RAYON_NUM_THREADS` env var. In the browser the same
+parallelism runs on Web Workers via `wasm-bindgen-rayon` (see the
+web-demo notes above). Design history + measurements:
+[PORTING-MULTICORE.md](https://github.com/NCrashed/roxlap/blob/master/docs/porting/PORTING-MULTICORE.md)
+(original strip-parallel port) and
+[PORTING-PERF.md](https://github.com/NCrashed/roxlap/blob/master/docs/porting/PORTING-PERF.md)
+(the PF series: parallel lighting bake, dirty-extent GPU refresh,
+quiet-frame skips).
 
 ## Documentation
 
-- API: [docs.rs/roxlap-core](https://docs.rs/roxlap-core),
+- API: [docs.rs/roxlap-render](https://docs.rs/roxlap-render),
+  [docs.rs/roxlap-scene](https://docs.rs/roxlap-scene),
+  [docs.rs/roxlap-core](https://docs.rs/roxlap-core),
   [docs.rs/roxlap-formats](https://docs.rs/roxlap-formats).
-- Algorithm + porting notes: [PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/PORTING-RUST.md).
+- Algorithm + porting notes: [docs/porting/](https://github.com/NCrashed/roxlap/tree/master/docs/porting),
+  starting from [PORTING-RUST.md](https://github.com/NCrashed/roxlap/blob/master/docs/porting/PORTING-RUST.md).
 - Reference C engine this ports from:
   [voxlaptest](https://github.com/NCrashed/voxlaptest).
 - Original Voxlap homepage: [advsys.net/ken/voxlap.htm](http://advsys.net/ken/voxlap.htm).

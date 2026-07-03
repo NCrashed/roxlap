@@ -57,17 +57,19 @@ use roxlap_core::Camera;
 use crate::{Grid, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
 /// Per-grid bounding metadata in grid-local space — computed once
-/// per render dispatch by [`grid_local_centre_and_radius`].
+/// per render dispatch by `grid_local_centre_and_radius`.
 /// Exposed so S6.3's `render_scene_composed` Far arm can share the
 /// centre/radius pair across the cache lookup AND the blit
 /// projection without recomputing.
 #[derive(Debug, Clone, Copy)]
 pub struct GridLocalBounds {
+    /// Grid-local centre of the populated-chunk bounding box.
     pub centre: DVec3,
+    /// Bounding-sphere radius around `centre` (grid-local units).
     pub radius: f64,
 }
 
-/// See [`super::grid_local_centre_and_radius`] for the internal
+/// See `super::grid_local_centre_and_radius` for the internal
 /// version. The pub re-export keeps render.rs out of the
 /// internal-helper namespace.
 #[must_use]
@@ -85,7 +87,7 @@ const CAMERA_DISTANCE_FACTOR: f64 = 8.0;
 /// Default per-snapshot framebuffer resolution. 128 × 128 keeps
 /// memory budget per grid at `26 × 128² × (4 colour + 4 depth) =
 /// ~3.4 MB` — acceptable for a handful of ships in a scene.
-/// Configurable via [`BillboardCache::with_resolution`].
+/// Configurable via `BillboardCache::with_resolution`.
 pub const DEFAULT_RESOLUTION: u32 = 128;
 
 /// Sentinel colour stamped into a snapshot's framebuffer wherever

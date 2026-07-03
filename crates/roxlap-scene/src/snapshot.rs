@@ -92,6 +92,7 @@ pub struct SceneSnapshot {
 /// One grid's snapshot: transform + flattened chunks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GridSnapshot {
+    /// The grid's world placement (position + rotation).
     pub transform: GridTransform,
     /// Chunks as `(chunk_idx, vxl_bytes)`. `vxl_bytes` is
     /// [`roxlap_formats::vxl::serialize`] output — re-parseable
@@ -114,8 +115,11 @@ pub enum FromSnapshotError {
     /// One chunk's bytes failed to round-trip through
     /// [`roxlap_formats::vxl::parse`].
     ChunkParse {
+        /// The grid whose chunk failed to parse.
         grid: GridId,
+        /// The failing chunk's index within `grid`.
         chunk: IVec3,
+        /// The underlying `.vxl` parse failure.
         source: ParseError,
     },
 }

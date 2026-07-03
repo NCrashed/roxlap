@@ -1,4 +1,7 @@
-//! roxlap-host — winit + softbuffer demo host.
+//! roxlap-host — the legacy engine-feature demo binary (winit +
+//! softbuffer). Despite the name this is **not** a host-integration
+//! helper crate: to embed roxlap in your own window / event loop,
+//! depend on `roxlap-render` and start from its `quickstart` example.
 //!
 //! Opens a window, loads a real `.vxl` world (oracle.vxl.gz from the
 //! workspace assets), and on every `RedrawRequested` event runs
@@ -362,17 +365,7 @@ impl App {
         // assumes — get the chirality wrong and `kv6_draw_prepare`'s
         // bound-cube cull rejects every sprite as "outside the
         // frustum".
-        let (sy, cy) = self.yaw.sin_cos();
-        let (sp, cp) = self.pitch.sin_cos();
-        let right = [-sy, cy, 0.0];
-        let down = [-cy * sp, -sy * sp, cp];
-        let forward = [cy * cp, sy * cp, sp];
-        Camera {
-            pos: self.cam_pos,
-            right,
-            down,
-            forward,
-        }
+        Camera::from_yaw_pitch(self.cam_pos, self.yaw, self.pitch)
     }
 
     fn toggle_sky(&mut self) {

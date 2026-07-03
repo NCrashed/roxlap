@@ -56,12 +56,12 @@
           # The toolchain bundles `rust-src` (required by
           # `-Z build-std`) and the wasm32-unknown-unknown target so
           # cargo can rebuild std with `+atomics` for wasm threads.
-          # `pkgs.rust-bin.fromRustupToolchainFile` reads the same
-          # rust-toolchain.toml `cargo` itself uses, so a single
-          # source-of-truth controls both Nix devShell and ad-hoc
-          # `cargo +stable` overrides.
+          # QE.0 scoped the pin to the web crates (plain rustup clones
+          # build on stable, matching CI); the devShell keeps reading
+          # the same file so one source-of-truth controls both.
           rustToolchain =
-            pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+            pkgs.rust-bin.fromRustupToolchainFile
+            ./crates/roxlap-web/rust-toolchain.toml;
         in {
           default = pkgs.mkShell {
             packages = with pkgs; [

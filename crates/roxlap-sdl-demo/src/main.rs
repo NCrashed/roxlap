@@ -99,18 +99,13 @@ impl HasDisplayHandle for SdlWindowHandle {
     }
 }
 
-/// Build a `Camera` (voxlap basis) from a yaw/pitch fly-camera pose.
-/// Mirrors `roxlap-scene-demo`'s helper: +z is down, yaw rotates in the
-/// xy plane, positive pitch looks downward.
+/// Build a `Camera` (voxlap basis) from a yaw/pitch fly-camera pose:
+/// +z is down, yaw rotates in the xy plane, positive pitch looks
+/// downward. Delegates to the canonical [`Camera::from_yaw_pitch`]
+/// (never hand-roll the basis — a left-handed one silently culls
+/// every sprite).
 fn camera_for_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
-    let (sy, cy) = yaw.sin_cos();
-    let (sp, cp) = pitch.sin_cos();
-    Camera {
-        pos,
-        right: [-sy, cy, 0.0],
-        down: [-cy * sp, -sy * sp, cp],
-        forward: [cy * cp, sy * cp, sp],
-    }
+    Camera::from_yaw_pitch(pos, yaw, pitch)
 }
 
 /// Fly-camera pose advanced from input each frame.

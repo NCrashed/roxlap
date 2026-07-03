@@ -21,11 +21,26 @@
 //! [`Line3`]); they land in the framebuffer, occluded by the rendered
 //! scene, with egui still painting panels on top.
 //!
-//! This is the RF.0 skeleton: backend selection + fallback + a
-//! clear-to-sky frame. RF.1/RF.2 fill in the real CPU/GPU scene
-//! render; RF.3 adds sprites; RF.4 adds framebuffer capture.
+//! Beyond the scene render itself, the facade owns sprites (static +
+//! per-instance dynamic), animated voxel clips, billboard sprites +
+//! actors, characters (`.rkc`), materials + transparency, dynamic
+//! lighting ([`FrameParams::lights`]), screen→world picking, overlay
+//! lines / images / egui, and the fixed-resolution post pipeline
+//! ([`SceneRenderer::set_render_resolution`] / `set_ssaa` /
+//! `set_posterize`).
 
 #![forbid(unsafe_code)]
+// QE.0 — the facade's public surface is fully documented; keep it that
+// way (CI's `-D warnings` turns this into a hard gate for new items).
+#![warn(missing_docs)]
+
+// Compile the workspace README's Rust snippets as doctests so the
+// "Use it in your game" example can never rot the way the pre-QE.0
+// Multicore snippet did (it kept calling API deleted releases earlier).
+// `cfg(doctest)` keeps the README out of the rendered crate docs.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;
 
 mod cpu;
 /// WebGL2 framebuffer presenter for the CPU backend on wasm (the
@@ -35,7 +50,8 @@ mod cpu_blit;
 #[cfg(feature = "hud")]
 mod cpu_egui;
 mod gpu;
-/// Dynamic lighting types (stage DL) — GPU-only sun + point lights.
+/// Dynamic lighting types (stages DL + SL) — runtime sun, point and
+/// spot lights, on both backends.
 mod light;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -91,7 +107,9 @@ pub(crate) type DynWindow = dyn HasWindowHandle + Send + Sync + 'static;
 /// One placed sprite instance: which [`SpriteSet::models`] entry and
 /// where in the world.
 pub struct SpriteInstanceDesc {
+    /// Positional index into [`SpriteSet::models`].
     pub model: usize,
+    /// World position of the model's anchor (voxel units).
     pub pos: [f32; 3],
 }
 
@@ -775,7 +793,11 @@ pub struct BillboardActorId {
 /// is the view-from-front (camera in the actor's facing direction),
 /// increasing counter-clockwise.
 pub struct ActorState {
+    /// State name [`SceneRenderer::set_actor_state`] selects by
+    /// (e.g. `"walk"`, `"attack"`).
     pub name: &'static str,
+    /// One clip per view direction, counter-clockwise from "facing the
+    /// viewer" — 1 (billboard), 4, or 8 entries.
     pub dirs: Vec<VoxelClipId>,
 }
 
@@ -790,7 +812,9 @@ pub struct BillboardActorDef {
     pub lighting: BillboardLighting,
     /// Playback rate of the state animation, Q8 (256 = 1×).
     pub speed_q8: i32,
+    /// Whether the actor's voxels block dynamic-light shadow rays.
     pub casts_shadow: bool,
+    /// Whether terrain shadows darken the actor's voxels.
     pub receives_shadow: bool,
 }
 
@@ -904,6 +928,8 @@ pub struct SpriteSet {
     /// Distinct voxel models (KV6 + base orientation). Instances index
     /// into this; their position overrides the model's.
     pub models: Vec<Sprite>,
+    /// Initial placements — one drawn sprite per entry, each binding a
+    /// [`models`](Self::models) index to a world position.
     pub instances: Vec<SpriteInstanceDesc>,
     /// Model the [`SceneRenderer::carve_active_sprite`] hotkey edits
     /// (GPU only, mirroring the demo's `G`-carve). `None` disables it.
@@ -922,9 +948,9 @@ pub struct FrameParams<'a> {
     pub sky_color: u32,
     /// Optional sky panorama for the CPU rasterizer's sky sampling.
     pub sky: Option<&'a Sky>,
-    /// CPU fog: packed colour + max scan distance (voxels). `0` scan
-    /// distance disables CPU fog.
+    /// CPU fog: the packed colour distant voxels fade toward.
     pub fog_color: u32,
+    /// CPU fog: full-fog distance (voxels). `0` disables CPU fog.
     pub fog_max_scan_dist: i32,
     /// CPU: treat z=255 as air (avoids the S1.X bedrock path for
     /// out-of-bounds cameras).
@@ -954,13 +980,62 @@ pub struct FrameParams<'a> {
     /// pass by darkening a hit voxel's brightness by the hit face's
     /// shade (the face taken from the DDA's last-stepped axis).
     pub side_shades: [i8; 6],
-    /// Dynamic lighting (stage DL) — runtime sun + point lights + stylized
-    /// shadows. **GPU-only**: the CPU backend ignores this and keeps
-    /// multiplying the baked ambient byte. `None` (the default for hosts
-    /// that don't set it) ⇒ exactly the pre-DL render, both backends. The
-    /// baked brightness byte is reinterpreted as the ambient/AO channel;
-    /// direct light composites on top (`albedo*ambient + Σ direct`).
+    /// Dynamic lighting (stages DL + SL) — runtime sun + point + spot
+    /// lights + stylized shadows, applied by **both** backends (GPU
+    /// shaders since DL; the CPU renderer since CPU.1/CPU.2). `None`
+    /// (the default for hosts that don't set it) ⇒ exactly the pre-DL
+    /// render, both backends. The baked brightness byte is
+    /// reinterpreted as the ambient/AO channel; direct light composites
+    /// on top (`albedo*ambient + Σ direct`).
     pub lights: Option<LightRig<'a>>,
+}
+
+impl<'a> FrameParams<'a> {
+    /// Frame params with sensible defaults for everything except the
+    /// CPU [`OpticastSettings`] (which the host owns): the default sky
+    /// colour ([`RenderOptions::clear_sky`]'s default), no panorama, CPU
+    /// fog off, sprites on, no per-side shading, no dynamic lights —
+    /// and a **GPU projection derived from `settings`** (`fov_y =
+    /// 2·atan(yres/2 / hz)`), so both backends render the same field of
+    /// view without the host keeping `hz` and `gpu_fov_y_rad` in sync
+    /// by hand. The GPU outer-DDA step budget follows
+    /// [`OpticastSettings::max_scan_dist`].
+    ///
+    /// `treat_z_max_as_air` defaults to `true` (what every demo passes;
+    /// out-of-bounds cameras skip the bedrock path). Hosts that want
+    /// the pre-QE literal-struct behaviour set it back to `false`.
+    ///
+    /// Every field stays public — construct with `new` and override
+    /// what differs:
+    ///
+    /// ```ignore
+    /// let mut fp = FrameParams::new(&settings);
+    /// fp.sky = Some(&sky);
+    /// fp.lights = Some(rig);
+    /// ```
+    // Screen dims cast to f32 are bounded by realistic resolutions.
+    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    #[must_use]
+    pub fn new(settings: &'a OpticastSettings) -> Self {
+        let default_sky = RenderOptions::default().clear_sky;
+        let fov_y = 2.0 * ((settings.yres as f32) * 0.5 / settings.hz).atan();
+        let chunks_visible =
+            (settings.max_scan_dist.max(1) as u32) / roxlap_scene::CHUNK_SIZE_XY + 4;
+        Self {
+            settings,
+            sky_color: default_sky,
+            sky: None,
+            fog_color: default_sky,
+            fog_max_scan_dist: 0,
+            treat_z_max_as_air: true,
+            gpu_mip_scan_dist: 64.0,
+            gpu_max_outer_steps: chunks_visible,
+            gpu_fov_y_rad: fov_y,
+            draw_sprites: true,
+            side_shades: [0; 6],
+            lights: None,
+        }
+    }
 }
 
 /// Result of [`SceneRenderer::pick`] — a resolved screen→world voxel
@@ -969,8 +1044,11 @@ pub struct FrameParams<'a> {
 /// (transform-correct for rotated / translated grids).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct PickHit {
+    /// World-space surface point of the hit.
     pub world: [f32; 3],
+    /// The grid owning the hit voxel.
     pub grid: roxlap_scene::GridId,
+    /// The hit voxel, in `grid`-local coordinates.
     pub voxel: glam::IVec3,
 }
 
@@ -981,7 +1059,9 @@ pub struct PickHit {
 /// intersect it with a plane for tile selection.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Ray {
+    /// World-space ray origin (the camera position for view rays).
     pub origin: glam::DVec3,
+    /// Unit-length world-space ray direction.
     pub dir: glam::DVec3,
 }
 
@@ -993,6 +1073,7 @@ pub struct Line3 {
     /// World-space endpoints (voxel units), in the same frame the
     /// rendered scene + `camera` use.
     pub a: [f64; 3],
+    /// The segment's other endpoint, same space as `a`.
     pub b: [f64; 3],
     /// `0xAARRGGBB` — the high byte is an alpha blend factor (`0xFF`
     /// opaque, `0x00` invisible), the low 24 bits the RGB colour.
@@ -1023,11 +1104,19 @@ pub enum ImageFacing {
     /// is ignored (the quad is sized by [`ImageSprite::size`]), so pass
     /// the plane's axes directly. Row 0 of the image is the `origin`
     /// edge and rows grow along `v`.
-    World { u: [f32; 3], v: [f32; 3] },
+    World {
+        /// World direction of the image's +column (width) axis.
+        u: [f32; 3],
+        /// World direction of the image's +row (height) axis.
+        v: [f32; 3],
+    },
     /// Always faces the camera (billboard); `up` is the world direction
     /// the image's top edge points toward (e.g. world `-Z` for the
     /// scene-demo's z-down world, or any "up" the host prefers).
-    Billboard { up: [f32; 3] },
+    Billboard {
+        /// World direction the image's top edge points toward.
+        up: [f32; 3],
+    },
 }
 
 /// One placed 2D image sprite for the current frame: a flat textured
@@ -1091,10 +1180,15 @@ pub(crate) struct QuadDraw {
 /// hit point; `t` is its euclidean distance from the camera.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ImagePickHit {
+    /// The hit sprite's texture handle.
     pub image: ImageId,
+    /// Normalised position within the quad (`(0,0)` = top-left).
     pub uv: [f32; 2],
+    /// The matching source-image pixel (column, row).
     pub texel: (u32, u32),
+    /// World-space hit point on the quad.
     pub world: [f32; 3],
+    /// Euclidean distance from the camera to `world`.
     pub t: f32,
 }
 
@@ -1119,24 +1213,36 @@ pub struct RenderOptions {
     /// with until a scene render lands. Also the CPU sky-miss colour
     /// default if a frame supplies none.
     pub clear_sky: u32,
-    /// CPU [`ScratchPool`](roxlap_core::rasterizer::ScratchPool) `lastx`
-    /// sizing — the largest combined grid `vsid` the CPU rasterizer
-    /// will see. Pre-sizing keeps later frames allocation-free.
+    /// Unused. Sized the strip-parallel opticast's per-frame scratch
+    /// pool; the per-pixel DDA renderer that replaced it needs no
+    /// pre-sizing, so the value is ignored.
+    #[deprecated(
+        since = "0.22.0",
+        note = "ignored — the DDA renderer replaced the strip-parallel \
+                opticast and needs no scratch-pool pre-sizing"
+    )]
     pub cpu_max_grid_vsid: u32,
-    /// CPU strip-parallel render thread count (capped to the rayon
-    /// pool). One [`ScratchPool`](roxlap_core::rasterizer::ScratchPool)
-    /// slot per thread.
+    /// Unused. Set the strip-parallel opticast's thread count; the DDA
+    /// renderer parallelises internally over the rayon pool (bound it
+    /// with `RAYON_NUM_THREADS` if needed), so the value is ignored.
+    #[deprecated(
+        since = "0.22.0",
+        note = "ignored — the DDA renderer parallelises over the rayon \
+                pool; bound it with RAYON_NUM_THREADS"
+    )]
     pub cpu_render_threads: usize,
 }
 
+// The deprecated fields still have to be constructed until they are
+// removed for real (QE has a breaking window; see docs/porting/
+// PORTING-QUALITY.md).
+#[allow(deprecated)]
 impl Default for RenderOptions {
     fn default() -> Self {
         Self {
             want_gpu: false,
             gpu: GpuRendererSettings::default(),
             clear_sky: 0x0099_b3d9,
-            // 32 chunks × CHUNK_SIZE_XY — the scene-demo's widest
-            // combined ground grid.
             cpu_max_grid_vsid: 32 * roxlap_scene::CHUNK_SIZE_XY,
             cpu_render_threads: 4,
         }
@@ -1305,7 +1411,12 @@ pub enum RenderResolution {
     /// Upscaled to the window with nearest sampling (hard pixels). A logical
     /// aspect ratio different from the window's stretches non-uniformly — a
     /// deliberate, classic fixed-res look (no letterbox in RP.0).
-    Fixed { w: u32, h: u32 },
+    Fixed {
+        /// Logical framebuffer width, pixels.
+        w: u32,
+        /// Logical framebuffer height, pixels.
+        h: u32,
+    },
     /// Logical = `round(window * factor)`. `0.5` ⇒ a quarter of the pixels,
     /// aspect preserved. Clamped to `>= 1px` per axis.
     Scale(f32),
@@ -1354,9 +1465,13 @@ pub enum DitherMode {
 /// that channel untouched. `None` posterize ⇒ the RP.0/RP.1 paths verbatim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PosterizeConfig {
+    /// Quantisation levels for the red channel (≥ 2).
     pub levels_r: u8,
+    /// Quantisation levels for the green channel (≥ 2).
     pub levels_g: u8,
+    /// Quantisation levels for the blue channel (≥ 2).
     pub levels_b: u8,
+    /// Dither pattern applied before quantisation.
     pub dither: DitherMode,
 }
 
@@ -2107,17 +2222,6 @@ impl SceneRenderer {
         self.dyn_map.order.len()
     }
 
-    /// Register one new sprite **model** incrementally from `kv6`,
-    /// **without** rebuilding the existing model set — the streaming-in
-    /// counterpart to [`add_sprite_instance`](Self::add_sprite_instance)
-    /// for unique generated geometry (procedural asteroids, debris).
-    /// Returns a stable [`SpriteModelId`] usable immediately with
-    /// [`add_sprite_instance`](Self::add_sprite_instance) /
-    /// [`add_sprite_instance_posed`](Self::add_sprite_instance_posed).
-    ///
-    /// Works before any [`set_sprites`](Self::set_sprites) (it establishes
-    /// residency on the GPU backend's first model). The GPU backend
-    /// appends one LOD chain to the resident registry (amortised O(model
     /// Define a global voxel **material** (TV stage): the opacity + blend
     /// mode that a per-voxel material id resolves to. The renderer owns one
     /// 256-entry palette shared by every model and grid.
@@ -2160,6 +2264,17 @@ impl SceneRenderer {
         }
     }
 
+    /// Register one new sprite **model** incrementally from `kv6`,
+    /// **without** rebuilding the existing model set — the streaming-in
+    /// counterpart to [`add_sprite_instance`](Self::add_sprite_instance)
+    /// for unique generated geometry (procedural asteroids, debris).
+    /// Returns a stable [`SpriteModelId`] usable immediately with
+    /// [`add_sprite_instance`](Self::add_sprite_instance) /
+    /// [`add_sprite_instance_posed`](Self::add_sprite_instance_posed).
+    ///
+    /// Works before any [`set_sprites`](Self::set_sprites) (it establishes
+    /// residency on the GPU backend's first model). The GPU backend
+    /// appends one LOD chain to the resident registry (amortised O(model
     /// voxels)); the CPU backend pushes an axis-aligned template.
     pub fn add_sprite_model(&mut self, kv6: &Kv6) -> SpriteModelId {
         let model_index = match &mut self.inner {

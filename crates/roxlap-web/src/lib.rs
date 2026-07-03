@@ -138,16 +138,7 @@ enum TouchZone {
 /// `oracle.c:set_camera_yaw_pitch`. `right × down = forward`
 /// keeps the frustum cull on the correct side of every plane.
 fn cam_from_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
-    let cy = yaw.cos();
-    let sy = yaw.sin();
-    let cp = pitch.cos();
-    let sp = pitch.sin();
-    Camera {
-        pos,
-        right: [-sy, cy, 0.0],
-        down: [-cy * sp, -sy * sp, cp],
-        forward: [cy * cp, sy * cp, sp],
-    }
+    Camera::from_yaw_pitch(pos, yaw, pitch)
 }
 
 // Voxlap-packed colours: `(brightness << 24) | (R << 16) | (G << 8) | B`,
@@ -431,8 +422,6 @@ async fn start() -> Result<(), JsValue> {
     // CPU DDA path (presented via WebGL2) when WebGPU is absent.
     let opts = RenderOptions {
         want_gpu: true,
-        cpu_max_grid_vsid: 8 * roxlap_scene::CHUNK_SIZE_XY,
-        cpu_render_threads: navigator_hardware_concurrency(),
         ..RenderOptions::default()
     };
     let renderer = SceneRenderer::new_from_canvas_async(canvas.clone(), (XRES, YRES), &opts).await;

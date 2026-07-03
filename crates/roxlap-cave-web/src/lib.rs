@@ -1,6 +1,6 @@
 //! roxlap-cave-web — procedural cave demo on wasm32 + canvas.
 //!
-//! GW.3: rendered through the `roxlap-render` [`SceneRenderer`] facade
+//! GW.3: rendered through the `roxlap-render` [`SceneRenderer`](roxlap_render::SceneRenderer) facade
 //! — the WebGPU compute marcher when the browser has WebGPU, else the
 //! CPU DDA path presented via the facade's WebGL2 blit. The cave
 //! is generated into a single-chunk `roxlap_scene::Scene` grid;
@@ -218,16 +218,7 @@ fn build_bullet_model() -> Sprite {
 // ----- Camera + collision ---------------------------------------------------
 
 fn cam_from_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
-    let cy = yaw.cos();
-    let sy = yaw.sin();
-    let cp = pitch.cos();
-    let sp = pitch.sin();
-    Camera {
-        pos,
-        right: [-sy, cy, 0.0],
-        down: [-cy * sp, -sy * sp, cp],
-        forward: [cy * cp, sy * cp, sp],
-    }
+    Camera::from_yaw_pitch(pos, yaw, pitch)
 }
 
 /// `true` if the `PLAYER_RADIUS` box around `pos` overlaps any solid
@@ -563,8 +554,6 @@ async fn start() -> Result<(), JsValue> {
 
     let opts = RenderOptions {
         want_gpu: true,
-        cpu_max_grid_vsid: VSID,
-        cpu_render_threads: navigator_hardware_concurrency(),
         ..RenderOptions::default()
     };
     let renderer = SceneRenderer::new_from_canvas_async(canvas.clone(), (XRES, YRES), &opts).await;

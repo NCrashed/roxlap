@@ -4,7 +4,7 @@
 //! Port of `equivecinit(255)` (``) plus the iunivec
 //! quantisation loop (``). Voxlap calls this
 //! once during `initvoxlap`; roxlap builds the tables lazily via
-//! [`OnceLock`] on first access from `updatereflects`.
+//! [`OnceLock`](std::sync::OnceLock) on first access from `updatereflects`.
 //!
 //! The direction at index `i` (for `n = 255`) is:
 //!

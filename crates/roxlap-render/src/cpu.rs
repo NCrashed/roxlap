@@ -1,9 +1,10 @@
-//! CPU backend — `roxlap-core` opticast presented via `softbuffer`.
+//! CPU backend — the `roxlap-core` per-pixel DDA renderer presented
+//! via `softbuffer` (native) / a WebGL2 blit (wasm).
 //!
-//! RF.1: owns the software surface + the per-frame [`ScratchPool`] and
-//! z-buffer, and runs the multi-grid opticast compositor
-//! ([`render_scene_composed`]). Mirrors the scene-demo's old `redraw`
-//! world pass. Sprites land in RF.3.
+//! Owns the software surface, the framebuffer + z-buffer, and the
+//! multi-grid compositor ([`render_scene_composed`]), plus the CPU
+//! sides of sprites, clips, billboards, materials, dynamic lighting
+//! and the post pipeline.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::num::NonZeroU32;

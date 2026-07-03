@@ -1,9 +1,9 @@
-//! Import an animated GIF into a [`VoxelClip`] of flat, camera-facing
+//! Import an animated GIF into a [`VoxelClip`](crate::voxel_clip::VoxelClip) of flat, camera-facing
 //! voxel **slabs** — the authoring bridge for Doom/Build-style billboard
 //! sprites (stage **BB**; see `PORTING-BILLBOARD.md`). Feature-gated behind
 //! the `gif` feature.
 //!
-//! Each GIF frame becomes one [`VoxelFrame`] slab of dims
+//! Each GIF frame becomes one [`VoxelFrame`](crate::voxel_clip::VoxelFrame) slab of dims
 //! `[W, thickness, H]`: every non-transparent pixel becomes a voxel, every
 //! transparent pixel is air (a 1-bit cutout — GIF carries only a single
 //! transparent palette index). The slab is 1 voxel thick by default
@@ -31,7 +31,7 @@
 use crate::slab;
 use crate::voxel_clip::{LoopMode, VoxelClip, VoxelFrame};
 
-/// Re-exported from [`crate::slab`] — where the clip's pivot sits in the slab.
+/// Re-exported from `crate::slab` — where the clip's pivot sits in the slab.
 pub use crate::slab::Pivot;
 
 /// Options for [`voxel_clip_from_gif`].

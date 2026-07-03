@@ -268,7 +268,7 @@ impl EstNormCache {
     ///
     /// The `chz_delta == 0` reads build the in-plane cache exactly like
     /// [`Self::build_with_reader`]; the `±1` reads populate the
-    /// [`Self::z_below`] / [`Self::z_above`] overlays so [`Self::solid`]
+    /// `Self::z_below` / `Self::z_above` overlays so `Self::solid`
     /// — and therefore [`Self::ambient_occlusion`] / [`Self::estnorm`] —
     /// see the neighbouring chunk's voxels across the z-seam instead of
     /// the implicit air-above / bedrock-below boundary. Where a z-
@@ -345,7 +345,7 @@ impl EstNormCache {
     /// chunk via `Grid::chunk(IVec3)` so the 2-voxel padding
     /// extends seamlessly across chunk boundaries.
     ///
-    /// The cache's [`Self::vsid`] field is left at `0` for chunk-
+    /// The cache's `Self::vsid` field is left at `0` for chunk-
     /// aware builds — the field is dead-code anyway, preserved
     /// only for inspection.
     #[must_use]

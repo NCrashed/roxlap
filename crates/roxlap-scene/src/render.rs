@@ -1,4 +1,4 @@
-//! Scene-level rendering — drives [`roxlap_core::opticast::opticast`]
+//! Scene-level rendering — drives `roxlap_core::opticast::opticast`
 //! across the grids of a [`Scene`].
 //!
 //! Two entry points:
@@ -18,7 +18,7 @@
 //!
 //! Both APIs route per-grid rendering through
 //! [`crate::Grid::chunk_xy_backing`] → [`roxlap_core::ChunkGrid`] →
-//! [`roxlap_core::GridView::from_chunk_grid`] → [`opticast`].
+//! [`roxlap_core::GridView::from_chunk_grid`] → `opticast`.
 //! `opticast`'s prelude looks up the camera's chunk via
 //! [`roxlap_core::GridView::chunk_at_xy`]; the grouscan column-step
 //! swaps the active per-chunk `(slab_buf, column_offsets)` when
@@ -259,7 +259,7 @@ fn single_chunk_fast_path<'a>(
 
 /// matches-direct-opticast property — the test suite uses it as a
 /// sanity check that the combined-world stitch + render harness
-/// doesn't drift vs. a raw [`opticast`] call.
+/// doesn't drift vs. a raw `opticast` call.
 ///
 /// Caller pre-fills `fb` with the desired sky colour and `zb` with
 /// any value (typically `0.0` matching the per-chunk renderer's
@@ -538,7 +538,7 @@ pub struct SceneRenderScratch {
 ///    initial composition).
 /// 2. For each grid, allocate a temporary `(temp_fb, temp_zb)` of
 ///    the same size, pre-fill them with sky / `INFINITY`, and run
-///    [`opticast`] into them via a [`ScalarRasterizer`] over the
+///    `opticast` into them via a `ScalarRasterizer` over the
 ///    temporary buffers AND the grid's combined-world view (S4.0).
 /// 3. Merge the temporary buffers into the shared `(fb, zb)` via
 ///    [`compose_into`] — closer pixels (smaller `z`) win.
@@ -2811,14 +2811,7 @@ mod tests {
         // mountain direction), pitch=0.72 rad (≈ 41° down) so the
         // ray bisecting the screen aims at the chz=0 mountain centre
         // ≈ (112, 112, 150).
-        let (sy, cy) = (std::f64::consts::FRAC_PI_4).sin_cos();
-        let (sp, cp) = 0.72_f64.sin_cos();
-        let camera = Camera {
-            pos: [40.0, 40.0, 60.0],
-            right: [-sy, cy, 0.0],
-            down: [-cy * sp, -sy * sp, cp],
-            forward: [cy * cp, sy * cp, sp],
-        };
+        let camera = Camera::from_yaw_pitch([40.0, 40.0, 60.0], std::f64::consts::FRAC_PI_4, 0.72);
         let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
         let outcome = render_scene_composed(
             &mut fb,

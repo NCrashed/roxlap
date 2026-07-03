@@ -15,17 +15,17 @@
 //! grid by LOD distance, clamped by [`effective_mip`] to a level every
 //! chunk has built) coarsens the cell size to `2^mip` mip-0 voxels and
 //! samples mip-`mip` data — the ray stays in mip-0 units so depth and
-//! fog are exact. [`BrickMaps`] (one occupancy map per populated chunk,
+//! fog are exact. `BrickMaps` (one occupancy map per populated chunk,
 //! at the render mip) are built once per frame and shared immutably; a
-//! [`Sampler`] resolves each cell to its chunk
+//! `Sampler` resolves each cell to its chunk
 //! ([`GridView::chunk_at_xyz`]) and brick-gates the
 //! [`GridView::surface_color_mip`] slab walk, caching the current chunk
 //! so air costs an O(1) bit test. [`render_dda_parallel`] splits the
 //! frame into disjoint rayon bands — bit-identical to sequential since
 //! pixels are independent. Hits are shaded by baked brightness
-//! ([`shade`]) + [`DdaEnv::side_shades`] face tint, fogged toward
-//! [`DdaEnv::fog_color`] ([`apply_fog`]); misses sample the
-//! [`DdaEnv::sky`] panorama ([`sample_sky`]) or keep the solid pre-fill.
+//! (`shade`) + [`DdaEnv::side_shades`] face tint, fogged toward
+//! [`DdaEnv::fog_color`] (`apply_fog`); misses sample the
+//! [`DdaEnv::sky`] panorama (`sample_sky`) or keep the solid pre-fill.
 //!
 //! Buffer conventions match the rest of the engine so this backend is
 //! colour is packed `0x80RRGGBB`; depth is perpendicular distance from
@@ -72,13 +72,13 @@ pub struct DdaEnv<'a> {
     pub terrain_materials: &'a [(u32, u8)],
     /// CPU.1 — dynamic lighting (stage DL on the CPU): sun + point lights +
     /// stylized cel/ramp, evaluated flat per voxel. Disabled by default ⇒ the
-    /// hit uses the baked-byte [`shade`] path, byte-identical to pre-DL. Lights
+    /// hit uses the baked-byte `shade` path, byte-identical to pre-DL. Lights
     /// here are already in the grid's **local** frame (the scene renderer
     /// transforms them per grid). Shadows: see [`Self::world_shadow`].
     pub lights: CpuLights<'a>,
     /// XS.1 — when set, shadow rays test the **whole scene** (all grids +
     /// sprites) via this world-space occluder + the current grid's
-    /// local→world transform, instead of the single-grid [`SamplerShadow`].
+    /// local→world transform, instead of the single-grid `SamplerShadow`.
     /// `None` ⇒ single-grid shadows (the direct `render_dda` path / tests).
     pub world_shadow: Option<WorldShadowCtx<'a>>,
 }
@@ -1833,7 +1833,7 @@ fn pixel_result(
 /// horizontal bands rendered concurrently (rayon) — **bit-identical**
 /// to the sequential render regardless of thread count, unlike voxlap's
 /// per-strip discretisation. Each band spins up its own lightweight
-/// [`Sampler`] over the shared, immutable `cache`.
+/// `Sampler` over the shared, immutable `cache`.
 ///
 /// `cache` must already hold current brick maps for every chunk at
 /// `mip` (populate via [`BrickCache::ensure`]); `mip` is the effective

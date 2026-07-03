@@ -24,8 +24,8 @@ use crate::scenes::{
     sprites::SpritesScene, transparency::TransparencyScene, world::WorldScene,
 };
 use crate::{
-    load_png_sky, load_png_sky_rgba, MAX_GRID_VSID, RENDER_THREADS, SCAN_DIST_INITIAL,
-    SCAN_DIST_MAX, SCAN_DIST_MIN, SCAN_DIST_STEP, SKY_PNG,
+    load_png_sky, load_png_sky_rgba, SCAN_DIST_INITIAL, SCAN_DIST_MAX, SCAN_DIST_MIN,
+    SCAN_DIST_STEP, SKY_PNG,
 };
 
 const WIDTH: u32 = 800;
@@ -501,8 +501,6 @@ impl ApplicationHandler for Host {
         let want_gpu = std::env::var_os("ROXLAP_GPU").is_some_and(|v| v != "0" && !v.is_empty());
         let opts = RenderOptions {
             want_gpu,
-            cpu_max_grid_vsid: MAX_GRID_VSID,
-            cpu_render_threads: RENDER_THREADS,
             ..RenderOptions::default()
         };
         let init = window.inner_size();

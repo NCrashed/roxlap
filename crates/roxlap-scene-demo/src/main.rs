@@ -34,13 +34,6 @@ use roxlap_render::{
 };
 use winit::event_loop::{ControlFlow, EventLoop};
 
-/// Headroom for the per-frame [`ScratchPool`] sizing — `lastx`
-/// inside each pool slot is sized `max(yres, vsid)`. The S4.0 demo
-/// ships with a 2-chunk-wide ground (combined `vsid = 256`); pre-
-/// allocating for 32×32 chunks keeps later demo expansions
-/// allocation-free.
-const MAX_GRID_VSID: u32 = 32 * roxlap_scene::CHUNK_SIZE_XY;
-
 /// Initial max ray-march distance for the per-frame opticast pass.
 /// User can adjust at runtime via `+` / `-` (range
 /// [`SCAN_DIST_MIN`, `SCAN_DIST_MAX`]). Multi-mip absorbs the cost
@@ -59,14 +52,6 @@ const SCAN_DIST_INITIAL: i32 = 384;
 const SCAN_DIST_MIN: i32 = 64;
 const SCAN_DIST_MAX: i32 = 1024;
 const SCAN_DIST_STEP: i32 = 64;
-
-/// Cap for `rayon`'s strip-parallel pool. Voxlap's per-strip
-/// projection re-derivation adds fixed overhead that amortises
-/// poorly past ~4 strips for an 800×600 frame; bench shows >4
-/// threads slows down (per-strip overhead > work). Set high
-/// enough to use modest multicore boost without going past the
-/// efficiency knee.
-const RENDER_THREADS: usize = 4;
 
 /// Embedded panoramic sky texture for the textured-`startsky`
 /// path. Whatever PNG the user has dropped in `assets/sky.png` is

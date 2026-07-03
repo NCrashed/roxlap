@@ -1,0 +1,18 @@
+# R10.X.2 (scoped to this crate in QE.0): nightly Rust toolchain
+# pinned for the wasm-bindgen-rayon threading path.
+# `wasm-bindgen-rayon` rebuilds std with `+atomics` via `-Z build-std`,
+# which requires both nightly cargo and the `rust-src` component
+# shipped here.
+#
+# The pin lives here (and in ../roxlap-cave-web/) instead of the
+# workspace root so plain `cargo build` on a fresh clone uses the
+# user's stable toolchain — matching CI, which builds on stable.
+# rustup picks this file up when building from inside the crate
+# directory, which is how the wasm workflow runs anyway
+# (`cd crates/roxlap-web && trunk serve`). Nix users get the same
+# nightly from the flake regardless of cwd.
+[toolchain]
+channel = "nightly-2026-04-15"
+components = ["rustc", "cargo", "rust-src", "rustfmt", "clippy", "rust-analyzer"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

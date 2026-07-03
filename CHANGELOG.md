@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`FrameParams::new(settings)`** (stage QE.0) — a constructor with
+  sensible defaults for every field except the CPU `OpticastSettings`,
+  so hosts stop copying 12-field struct literals. Notably it derives
+  the **GPU projection from the CPU settings** (`fov_y = 2·atan(yres/2
+  / hz)`), so both backends render the same field of view by default —
+  previously a host had to keep `OpticastSettings::hz` and
+  `gpu_fov_y_rad` in sync by hand. All fields stay public; construct
+  with `new` and override what differs. Defaults: sky/fog =
+  `RenderOptions::default().clear_sky` with CPU fog off, sprites on,
+  no side shades, no dynamic lights, `treat_z_max_as_air = true`,
+  `gpu_mip_scan_dist = 64`, step budget from
+  `OpticastSettings::max_scan_dist`.
+- **`quickstart` example** (`cargo run -p roxlap-render --example
+  quickstart`) — a minimal winit "hello voxel world" (window + tiny
+  scene + orbit camera), and a matching **"Use it in your game"**
+  README section whose snippet is compiled as a doctest of
+  `roxlap-render` (a `#[cfg(doctest)] #[doc = include_str!]` hook), so
+  README code can no longer rot silently — the previous README snippet
+  called API deleted many releases ago.
+
+### Deprecated
+
+- `RenderOptions::cpu_max_grid_vsid` and
+  `RenderOptions::cpu_render_threads` — **both have been ignored since
+  the DDA renderer replaced the strip-parallel opticast**; setting them
+  has had no effect for many releases. Migration: delete the fields
+  from your `RenderOptions` literal (use `..RenderOptions::default()`);
+  to bound CPU render parallelism, set the standard
+  `RAYON_NUM_THREADS` env var instead. The fields will be removed in a
+  QE-series breaking release.
+
+### Changed
+
+- **Docs/onboarding sweep (QE.0)** — the 17 `PORTING-*.md` stage docs
+  moved from the repository root to `docs/porting/` (all README /
+  CHANGELOG / rustdoc references updated); README gained the
+  quickstart section and now points docs.rs readers at `roxlap-render`
+  / `roxlap-scene` first; the stale "Multicore" README section was
+  rewritten (its code sample called deleted API); every hand-rolled
+  camera basis in demos/tests now delegates to
+  `Camera::from_yaw_pitch` (byte-identical math, one canonical
+  implementation); ~55 broken rustdoc links fixed workspace-wide, and
+  stale crate docs (RF.0-era facade skeleton, "GPU-only" dynamic
+  lighting — CPU support landed in 0.18) rewritten;
+  `#![warn(missing_docs)]` now guards `roxlap-render` +
+  `roxlap-scene`; CHANGELOG version links restored for 0.3.0–0.21.0.
+- **Build friction** — the workspace-root nightly `rust-toolchain.toml`
+  pin moved into the two web crates (the only nightly consumers, for
+  wasm `-Z build-std` threads); a fresh clone now builds on the
+  developer's stable toolchain, matching CI. To get the old behaviour
+  back (nightly everywhere), copy
+  `crates/roxlap-web/rust-toolchain.toml` to the repo root. The
+  workspace also gained `default-members` excluding `roxlap-sdl-demo`,
+  so plain `cargo build` / `cargo test` no longer needs system SDL2
+  headers — build it explicitly with `-p roxlap-sdl-demo` or
+  `--workspace`.
+
 ## [0.21.0] — 2026-07-01
 
 ### Added
@@ -1540,7 +1599,7 @@ ground + vsid=768 ship, max_scan_dist=512, mip_levels=4):
 LOD-and-streaming release: per-grid Far-tier billboard impostors,
 mid-tier mip overrides, and an end-to-end streaming + procedural
 generation pipeline. Closes the S6 + S7 macro-stages of
-[`PORTING-SCENE.md`](PORTING-SCENE.md).
+[`PORTING-SCENE.md`](docs/porting/PORTING-SCENE.md).
 
 ### Added
 
@@ -1680,7 +1739,7 @@ generation pipeline. Closes the S6 + S7 macro-stages of
 
 Scene-graph release: many independent chunked voxel grids, each with
 f64 world position and `Quat` rotation. Substages S1..S5 of
-[`PORTING-SCENE.md`](PORTING-SCENE.md).
+[`PORTING-SCENE.md`](docs/porting/PORTING-SCENE.md).
 
 ### Added
 
@@ -1798,7 +1857,7 @@ f64 world position and `Quat` rotation. Substages S1..S5 of
   through one column is unsupported. Scene-demo poses A/B/C/D
   unaffected; full investigation log in memory.
 
-[0.2.0]: https://github.com/NCrashed/roxlap/releases/tag/v0.2.0
+[0.2.0]: https://github.com/NCrashed/roxlap/compare/v0.1.1...v0.2.0
 
 ## [0.1.1] — 2026-05-07
 
@@ -1896,7 +1955,7 @@ Initial public release of the roxlap workspace.
   - Three new oracle bench subcommands report scaling curves:
     `bench --threads N`, `bench-lighting`, `bench-sprites`.
   - Full design + measured numbers in
-    [`PORTING-MULTICORE.md`](PORTING-MULTICORE.md).
+    [`PORTING-MULTICORE.md`](docs/porting/PORTING-MULTICORE.md).
 
 #### `roxlap-host`
 
@@ -1989,3 +2048,27 @@ Initial public release of the roxlap workspace.
 
 [0.1.1]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.1
 [0.1.0]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.0
+
+[Unreleased]: https://github.com/NCrashed/roxlap/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/NCrashed/roxlap/compare/v0.20.0...v0.21.0
+[0.20.0]: https://github.com/NCrashed/roxlap/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/NCrashed/roxlap/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/NCrashed/roxlap/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/NCrashed/roxlap/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/NCrashed/roxlap/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/NCrashed/roxlap/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/NCrashed/roxlap/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/NCrashed/roxlap/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/NCrashed/roxlap/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/NCrashed/roxlap/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/NCrashed/roxlap/compare/8263621...v0.10.0
+[0.9.0]: https://github.com/NCrashed/roxlap/compare/v0.8.0...8263621
+[0.8.0]: https://github.com/NCrashed/roxlap/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/NCrashed/roxlap/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/NCrashed/roxlap/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/NCrashed/roxlap/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/NCrashed/roxlap/compare/v0.4.2...v0.5.0
+[0.4.2]: https://github.com/NCrashed/roxlap/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/NCrashed/roxlap/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/NCrashed/roxlap/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/NCrashed/roxlap/compare/v0.2.0...v0.3.0
