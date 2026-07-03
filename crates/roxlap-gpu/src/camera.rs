@@ -1,4 +1,4 @@
-//! World-space camera state passed to [`crate::GpuRenderer::render_chunk`].
+//! World-space camera state passed to [`crate::GpuRenderer::render_scene`].
 //!
 //! Mirrors `roxlap-core::Camera`'s shape (position + orthonormal
 //! right / down / forward basis) but in `f32` since the GPU does its

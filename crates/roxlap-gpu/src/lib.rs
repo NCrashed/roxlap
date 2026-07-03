@@ -43,9 +43,14 @@ pub mod resident;
 pub mod scene;
 pub mod sprite_model;
 
+mod lights;
+mod overlay;
+mod readback;
+mod shader_src;
+
 pub use camera::Camera;
 pub use decompress::{decompress_chunk, ChunkUpload, BEDROCK_RGB, CHUNK_Z};
-pub use grid::{bounding_box_of, GpuGridResident, GridUpload};
+pub use grid::{bounding_box_of, GridUpload};
 #[cfg(not(target_arch = "wasm32"))]
 pub use headless::HeadlessGpu;
 pub use resident::GpuChunkResident;
@@ -59,10 +64,18 @@ pub use sprite_model::{
     SpriteModel, SpriteModelRegistry, SpriteRegistryResident,
 };
 
+pub use lights::{GpuLight, SceneLights, MAX_POINT_LIGHTS, MAX_SHADOW_CASTERS};
+pub use overlay::{GpuImageQuad, GpuLine, GpuLineCamera};
+pub use readback::pinhole_pixel_ray;
+
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+
+use lights::{inject_grid_sun_dirs, pack_scene_lights, upload_grid_point_lights, GpuPointLight};
+use overlay::{ImageResident, ImageResources, LineResources, LINE_NEAR_Z};
+use shader_src::{scene_shader_source, sprite_shader_source};
 
 /// Caller-controllable knobs for [`GpuRenderer::new`]. Defaults
 /// target "highest-performance GPU, prefer Mailbox/Immediate over
@@ -139,356 +152,6 @@ impl From<wgpu::RequestDeviceError> for GpuInitError {
     }
 }
 
-/// WGPU-backed renderer. Owns the device, queue, and surface
-/// bound to the host's window. [`GpuRenderer::render`] is the GPU.1
-/// clear-to-colour path; [`GpuRenderer::render_chunk`] is GPU.3's
-/// single-chunk DDA marcher.
-///
-/// The window is consumed only at construction — `wgpu`'s
-/// `Surface<'static>` keeps its own `Arc` clone of the handle, so
-/// the renderer holds no window field of its own.
-/// A world-space line segment for [`GpuRenderer::draw_lines_deferred`].
-/// `color` is straight RGBA in `0..=1` (the alpha drives the over-blend);
-/// `width_px` is the screen-space thickness; `depth_test` occludes the
-/// segment behind nearer marched geometry.
-#[derive(Clone, Copy, Debug)]
-pub struct GpuLine {
-    pub a: [f32; 3],
-    pub b: [f32; 3],
-    pub color: [f32; 4],
-    pub width_px: f32,
-    pub depth_test: bool,
-}
-
-/// World camera basis for projecting [`GpuLine`] endpoints — the same
-/// pinhole the scene-DDA pass marches with (`right`/`down`/`forward`
-/// orthonormal, `pos` in world voxel units).
-#[derive(Clone, Copy, Debug)]
-pub struct GpuLineCamera {
-    pub pos: [f32; 3],
-    pub right: [f32; 3],
-    pub down: [f32; 3],
-    pub forward: [f32; 3],
-}
-
-/// Near plane (camera-forward distance) below which a [`GpuLine`] endpoint
-/// is clipped, so the pinhole divide stays finite.
-const LINE_NEAR_Z: f32 = 0.0625;
-/// Depth-test slack (euclidean world distance) so a line resting on the
-/// surface it traces doesn't z-fight the marched geometry.
-const LINE_DEPTH_BIAS: f32 = 0.5;
-
-/// One expanded-quad vertex (`build_line_vertices` output). `pos` is NDC;
-/// `depth` is the euclidean world distance of the source endpoint (the
-/// marcher's `best_t` metric); `depth_test` is `1.0`/`0.0`.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct LineVertex {
-    pos: [f32; 2],
-    depth: f32,
-    depth_test: f32,
-    color: [f32; 4],
-}
-
-/// `line.wgsl` / `image.wgsl` fragment uniform (std140; padded to 32 bytes
-/// so the uniform's struct stride is a 16-byte multiple).
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct LineParams {
-    /// Target (swapchain) size — the range of the fragment's `clip.xy`.
-    screen_w: u32,
-    screen_h: u32,
-    depth_bias: f32,
-    no_depth: u32,
-    /// 1 when the viewport flip is on. The depth buffer is written
-    /// unflipped (the blit mirrors at read time), but these passes flip the
-    /// vertex NDC X, so the fragment must mirror its depth lookup to match.
-    flip_x: u32,
-    /// RP.0 — the **render** (logical) size the depth buffer is stored at.
-    /// The fragment scales its swapchain `clip.xy` into this grid for the
-    /// depth lookup. Equal to `screen_*` under `Native` (identity).
-    depth_w: u32,
-    depth_h: u32,
-    _pad: u32,
-}
-
-/// Lazy-built debug-line pipeline (L3.2). The bind group is rebuilt each
-/// draw (it references the current `scene_dda.depth_buffer`, which the
-/// swapchain resize recreates); the pipeline / layout / uniform persist.
-struct LineResources {
-    pipeline: wgpu::RenderPipeline,
-    bgl: wgpu::BindGroupLayout,
-    uniform_buf: wgpu::Buffer,
-    /// 1-word stand-in bound when no scene depth exists (sprite-only /
-    /// empty scene); `no_depth = 1` keeps the shader from indexing it.
-    dummy_depth: wgpu::Buffer,
-}
-
-/// Project + expand world-space [`GpuLine`]s into screen-space quad
-/// vertices (6 per visible segment) for `line.wgsl`. Mirrors the
-/// scene-DDA pinhole (`forward + ndc_x·half_w·right − ndc_y·half_h·down`)
-/// so lines land on the marched geometry, carrying each endpoint's
-/// euclidean world distance as the depth-test key (= the marcher's
-/// `best_t`). Segments fully behind the near plane are dropped; the rest
-/// are clipped to it.
-fn build_line_vertices(
-    cam: &GpuLineCamera,
-    lines: &[GpuLine],
-    w: u32,
-    h: u32,
-    fov_y: f32,
-    flip_x: bool,
-) -> Vec<LineVertex> {
-    let aspect = w as f32 / h as f32;
-    let half_h = (fov_y * 0.5).tan();
-    let half_w = half_h * aspect;
-    let (wf, hf) = (w as f32, h as f32);
-
-    let cam_coords = |p: [f32; 3]| -> [f32; 3] {
-        let d = [p[0] - cam.pos[0], p[1] - cam.pos[1], p[2] - cam.pos[2]];
-        [
-            cam.right[0] * d[0] + cam.right[1] * d[1] + cam.right[2] * d[2],
-            cam.down[0] * d[0] + cam.down[1] * d[1] + cam.down[2] * d[2],
-            cam.forward[0] * d[0] + cam.forward[1] * d[1] + cam.forward[2] * d[2],
-        ]
-    };
-    // Camera-space point → (NDC xy, euclidean depth). NDC y is up (+1 top),
-    // matching WebGPU clip space; depth is the marcher's world-t metric.
-    let project = |q: [f32; 3]| -> ([f32; 2], f32) {
-        let inv = 1.0 / q[2];
-        let nx = q[0] * inv / half_w;
-        let ny = -q[1] * inv / half_h;
-        let depth = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt();
-        ([nx, ny], depth)
-    };
-
-    let mut out = Vec::with_capacity(lines.len() * 6);
-    for line in lines {
-        let ca = cam_coords(line.a);
-        let cb = cam_coords(line.b);
-        let (cfa, cfb) = (ca[2], cb[2]);
-        if cfa < LINE_NEAR_Z && cfb < LINE_NEAR_Z {
-            continue;
-        }
-        // Near-clip in segment-parameter space on the forward component.
-        let (mut t0, mut t1) = (0.0f32, 1.0f32);
-        let dz = cfb - cfa;
-        if dz.abs() > f32::EPSILON {
-            let tn = (LINE_NEAR_Z - cfa) / dz;
-            if dz > 0.0 {
-                t0 = t0.max(tn);
-            } else {
-                t1 = t1.min(tn);
-            }
-        }
-        if t0 > t1 {
-            continue;
-        }
-        let lerp3 = |t: f32| {
-            [
-                ca[0] + (cb[0] - ca[0]) * t,
-                ca[1] + (cb[1] - ca[1]) * t,
-                ca[2] + (cb[2] - ca[2]) * t,
-            ]
-        };
-        let (n0, d0) = project(lerp3(t0));
-        let (n1, d1) = project(lerp3(t1));
-
-        // Expand in pixel space for a uniform screen-space thickness.
-        let to_px = |n: [f32; 2]| [(n[0] * 0.5 + 0.5) * wf, (0.5 - n[1] * 0.5) * hf];
-        let to_ndc = |p: [f32; 2]| [p[0] / wf * 2.0 - 1.0, 1.0 - p[1] / hf * 2.0];
-        let p0 = to_px(n0);
-        let p1 = to_px(n1);
-        let (dx, dy) = (p1[0] - p0[0], p1[1] - p0[1]);
-        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
-        let half = line.width_px.max(1.0) * 0.5;
-        let (ex, ey) = (-dy / len * half, dx / len * half);
-
-        let c0a = to_ndc([p0[0] + ex, p0[1] + ey]);
-        let c0b = to_ndc([p0[0] - ex, p0[1] - ey]);
-        let c1a = to_ndc([p1[0] + ex, p1[1] + ey]);
-        let c1b = to_ndc([p1[0] - ex, p1[1] - ey]);
-        let dt = if line.depth_test { 1.0 } else { 0.0 };
-        // Mirror the overlay's NDC x to match the flipped scene blit.
-        let vert = |pos: [f32; 2], depth: f32| LineVertex {
-            pos: [if flip_x { -pos[0] } else { pos[0] }, pos[1]],
-            depth,
-            depth_test: dt,
-            color: line.color,
-        };
-        // Two triangles, cull disabled so winding is irrelevant.
-        out.push(vert(c0a, d0));
-        out.push(vert(c0b, d0));
-        out.push(vert(c1a, d1));
-        out.push(vert(c1a, d1));
-        out.push(vert(c0b, d0));
-        out.push(vert(c1b, d1));
-    }
-    out
-}
-
-/// A world-space 2D image-sprite quad for [`GpuRenderer::draw_images_deferred`].
-/// `corners` are the four world points `TL, TR, BL, BR` (UVs `(0,0) (1,0)
-/// (0,1) (1,1)`); `image` indexes a texture uploaded via
-/// [`GpuRenderer::upload_image`]; `tint` is straight RGBA in `0..=1`
-/// (multiplied into every texel); `depth_test` occludes the quad behind
-/// nearer marched geometry. The facade resolves orientation + back-face
-/// culling, so this is pure geometry.
-#[derive(Clone, Copy, Debug)]
-pub struct GpuImageQuad {
-    pub corners: [[f32; 3]; 4],
-    pub image: usize,
-    pub tint: [f32; 4],
-    pub depth_test: bool,
-    /// Texels with alpha below this (`0..=1`) are discarded in the FS.
-    /// `0.0` keeps the plain over-blend.
-    pub alpha_cutoff: f32,
-}
-
-/// One expanded textured-quad vertex (`build_image_vertices` output).
-/// `ndc` is the projected NDC xy; `w` is the source `forward` depth, fed
-/// back into a homogeneous clip position so the rasterizer interpolates
-/// `uv` perspective-correctly; `depth` is the euclidean world distance
-/// (the marcher's `best_t`) for the manual depth test.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct ImageVertex {
-    ndc: [f32; 2],
-    w: f32,
-    depth: f32,
-    depth_test: f32,
-    cutoff: f32,
-    uv: [f32; 2],
-    tint: [f32; 4],
-}
-
-/// Lazy-built image-sprite pipeline (mirrors [`LineResources`]). The
-/// per-draw bind group adds the quad's texture + a sampler to the line
-/// pass's uniform + scene-depth bindings.
-struct ImageResources {
-    pipeline: wgpu::RenderPipeline,
-    bgl: wgpu::BindGroupLayout,
-    uniform_buf: wgpu::Buffer,
-    dummy_depth: wgpu::Buffer,
-    sampler: wgpu::Sampler,
-}
-
-/// A retained image-sprite texture (uploaded via
-/// [`GpuRenderer::upload_image`], referenced by [`GpuImageQuad::image`]).
-struct ImageResident {
-    view: wgpu::TextureView,
-    // Held so the view stays valid + the texture shows in profiler dumps.
-    _texture: wgpu::Texture,
-}
-
-/// Camera-space textured-quad vertex (near-clip working set): the
-/// `(right, down, forward)` components + the texture `uv`.
-#[derive(Clone, Copy)]
-struct ImgClipV {
-    cam: [f32; 3],
-    uv: [f32; 2],
-}
-
-/// Clip a convex camera-space polygon against the near plane
-/// (`forward >= LINE_NEAR_Z`), interpolating UVs at each crossing.
-fn clip_near_image(poly: &[ImgClipV]) -> Vec<ImgClipV> {
-    let n = poly.len();
-    let mut out: Vec<ImgClipV> = Vec::with_capacity(n + 1);
-    for i in 0..n {
-        let cur = poly[i];
-        let prev = poly[(i + n - 1) % n];
-        let cur_in = cur.cam[2] >= LINE_NEAR_Z;
-        let prev_in = prev.cam[2] >= LINE_NEAR_Z;
-        if cur_in != prev_in {
-            let t = (LINE_NEAR_Z - prev.cam[2]) / (cur.cam[2] - prev.cam[2]);
-            out.push(ImgClipV {
-                cam: [
-                    prev.cam[0] + (cur.cam[0] - prev.cam[0]) * t,
-                    prev.cam[1] + (cur.cam[1] - prev.cam[1]) * t,
-                    LINE_NEAR_Z,
-                ],
-                uv: [
-                    prev.uv[0] + (cur.uv[0] - prev.uv[0]) * t,
-                    prev.uv[1] + (cur.uv[1] - prev.uv[1]) * t,
-                ],
-            });
-        }
-        if cur_in {
-            out.push(cur);
-        }
-    }
-    out
-}
-
-/// Project + near-clip a world-space [`GpuImageQuad`] into perspective-correct
-/// textured-quad vertices for `image.wgsl`. Mirrors the scene-DDA pinhole
-/// (the same one [`build_line_vertices`] uses), carrying each vertex's
-/// euclidean world distance as the depth-test key. Quads fully behind the
-/// near plane produce no vertices.
-fn build_image_vertices(
-    cam: &GpuLineCamera,
-    quad: &GpuImageQuad,
-    w: u32,
-    h: u32,
-    fov_y: f32,
-    flip_x: bool,
-) -> Vec<ImageVertex> {
-    let aspect = w as f32 / h as f32;
-    let half_h = (fov_y * 0.5).tan();
-    let half_w = half_h * aspect;
-    let dt = if quad.depth_test { 1.0 } else { 0.0 };
-
-    let cam_coords = |p: [f32; 3]| -> [f32; 3] {
-        let d = [p[0] - cam.pos[0], p[1] - cam.pos[1], p[2] - cam.pos[2]];
-        [
-            cam.right[0] * d[0] + cam.right[1] * d[1] + cam.right[2] * d[2],
-            cam.down[0] * d[0] + cam.down[1] * d[1] + cam.down[2] * d[2],
-            cam.forward[0] * d[0] + cam.forward[1] * d[1] + cam.forward[2] * d[2],
-        ]
-    };
-    let project = |v: ImgClipV| -> ImageVertex {
-        let (cx, cy, cz) = (v.cam[0], v.cam[1], v.cam[2]);
-        let nx = cx / (cz * half_w);
-        ImageVertex {
-            // Mirror NDC x to match the flipped scene blit.
-            ndc: [if flip_x { -nx } else { nx }, -cy / (cz * half_h)],
-            w: cz,
-            depth: (cx * cx + cy * cy + cz * cz).sqrt(),
-            depth_test: dt,
-            cutoff: quad.alpha_cutoff,
-            uv: v.uv,
-            tint: quad.tint,
-        }
-    };
-
-    // Per-corner UV: TL(0,0) TR(1,0) BL(0,1) BR(1,1).
-    let uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
-    let verts: Vec<ImgClipV> = quad
-        .corners
-        .iter()
-        .zip(uvs)
-        .map(|(c, uv)| ImgClipV {
-            cam: cam_coords(*c),
-            uv,
-        })
-        .collect();
-
-    let mut out = Vec::with_capacity(12);
-    for tri in [[0usize, 1, 2], [1, 3, 2]] {
-        let poly = [verts[tri[0]], verts[tri[1]], verts[tri[2]]];
-        let clipped = clip_near_image(&poly);
-        if clipped.len() < 3 {
-            continue;
-        }
-        for i in 1..clipped.len() - 1 {
-            out.push(project(clipped[0]));
-            out.push(project(clipped[i]));
-            out.push(project(clipped[i + 1]));
-        }
-    }
-    out
-}
-
 /// RP.2 — flat posterize config for the resolve pass uniform. `levels[c] <= 1`
 /// leaves that channel untouched; `dither` is `0`=none, `1`=Bayer4×4,
 /// `2`=blue-noise (IGN). Mirror of `roxlap_render::PosterizeConfig`.
@@ -562,13 +225,6 @@ pub struct GpuRenderer {
     /// RP.2 — reduced-palette post applied in the resolve pass (at logical
     /// resolution). `None` = off (`levels = [1,1,1]` ⇒ the RP.1 box-avg only).
     posterize: Option<PosterizeGpu>,
-    /// Lazy-built on first [`Self::render_chunk`] call; rebuilt when
-    /// the swapchain resizes (storage texture must match).
-    chunk_dda: Option<ChunkDdaResources>,
-    /// Lazy-built on first [`Self::render_grid`] call; same resize
-    /// trigger as `chunk_dda`. The two paths share the same blit
-    /// pipeline structure but bind different storage layouts.
-    grid_dda: Option<GridDdaResources>,
     /// Lazy-built on first [`Self::render_scene`] call. Holds the
     /// multi-grid pipeline + per-grid camera uniforms.
     scene_dda: Option<SceneDdaResources>,
@@ -579,13 +235,9 @@ pub struct GpuRenderer {
     /// whether any mapped material is translucent (the shader gate).
     scene_terrain_map: Vec<[u32; 2]>,
     scene_terrain_translucent: bool,
-    /// Whether the *current* deferred frame ran a scene pass that wrote
-    /// `scene_dda.depth_buffer`. [`Self::render_scene`] sets it; the
-    /// color-only [`Self::render_clear_deferred`] clears it. Without this,
-    /// depth-tested overlays (`draw_lines_deferred` / `draw_image`) drawn
-    /// over an empty/cleared scene would test against the *previous*
-    /// scene's stale depth and clip incorrectly.
-    scene_depth_valid: bool,
+    /// QE.8c - the cross-frame validity/dirty flags, grouped with
+    /// their lifecycle rules in one place (see [`FrameDirty`]).
+    dirty: FrameDirty,
     /// GPU.8 — panoramic sky texture + sampler. Created at
     /// `new` as a 1×1 mid-grey default; [`Self::set_sky_panorama`]
     /// replaces it. The scene-DDA bind group references this each
@@ -642,15 +294,6 @@ pub struct GpuRenderer {
     /// [`Self::set_scene_lights`]; [`SceneLights::default`] = no lights
     /// (the pre-DL render). Consumed by `render_scene` each frame.
     scene_lights: SceneLights,
-    /// PF.5 — set when [`Self::set_scene_lights`] stores a DIFFERENT rig;
-    /// `render_scene` re-packs + re-uploads the scene point lights only
-    /// then (a static rig costs nothing per frame). Starts `true`.
-    scene_lights_dirty: bool,
-    /// PF.5 — like `scene_lights_dirty` but cleared by the SPRITE pass's
-    /// world-light upload (which only runs when sprites are visible, so it
-    /// needs its own flag or a lights change while no sprite is on screen
-    /// would be lost).
-    sprite_lights_dirty: bool,
     /// PF.5 — cached results of the last `pack_scene_lights` (they feed the
     /// per-frame uniform even on pack-skipped frames).
     lights_sun_flags: u32,
@@ -710,33 +353,6 @@ pub struct GpuRenderer {
     egui_renderer: Option<egui_wgpu::Renderer>,
 }
 
-/// Per-renderer chunk-DDA pipeline state. The compute shader writes
-/// into the storage texture; a fullscreen-triangle render pass
-/// nearest-neighbour blits it to the swapchain.
-struct ChunkDdaResources {
-    storage_size: (u32, u32),
-    storage_view: wgpu::TextureView,
-    uniform_buf: wgpu::Buffer,
-    bgl_dda: wgpu::BindGroupLayout,
-    pipeline_dda: wgpu::ComputePipeline,
-    blit_bg: wgpu::BindGroup,
-    pipeline_blit: wgpu::RenderPipeline,
-    // wgpu BindGroups internally Arc their resources, but we keep
-    // the handle so the sampler shows up in profiler dumps.
-    _sampler: wgpu::Sampler,
-}
-
-struct GridDdaResources {
-    storage_size: (u32, u32),
-    storage_view: wgpu::TextureView,
-    uniform_buf: wgpu::Buffer,
-    bgl_dda: wgpu::BindGroupLayout,
-    pipeline_dda: wgpu::ComputePipeline,
-    blit_bg: wgpu::BindGroup,
-    pipeline_blit: wgpu::RenderPipeline,
-    _sampler: wgpu::Sampler,
-}
-
 struct SceneDdaResources {
     /// RP.1 — the **march** framebuffer size (`logical × ssaa`); the scene +
     /// sprite + depth passes run at this. Used for the rebuild check.
@@ -792,6 +408,51 @@ struct SceneDdaResources {
     /// sprites). `sprite_cast_count == 0` keeps the shader from indexing it.
     /// `None` on non-capable devices (those bindings aren't in the BGL).
     sprite_cast_dummy: Option<wgpu::Buffer>,
+}
+
+/// QE.8c — the renderer's cross-frame validity/dirty flags, grouped so
+/// their lifecycle rules live on the fields they guard instead of in
+/// comments scattered across three loose booleans (the QE review
+/// called those "discipline-only invariants").
+#[derive(Debug)]
+pub(crate) struct FrameDirty {
+    /// PF.5 — set when [`GpuRenderer::set_scene_lights`] stores a
+    /// *different* rig; the SCENE pass re-packs + re-uploads the grid
+    /// point lights only then, and clears it (a static rig costs
+    /// nothing per frame). Starts `true` so the first frame seeds.
+    pub(crate) scene_lights: bool,
+    /// PF.5 — like [`scene_lights`](Self::scene_lights) but cleared by
+    /// the SPRITE pass's world-light upload, which only runs when
+    /// sprites are visible — a lights change while no sprite is on
+    /// screen must stay dirty for the frame that finally draws one,
+    /// hence its own flag. Starts `true`.
+    pub(crate) sprite_lights: bool,
+    /// Whether the *current* deferred frame ran a scene pass that
+    /// wrote `scene_dda.depth_buffer`. `render_scene` sets it; the
+    /// color-only `render_clear_deferred` clears it. Depth-tested
+    /// overlays gate on it — without this they'd test against the
+    /// *previous* scene's stale depth and clip incorrectly.
+    pub(crate) scene_depth_valid: bool,
+}
+
+impl Default for FrameDirty {
+    fn default() -> Self {
+        Self {
+            scene_lights: true,
+            sprite_lights: true,
+            scene_depth_valid: false,
+        }
+    }
+}
+
+impl FrameDirty {
+    /// A new light rig arrived — both consumers must re-upload (each
+    /// clears only its own flag; see the field docs for why they are
+    /// separate).
+    pub(crate) fn mark_lights_changed(&mut self) {
+        self.scene_lights = true;
+        self.sprite_lights = true;
+    }
 }
 
 /// PF.4 — persistent per-frame pack state for `render_scene`: the per-grid
@@ -1084,216 +745,6 @@ fn material_palette(
     (out, any_translucent)
 }
 
-// ───────────────────────── DL — dynamic lighting ─────────────────────────
-// Stage DL (GPU-only). The scene-DDA pass gains a runtime sun + point
-// lights + stylized hard shadows. The host passes lights already
-// transformed into each grid's local frame (mirroring the per-grid
-// cameras); the shader works entirely in grid-local space. DL.0 wires the
-// buffers + uniform fields + bindings; the shader receives them but does
-// not yet read them (the hit-site shading lands in DL.1+).
-
-/// Max point lights honoured per frame. Excess are dropped with a warning
-/// (never silently truncated). The per-grid buffer is sized
-/// `grid_count * point_count`.
-pub const MAX_POINT_LIGHTS: usize = 32;
-/// Max simultaneous shadow casters (the sun counts as one). Lights flagged
-/// to cast beyond this are demoted to shadowless with a warning. Enforced
-/// in DL.3 (shadow stage); declared here so the budget is one constant.
-pub const MAX_SHADOW_CASTERS: usize = 4;
-
-/// A point light in a grid's **local** space, as handed to
-/// [`GpuRenderer::set_scene_lights`]. The facade transforms world-space
-/// `roxlap_render::PointLight`s into each grid's frame.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GpuLight {
-    /// Grid-local position (voxel units).
-    pub position: [f32; 3],
-    /// Hard cutoff distance, world/voxel units.
-    pub radius: f32,
-    /// Linear RGB, `0..1`.
-    pub color: [f32; 3],
-    pub intensity: f32,
-    pub casts_shadow: bool,
-    /// SL — spot (cone) axis: unit direction the light shines **along**,
-    /// in the same frame as [`Self::position`] (grid-local for the scene
-    /// pass, world for the sprite pass). Ignored when [`Self::cos_outer`]
-    /// is `-1.0`.
-    pub spot_dir: [f32; 3],
-    /// SL — cosine of the inner cone half-angle (full brightness within it).
-    pub cos_inner: f32,
-    /// SL — cosine of the outer cone half-angle (zero past it; soft between).
-    /// `-1.0` (180° cone) ⇒ a pure point light: the cone mask is skipped.
-    pub cos_outer: f32,
-}
-
-/// The whole per-frame light environment, already transformed per grid.
-/// `grid_sun_dirs` and `grid_point_lights` are indexed by grid (outer
-/// length == `grid_count`); empty ⇒ that light type is off. Set each frame
-/// via [`GpuRenderer::set_scene_lights`]; [`Default`] = no lights (the
-/// pre-DL render).
-#[derive(Clone, Default, PartialEq)]
-pub struct SceneLights {
-    /// Whether a dynamic-lighting rig is active this frame. `false` (the
-    /// default) ⇒ the shader takes the unchanged baked-only path
-    /// (byte-identical to pre-DL). `true` ⇒ the lit path runs (ambient
-    /// term + sun + point lights), even with no sun/points set, so the
-    /// `ambient` multiplier still applies.
-    pub enabled: bool,
-    /// Per-grid unit direction **to** the sun (grid-local). Empty ⇒ no sun.
-    pub grid_sun_dirs: Vec<[f32; 3]>,
-    pub sun_color: [f32; 3],
-    pub sun_intensity: f32,
-    pub sun_casts_shadow: bool,
-    /// Per-grid point lights (grid-local). Outer len == `grid_count`; the
-    /// inner len (the point count) is the same for every grid.
-    pub grid_point_lights: Vec<Vec<GpuLight>>,
-    /// Multiplier on the baked ambient byte.
-    pub ambient: [f32; 3],
-    pub shadow_strength: f32,
-    pub shadow_bias: f32,
-    pub shadow_max_dist: f32,
-    pub shadow_max_steps: u32,
-    /// DL.4 — **world-space** unit direction to the sun, for the sprite
-    /// pass (sprites render in world space, not grid-local). `[0;3]` ⇒ no
-    /// sun. Empty `grid_sun_dirs` and a zero `world_sun_dir` both mean
-    /// "no sun" for their respective passes.
-    pub world_sun_dir: [f32; 3],
-    /// DL.4 — world-space point lights for the sprite pass (positions in
-    /// world coords; same colour/intensity/radius as the per-grid copies).
-    pub world_points: Vec<GpuLight>,
-    /// DL.6 — stylized cel banding: `0` = smooth, `≥1` = quantize the
-    /// diffuse to `bands + 1` levels + gradient-map the sun key.
-    pub style_bands: u32,
-    /// DL.6 — cool shadow/ambient tint (the stylized ramp's unlit end).
-    pub shadow_tint: [f32; 3],
-}
-
-/// One point light packed for the GPU (binding 18, std430, 64 bytes —
-/// four `vec4<f32>`). Mirrors `PointLight` in `scene_dda.wgsl` and
-/// `sprite_model_dda.wgsl`. SL grew this 48→64 for the spot (cone) fields;
-/// a `-1.0` `cos_outer` marks a pure point light (cone mask skipped).
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuPointLight {
-    pos: [f32; 3],
-    radius: f32,
-    color: [f32; 3],
-    intensity: f32,
-    // SL — spot (cone) fields. `cos_outer == -1.0` ⇒ omnidirectional point.
-    spot_dir: [f32; 3],
-    cos_outer: f32,
-    cos_inner: f32,
-    casts_shadow: u32,
-    _pad: [u32; 2],
-}
-
-// SL — the std430 stride must stay locked to the WGSL `PointLight` (four
-// `vec4<f32>`); a mismatch silently corrupts every light past the first.
-const _: () = assert!(core::mem::size_of::<GpuPointLight>() == 64);
-
-/// Build the per-grid point-light storage buffer (binding 18), grid-major:
-/// grid `g`'s lights occupy `[g*count .. (g+1)*count]`. Pads to one zeroed
-/// element when empty (wgpu rejects a zero-sized storage binding).
-fn upload_grid_point_lights(device: &wgpu::Device, lights: &[GpuPointLight]) -> wgpu::Buffer {
-    use wgpu::util::DeviceExt;
-    let one = [GpuPointLight::zeroed()];
-    let src: &[GpuPointLight] = if lights.is_empty() { &one } else { lights };
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("roxlap-gpu scene_dda.grid_point_lights"),
-        contents: bytemuck::cast_slice(src),
-        usage: wgpu::BufferUsages::STORAGE,
-    })
-}
-
-/// DL — inject each grid's sun direction into `cam_vec[g].sun_dir`
-/// (binding 15). PF.5 — split from [`pack_scene_lights`]: the camera
-/// vector is rebuilt every frame, so the injection must run every frame,
-/// while the point-light pack is gated behind the lights dirty flag.
-fn inject_grid_sun_dirs(lights: &SceneLights, cam_vec: &mut [SceneDdaPerGridCamera]) {
-    if lights.grid_sun_dirs.is_empty() {
-        return;
-    }
-    for (g, cam) in cam_vec.iter_mut().enumerate() {
-        let d = lights.grid_sun_dirs.get(g).copied().unwrap_or([0.0; 3]);
-        cam.sun_dir = [d[0], d[1], d[2], 0.0];
-    }
-}
-
-/// DL — pack `lights` for the scene-DDA pass, shared by the surface and
-/// headless paths: the grid-major point-light rows (binding 18), returned
-/// as `(packed_lights, sun_flags, point_count)`. PF.4 — packing only; the
-/// caller uploads (the surface path into a persistent buffer, headless via
-/// `create_buffer_init`). PF.5 — the surface path calls this only when the
-/// lights changed (so the over-cap warnings below also fire once per
-/// change, not per frame). `sun_flags`: bit0 = sun enabled, bit1 = sun
-/// casts shadow, bit2 = dynamic lighting active. Over-cap point lights are
-/// dropped with a warning (never silently truncated).
-fn pack_scene_lights(lights: &SceneLights, grid_count: usize) -> (Vec<GpuPointLight>, u32, u32) {
-    let sun_enabled = !lights.grid_sun_dirs.is_empty();
-    // Point-light count per grid (same across grids); capped + warned.
-    let mut point_count = lights
-        .grid_point_lights
-        .first()
-        .map_or(0, std::vec::Vec::len);
-    if point_count > MAX_POINT_LIGHTS {
-        eprintln!(
-            "roxlap-gpu: {point_count} point lights > MAX_POINT_LIGHTS ({MAX_POINT_LIGHTS}); dropping the excess"
-        );
-        point_count = MAX_POINT_LIGHTS;
-    }
-    // MAX_SHADOW_CASTERS cap (locked decision #5): the sun (if it casts) is
-    // the first caster; keep at most MAX_SHADOW_CASTERS shadow casters total
-    // and demote the rest to shadowless — never silently. The point list is
-    // identical across grids (only positions differ), so decide per index
-    // once from the representative (grid-0) row.
-    let mut budget = MAX_SHADOW_CASTERS;
-    if sun_enabled && lights.sun_casts_shadow {
-        budget = budget.saturating_sub(1);
-    }
-    let mut allow_shadow = vec![false; point_count];
-    let mut demoted = 0usize;
-    if let Some(rep) = lights.grid_point_lights.first() {
-        for (i, slot) in allow_shadow.iter_mut().enumerate() {
-            if rep.get(i).is_some_and(|l| l.casts_shadow) {
-                if budget > 0 {
-                    *slot = true;
-                    budget -= 1;
-                } else {
-                    demoted += 1;
-                }
-            }
-        }
-    }
-    if demoted > 0 {
-        eprintln!(
-            "roxlap-gpu: {demoted} shadow-casting point lights > MAX_SHADOW_CASTERS ({MAX_SHADOW_CASTERS}); demoting the excess to shadowless"
-        );
-    }
-    // Grid-major point-light buffer: grid g at [g*count .. (g+1)*count].
-    let mut packed: Vec<GpuPointLight> = Vec::with_capacity(grid_count * point_count);
-    for g in 0..grid_count {
-        let row = lights.grid_point_lights.get(g);
-        for (i, &allow) in allow_shadow.iter().enumerate() {
-            let p = row.and_then(|r| r.get(i));
-            packed.push(p.map_or(GpuPointLight::zeroed(), |l| GpuPointLight {
-                pos: l.position,
-                radius: l.radius,
-                color: l.color,
-                intensity: l.intensity,
-                spot_dir: l.spot_dir,
-                cos_outer: l.cos_outer,
-                cos_inner: l.cos_inner,
-                casts_shadow: u32::from(l.casts_shadow && allow),
-                _pad: [0; 2],
-            }));
-        }
-    }
-    let sun_flags = u32::from(sun_enabled)
-        | (u32::from(sun_enabled && lights.sun_casts_shadow) << 1)
-        | (u32::from(lights.enabled) << 2);
-    (packed, sun_flags, point_count as u32)
-}
-
 /// Build the per-grid camera storage buffer bound at `scene_dda.wgsl`
 /// binding 15 (read-only). One [`SceneDdaPerGridCamera`] per grid; the
 /// shader only indexes `0..grid_count`. An empty scene pads to one
@@ -1467,42 +918,6 @@ struct SceneDdaUniform {
     /// casters (the loop is skipped); only consulted by the capable variant.
     sprite_cast_count: u32,
     _pad7: [u32; 2],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GridDdaUniform {
-    camera_pos: [f32; 3],
-    _pad0: f32,
-    camera_right: [f32; 3],
-    _pad1: f32,
-    camera_down: [f32; 3],
-    _pad2: f32,
-    camera_forward: [f32; 3],
-    fov_y_rad: f32,
-    screen_size: [u32; 2],
-    vsid: u32,
-    max_outer_steps: u32,
-    chunks_dims: [u32; 3],
-    _pad3: u32,
-    origin_chunk: [i32; 3],
-    _pad4: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct ChunkDdaUniform {
-    camera_pos: [f32; 3],
-    _pad0: f32,
-    camera_right: [f32; 3],
-    _pad1: f32,
-    camera_down: [f32; 3],
-    _pad2: f32,
-    camera_forward: [f32; 3],
-    fov_y_rad: f32,
-    screen_size: [u32; 2],
-    vsid: u32,
-    max_scan_dist: u32,
 }
 
 impl GpuRenderer {
@@ -1759,8 +1174,6 @@ impl GpuRenderer {
             render_res: RenderResolution::Native,
             ssaa: 1,
             posterize: None,
-            chunk_dda: None,
-            grid_dda: None,
             scene_dda: None,
             scene_materials: Box::new(
                 [MaterialGpu {
@@ -1770,7 +1183,7 @@ impl GpuRenderer {
             ),
             scene_terrain_map: Vec::new(),
             scene_terrain_translucent: false,
-            scene_depth_valid: false,
+            dirty: FrameDirty::default(),
             sky_texture,
             sky_view,
             sky_sampler,
@@ -1799,8 +1212,6 @@ impl GpuRenderer {
             scene_mip_scan_dist: 64.0,
             scene_side_shades: [[0; 4]; 2],
             scene_lights: SceneLights::default(),
-            scene_lights_dirty: true,
-            sprite_lights_dirty: true,
             lights_sun_flags: 0,
             lights_point_count: 0,
             lights_packed_grids: 0,
@@ -1934,8 +1345,8 @@ impl GpuRenderer {
     }
 
     /// Re-configure the swapchain to a new physical size. Call from
-    /// `WindowEvent::Resized`. Drops the chunk-DDA storage texture
-    /// so [`Self::render_chunk`] rebuilds it at the new size.
+    /// `WindowEvent::Resized`. The scene resources rebuild lazily at
+    /// the new size on the next [`Self::render_scene`].
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -1943,8 +1354,6 @@ impl GpuRenderer {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
-        self.chunk_dda = None;
-        self.grid_dda = None;
         self.scene_dda = None;
     }
 
@@ -2055,609 +1464,6 @@ impl GpuRenderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         surf_tex.present();
         self.frame_count = self.frame_count.wrapping_add(1);
-    }
-
-    /// GPU.3 single-chunk render. Dispatches `chunk_dda.wgsl`
-    /// against `resident`'s storage buffers, then blits the
-    /// low-res storage texture to the swapchain. `camera.position`
-    /// is in **chunk-local** voxel units (host translates from
-    /// world coords). `max_scan_dist` caps the per-pixel DDA loop —
-    /// scene-demo wires `+` / `-` through this each frame.
-    ///
-    /// # Panics
-    /// Internally `expect`s the chunk-DDA resources to be built —
-    /// they are constructed at the top of this function if missing.
-    /// Cannot fire in normal control flow.
-    pub fn render_chunk(
-        &mut self,
-        resident: &GpuChunkResident,
-        camera: &Camera,
-        max_scan_dist: u32,
-    ) {
-        let Some(surf_tex) = self.acquire_frame() else {
-            return;
-        };
-        let surf_view = surf_tex
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let surface_w = self.surface_config.width;
-        let surface_h = self.surface_config.height;
-        let surface_format = self.surface_config.format;
-
-        // Lazy-build chunk-DDA resources; rebuild when the swapchain
-        // grew or shrank.
-        let needs_build = match &self.chunk_dda {
-            Some(r) => r.storage_size != (surface_w, surface_h),
-            None => true,
-        };
-        if needs_build {
-            self.chunk_dda = Some(self.build_chunk_dda(surface_w, surface_h, surface_format));
-        }
-        let dda = self.chunk_dda.as_ref().expect("just built");
-
-        // Update uniforms.
-        let uniform = ChunkDdaUniform {
-            camera_pos: camera.position,
-            _pad0: 0.0,
-            camera_right: camera.right,
-            _pad1: 0.0,
-            camera_down: camera.down,
-            _pad2: 0.0,
-            camera_forward: camera.forward,
-            fov_y_rad: camera.fov_y_rad,
-            screen_size: [surface_w, surface_h],
-            vsid: resident.vsid,
-            max_scan_dist,
-        };
-        self.queue
-            .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
-
-        // Per-frame DDA bind group — references the chunk's buffers
-        // so we rebuild every frame (the resident can change between
-        // calls).
-        let dda_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("roxlap-gpu chunk_dda.bg"),
-            layout: &dda.bgl_dda,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: dda.uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: resident.occupancy.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: resident.color_offsets.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: resident.colors.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&dda.storage_view),
-                },
-            ],
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("roxlap-gpu chunk encoder"),
-            });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("roxlap-gpu chunk_dda compute"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&dda.pipeline_dda);
-            cpass.set_bind_group(0, &dda_bg, &[]);
-            cpass.dispatch_workgroups(surface_w.div_ceil(8), surface_h.div_ceil(8), 1);
-        }
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("roxlap-gpu chunk_dda blit"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surf_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rpass.set_pipeline(&dda.pipeline_blit);
-            rpass.set_bind_group(0, &dda.blit_bg, &[]);
-            rpass.draw(0..3, 0..1);
-        }
-        self.queue.submit(std::iter::once(encoder.finish()));
-        surf_tex.present();
-        self.frame_count = self.frame_count.wrapping_add(1);
-    }
-
-    fn build_chunk_dda(
-        &self,
-        width: u32,
-        height: u32,
-        surface_format: wgpu::TextureFormat,
-    ) -> ChunkDdaResources {
-        let storage_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("roxlap-gpu chunk_dda.storage"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let storage_view = storage_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("roxlap-gpu chunk_dda.uniform"),
-            size: std::mem::size_of::<ChunkDdaUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let dda_shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("chunk_dda.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/chunk_dda.wgsl").into()),
-            });
-        let bgl_dda = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("roxlap-gpu chunk_dda.bgl"),
-                entries: &[
-                    bgl_uniform_entry(0),
-                    bgl_storage_entry(1, true),
-                    bgl_storage_entry(2, true),
-                    bgl_storage_entry(3, true),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-        let dda_pl = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("roxlap-gpu chunk_dda.layout"),
-                bind_group_layouts: &[Some(&bgl_dda)],
-                immediate_size: 0,
-            });
-        let pipeline_dda = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("roxlap-gpu chunk_dda.pipeline"),
-                layout: Some(&dda_pl),
-                module: &dda_shader,
-                entry_point: Some("render_chunk"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
-
-        // Fullscreen-triangle blit upscales the storage texture into
-        // the swapchain. Nearest filter keeps the retro pixel look.
-        let blit_shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("blit.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
-            });
-        let bgl_blit = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("roxlap-gpu chunk_dda.blit_bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                        count: None,
-                    },
-                ],
-            });
-        let blit_pl = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("roxlap-gpu chunk_dda.blit_layout"),
-                bind_group_layouts: &[Some(&bgl_blit)],
-                immediate_size: 0,
-            });
-        let pipeline_blit = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("roxlap-gpu chunk_dda.blit_pipeline"),
-                layout: Some(&blit_pl),
-                vertex: wgpu::VertexState {
-                    module: &blit_shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &blit_shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: surface_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("roxlap-gpu chunk_dda.blit_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("roxlap-gpu chunk_dda.blit_bg"),
-            layout: &bgl_blit,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&storage_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
-        ChunkDdaResources {
-            storage_size: (width, height),
-            storage_view,
-            uniform_buf,
-            bgl_dda,
-            pipeline_dda,
-            blit_bg,
-            pipeline_blit,
-            _sampler: sampler,
-        }
-    }
-
-    /// GPU.4 render — outer DDA over chunk indices + inner DDA into
-    /// non-empty chunks. `camera.position` is in **grid-local**
-    /// voxel units. `max_outer_steps` caps how many chunks the
-    /// outer DDA may traverse per ray (scene-demo wires `+ / -`
-    /// through this).
-    ///
-    /// # Panics
-    /// Internally `expect`s the grid-DDA resources to be built;
-    /// they are constructed at the top of this function if missing.
-    pub fn render_grid(&mut self, grid: &GpuGridResident, camera: &Camera, max_outer_steps: u32) {
-        let Some(surf_tex) = self.acquire_frame() else {
-            return;
-        };
-        let surf_view = surf_tex
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let surface_w = self.surface_config.width;
-        let surface_h = self.surface_config.height;
-        let surface_format = self.surface_config.format;
-
-        let needs_build = match &self.grid_dda {
-            Some(r) => r.storage_size != (surface_w, surface_h),
-            None => true,
-        };
-        if needs_build {
-            self.grid_dda = Some(self.build_grid_dda(surface_w, surface_h, surface_format));
-        }
-        let dda = self.grid_dda.as_ref().expect("just built");
-
-        let uniform = GridDdaUniform {
-            camera_pos: camera.position,
-            _pad0: 0.0,
-            camera_right: camera.right,
-            _pad1: 0.0,
-            camera_down: camera.down,
-            _pad2: 0.0,
-            camera_forward: camera.forward,
-            fov_y_rad: camera.fov_y_rad,
-            screen_size: [surface_w, surface_h],
-            vsid: grid.vsid,
-            max_outer_steps,
-            chunks_dims: grid.chunks_dims,
-            _pad3: 0,
-            origin_chunk: grid.origin_chunk,
-            _pad4: 0,
-        };
-        self.queue
-            .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
-
-        let dda_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("roxlap-gpu grid_dda.bg"),
-            layout: &dda.bgl_dda,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: dda.uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: grid.occupancy.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: grid.color_offsets.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: grid.colors.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: grid.chunk_colors_base.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: grid.chunk_occupancy.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::TextureView(&dda.storage_view),
-                },
-            ],
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("roxlap-gpu grid encoder"),
-            });
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("roxlap-gpu grid_dda compute"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&dda.pipeline_dda);
-            cpass.set_bind_group(0, &dda_bg, &[]);
-            cpass.dispatch_workgroups(surface_w.div_ceil(8), surface_h.div_ceil(8), 1);
-        }
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("roxlap-gpu grid_dda blit"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surf_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rpass.set_pipeline(&dda.pipeline_blit);
-            rpass.set_bind_group(0, &dda.blit_bg, &[]);
-            rpass.draw(0..3, 0..1);
-        }
-        self.queue.submit(std::iter::once(encoder.finish()));
-        surf_tex.present();
-        self.frame_count = self.frame_count.wrapping_add(1);
-    }
-
-    fn build_grid_dda(
-        &self,
-        width: u32,
-        height: u32,
-        surface_format: wgpu::TextureFormat,
-    ) -> GridDdaResources {
-        let storage_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("roxlap-gpu grid_dda.storage"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let storage_view = storage_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("roxlap-gpu grid_dda.uniform"),
-            size: std::mem::size_of::<GridDdaUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let dda_shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("grid_dda.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/grid_dda.wgsl").into()),
-            });
-        let bgl_dda = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("roxlap-gpu grid_dda.bgl"),
-                entries: &[
-                    bgl_uniform_entry(0),
-                    bgl_storage_entry(1, true),
-                    bgl_storage_entry(2, true),
-                    bgl_storage_entry(3, true),
-                    bgl_storage_entry(4, true),
-                    bgl_storage_entry(5, true),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-        let dda_pl = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("roxlap-gpu grid_dda.layout"),
-                bind_group_layouts: &[Some(&bgl_dda)],
-                immediate_size: 0,
-            });
-        let pipeline_dda = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("roxlap-gpu grid_dda.pipeline"),
-                layout: Some(&dda_pl),
-                module: &dda_shader,
-                entry_point: Some("render_grid"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
-
-        let blit_shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("blit.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
-            });
-        let bgl_blit = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("roxlap-gpu grid_dda.blit_bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                        count: None,
-                    },
-                ],
-            });
-        let blit_pl = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("roxlap-gpu grid_dda.blit_layout"),
-                bind_group_layouts: &[Some(&bgl_blit)],
-                immediate_size: 0,
-            });
-        let pipeline_blit = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("roxlap-gpu grid_dda.blit_pipeline"),
-                layout: Some(&blit_pl),
-                vertex: wgpu::VertexState {
-                    module: &blit_shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &blit_shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: surface_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("roxlap-gpu grid_dda.blit_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("roxlap-gpu grid_dda.blit_bg"),
-            layout: &bgl_blit,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&storage_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
-        GridDdaResources {
-            storage_size: (width, height),
-            storage_view,
-            uniform_buf,
-            bgl_dda,
-            pipeline_dda,
-            blit_bg,
-            pipeline_blit,
-            _sampler: sampler,
-        }
     }
 
     /// GPU.5 render — multi-grid scene marcher. `cameras[i]` is the
@@ -2832,14 +1638,14 @@ impl GpuRenderer {
         fp.write_cameras(&self.device, &self.queue, &cam_vec);
         // PF.5 — re-pack + re-upload the grid-major point lights only when
         // the rig changed (or the grid count did — the rows depend on it).
-        if self.scene_lights_dirty || self.lights_packed_grids != scene.grid_count {
+        if self.dirty.scene_lights || self.lights_packed_grids != scene.grid_count {
             let (packed_lights, sun_flags, point_count) =
                 pack_scene_lights(lights, scene.grid_count as usize);
             fp.write_point_lights(&self.device, &self.queue, &packed_lights);
             self.lights_sun_flags = sun_flags;
             self.lights_point_count = point_count;
             self.lights_packed_grids = scene.grid_count;
-            self.scene_lights_dirty = false;
+            self.dirty.scene_lights = false;
         }
         let (sun_flags, point_count) = (self.lights_sun_flags, self.lights_point_count);
 
@@ -2981,7 +1787,7 @@ impl GpuRenderer {
                 // PF.5 — rebuilt + re-uploaded only when the rig changed;
                 // this pass's own dirty flag (it only runs with sprites on
                 // screen, so it can't ride the scene pack's flag).
-                if self.sprite_lights_dirty {
+                if self.dirty.sprite_lights {
                     let sprite_pts: Vec<GpuPointLight> = dl
                         .world_points
                         .iter()
@@ -3002,7 +1808,7 @@ impl GpuRenderer {
                         })
                         .collect();
                     fp.write_sprite_lights(&self.device, &self.queue, &sprite_pts);
-                    self.sprite_lights_dirty = false;
+                    self.dirty.sprite_lights = false;
                 }
                 // sun_flags bit0 = sun enabled, bit1 = sun casts shadow (XS.4.2),
                 // bit2 = dynamic lighting active.
@@ -3194,7 +2000,7 @@ impl GpuRenderer {
         self.queue.submit(std::iter::once(encoder.finish()));
         // This frame wrote `scene_dda.depth_buffer`, so depth-tested
         // overlays may test against it.
-        self.scene_depth_valid = true;
+        self.dirty.scene_depth_valid = true;
         // Deferred present — the host calls `present` or `paint_egui`.
         self.pending_frame = Some((surf_tex, surf_view));
         self.frame_count = self.frame_count.wrapping_add(1);
@@ -3208,7 +2014,7 @@ impl GpuRenderer {
         // No scene pass this frame ⇒ `scene_dda.depth_buffer` (if it
         // exists from an earlier scene) is stale; depth-tested overlays
         // must not test against it.
-        self.scene_depth_valid = false;
+        self.dirty.scene_depth_valid = false;
         self.pending_frame = None;
         let Some(surf_tex) = self.acquire_frame() else {
             return;
@@ -3271,607 +2077,6 @@ impl GpuRenderer {
         }
     }
 
-    /// Draw depth-tested world-space [`GpuLine`]s over the pending frame
-    /// (L3.2). Projects each endpoint with `cam` (the marcher's pinhole) +
-    /// the last frame's FOV / surface size, expands to screen-space quads,
-    /// and runs a `LoadOp::Load` pass into the pending swapchain view — so
-    /// the lines land on the marched frame and a later `present` /
-    /// `paint_egui` still finishes it (the pending frame is left intact).
-    /// Depth-tested lines are occluded by nearer marched geometry (compared
-    /// against the scene-DDA depth buffer's `best_t`); call after `render`,
-    /// before `present` / `paint_egui`. No-op if no frame is pending.
-    pub fn draw_lines_deferred(&mut self, cam: &GpuLineCamera, lines: &[GpuLine]) {
-        if self.pending_frame.is_none() || lines.is_empty() {
-            return;
-        }
-        let (w, h) = (self.surface_config.width, self.surface_config.height);
-        // RP.0 — project with the render (logical) aspect so the lines align
-        // with the upscaled scene; the depth buffer is render-sized too.
-        let (rw, rh) = self.render_dims();
-        let fov = self.last_fov_y_rad;
-        if w == 0 || h == 0 || fov <= 0.0 {
-            return; // no frame marched yet — no projection to reuse
-        }
-        let verts = build_line_vertices(cam, lines, rw, rh, fov, self.flip_x);
-        if verts.is_empty() {
-            return;
-        }
-        self.ensure_line_resources();
-        let res = self.line_resources.as_ref().expect("just built");
-
-        // Skip the depth test when there's no current scene depth to read —
-        // either no buffer at all (sprite-only / never-rendered) or this
-        // frame was a color-only clear so the buffer is stale (an empty
-        // scene drawn after a grid scene). The 1-word dummy / stale buffer
-        // is still bound to satisfy the layout; `no_depth = 1` keeps the
-        // shader from indexing it.
-        let no_depth = u32::from(self.scene_dda.is_none() || !self.scene_depth_valid);
-        let params = LineParams {
-            screen_w: w,
-            screen_h: h,
-            depth_bias: LINE_DEPTH_BIAS,
-            no_depth,
-            flip_x: u32::from(self.flip_x),
-            depth_w: rw,
-            depth_h: rh,
-            _pad: 0,
-        };
-        self.queue
-            .write_buffer(&res.uniform_buf, 0, bytemuck::bytes_of(&params));
-
-        // PF.13 (H7-lite) — the bind group depends only on the uniform
-        // buffer (stable) and the depth buffer identity, so cache it and
-        // rebuild only when the depth buffer is swapped (resize / scene
-        // rebuild). wgpu buffers compare by identity.
-        let depth_key: Option<wgpu::Buffer> =
-            self.scene_dda.as_ref().map(|dda| dda.depth_buffer.clone());
-        if !matches!(&self.line_bg_cache, Some((_, key)) if *key == depth_key) {
-            let depth_resource = match &self.scene_dda {
-                Some(dda) => dda.depth_buffer.as_entire_binding(),
-                None => res.dummy_depth.as_entire_binding(),
-            };
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("roxlap-gpu line.bg"),
-                layout: &res.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: res.uniform_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: depth_resource,
-                    },
-                ],
-            });
-            self.line_bg_cache = Some((bg, depth_key));
-        }
-        let bg = &self.line_bg_cache.as_ref().expect("just ensured").0;
-
-        // Grow-only persistent vertex buffer (L3.3): one `write_buffer`
-        // per overlay, reused across frames. Power-of-two capacity keeps
-        // re-allocation rare as the segment count drifts.
-        let needed = std::mem::size_of_val(verts.as_slice()) as u64;
-        if self.line_vbuf_cap < needed {
-            let cap = needed.next_power_of_two().max(4096);
-            self.line_vbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("roxlap-gpu line.vbuf"),
-                size: cap,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            self.line_vbuf_cap = cap;
-        }
-        let vbuf = self.line_vbuf.as_ref().expect("ensured above");
-        self.queue
-            .write_buffer(vbuf, 0, bytemuck::cast_slice(&verts));
-
-        let view = &self.pending_frame.as_ref().expect("checked above").1;
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("roxlap-gpu lines"),
-            });
-        {
-            // `LoadOp::Load` keeps the marcher's frame; the lines draw over
-            // it. Manual depth test in the FS (no depth-stencil attachment).
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("roxlap-gpu line paint"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&res.pipeline);
-            pass.set_bind_group(0, bg, &[]);
-            pass.set_vertex_buffer(0, vbuf.slice(..));
-            pass.draw(0..verts.len() as u32, 0..1);
-        }
-        self.queue.submit(std::iter::once(encoder.finish()));
-        // pending_frame left intact — present/paint_egui finishes the frame.
-    }
-
-    /// Lazy-build the [`LineResources`] (`line.wgsl` pipeline + uniform +
-    /// dummy depth buffer). The colour target uses the surface format with
-    /// straight-alpha over-blending; no depth-stencil attachment (the depth
-    /// test is manual in the fragment shader against the scene depth buffer).
-    fn ensure_line_resources(&mut self) {
-        if self.line_resources.is_some() {
-            return;
-        }
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("line.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/line.wgsl").into()),
-            });
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("roxlap-gpu line.bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("roxlap-gpu line.layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        let pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("roxlap-gpu line.pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<LineVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![
-                            0 => Float32x2, // pos (NDC)
-                            1 => Float32,   // depth
-                            2 => Float32,   // depth_test
-                            3 => Float32x4, // color
-                        ],
-                    }],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: self.surface_config.format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("roxlap-gpu line.uniform"),
-            size: std::mem::size_of::<LineParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let dummy_depth = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("roxlap-gpu line.dummy_depth"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        self.line_resources = Some(LineResources {
-            pipeline,
-            bgl,
-            uniform_buf,
-            dummy_depth,
-        });
-    }
-
-    /// Upload (or replace) an RGBA8 image as a sampled texture, returning
-    /// a stable id for [`GpuImageQuad::image`]. `rgba` is row-major,
-    /// `width * height * 4` bytes, straight (un-premultiplied) alpha.
-    /// Reuses a dropped slot when one exists. Returns `0` for malformed
-    /// input (an id that draws nothing).
-    pub fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> usize {
-        if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
-            return 0;
-        }
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("roxlap-gpu image_sprite"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let resident = ImageResident {
-            view,
-            _texture: texture,
-        };
-        if let Some(slot) = self.images.iter().position(Option::is_none) {
-            self.images[slot] = Some(resident);
-            // PF.13 (H7-lite) — the slot now holds a different texture;
-            // any cached bind group for the old occupant is stale.
-            self.image_bg_cache.remove(&slot);
-            slot
-        } else {
-            self.images.push(Some(resident));
-            self.images.len() - 1
-        }
-    }
-
-    /// Release an image uploaded with [`Self::upload_image`] (the slot
-    /// becomes reusable).
-    pub fn drop_image(&mut self, id: usize) {
-        if let Some(slot) = self.images.get_mut(id) {
-            *slot = None;
-            self.image_bg_cache.remove(&id);
-        }
-    }
-
-    /// Draw world-space 2D image sprites ([`GpuImageQuad`]) over the
-    /// pending frame — the textured-quad sibling of
-    /// [`Self::draw_lines_deferred`]. Projects each quad with `cam` (the
-    /// marcher's pinhole) + the last frame's FOV / surface size, expands +
-    /// near-clips to triangles, and runs one `LoadOp::Load` pass with a
-    /// draw per quad (each binds its own texture). UVs are perspective-correct;
-    /// depth-tested quads are occluded by nearer marched geometry. Call
-    /// after `render`, before `present` / `paint_egui`. No-op if no frame
-    /// is pending.
-    pub fn draw_images_deferred(&mut self, cam: &GpuLineCamera, quads: &[GpuImageQuad]) {
-        if self.pending_frame.is_none() || quads.is_empty() {
-            return;
-        }
-        let (w, h) = (self.surface_config.width, self.surface_config.height);
-        // RP.0 — project with the render (logical) aspect (see
-        // `draw_lines_deferred`); depth buffer is render-sized.
-        let (rw, rh) = self.render_dims();
-        let fov = self.last_fov_y_rad;
-        if w == 0 || h == 0 || fov <= 0.0 {
-            return;
-        }
-
-        // Concatenate every quad's verts into one buffer, recording each
-        // quad's (range, texture) so they share a single render pass.
-        let mut verts: Vec<ImageVertex> = Vec::new();
-        let mut draws: Vec<(u32, u32, usize)> = Vec::new();
-        for quad in quads {
-            if !matches!(self.images.get(quad.image), Some(Some(_))) {
-                continue; // dropped / never-uploaded id
-            }
-            let v = build_image_vertices(cam, quad, rw, rh, fov, self.flip_x);
-            if v.is_empty() {
-                continue;
-            }
-            let start = verts.len() as u32;
-            verts.extend_from_slice(&v);
-            draws.push((start, verts.len() as u32, quad.image));
-        }
-        if draws.is_empty() {
-            return;
-        }
-
-        self.ensure_image_resources();
-        // See `draw_lines_deferred`: skip depth when there's no valid
-        // current-frame scene depth (none built, or a color-only clear).
-        let no_depth = u32::from(self.scene_dda.is_none() || !self.scene_depth_valid);
-        let params = LineParams {
-            screen_w: w,
-            screen_h: h,
-            depth_bias: LINE_DEPTH_BIAS,
-            no_depth,
-            flip_x: u32::from(self.flip_x),
-            depth_w: rw,
-            depth_h: rh,
-            _pad: 0,
-        };
-        {
-            let res = self.image_resources.as_ref().expect("just built");
-            self.queue
-                .write_buffer(&res.uniform_buf, 0, bytemuck::bytes_of(&params));
-        }
-
-        // Grow-only persistent vertex buffer (mirrors the line vbuf).
-        let needed = std::mem::size_of_val(verts.as_slice()) as u64;
-        if self.image_vbuf_cap < needed {
-            let cap = needed.next_power_of_two().max(4096);
-            self.image_vbuf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("roxlap-gpu image.vbuf"),
-                size: cap,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            self.image_vbuf_cap = cap;
-        }
-        let vbuf = self.image_vbuf.as_ref().expect("ensured above");
-        self.queue
-            .write_buffer(vbuf, 0, bytemuck::cast_slice(&verts));
-
-        // One bind group per image id (the texture view differs per
-        // image). PF.13 (H7-lite) — cached across frames keyed by image
-        // id, valid while the depth buffer identity holds; a static HUD
-        // costs zero bind-group creations per frame. Entries evict on
-        // image drop / slot re-upload.
-        let res = self.image_resources.as_ref().expect("just built");
-        let depth_key: Option<wgpu::Buffer> =
-            self.scene_dda.as_ref().map(|dda| dda.depth_buffer.clone());
-        if self.image_bg_depth != depth_key {
-            self.image_bg_cache.clear();
-            self.image_bg_depth = depth_key;
-        }
-        let depth_resource = match &self.scene_dda {
-            Some(dda) => dda.depth_buffer.as_entire_binding(),
-            None => res.dummy_depth.as_entire_binding(),
-        };
-        for &(_, _, image_id) in &draws {
-            if self.image_bg_cache.contains_key(&image_id) {
-                continue;
-            }
-            let resident = self.images[image_id].as_ref().expect("checked present");
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("roxlap-gpu image.bg"),
-                layout: &res.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: res.uniform_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: depth_resource.clone(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&resident.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&res.sampler),
-                    },
-                ],
-            });
-            self.image_bg_cache.insert(image_id, bg);
-        }
-
-        let view = &self.pending_frame.as_ref().expect("checked above").1;
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("roxlap-gpu images"),
-            });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("roxlap-gpu image paint"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&res.pipeline);
-            pass.set_vertex_buffer(0, vbuf.slice(..));
-            for &(start, end, image_id) in &draws {
-                let bg = self.image_bg_cache.get(&image_id).expect("just ensured");
-                pass.set_bind_group(0, bg, &[]);
-                pass.draw(start..end, 0..1);
-            }
-        }
-        self.queue.submit(std::iter::once(encoder.finish()));
-        // pending_frame left intact — present/paint_egui finishes it.
-    }
-
-    /// Lazy-build the [`ImageResources`] (`image.wgsl` pipeline + uniform +
-    /// nearest sampler + dummy depth). Straight-alpha over-blend, no
-    /// depth-stencil attachment (the depth test is manual in the FS).
-    fn ensure_image_resources(&mut self) {
-        if self.image_resources.is_some() {
-            return;
-        }
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("image.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/image.wgsl").into()),
-            });
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("roxlap-gpu image.bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("roxlap-gpu image.layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        let pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("roxlap-gpu image.pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<ImageVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![
-                            0 => Float32x2, // ndc
-                            1 => Float32,   // w
-                            2 => Float32,   // depth
-                            3 => Float32,   // depth_test
-                            4 => Float32,   // cutoff
-                            5 => Float32x2, // uv
-                            6 => Float32x4, // tint
-                        ],
-                    }],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: self.surface_config.format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-        let uniform_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("roxlap-gpu image.uniform"),
-            size: std::mem::size_of::<LineParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let dummy_depth = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("roxlap-gpu image.dummy_depth"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("roxlap-gpu image.sampler"),
-            // Nearest + clamp: pixel-art references want crisp texels and
-            // no wrap bleed at the quad edges.
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        self.image_resources = Some(ImageResources {
-            pipeline,
-            bgl,
-            uniform_buf,
-            dummy_depth,
-            sampler,
-        });
-    }
-
     /// Project a world point to window pixels under the marcher's
     /// vertical-FOV pinhole (the inverse of [`Self::pixel_ray`]), using
     /// the last-rendered frame's size + FOV. `None` before the first
@@ -3908,86 +2113,6 @@ impl GpuRenderer {
         let sx = (ndc_x * 0.5 + 0.5) * w as f32;
         let sy = (0.5 - ndc_y * 0.5) * h as f32;
         Some((sx, sy))
-    }
-
-    /// Overlay an `egui` UI on the pending frame, then present it
-    /// (`hud` feature). `jobs` are the host's tessellated primitives
-    /// (`egui::Context::tessellate`), `textures` the per-frame texture
-    /// delta from `egui::FullOutput`, `pixels_per_point` the UI scale.
-    ///
-    /// Draws with `LoadOp::Load` over the marcher's frame (a separate
-    /// encoder submitted after the scene's), so the UI composites on top
-    /// of the world. No-op if no frame is pending.
-    #[cfg(feature = "hud")]
-    pub fn paint_egui(
-        &mut self,
-        jobs: &[egui::ClippedPrimitive],
-        textures: &egui::TexturesDelta,
-        pixels_per_point: f32,
-    ) {
-        let Some((surf_tex, surf_view)) = self.pending_frame.take() else {
-            return;
-        };
-        let format = self.surface_config.format;
-        let egui_rend = self.egui_renderer.get_or_insert_with(|| {
-            egui_wgpu::Renderer::new(
-                &self.device,
-                format,
-                egui_wgpu::RendererOptions {
-                    msaa_samples: 1,
-                    depth_stencil_format: None,
-                    dithering: false,
-                    ..Default::default()
-                },
-            )
-        });
-
-        let screen = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.surface_config.width, self.surface_config.height],
-            pixels_per_point,
-        };
-        for (id, delta) in &textures.set {
-            egui_rend.update_texture(&self.device, &self.queue, *id, delta);
-        }
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("roxlap-gpu egui"),
-            });
-        let user_bufs =
-            egui_rend.update_buffers(&self.device, &self.queue, &mut encoder, jobs, &screen);
-        {
-            // `LoadOp::Load` keeps the marcher's frame; egui draws over it.
-            let mut pass = encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("roxlap-gpu egui paint"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &surf_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                })
-                // egui-wgpu 0.29 requires a `'static` pass (see its docs).
-                .forget_lifetime();
-            egui_rend.render(&mut pass, jobs, &screen);
-        }
-        for id in &textures.free {
-            egui_rend.free_texture(id);
-        }
-        self.queue.submit(
-            user_bufs
-                .into_iter()
-                .chain(std::iter::once(encoder.finish())),
-        );
-        surf_tex.present();
     }
 
     fn build_scene_dda(
@@ -4391,169 +2516,6 @@ impl GpuRenderer {
         }
     }
 
-    /// Read back the per-pixel world-t depth at window pixel `(x, y)`
-    /// from the last rendered frame, for screen→world picking. Returns
-    /// the distance `t` along the (normalised) view ray to the nearest
-    /// scene-grid surface, so the host reconstructs the world hit as
-    /// `cam.pos + t * normalize(ray_dir)`. `None` for out-of-bounds
-    /// pixels, sky / no-hit (the `T_INF` sentinel), or when no scene
-    /// frame has been rendered.
-    ///
-    /// The depth buffer is the SCENE pass's output (terrain + grids),
-    /// untouched by the sprite pass (which reads it read-only), so a
-    /// cursor sprite under the pointer does not occlude the pick.
-    ///
-    /// Synchronous: copies the depth buffer to a mapped staging buffer
-    /// and blocks on `device.poll(Wait)`. Cheap enough for click-time
-    /// picks; do not call it every frame.
-    ///
-    /// Requires the last frame to have written depth, which happens
-    /// when sprites are present (`write_depth`). The pick demo always
-    /// has a cursor sprite, so this holds.
-    ///
-    /// Compiles on wasm, but the wasm facade never calls it: WebGPU's
-    /// `device.poll` doesn't block for the GPU, so the blocking
-    /// `recv()` here would hang the single browser thread. Picking is
-    /// deferred on the wasm GPU path (the facade returns `None`).
-    #[must_use]
-    pub fn read_depth_pixel(&self, x: u32, y: u32) -> Option<f32> {
-        let dda = self.scene_dda.as_ref()?;
-        let (w, h) = dda.storage_size;
-        if x >= w || y >= h {
-            return None;
-        }
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("roxlap-gpu depth readback"),
-            });
-        // PF.5 (H4) — copy ONLY the picked pixel's 4 bytes, not the whole
-        // depth buffer (8+ MB at high res): the pick still blocks on the
-        // poll below, but the copy + map are now O(1). The 4-byte offset
-        // meets wgpu's copy alignment.
-        let offset = (u64::from(y) * u64::from(w) + u64::from(x)) * 4;
-        enc.copy_buffer_to_buffer(&dda.depth_buffer, offset, &dda.depth_readback, 0, 4);
-        self.queue.submit(std::iter::once(enc.finish()));
-
-        let slice = dda.depth_readback.slice(..4);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        rx.recv().ok()?.ok()?;
-
-        let t = {
-            let data = slice.get_mapped_range();
-            let bytes: [u8; 4] = data[0..4].try_into().ok()?;
-            f32::from_le_bytes(bytes)
-        };
-        dda.depth_readback.unmap();
-
-        // Reject sky / no-hit (T_INF == 1e30 in the shader) + non-finite.
-        if !t.is_finite() || t >= 1.0e29 {
-            return None;
-        }
-        Some(t)
-    }
-
-    /// QE.7a — read back the last rendered frame's colour at the
-    /// **logical** resolution (post-SSAA/posterize, pre-upscale) as
-    /// `0x00RRGGBB` pixels — the GPU side of frame capture, closing
-    /// the "screenshots impossible on the GPU backend" parity gap.
-    ///
-    /// Blocking (encode copy → submit → map, like
-    /// [`Self::read_depth_pixel`]): a screenshot hotkey, not a
-    /// per-frame path. `None` before the first scene render. Compiles
-    /// on wasm but must not be called there — WebGPU's `poll` can't
-    /// block, so the facade returns `None` on the wasm GPU path.
-    #[must_use]
-    pub fn read_frame_pixels(&self) -> Option<(Vec<u32>, u32, u32)> {
-        let dda = self.scene_dda.as_ref()?;
-        let (w, h) = dda.logical_size;
-        if w == 0 || h == 0 {
-            return None;
-        }
-        // Mirror `render_scene`'s identity-resolve choice: with ssaa 1
-        // + posterize off the resolve pass was skipped and the march
-        // framebuffer IS the logical image.
-        let identity = dda.storage_size == dda.logical_size && self.posterize.is_none();
-        let src = if identity {
-            &dda.framebuffer
-        } else {
-            &dda.resolve_buf
-        };
-        let size = u64::from(w) * u64::from(h) * 4;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("roxlap-gpu capture staging"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("roxlap-gpu capture readback"),
-            });
-        enc.copy_buffer_to_buffer(src, 0, &staging, 0, size);
-        self.queue.submit(std::iter::once(enc.finish()));
-
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        rx.recv().ok()?.ok()?;
-
-        let pixels = {
-            let data = slice.get_mapped_range();
-            // The shaders store `pack4x8unorm(r, g, b, a)` — r in the
-            // low byte. Repack to the facade's `0x00RRGGBB`.
-            data.chunks_exact(4)
-                .map(|px| {
-                    let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
-                    let (r, g, b) = (v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff);
-                    (r << 16) | (g << 8) | b
-                })
-                .collect()
-        };
-        staging.unmap();
-        Some((pixels, w, h))
-    }
-
-    /// World-space view-ray direction (un-normalised) for window pixel
-    /// `(x, y)`, under the GPU marcher's projection — the canonical GPU
-    /// unproject, mirroring `scene_dda.wgsl`'s `render_scene`
-    /// (vertical-FOV pinhole). Uses the last-rendered frame's target
-    /// size + FOV; `None` before the first scene render. Pair with
-    /// [`Self::read_depth_pixel`] for screen→world picking.
-    #[must_use]
-    pub fn pixel_ray(
-        &self,
-        right: [f64; 3],
-        down: [f64; 3],
-        forward: [f64; 3],
-        x: f64,
-        y: f64,
-    ) -> Option<[f64; 3]> {
-        let dda = self.scene_dda.as_ref()?;
-        let (w, h) = dda.storage_size;
-        if w == 0 || h == 0 || self.last_fov_y_rad <= 0.0 {
-            return None;
-        }
-        Some(pinhole_pixel_ray(
-            right,
-            down,
-            forward,
-            x,
-            y,
-            f64::from(w),
-            f64::from(h),
-            f64::from(self.last_fov_y_rad),
-        ))
-    }
-
     /// GPU.10.1 — upload a sprite model registry + its instances for
     /// the DDA path. An empty instance slice clears all sprites.
     pub fn set_sprite_instances(
@@ -4802,22 +2764,6 @@ impl GpuRenderer {
         // (up, down, 0, 0) for the two uniform vec4s.
         let v = |i: usize| i32::from(s[i] as u8);
         self.scene_side_shades = [[v(0), v(1), v(2), v(3)], [v(4), v(5), 0, 0]];
-    }
-
-    /// DL — set the per-frame dynamic lights (sun + point lights), already
-    /// transformed into each grid's local frame. Call once per frame before
-    /// [`Self::render_scene`] (the facade does this from
-    /// `FrameParams::lights`). [`SceneLights::default`] clears all lights —
-    /// the pre-DL render. GPU-only; the CPU backend has no analogue.
-    /// PF.5 — an unchanged rig is a no-op: `render_scene` re-packs +
-    /// re-uploads the light buffers only when this actually stores
-    /// something different, so a static rig costs nothing per frame.
-    pub fn set_scene_lights(&mut self, lights: SceneLights) {
-        if self.scene_lights != lights {
-            self.scene_lights = lights;
-            self.scene_lights_dirty = true;
-            self.sprite_lights_dirty = true;
-        }
     }
 
     /// GPU.10.1 — build the instanced model-DDA pipeline (one thread
@@ -5139,13 +3085,6 @@ impl HeadlessSceneRenderer {
             side_shades: [[0; 4]; 2],
             lights: SceneLights::default(),
         }
-    }
-
-    /// DL — set dynamic lights for subsequent [`Self::render`] calls
-    /// (already in grid-local space). Lets tests exercise the lit path
-    /// (sun N·L, point lights). Default = none (baked-only).
-    pub fn set_scene_lights(&mut self, lights: SceneLights) {
-        self.lights = lights;
     }
 
     /// Set per-face side-shades for subsequent [`Self::render`] calls —
@@ -5522,56 +3461,6 @@ pub(crate) fn pick_required_limits(adapter_limits: &wgpu::Limits) -> wgpu::Limit
     }
 }
 
-/// XS.4.2 — build the sprite-pass shader source. On a sprite-shadow-capable
-/// device, splice `sprite_terrain_shadow.wgsl` over the `//XS4_STUB_BEGIN`..
-/// `//XS4_STUB_END` block so `shadow_occluded_world` becomes the real terrain
-/// march (+ the occupancy bindings 16..23); otherwise the stub keeps GPU
-/// sprites unshadowed. The base file is always valid WGSL (the stub variant),
-/// so `wgsl_shaders_validate` covers the fallback path.
-fn sprite_shader_source(capable: bool) -> String {
-    let base = include_str!("../shaders/sprite_model_dda.wgsl");
-    if !capable {
-        return base.to_string();
-    }
-    let snippet = include_str!("../shaders/sprite_terrain_shadow.wgsl");
-    const BEGIN: &str = "//XS4_STUB_BEGIN";
-    const END: &str = "//XS4_STUB_END";
-    let (Some(b), Some(e)) = (base.find(BEGIN), base.find(END)) else {
-        // Markers missing — fail loud rather than silently shipping the stub.
-        panic!("sprite_model_dda.wgsl: XS4 stub markers not found");
-    };
-    let e_end = e + END.len();
-    let mut out = String::with_capacity(base.len() + snippet.len());
-    out.push_str(&base[..b]);
-    out.push_str(snippet);
-    out.push_str(&base[e_end..]);
-    out
-}
-
-/// XS.4.3 — build the scene-pass shader source. On a sprite-shadow-capable
-/// device, splice `scene_sprite_shadow.wgsl` over the `//XS4C_STUB_BEGIN`..
-/// `//XS4C_STUB_END` block so `sprites_occlude` marches the sprite registry
-/// (+ bindings 19..21) and terrain receives sprite-cast shadows; otherwise the
-/// stub returns false. The base file is always valid WGSL (the stub variant).
-fn scene_shader_source(capable: bool) -> String {
-    let base = include_str!("../shaders/scene_dda.wgsl");
-    if !capable {
-        return base.to_string();
-    }
-    let snippet = include_str!("../shaders/scene_sprite_shadow.wgsl");
-    const BEGIN: &str = "//XS4C_STUB_BEGIN";
-    const END: &str = "//XS4C_STUB_END";
-    let (Some(b), Some(e)) = (base.find(BEGIN), base.find(END)) else {
-        panic!("scene_dda.wgsl: XS4C stub markers not found");
-    };
-    let e_end = e + END.len();
-    let mut out = String::with_capacity(base.len() + snippet.len());
-    out.push_str(&base[..b]);
-    out.push_str(snippet);
-    out.push_str(&base[e_end..]);
-    out
-}
-
 /// XS.4 — storage buffers per shader stage needed for GPU sprite shadows. The
 /// sprite pass binds its own 14 + the terrain occupancy set (occupancy pages
 /// 0..3, chunk occupancy, slot index, grid meta, per-grid cameras) to march
@@ -5587,171 +3476,4 @@ fn pick_present_mode(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
         }
     }
     wgpu::PresentMode::Fifo
-}
-
-/// World-space view-ray direction (un-normalised) for window pixel
-/// `(x, y)` under a vertical-FOV pinhole — the projection
-/// `scene_dda.wgsl`'s `render_scene` uses. Shared by
-/// [`GpuRenderer::pixel_ray`]; standalone so it's unit-testable without
-/// a device. `right`/`down`/`forward` are the camera basis.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-pub fn pinhole_pixel_ray(
-    right: [f64; 3],
-    down: [f64; 3],
-    forward: [f64; 3],
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    fov_y_rad: f64,
-) -> [f64; 3] {
-    let half_h = (fov_y_rad * 0.5).tan();
-    let half_w = half_h * (w / h);
-    let ndc_x = (x + 0.5) / w * 2.0 - 1.0;
-    let ndc_y_top = 1.0 - (y + 0.5) / h * 2.0;
-    let (kx, ky) = (ndc_x * half_w, ndc_y_top * half_h);
-    [
-        forward[0] + kx * right[0] - ky * down[0],
-        forward[1] + kx * right[1] - ky * down[1],
-        forward[2] + kx * right[2] - ky * down[2],
-    ]
-}
-
-#[cfg(test)]
-mod pixel_ray_tests {
-    use super::pinhole_pixel_ray;
-
-    const RIGHT: [f64; 3] = [1.0, 0.0, 0.0];
-    const DOWN: [f64; 3] = [0.0, 1.0, 0.0];
-    const FWD: [f64; 3] = [0.0, 0.0, 1.0]; // voxlap z-down "look down"
-
-    // Frame centre (NDC 0,0) points straight along `forward`.
-    #[test]
-    fn centre_pixel_is_forward() {
-        let d = pinhole_pixel_ray(
-            RIGHT,
-            DOWN,
-            FWD,
-            639.5,
-            359.5,
-            1280.0,
-            720.0,
-            60_f64.to_radians(),
-        );
-        assert!(
-            d[0].abs() < 1e-9 && d[1].abs() < 1e-9,
-            "centre ≈ forward, got {d:?}"
-        );
-        assert!((d[2] - 1.0).abs() < 1e-9);
-    }
-
-    // Right edge pixel tilts +right by tan(hfov/2); the lateral
-    // component equals half_w = tan(fov_y/2)*aspect at the very edge.
-    #[test]
-    fn right_edge_tilts_by_half_w() {
-        let fov = 60_f64.to_radians();
-        let d = pinhole_pixel_ray(RIGHT, DOWN, FWD, 1279.5, 359.5, 1280.0, 720.0, fov);
-        let half_w = (fov * 0.5).tan() * (1280.0 / 720.0);
-        assert!((d[0] - half_w).abs() < 1e-6, "x={}, half_w={half_w}", d[0]);
-        assert!(d[0] > 0.0, "right edge tilts +right");
-    }
-
-    /// Statically validate every WGSL shader with naga (the same
-    /// front-end + validator wgpu runs at pipeline creation), so shader
-    /// edits — e.g. the GPU.10 sprite lighting bindings — are caught in
-    /// CI without needing a GPU device.
-    #[test]
-    fn wgsl_shaders_validate() {
-        let shaders: &[(&str, &str)] = &[
-            (
-                "sprite_model_dda.wgsl",
-                include_str!("../shaders/sprite_model_dda.wgsl"),
-            ),
-            ("scene_dda.wgsl", include_str!("../shaders/scene_dda.wgsl")),
-            ("blit.wgsl", include_str!("../shaders/blit.wgsl")),
-            ("chunk_dda.wgsl", include_str!("../shaders/chunk_dda.wgsl")),
-            ("grid_dda.wgsl", include_str!("../shaders/grid_dda.wgsl")),
-            (
-                "scene_blit.wgsl",
-                include_str!("../shaders/scene_blit.wgsl"),
-            ),
-            (
-                "scene_resolve.wgsl",
-                include_str!("../shaders/scene_resolve.wgsl"),
-            ),
-            ("line.wgsl", include_str!("../shaders/line.wgsl")),
-            ("image.wgsl", include_str!("../shaders/image.wgsl")),
-        ];
-        let mut validator = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        );
-        for (name, src) in shaders {
-            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| {
-                panic!("{name}: WGSL parse failed:\n{}", e.emit_to_string(src))
-            });
-            validator
-                .validate(&module)
-                .unwrap_or_else(|e| panic!("{name}: WGSL validation failed: {e:?}"));
-        }
-        // XS.4.2 — the raw `sprite_model_dda.wgsl` above is the unshadowed STUB
-        // variant; also validate the sprite-shadow-CAPABLE spliced variant (the
-        // terrain-shadow snippet injected) that capable devices build.
-        let capable = super::sprite_shader_source(true);
-        let module = naga::front::wgsl::parse_str(&capable).unwrap_or_else(|e| {
-            panic!(
-                "sprite_model_dda.wgsl (capable): parse failed:\n{}",
-                e.emit_to_string(&capable)
-            )
-        });
-        validator.validate(&module).unwrap_or_else(|e| {
-            panic!("sprite_model_dda.wgsl (capable): validation failed: {e:?}")
-        });
-        // XS.4.3 — the capable scene variant (sprite-cast snippet spliced in).
-        let scene_cap = super::scene_shader_source(true);
-        let module = naga::front::wgsl::parse_str(&scene_cap).unwrap_or_else(|e| {
-            panic!(
-                "scene_dda.wgsl (capable): parse failed:\n{}",
-                e.emit_to_string(&scene_cap)
-            )
-        });
-        validator
-            .validate(&module)
-            .unwrap_or_else(|e| panic!("scene_dda.wgsl (capable): validation failed: {e:?}"));
-    }
-
-    /// A 2×2 world quad centred straight ahead projects to vertices whose
-    /// homogeneous `w` equals the camera-forward distance (so the shader's
-    /// `clip = ndc·w` recovers perspective-correct UVs) and whose `depth`
-    /// is the euclidean range. Verifies geometry without a GPU device.
-    #[test]
-    fn image_vertices_carry_forward_w_and_euclidean_depth() {
-        let cam = crate::GpuLineCamera {
-            pos: [0.0, 0.0, 0.0],
-            right: [1.0, 0.0, 0.0],
-            down: [0.0, 1.0, 0.0],
-            forward: [0.0, 0.0, 1.0],
-        };
-        // Quad 10 units ahead (forward = +Z), spanning x∈[-1,1], y∈[-1,1].
-        let quad = crate::GpuImageQuad {
-            corners: [
-                [-1.0, -1.0, 10.0], // TL
-                [1.0, -1.0, 10.0],  // TR
-                [-1.0, 1.0, 10.0],  // BL
-                [1.0, 1.0, 10.0],   // BR
-            ],
-            image: 0,
-            tint: [1.0, 1.0, 1.0, 1.0],
-            depth_test: true,
-            alpha_cutoff: 0.0,
-        };
-        let verts = crate::build_image_vertices(&cam, &quad, 800, 600, 60_f32.to_radians(), false);
-        assert_eq!(verts.len(), 6, "two triangles, no near-clip");
-        for v in &verts {
-            assert!((v.w - 10.0).abs() < 1e-4, "w == forward distance");
-            assert!(v.depth >= 10.0, "euclidean depth >= forward distance");
-            assert_eq!(v.depth_test, 1.0);
-        }
-    }
 }

@@ -7,6 +7,27 @@ onboarding. This is the **entry doc** for the quality/ergonomics stage —
 tag **QE**. A fresh-context session should read it top to bottom before
 touching code.
 
+## Status — QE series CLOSED (2026-07-03)
+
+All phases landed (QE.4's facade-test harness folded into the others'
+per-phase tests; a dedicated CPU↔GPU diff harness remains desirable).
+Every landed change carries CHANGELOG migration notes per the policy
+below. **Still owed**, carried out of the series:
+
+- `cargo-fuzz` harnesses for the `&[u8] → Result` parsers (QE.6 —
+  tooling unavailable in the dev environment; adversarial unit tests
+  cover the review's findings).
+- WGSL shared-snippet extraction (QE.8 — the copies are structurally
+  similar but not byte-identical; merging = parameterising shader code,
+  which needs render verification on a real GPU. Do alongside TV.3b /
+  TV.6 shader work).
+- The QE-B6 leftovers: `PackedColor` newtype family, generational
+  `ImageId`, splitting `set_sprites`' all-family reset, collapsing the
+  `_with_materials` variants, a `Frame` guard object, typed `BakeMode`.
+- CPU↔GPU pixel-diff harness + more golden scenes (QE-C5).
+- Workspace-wide `missing_docs` (roxlap-gpu/-formats/-core owe ~250
+  field docs; the lint already guards roxlap-render + roxlap-scene).
+
 ## API stability policy for this stage — LOCKED
 
 Decision taken with the engine author 2026-07-03:

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — internal (QE.8): roxlap-gpu de-monolithed
+
+- **Dead pipelines deleted** — `GpuRenderer::render_chunk` /
+  `render_grid` (the GPU.0/GPU.3 single-chunk and single-grid
+  baselines, superseded by the scene marcher since GPU.5) plus their
+  resources, uniforms, `GpuGridResident`, and the `chunk_dda.wgsl` /
+  `grid_dda.wgsl` shaders — ~900 lines with **zero callers** outside
+  their own definitions. `GridUpload` / `bounding_box_of` (used by the
+  live scene-upload path) stay. If you called these directly:
+  `render_scene` with a one-grid `SceneUpload` is the replacement.
+- **`lib.rs` split by pass** (5.7k → ~3.5k lines): `overlay.rs`
+  (deferred lines + image quads + egui paint), `lights.rs` (dynamic
+  light packing/upload), `readback.rs` (blocking depth/colour
+  readbacks + unproject), `shader_src.rs` (shader-source splicing +
+  the naga validation test). Pure code moves; public API re-exported
+  unchanged from the crate root.
+- **`FrameDirty`** — the three loose cross-frame booleans
+  (`scene_lights_dirty`, `sprite_lights_dirty`, `scene_depth_valid`)
+  grouped into one struct whose lifecycle rules (notably
+  "sprite-lights is cleared only by the conditional sprite pass") are
+  documented on the fields they guard, closing the QE review's last
+  "discipline-only invariant".
+- WGSL shared-snippet extraction (sky/occupancy/light-loop copies
+  across `scene_dda` / `sprite_model_dda`) is deliberately **not**
+  done: the copies are structurally similar but not byte-identical
+  (different camera sources / variable names), so merging means
+  parameterising shader code — a change that needs render-output
+  verification on a real GPU, not just the naga validation available
+  in CI. Tracked as owed in `docs/porting/PORTING-QUALITY.md`,
+  best done alongside the TV.3b/TV.6 shader work.
+
 ### Added — QE.7a: GPU frame capture + capability probing
 
 - **Screenshots now work on the GPU backend** —
