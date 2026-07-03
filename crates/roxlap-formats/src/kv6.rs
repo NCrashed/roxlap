@@ -549,7 +549,10 @@ pub fn parse(bytes: &[u8]) -> Result<Kv6, ParseError> {
     let zpiv = cur.read_f32()?;
     let numvoxs = cur.read_u32()?;
 
-    let mut voxels = Vec::with_capacity(numvoxs as usize);
+    // QE.6b — every capacity is clamped by the bytes actually left
+    // (8 B/voxel, 4 B/xlen, 2 B/ylen), so a crafted count errors as
+    // Truncated instead of allocation-bombing first.
+    let mut voxels = Vec::with_capacity(cur.clamped_capacity(numvoxs as usize, 8));
     for _ in 0..numvoxs {
         let col = cur.read_u32()?;
         let z = cur.read_u16()?;
@@ -558,14 +561,15 @@ pub fn parse(bytes: &[u8]) -> Result<Kv6, ParseError> {
         voxels.push(Voxel { col, z, vis, dir });
     }
 
-    let mut xlen = Vec::with_capacity(xsiz as usize);
+    let mut xlen = Vec::with_capacity(cur.clamped_capacity(xsiz as usize, 4));
     for _ in 0..xsiz {
         xlen.push(cur.read_u32()?);
     }
 
-    let mut ylen = Vec::with_capacity(xsiz as usize);
+    let row_bytes = (ysiz as usize).saturating_mul(2);
+    let mut ylen = Vec::with_capacity(cur.clamped_capacity(xsiz as usize, row_bytes));
     for _ in 0..xsiz {
-        let mut row = Vec::with_capacity(ysiz as usize);
+        let mut row = Vec::with_capacity(cur.clamped_capacity(ysiz as usize, 2));
         for _ in 0..ysiz {
             row.push(cur.read_u16()?);
         }
@@ -1042,5 +1046,22 @@ mod tests {
         bad[0] = b'X';
         let r = parse(&bad);
         assert!(matches!(r, Err(ParseError::BadMagic { .. })));
+    }
+
+    /// QE.6b — a 36-byte file claiming `u32::MAX` voxels (≈32 GiB of
+    /// records) must fail as `Truncated`, not allocation-bomb the
+    /// process on `Vec::with_capacity` first.
+    #[test]
+    fn parse_survives_absurd_numvoxs_without_alloc_bomb() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"Kvxl");
+        for dim in [1u32, 1, 1] {
+            bytes.extend_from_slice(&dim.to_le_bytes());
+        }
+        for piv in [0f32, 0.0, 0.0] {
+            bytes.extend_from_slice(&piv.to_le_bytes());
+        }
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // numvoxs
+        assert!(matches!(parse(&bytes), Err(ParseError::Truncated { .. })));
     }
 }

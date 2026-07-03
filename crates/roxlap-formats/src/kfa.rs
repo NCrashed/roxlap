@@ -101,6 +101,14 @@ pub enum ParseError {
     BadMagic { got: u32 },
     /// A read of `need` bytes at offset `at` would run past EOF.
     Truncated { at: usize, need: usize },
+    /// QE.6b — a hinge whose `parent` is neither `-1` (root) nor a
+    /// valid hinge index. Pre-QE.6 this panicked out-of-bounds later,
+    /// in `sort_hinges`.
+    BadHingeParent { hinge: usize, parent: i32 },
+    /// QE.6b — the hinge parent links contain a cycle. Pre-QE.6 this
+    /// hung the loader forever (the topological solve in
+    /// `sort_hinges` never converged).
+    HingeCycle { hinge: usize },
 }
 
 impl fmt::Display for ParseError {
@@ -111,6 +119,12 @@ impl fmt::Display for ParseError {
             }
             Self::Truncated { at, need } => {
                 write!(f, "kfa truncated: need {need} bytes at offset {at}")
+            }
+            Self::BadHingeParent { hinge, parent } => {
+                write!(f, "kfa hinge {hinge}: parent {parent} out of range")
+            }
+            Self::HingeCycle { hinge } => {
+                write!(f, "kfa hinge {hinge}: parent links form a cycle")
             }
         }
     }
@@ -143,16 +157,20 @@ pub fn parse(bytes: &[u8]) -> Result<Kfa, ParseError> {
     let name_len = cur.read_u32()? as usize;
     let kv6_name = cur.read_bytes(name_len)?.to_vec();
 
+    // QE.6b — capacities clamped by the remaining bytes (hinge record
+    // = 64 B, frmval row = 2 B/hinge, seq entry = 8 B) so a crafted
+    // count can't allocation-bomb before the reads fail as Truncated.
     let numhin = cur.read_u32()? as usize;
-    let mut hinges = Vec::with_capacity(numhin);
+    let mut hinges = Vec::with_capacity(cur.clamped_capacity(numhin, 64));
     for _ in 0..numhin {
         hinges.push(read_hinge(&mut cur)?);
     }
+    validate_hinge_topology(&hinges)?;
 
     let numfrm = cur.read_u32()? as usize;
-    let mut frmval = Vec::with_capacity(numfrm);
+    let mut frmval = Vec::with_capacity(cur.clamped_capacity(numfrm, numhin.saturating_mul(2)));
     for _ in 0..numfrm {
-        let mut row = Vec::with_capacity(numhin);
+        let mut row = Vec::with_capacity(cur.clamped_capacity(numhin, 2));
         for _ in 0..numhin {
             row.push(cur.read_i16()?);
         }
@@ -160,7 +178,7 @@ pub fn parse(bytes: &[u8]) -> Result<Kfa, ParseError> {
     }
 
     let seqnum = cur.read_u32()? as usize;
-    let mut seq = Vec::with_capacity(seqnum);
+    let mut seq = Vec::with_capacity(cur.clamped_capacity(seqnum, 8));
     for _ in 0..seqnum {
         let tim = cur.read_i32()?;
         let frm = cur.read_i32()?;
@@ -251,6 +269,37 @@ fn write_point3(out: &mut Vec<u8>, p: Point3) {
     out.extend_from_slice(&p.x.to_le_bytes());
     out.extend_from_slice(&p.y.to_le_bytes());
     out.extend_from_slice(&p.z.to_le_bytes());
+}
+
+/// QE.6b — validate every hinge's `parent` is `-1` or an in-range
+/// index, and that the parent links are acyclic. A malformed skeleton
+/// previously panicked out-of-bounds or **hung forever** in
+/// `sort_hinges`'s topological solve — a denial-of-service on load
+/// for hostile/corrupted `.kfa`/`.rkc` files.
+fn validate_hinge_topology(hinges: &[Hinge]) -> Result<(), ParseError> {
+    let n = hinges.len();
+    for (i, h) in hinges.iter().enumerate() {
+        if h.parent != -1 && usize::try_from(h.parent).map_or(true, |p| p >= n) {
+            return Err(ParseError::BadHingeParent {
+                hinge: i,
+                parent: h.parent,
+            });
+        }
+    }
+    // Walk each parent chain; more than `n` hops means a cycle.
+    for start in 0..n {
+        let mut cur = hinges[start].parent;
+        let mut hops = 0usize;
+        while cur != -1 {
+            hops += 1;
+            if hops > n {
+                return Err(ParseError::HingeCycle { hinge: start });
+            }
+            // In-range per the loop above.
+            cur = hinges[usize::try_from(cur).expect("validated non-negative")].parent;
+        }
+    }
+    Ok(())
 }
 
 fn read_hinge(cur: &mut Cursor<'_>) -> Result<Hinge, OutOfBounds> {
@@ -960,5 +1009,73 @@ mod tests {
         // Never returns the final index: the last entry is always the
         // *upper* bracket, so beyond it we stay on the last segment.
         assert_eq!(kfatime2seq(&seq, 9999), 2, "last segment's lower bracket");
+    }
+
+    // ---- QE.6b adversarial skeletons: error, never panic/hang ----
+
+    fn hinge_with_parent(parent: i32) -> Hinge {
+        let p = Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        Hinge {
+            parent,
+            p: [p, p],
+            v: [p, p],
+            vmin: 0,
+            vmax: 0,
+            htype: 0,
+            filler: [0; 7],
+        }
+    }
+
+    fn kfa_with_hinges(hinges: Vec<Hinge>) -> Vec<u8> {
+        serialize(&Kfa {
+            kv6_name: b"x.kv6".to_vec(),
+            hinges,
+            frmval: Vec::new(),
+            seq: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn parse_rejects_out_of_range_hinge_parent() {
+        // Pre-QE.6b: an OOB panic later, in sort_hinges.
+        let bytes = kfa_with_hinges(vec![hinge_with_parent(5)]);
+        assert!(matches!(
+            parse(&bytes),
+            Err(ParseError::BadHingeParent {
+                hinge: 0,
+                parent: 5
+            })
+        ));
+        let bytes = kfa_with_hinges(vec![hinge_with_parent(-2)]);
+        assert!(matches!(
+            parse(&bytes),
+            Err(ParseError::BadHingeParent { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_cyclic_hinge_parents() {
+        // Pre-QE.6b: the loader hung forever (sort_hinges never
+        // converged) - a denial-of-service on load.
+        let bytes = kfa_with_hinges(vec![hinge_with_parent(1), hinge_with_parent(0)]);
+        assert!(matches!(parse(&bytes), Err(ParseError::HingeCycle { .. })));
+        // Self-parent is the 1-cycle.
+        let bytes = kfa_with_hinges(vec![hinge_with_parent(0)]);
+        assert!(matches!(parse(&bytes), Err(ParseError::HingeCycle { .. })));
+    }
+
+    #[test]
+    fn parse_survives_absurd_counts_without_alloc_bomb() {
+        // A tiny buffer claiming u32::MAX hinges must fail as
+        // Truncated - not attempt a ~275 GiB Vec::with_capacity.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // name_len
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // numhin
+        assert!(matches!(parse(&bytes), Err(ParseError::Truncated { .. })));
     }
 }

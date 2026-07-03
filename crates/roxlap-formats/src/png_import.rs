@@ -50,7 +50,9 @@ impl Default for PngImportOpts {
             loop_mode: LoopMode::Loop,
             default_frame_ms: 100,
             keyframe_gap: 8,
-            max_dims: None,
+            // QE.6b - default cap (mirrors GifImportOpts): opt out with
+            // None for truly unbounded imports.
+            max_dims: Some([4096, 4096, 4096]),
             alpha_cutoff: 128,
         }
     }

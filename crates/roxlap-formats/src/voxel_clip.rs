@@ -60,6 +60,13 @@ const CHUNK_FLAG_DEFLATED: u8 = 0x01;
 /// guard). A real `.rvc` chunk never approaches this; a larger claim is
 /// rejected before it can drive a giant allocation.
 const MAX_CHUNK_INFLATE: usize = 64 << 20; // 64 MiB
+
+/// QE.6b - per-axis clip dimension cap. Bounds every dims-derived
+/// allocation (`cols * occ_words_per_col` peaks at ~512 MiB of u32s at
+/// 4096 cubed - large but finite; real clips are orders of magnitude
+/// smaller) and keeps `cols * owpc` far from usize overflow on 32-bit
+/// targets (wasm).
+const MAX_CLIP_DIM: u32 = 4096;
 /// miniz_oxide deflate level for `.rvc` writes (clips are written once,
 /// read often — favour ratio over encode speed, but level 10 is overkill).
 const DEFLATE_LEVEL: u8 = 8;
@@ -1401,7 +1408,10 @@ fn write_u32_vec(out: &mut Vec<u8>, v: &[u32]) {
 
 fn read_u32_vec(cur: &mut Cursor) -> Result<Vec<u32>, ParseError> {
     let n = cur.read_u32()? as usize;
-    let mut v = Vec::with_capacity(n);
+    // QE.6b - clamp by remaining bytes (4 B/element): a lying count
+    // fails as Truncated instead of allocation-bombing first (the 64
+    // MiB inflate cap bounds the payload but not a crafted count).
+    let mut v = Vec::with_capacity(cur.clamped_capacity(n, 4));
     for _ in 0..n {
         v.push(cur.read_u32()?);
     }
@@ -1412,6 +1422,11 @@ fn read_u32_vec(cur: &mut Cursor) -> Result<Vec<u32>, ParseError> {
 fn parse_meta(payload: &[u8]) -> Result<([u32; 3], [f32; 3], f32, LoopMode, u32, u32), ParseError> {
     let mut cur = Cursor::new(payload);
     let dims = [cur.read_u32()?, cur.read_u32()?, cur.read_u32()?];
+    // QE.6b - reject degenerate/huge dims before anything derives an
+    // allocation (or a usize overflow on wasm32) from them.
+    if dims.iter().any(|&d| d == 0 || d > MAX_CLIP_DIM) {
+        return Err(ParseError::BadDims { dims });
+    }
     let pivot = [cur.read_f32()?, cur.read_f32()?, cur.read_f32()?];
     let voxel_world_size = cur.read_f32()?;
     let loop_mode = LoopMode::from_u8(cur.read_u8()?).ok_or(ParseError::BadLoopMode)?;
@@ -1516,6 +1531,11 @@ pub enum ParseError {
     /// A `CHUNK_FLAG_DEFLATED` payload failed to inflate, or its inflated
     /// length disagreed with the stored `raw_len`.
     BadDeflate,
+    /// QE.6b - a META chunk with a zero or > 4096 dimension (bounds
+    /// every dims-derived allocation; see `MAX_CLIP_DIM`).
+    BadDims {
+        dims: [u32; 3],
+    },
 }
 
 impl From<OutOfBounds> for ParseError {

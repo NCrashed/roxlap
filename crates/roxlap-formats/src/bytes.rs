@@ -76,3 +76,15 @@ impl<'a> Cursor<'a> {
         Some(&self.bytes[self.pos..end])
     }
 }
+
+impl Cursor<'_> {
+    /// QE.6b — capacity clamp for length-prefixed reads: a crafted
+    /// count can't drive `Vec::with_capacity` past what the remaining
+    /// bytes could possibly encode (`elem_size` = minimum bytes per
+    /// element). A lying count still fails the subsequent reads with
+    /// [`OutOfBounds`] — this only defuses the allocation bomb that
+    /// would abort the process before those reads ran.
+    pub(crate) fn clamped_capacity(&self, declared: usize, elem_size: usize) -> usize {
+        declared.min(self.remaining() / elem_size.max(1))
+    }
+}

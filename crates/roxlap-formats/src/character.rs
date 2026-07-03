@@ -235,6 +235,25 @@ pub enum ParseError {
     BadMesh(kv6::ParseError),
     /// An embedded `VCLP` clip blob failed to parse as a voxel clip (VCL.5).
     BadClip(voxel_clip::ParseError),
+    /// QE.6b - an attachment references a mesh / voxel-clip index past
+    /// the corresponding table. Pre-QE.6 this surfaced as a documented
+    /// (but wrong: "parse keeps indices in range") panic later, in
+    /// `to_kfa_sprite` / the attachment runtime.
+    BadAttachmentIndex {
+        /// The owning bone.
+        bone: usize,
+        /// The out-of-range index.
+        index: usize,
+        /// The referenced table's length (meshes or voxel clips).
+        table_len: usize,
+    },
+    /// QE.6b - a bone hinge whose `parent` is neither `-1` nor a valid
+    /// bone index, or whose parent links form a cycle (previously an
+    /// OOB panic / infinite loop in the skeleton solve).
+    BadSkeleton {
+        /// The offending bone.
+        bone: usize,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -270,6 +289,17 @@ impl fmt::Display for ParseError {
             }
             Self::BadMesh(e) => write!(f, "character embedded kv6 mesh: {e}"),
             Self::BadClip(e) => write!(f, "character embedded voxel clip: {e:?}"),
+            Self::BadAttachmentIndex {
+                bone,
+                index,
+                table_len,
+            } => write!(
+                f,
+                "character bone {bone}: attachment index {index} past table of {table_len}"
+            ),
+            Self::BadSkeleton { bone } => {
+                write!(f, "character bone {bone}: parent out of range or cyclic")
+            }
         }
     }
 }
@@ -351,6 +381,45 @@ pub fn parse(bytes: &[u8]) -> Result<Character, ParseError> {
         Some(p) => parse_vclp(p)?,
         None => Vec::new(),
     };
+
+    // QE.6b - cross-reference validation, so the doc contract
+    // "`Character` values from `parse` keep indices in range" is
+    // actually true (pre-QE.6 it was claimed but never checked:
+    // `to_kfa_sprite` / the attachment runtime panicked instead).
+    for (bi, bone) in bones.iter().enumerate() {
+        for att in &bone.attachments {
+            let (index, table_len) = match att.target {
+                MeshRef::Static(i) => (i, meshes.len()),
+                MeshRef::Clip(i) => (i, voxel_clips.len()),
+            };
+            if index >= table_len {
+                return Err(ParseError::BadAttachmentIndex {
+                    bone: bi,
+                    index,
+                    table_len,
+                });
+            }
+        }
+        // Parent range; cycles checked below over the whole set.
+        if bone.hinge.parent != -1
+            && usize::try_from(bone.hinge.parent).map_or(true, |p| p >= bones.len())
+        {
+            return Err(ParseError::BadSkeleton { bone: bi });
+        }
+    }
+    for start in 0..bones.len() {
+        let mut cur_parent = bones[start].hinge.parent;
+        let mut hops = 0usize;
+        while cur_parent != -1 {
+            hops += 1;
+            if hops > bones.len() {
+                return Err(ParseError::BadSkeleton { bone: start });
+            }
+            cur_parent = bones[usize::try_from(cur_parent).expect("validated non-negative")]
+                .hinge
+                .parent;
+        }
+    }
 
     Ok(Character {
         name,
@@ -510,7 +579,9 @@ fn parse_meta(payload: &[u8]) -> Result<(String, [f32; 3]), ParseError> {
 fn parse_mshs(payload: &[u8]) -> Result<Vec<Kv6>, ParseError> {
     let mut cur = Cursor::new(payload);
     let count = cur.read_u32()? as usize;
-    let mut meshes = Vec::with_capacity(count);
+    // QE.6b - capacity clamped by remaining bytes (>= 4 B length per
+    // mesh blob); a lying count fails as Truncated, not an alloc bomb.
+    let mut meshes = Vec::with_capacity(cur.clamped_capacity(count, 4));
     for _ in 0..count {
         let blob_len = cur.read_u32()? as usize;
         let blob = cur.read_bytes(blob_len)?;
@@ -522,12 +593,14 @@ fn parse_mshs(payload: &[u8]) -> Result<Vec<Kv6>, ParseError> {
 fn parse_bons(payload: &[u8]) -> Result<Vec<Bone>, ParseError> {
     let mut cur = Cursor::new(payload);
     let count = cur.read_u32()? as usize;
-    let mut bones = Vec::with_capacity(count);
+    // QE.6b - >= 70 B per bone (name len + attach count + 64 B hinge).
+    let mut bones = Vec::with_capacity(cur.clamped_capacity(count, 70));
     for _ in 0..count {
         let name_len = cur.read_u16()? as usize;
         let name = String::from_utf8_lossy(cur.read_bytes(name_len)?).into_owned();
         let attach_count = cur.read_u32()? as usize;
-        let mut attachments = Vec::with_capacity(attach_count);
+        // QE.6b - an attachment record is 54 bytes.
+        let mut attachments = Vec::with_capacity(cur.clamped_capacity(attach_count, 54));
         for _ in 0..attach_count {
             attachments.push(read_attachment(&mut cur)?);
         }
@@ -567,7 +640,8 @@ fn read_attachment(cur: &mut Cursor<'_>) -> Result<Attachment, ParseError> {
 fn parse_vclp(payload: &[u8]) -> Result<Vec<VoxelClip>, ParseError> {
     let mut cur = Cursor::new(payload);
     let count = cur.read_u32()? as usize;
-    let mut clips = Vec::with_capacity(count);
+    // QE.6b - >= 4 B length prefix per clip blob.
+    let mut clips = Vec::with_capacity(cur.clamped_capacity(count, 4));
     for _ in 0..count {
         let blob_len = cur.read_u32()? as usize;
         let blob = cur.read_bytes(blob_len)?;
@@ -579,7 +653,8 @@ fn parse_vclp(payload: &[u8]) -> Result<Vec<VoxelClip>, ParseError> {
 fn parse_clps(payload: &[u8], numbone: usize) -> Result<Vec<Clip>, ParseError> {
     let mut cur = Cursor::new(payload);
     let count = cur.read_u32()? as usize;
-    let mut clips = Vec::with_capacity(count);
+    // QE.6b - >= 8 B per named clip record.
+    let mut clips = Vec::with_capacity(cur.clamped_capacity(count, 8));
     for _ in 0..count {
         let name_len = cur.read_u16()? as usize;
         let name = String::from_utf8_lossy(cur.read_bytes(name_len)?).into_owned();
@@ -606,16 +681,17 @@ fn parse_skeletal(body: &[u8], numbone: usize) -> Result<ClipData, ParseError> {
     if numhin != numbone {
         return Err(ParseError::ClipBoneCountMismatch);
     }
-    let mut frmval = Vec::with_capacity(numfrm);
+    // QE.6b - a BoneXform row is 40 B per bone.
+    let mut frmval = Vec::with_capacity(cur.clamped_capacity(numfrm, numhin.saturating_mul(40)));
     for _ in 0..numfrm {
-        let mut row = Vec::with_capacity(numhin);
+        let mut row = Vec::with_capacity(cur.clamped_capacity(numhin, 40));
         for _ in 0..numhin {
             row.push(read_bonexform(&mut cur)?);
         }
         frmval.push(row);
     }
     let seqcount = cur.read_u32()? as usize;
-    let mut seq = Vec::with_capacity(seqcount);
+    let mut seq = Vec::with_capacity(cur.clamped_capacity(seqcount, 8));
     for _ in 0..seqcount {
         let tim = cur.read_i32()?;
         let frm = cur.read_i32()?;
@@ -1233,5 +1309,42 @@ mod tests {
             pos += 8 + len;
         }
         panic!("tag {tag:?} not found");
+    }
+
+    // ---- QE.6b adversarial characters: error, never panic/hang ----
+
+    #[test]
+    fn parse_rejects_out_of_range_attachment_index() {
+        // Pre-QE.6b: parse accepted this and to_kfa_sprite / the
+        // attachment runtime panicked out-of-bounds later.
+        let mut c = synthetic_character();
+        c.bones[1].attachments = vec![Attachment::static_mesh(99)];
+        let bytes = serialize(&c);
+        assert!(matches!(
+            parse(&bytes),
+            Err(ParseError::BadAttachmentIndex {
+                bone: 1,
+                index: 99,
+                table_len: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_bad_or_cyclic_bone_skeleton() {
+        // Out-of-range parent (pre-QE.6b: OOB panic in the solve).
+        let mut c = synthetic_character();
+        c.bones[1].hinge.parent = 42;
+        assert!(matches!(
+            parse(&serialize(&c)),
+            Err(ParseError::BadSkeleton { bone: 1 })
+        ));
+        // Cyclic parents (pre-QE.6b: the loader hung forever).
+        let mut c = synthetic_character();
+        c.bones[0].hinge.parent = 1;
+        assert!(matches!(
+            parse(&serialize(&c)),
+            Err(ParseError::BadSkeleton { .. })
+        ));
     }
 }

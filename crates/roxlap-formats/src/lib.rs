@@ -48,6 +48,9 @@ pub mod png_import;
 #[cfg(any(feature = "gif", feature = "png"))]
 mod slab;
 pub mod sprite;
+/// MagicaVoxel `.vox` importer (QE.6a) — models + palette → [`kv6::Kv6`]
+/// sprite models. The bridge from the industry-standard voxel editor.
+pub mod vox;
 /// Animated voxel-sprite clips (`.rvc`) — keyframe + diff "GIF/MP4 for
 /// voxel models" for effects (flame, spells). Frames use the GPU sprite
 /// model's dense-column layout; see [`voxel_clip`] + `PORTING-VOXEL-CLIP.md`.

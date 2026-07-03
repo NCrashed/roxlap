@@ -64,7 +64,11 @@ impl Default for GifImportOpts {
             loop_mode: LoopMode::Loop,
             default_frame_ms: 100,
             keyframe_gap: 8,
-            max_dims: None,
+            // QE.6b - default cap: a hostile GIF can declare u16-max
+            // dimensions (a ~16 GiB RGBA canvas). 4096 square covers any
+            // real billboard sprite; opt out with None if you truly
+            // want unbounded (no silent downscale either way).
+            max_dims: Some([4096, 4096, 4096]),
         }
     }
 }

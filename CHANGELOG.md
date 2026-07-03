@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — QE.6: MagicaVoxel import + hostile-input hardening
+
+- **MagicaVoxel `.vox` importer** (`roxlap_formats::vox`, QE.6a) —
+  the bridge from the industry-standard voxel editor:
+  `vox::parse(bytes)` → models + palette,
+  `VoxFile::to_kv6_models()` → ready-to-register KV6 sprite models
+  (`add_sprite_model` / `SpriteSet`). Hand-parsed in the house style
+  (shared cursor, typed `ParseError`, hardened by construction — a
+  crafted file errors, never panics/hangs/allocation-bombs); **no new
+  dependencies**. Covers `SIZE`/`XYZI`/`RGBA` (multi-model files
+  yield models in file order); the scene graph / materials are
+  skipped for now. z-up → z-down mapped so editor-upright models stay
+  upright; palette → voxlap-packed `0x80RRGGBB`; files without a
+  palette get the official default.
+- **Parser hardening sweep** (QE.6b) — adversarial-input fixes across
+  every format, each pinned by a new adversarial test:
+  - **Allocation bombs defused**: every length-prefixed
+    `Vec::with_capacity` in `.kv6` / `.kfa` / `.rkc` / `.rvc` is now
+    clamped by the bytes actually remaining (a 36-byte file claiming
+    `u32::MAX` voxels used to attempt a ~32 GiB allocation — process
+    abort — before the reads could fail; now it errors `Truncated`).
+  - **`.kfa`/`.rkc` skeleton validation at parse**: an out-of-range
+    hinge/bone `parent` used to panic out-of-bounds later, and
+    **cyclic parents hung the loader forever** (denial-of-service on
+    load); both are now `ParseError`s (`BadHingeParent`/`HingeCycle`,
+    `BadSkeleton`).
+  - **`.rkc` cross-reference validation**: an attachment mesh/clip
+    index past its table is now `BadAttachmentIndex` at parse (the
+    doc contract "parse keeps indices in range" was previously
+    claimed but unchecked — the runtime panicked instead).
+  - **`.rvc` dimension cap**: META dims are validated (≤ 4096 per
+    axis, non-zero) before anything derives an allocation — a crafted
+    header could previously drive huge allocs or a usize overflow on
+    wasm32.
+  - **GIF/PNG importer caps default on**: `max_dims` now defaults to
+    `Some([4096, 4096, 4096])` (a hostile GIF can declare a ~16 GiB
+    canvas). Migration: set `max_dims: None` explicitly for truly
+    unbounded imports; there is still no silent downscale.
+  - `cargo-fuzz` harnesses for the `&[u8] → Result` parsers remain
+    owed (tooling unavailable in the dev environment); the adversarial
+    classes found by review are covered by deterministic tests.
+
 ### Added — QE.5: streamed-edit persistence + versioned save files
 
 - **`ChunkStore`** (roxlap-scene, QE.5a) — the persistence hook that
