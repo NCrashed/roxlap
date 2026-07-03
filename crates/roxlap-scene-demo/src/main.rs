@@ -790,6 +790,9 @@ fn plane_hit(pos: [f64; 3], dir: [f64; 3], ground_z: f64) -> Option<[f32; 3]> {
 }
 
 fn main() {
+    // QE.2b - surface the facade's log-facade warnings (GPU-init
+    // fallback, light-budget demotion) on stderr; RUST_LOG overrides.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let event_loop = EventLoop::new().expect("winit: EventLoop::new");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = host::Host::new();

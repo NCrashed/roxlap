@@ -11,6 +11,11 @@ description = "SDL2 host demo for the roxlap scene-graph engine — shows that r
 publish = false
 
 [dependencies]
+# QE.2b - roxlap-render reports diagnostics (GPU-init fallback, light
+# budget demotion) through the `log` facade; env_logger surfaces them
+# on stderr like the pre-QE.2 eprintln!s did (RUST_LOG adjusts
+# verbosity).
+env_logger = "0.11"
 # The renderer facade. Decoupled from winit since 0.7: `SceneRenderer`
 # binds to any `HasWindowHandle`/`HasDisplayHandle` provider. This
 # demo proves the point with SDL2 instead of winit.

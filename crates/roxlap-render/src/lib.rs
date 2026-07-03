@@ -849,11 +849,27 @@ pub struct SpriteSet {
 }
 
 /// Per-frame inputs both backends consume. The host builds the
-/// [`OpticastSettings`] (it owns scan distance etc.); the facade does
-/// everything else (pool config, sky fill, render, present).
+/// [`OpticastSettings`] (it owns scan distance, projection etc.); the
+/// facade does everything else (pool config, sky fill, render,
+/// present).
+///
+/// **Both backends derive their projection from
+/// [`settings`](Self::settings)** (QE.2a): the vertical field of view
+/// is `2·atan(yres/2 / hz)` and the GPU outer-DDA step budget follows
+/// [`OpticastSettings::max_scan_dist`], so the two backends can no
+/// longer disagree about what they show. Pick an explicit FOV with
+/// [`OpticastSettings::with_fov_y`].
+///
+/// `#[non_exhaustive]`: construct with [`FrameParams::new`] and
+/// override fields — a future field addition is then not a breaking
+/// change (pre-QE.2, every added field broke every host's struct
+/// literal).
+#[non_exhaustive]
 pub struct FrameParams<'a> {
-    /// CPU opticast settings (scan distance, mip ladder, framebuffer
-    /// geometry). Ignored by the GPU backend.
+    /// Render settings both backends share: framebuffer geometry +
+    /// projection (`hx`/`hy`/`hz`), scan distances, and the mip
+    /// ladder. (Named for the CPU renderer it configured first; the
+    /// GPU backend derives its FOV + step budget from it too.)
     pub settings: &'a OpticastSettings,
     /// Packed engine sky colour: the CPU sky-miss fill + skycast, and
     /// the clear colour if no scene renders.
@@ -867,14 +883,6 @@ pub struct FrameParams<'a> {
     /// CPU: treat z=255 as air (avoids the S1.X bedrock path for
     /// out-of-bounds cameras).
     pub treat_z_max_as_air: bool,
-    /// GPU scene-grid LOD scan distance (world units); see GPU.11.1.
-    /// Ignored by the CPU backend.
-    pub gpu_mip_scan_dist: f32,
-    /// GPU outer-DDA step budget (chunks). Ignored by the CPU backend.
-    pub gpu_max_outer_steps: u32,
-    /// GPU vertical field of view (radians). Ignored by the CPU
-    /// backend (it derives projection from [`OpticastSettings`]).
-    pub gpu_fov_y_rad: f32,
     /// Whether to draw the renderer's sprites this frame. Both backends
     /// draw KV6 sprites flat-lit (the clean-room DDA sprite raycaster on
     /// CPU; uploaded model colours on GPU), so no host-supplied lighting
@@ -903,15 +911,12 @@ pub struct FrameParams<'a> {
 }
 
 impl<'a> FrameParams<'a> {
-    /// Frame params with sensible defaults for everything except the
-    /// CPU [`OpticastSettings`] (which the host owns): the default sky
-    /// colour ([`RenderOptions::clear_sky`]'s default), no panorama, CPU
-    /// fog off, sprites on, no per-side shading, no dynamic lights —
-    /// and a **GPU projection derived from `settings`** (`fov_y =
-    /// 2·atan(yres/2 / hz)`), so both backends render the same field of
-    /// view without the host keeping `hz` and `gpu_fov_y_rad` in sync
-    /// by hand. The GPU outer-DDA step budget follows
-    /// [`OpticastSettings::max_scan_dist`].
+    /// Frame params with sensible defaults for everything except
+    /// [`settings`](Self::settings) (which the host owns): the default
+    /// sky colour ([`RenderOptions::clear_sky`]'s default), no
+    /// panorama, CPU fog off, sprites on, no per-side shading, no
+    /// dynamic lights. Both backends' projection comes from
+    /// `settings` (see the struct docs).
     ///
     /// `treat_z_max_as_air` defaults to `true` (what every demo passes;
     /// out-of-bounds cameras skip the bedrock path). Hosts that want
@@ -925,14 +930,9 @@ impl<'a> FrameParams<'a> {
     /// fp.sky = Some(&sky);
     /// fp.lights = Some(rig);
     /// ```
-    // Screen dims cast to f32 are bounded by realistic resolutions.
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     #[must_use]
     pub fn new(settings: &'a OpticastSettings) -> Self {
         let default_sky = RenderOptions::default().clear_sky;
-        let fov_y = 2.0 * ((settings.yres as f32) * 0.5 / settings.hz).atan();
-        let chunks_visible =
-            (settings.max_scan_dist.max(1) as u32) / roxlap_scene::CHUNK_SIZE_XY + 4;
         Self {
             settings,
             sky_color: default_sky,
@@ -940,13 +940,29 @@ impl<'a> FrameParams<'a> {
             fog_color: default_sky,
             fog_max_scan_dist: 0,
             treat_z_max_as_air: true,
-            gpu_mip_scan_dist: 64.0,
-            gpu_max_outer_steps: chunks_visible,
-            gpu_fov_y_rad: fov_y,
             draw_sprites: true,
             side_shades: [0; 6],
             lights: None,
         }
+    }
+
+    /// The vertical field of view both backends render `settings`
+    /// with: `2·atan(yres/2 / hz)` — resolution-independent, so it
+    /// holds at any window / logical size.
+    // Screen dims cast to f32 are bounded by realistic resolutions.
+    #[allow(clippy::cast_precision_loss)]
+    #[must_use]
+    pub fn fov_y_rad(&self) -> f32 {
+        2.0 * ((self.settings.yres as f32) * 0.5 / self.settings.hz).atan()
+    }
+
+    /// The GPU outer-DDA step budget (chunks) derived from
+    /// [`OpticastSettings::max_scan_dist`]: enough chunk steps to cover
+    /// the scan distance, plus slack for the entry/exit chunks.
+    #[allow(clippy::cast_sign_loss)]
+    #[must_use]
+    pub fn gpu_outer_steps(&self) -> u32 {
+        (self.settings.max_scan_dist.max(1) as u32) / roxlap_scene::CHUNK_SIZE_XY + 4
     }
 }
 
@@ -1113,6 +1129,30 @@ pub enum Backend {
     Gpu,
 }
 
+/// Construction failure from [`SceneRenderer::try_new`] (QE.2b).
+///
+/// The facade tries the GPU backend (when asked), then the CPU
+/// backend; `try_new` fails only when the **last-resort** CPU software
+/// surface can't be created either. A GPU-only failure is not an
+/// error — it logs a `warn` and falls back.
+#[derive(Debug)]
+pub enum RenderError {
+    /// The CPU backend couldn't bind its software present surface
+    /// (softbuffer context/surface creation failed — e.g. a broken or
+    /// unsupported display connection).
+    CpuSurface(String),
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CpuSurface(msg) => write!(f, "CPU present surface init failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for RenderError {}
+
 /// Construction-time options for [`SceneRenderer::new`].
 pub struct RenderOptions {
     /// Try the GPU backend first. When `false`, or when GPU init
@@ -1125,6 +1165,26 @@ pub struct RenderOptions {
     /// with until a scene render lands. Also the CPU sky-miss colour
     /// default if a frame supplies none.
     pub clear_sky: u32,
+    /// GPU scene-grid LOD scan distance in world units (GPU.11.1):
+    /// rays farther than this from the camera sample coarser chunk
+    /// mips. QE.2a — construction-time here (was a per-frame
+    /// `FrameParams` field); the `ROXLAP_GPU_MIP_SCAN_DIST` env var
+    /// still overrides it as a user-side escape hatch. Ignored by the
+    /// CPU backend (its mip ladder comes from
+    /// [`OpticastSettings::mip_scan_dist`]).
+    pub gpu_mip_scan_dist: f32,
+    /// GPU per-frame dirty-chunk install budget (QE.2c — was env-only
+    /// `ROXLAP_GPU_CHUNK_BUDGET`, which still overrides). Each chunk
+    /// install issues several `queue.write_buffer` calls; a big batch
+    /// can exhaust the device staging pool (seen as egui-wgpu panics on
+    /// Mesa/NVK while flying fast). Small budget = bounded per-frame
+    /// writes, more terrain pop-in when moving quickly. `0` =
+    /// unbounded.
+    pub gpu_chunk_upload_budget: u32,
+    /// GPU frames-per-staging-flush while registering a flipbook clip
+    /// (QE.2c — was env-only `ROXLAP_GPU_CLIP_BUDGET`, which still
+    /// overrides). `0` = unbounded.
+    pub gpu_clip_upload_budget: u32,
     /// Unused. Sized the strip-parallel opticast's per-frame scratch
     /// pool; the per-pixel DDA renderer that replaced it needs no
     /// pre-sizing, so the value is ignored.
@@ -1155,6 +1215,9 @@ impl Default for RenderOptions {
             want_gpu: false,
             gpu: GpuRendererSettings::default(),
             clear_sky: 0x0099_b3d9,
+            gpu_mip_scan_dist: 64.0,
+            gpu_chunk_upload_budget: 2,
+            gpu_clip_upload_budget: 8,
             cpu_max_grid_vsid: 32 * roxlap_scene::CHUNK_SIZE_XY,
             cpu_render_threads: 4,
         }
@@ -1456,53 +1519,11 @@ pub struct SceneRenderer {
 }
 
 impl SceneRenderer {
-    /// Build a renderer for `window` — any [`raw-window-handle`]
-    /// provider (winit, SDL, GLFW, …) in an `Arc`. `size` is the
-    /// window's initial physical framebuffer size in pixels; thereafter
-    /// the host reports changes via [`Self::resize`]. Passing the size
-    /// explicitly keeps the facade decoupled from any one windowing
-    /// library's size API.
-    ///
-    /// Selects the GPU backend when `opts.want_gpu` and WGPU
-    /// initialises; otherwise the CPU backend. **Never fails** — a
-    /// missing/incompatible GPU silently yields the CPU path (the
-    /// message is logged to stderr).
-    ///
-    /// [`raw-window-handle`]: raw_window_handle
-    #[cfg(not(target_arch = "wasm32"))]
-    #[must_use]
-    pub fn new<W>(window: Arc<W>, size: (u32, u32), opts: &RenderOptions) -> Self
-    where
-        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
-    {
-        if opts.want_gpu {
-            match GpuBackend::new(window.clone(), size, opts) {
-                Ok(g) => {
-                    return Self {
-                        inner: BackendImpl::Gpu(Box::new(g)),
-                        dyn_map: DynInstanceMap::default(),
-                        model_map: EpochSlotMap::default(),
-                        clip_map: EpochSlotMap::default(),
-                        char_map: EpochSlotMap::default(),
-                        char_instances: Vec::new(),
-                        streaming_map: EpochSlotMap::default(),
-                        streaming_clips: Vec::new(),
-                        clip_meta: Vec::new(),
-                        clip_players: Vec::new(),
-                        billboards: Vec::new(),
-                        actor_map: EpochSlotMap::default(),
-                        billboard_actors: Vec::new(),
-                    };
-                }
-                Err(e) => {
-                    eprintln!(
-                        "roxlap-render: GPU init failed ({e}); falling back to the CPU renderer",
-                    );
-                }
-            }
-        }
+    /// Wrap a constructed backend with the facade's (empty) handle
+    /// registries — the shared tail of every constructor.
+    fn from_backend(inner: BackendImpl) -> Self {
         Self {
-            inner: BackendImpl::Cpu(Box::new(CpuBackend::new(window, size, opts))),
+            inner,
             dyn_map: DynInstanceMap::default(),
             model_map: EpochSlotMap::default(),
             clip_map: EpochSlotMap::default(),
@@ -1515,6 +1536,67 @@ impl SceneRenderer {
             billboards: Vec::new(),
             actor_map: EpochSlotMap::default(),
             billboard_actors: Vec::new(),
+        }
+    }
+
+    /// Build a renderer for `window` — any [`raw-window-handle`]
+    /// provider (winit, SDL, GLFW, …) in an `Arc`. `size` is the
+    /// window's initial physical framebuffer size in pixels; thereafter
+    /// the host reports changes via [`Self::resize`]. Passing the size
+    /// explicitly keeps the facade decoupled from any one windowing
+    /// library's size API.
+    ///
+    /// Selects the GPU backend when `opts.want_gpu` and WGPU
+    /// initialises; otherwise the CPU backend (the GPU failure is
+    /// logged at `warn` through the [`log`] facade — install a logger
+    /// like `env_logger` to see why a machine is software-rendering).
+    /// Fails only when even the **CPU** software surface can't be
+    /// created (QE.2b; previously that case was a hidden panic behind
+    /// a "never fails" doc).
+    ///
+    /// # Errors
+    /// [`RenderError::CpuSurface`] — the last-resort softbuffer
+    /// context/surface couldn't bind to `window`.
+    ///
+    /// [`raw-window-handle`]: raw_window_handle
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn try_new<W>(
+        window: Arc<W>,
+        size: (u32, u32),
+        opts: &RenderOptions,
+    ) -> Result<Self, RenderError>
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
+        if opts.want_gpu {
+            match GpuBackend::new(window.clone(), size, opts) {
+                Ok(g) => return Ok(Self::from_backend(BackendImpl::Gpu(Box::new(g)))),
+                Err(e) => {
+                    log::warn!("GPU init failed ({e}); falling back to the CPU renderer");
+                }
+            }
+        }
+        let cpu = CpuBackend::try_new(window, size, opts)?;
+        Ok(Self::from_backend(BackendImpl::Cpu(Box::new(cpu))))
+    }
+
+    /// Infallible [`Self::try_new`]: **panics** if even the CPU
+    /// software surface can't be created — the convenient default for
+    /// demos and tools, where "no window surface at all" has no
+    /// meaningful recovery. Games that want to show their own error UI
+    /// call [`try_new`](Self::try_new).
+    ///
+    /// # Panics
+    /// When [`Self::try_new`] returns [`RenderError::CpuSurface`].
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn new<W>(window: Arc<W>, size: (u32, u32), opts: &RenderOptions) -> Self
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
+        match Self::try_new(window, size, opts) {
+            Ok(r) => r,
+            Err(e) => panic!("SceneRenderer::new: {e} (use try_new to handle this)"),
         }
     }
 
@@ -1540,23 +1622,7 @@ impl SceneRenderer {
             // GPU attempt gets a clone — the CPU fallback keeps the
             // original if WebGPU init fails.
             match GpuBackend::new_async(canvas.clone(), size, opts).await {
-                Ok(g) => {
-                    return Self {
-                        inner: BackendImpl::Gpu(Box::new(g)),
-                        dyn_map: DynInstanceMap::default(),
-                        model_map: EpochSlotMap::default(),
-                        clip_map: EpochSlotMap::default(),
-                        char_map: EpochSlotMap::default(),
-                        char_instances: Vec::new(),
-                        streaming_map: EpochSlotMap::default(),
-                        streaming_clips: Vec::new(),
-                        clip_meta: Vec::new(),
-                        clip_players: Vec::new(),
-                        billboards: Vec::new(),
-                        actor_map: EpochSlotMap::default(),
-                        billboard_actors: Vec::new(),
-                    };
-                }
+                Ok(g) => return Self::from_backend(BackendImpl::Gpu(Box::new(g))),
                 Err(e) => {
                     web_sys::console::warn_1(
                         &format!("roxlap-render: WebGPU init failed ({e}); using the CPU renderer")
@@ -1565,21 +1631,9 @@ impl SceneRenderer {
                 }
             }
         }
-        Self {
-            inner: BackendImpl::Cpu(Box::new(CpuBackend::new_from_canvas(canvas, size, opts))),
-            dyn_map: DynInstanceMap::default(),
-            model_map: EpochSlotMap::default(),
-            clip_map: EpochSlotMap::default(),
-            char_map: EpochSlotMap::default(),
-            char_instances: Vec::new(),
-            streaming_map: EpochSlotMap::default(),
-            streaming_clips: Vec::new(),
-            clip_meta: Vec::new(),
-            clip_players: Vec::new(),
-            billboards: Vec::new(),
-            actor_map: EpochSlotMap::default(),
-            billboard_actors: Vec::new(),
-        }
+        Self::from_backend(BackendImpl::Cpu(Box::new(CpuBackend::new_from_canvas(
+            canvas, size, opts,
+        ))))
     }
 
     /// Which backend was selected.

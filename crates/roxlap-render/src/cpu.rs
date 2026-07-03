@@ -596,8 +596,15 @@ impl CpuBackend {
     }
 
     /// Native: present into a `softbuffer` surface bound to `window`.
+    /// QE.2b — fallible: a display/surface the software presenter can't
+    /// bind (broken Wayland/X11 connection, unsupported handle kind)
+    /// surfaces as [`RenderError::CpuSurface`] instead of a panic.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn new<W>(window: Arc<W>, size: (u32, u32), opts: &RenderOptions) -> Self
+    pub(crate) fn try_new<W>(
+        window: Arc<W>,
+        size: (u32, u32),
+        opts: &RenderOptions,
+    ) -> Result<Self, crate::RenderError>
     where
         W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
     {
@@ -608,9 +615,11 @@ impl CpuBackend {
         // erased Arcs satisfy softbuffer's bounds.
         let display: Arc<DynDisplay> = window.clone();
         let window: Arc<DynWindow> = window;
-        let context = softbuffer::Context::new(display).expect("softbuffer: Context::new");
-        let surface = softbuffer::Surface::new(&context, window).expect("softbuffer: Surface::new");
-        Self::assemble(surface, size, opts)
+        let context = softbuffer::Context::new(display)
+            .map_err(|e| crate::RenderError::CpuSurface(format!("softbuffer context: {e}")))?;
+        let surface = softbuffer::Surface::new(&context, window)
+            .map_err(|e| crate::RenderError::CpuSurface(format!("softbuffer surface: {e}")))?;
+        Ok(Self::assemble(surface, size, opts))
     }
 
     /// wasm: present into a WebGL2 blitter over `canvas` (no softbuffer
@@ -1318,8 +1327,8 @@ impl CpuBackend {
             // frame loop; an over-cap rig otherwise spams stderr at 60 Hz).
             if demoted != self.shadow_demote_warned {
                 if demoted > 0 {
-                    eprintln!(
-                        "roxlap CPU: {demoted} shadow-casting point lights > MAX_SHADOW_CASTERS ({}); demoting the excess to shadowless",
+                    log::warn!(
+                        "CPU: {demoted} shadow-casting point lights > MAX_SHADOW_CASTERS ({}); demoting the excess to shadowless",
                         roxlap_gpu::MAX_SHADOW_CASTERS
                     );
                 }

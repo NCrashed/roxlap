@@ -425,21 +425,15 @@ fn render(state: &mut State) {
     let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
     let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
     settings.max_scan_dist = MAXZDIM;
-    let chunks_visible = (settings.max_scan_dist.max(1) as u32) / roxlap_scene::CHUNK_SIZE_XY + 4;
-    let frame = FrameParams {
-        settings: &settings,
-        sky_color: state.engine.sky_color(),
-        sky: state.engine.sky(),
-        fog_color: state.engine.fog_color(),
-        fog_max_scan_dist: state.engine.fog_max_scan_dist(),
-        treat_z_max_as_air: true,
-        gpu_mip_scan_dist: 64.0,
-        gpu_max_outer_steps: chunks_visible,
-        gpu_fov_y_rad: GPU_FOV_Y_DEG.to_radians(),
-        draw_sprites: true,
-        side_shades: [0; 6],
-        lights: None, // DL — GPU-only dynamic lighting opt-in; off here.
-    };
+    // QE.2 — `FrameParams::new` + overrides; the GPU projection derives
+    // from `settings`, so the deliberate 70° FOV is set there (for
+    // both backends).
+    let settings = settings.with_fov_y(GPU_FOV_Y_DEG.to_radians());
+    let mut frame = FrameParams::new(&settings);
+    frame.sky_color = state.engine.sky_color();
+    frame.sky = state.engine.sky();
+    frame.fog_color = state.engine.fog_color();
+    frame.fog_max_scan_dist = state.engine.fog_max_scan_dist();
     state.renderer.render(&mut state.scene, &cam, &frame);
     state.renderer.present();
 }

@@ -73,6 +73,22 @@ impl OpticastSettings {
         }
     }
 
+    /// Pick an explicit vertical field of view (radians): sets the
+    /// focal length `hz = (yres/2) / tan(fov_y/2)` so both renderer
+    /// backends show exactly this FOV (QE.2a — the facade derives the
+    /// GPU projection from these settings too). The projection centre
+    /// (`hx`, `hy`) is untouched. The default
+    /// [`Self::for_oracle_framebuffer`] focal (`hz = w/2`) equals
+    /// `with_fov_y(2·atan(h/w))` — ≈ 73.7° for 4:3, ≈ 58.7° for 16:9.
+    #[must_use]
+    pub fn with_fov_y(mut self, fov_y_rad: f32) -> Self {
+        // yres → f32 is exact for realistic screen sizes.
+        #[allow(clippy::cast_precision_loss)]
+        let half_h = (self.yres as f32) * 0.5;
+        self.hz = half_h / (fov_y_rad * 0.5).tan();
+        self
+    }
+
     /// Restrict this settings struct to the `[y_start, y_end)`
     /// horizontal strip. Used by the per-strip parallel dispatch — each
     /// strip clones the base settings and clamps the y-range. Caller is

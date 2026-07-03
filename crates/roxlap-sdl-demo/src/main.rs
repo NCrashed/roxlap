@@ -169,20 +169,13 @@ fn render_frame(
     camera: &Camera,
     settings: &OpticastSettings,
 ) {
-    let frame = FrameParams {
-        settings,
-        sky_color: SKY,
-        sky: None,
-        fog_color: SKY,
-        fog_max_scan_dist: settings.max_scan_dist,
-        treat_z_max_as_air: true,
-        gpu_mip_scan_dist: 64.0,
-        gpu_max_outer_steps: 64,
-        gpu_fov_y_rad: 60.0_f32.to_radians(),
-        draw_sprites: false,
-        side_shades: [0; 6],
-        lights: None, // DL — GPU-only dynamic lighting opt-in; off here.
-    };
+    // QE.2 — `FrameParams::new` + overrides; both backends project
+    // from `settings` (one FOV, one scan budget).
+    let mut frame = FrameParams::new(settings);
+    frame.sky_color = SKY;
+    frame.fog_color = SKY;
+    frame.fog_max_scan_dist = settings.max_scan_dist;
+    frame.draw_sprites = false;
     renderer.render(scene, camera, &frame);
     // render() composites but doesn't present — finish the frame.
     renderer.present();
@@ -219,6 +212,9 @@ fn build_scene() -> Scene {
 }
 
 fn main() -> Result<(), String> {
+    // QE.2b - surface the facade's log-facade warnings (GPU-init
+    // fallback) on stderr; RUST_LOG overrides.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let sdl = sdl2::init()?;
     let video = sdl.video()?;
 

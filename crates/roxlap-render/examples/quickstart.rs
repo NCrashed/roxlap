@@ -133,6 +133,10 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
+    // roxlap-render reports diagnostics (e.g. why GPU init failed and
+    // it fell back to CPU) through the `log` facade — install any
+    // logger to see them. RUST_LOG=debug for more detail.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop
         .run_app(&mut App::default())

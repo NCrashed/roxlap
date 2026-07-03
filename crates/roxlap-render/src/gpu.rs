@@ -170,12 +170,51 @@ pub(crate) struct GpuBackend {
     /// palette rebuilds every frame). Starts `true` so the first frame
     /// seeds the device palettes.
     materials_dirty: bool,
+    /// GPU scene-grid LOD scan distance (world units; GPU.11.1). QE.2a:
+    /// seeded from [`RenderOptions::gpu_mip_scan_dist`] (env
+    /// `ROXLAP_GPU_MIP_SCAN_DIST` overrides at construction) instead of
+    /// arriving through every `FrameParams`.
+    mip_scan_dist: f32,
+}
+
+/// Read a `f32` env override, `None` when unset/unparseable (or on
+/// wasm, which has no process environment).
+fn env_f32(var: &str) -> Option<f32> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = var;
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var(var).ok().and_then(|v| v.parse().ok())
+    }
+}
+
+/// Resolve an upload budget: the env var (user-side escape hatch) wins
+/// over the [`RenderOptions`] field; `0` means unbounded on both.
+fn budget_option(var: &str, from_opts: u32) -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    let raw = {
+        let _ = var;
+        from_opts
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let raw = std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(from_opts);
+    if raw == 0 {
+        u32::MAX
+    } else {
+        raw
+    }
 }
 
 impl GpuBackend {
     /// Backend-agnostic field seeding shared by the native + wasm
     /// constructors, given an already-initialised [`GpuRenderer`].
-    fn from_gpu(gpu: GpuRenderer) -> Self {
+    fn from_gpu(gpu: GpuRenderer, opts: &RenderOptions) -> Self {
         Self {
             gpu,
             resident: None,
@@ -198,49 +237,20 @@ impl GpuBackend {
             carve_z: 0,
             host_sky_set: false,
             auto_sky_color: None,
-            chunk_upload_budget: Self::chunk_upload_budget_from_env(),
-            clip_upload_budget: Self::clip_upload_budget_from_env(),
+            chunk_upload_budget: budget_option(
+                "ROXLAP_GPU_CHUNK_BUDGET",
+                opts.gpu_chunk_upload_budget,
+            ),
+            clip_upload_budget: budget_option(
+                "ROXLAP_GPU_CLIP_BUDGET",
+                opts.gpu_clip_upload_budget,
+            ),
             image_pixels: Vec::new(),
             transforms_dirty: false,
             materials: MaterialTable::new(),
             terrain_materials: Vec::new(),
             materials_dirty: true,
-        }
-    }
-
-    /// Frames-per-staging-flush while registering a flipbook clip — default
-    /// 8, overridable via `ROXLAP_GPU_CLIP_BUDGET` (`0` = unbounded). See
-    /// [`Self::clip_upload_budget`].
-    fn clip_upload_budget_from_env() -> u32 {
-        match std::env::var("ROXLAP_GPU_CLIP_BUDGET")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-        {
-            Some(0) => u32::MAX,
-            Some(n) => n,
-            None => 8,
-        }
-    }
-
-    /// Per-frame dirty-chunk install budget — default 2, overridable via
-    /// `ROXLAP_GPU_CHUNK_BUDGET` (`0` = unbounded, the old behaviour).
-    ///
-    /// Each chunk install issues several `queue.write_buffer` calls
-    /// (occupancy pages, colours, offsets, …); a big batch in one frame
-    /// can exhaust the device staging pool, which then makes egui's own
-    /// `write_buffer_with` fail (a hard panic in egui-wgpu) — seen while
-    /// flying fast on the Mesa/NVK Vulkan driver. A small budget keeps the
-    /// per-frame write volume bounded; the trade-off is slower chunk fill
-    /// (more terrain pop-in) when moving quickly. Raise it on a driver
-    /// that tolerates the bursts.
-    fn chunk_upload_budget_from_env() -> u32 {
-        match std::env::var("ROXLAP_GPU_CHUNK_BUDGET")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-        {
-            Some(0) => u32::MAX,
-            Some(n) => n,
-            None => 2,
+            mip_scan_dist: env_f32("ROXLAP_GPU_MIP_SCAN_DIST").unwrap_or(opts.gpu_mip_scan_dist),
         }
     }
 
@@ -255,7 +265,7 @@ impl GpuBackend {
         W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
     {
         let gpu = GpuRenderer::new_blocking(window, size, opts.gpu)?;
-        Ok(Self::from_gpu(gpu))
+        Ok(Self::from_gpu(gpu, opts))
     }
 
     /// wasm/WebGPU: await the async wgpu init against an HTML canvas.
@@ -268,7 +278,7 @@ impl GpuBackend {
         opts: &RenderOptions,
     ) -> Result<Self, GpuInitError> {
         let gpu = GpuRenderer::new_from_canvas(canvas, size, opts.gpu).await?;
-        Ok(Self::from_gpu(gpu))
+        Ok(Self::from_gpu(gpu, opts))
     }
 
     /// Build an instanced model registry from `set` and upload it.
@@ -1090,8 +1100,9 @@ impl GpuBackend {
             self.transforms_dirty = false;
         }
 
-        // Per-frame GPU scene-LOD knob (GPU.11.1).
-        self.gpu.set_scene_mip_scan_dist(frame.gpu_mip_scan_dist);
+        // GPU scene-LOD knob (GPU.11.1) — construction-time since QE.2a
+        // (`RenderOptions::gpu_mip_scan_dist` / env override).
+        self.gpu.set_scene_mip_scan_dist(self.mip_scan_dist);
 
         // Per-face grid shading (voxlap setsideshades) — the scene-DDA
         // pass darkens a hit voxel's brightness by the hit face's shade,
@@ -1130,14 +1141,18 @@ impl GpuBackend {
         // this the GPU sprite pass used `cameras[0]` and shifted every
         // instance by grid 0's origin/rotation.
         let sprite_camera = grid_local_camera(glam::DQuat::IDENTITY, DVec3::ZERO, camera);
+        // QE.2a — both backends project from `frame.settings`: one FOV,
+        // one scan budget, no per-backend desync.
+        let fov_y = frame.fov_y_rad();
+        let outer_steps = frame.gpu_outer_steps();
         if let Some(resident) = &self.resident {
             self.gpu.render_scene(
                 resident,
                 &cameras,
                 &grid_world,
                 &sprite_camera,
-                frame.gpu_fov_y_rad,
-                frame.gpu_max_outer_steps,
+                fov_y,
+                outer_steps,
             );
         } else if !self.sprite_instances.is_empty() {
             // Sprite-only scene (no voxel grids — e.g. an asset/model
@@ -1151,14 +1166,8 @@ impl GpuBackend {
                 self.empty_resident = Some(GpuSceneResident::upload(self.gpu.device(), &info));
             }
             let empty = self.empty_resident.as_ref().expect("just built");
-            self.gpu.render_scene(
-                empty,
-                &[],
-                &[],
-                &sprite_camera,
-                frame.gpu_fov_y_rad,
-                frame.gpu_max_outer_steps,
-            );
+            self.gpu
+                .render_scene(empty, &[], &[], &sprite_camera, fov_y, outer_steps);
         } else {
             // Truly empty (no grids, no sprites) — clear to colour
             // (deferred, so a HUD can still be painted over it).
@@ -1400,8 +1409,8 @@ impl GpuBackend {
 
         let info = roxlap_gpu::SceneUpload { grids: scene_grids };
         let resident = GpuSceneResident::upload(self.gpu.device(), &info);
-        eprintln!(
-            "roxlap-render: uploaded scene — {} grids, {total_chunks} chunks, {:.1} MiB resident",
+        log::info!(
+            "uploaded scene — {} grids, {total_chunks} chunks, {:.1} MiB resident",
             grid_ids.len(),
             resident.resident_bytes() as f64 / (1024.0 * 1024.0),
         );
@@ -1553,7 +1562,7 @@ impl GpuBackend {
             }
         }
         if decompressed > 8 || evicted > 0 {
-            eprintln!("roxlap-render: refreshed {decompressed} chunks, evicted {evicted}");
+            log::debug!("refreshed {decompressed} chunks, evicted {evicted}");
         }
     }
 

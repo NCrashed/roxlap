@@ -288,21 +288,15 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, perf: &web_sys::Performance, now_ms
         settings.max_scan_dist = SCAN_DIST;
         settings.mip_levels = 4;
         settings.mip_scan_dist = 64;
-        let chunks_visible = (SCAN_DIST.max(1) as u32) / roxlap_scene::CHUNK_SIZE_XY + 4;
-        let frame = FrameParams {
-            settings: &settings,
-            sky_color: engine.sky_color(),
-            sky: engine.sky(),
-            fog_color: engine.fog_color(),
-            fog_max_scan_dist: engine.fog_max_scan_dist(),
-            treat_z_max_as_air: true,
-            gpu_mip_scan_dist: 64.0,
-            gpu_max_outer_steps: chunks_visible,
-            gpu_fov_y_rad: GPU_FOV_Y_DEG.to_radians(),
-            draw_sprites: false,
-            side_shades: [0; 6],
-            lights: None, // DL — GPU-only dynamic lighting opt-in; off here.
-        };
+        // QE.2 — the GPU projection derives from `settings`, so the
+        // deliberate FOV is set there (for both backends).
+        let settings = settings.with_fov_y(GPU_FOV_Y_DEG.to_radians());
+        let mut frame = FrameParams::new(&settings);
+        frame.sky_color = engine.sky_color();
+        frame.sky = engine.sky();
+        frame.fog_color = engine.fog_color();
+        frame.fog_max_scan_dist = engine.fog_max_scan_dist();
+        frame.draw_sprites = false;
         renderer.render(scene, &cam, &frame);
         renderer.present();
     }

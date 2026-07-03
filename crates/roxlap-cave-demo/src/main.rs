@@ -574,23 +574,15 @@ impl App {
 
         let cam = self.camera();
         let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
-        #[allow(clippy::cast_sign_loss)]
-        let chunks_visible = (settings.max_scan_dist.max(1) as u32) / CHUNK_SIZE_XY + 4;
 
-        let frame = FrameParams {
-            settings: &settings,
-            sky_color: self.engine.sky_color(),
-            sky: self.engine.sky(),
-            fog_color: self.engine.fog_color(),
-            fog_max_scan_dist: self.engine.fog_max_scan_dist(),
-            treat_z_max_as_air: true,
-            gpu_mip_scan_dist: 64.0,
-            gpu_max_outer_steps: chunks_visible,
-            gpu_fov_y_rad: 60.0_f32.to_radians(),
-            draw_sprites: true,
-            side_shades: self.engine.side_shades(),
-            lights: None, // DL — GPU-only dynamic lighting opt-in; off here.
-        };
+        // QE.2 — `FrameParams::new` + overrides; both backends project
+        // from `settings` (one FOV, one derived scan budget).
+        let mut frame = FrameParams::new(&settings);
+        frame.sky_color = self.engine.sky_color();
+        frame.sky = self.engine.sky();
+        frame.fog_color = self.engine.fog_color();
+        frame.fog_max_scan_dist = self.engine.fog_max_scan_dist();
+        frame.side_shades = self.engine.side_shades();
 
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -1070,6 +1062,9 @@ fn is_blocked(chunk: &Vxl, pos: [f64; 3]) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // QE.2b - surface the facade's log-facade warnings (GPU-init
+    // fallback) on stderr; RUST_LOG overrides.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new();

@@ -16,6 +16,11 @@ name = "roxlap-cave-demo"
 path = "src/main.rs"
 
 [dependencies]
+# QE.2b - roxlap-render reports diagnostics (GPU-init fallback, light
+# budget demotion) through the `log` facade; env_logger surfaces them
+# on stderr like the pre-QE.2 eprintln!s did (RUST_LOG adjusts
+# verbosity).
+env_logger = "0.11"
 roxlap-core = { path = "../roxlap-core", version = "0.21" }
 roxlap-formats = { path = "../roxlap-formats", version = "0.21" }
 roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.21" }

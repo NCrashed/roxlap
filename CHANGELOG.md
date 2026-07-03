@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — **breaking** (QE.2): `FrameParams` is `#[non_exhaustive]`, one projection for both backends
+
+`FrameParams` can no longer be built with a struct literal outside
+roxlap-render — construct with `FrameParams::new(&settings)` and
+override fields. In exchange, **future field additions stop being
+breaking changes** (pre-QE.2, every added field broke every host's
+literal), and the three per-backend projection knobs are gone:
+
+| Removed field | Where it went | Migration |
+|---|---|---|
+| `gpu_fov_y_rad` | derived from `settings`: `fov_y = 2·atan(yres/2 / hz)` | want an explicit FOV? `settings = settings.with_fov_y(rad)` (new `OpticastSettings` helper) — it now applies to **both** backends |
+| `gpu_max_outer_steps` | derived from `settings.max_scan_dist` (`/CHUNK_SIZE_XY + 4`, the formula every host already used) | set `settings.max_scan_dist` |
+| `gpu_mip_scan_dist` | `RenderOptions::gpu_mip_scan_dist` (construction-time; default 64.0) | set it in `RenderOptions`; the `ROXLAP_GPU_MIP_SCAN_DIST` env var still overrides |
+
+Before/after:
+
+```rust,ignore
+// before                                   // after
+let frame = FrameParams {                   let mut frame = FrameParams::new(&settings);
+    settings: &settings,                    frame.sky_color = sky;
+    sky_color: sky,                         frame.fog_color = sky;
+    sky: None,                              frame.fog_max_scan_dist = settings.max_scan_dist;
+    fog_color: sky,                         // gpu_* fields: see the table above
+    fog_max_scan_dist: msd,
+    treat_z_max_as_air: true,               // `new` defaults: treat_z_max_as_air = true,
+    gpu_mip_scan_dist: 64.0,                // draw_sprites = true, side_shades = [0;6],
+    gpu_max_outer_steps: n,                 // lights = None — override what differs.
+    gpu_fov_y_rad: 60f32.to_radians(),
+    draw_sprites: true,
+    side_shades: [0; 6],
+    lights: None,
+};
+```
+
+**Visual note:** the GPU backend previously rendered whatever
+`gpu_fov_y_rad` said (typically a hard-coded 60°) while the CPU
+backend rendered the `OpticastSettings` FOV (≈73.7° for the default
+4:3 `for_oracle_framebuffer`). They now always match; if you relied on
+the old GPU-side 60°, apply `settings.with_fov_y(60f32.to_radians())`
+— to both backends, which is the point.
+
+### Changed — **breaking** (QE.2b): construction diagnostics + `try_new`
+
+- **`SceneRenderer::try_new(window, size, &opts) -> Result<Self,
+  RenderError>`** (native) — the honest constructor: a GPU-init
+  failure still falls back to CPU (now logged at `warn` via the
+  [`log`] facade), and the `Err` fires only when even the last-resort
+  CPU software surface can't bind. `SceneRenderer::new` stays and
+  keeps the old behaviour, but its doc no longer claims "never fails"
+  — it panics where it always secretly did (softbuffer init), with a
+  clear message. Migration: nothing required; switch to `try_new` if
+  you want to show your own error UI.
+- **Library diagnostics moved from `eprintln!` to the `log` facade**
+  (GPU-fallback reason, CPU light-budget demotion at `warn`;
+  scene-upload/refresh traces at `info`/`debug`). Migration: install
+  any logger to keep seeing them — the demos + quickstart now init
+  `env_logger` with a `warn` default filter (`RUST_LOG` overrides), so
+  their stderr output is unchanged.
+
+### Added — QE.2
+
+- `OpticastSettings::with_fov_y(rad)` — set an explicit vertical FOV
+  by computing the focal length (`hz`); both backends follow it.
+- `FrameParams::fov_y_rad()` / `FrameParams::gpu_outer_steps()` — the
+  derived projection values, exposed for hosts/tools that need them.
+- `RenderOptions::{gpu_mip_scan_dist, gpu_chunk_upload_budget,
+  gpu_clip_upload_budget}` (QE.2c) — the last two were previously
+  reachable **only** via `ROXLAP_GPU_CHUNK_BUDGET` /
+  `ROXLAP_GPU_CLIP_BUDGET` env vars, which a shipped game can't
+  reasonably set; the env vars remain as user-side overrides. `0` =
+  unbounded. Defaults unchanged (2 / 8 / 64.0).
+
 ### Changed — **breaking** (QE.1c): spawn methods return `Option`
 
 Every facade spawn that could previously fail *silently* — handing back

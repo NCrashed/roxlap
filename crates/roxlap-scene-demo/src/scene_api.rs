@@ -10,26 +10,13 @@
 //! consume them.
 
 use std::f64::consts::PI;
-use std::sync::OnceLock;
 
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::{Camera, Engine};
 use roxlap_render::{FrameParams, SceneRenderer};
-use roxlap_scene::CHUNK_SIZE_XY;
+
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
-
-/// Default GPU mip-scan distance, overridable once via the
-/// `ROXLAP_GPU_MIP_SCAN_DIST` env var (read on first use).
-fn gpu_mip_scan_dist() -> f32 {
-    static V: OnceLock<f32> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("ROXLAP_GPU_MIP_SCAN_DIST")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64.0)
-    })
-}
 
 /// Per-frame opticast settings every scene shares: the full 6-mip ladder
 /// with the host's `+`/`-` ray-march distance.
@@ -42,32 +29,25 @@ pub fn opticast_settings(size: (u32, u32), scan_dist: i32) -> OpticastSettings {
     s
 }
 
-/// Per-frame [`FrameParams`] every scene shares. Sky/fog/shading come from
-/// the host `engine`; the GPU mip-scan distance honours
-/// `ROXLAP_GPU_MIP_SCAN_DIST` (default 64).
+/// Per-frame [`FrameParams`] every scene shares. Sky/fog/shading come
+/// from the host `engine`. QE.2 — both backends project from
+/// `settings`, and the GPU mip-scan distance / step budget moved to
+/// [`roxlap_render::RenderOptions`] / derivation (the
+/// `ROXLAP_GPU_MIP_SCAN_DIST` env override still works — the facade
+/// reads it at construction).
 #[must_use]
 pub fn frame_params<'a>(
     engine: &'a Engine,
     settings: &'a OpticastSettings,
     scan_dist: i32,
 ) -> FrameParams<'a> {
-    #[allow(clippy::cast_sign_loss)]
-    let chunks_visible = (scan_dist.max(1) as u32) / CHUNK_SIZE_XY + 4;
-    FrameParams {
-        settings,
-        sky_color: engine.sky_color(),
-        sky: engine.sky(),
-        fog_color: engine.sky_color(),
-        fog_max_scan_dist: scan_dist,
-        treat_z_max_as_air: true,
-        gpu_mip_scan_dist: gpu_mip_scan_dist(),
-        gpu_max_outer_steps: chunks_visible,
-        gpu_fov_y_rad: 60.0_f32.to_radians(),
-        draw_sprites: true,
-        side_shades: engine.side_shades(),
-        // DL — dynamic lighting opt-in (GPU-only); default off ⇒ pre-DL render.
-        lights: None,
-    }
+    let mut frame = FrameParams::new(settings);
+    frame.sky_color = engine.sky_color();
+    frame.sky = engine.sky();
+    frame.fog_color = engine.sky_color();
+    frame.fog_max_scan_dist = scan_dist;
+    frame.side_shades = engine.side_shades();
+    frame
 }
 
 /// Fly speed (voxels/sec) and look sensitivity shared by every scene.

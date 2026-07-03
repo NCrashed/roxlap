@@ -81,6 +81,11 @@ glam = { version = "0.30", default-features = false, features = ["std", "serde"]
 # round-trip). Format-agnostic — downstream picks bincode / postcard
 # / json / etc.
 serde = { version = "1", features = ["derive"] }
+# QE.2b — library diagnostics (GPU-init fallback, light-budget
+# demotion, chunk-refresh traces) go through the `log` facade instead
+# of `eprintln!`, so hosts control verbosity/destination with any
+# logger (env_logger, …). Already in-tree transitively via wgpu/winit.
+log = "0.4"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

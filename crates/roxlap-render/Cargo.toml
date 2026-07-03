@@ -19,6 +19,8 @@ roxlap-formats = { path = "../roxlap-formats", version = "0.21" }
 roxlap-scene = { path = "../roxlap-scene", version = "0.21" }
 roxlap-gpu = { path = "../roxlap-gpu", version = "0.21" }
 glam = { workspace = true }
+# QE.2b — diagnostics through the `log` facade (hosts pick the logger).
+log = { workspace = true }
 # CPU strip-parallel render thread count (caps the ScratchPool slots).
 # Runs on wasm too via wasm-bindgen-rayon (the host inits the pool).
 rayon = { workspace = true }
@@ -80,6 +82,9 @@ gif = ["roxlap-formats/gif"]
 png = ["roxlap-formats/png"]
 
 [dev-dependencies]
+# The quickstart example installs env_logger so the facade's
+# GPU-fallback warning is visible (QE.2b routes it through `log`).
+env_logger = "0.11"
 # Doctests/examples construct a winit window to drive the facade; the
 # library itself no longer depends on winit.
 winit = "0.30"
