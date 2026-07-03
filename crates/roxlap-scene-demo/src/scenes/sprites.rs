@@ -202,7 +202,10 @@ impl DemoScene for SpritesScene {
                     let x = (i as f32 - (n as f32 - 1.0) * 0.5) * 44.0;
                     // A row right in front of the start camera (looking +y),
                     // near eye level, ahead of the green/red field.
-                    let id = ctx.renderer.add_sprite_instance(green, [x, -55.0, 45.0]);
+                    let id = ctx
+                        .renderer
+                        .add_sprite_instance(green, [x, -55.0, 45.0])
+                        .expect("green model registered by set_sprites");
                     self.tinted.push(id);
                 }
             }

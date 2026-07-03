@@ -60,6 +60,13 @@ web-sys = { version = "0.3", features = [
     "console",
 ] }
 
+# docs.rs builds with every feature on so feature-gated items
+# (`paint_egui`, `gif_import`, `png_import`) appear and the crate-doc
+# links to them resolve (a plain `cargo doc -p roxlap-render` without
+# features leaves those links dead).
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 # Overlay an egui UI on top of the rendered frame (`SceneRenderer::
 # paint_egui`). Pulls egui's tessellation types for the CPU

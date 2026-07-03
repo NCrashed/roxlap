@@ -7,9 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — **breaking** (QE.1c): spawn methods return `Option`
+
+Every facade spawn that could previously fail *silently* — handing back
+a sentinel id that resolved to nothing, so a misconfigured entity just
+didn't exist with zero signals — now returns `Option<…>` and spawns
+nothing on `None`:
+
+| Method | Was | Now |
+|---|---|---|
+| `add_sprite_instance` / `add_sprite_instance_posed` | `SpriteInstanceId` (sentinel on stale model) | `Option<SpriteInstanceId>` |
+| `add_clip_instance_posed` / `add_clip_instance_playing` | `SpriteInstanceId` (sentinel on stale clip) | `Option<SpriteInstanceId>` |
+| `add_billboard_instance` | `SpriteInstanceId` (sentinel on stale clip) | `Option<SpriteInstanceId>` |
+| `add_billboard_actor` | `BillboardActorId` (sentinel on empty def / stale clip) | `Option<BillboardActorId>` |
+| `add_streaming_clip_instance` | `StreamingInstanceId` (sentinel on stale clip) | `Option<StreamingInstanceId>` |
+
+Migration: where the source handle is freshly registered (the common
+case — you just called `add_sprite_model` / `add_voxel_clip`), append
+`.expect("model just registered")` to keep the old
+can't-actually-fail behaviour; where failure is possible (data-driven
+spawns), handle the `None`. To get literally the old semantics —
+ignore the failure and carry a dead handle — there is no dead handle
+anymore; store the `Option` and skip `None` at use sites.
+
 ### Added
 
-- **`FrameParams::new(settings)`** (stage QE.0) — a constructor with
+- **`SceneRenderer::tick(camera, dt)`** (QE.1b) — one call drives every
+  facade-owned animated collection in the right order (auto-playing
+  clip players → all characters → billboard actors → billboard
+  facing), replacing the 4-to-5-call per-frame protocol hosts had to
+  know (a missed call meant frozen animation or unfaced billboards —
+  silently). The fine-grained methods (`advance_voxel_clips`,
+  `advance_character`, `update_billboard_actors`,
+  `face_billboards_to`) stay public and unchanged for hosts that need
+  custom per-entity `dt` or ordering; `tick` is exactly equivalent to
+  calling them in the order above. KFA sprites driven via
+  `update_kfa_poses` remain a separate call (host-owned skeletons).
+
+- **`FrameParams::new(settings)`** (QE.0) — a constructor with
   sensible defaults for every field except the CPU `OpticastSettings`,
   so hosts stop copying 12-field struct literals. Notably it derives
   the **GPU projection from the CPU settings** (`fov_y = 2·atan(yres/2
@@ -65,6 +100,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so plain `cargo build` / `cargo test` no longer needs system SDL2
   headers — build it explicitly with `-p roxlap-sdl-demo` or
   `--workspace`.
+- **Internal (QE.1a)** — the facade's five hand-rolled epoch slotmaps
+  (`DynModelMap`, `DynClipMap`, `CharMap`, `StreamingClipMap`,
+  `BillboardActorMap`) collapsed into one generic `EpochSlotMap<I>`
+  (~200 lines deleted; no behaviour change — the model map keeps its
+  deliberate positional-ids-survive-`set_sprites` semantics via
+  `reset_live`).
 
 ## [0.21.0] — 2026-07-01
 

@@ -187,11 +187,9 @@ impl DemoScene for DoomScene {
             casts_shadow: true,
             receives_shadow: true,
         };
-        self.monster = Some(ctx.renderer.add_billboard_actor(
-            def,
-            self.monster_pos,
-            self.monster_yaw,
-        ));
+        self.monster = ctx
+            .renderer
+            .add_billboard_actor(def, self.monster_pos, self.monster_yaw);
 
         // A flickering flame: a 1-directional, multi-frame billboard actor
         // that does NOT cast a shadow (a flat glow shouldn't).
@@ -216,21 +214,19 @@ impl DemoScene for DoomScene {
         // A standalone billboard (BB.2 path): a static signpost oriented by
         // face_billboards_to each frame.
         let totem = Self::clip_from_frames(ctx, FIG_W, FIG_H, &[totem_rgba()], 100);
-        self.standalone = Some(ctx.renderer.add_billboard_instance(
+        self.standalone = ctx.renderer.add_billboard_instance(
             totem,
             [-24.0, 84.0, f32::from(FLOOR_TOP_Z as u8)],
             BillboardMode::Cylindrical,
-        ));
+        );
     }
 
     fn update(&mut self, ctx: &mut SceneCtx, dt: f64) {
         ctx.cam.fly_free(ctx.input, dt);
         self.clock += dt;
-        let camera = ctx.cam.camera();
-        // Drive the directional actors (pick dir-clip + animate + face camera)
-        // and orient the standalone billboard.
-        ctx.renderer.update_billboard_actors(&camera, dt);
-        ctx.renderer.face_billboards_to(&camera);
+        // One tick drives the directional actors (pick dir-clip +
+        // animate + face camera) and orients the standalone billboard.
+        ctx.renderer.tick(&ctx.cam.camera(), dt);
     }
 
     fn on_input(&mut self, ctx: &mut SceneCtx, ev: &SceneInput) {

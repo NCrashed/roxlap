@@ -97,7 +97,7 @@ impl DemoScene for PickingScene {
         self.marker_model = models.get(1).copied();
         self.cursor_inst = models
             .first()
-            .map(|m| ctx.renderer.add_sprite_instance(*m, self.cursor_world));
+            .and_then(|m| ctx.renderer.add_sprite_instance(*m, self.cursor_world));
         // Re-materialise markers dropped on a previous visit.
         if let Some(marker) = self.marker_model {
             for p in &self.placed {

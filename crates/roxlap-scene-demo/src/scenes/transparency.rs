@@ -90,6 +90,7 @@ impl TransparencyScene {
     fn spawn(r: &mut SceneRenderer, kv6: &Kv6, pos: [f32; 3]) -> SpriteInstanceId {
         let model = r.add_sprite_model(kv6);
         r.add_sprite_instance_posed(model, Self::pose(pos))
+            .expect("model just registered")
     }
 
     /// A **mixed-material** window panel (TV.3): an opaque brown frame around
@@ -259,8 +260,8 @@ impl DemoScene for TransparencyScene {
 
     fn update(&mut self, ctx: &mut SceneCtx, dt: f64) {
         ctx.cam.fly_free(ctx.input, dt);
-        // Advance the auto-playing glass-orb clip on its own clock.
-        ctx.renderer.advance_voxel_clips(dt);
+        // One tick drives the auto-playing glass-orb clip (QE.1b).
+        ctx.renderer.tick(&ctx.cam.camera(), dt);
         self.clock += dt;
         // Pulse the smoke opacity in [40, 255] so it visibly thins + thickens
         // — a per-instance alpha_mul update, no volume re-upload.

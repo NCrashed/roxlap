@@ -441,7 +441,11 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        let inst = renderer.add_sprite_instance_posed(model, bullet_pose(pos));
+        // The bullet model is registered at startup, so the spawn
+        // cannot see a stale handle.
+        let inst = renderer
+            .add_sprite_instance_posed(model, bullet_pose(pos))
+            .expect("bullet model registered");
         self.bullets.push(Bullet {
             pos,
             vel,

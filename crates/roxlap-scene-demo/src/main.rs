@@ -939,7 +939,9 @@ impl Spinner {
             // Stream a fresh unique model in, spawn it pre-posed.
             let model = renderer.add_sprite_model(&build_spinner_block(col));
             let phase = self.clock * Self::SPIN_RATE + spin_offset;
-            let inst = renderer.add_sprite_instance_posed(model, Self::pose(pos, phase));
+            let inst = renderer
+                .add_sprite_instance_posed(model, Self::pose(pos, phase))
+                .expect("spinner model just registered");
             self.ring.push_back(SpinnerBlock {
                 model,
                 inst,

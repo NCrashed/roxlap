@@ -250,7 +250,7 @@ impl DemoScene for LightingScene {
     fn update(&mut self, ctx: &mut SceneCtx, dt: f64) {
         // Shared free-fly camera (WASD + Space/Shift); no collision here.
         ctx.cam.fly_free(ctx.input, dt);
-        ctx.renderer.advance_voxel_clips(dt);
+        ctx.renderer.tick(&ctx.cam.camera(), dt);
         if !self.paused {
             self.clock += dt;
         }

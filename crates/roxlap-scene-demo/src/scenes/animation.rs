@@ -74,9 +74,9 @@ impl DemoScene for AnimationScene {
             }
             ctx.renderer.update_kfa_poses(&mut self.kfa);
         }
-        if let Some(id) = self.flame_char {
-            ctx.renderer.advance_character(id, dt);
-        }
+        // One tick advances the flame character (and any clips); the
+        // KFA skeletons above stay host-driven via `update_kfa_poses`.
+        ctx.renderer.tick(&ctx.cam.camera(), dt);
     }
 
     fn render(&mut self, ctx: &mut SceneCtx) {

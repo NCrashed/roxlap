@@ -202,59 +202,133 @@ impl DynInstanceMap {
     }
 }
 
-/// Facade-side slotmap for registered sprite **models**, mirroring
-/// [`DynInstanceMap`] but **without** the swap-remove fixup: a model
-/// slot maps 1:1 to the backends' positional model index (the GPU LOD
-/// chain id), which is append-only and never reused. A removed model
-/// tombstones its slot *in place* (the backend frees the voxel data but
-/// keeps the id), so a stale [`SpriteModelId`] resolves to `None` → a
-/// safe no-op rather than aliasing another model.
-#[derive(Default)]
-struct DynModelMap {
-    /// Per slot (== backend model index): `(generation, live)`. Slots are
-    /// never reused, so `generation` stays `0`; `live` flips to `false`
-    /// on removal.
-    slots: Vec<(u32, bool)>,
+/// Crate-internal contract of every epoch-slotmap handle type
+/// ([`SpriteModelId`], [`VoxelClipId`], [`CharacterId`],
+/// [`StreamingClipId`], [`BillboardActorId`]): mint from / split into
+/// the `(slot, generation)` pair. Lets one generic [`EpochSlotMap`]
+/// serve all five families while each keeps its own distinct handle
+/// type (so a `CharacterId` can never be passed where a `VoxelClipId`
+/// is expected).
+trait SlotHandle: Copy {
+    fn mint(slot: u32, gen: u32) -> Self;
+    fn parts(self) -> (u32, u32);
 }
 
-impl DynModelMap {
-    /// Reset to `n` live models with ids `0..n` — used by
-    /// [`SceneRenderer::set_sprites`], which rebuilds the whole model set
-    /// positionally (model index = chain id on both backends).
-    fn reset(&mut self, n: usize) {
-        self.slots.clear();
-        self.slots.resize(n, (0, true));
-    }
+macro_rules! impl_slot_handle {
+    ($($t:ty),+ $(,)?) => {$(
+        impl SlotHandle for $t {
+            fn mint(slot: u32, gen: u32) -> Self {
+                Self { slot, gen }
+            }
+            fn parts(self) -> (u32, u32) {
+                (self.slot, self.gen)
+            }
+        }
+    )+};
+}
 
-    /// Register a freshly appended model at positional index
-    /// `model_index` (always the new `slots.len()`); returns its handle.
-    fn alloc(&mut self, model_index: u32) -> SpriteModelId {
-        debug_assert_eq!(self.slots.len() as u32, model_index);
-        self.slots.push((0, true));
-        SpriteModelId {
-            slot: model_index,
-            gen: 0,
+impl_slot_handle!(
+    SpriteModelId,
+    VoxelClipId,
+    CharacterId,
+    StreamingClipId,
+    BillboardActorId,
+);
+
+/// Facade-side epoch slotmap (QE.1a — one generic replacing five
+/// hand-rolled copies). Unlike [`DynInstanceMap`] there is **no**
+/// swap-remove fixup: a slot maps 1:1 to the backends' positional
+/// index, which is append-only and never reused. A removed entry
+/// tombstones its slot *in place* (the backend frees the data but
+/// keeps the index), so a stale handle resolves to `None` → a safe
+/// no-op rather than aliasing another entry.
+///
+/// [`reset`](Self::reset) clears the slots **and bumps `epoch`**,
+/// which is baked into each minted id's generation. A handle from
+/// before a [`SceneRenderer::set_sprites`] therefore carries the old
+/// epoch and resolves to `None` rather than silently aliasing the
+/// entry that re-took its slot. ([`reset_live`](Self::reset_live) is
+/// the model map's deliberate exception.)
+struct EpochSlotMap<I> {
+    /// Per slot (== backend positional index): `(epoch_at_alloc, live)`.
+    slots: Vec<(u32, bool)>,
+    epoch: u32,
+    _handle: std::marker::PhantomData<I>,
+}
+
+impl<I> Default for EpochSlotMap<I> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            epoch: 0,
+            _handle: std::marker::PhantomData,
         }
     }
+}
 
-    /// Resolve a handle to its backend model index, or `None` if it's
-    /// stale / already removed.
-    fn model_index(&self, id: SpriteModelId) -> Option<usize> {
-        let (gen, live) = *self.slots.get(id.slot as usize)?;
-        (gen == id.gen && live).then_some(id.slot as usize)
+impl<I: SlotHandle> EpochSlotMap<I> {
+    /// Register a freshly appended entry at positional `index` (always
+    /// the current `slots.len()`); returns its stable handle.
+    fn alloc(&mut self, index: u32) -> I {
+        debug_assert_eq!(self.slots.len() as u32, index);
+        self.slots.push((self.epoch, true));
+        I::mint(index, self.epoch)
     }
 
-    /// Tombstone a model slot in place. Returns `false` if the handle is
+    /// The handle a live slot at `index` resolves from — used by
+    /// [`SceneRenderer::set_sprites`] to hand back ids for the `0..n`
+    /// entries seeded by [`reset_live`](Self::reset_live).
+    fn minted(&self, index: u32) -> I {
+        I::mint(index, self.epoch)
+    }
+
+    /// Resolve a handle to its backend positional index, or `None` if
+    /// it's stale / already removed.
+    fn index(&self, id: I) -> Option<usize> {
+        let (slot, gen) = id.parts();
+        let (epoch, live) = *self.slots.get(slot as usize)?;
+        (epoch == gen && live).then_some(slot as usize)
+    }
+
+    /// Tombstone a slot in place. Returns `false` if the handle is
     /// stale / already removed.
-    fn remove(&mut self, id: SpriteModelId) -> bool {
-        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
+    fn remove(&mut self, id: I) -> bool {
+        let (slot, gen) = id.parts();
+        let Some(entry) = self.slots.get_mut(slot as usize) else {
             return false;
         };
-        if slot.0 != id.gen || !slot.1 {
+        if entry.0 != gen || !entry.1 {
             return false;
         }
-        slot.1 = false;
+        entry.1 = false;
         true
+    }
+
+    /// Drop every entry and invalidate every outstanding handle (the
+    /// epoch bump).
+    fn reset(&mut self) {
+        self.slots.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Positional indices of every live entry, ascending — the
+    /// iteration [`SceneRenderer::tick`] drives collection updates
+    /// from.
+    fn live_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &(_, live))| live.then_some(i))
+    }
+
+    /// Re-seat `n` live entries with positional ids `0..n` **without**
+    /// bumping the epoch — [`SceneRenderer::set_sprites`]' model-map
+    /// semantics, where model index = chain id on both backends and a
+    /// pre-rebuild positional id deliberately keeps meaning "model
+    /// `i` of the current set".
+    fn reset_live(&mut self, n: usize) {
+        self.slots.clear();
+        self.slots.resize(n, (self.epoch, true));
     }
 }
 
@@ -271,53 +345,6 @@ pub struct VoxelClipId {
     gen: u32,
 }
 
-/// Facade-side slotmap for registered voxel clips — mirrors
-/// [`DynModelMap`]: a clip slot maps 1:1 to the backends' positional clip
-/// index (append-only, tombstoned in place on removal, never reused).
-///
-/// `reset` clears the slots **and bumps `epoch`**, which is baked into each
-/// minted id's `gen`. A handle from before a `set_sprites` therefore carries
-/// the old epoch and resolves to `None` rather than silently aliasing the
-/// new clip that re-took its slot.
-#[derive(Default)]
-struct DynClipMap {
-    /// Per slot: `(epoch_at_alloc, live)`.
-    slots: Vec<(u32, bool)>,
-    epoch: u32,
-}
-
-impl DynClipMap {
-    fn alloc(&mut self, clip_index: u32) -> VoxelClipId {
-        debug_assert_eq!(self.slots.len() as u32, clip_index);
-        self.slots.push((self.epoch, true));
-        VoxelClipId {
-            slot: clip_index,
-            gen: self.epoch,
-        }
-    }
-
-    fn clip_index(&self, id: VoxelClipId) -> Option<usize> {
-        let (gen, live) = *self.slots.get(id.slot as usize)?;
-        (gen == id.gen && live).then_some(id.slot as usize)
-    }
-
-    fn remove(&mut self, id: VoxelClipId) -> bool {
-        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
-            return false;
-        };
-        if slot.0 != id.gen || !slot.1 {
-            return false;
-        }
-        slot.1 = false;
-        true
-    }
-
-    fn reset(&mut self) {
-        self.slots.clear();
-        self.epoch = self.epoch.wrapping_add(1);
-    }
-}
-
 /// Stable handle to a registered animated character (VCL.6) — the result
 /// of [`SceneRenderer::add_character`], advanced each frame with
 /// [`advance_character`](SceneRenderer::advance_character) and dropped with
@@ -327,45 +354,6 @@ impl DynClipMap {
 pub struct CharacterId {
     slot: u32,
     gen: u32,
-}
-
-/// Facade-side slotmap for registered characters (mirrors [`DynClipMap`],
-/// including the epoch bump on `reset` so a pre-`set_sprites` handle
-/// resolves to `None` instead of aliasing a new character).
-#[derive(Default)]
-struct CharMap {
-    /// Per slot: `(epoch_at_alloc, live)`.
-    slots: Vec<(u32, bool)>,
-    epoch: u32,
-}
-
-impl CharMap {
-    fn alloc(&mut self, index: u32) -> CharacterId {
-        debug_assert_eq!(self.slots.len() as u32, index);
-        self.slots.push((self.epoch, true));
-        CharacterId {
-            slot: index,
-            gen: self.epoch,
-        }
-    }
-    fn index(&self, id: CharacterId) -> Option<usize> {
-        let (gen, live) = *self.slots.get(id.slot as usize)?;
-        (gen == id.gen && live).then_some(id.slot as usize)
-    }
-    fn remove(&mut self, id: CharacterId) -> bool {
-        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
-            return false;
-        };
-        if slot.0 != id.gen || !slot.1 {
-            return false;
-        }
-        slot.1 = false;
-        true
-    }
-    fn reset(&mut self) {
-        self.slots.clear();
-        self.epoch = self.epoch.wrapping_add(1);
-    }
 }
 
 /// Stable handle to a registered **streaming** voxel clip (follow-up #3) —
@@ -397,44 +385,6 @@ pub struct StreamingClipId {
 /// [`remove_streaming_instance`](SceneRenderer::remove_streaming_instance).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct StreamingInstanceId(SpriteInstanceId);
-
-/// Facade-side slotmap for streaming clips (mirrors [`CharMap`], epoch bump
-/// on `reset` included).
-#[derive(Default)]
-struct StreamingClipMap {
-    /// Per slot: `(epoch_at_alloc, live)`.
-    slots: Vec<(u32, bool)>,
-    epoch: u32,
-}
-
-impl StreamingClipMap {
-    fn alloc(&mut self, index: u32) -> StreamingClipId {
-        debug_assert_eq!(self.slots.len() as u32, index);
-        self.slots.push((self.epoch, true));
-        StreamingClipId {
-            slot: index,
-            gen: self.epoch,
-        }
-    }
-    fn index(&self, id: StreamingClipId) -> Option<usize> {
-        let (gen, live) = *self.slots.get(id.slot as usize)?;
-        (gen == id.gen && live).then_some(id.slot as usize)
-    }
-    fn remove(&mut self, id: StreamingClipId) -> bool {
-        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
-            return false;
-        };
-        if slot.0 != id.gen || !slot.1 {
-            return false;
-        }
-        slot.1 = false;
-        true
-    }
-    fn reset(&mut self) {
-        self.slots.clear();
-        self.epoch = self.epoch.wrapping_add(1);
-    }
-}
 
 /// One registered streaming clip: the seekable cursor + the single sprite
 /// model it re-uploads each frame, plus the dims/pivot used to rebuild it.
@@ -879,44 +829,6 @@ fn dir_index(pos: [f32; 3], facing_yaw: f64, cam: [f64; 3], n: usize) -> usize {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let idx = (rel / sector).round() as usize % n;
     idx
-}
-
-/// Facade-side slotmap for billboard actors — mirrors [`DynClipMap`]
-/// (append-only, tombstoned in place, epoch-bumped on `reset` so a
-/// pre-`set_sprites` handle resolves to `None`).
-#[derive(Default)]
-struct BillboardActorMap {
-    slots: Vec<(u32, bool)>,
-    epoch: u32,
-}
-
-impl BillboardActorMap {
-    fn alloc(&mut self, index: u32) -> BillboardActorId {
-        debug_assert_eq!(self.slots.len() as u32, index);
-        self.slots.push((self.epoch, true));
-        BillboardActorId {
-            slot: index,
-            gen: self.epoch,
-        }
-    }
-    fn index(&self, id: BillboardActorId) -> Option<usize> {
-        let (gen, live) = *self.slots.get(id.slot as usize)?;
-        (gen == id.gen && live).then_some(id.slot as usize)
-    }
-    fn remove(&mut self, id: BillboardActorId) -> bool {
-        let Some(slot) = self.slots.get_mut(id.slot as usize) else {
-            return false;
-        };
-        if slot.0 != id.gen || !slot.1 {
-            return false;
-        }
-        slot.1 = false;
-        true
-    }
-    fn reset(&mut self) {
-        self.slots.clear();
-        self.epoch = self.epoch.wrapping_add(1);
-    }
 }
 
 /// Backend-agnostic sprite description. The facade builds the CPU
@@ -1507,18 +1419,18 @@ pub struct SceneRenderer {
     /// Handles for registered sprite models (see [`Self::add_sprite_model`]
     /// and the models returned by [`Self::set_sprites`]). Reset by
     /// [`Self::set_sprites`].
-    model_map: DynModelMap,
+    model_map: EpochSlotMap<SpriteModelId>,
     /// Handles for registered animated voxel clips (see
     /// [`Self::add_voxel_clip`]). Reset by [`Self::set_sprites`].
-    clip_map: DynClipMap,
+    clip_map: EpochSlotMap<VoxelClipId>,
     /// Handles for registered animated characters (see
     /// [`Self::add_character`]). Reset by [`Self::set_sprites`].
-    char_map: CharMap,
+    char_map: EpochSlotMap<CharacterId>,
     /// Live character runtimes, parallel to `char_map` slots (VCL.6).
     char_instances: Vec<CharInstance>,
     /// Handles for registered streaming clips (see
     /// [`Self::add_streaming_clip`]). Reset by [`Self::set_sprites`].
-    streaming_map: StreamingClipMap,
+    streaming_map: EpochSlotMap<StreamingClipId>,
     /// Streaming-clip runtimes (cursor + one re-uploaded model), parallel
     /// to `streaming_map` slots; `None` once removed (#3).
     streaming_clips: Vec<Option<StreamingClipState>>,
@@ -1537,7 +1449,7 @@ pub struct SceneRenderer {
     billboards: Vec<BillboardRec>,
     /// Handles for high-level directional billboard actors (BB.4). Reset by
     /// [`Self::set_sprites`].
-    actor_map: BillboardActorMap,
+    actor_map: EpochSlotMap<BillboardActorId>,
     /// Live billboard-actor runtimes, parallel to `actor_map` slots; `None`
     /// once removed. Driven by [`Self::update_billboard_actors`].
     billboard_actors: Vec<Option<BillboardActor>>,
@@ -1569,16 +1481,16 @@ impl SceneRenderer {
                     return Self {
                         inner: BackendImpl::Gpu(Box::new(g)),
                         dyn_map: DynInstanceMap::default(),
-                        model_map: DynModelMap::default(),
-                        clip_map: DynClipMap::default(),
-                        char_map: CharMap::default(),
+                        model_map: EpochSlotMap::default(),
+                        clip_map: EpochSlotMap::default(),
+                        char_map: EpochSlotMap::default(),
                         char_instances: Vec::new(),
-                        streaming_map: StreamingClipMap::default(),
+                        streaming_map: EpochSlotMap::default(),
                         streaming_clips: Vec::new(),
                         clip_meta: Vec::new(),
                         clip_players: Vec::new(),
                         billboards: Vec::new(),
-                        actor_map: BillboardActorMap::default(),
+                        actor_map: EpochSlotMap::default(),
                         billboard_actors: Vec::new(),
                     };
                 }
@@ -1592,16 +1504,16 @@ impl SceneRenderer {
         Self {
             inner: BackendImpl::Cpu(Box::new(CpuBackend::new(window, size, opts))),
             dyn_map: DynInstanceMap::default(),
-            model_map: DynModelMap::default(),
-            clip_map: DynClipMap::default(),
-            char_map: CharMap::default(),
+            model_map: EpochSlotMap::default(),
+            clip_map: EpochSlotMap::default(),
+            char_map: EpochSlotMap::default(),
             char_instances: Vec::new(),
-            streaming_map: StreamingClipMap::default(),
+            streaming_map: EpochSlotMap::default(),
             streaming_clips: Vec::new(),
             clip_meta: Vec::new(),
             clip_players: Vec::new(),
             billboards: Vec::new(),
-            actor_map: BillboardActorMap::default(),
+            actor_map: EpochSlotMap::default(),
             billboard_actors: Vec::new(),
         }
     }
@@ -1632,16 +1544,16 @@ impl SceneRenderer {
                     return Self {
                         inner: BackendImpl::Gpu(Box::new(g)),
                         dyn_map: DynInstanceMap::default(),
-                        model_map: DynModelMap::default(),
-                        clip_map: DynClipMap::default(),
-                        char_map: CharMap::default(),
+                        model_map: EpochSlotMap::default(),
+                        clip_map: EpochSlotMap::default(),
+                        char_map: EpochSlotMap::default(),
                         char_instances: Vec::new(),
-                        streaming_map: StreamingClipMap::default(),
+                        streaming_map: EpochSlotMap::default(),
                         streaming_clips: Vec::new(),
                         clip_meta: Vec::new(),
                         clip_players: Vec::new(),
                         billboards: Vec::new(),
-                        actor_map: BillboardActorMap::default(),
+                        actor_map: EpochSlotMap::default(),
                         billboard_actors: Vec::new(),
                     };
                 }
@@ -1656,16 +1568,16 @@ impl SceneRenderer {
         Self {
             inner: BackendImpl::Cpu(Box::new(CpuBackend::new_from_canvas(canvas, size, opts))),
             dyn_map: DynInstanceMap::default(),
-            model_map: DynModelMap::default(),
-            clip_map: DynClipMap::default(),
-            char_map: CharMap::default(),
+            model_map: EpochSlotMap::default(),
+            clip_map: EpochSlotMap::default(),
+            char_map: EpochSlotMap::default(),
             char_instances: Vec::new(),
-            streaming_map: StreamingClipMap::default(),
+            streaming_map: EpochSlotMap::default(),
             streaming_clips: Vec::new(),
             clip_meta: Vec::new(),
             clip_players: Vec::new(),
             billboards: Vec::new(),
-            actor_map: BillboardActorMap::default(),
+            actor_map: EpochSlotMap::default(),
             billboard_actors: Vec::new(),
         }
     }
@@ -1776,6 +1688,39 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.logical_dims(),
             BackendImpl::Gpu(g) => g.logical_dims(),
         }
+    }
+
+    /// One-call per-frame animation tick (QE.1b): drives **every**
+    /// facade-owned animated collection, replacing the multi-call
+    /// protocol hosts previously had to know (and could silently get
+    /// wrong — a missed call meant frozen clips or unfaced
+    /// billboards). Call once per frame before [`render`](Self::render):
+    ///
+    /// 1. [`advance_voxel_clips`](Self::advance_voxel_clips) —
+    ///    auto-playing flipbook + streaming clip players;
+    /// 2. every live character — skeleton + clip attachments (the
+    ///    all-characters sweep of
+    ///    [`advance_character`](Self::advance_character));
+    /// 3. [`update_billboard_actors`](Self::update_billboard_actors) —
+    ///    actor direction/state clips + camera facing;
+    /// 4. [`face_billboards_to`](Self::face_billboards_to) — plain
+    ///    billboard instances.
+    ///
+    /// The fine-grained methods stay public for hosts that need a
+    /// custom per-entity `dt` (slow-motion on one character) or their
+    /// own ordering — `tick` is the "do the right thing" default and
+    /// is exactly equivalent to calling them in the order above.
+    /// KFA sprites driven via
+    /// [`update_kfa_poses`](Self::update_kfa_poses) remain a separate
+    /// call (they mutate host-owned skeletons).
+    pub fn tick(&mut self, camera: &Camera, dt: f64) {
+        self.advance_voxel_clips(dt);
+        let live: Vec<usize> = self.char_map.live_indices().collect();
+        for idx in live {
+            self.advance_character_at(idx, dt);
+        }
+        self.update_billboard_actors(camera, dt);
+        self.face_billboards_to(camera);
     }
 
     /// Composite `scene` from `camera` with `frame` params into the
@@ -2078,7 +2023,7 @@ impl SceneRenderer {
         // handles and re-seat the model slotmap with `set.models.len()`
         // live ids `0..n` (model index = chain id on both backends).
         self.dyn_map = DynInstanceMap::default();
-        self.model_map.reset(set.models.len());
+        self.model_map.reset_live(set.models.len());
         // A full sprite rebuild drops the dynamic + clip layers on both
         // backends (the GPU registry is replaced), so reset the clip +
         // character maps too.
@@ -2093,7 +2038,7 @@ impl SceneRenderer {
         self.actor_map.reset();
         self.billboard_actors.clear();
         (0..set.models.len() as u32)
-            .map(|slot| SpriteModelId { slot, gen: 0 })
+            .map(|slot| self.model_map.minted(slot))
             .collect()
     }
 
@@ -2114,7 +2059,7 @@ impl SceneRenderer {
     /// the model. Use [`set_sprites`](Self::set_sprites) to add/remove
     /// models or change the instance set.
     pub fn refresh_sprite_model(&mut self, model: SpriteModelId, kv6: &Kv6) {
-        let Some(idx) = self.model_map.model_index(model) else {
+        let Some(idx) = self.model_map.index(model) else {
             return; // stale / removed handle → no-op
         };
         match &mut self.inner {
@@ -2134,7 +2079,7 @@ impl SceneRenderer {
         kv6: &Kv6,
         material_map: &[(u32, u8)],
     ) {
-        let Some(idx) = self.model_map.model_index(model) else {
+        let Some(idx) = self.model_map.index(model) else {
             return; // stale / removed handle → no-op
         };
         match &mut self.inner {
@@ -2155,7 +2100,14 @@ impl SceneRenderer {
     /// [`set_sprites`](Self::set_sprites) (a model registered there, even
     /// with zero initial instances). Dynamic instances live *after* the
     /// static set + any KFA limbs, so register those first.
-    pub fn add_sprite_instance(&mut self, model: SpriteModelId, pos: [f32; 3]) -> SpriteInstanceId {
+    ///
+    /// Returns `None` — spawning nothing — on a stale/removed `model`
+    /// handle (QE.1c; previously a silent sentinel id).
+    pub fn add_sprite_instance(
+        &mut self,
+        model: SpriteModelId,
+        pos: [f32; 3],
+    ) -> Option<SpriteInstanceId> {
         self.add_sprite_instance_posed(
             model,
             DynSpriteTransform {
@@ -2175,28 +2127,21 @@ impl SceneRenderer {
     /// this with the identity basis). Returns a stable
     /// [`SpriteInstanceId`].
     ///
-    /// A stale/removed `model` handle spawns nothing and returns a handle
-    /// that is itself already stale (it resolves to no instance). `xf`'s
-    /// basis must be non-singular; a degenerate one makes the instance
+    /// Returns `None` — spawning nothing — on a stale/removed `model`
+    /// handle (QE.1c; previously a silent sentinel id). `xf`'s basis
+    /// must be non-singular; a degenerate one makes the instance
     /// silently skip drawing (see [`DynSpriteTransform`]).
     pub fn add_sprite_instance_posed(
         &mut self,
         model: SpriteModelId,
         xf: DynSpriteTransform,
-    ) -> SpriteInstanceId {
-        let Some(idx) = self.model_map.model_index(model) else {
-            // Stale model → spawn nothing; hand back a sentinel id that
-            // resolves to no live instance (a safe no-op everywhere).
-            return SpriteInstanceId {
-                slot: u32::MAX,
-                gen: u32::MAX,
-            };
-        };
+    ) -> Option<SpriteInstanceId> {
+        let idx = self.model_map.index(model)?;
         let dyn_index = match &mut self.inner {
             BackendImpl::Cpu(c) => c.add_dyn_instance_posed(idx, xf),
             BackendImpl::Gpu(g) => g.add_dyn_instance_posed(idx, xf),
         };
-        self.dyn_map.alloc(dyn_index as u32)
+        Some(self.dyn_map.alloc(dyn_index as u32))
     }
 
     /// Remove a dynamic sprite instance added by
@@ -2321,7 +2266,7 @@ impl SceneRenderer {
     /// [`compact_sprite_models`](Self::compact_sprite_models) afterwards
     /// to reclaim the GPU buffer holes.
     pub fn remove_sprite_model(&mut self, id: SpriteModelId) -> bool {
-        let Some(idx) = self.model_map.model_index(id) else {
+        let Some(idx) = self.model_map.index(id) else {
             return false;
         };
         match &mut self.inner {
@@ -2532,7 +2477,7 @@ impl SceneRenderer {
     /// [`remove_sprite_instance`](Self::remove_sprite_instance). Returns
     /// `false` if `id` is stale / already removed.
     pub fn remove_voxel_clip(&mut self, id: VoxelClipId) -> bool {
-        let Some(clip_index) = self.clip_map.clip_index(id) else {
+        let Some(clip_index) = self.clip_map.index(id) else {
             return false;
         };
         match &mut self.inner {
@@ -2549,8 +2494,8 @@ impl SceneRenderer {
     /// advance its frame with
     /// [`set_clip_instance_frame`](Self::set_clip_instance_frame), and drop
     /// it with [`remove_sprite_instance`](Self::remove_sprite_instance).
-    /// A stale `clip` handle yields an instance id that resolves to nothing
-    /// (a safe no-op everywhere).
+    /// Returns `None` — spawning nothing — on a stale/removed `clip`
+    /// handle (QE.1c; previously a silent sentinel id).
     ///
     /// This instance has **no playback clock**: drive its frame yourself via
     /// [`set_clip_instance_frame`](Self::set_clip_instance_frame) (frame-based
@@ -2563,18 +2508,13 @@ impl SceneRenderer {
         &mut self,
         clip: VoxelClipId,
         xf: DynSpriteTransform,
-    ) -> SpriteInstanceId {
-        let Some(clip_index) = self.clip_map.clip_index(clip) else {
-            return SpriteInstanceId {
-                slot: u32::MAX,
-                gen: u32::MAX,
-            };
-        };
+    ) -> Option<SpriteInstanceId> {
+        let clip_index = self.clip_map.index(clip)?;
         let dyn_index = match &mut self.inner {
             BackendImpl::Cpu(c) => c.add_clip_instance(clip_index, xf),
             BackendImpl::Gpu(g) => g.add_clip_instance(clip_index, xf),
         };
-        self.dyn_map.alloc(dyn_index as u32)
+        Some(self.dyn_map.alloc(dyn_index as u32))
     }
 
     /// Select which frame a clip instance shows — the per-frame playback
@@ -2612,7 +2552,7 @@ impl SceneRenderer {
         let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
             return false;
         };
-        let Some(clip_index) = self.clip_map.clip_index(clip) else {
+        let Some(clip_index) = self.clip_map.index(clip) else {
             return false;
         };
         let ok = match &mut self.inner {
@@ -2652,16 +2592,14 @@ impl SceneRenderer {
         clip: VoxelClipId,
         pos: [f32; 3],
         mode: BillboardMode,
-    ) -> SpriteInstanceId {
+    ) -> Option<SpriteInstanceId> {
         let xf = DynSpriteTransform {
             pos,
             ..Default::default()
         };
-        let id = self.add_clip_instance_posed(clip, xf);
-        if self.dyn_map.dyn_index(id).is_some() {
-            self.billboards.push(BillboardRec { id, pos, mode });
-        }
-        id
+        let id = self.add_clip_instance_posed(clip, xf)?;
+        self.billboards.push(BillboardRec { id, pos, mode });
+        Some(id)
     }
 
     /// Change a billboard instance's facing mode. No-op on a non-billboard id.
@@ -2708,7 +2646,7 @@ impl SceneRenderer {
     /// Build a [`ClipClock`] seeded from `clip`'s timeline (durations + loop
     /// mode), or an empty/looping clock if `clip` is `None`/stale.
     fn clock_for_clip(&self, clip: Option<VoxelClipId>, speed_q8: i32) -> ClipClock {
-        let (durations, loop_mode) = clip.and_then(|c| self.clip_map.clip_index(c)).map_or_else(
+        let (durations, loop_mode) = clip.and_then(|c| self.clip_map.index(c)).map_or_else(
             || (Vec::new(), LoopMode::Loop),
             |ci| {
                 (
@@ -2731,30 +2669,24 @@ impl SceneRenderer {
     ///
     /// `pos` is the actor's world position; `facing_yaw` is the world yaw it
     /// faces (radians; the dir picker compares the camera's bearing to it).
-    /// Returns a stale id if `def` has no states / a state with no dirs, or
-    /// the initial clip is stale.
+    /// Returns `None` — spawning nothing — if `def` has no states / a
+    /// state with no dirs, or the initial clip is stale (QE.1c;
+    /// previously a silent sentinel id).
     pub fn add_billboard_actor(
         &mut self,
         def: BillboardActorDef,
         pos: [f32; 3],
         facing_yaw: f64,
-    ) -> BillboardActorId {
-        let stale = BillboardActorId {
-            slot: u32::MAX,
-            gen: u32::MAX,
-        };
+    ) -> Option<BillboardActorId> {
         if def.states.is_empty() || def.states.iter().any(|s| s.dirs.is_empty()) {
-            return stale;
+            return None;
         }
         let init_clip = def.states[0].dirs[0];
         let xf = DynSpriteTransform {
             pos,
             ..Default::default()
         };
-        let inst = self.add_clip_instance_posed(init_clip, xf);
-        if self.dyn_map.dyn_index(inst).is_none() {
-            return stale; // stale initial clip
-        }
+        let inst = self.add_clip_instance_posed(init_clip, xf)?;
         self.set_sprite_instance_shadow_flags(inst, def.casts_shadow, def.receives_shadow);
         self.set_sprite_instance_lighting(inst, def.lighting);
         let clock = self.clock_for_clip(Some(init_clip), def.speed_q8);
@@ -2771,7 +2703,7 @@ impl SceneRenderer {
         };
         let index = self.billboard_actors.len() as u32;
         self.billboard_actors.push(Some(actor));
-        self.actor_map.alloc(index)
+        Some(self.actor_map.alloc(index))
     }
 
     /// Switch an actor to a named animation state, restarting its clock (the
@@ -2914,7 +2846,7 @@ impl SceneRenderer {
     /// stale. (Same as `clip_metadata(id)?.frame_count`, without the clone.)
     #[must_use]
     pub fn clip_frame_count(&self, id: VoxelClipId) -> Option<usize> {
-        let idx = self.clip_map.clip_index(id)?;
+        let idx = self.clip_map.index(id)?;
         Some(self.clip_meta[idx].durations.len())
     }
 
@@ -2923,7 +2855,7 @@ impl SceneRenderer {
     /// — so an editor needn't shadow the source [`DecodedClip`].
     #[must_use]
     pub fn clip_metadata(&self, id: VoxelClipId) -> Option<ClipMetadata> {
-        let idx = self.clip_map.clip_index(id)?;
+        let idx = self.clip_map.index(id)?;
         let m = &self.clip_meta[idx];
         Some(ClipMetadata {
             dims: m.dims,
@@ -2958,7 +2890,7 @@ impl SceneRenderer {
     /// `frame`, or a frame that fails the clip's layout (so it can't corrupt
     /// the flipbook).
     pub fn update_clip_frame(&mut self, id: VoxelClipId, frame: u32, vf: &VoxelFrame) -> bool {
-        let Some(clip_index) = self.clip_map.clip_index(id) else {
+        let Some(clip_index) = self.clip_map.index(id) else {
             return false;
         };
         let m = &self.clip_meta[clip_index];
@@ -3044,25 +2976,20 @@ impl SceneRenderer {
     /// and drop it with
     /// [`remove_sprite_instance`](Self::remove_sprite_instance), like any
     /// dynamic instance. All instances of one streaming clip share its single
-    /// model. A stale `id` yields a no-op instance handle.
+    /// model. Returns `None` — spawning nothing — on a stale/removed
+    /// `id` (QE.1c; previously a silent sentinel handle).
     pub fn add_streaming_clip_instance(
         &mut self,
         id: StreamingClipId,
         xf: DynSpriteTransform,
-    ) -> StreamingInstanceId {
+    ) -> Option<StreamingInstanceId> {
         let model = self
             .streaming_map
             .index(id)
             .and_then(|idx| self.streaming_clips[idx].as_ref())
-            .map(|s| s.model);
-        let inst = match model {
-            Some(model) => self.add_sprite_instance_posed(model, xf),
-            None => SpriteInstanceId {
-                slot: u32::MAX,
-                gen: u32::MAX,
-            },
-        };
-        StreamingInstanceId(inst)
+            .map(|s| s.model)?;
+        let inst = self.add_sprite_instance_posed(model, xf)?;
+        Some(StreamingInstanceId(inst))
     }
 
     /// Re-pose a streaming-clip instance (world transform). No-op on a stale
@@ -3132,20 +3059,16 @@ impl SceneRenderer {
     /// such instance — no per-frame `frame_at` + `set_clip_instance_frame`
     /// bookkeeping in the host. `speed_q8` is the Q8 playback rate (`256` =
     /// 1×); `start_phase_ms` offsets the clock (stagger copies of one clip).
-    /// A stale `clip` yields a no-op instance handle and no player.
+    /// Returns `None` — spawning nothing, registering no player — on a
+    /// stale/removed `clip` (QE.1c; previously a silent sentinel id).
     pub fn add_clip_instance_playing(
         &mut self,
         clip: VoxelClipId,
         xf: DynSpriteTransform,
         speed_q8: i32,
         start_phase_ms: u32,
-    ) -> SpriteInstanceId {
-        let Some(clip_index) = self.clip_map.clip_index(clip) else {
-            return SpriteInstanceId {
-                slot: u32::MAX,
-                gen: u32::MAX,
-            };
-        };
+    ) -> Option<SpriteInstanceId> {
+        let clip_index = self.clip_map.index(clip)?;
         let meta = &self.clip_meta[clip_index];
         let clock = ClipClock::new(
             &meta.durations,
@@ -3153,13 +3076,13 @@ impl SceneRenderer {
             speed_q8,
             f64::from(start_phase_ms),
         );
-        let inst = self.add_clip_instance_posed(clip, xf);
+        let inst = self.add_clip_instance_posed(clip, xf)?;
         self.clip_players.push(ClipPlayer {
             target: PlayerTarget::Flipbook(inst),
             clock,
             paused: false,
         });
-        inst
+        Some(inst)
     }
 
     /// Give a streaming clip ([`add_streaming_clip`](Self::add_streaming_clip))
@@ -3407,8 +3330,12 @@ impl SceneRenderer {
                 };
                 match att.target {
                     MeshRef::Static(mi) => {
-                        if let Some(&mid) = model_ids.get(mi) {
-                            let inst = self.add_sprite_instance_posed(mid, xf);
+                        // The model was registered a few lines up, so the
+                        // spawn can only fail on an out-of-range mesh index.
+                        if let Some(inst) = model_ids
+                            .get(mi)
+                            .and_then(|&mid| self.add_sprite_instance_posed(mid, xf))
+                        {
                             attaches.push(AttachInst {
                                 bone: bi,
                                 local_offset: att.local_offset,
@@ -3419,7 +3346,9 @@ impl SceneRenderer {
                     }
                     MeshRef::Clip(ci) => {
                         if let Some(Some((cid, durations, loop_mode))) = clip_regs.get(ci) {
-                            let inst = self.add_clip_instance_posed(*cid, xf);
+                            let Some(inst) = self.add_clip_instance_posed(*cid, xf) else {
+                                continue;
+                            };
                             attaches.push(AttachInst {
                                 bone: bi,
                                 local_offset: att.local_offset,
@@ -3454,11 +3383,17 @@ impl SceneRenderer {
     /// each clip attachment's clock, then re-pose every attachment
     /// (bone × local_offset) and select each clip's current frame. No-op on
     /// a stale id.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn advance_character(&mut self, id: CharacterId, dt: f64) {
         let Some(idx) = self.char_map.index(id) else {
             return;
         };
+        self.advance_character_at(idx, dt);
+    }
+
+    /// [`advance_character`](Self::advance_character)'s resolved-index
+    /// core, shared with [`tick`](Self::tick)'s all-characters sweep.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn advance_character_at(&mut self, idx: usize, dt: f64) {
         // Phase 1: solve the skeleton + compute each attachment's update,
         // borrowing only `char_instances[idx]`.
         let updates: Vec<(SpriteInstanceId, DynSpriteTransform, Option<u32>)> = {
@@ -3824,38 +3759,38 @@ mod tests {
     /// every other id survives the remove.
     #[test]
     fn dyn_model_map_lifecycle() {
-        let mut map = DynModelMap::default();
+        let mut map = EpochSlotMap::default();
         // `set_sprites(3 models)` seeds ids 0..3, all live.
-        map.reset(3);
+        map.reset_live(3);
         let ids: Vec<SpriteModelId> = (0..3).map(|s| SpriteModelId { slot: s, gen: 0 }).collect();
         for (i, &id) in ids.iter().enumerate() {
-            assert_eq!(map.model_index(id), Some(i));
+            assert_eq!(map.index(id), Some(i));
         }
 
         // Incrementally add a fourth model.
         let extra = map.alloc(3);
         assert_eq!(extra, SpriteModelId { slot: 3, gen: 0 });
-        assert_eq!(map.model_index(extra), Some(3));
+        assert_eq!(map.index(extra), Some(3));
 
         // Remove model 1: its handle goes stale, the rest stay valid.
         assert!(map.remove(ids[1]));
-        assert_eq!(map.model_index(ids[1]), None);
-        assert_eq!(map.model_index(ids[0]), Some(0));
-        assert_eq!(map.model_index(ids[2]), Some(2));
-        assert_eq!(map.model_index(extra), Some(3));
+        assert_eq!(map.index(ids[1]), None);
+        assert_eq!(map.index(ids[0]), Some(0));
+        assert_eq!(map.index(ids[2]), Some(2));
+        assert_eq!(map.index(extra), Some(3));
 
         // Double remove / stale removal is a no-op returning false.
         assert!(!map.remove(ids[1]));
 
         // A bogus / out-of-range handle resolves to nothing, no panic.
         let bogus = SpriteModelId { slot: 999, gen: 0 };
-        assert_eq!(map.model_index(bogus), None);
+        assert_eq!(map.index(bogus), None);
         assert!(!map.remove(bogus));
 
         // A handle with a mismatched generation never resolves (guards a
         // future compacting registry).
         let wrong_gen = SpriteModelId { slot: 0, gen: 7 };
-        assert_eq!(map.model_index(wrong_gen), None);
+        assert_eq!(map.index(wrong_gen), None);
     }
 
     /// The voxel-clip slotmap (VCL.4) mints stable ids, resolves only live
@@ -3863,35 +3798,35 @@ mod tests {
     /// model slotmap, since clips register append-only too.
     #[test]
     fn dyn_clip_map_lifecycle() {
-        let mut map = DynClipMap::default();
+        let mut map = EpochSlotMap::default();
         // Two clips registered incrementally (indices 0, 1).
         let c0 = map.alloc(0);
         let c1 = map.alloc(1);
         assert_eq!(c0, VoxelClipId { slot: 0, gen: 0 });
-        assert_eq!(map.clip_index(c0), Some(0));
-        assert_eq!(map.clip_index(c1), Some(1));
+        assert_eq!(map.index(c0), Some(0));
+        assert_eq!(map.index(c1), Some(1));
 
         // Remove clip 0: stale handle, clip 1 stays valid; slot not reused.
         assert!(map.remove(c0));
-        assert_eq!(map.clip_index(c0), None);
-        assert_eq!(map.clip_index(c1), Some(1));
+        assert_eq!(map.index(c0), None);
+        assert_eq!(map.index(c1), Some(1));
         // Double / stale / out-of-range removes are false, no panic.
         assert!(!map.remove(c0));
         assert!(!map.remove(VoxelClipId { slot: 99, gen: 0 }));
         // Mismatched generation never resolves.
-        assert_eq!(map.clip_index(VoxelClipId { slot: 1, gen: 5 }), None);
+        assert_eq!(map.index(VoxelClipId { slot: 1, gen: 5 }), None);
 
         // `set_sprites` resets the clip layer → ids restart at slot 0, but
         // the epoch bumps so old handles don't alias the new clips.
         map.reset();
-        assert_eq!(map.clip_index(c1), None, "reset invalidates old handles");
+        assert_eq!(map.index(c1), None, "reset invalidates old handles");
         let again = map.alloc(0); // re-takes slot 0 under the new epoch
         assert_eq!(again, VoxelClipId { slot: 0, gen: 1 });
-        assert_eq!(map.clip_index(again), Some(0));
+        assert_eq!(map.index(again), Some(0));
         // The footgun fix: c0 (slot 0, old epoch) must NOT resolve to the new
         // clip now occupying slot 0.
         assert_eq!(
-            map.clip_index(c0),
+            map.index(c0),
             None,
             "a pre-reset handle must not alias a new clip on the same slot"
         );
@@ -3901,7 +3836,7 @@ mod tests {
     /// handles, tombstones in place, and `reset` clears it.
     #[test]
     fn char_map_lifecycle() {
-        let mut map = CharMap::default();
+        let mut map = EpochSlotMap::default();
         let a = map.alloc(0);
         let b = map.alloc(1);
         assert_eq!(a, CharacterId { slot: 0, gen: 0 });
@@ -3925,7 +3860,7 @@ mod tests {
     /// handles, tombstones in place, and `reset` clears it.
     #[test]
     fn streaming_clip_map_lifecycle() {
-        let mut map = StreamingClipMap::default();
+        let mut map = EpochSlotMap::default();
         let a = map.alloc(0);
         let b = map.alloc(1);
         assert_eq!(a, StreamingClipId { slot: 0, gen: 0 });
