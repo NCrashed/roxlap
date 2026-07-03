@@ -25,7 +25,7 @@ use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::Camera;
-use roxlap_formats::material::{Material, MaterialTable};
+
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_gpu::{
     build_sprite_model, build_sprite_model_with_materials,
@@ -66,17 +66,11 @@ pub(crate) struct GpuBackend {
     /// scene's ship) would ghost into a gridless scene. (The CPU backend
     /// renders straight from the scene each frame, so it can't go stale.)
     resident_scene_grids: Vec<u32>,
-    /// Per-grid `chunk_idx → last-uploaded version` for the dirty poll.
-    versions: Vec<HashMap<IVec3, u64>>,
-    /// PF.13 (H9) — per-grid [`Grid::mutation_counter`] value as of the
-    /// last COMPLETE `refresh_dirty` sync (parallel to
-    /// [`grid_ids`](Self::grid_ids)). A matching counter means nothing
-    /// changed since, so the O(chunks) version poll + stale-eviction
-    /// scan are skipped for that grid. Entries hold `u64::MAX` (never a
-    /// live counter value right after upload) until the first full
-    /// pass, and are NOT updated when a pass is cut short by the upload
-    /// budget or a failed refresh.
-    grid_mutations: Vec<u64>,
+    /// Per-grid record of what the resident scene last synced (QE.3b —
+    /// one struct with its invariants documented in place, replacing
+    /// two parallel vectors whose update rules lived only in comments).
+    /// Parallel to [`grid_ids`](Self::grid_ids).
+    sync: Vec<GridSync>,
     /// Instanced sprite registry + the uploaded instance list; `None`
     /// until [`set_sprites`](Self::set_sprites).
     sprite_registry: Option<SpriteModelRegistry>,
@@ -103,13 +97,6 @@ pub(crate) struct GpuBackend {
     /// which occupy the tail of [`sprite_instances`] after the static set +
     /// KFA limbs. Their base index is `sprite_instances.len() - dyn_count`.
     dyn_count: usize,
-    /// Per dynamic instance: `Some((clip_idx, frame))` if it plays an
-    /// animated voxel clip (VCL.4), else `None`. Parallel to the dynamic
-    /// tail of `sprite_instances`; swap-removed alongside it.
-    /// `set_clip_frame` resolves `clips[clip_idx][frame]` → the chain to
-    /// repoint the instance's model at, and records the current `frame` so
-    /// it can be queried (`clip_instance_frame`).
-    dyn_clip: Vec<Option<(usize, usize)>>,
     /// Registered animated voxel clips: per clip, one registry LOD-chain
     /// id per frame (the flipbook, VCL.2). A clip instance is a regular
     /// dynamic instance whose `model_id` we swap between these chains.
@@ -155,26 +142,28 @@ pub(crate) struct GpuBackend {
     /// device once (full ordered slice) and clears it. Coalesces a whole
     /// frame's per-instance updates into one upload (avoids O(n²)).
     transforms_dirty: bool,
-    /// Global voxel-material palette (TV stage): per-voxel material ids index
-    /// this for opacity + blend mode. Defaults to all-[`Material::OPAQUE`], so
-    /// it is inert until the host defines a translucent material via
-    /// [`SceneRenderer::define_material`](crate::SceneRenderer::define_material).
-    /// The device-side palette + per-voxel material buffers + blending shader
-    /// land in a later TV sub-stage; this holds the authoritative table.
-    materials: MaterialTable,
-    /// TV: terrain colour→material map. Retained for the TV.6 GPU terrain
-    /// path; the CPU backend already composites with it.
-    terrain_materials: Vec<(u32, u8)>,
-    /// PF.5 — set when `materials` / `terrain_materials` change; `render`
-    /// mirrors them to the device only then (was: two `write_buffer`s +
-    /// palette rebuilds every frame). Starts `true` so the first frame
-    /// seeds the device palettes.
-    materials_dirty: bool,
     /// GPU scene-grid LOD scan distance (world units; GPU.11.1). QE.2a:
     /// seeded from [`RenderOptions::gpu_mip_scan_dist`] (env
     /// `ROXLAP_GPU_MIP_SCAN_DIST` overrides at construction) instead of
     /// arriving through every `FrameParams`.
     mip_scan_dist: f32,
+}
+
+/// What the GPU resident has synced from one grid (QE.3b): the
+/// per-chunk upload watermark plus the quiet-frame counter, updated
+/// together so they can't drift.
+struct GridSync {
+    /// `chunk_idx → last-uploaded version` for the dirty poll.
+    chunk_versions: HashMap<IVec3, u64>,
+    /// PF.13 (H9) — [`Grid::mutation_counter`] value as of the last
+    /// **complete** `refresh_dirty` pass. A matching live counter means
+    /// nothing changed since, so the O(chunks) version poll +
+    /// stale-eviction scan are skipped. Holds `u64::MAX` (never a live
+    /// counter right after upload) until the first full pass, and is
+    /// NOT advanced when a pass is cut short by the upload budget or a
+    /// failed refresh — a budget-deferred chunk must keep the scans
+    /// alive.
+    complete_at: u64,
 }
 
 /// Read a `f32` env override, `None` when unset/unparseable (or on
@@ -221,8 +210,7 @@ impl GpuBackend {
             empty_resident: None,
             grid_ids: Vec::new(),
             resident_scene_grids: Vec::new(),
-            versions: Vec::new(),
-            grid_mutations: Vec::new(),
+            sync: Vec::new(),
             sprite_registry: None,
             sprite_instances: Vec::new(),
             sprite_basis: Vec::new(),
@@ -230,7 +218,6 @@ impl GpuBackend {
             kfa_base: 0,
             sprite_models_tpl: Vec::new(),
             dyn_count: 0,
-            dyn_clip: Vec::new(),
             clips: Vec::new(),
             sprite_model_ids: Vec::new(),
             carve_model_id: None,
@@ -247,9 +234,6 @@ impl GpuBackend {
             ),
             image_pixels: Vec::new(),
             transforms_dirty: false,
-            materials: MaterialTable::new(),
-            terrain_materials: Vec::new(),
-            materials_dirty: true,
             mip_scan_dist: env_f32("ROXLAP_GPU_MIP_SCAN_DIST").unwrap_or(opts.gpu_mip_scan_dist),
         }
     }
@@ -328,28 +312,29 @@ impl GpuBackend {
         // a `set_sprites`, like the streamed sprite models).
         self.sprite_models_tpl.clone_from(&set.models);
         self.dyn_count = 0;
-        self.dyn_clip.clear();
         self.clips.clear();
     }
 
     /// Append one dynamic instance of `model_index` pre-posed by `xf`;
-    /// returns its dynamic-sublist index (the new last). Uses the
-    /// incremental `append_sprite_instances` (no registry rebuild) and
-    /// mirrors the instance into the parallel
+    /// returns its dynamic-sublist index (the new last), or `None` —
+    /// appending nothing — when the model/registry is missing, so the
+    /// facade never books a handle for an instance that was not
+    /// created (QE.3a). Uses the incremental `append_sprite_instances`
+    /// (no registry rebuild) and mirrors the instance into the parallel
     /// `sprite_instances`/`sprite_basis` so the per-frame lighting +
     /// transform updates keep covering it.
     pub(crate) fn add_dyn_instance_posed(
         &mut self,
         model_index: usize,
         xf: DynSpriteTransform,
-    ) -> usize {
+    ) -> Option<usize> {
         let idx = self.dyn_count;
         let (Some(&chain_id), Some(model), Some(registry)) = (
             self.sprite_model_ids.get(model_index),
             self.sprite_models_tpl.get(model_index),
             self.sprite_registry.as_ref(),
         ) else {
-            return idx;
+            return None;
         };
         let mut s = model.clone();
         xf.apply_to(&mut s);
@@ -364,9 +349,8 @@ impl GpuBackend {
         self.gpu.append_sprite_instances(registry, &[inst]);
         self.sprite_instances.push(inst);
         self.sprite_basis.push(s);
-        self.dyn_clip.push(None);
         self.dyn_count += 1;
-        idx
+        Some(idx)
     }
 
     /// Update dynamic instance `idx`'s pose (position + orientation) in
@@ -540,32 +524,6 @@ impl GpuBackend {
         }
     }
 
-    /// Define global voxel-material `id` (TV stage). Id 0 is reserved as
-    /// [`Material::OPAQUE`]; defining it is a no-op returning `false`. The
-    /// table is held authoritatively here; device upload + blending land in
-    /// a later TV sub-stage.
-    pub(crate) fn define_material(&mut self, id: u8, mat: Material) -> bool {
-        let changed = self.materials.set(id, mat);
-        if changed {
-            self.materials_dirty = true;
-        }
-        changed
-    }
-
-    /// The material at `id` ([`Material::OPAQUE`] for any never-defined id).
-    pub(crate) fn material(&self, id: u8) -> Material {
-        self.materials.get(id)
-    }
-
-    /// Set the terrain colour→material map (TV.4). Retained for the TV.6 GPU
-    /// terrain transparency path.
-    pub(crate) fn set_terrain_materials(&mut self, map: &[(u32, u8)]) {
-        if self.terrain_materials != map {
-            self.terrain_materials = map.to_vec();
-            self.materials_dirty = true;
-        }
-    }
-
     /// Remove the dynamic instance at dynamic-sublist index `idx` by
     /// swap-remove. Returns `Some(old_last)` (dynamic-local) if a
     /// different instance filled the hole, else `None` — matching the CPU
@@ -582,7 +540,6 @@ impl GpuBackend {
         // since dynamics are the tail — exactly as the GPU cull does).
         self.sprite_instances.swap_remove(gpu_index);
         self.sprite_basis.swap_remove(gpu_index);
-        self.dyn_clip.swap_remove(idx); // dyn-local index (parallel to the tail)
         self.dyn_count -= 1;
         moved.map(|m| m - base)
     }
@@ -648,27 +605,27 @@ impl GpuBackend {
         if let Some(c) = self.clips.get_mut(clip_idx) {
             c.clear();
         }
-        // Detach instances that were playing this clip so they're no longer
-        // treated as clip instances (their now-tombstoned chain draws
-        // nothing regardless; this keeps the bookkeeping honest).
-        for slot in &mut self.dyn_clip {
-            if matches!(slot, Some((c, _)) if *c == clip_idx) {
-                *slot = None;
-            }
-        }
+        // The facade detaches the clip's instances in its shared
+        // bookkeeping (QE.3a); the tombstoned chains draw nothing.
     }
 
     /// Append a dynamic instance playing clip `clip_idx`, posed by `xf`,
     /// starting on frame 0. Returns its dynamic-sublist index. A clip
     /// instance is a regular dynamic instance whose `model_id` is one of
     /// the clip's frame chains; [`Self::set_clip_frame`] swaps it.
-    pub(crate) fn add_clip_instance(&mut self, clip_idx: usize, xf: DynSpriteTransform) -> usize {
+    pub(crate) fn add_clip_instance(
+        &mut self,
+        clip_idx: usize,
+        xf: DynSpriteTransform,
+    ) -> Option<usize> {
         let idx = self.dyn_count;
         let (Some(&chain0), Some(registry)) = (
             self.clips.get(clip_idx).and_then(|c| c.first()),
             self.sprite_registry.as_ref(),
         ) else {
-            return idx;
+            // Appending nothing (empty clip / no registry yet) — the
+            // facade books no handle either (QE.3a).
+            return None;
         };
         // Pose carrier — only `s/h/f/p` matter (the volume is the chain's).
         let mut s = Sprite::axis_aligned(Kv6::from_fn(1, 1, 1, |_, _, _| None), [0.0, 0.0, 0.0]);
@@ -684,25 +641,17 @@ impl GpuBackend {
         self.gpu.append_sprite_instances(registry, &[inst]);
         self.sprite_instances.push(inst);
         self.sprite_basis.push(s);
-        self.dyn_clip.push(Some((clip_idx, 0)));
         self.dyn_count += 1;
-        idx
+        Some(idx)
     }
 
-    /// Select the playback frame of clip instance `idx`: repoint its model
-    /// at `clips[clip_idx][frame]` (the cheap per-frame flipbook step — no
-    /// volume re-upload). No-op if `idx` isn't a clip instance / out of
-    /// range.
-    pub(crate) fn set_clip_frame(&mut self, idx: usize, frame: usize) {
+    /// Device-side reaction to a clip-instance frame change (QE.3a —
+    /// the bookkeeping + same-frame guard live in the facade's
+    /// [`SceneState`](crate::SceneState)): repoint the instance's model
+    /// at `clips[clip_idx][frame]` (the cheap per-frame flipbook step —
+    /// no volume re-upload). No-op on an out-of-range index/frame.
+    pub(crate) fn apply_clip_frame(&mut self, idx: usize, clip_idx: usize, frame: usize) {
         if idx >= self.dyn_count {
-            return;
-        }
-        let Some(Some((clip_idx, cur_frame))) = self.dyn_clip.get(idx).copied() else {
-            return;
-        };
-        // PF.5 — same-frame guard: a player ticking at render rate re-applies
-        // the same clip frame most ticks; skip the instance + GPU writes.
-        if cur_frame == frame {
             return;
         }
         let Some(&chain) = self.clips.get(clip_idx).and_then(|c| c.get(frame)) else {
@@ -713,17 +662,16 @@ impl GpuBackend {
         if let Some(reg) = self.sprite_registry.as_ref() {
             self.gpu.set_sprite_instance_model(reg, gpu_index, chain);
         }
-        self.dyn_clip[idx] = Some((clip_idx, frame));
     }
 
-    /// Retarget clip instance `idx` onto a *different* clip (BB.1): repoint
-    /// its model at the new clip's frame 0 and rebind its `dyn_clip` to
-    /// `(new_clip_idx, 0)`. The transform is untouched (same instance). No
-    /// volume re-upload — just a model-id swap, like [`Self::set_clip_frame`].
-    /// Returns `false` if `idx` isn't a live clip instance or the new clip
-    /// has no frames.
-    pub(crate) fn set_clip_instance_clip(&mut self, idx: usize, new_clip_idx: usize) -> bool {
-        if idx >= self.dyn_count || !matches!(self.dyn_clip.get(idx), Some(Some(_))) {
+    /// Device-side reaction to a clip-instance retarget (BB.1; QE.3a —
+    /// bookkeeping in the facade): repoint the instance's model at the
+    /// new clip's frame 0. No volume re-upload — just a model-id swap,
+    /// like [`Self::apply_clip_frame`]. Returns `false` if `idx` is out
+    /// of range or the new clip has no frames (the facade then leaves
+    /// its bookkeeping unchanged).
+    pub(crate) fn apply_clip_retarget(&mut self, idx: usize, new_clip_idx: usize) -> bool {
+        if idx >= self.dyn_count {
             return false;
         }
         let Some(&chain0) = self.clips.get(new_clip_idx).and_then(|c| c.first()) else {
@@ -734,17 +682,7 @@ impl GpuBackend {
         if let Some(reg) = self.sprite_registry.as_ref() {
             self.gpu.set_sprite_instance_model(reg, gpu_index, chain0);
         }
-        self.dyn_clip[idx] = Some((new_clip_idx, 0));
         true
-    }
-
-    /// The frame a clip instance is currently showing, or `None` if `idx`
-    /// isn't a (live) clip instance.
-    pub(crate) fn clip_instance_frame(&self, idx: usize) -> Option<usize> {
-        match self.dyn_clip.get(idx) {
-            Some(Some((_, frame))) => Some(*frame),
-            _ => None,
-        }
     }
 
     /// Re-upload **one** frame's volume of clip `clip_idx` in place (the
@@ -1070,7 +1008,13 @@ impl GpuBackend {
         self.gpu.set_fog(color, 0.0, far);
     }
 
-    pub(crate) fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
+    pub(crate) fn render(
+        &mut self,
+        scene: &mut Scene,
+        camera: &Camera,
+        frame: &FrameParams,
+        shared: &crate::SceneState,
+    ) {
         // CPU/GPU parity: mirror the frame's flat sky + fog onto the GPU
         // (which carries its own sky texture + fog state).
         self.sync_sky_and_fog(frame);
@@ -1120,11 +1064,10 @@ impl GpuBackend {
         // and the terrain palette + colour→material map to the scene pass
         // (glass/water as world geometry). PF.5 — only when something
         // actually changed (materials are effectively static at runtime).
-        if self.materials_dirty {
-            self.gpu.set_sprite_materials(&self.materials);
+        if shared.materials_dirty {
+            self.gpu.set_sprite_materials(&shared.materials);
             self.gpu
-                .set_scene_terrain_materials(&self.materials, &self.terrain_materials);
-            self.materials_dirty = false;
+                .set_scene_terrain_materials(&shared.materials, &shared.terrain_materials);
         }
 
         // Sprites render flat-lit (identity `kv6colmul`, the GPU default)
@@ -1415,25 +1358,24 @@ impl GpuBackend {
             resident.resident_bytes() as f64 / (1024.0 * 1024.0),
         );
 
-        // Seed dirty trackers with each chunk's current version.
-        let mut versions: Vec<HashMap<IVec3, u64>> = Vec::with_capacity(grid_ids.len());
-        for gid in &grid_ids {
-            let mut gv: HashMap<IVec3, u64> = HashMap::new();
-            if let Some(grid) = scene.grid(*gid) {
-                for c in grid.chunks.keys() {
-                    gv.insert(*c, grid.chunk_version(*c));
-                }
-            }
-            versions.push(gv);
-        }
-
-        // PF.13 (H9) — u64::MAX forces one full refresh_dirty pass per
-        // grid; that pass finds everything already synced and records
-        // the real counter, arming the quiet-frame skip from frame 2.
-        self.grid_mutations = vec![u64::MAX; grid_ids.len()];
+        // Seed the sync trackers with each chunk's current version.
+        // `complete_at: u64::MAX` forces one full refresh_dirty pass
+        // per grid (PF.13 H9); that pass finds everything already
+        // synced and records the real counter, arming the quiet-frame
+        // skip from frame 2.
+        let sync: Vec<GridSync> = grid_ids
+            .iter()
+            .map(|gid| GridSync {
+                chunk_versions: scene
+                    .grid(*gid)
+                    .map(|grid| grid.chunk_versions().clone())
+                    .unwrap_or_default(),
+                complete_at: u64::MAX,
+            })
+            .collect();
         self.resident = Some(resident);
         self.grid_ids = grid_ids;
-        self.versions = versions;
+        self.sync = sync;
     }
 
     /// Re-upload any chunk whose `chunk_version` bumped since last
@@ -1459,10 +1401,10 @@ impl GpuBackend {
             // since the last COMPLETE sync): skip the whole O(chunks)
             // version poll + stale-eviction scan.
             let mutations = grid.mutation_counter();
-            if self.grid_mutations.get(scene_idx).copied() == Some(mutations) {
+            if self.sync.get(scene_idx).map(|s| s.complete_at) == Some(mutations) {
                 continue;
             }
-            let tracker = &mut self.versions[scene_idx];
+            let tracker = &mut self.sync[scene_idx].chunk_versions;
 
             // Install / refresh current chunks, up to the per-frame
             // budget — the rest stay dirty and ride the next frames, so a
@@ -1556,8 +1498,8 @@ impl GpuBackend {
             // PF.13 (H9) — grid fully synced at counter `mutations`:
             // arm the quiet-frame skip.
             if complete {
-                if let Some(slot) = self.grid_mutations.get_mut(scene_idx) {
-                    *slot = mutations;
+                if let Some(s) = self.sync.get_mut(scene_idx) {
+                    s.complete_at = mutations;
                 }
             }
         }

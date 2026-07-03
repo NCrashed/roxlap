@@ -433,7 +433,13 @@ pub struct Grid {
     /// Missing entries read as `0` via [`Self::chunk_version`].
     /// Evictions in [`Scene::pump_streaming_sync`] drop the
     /// corresponding entry so the map stays bounded.
-    pub chunk_versions: HashMap<IVec3, u64>,
+    ///
+    /// QE.3b — private: every mutation goes through
+    /// [`Self::bump_chunk_version`] / [`Self::bump_chunk_version_bbox`]
+    /// / the crate-internal tracking helpers, so the
+    /// version/extent/counter triple can never desync. Read via
+    /// [`Self::chunk_version`] / [`Self::chunk_versions`].
+    chunk_versions: HashMap<IVec3, u64>,
     /// In-flight background generation tasks (S7.3).
     ///
     /// Populated by [`Scene::pump_streaming`] when it dispatches a
@@ -619,6 +625,40 @@ impl Grid {
         self.chunk_dirty.remove(&chunk_idx)
     }
 
+    /// The full per-chunk edit-version map (QE.3b — the read half of
+    /// the previously `pub` field). Consumers seeding a sync tracker
+    /// iterate this; per-chunk reads go through
+    /// [`Self::chunk_version`].
+    #[must_use]
+    pub fn chunk_versions(&self) -> &HashMap<IVec3, u64> {
+        &self.chunk_versions
+    }
+
+    /// QE.3b — record a chunk-**set** mutation (materialise / install /
+    /// evict) on the PF.13 quiet-frame counter. The single entry point
+    /// for the counter besides the version bumps above; per-frame
+    /// consumers compare [`Self::mutation_counter`] snapshots.
+    pub(crate) fn note_chunk_set_changed(&mut self) {
+        self.mutations = self.mutations.wrapping_add(1);
+    }
+
+    /// QE.3b — drop `chunk_idx`'s per-chunk tracking on eviction, so
+    /// both maps stay bounded by the live chunk count. (Also clears any
+    /// accumulated [`DirtyExtent`] — pre-QE.3b that entry leaked until
+    /// a consumer happened to take it.) A future re-stream of the same
+    /// index restarts at version 0.
+    pub(crate) fn forget_chunk_tracking(&mut self, chunk_idx: IVec3) {
+        self.chunk_versions.remove(&chunk_idx);
+        self.chunk_dirty.remove(&chunk_idx);
+    }
+
+    /// QE.3b — seat a restored per-chunk version verbatim (the
+    /// [`snapshot`] load path; not an edit, so no extent / counter
+    /// side-effects).
+    pub(crate) fn restore_chunk_version(&mut self, chunk_idx: IVec3, version: u64) {
+        self.chunk_versions.insert(chunk_idx, version);
+    }
+
     /// Attach (or detach) the procedural generator used by
     /// [`Self::ensure_chunk_generated`] (S7.0).
     ///
@@ -664,7 +704,7 @@ impl Grid {
         }
         let chunk = generator.generate(chunk_idx);
         self.chunks.insert(chunk_idx, chunk);
-        self.mutations = self.mutations.wrapping_add(1);
+        self.note_chunk_set_changed();
         // S7.4: a fresh chunk grows the populated AABB → the
         // bounding sphere shifts/expands → existing impostor
         // projections become wrong. Match the eviction (S7.1) +
@@ -968,7 +1008,7 @@ impl Scene {
                 continue;
             }
             grid.chunks.insert(result.chunk_idx, result.vxl);
-            grid.mutations = grid.mutations.wrapping_add(1);
+            grid.note_chunk_set_changed();
             // S7.4: same invalidation contract as the sync
             // `ensure_chunk_generated` path — installing a new
             // chunk can grow the bounding sphere, so the
@@ -1089,14 +1129,14 @@ fn evict_grid_chunks_with_cam(grid: &mut Grid, cam_local: DVec3) {
     }
     for idx in &to_evict {
         grid.chunks.remove(idx);
-        grid.mutations = grid.mutations.wrapping_add(1);
-        // S7.2: keep chunk_versions in sync with chunks so the
-        // map stays bounded. A future re-stream of the same idx
-        // restarts at 0 — that's fine because any in-flight
-        // gen-result tagged with the pre-eviction version is
-        // unreachable (no chunk to install onto) and gets
-        // discarded by the new "version still 0" check anyway.
-        grid.chunk_versions.remove(idx);
+        grid.note_chunk_set_changed();
+        // S7.2/QE.3b: drop the chunk's version + dirty-extent tracking
+        // so both maps stay bounded. A future re-stream of the same idx
+        // restarts at 0 — that's fine because any in-flight gen-result
+        // tagged with the pre-eviction version is unreachable (no chunk
+        // to install onto) and gets discarded by the new "version
+        // still 0" check anyway.
+        grid.forget_chunk_tracking(*idx);
         // S7.3: drop pending entry for the same chunk too. If a
         // background task is still running, its result will be
         // dropped on arrival (was_pending = false).

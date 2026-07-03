@@ -223,13 +223,13 @@ impl Scene {
                 let n_cols = (vxl.vsid as usize) * (vxl.vsid as usize);
                 vxl.reserve_edit_capacity(n_cols * RESTORE_EDIT_HEADROOM_PER_COLUMN);
                 grid.chunks.insert(*addr, vxl);
-                grid.mutations = grid.mutations.wrapping_add(1);
+                grid.note_chunk_set_changed();
             }
             // S7.2: restore per-chunk versions. Pre-S7.2 snapshots
             // carry an empty Vec (via #[serde(default)]) → no
             // bumps applied, every chunk reads as version 0.
             for (addr, ver) in &gsnap.chunk_versions {
-                grid.chunk_versions.insert(*addr, *ver);
+                grid.restore_chunk_version(*addr, *ver);
             }
             scene.grids.insert(*id, grid);
         }

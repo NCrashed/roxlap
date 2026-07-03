@@ -20,7 +20,7 @@ use roxlap_core::render_sky_fill;
 use roxlap_core::Camera;
 use roxlap_core::{CompositeOccluder, WorldOccluder};
 use roxlap_formats::kv6::Kv6;
-use roxlap_formats::material::{Material, MaterialTable};
+
 use roxlap_formats::sprite::Sprite;
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_scene::occluder::SceneOccluder;
@@ -470,12 +470,6 @@ pub(crate) struct CpuBackend {
     /// Source model index per entry in [`dyn_sprites`](Self::dyn_sprites),
     /// so [`Self::update_sprite_model`] refreshes dynamic instances too.
     dyn_models: Vec<usize>,
-    /// Per dynamic instance: `Some((clip_book, frame))` if it plays an
-    /// animated voxel clip (VCL.4), else `None` for a plain KV6 sprite.
-    /// Parallel to [`dyn_sprites`](Self::dyn_sprites) — a clip instance's
-    /// `dyn_sprites` entry is a pose carrier (empty kv6); its pixels come
-    /// from `clip_books[book].draw_frame(frame, pose)`.
-    dyn_clip: Vec<Option<(usize, usize)>>,
     /// Decoded animated voxel clips, one cached [`ClipFlipbook`] each
     /// (VCL.3). A clip's frames are decoded once at
     /// [`Self::add_voxel_clip`]; per-frame playback is a grid select.
@@ -519,15 +513,6 @@ pub(crate) struct CpuBackend {
     /// Retained image-sprite textures, indexed by [`ImageId`]. A dropped
     /// slot is `None` and may be re-used by a later `upload_image`.
     images: Vec<Option<CpuImage>>,
-    /// Global voxel-material palette (TV stage): per-voxel material ids index
-    /// this for opacity + blend mode. Defaults to all-[`Material::OPAQUE`], so
-    /// it is inert until the host defines a translucent material via
-    /// [`SceneRenderer::define_material`](crate::SceneRenderer::define_material).
-    materials: MaterialTable,
-    /// TV: terrain colour→material map (`(rgb, material_id)`). Empty (the
-    /// default) ⇒ terrain is fully opaque. Set via
-    /// [`SceneRenderer::set_terrain_materials`](crate::SceneRenderer::set_terrain_materials).
-    terrain_materials: Vec<(u32, u8)>,
     /// egui atlas cache + software rasteriser (`hud` feature).
     #[cfg(feature = "hud")]
     egui_raster: crate::cpu_egui::EguiRaster,
@@ -559,7 +544,6 @@ impl CpuBackend {
             models: Vec::new(),
             dyn_sprites: Vec::new(),
             dyn_models: Vec::new(),
-            dyn_clip: Vec::new(),
             clip_books: Vec::new(),
             kfa_limbs: Vec::new(),
             shadow_demote_warned: 0,
@@ -571,8 +555,6 @@ impl CpuBackend {
             framebuffer,
             flip_x: false,
             images: Vec::new(),
-            materials: MaterialTable::new(),
-            terrain_materials: Vec::new(),
             #[cfg(feature = "hud")]
             egui_raster: crate::cpu_egui::EguiRaster::default(),
         }
@@ -731,7 +713,6 @@ impl CpuBackend {
         self.models.clone_from(&set.models);
         self.dyn_sprites.clear();
         self.dyn_models.clear();
-        self.dyn_clip.clear();
         // Mirror the GPU backend: drop the registered clip flipbooks too, so
         // clip indices restart at 0 on both backends (and the old volumes
         // don't leak).
@@ -741,23 +722,22 @@ impl CpuBackend {
     }
 
     /// Append one dynamic instance of `model_index` pre-posed by `xf`;
-    /// returns its dynamic-sublist index (always the new last). The facade
-    /// wraps this in a stable handle. No-op-ish (returns the current count)
-    /// if the model id is unknown.
+    /// returns its dynamic-sublist index (always the new last), or
+    /// `None` (appending nothing) if the model id is unknown - so the
+    /// facade never books a handle for an instance that was not
+    /// created (QE.3a).
     pub(crate) fn add_dyn_instance_posed(
         &mut self,
         model_index: usize,
         xf: DynSpriteTransform,
-    ) -> usize {
+    ) -> Option<usize> {
         let idx = self.dyn_sprites.len();
-        if let Some(model) = self.models.get(model_index) {
-            let mut s = model.clone();
-            xf.apply_to(&mut s);
-            self.dyn_sprites.push(s);
-            self.dyn_models.push(model_index);
-            self.dyn_clip.push(None);
-        }
-        idx
+        let model = self.models.get(model_index)?;
+        let mut s = model.clone();
+        xf.apply_to(&mut s);
+        self.dyn_sprites.push(s);
+        self.dyn_models.push(model_index);
+        Some(idx)
     }
 
     /// O(1) per-frame pose update of dynamic instance `idx` (position +
@@ -862,23 +842,6 @@ impl CpuBackend {
     #[allow(clippy::unused_self)]
     pub(crate) fn compact_models(&mut self) {}
 
-    /// Define global voxel-material `id` (TV stage). Id 0 is reserved as
-    /// [`Material::OPAQUE`]; defining it is a no-op returning `false`.
-    pub(crate) fn define_material(&mut self, id: u8, mat: Material) -> bool {
-        self.materials.set(id, mat)
-    }
-
-    /// The material at `id` ([`Material::OPAQUE`] for any never-defined id).
-    pub(crate) fn material(&self, id: u8) -> Material {
-        self.materials.get(id)
-    }
-
-    /// Set the terrain colour→material map (TV.4): matching-colour terrain
-    /// voxels render with that material (glass/water in the world).
-    pub(crate) fn set_terrain_materials(&mut self, map: &[(u32, u8)]) {
-        self.terrain_materials = map.to_vec();
-    }
-
     /// Remove the dynamic instance at `idx` by swap-remove. Returns
     /// `Some(old_last)` when a different instance was moved into `idx`, or
     /// `None` if `idx` was the last / out of range — matching the GPU
@@ -890,7 +853,6 @@ impl CpuBackend {
         let last = self.dyn_sprites.len() - 1;
         self.dyn_sprites.swap_remove(idx);
         self.dyn_models.swap_remove(idx);
-        self.dyn_clip.swap_remove(idx);
         (idx != last).then_some(last)
     }
 
@@ -917,61 +879,32 @@ impl CpuBackend {
     /// empty one). Existing instances of it then draw nothing; the slot is
     /// kept so other clip indices stay valid. No-op if out of range.
     pub(crate) fn remove_voxel_clip(&mut self, clip_idx: usize) {
+        // The facade detaches the clip's instances in its shared
+        // bookkeeping (QE.3a); this backend just empties the flipbook.
         if let Some(book) = self.clip_books.get_mut(clip_idx) {
             *book = ClipFlipbook::empty();
-        }
-        // Detach instances that were playing this clip (mirror the GPU
-        // backend) so they stop drawing the emptied flipbook.
-        for slot in &mut self.dyn_clip {
-            if matches!(slot, Some((book, _)) if *book == clip_idx) {
-                *slot = None;
-            }
         }
     }
 
     /// Append a dynamic instance playing clip `clip_idx`, posed by `xf`,
     /// starting on frame 0. Returns its dynamic-sublist index. The
     /// `dyn_sprites` entry is a pose carrier (empty kv6); the clip's
-    /// frames supply the pixels.
-    pub(crate) fn add_clip_instance(&mut self, clip_idx: usize, xf: DynSpriteTransform) -> usize {
+    /// frames supply the pixels — which frame comes from the facade's
+    /// [`SceneState::dyn_clip`](crate::SceneState) bookkeeping (QE.3a).
+    /// `Option` for facade parity with the GPU backend, which can
+    /// decline (empty clip / no registry); the CPU path always appends.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn add_clip_instance(
+        &mut self,
+        _clip_idx: usize,
+        xf: DynSpriteTransform,
+    ) -> Option<usize> {
         let idx = self.dyn_sprites.len();
         let mut s = Sprite::axis_aligned(empty_kv6(), [0.0, 0.0, 0.0]);
         xf.apply_to(&mut s);
         self.dyn_sprites.push(s);
         self.dyn_models.push(usize::MAX); // not a KV6 model
-        self.dyn_clip.push(Some((clip_idx, 0)));
-        idx
-    }
-
-    /// Select the playback frame of clip instance `idx` (VCL.4). No-op if
-    /// `idx` isn't a clip instance / is out of range.
-    pub(crate) fn set_clip_frame(&mut self, idx: usize, frame: usize) {
-        if let Some(Some((_book, f))) = self.dyn_clip.get_mut(idx) {
-            *f = frame;
-        }
-    }
-
-    /// The frame a clip instance is currently showing, or `None` if `idx`
-    /// isn't a (live) clip instance.
-    pub(crate) fn clip_instance_frame(&self, idx: usize) -> Option<usize> {
-        match self.dyn_clip.get(idx) {
-            Some(Some((_book, frame))) => Some(*frame),
-            _ => None,
-        }
-    }
-
-    /// Retarget clip instance `idx` onto a *different* clip (BB.1): rebind its
-    /// `dyn_clip` to `(new_clip_idx, 0)` so subsequent draws read the new
-    /// flipbook from frame 0. The pose carrier is untouched. Returns `false`
-    /// if `idx` isn't a live clip instance or `new_clip_idx` is out of range.
-    pub(crate) fn set_clip_instance_clip(&mut self, idx: usize, new_clip_idx: usize) -> bool {
-        if !matches!(self.dyn_clip.get(idx), Some(Some(_)))
-            || self.clip_books.get(new_clip_idx).is_none()
-        {
-            return false;
-        }
-        self.dyn_clip[idx] = Some((new_clip_idx, 0));
-        true
+        Some(idx)
     }
 
     /// Replace one frame's cached dense grid of clip `clip_idx` (the editor's
@@ -1169,7 +1102,13 @@ impl CpuBackend {
         self.render_res.logical_for(self.current_dims)
     }
 
-    pub(crate) fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
+    pub(crate) fn render(
+        &mut self,
+        scene: &mut Scene,
+        camera: &Camera,
+        frame: &FrameParams,
+        shared: &crate::SceneState,
+    ) {
         // RP.0/RP.1 — march at the *render* size (`logical × ssaa`), then
         // box-downfilter to logical (RP.1) + nearest-upscale to the window
         // (RP.0) at present. `Native` + `ssaa==1` ⇒ render == window ⇒ pre-RP
@@ -1382,7 +1321,7 @@ impl CpuBackend {
                 if !casts(s) {
                     continue;
                 }
-                if let Some((book, fr)) = self.dyn_clip[i] {
+                if let Some((book, fr)) = shared.dyn_clip[i] {
                     if let Some(d) = self.clip_books.get(book).and_then(|b| b.frame_arc(fr)) {
                         so.push(d, s.p, s.s, s.h, s.f);
                     }
@@ -1413,8 +1352,8 @@ impl CpuBackend {
             &settings,
             frame.sky_color,
             frame.sky,
-            Some(&self.materials),
-            &self.terrain_materials,
+            Some(&shared.materials),
+            &shared.terrain_materials,
             cpu_lights,
             sprite_occ.as_ref().map(|o| o as &dyn WorldOccluder),
             // PF.7 — persistent temp-buffer pair + per-grid scratch.
@@ -1457,7 +1396,7 @@ impl CpuBackend {
             // material is opaque (the default, and all of them until a
             // translucent material is defined) takes the unchanged first-hit
             // path; only translucent sprites accumulate.
-            let materials = &self.materials;
+            let materials = &shared.materials;
             // XS.2 — sprites RECEIVE shadows: the scene-wide occluder = grids
             // (built now that the terrain render released the `&mut Scene`) +
             // the sprite volumes. `composite_store` backs the borrow.
@@ -1545,7 +1484,7 @@ impl CpuBackend {
             for (i, sprite) in self.dyn_sprites.iter().enumerate() {
                 let zb = &mut self.zbuffer[..pixel_count];
                 let shade = shade_of(sprite);
-                if let Some((book, fr)) = self.dyn_clip[i] {
+                if let Some((book, fr)) = shared.dyn_clip[i] {
                     if let Some(b) = self.clip_books.get(book) {
                         let _written = b.draw_frame_shaded(
                             fb,

@@ -399,7 +399,7 @@ impl Grid {
     pub fn ensure_chunk(&mut self, chunk_idx: IVec3) -> &mut Vxl {
         // PF.13 (H9) — materialising a chunk mutates the chunk set.
         if !self.chunks.contains_key(&chunk_idx) {
-            self.mutations = self.mutations.wrapping_add(1);
+            self.note_chunk_set_changed();
         }
         self.chunks.entry(chunk_idx).or_insert_with(empty_chunk_vxl)
     }

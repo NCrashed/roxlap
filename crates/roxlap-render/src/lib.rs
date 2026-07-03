@@ -61,6 +61,7 @@ use roxlap_core::kfa_draw::{compose_attachment, solve_kfa_limbs};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
+use roxlap_formats::material::MaterialTable;
 use roxlap_formats::voxel_clip::{duration_prefix_sums, frame_at_prefix};
 use roxlap_scene::Scene;
 
@@ -966,6 +967,48 @@ impl<'a> FrameParams<'a> {
     }
 }
 
+/// Backend-agnostic scene bookkeeping the facade owns **once** (QE.3a
+/// — previously each backend kept a duplicate copy, and every new
+/// feature needed three coordinated edits: facade arm + cpu + gpu,
+/// with parity drift as the failure mode: the GPU copy had grown
+/// change-detection the CPU copy lacked).
+///
+/// Backends receive `&SceneState` where they need it (the render
+/// passes); the truly divergent reactions (CPU flipbook draw, GPU
+/// instance-buffer/model-id writes, device palette mirror) stay in the
+/// backends behind small `apply_*` hooks.
+pub(crate) struct SceneState {
+    /// Global voxel-material palette (TV stage): per-voxel material
+    /// ids resolve to opacity + blend mode here. The CPU compositor
+    /// reads it live each frame; the GPU mirrors it to device
+    /// palettes when [`materials_dirty`](Self::materials_dirty).
+    pub(crate) materials: MaterialTable,
+    /// Terrain colour→material map (TV.4) — matching-colour world
+    /// voxels render with that material (glass walls, water).
+    pub(crate) terrain_materials: Vec<(u32, u8)>,
+    /// PF.5 — set when `materials` / `terrain_materials` change;
+    /// cleared after each `render` (the GPU mirrors device palettes
+    /// only then). Starts `true` so the first GPU frame seeds them.
+    pub(crate) materials_dirty: bool,
+    /// Per **dynamic** instance (parallel to the backends' dynamic
+    /// sublist): `Some((clip_index, current_frame))` for a clip
+    /// instance, `None` for a plain model instance. The CPU render
+    /// picks each instance's flipbook frame from this; the GPU keeps
+    /// its instance buffer in sync via the `apply_clip_*` hooks.
+    pub(crate) dyn_clip: Vec<Option<(usize, usize)>>,
+}
+
+impl Default for SceneState {
+    fn default() -> Self {
+        Self {
+            materials: MaterialTable::new(),
+            terrain_materials: Vec::new(),
+            materials_dirty: true,
+            dyn_clip: Vec::new(),
+        }
+    }
+}
+
 /// Result of [`SceneRenderer::pick`] — a resolved screen→world voxel
 /// hit. `world` is the surface point (`cam.pos + t · normalize(ray)`);
 /// `grid` + `voxel` are the owning grid and its **grid-local** voxel
@@ -1516,6 +1559,9 @@ pub struct SceneRenderer {
     /// Live billboard-actor runtimes, parallel to `actor_map` slots; `None`
     /// once removed. Driven by [`Self::update_billboard_actors`].
     billboard_actors: Vec<Option<BillboardActor>>,
+    /// QE.3a - the once-per-facade scene bookkeeping both backends
+    /// read (materials, terrain map, clip-instance frames).
+    state: SceneState,
 }
 
 impl SceneRenderer {
@@ -1536,6 +1582,7 @@ impl SceneRenderer {
             billboards: Vec::new(),
             actor_map: EpochSlotMap::default(),
             billboard_actors: Vec::new(),
+            state: SceneState::default(),
         }
     }
 
@@ -1789,9 +1836,13 @@ impl SceneRenderer {
     /// Calling `render` again without finishing drops the pending frame.
     pub fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
         match &mut self.inner {
-            BackendImpl::Cpu(c) => c.render(scene, camera, frame),
-            BackendImpl::Gpu(g) => g.render(scene, camera, frame),
+            BackendImpl::Cpu(c) => c.render(scene, camera, frame, &self.state),
+            BackendImpl::Gpu(g) => g.render(scene, camera, frame, &self.state),
         }
+        // The GPU mirrored its device palettes this frame if it needed
+        // to; the CPU reads the table live. Either way the change flag
+        // is consumed.
+        self.state.materials_dirty = false;
     }
 
     /// Draw world-space [`Line3`] segments over the frame
@@ -2091,6 +2142,7 @@ impl SceneRenderer {
         self.billboards.clear();
         self.actor_map.reset();
         self.billboard_actors.clear();
+        self.state.dyn_clip.clear();
         (0..set.models.len() as u32)
             .map(|slot| self.model_map.minted(slot))
             .collect()
@@ -2194,7 +2246,8 @@ impl SceneRenderer {
         let dyn_index = match &mut self.inner {
             BackendImpl::Cpu(c) => c.add_dyn_instance_posed(idx, xf),
             BackendImpl::Gpu(g) => g.add_dyn_instance_posed(idx, xf),
-        };
+        }?;
+        self.state.dyn_clip.push(None); // a plain model instance
         Some(self.dyn_map.alloc(dyn_index as u32))
     }
 
@@ -2210,6 +2263,9 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.remove_dyn_instance(dyn_index as usize),
             BackendImpl::Gpu(g) => g.remove_dyn_instance(dyn_index as usize),
         };
+        // Mirror the backend's swap-remove on the facade's parallel
+        // clip bookkeeping (QE.3a).
+        self.state.dyn_clip.swap_remove(dyn_index as usize);
         self.dyn_map.remove(id, dyn_index, moved.map(|m| m as u32));
         true
     }
@@ -2234,20 +2290,18 @@ impl SceneRenderer {
     /// fully-opaque fast path, so this is inert until first called. See
     /// `PORTING-TRANSPARENCY.md`.
     pub fn define_material(&mut self, id: u8, mat: Material) -> bool {
-        match &mut self.inner {
-            BackendImpl::Cpu(c) => c.define_material(id, mat),
-            BackendImpl::Gpu(g) => g.define_material(id, mat),
+        let changed = self.state.materials.set(id, mat);
+        if changed {
+            self.state.materials_dirty = true;
         }
+        changed
     }
 
     /// The [`Material`] currently at palette `id` ([`Material::OPAQUE`] for
     /// any id never passed to [`define_material`](Self::define_material)).
     #[must_use]
     pub fn material(&self, id: u8) -> Material {
-        match &self.inner {
-            BackendImpl::Cpu(c) => c.material(id),
-            BackendImpl::Gpu(g) => g.material(id),
-        }
+        self.state.materials.get(id)
     }
 
     /// Set the **terrain** colour→material map (TV.4): pairs of `(rgb,
@@ -2257,9 +2311,9 @@ impl SceneRenderer {
     /// keeps all terrain opaque. The CPU backend composites these today; the
     /// GPU backend renders them once the TV.6 device path lands.
     pub fn set_terrain_materials(&mut self, map: &[(u32, u8)]) {
-        match &mut self.inner {
-            BackendImpl::Cpu(c) => c.set_terrain_materials(map),
-            BackendImpl::Gpu(g) => g.set_terrain_materials(map),
+        if self.state.terrain_materials != map {
+            self.state.terrain_materials = map.to_vec();
+            self.state.materials_dirty = true;
         }
     }
 
@@ -2538,6 +2592,14 @@ impl SceneRenderer {
             BackendImpl::Cpu(c) => c.remove_voxel_clip(clip_index),
             BackendImpl::Gpu(g) => g.remove_voxel_clip(clip_index),
         }
+        // Detach instances that were playing this clip so they stop
+        // being treated as clip instances (QE.3a — facade bookkeeping;
+        // was duplicated in both backends).
+        for slot in &mut self.state.dyn_clip {
+            if matches!(slot, Some((c, _)) if *c == clip_index) {
+                *slot = None;
+            }
+        }
         self.clip_map.remove(id)
     }
 
@@ -2567,7 +2629,8 @@ impl SceneRenderer {
         let dyn_index = match &mut self.inner {
             BackendImpl::Cpu(c) => c.add_clip_instance(clip_index, xf),
             BackendImpl::Gpu(g) => g.add_clip_instance(clip_index, xf),
-        };
+        }?;
+        self.state.dyn_clip.push(Some((clip_index, 0)));
         Some(self.dyn_map.alloc(dyn_index as u32))
     }
 
@@ -2581,9 +2644,23 @@ impl SceneRenderer {
         let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
             return;
         };
-        match &mut self.inner {
-            BackendImpl::Cpu(c) => c.set_clip_frame(dyn_index as usize, frame as usize),
-            BackendImpl::Gpu(g) => g.set_clip_frame(dyn_index as usize, frame as usize),
+        let frame = frame as usize;
+        let Some(Some((clip_index, cur_frame))) = self.state.dyn_clip.get_mut(dyn_index as usize)
+        else {
+            return; // not a clip instance
+        };
+        // PF.5 — same-frame guard: a player ticking at render rate
+        // re-applies the same frame most ticks; skip the bookkeeping +
+        // GPU writes (QE.3a: the guard now covers both backends).
+        if *cur_frame == frame {
+            return;
+        }
+        let clip_index = *clip_index;
+        *cur_frame = frame;
+        // The CPU render reads the frame from `state.dyn_clip`; only
+        // the GPU keeps device-side state (the instance's model id).
+        if let BackendImpl::Gpu(g) = &mut self.inner {
+            g.apply_clip_frame(dyn_index as usize, clip_index, frame);
         }
     }
 
@@ -2609,11 +2686,17 @@ impl SceneRenderer {
         let Some(clip_index) = self.clip_map.index(clip) else {
             return false;
         };
+        if !matches!(self.state.dyn_clip.get(dyn_index as usize), Some(Some(_))) {
+            return false; // not a clip instance
+        }
+        // Only the GPU has device-side state to retarget (the model
+        // id); it reports whether the new clip actually has frames.
         let ok = match &mut self.inner {
-            BackendImpl::Cpu(c) => c.set_clip_instance_clip(dyn_index as usize, clip_index),
-            BackendImpl::Gpu(g) => g.set_clip_instance_clip(dyn_index as usize, clip_index),
+            BackendImpl::Cpu(_) => true,
+            BackendImpl::Gpu(g) => g.apply_clip_retarget(dyn_index as usize, clip_index),
         };
         if ok {
+            self.state.dyn_clip[dyn_index as usize] = Some((clip_index, 0));
             // Retarget the auto-player's timeline to the new clip (different
             // frame count / durations / loop), restart its clock, keep the
             // playback policy (speed + paused). Clone metadata first so the
@@ -2930,10 +3013,7 @@ impl SceneRenderer {
     #[must_use]
     pub fn get_clip_instance_frame(&self, id: SpriteInstanceId) -> Option<u32> {
         let dyn_index = self.dyn_map.dyn_index(id)? as usize;
-        let frame = match &self.inner {
-            BackendImpl::Cpu(c) => c.clip_instance_frame(dyn_index),
-            BackendImpl::Gpu(g) => g.clip_instance_frame(dyn_index),
-        }?;
+        let (_, frame) = (*self.state.dyn_clip.get(dyn_index)?)?;
         u32::try_from(frame).ok()
     }
 

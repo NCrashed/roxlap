@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — internal (QE.3): one `SceneState`, one dirty-tracking entry point
+
+No API change; two structural debts retired while small:
+
+- **QE.3a — the facade owns scene bookkeeping once.** The material
+  palette, terrain colour→material map, and the per-instance
+  clip/frame table were previously kept in *duplicate* by the CPU and
+  GPU backends (every new feature meant three coordinated edits, and
+  the copies had already drifted: the GPU had change-detection the CPU
+  lacked). They now live in one facade-owned `SceneState` passed into
+  the backends' render passes; backends keep only the genuinely
+  divergent reactions (CPU flipbook draw, GPU model-id/instance-buffer
+  writes + device palette mirror) behind small `apply_*` hooks. The
+  PF.5 same-frame guard on clip playback now covers both backends
+  (was GPU-only). Spawning against a missing model/registry now books
+  no facade handle at all (previously the backends could silently
+  append nothing while the facade still minted a handle).
+- **QE.3b — `Grid`'s dirty tracking has one entry point.**
+  `Grid::chunk_versions` is private (read via the new
+  `Grid::chunk_versions()` accessor / `chunk_version(idx)`); the
+  version/extent/counter triple is only ever mutated together through
+  `bump_chunk_version[_bbox]` + crate-internal helpers, so the three
+  can no longer desync. Eviction now also drops a chunk's accumulated
+  `DirtyExtent` (pre-QE.3b it leaked until a consumer happened to take
+  it). On the GPU side the two parallel per-grid vectors
+  (`versions` + `grid_mutations`) merged into one `GridSync` struct
+  whose only-advance-on-complete-sync invariant is documented on the
+  field it guards.
+
 ### Changed — **breaking** (QE.2): `FrameParams` is `#[non_exhaustive]`, one projection for both backends
 
 `FrameParams` can no longer be built with a struct literal outside
