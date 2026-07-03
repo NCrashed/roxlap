@@ -1,6 +1,6 @@
 # roxlap — Pure-Rust port of Ken Silverman's Voxlap
 
-Substage roadmap and locked decisions. See [README.md](README.md) for
+Substage roadmap and locked decisions. See [README.md](../../README.md) for
 project intent and the relationship to
 [voxlaptest](https://github.com/NCrashed/voxlaptest).
 
