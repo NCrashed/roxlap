@@ -743,6 +743,9 @@ struct SceneDdaResources {
     storage_size: (u32, u32),
     /// RP.1 — the **logical** (resolved) size: `resolve_buf` + the blit src.
     logical_size: (u32, u32),
+    /// QE.7a - retained so `read_frame_pixels` (capture) can stage it;
+    /// the resolve/blit bind groups hold their own references.
+    resolve_buf: wgpu::Buffer,
     /// Framebuffer as a packed-`rgba8unorm` storage **buffer** (row
     /// stride = march width), written by the scene + sprite compute passes
     /// and read by the resolve pass. A buffer (not a storage texture) dodges
@@ -4005,7 +4008,9 @@ impl GpuRenderer {
         let framebuffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.framebuffer"),
             size: u64::from(width) * u64::from(height) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
+            // QE.7a - COPY_SRC so `read_frame_pixels` can stage the
+            // identity-resolve path (ssaa 1, posterize off) for capture.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         // RP.1 — logical-resolution buffer the resolve pass writes; the blit
@@ -4013,7 +4018,8 @@ impl GpuRenderer {
         let resolve_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu scene_dda.resolve_buf"),
             size: u64::from(logical_w) * u64::from(logical_h) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
+            // QE.7a - COPY_SRC so `read_frame_pixels` can stage it (capture).
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         // Resolve uniform: `[src(march) w,h, dst(logical) w,h, ssaa,
@@ -4357,6 +4363,7 @@ impl GpuRenderer {
             storage_size: (width, height),
             logical_size: (logical_w, logical_h),
             framebuffer,
+            resolve_buf,
             uniform_buf,
             bgl_dda,
             pipeline_dda,
@@ -4448,6 +4455,71 @@ impl GpuRenderer {
             return None;
         }
         Some(t)
+    }
+
+    /// QE.7a — read back the last rendered frame's colour at the
+    /// **logical** resolution (post-SSAA/posterize, pre-upscale) as
+    /// `0x00RRGGBB` pixels — the GPU side of frame capture, closing
+    /// the "screenshots impossible on the GPU backend" parity gap.
+    ///
+    /// Blocking (encode copy → submit → map, like
+    /// [`Self::read_depth_pixel`]): a screenshot hotkey, not a
+    /// per-frame path. `None` before the first scene render. Compiles
+    /// on wasm but must not be called there — WebGPU's `poll` can't
+    /// block, so the facade returns `None` on the wasm GPU path.
+    #[must_use]
+    pub fn read_frame_pixels(&self) -> Option<(Vec<u32>, u32, u32)> {
+        let dda = self.scene_dda.as_ref()?;
+        let (w, h) = dda.logical_size;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        // Mirror `render_scene`'s identity-resolve choice: with ssaa 1
+        // + posterize off the resolve pass was skipped and the march
+        // framebuffer IS the logical image.
+        let identity = dda.storage_size == dda.logical_size && self.posterize.is_none();
+        let src = if identity {
+            &dda.framebuffer
+        } else {
+            &dda.resolve_buf
+        };
+        let size = u64::from(w) * u64::from(h) * 4;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu capture staging"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("roxlap-gpu capture readback"),
+            });
+        enc.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+        self.queue.submit(std::iter::once(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        rx.recv().ok()?.ok()?;
+
+        let pixels = {
+            let data = slice.get_mapped_range();
+            // The shaders store `pack4x8unorm(r, g, b, a)` — r in the
+            // low byte. Repack to the facade's `0x00RRGGBB`.
+            data.chunks_exact(4)
+                .map(|px| {
+                    let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+                    let (r, g, b) = (v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff);
+                    (r << 16) | (g << 8) | b
+                })
+                .collect()
+        };
+        staging.unmap();
+        Some((pixels, w, h))
     }
 
     /// World-space view-ray direction (un-normalised) for window pixel

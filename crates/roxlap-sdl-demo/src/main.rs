@@ -30,7 +30,7 @@ use raw_window_handle::{
 };
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Camera;
-use roxlap_render::{FrameParams, RenderOptions, SceneRenderer};
+use roxlap_render::{BackendPreference, FrameParams, RenderOptions, SceneRenderer};
 use roxlap_scene::{GridTransform, Scene};
 
 use sdl2::event::{Event, WindowEvent};
@@ -235,9 +235,14 @@ fn main() -> Result<(), String> {
         display: window.display_handle().map_err(|e| e.to_string())?.as_raw(),
     });
 
-    let want_gpu = std::env::var_os("ROXLAP_GPU").is_some_and(|v| v != "0" && !v.is_empty());
+    // QE.7b - BackendPreference replaces want_gpu.
+    let backend = if std::env::var_os("ROXLAP_GPU").is_some_and(|v| v != "0" && !v.is_empty()) {
+        BackendPreference::PreferGpu
+    } else {
+        BackendPreference::Cpu
+    };
     let opts = RenderOptions {
-        want_gpu,
+        backend,
         clear_sky: SKY,
         ..RenderOptions::default()
     };

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — QE.7a: GPU frame capture + capability probing
+
+- **Screenshots now work on the GPU backend** —
+  `SceneRenderer::request_capture` / `take_capture` implement a
+  blocking colour readback of the most recent frame at the logical
+  resolution (post-SSAA/posterize, pre-upscale), closing the biggest
+  backend-parity gap (photo modes, bug reports, golden tests ran
+  CPU-only before). Hotkey-grade cost, like `pick_depth`; returns
+  `None` on the wasm GPU path (WebGPU can't block).
+- **`SceneRenderer::supports(Feature)`** — the queryable form of the
+  CPU/GPU parity table (capture, sky panorama, sprite carve,
+  translucent sprite/terrain materials, free-vs-blocking pick), which
+  previously lived in scattered doc sentences and tribal knowledge.
+  The table itself is on the `Feature` docs.
+
+### Changed — **breaking** (QE.7b): API wart batch
+
+| Was | Now | Migration |
+|---|---|---|
+| `RenderOptions.want_gpu: bool` | `backend: BackendPreference` | `true` → `PreferGpu`, `false` → `Cpu`; **new**: `RequireGpu` fails construction (`RenderError::GpuInit`) instead of silently software-rendering — for CI/benchmark rigs |
+| `speed_q8: i32` (6 signatures + `BillboardActorDef.speed_q8`) | `speed: f32` (`1.0` = authored rate) | `speed = speed_q8 as f32 / 256.0`; clip clocks keep Q8 internally, `.rkc`'s on-disk `ClipPlayback.speed_q8` is unchanged (wire format) |
+| `set_sprite_instance_shadow_flags(id, true, false)` | takes `ShadowFlags { casts, receives }` | wrap the bools; `ShadowFlags::default()` = both on (the spawn default). `BillboardActorDef.{casts_shadow, receives_shadow}` merged into `shadows: ShadowFlags` |
+| `get_clip_instance_frame` | `clip_instance_frame` | the only `get_` prefix in the crate; deprecated forwarding shim kept for one minor release |
+| `ActorState.name: &'static str` | `String` | `.to_owned()` at literals; actor definitions can now come from data files without `Box::leak` |
+
+Still deferred (tracked in `docs/porting/PORTING-QUALITY.md`): the
+`PackedColor` newtype family, generational `ImageId`, splitting
+`set_sprites`' all-family reset, collapsing the `_with_materials`
+method variants, a `Frame` guard for the render/present protocol, and
+a typed `BakeMode` for `Grid::bake_lightmode`.
+
 ### Added — QE.6: MagicaVoxel import + hostile-input hardening
 
 - **MagicaVoxel `.vox` importer** (`roxlap_formats::vox`, QE.6a) —

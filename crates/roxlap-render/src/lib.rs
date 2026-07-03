@@ -745,11 +745,34 @@ pub struct BillboardActorId {
 /// increasing counter-clockwise.
 pub struct ActorState {
     /// State name [`SceneRenderer::set_actor_state`] selects by
-    /// (e.g. `"walk"`, `"attack"`).
-    pub name: &'static str,
+    /// (e.g. `"walk"`, `"attack"`). Owned since QE.7b, so actor
+    /// definitions can come from data files (monster definitions
+    /// loaded at runtime) without `Box::leak`.
+    pub name: String,
     /// One clip per view direction, counter-clockwise from "facing the
     /// viewer" — 1 (billboard), 4, or 8 entries.
     pub dirs: Vec<VoxelClipId>,
+}
+
+/// How a sprite instance participates in dynamic-light shadows
+/// (QE.7b — replaces the unreadable
+/// `set_sprite_instance_shadow_flags(id, true, false)` bool pair).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ShadowFlags {
+    /// The instance's voxels block dynamic-light shadow rays.
+    pub casts: bool,
+    /// Terrain / other-caster shadows darken the instance's voxels.
+    pub receives: bool,
+}
+
+impl Default for ShadowFlags {
+    /// Both on — the participating default every spawn starts with.
+    fn default() -> Self {
+        Self {
+            casts: true,
+            receives: true,
+        }
+    }
 }
 
 /// Recipe for [`add_billboard_actor`](SceneRenderer::add_billboard_actor).
@@ -761,12 +784,12 @@ pub struct BillboardActorDef {
     pub mode: BillboardMode,
     /// Shading-normal mode (BB.2b; default [`BillboardLighting::FaceNormal`]).
     pub lighting: BillboardLighting,
-    /// Playback rate of the state animation, Q8 (256 = 1×).
-    pub speed_q8: i32,
-    /// Whether the actor's voxels block dynamic-light shadow rays.
-    pub casts_shadow: bool,
-    /// Whether terrain shadows darken the actor's voxels.
-    pub receives_shadow: bool,
+    /// Playback rate of the state animation (`1.0` = authored speed,
+    /// negative = reverse). QE.7b — was Q8 fixed point (`speed_q8:
+    /// 256`); migrate with `speed = speed_q8 as f32 / 256.0`.
+    pub speed: f32,
+    /// Shadow participation for the actor's voxels.
+    pub shadows: ShadowFlags,
 }
 
 impl Default for BillboardActorDef {
@@ -775,11 +798,17 @@ impl Default for BillboardActorDef {
             states: Vec::new(),
             mode: BillboardMode::Cylindrical,
             lighting: BillboardLighting::FaceNormal,
-            speed_q8: 256,
-            casts_shadow: true,
-            receives_shadow: true,
+            speed: 1.0,
+            shadows: ShadowFlags::default(),
         }
     }
+}
+
+/// QE.7b — the public API speaks `f32` speed (`1.0` = authored rate);
+/// the clip clocks keep their Q8 fixed-point internals.
+#[allow(clippy::cast_possible_truncation)]
+fn speed_to_q8(speed: f32) -> i32 {
+    (speed * 256.0).round() as i32
 }
 
 /// A live directional billboard: one clip instance whose directional clip is
@@ -796,7 +825,8 @@ struct BillboardActor {
     clock: ClipClock,
     /// The directional clip currently shown, to avoid redundant clip swaps.
     showing: Option<VoxelClipId>,
-    speed_q8: i32,
+    /// The def's playback rate, kept for state-switch clock rebuilds.
+    speed: f32,
 }
 
 impl BillboardActor {
@@ -1172,35 +1202,101 @@ pub enum Backend {
     Gpu,
 }
 
+/// A backend-dependent capability, probed via
+/// [`SceneRenderer::supports`] (QE.7a). Every method below the parity
+/// line degrades to a silent no-op on the unsupporting backend; this
+/// enum turns the tribal knowledge into a queryable answer.
+///
+/// | Feature | CPU | GPU |
+/// |---|---|---|
+/// | [`Capture`](Self::Capture) | ✅ | ✅ native (❌ wasm — WebGPU can't block) |
+/// | [`SkyPanorama`](Self::SkyPanorama) | ❌ (use [`FrameParams::sky`]) | ✅ |
+/// | [`CarveActiveSprite`](Self::CarveActiveSprite) | ❌ | ✅ |
+/// | [`TranslucentSpriteMaterials`](Self::TranslucentSpriteMaterials) | ✅ | ❌ (owed: TV.3b) |
+/// | [`TranslucentTerrain`](Self::TranslucentTerrain) | ✅ | ❌ (owed: TV.6) |
+/// | [`FreePickDepth`](Self::FreePickDepth) | ✅ | ❌ (blocking readback) |
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Feature {
+    /// [`SceneRenderer::request_capture`] / `take_capture` produce
+    /// frames.
+    Capture,
+    /// [`SceneRenderer::set_sky_panorama`] uploads a sampled sky (the
+    /// CPU backend samples [`FrameParams::sky`] instead).
+    SkyPanorama,
+    /// [`SceneRenderer::carve_active_sprite`] carves.
+    CarveActiveSprite,
+    /// Per-voxel / per-instance **sprite** materials composite
+    /// translucently (an unsupporting backend renders them opaque).
+    TranslucentSpriteMaterials,
+    /// [`SceneRenderer::set_terrain_materials`] terrain translucency
+    /// composites (an unsupporting backend renders terrain opaque).
+    TranslucentTerrain,
+    /// [`SceneRenderer::pick_depth`] is cheap enough for per-frame use
+    /// (an in-memory read). Unsupporting = it works but **blocks** on
+    /// a device readback — hotkey-grade, not reticle-grade.
+    FreePickDepth,
+}
+
+/// Which backend [`SceneRenderer::try_new`] should build (QE.7b —
+/// replaces `RenderOptions.want_gpu: bool`, which couldn't express
+/// "GPU or fail": headless CI rigs and benchmarks silently fell back
+/// to a software render and measured the wrong thing).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BackendPreference {
+    /// The CPU renderer, unconditionally (the pre-QE.7 `want_gpu:
+    /// false`). The default.
+    #[default]
+    Cpu,
+    /// Try the GPU; fall back to CPU with a logged `warn` when WGPU
+    /// init fails (the pre-QE.7 `want_gpu: true`).
+    PreferGpu,
+    /// GPU or [`RenderError::GpuInit`] — no silent software fallback.
+    /// (The wasm constructor has no `Result` channel and treats this
+    /// as [`PreferGpu`](Self::PreferGpu).)
+    RequireGpu,
+}
+
 /// Construction failure from [`SceneRenderer::try_new`] (QE.2b).
 ///
-/// The facade tries the GPU backend (when asked), then the CPU
-/// backend; `try_new` fails only when the **last-resort** CPU software
-/// surface can't be created either. A GPU-only failure is not an
-/// error — it logs a `warn` and falls back.
+/// Under [`BackendPreference::PreferGpu`] a GPU failure is not an
+/// error (it logs a `warn` and falls back to CPU); `try_new` fails
+/// when the last-resort CPU surface can't be created, or when
+/// [`BackendPreference::RequireGpu`] couldn't get its GPU.
 #[derive(Debug)]
 pub enum RenderError {
     /// The CPU backend couldn't bind its software present surface
     /// (softbuffer context/surface creation failed — e.g. a broken or
     /// unsupported display connection).
     CpuSurface(String),
+    /// [`BackendPreference::RequireGpu`] and WGPU init failed (QE.7b).
+    GpuInit(GpuInitError),
 }
 
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CpuSurface(msg) => write!(f, "CPU present surface init failed: {msg}"),
+            Self::GpuInit(e) => write!(f, "GPU init failed (RequireGpu, no fallback): {e}"),
         }
     }
 }
 
-impl std::error::Error for RenderError {}
+impl std::error::Error for RenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::GpuInit(e) => Some(e),
+            Self::CpuSurface(_) => None,
+        }
+    }
+}
 
 /// Construction-time options for [`SceneRenderer::new`].
 pub struct RenderOptions {
-    /// Try the GPU backend first. When `false`, or when GPU init
-    /// fails, the renderer uses the CPU backend.
-    pub want_gpu: bool,
+    /// Which backend to build (QE.7b — replaces `want_gpu: bool`;
+    /// migrate `want_gpu: true` → [`BackendPreference::PreferGpu`],
+    /// `false` → [`BackendPreference::Cpu`]).
+    pub backend: BackendPreference,
     /// Settings forwarded to [`roxlap_gpu::GpuRenderer`] when the GPU
     /// backend is selected.
     pub gpu: GpuRendererSettings,
@@ -1255,7 +1351,7 @@ pub struct RenderOptions {
 impl Default for RenderOptions {
     fn default() -> Self {
         Self {
-            want_gpu: false,
+            backend: BackendPreference::Cpu,
             gpu: GpuRendererSettings::default(),
             clear_sky: 0x0099_b3d9,
             gpu_mip_scan_dist: 64.0,
@@ -1593,17 +1689,19 @@ impl SceneRenderer {
     /// explicitly keeps the facade decoupled from any one windowing
     /// library's size API.
     ///
-    /// Selects the GPU backend when `opts.want_gpu` and WGPU
-    /// initialises; otherwise the CPU backend (the GPU failure is
-    /// logged at `warn` through the [`log`] facade — install a logger
-    /// like `env_logger` to see why a machine is software-rendering).
-    /// Fails only when even the **CPU** software surface can't be
-    /// created (QE.2b; previously that case was a hidden panic behind
-    /// a "never fails" doc).
+    /// Builds the backend [`opts.backend`](RenderOptions::backend)
+    /// asks for. Under [`BackendPreference::PreferGpu`] a WGPU-init
+    /// failure falls back to the CPU backend with a `warn` through
+    /// the [`log`] facade (install a logger like `env_logger` to see
+    /// why a machine is software-rendering);
+    /// [`BackendPreference::RequireGpu`] turns that failure into an
+    /// error instead (QE.7b — headless CI / benchmark rigs must not
+    /// silently measure a software render).
     ///
     /// # Errors
     /// [`RenderError::CpuSurface`] — the last-resort softbuffer
-    /// context/surface couldn't bind to `window`.
+    /// context/surface couldn't bind to `window`;
+    /// [`RenderError::GpuInit`] — `RequireGpu` and WGPU init failed.
     ///
     /// [`raw-window-handle`]: raw_window_handle
     #[cfg(not(target_arch = "wasm32"))]
@@ -1615,9 +1713,12 @@ impl SceneRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
     {
-        if opts.want_gpu {
+        if opts.backend != BackendPreference::Cpu {
             match GpuBackend::new(window.clone(), size, opts) {
                 Ok(g) => return Ok(Self::from_backend(BackendImpl::Gpu(Box::new(g)))),
+                Err(e) if opts.backend == BackendPreference::RequireGpu => {
+                    return Err(RenderError::GpuInit(e));
+                }
                 Err(e) => {
                     log::warn!("GPU init failed ({e}); falling back to the CPU renderer");
                 }
@@ -1654,7 +1755,9 @@ impl SceneRenderer {
     /// Async because the browser drives wgpu's adapter/device requests
     /// through its event loop — `await` it inside a
     /// `wasm_bindgen_futures::spawn_local` task. Selects the GPU
-    /// (WebGPU) backend when `opts.want_gpu` and WebGPU is available;
+    /// (WebGPU) backend when `opts.backend` asks for GPU and WebGPU is
+    /// available (`RequireGpu` degrades to `PreferGpu` here — no
+    /// `Result` channel in the async wasm constructor);
     /// otherwise (no WebGPU, or init failed) it falls back to the CPU
     /// opticast path presented through a WebGL2 blit on the same canvas.
     /// **Never fails** — the message is logged to the browser console.
@@ -1664,7 +1767,7 @@ impl SceneRenderer {
         size: (u32, u32),
         opts: &RenderOptions,
     ) -> Self {
-        if opts.want_gpu {
+        if opts.backend != BackendPreference::Cpu {
             // `SurfaceTarget::Canvas` moves the canvas into wgpu, so the
             // GPU attempt gets a clone — the CPU fallback keeps the
             // original if WebGPU init fails.
@@ -1689,6 +1792,26 @@ impl SceneRenderer {
         match self.inner {
             BackendImpl::Cpu(_) => Backend::Cpu,
             BackendImpl::Gpu(_) => Backend::Gpu,
+        }
+    }
+
+    /// Whether the active backend supports `feature` (QE.7a) — the
+    /// queryable form of the parity table on [`Feature`]. Methods on
+    /// the "❌" side stay callable and degrade to documented no-ops;
+    /// use this to pick a strategy up front (e.g. photo mode: capture
+    /// vs "not available on this platform").
+    #[must_use]
+    pub fn supports(&self, feature: Feature) -> bool {
+        let gpu = matches!(self.inner, BackendImpl::Gpu(_));
+        match feature {
+            Feature::Capture => {
+                // GPU capture is a blocking readback — native only.
+                !gpu || cfg!(not(target_arch = "wasm32"))
+            }
+            Feature::SkyPanorama | Feature::CarveActiveSprite => gpu,
+            Feature::TranslucentSpriteMaterials
+            | Feature::TranslucentTerrain
+            | Feature::FreePickDepth => !gpu,
         }
     }
 
@@ -2490,28 +2613,35 @@ impl SceneRenderer {
         }
     }
 
-    /// Toggle a sprite/clip instance's shadow participation **live** (XS.4
-    /// flags, BB.3): whether it **casts** a shadow onto the world and whether
-    /// it **receives** shadows. Both default on at spawn. The per-instance
-    /// counterpart to the template-level `Sprite::with_casts_shadow` /
-    /// `with_receives_shadow` — e.g. a flat additive glow billboard that
-    /// should not cast, or a UI marker that ignores shadows. Other flag bits
-    /// are preserved. No-op on a stale id.
-    pub fn set_sprite_instance_shadow_flags(
-        &mut self,
-        id: SpriteInstanceId,
-        casts: bool,
-        receives: bool,
-    ) {
+    /// Toggle a sprite/clip instance's shadow participation **live**
+    /// (XS.4 flags, BB.3). [`ShadowFlags::default`] (both on) is what
+    /// every spawn starts with. The per-instance counterpart to the
+    /// template-level `Sprite::with_casts_shadow` /
+    /// `with_receives_shadow` — e.g. a flat additive glow billboard
+    /// that should not cast, or a UI marker that ignores shadows.
+    /// Other flag bits are preserved. No-op on a stale id.
+    ///
+    /// QE.7b — takes [`ShadowFlags`] instead of the old unreadable
+    /// `(id, true, false)` bool pair; migrate with
+    /// `ShadowFlags { casts, receives }`.
+    pub fn set_sprite_instance_shadow_flags(&mut self, id: SpriteInstanceId, shadows: ShadowFlags) {
         let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
             return;
         };
         match &mut self.inner {
             BackendImpl::Cpu(c) => {
-                c.set_dyn_instance_shadow_flags(dyn_index as usize, casts, receives);
+                c.set_dyn_instance_shadow_flags(
+                    dyn_index as usize,
+                    shadows.casts,
+                    shadows.receives,
+                );
             }
             BackendImpl::Gpu(g) => {
-                g.set_dyn_instance_shadow_flags(dyn_index as usize, casts, receives);
+                g.set_dyn_instance_shadow_flags(
+                    dyn_index as usize,
+                    shadows.casts,
+                    shadows.receives,
+                );
             }
         }
     }
@@ -2782,7 +2912,7 @@ impl SceneRenderer {
 
     /// Build a [`ClipClock`] seeded from `clip`'s timeline (durations + loop
     /// mode), or an empty/looping clock if `clip` is `None`/stale.
-    fn clock_for_clip(&self, clip: Option<VoxelClipId>, speed_q8: i32) -> ClipClock {
+    fn clock_for_clip(&self, clip: Option<VoxelClipId>, speed: f32) -> ClipClock {
         let (durations, loop_mode) = clip.and_then(|c| self.clip_map.index(c)).map_or_else(
             || (Vec::new(), LoopMode::Loop),
             |ci| {
@@ -2792,7 +2922,7 @@ impl SceneRenderer {
                 )
             },
         );
-        ClipClock::new(&durations, loop_mode, speed_q8, 0.0)
+        ClipClock::new(&durations, loop_mode, speed_to_q8(speed), 0.0)
     }
 
     /// Register a high-level **directional billboard actor** (BB.4): the
@@ -2824,9 +2954,9 @@ impl SceneRenderer {
             ..Default::default()
         };
         let inst = self.add_clip_instance_posed(init_clip, xf)?;
-        self.set_sprite_instance_shadow_flags(inst, def.casts_shadow, def.receives_shadow);
+        self.set_sprite_instance_shadow_flags(inst, def.shadows);
         self.set_sprite_instance_lighting(inst, def.lighting);
-        let clock = self.clock_for_clip(Some(init_clip), def.speed_q8);
+        let clock = self.clock_for_clip(Some(init_clip), def.speed);
         let actor = BillboardActor {
             inst,
             states: def.states,
@@ -2836,7 +2966,7 @@ impl SceneRenderer {
             mode: def.mode,
             clock,
             showing: None,
-            speed_q8: def.speed_q8,
+            speed: def.speed,
         };
         let index = self.billboard_actors.len() as u32;
         self.billboard_actors.push(Some(actor));
@@ -2858,7 +2988,7 @@ impl SceneRenderer {
             return false;
         };
         let rep = a.states[state_idx].dirs.first().copied();
-        let speed = a.speed_q8;
+        let speed = a.speed;
         let clock = self.clock_for_clip(rep, speed);
         let a = self.billboard_actors[idx].as_mut().unwrap();
         a.cur_state = state_idx;
@@ -3011,10 +3141,18 @@ impl SceneRenderer {
     /// Which frame a clip instance is currently showing (the timeline
     /// scrubber's read-back), or `None` if `id` isn't a live clip instance.
     #[must_use]
-    pub fn get_clip_instance_frame(&self, id: SpriteInstanceId) -> Option<u32> {
+    pub fn clip_instance_frame(&self, id: SpriteInstanceId) -> Option<u32> {
         let dyn_index = self.dyn_map.dyn_index(id)? as usize;
         let (_, frame) = (*self.state.dyn_clip.get(dyn_index)?)?;
         u32::try_from(frame).ok()
+    }
+
+    /// QE.7b — renamed: this was the only `get_`-prefixed method in
+    /// the crate. Forwarding shim for one minor release.
+    #[deprecated(since = "0.22.0", note = "renamed to `clip_instance_frame`")]
+    #[must_use]
+    pub fn get_clip_instance_frame(&self, id: SpriteInstanceId) -> Option<u32> {
+        self.clip_instance_frame(id)
     }
 
     /// Re-upload a **single** `frame` of registered clip `id` in place — the
@@ -3191,15 +3329,17 @@ impl SceneRenderer {
     /// facade tracks a playback clock so a single
     /// [`advance_voxel_clips`](Self::advance_voxel_clips) call advances every
     /// such instance — no per-frame `frame_at` + `set_clip_instance_frame`
-    /// bookkeeping in the host. `speed_q8` is the Q8 playback rate (`256` =
-    /// 1×); `start_phase_ms` offsets the clock (stagger copies of one clip).
-    /// Returns `None` — spawning nothing, registering no player — on a
-    /// stale/removed `clip` (QE.1c; previously a silent sentinel id).
+    /// bookkeeping in the host. `speed` is the playback rate (`1.0` =
+    /// authored speed, negative = reverse; QE.7b - was Q8, migrate with
+    /// `speed_q8 as f32 / 256.0`); `start_phase_ms` offsets the clock
+    /// (stagger copies of one clip). Returns `None` — spawning nothing,
+    /// registering no player — on a stale/removed `clip` (QE.1c;
+    /// previously a silent sentinel id).
     pub fn add_clip_instance_playing(
         &mut self,
         clip: VoxelClipId,
         xf: DynSpriteTransform,
-        speed_q8: i32,
+        speed: f32,
         start_phase_ms: u32,
     ) -> Option<SpriteInstanceId> {
         let clip_index = self.clip_map.index(clip)?;
@@ -3207,7 +3347,7 @@ impl SceneRenderer {
         let clock = ClipClock::new(
             &meta.durations,
             meta.loop_mode,
-            speed_q8,
+            speed_to_q8(speed),
             f64::from(start_phase_ms),
         );
         let inst = self.add_clip_instance_posed(clip, xf)?;
@@ -3233,12 +3373,8 @@ impl SceneRenderer {
     /// [`set_streaming_clip_speed`](Self::set_streaming_clip_speed) /
     /// [`set_streaming_clip_clock_ms`](Self::set_streaming_clip_clock_ms), the
     /// per-clip analogues of the flipbook `set_clip_instance_*` methods.
-    pub fn play_streaming_clip(
-        &mut self,
-        clip: StreamingClipId,
-        speed_q8: i32,
-        start_phase_ms: u32,
-    ) {
+    /// `speed` is the playback rate (`1.0` = authored; QE.7b - was Q8).
+    pub fn play_streaming_clip(&mut self, clip: StreamingClipId, speed: f32, start_phase_ms: u32) {
         let Some(idx) = self.streaming_map.index(clip) else {
             return;
         };
@@ -3248,7 +3384,7 @@ impl SceneRenderer {
         let clock = ClipClock::new(
             state.cursor.durations(),
             state.cursor.loop_mode(),
-            speed_q8,
+            speed_to_q8(speed),
             f64::from(start_phase_ms),
         );
         self.clip_players.push(ClipPlayer {
@@ -3326,11 +3462,12 @@ impl SceneRenderer {
             .map(|p| p.paused)
     }
 
-    /// Set the playback speed (Q8: `256` = 1×, negative = reverse) of clip
-    /// instance `id`'s auto-player. No-op if `id` has no player.
-    pub fn set_clip_instance_speed(&mut self, id: SpriteInstanceId, speed_q8: i32) {
+    /// Set the playback speed (`1.0` = authored rate, negative =
+    /// reverse; QE.7b — was Q8) of clip instance `id`'s auto-player.
+    /// No-op if `id` has no player.
+    pub fn set_clip_instance_speed(&mut self, id: SpriteInstanceId, speed: f32) {
         if let Some(p) = self.flipbook_player_mut(id) {
-            p.clock.speed_q8 = speed_q8;
+            p.clock.speed_q8 = speed_to_q8(speed);
         }
     }
 
@@ -3386,11 +3523,12 @@ impl SceneRenderer {
             .map(|p| p.paused)
     }
 
-    /// Set the playback speed (Q8: `256` = 1×, negative = reverse) of
-    /// streaming clip `clip`'s auto-player. No-op if `clip` has no player.
-    pub fn set_streaming_clip_speed(&mut self, clip: StreamingClipId, speed_q8: i32) {
+    /// Set the playback speed (`1.0` = authored rate, negative =
+    /// reverse; QE.7b — was Q8) of streaming clip `clip`'s
+    /// auto-player. No-op if `clip` has no player.
+    pub fn set_streaming_clip_speed(&mut self, clip: StreamingClipId, speed: f32) {
         if let Some(p) = self.streaming_player_mut(clip) {
-            p.clock.speed_q8 = speed_q8;
+            p.clock.speed_q8 = speed_to_q8(speed);
         }
     }
 
@@ -3681,21 +3819,31 @@ impl SceneRenderer {
         }
     }
 
-    /// Request that the next [`render`](Self::render) capture its
-    /// framebuffer for [`take_capture`](Self::take_capture). CPU only
-    /// (the GPU swapchain isn't read back) — a no-op on GPU.
+    /// Request that a frame be captured for
+    /// [`take_capture`](Self::take_capture) — screenshots, photo
+    /// modes, golden tests. Works on **both** backends since QE.7a
+    /// (previously a GPU no-op — screenshots were impossible on the
+    /// backend most games run). CPU: the next
+    /// [`render`](Self::render) copies its composited framebuffer.
+    /// GPU: arms [`take_capture`](Self::take_capture) to read back the
+    /// most recent frame.
     pub fn request_capture(&mut self) {
-        if let BackendImpl::Cpu(c) = &mut self.inner {
-            c.request_capture();
+        match &mut self.inner {
+            BackendImpl::Cpu(c) => c.request_capture(),
+            BackendImpl::Gpu(g) => g.request_capture(),
         }
     }
 
-    /// Take the most recently captured frame as packed `0x00RRGGBB`
-    /// pixels + dimensions, or `None` if no capture is ready / GPU.
+    /// Take the captured frame as packed `0x00RRGGBB` pixels +
+    /// dimensions (the **logical** resolution on GPU —
+    /// post-SSAA/posterize, pre-upscale), or `None` if no capture was
+    /// requested / nothing rendered yet. The GPU readback blocks like
+    /// [`pick_depth`](Self::pick_depth) — a hotkey path, not
+    /// per-frame — and returns `None` on wasm (WebGPU can't block).
     pub fn take_capture(&mut self) -> Option<(Vec<u32>, u32, u32)> {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.take_capture(),
-            BackendImpl::Gpu(_) => None,
+            BackendImpl::Gpu(g) => g.take_capture(),
         }
     }
 
@@ -4234,7 +4382,7 @@ mod tests {
     #[test]
     fn options_default_is_cpu_intent() {
         let o = RenderOptions::default();
-        assert!(!o.want_gpu);
+        assert_eq!(o.backend, BackendPreference::Cpu);
         assert_eq!(o.clear_sky & 0xFF00_0000, 0, "clear_sky is 0x00RRGGBB");
     }
 

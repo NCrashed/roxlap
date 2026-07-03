@@ -147,6 +147,9 @@ pub(crate) struct GpuBackend {
     /// `ROXLAP_GPU_MIP_SCAN_DIST` overrides at construction) instead of
     /// arriving through every `FrameParams`.
     mip_scan_dist: f32,
+    /// QE.7a - armed by `request_capture`; `take_capture` then reads
+    /// back the most recent frame (and disarms).
+    capture_armed: bool,
 }
 
 /// What the GPU resident has synced from one grid (QE.3b): the
@@ -235,6 +238,7 @@ impl GpuBackend {
             image_pixels: Vec::new(),
             transforms_dirty: false,
             mip_scan_dist: env_f32("ROXLAP_GPU_MIP_SCAN_DIST").unwrap_or(opts.gpu_mip_scan_dist),
+            capture_armed: false,
         }
     }
 
@@ -790,6 +794,30 @@ impl GpuBackend {
         }
         self.gpu
             .update_sprite_instance_transforms(&self.sprite_instances);
+    }
+
+    /// QE.7a — arm the next [`Self::take_capture`].
+    pub(crate) fn request_capture(&mut self) {
+        self.capture_armed = true;
+    }
+
+    /// QE.7a — blocking colour readback of the most recent frame at
+    /// the logical resolution, `0x00RRGGBB`. `None` when not armed via
+    /// [`Self::request_capture`], before the first render, or on wasm
+    /// (WebGPU's poll can't block the browser thread).
+    pub(crate) fn take_capture(&mut self) -> Option<(Vec<u32>, u32, u32)> {
+        if !self.capture_armed {
+            return None;
+        }
+        self.capture_armed = false;
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.gpu.read_frame_pixels()
+        }
     }
 
     /// Carve the next z-layer off the carve model, rebuild its LOD

@@ -25,7 +25,7 @@ use std::time::Instant;
 use glam::{DVec3, IVec3};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Camera;
-use roxlap_render::{FrameParams, RenderOptions, SceneRenderer};
+use roxlap_render::{BackendPreference, FrameParams, RenderOptions, SceneRenderer};
 use roxlap_scene::{GridTransform, Scene};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -74,9 +74,15 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
         let size = window.inner_size();
-        let want_gpu = std::env::var_os("ROXLAP_GPU").map_or(true, |v| v != "0");
+        // QE.7b - BackendPreference replaces want_gpu; the demos prefer
+        // GPU with automatic CPU fallback.
+        let backend = if std::env::var_os("ROXLAP_GPU").map_or(true, |v| v != "0") {
+            BackendPreference::PreferGpu
+        } else {
+            BackendPreference::Cpu
+        };
         let opts = RenderOptions {
-            want_gpu,
+            backend,
             clear_sky: SKY,
             ..RenderOptions::default()
         };

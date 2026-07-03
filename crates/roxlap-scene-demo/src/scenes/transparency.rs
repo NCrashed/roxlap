@@ -240,7 +240,7 @@ impl DemoScene for TransparencyScene {
             &[(GLASS_RGB & 0x00ff_ffff, MAT_GLASS)],
         );
         let _orb_inst =
-            r.add_clip_instance_playing(orb_clip, Self::pose([45.0, 70.0, 40.0]), 256, 0);
+            r.add_clip_instance_playing(orb_clip, Self::pose([45.0, 70.0, 40.0]), 1.0, 0);
 
         // Volumetric (Beer–Lambert) fog cloud: a *filled* grey sphere mapped
         // per voxel to MAT_FOG, so its core reads denser than its rim — the

@@ -27,7 +27,7 @@ use glam::{DVec3, IVec3};
 use roxlap_render::{
     gif_import::{voxel_clip_from_gif, GifImportOpts},
     ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode,
-    DirectionalLight, LightRig, SpriteInstanceId, VoxelClipId,
+    DirectionalLight, LightRig, ShadowFlags, SpriteInstanceId, VoxelClipId,
 };
 use roxlap_scene::{GridTransform, Scene};
 use winit::keyboard::KeyCode;
@@ -173,19 +173,18 @@ impl DemoScene for DoomScene {
         let def = BillboardActorDef {
             states: vec![
                 ActorState {
-                    name: "walk",
+                    name: "walk".to_owned(),
                     dirs: walk,
                 },
                 ActorState {
-                    name: "idle",
+                    name: "idle".to_owned(),
                     dirs: idle,
                 },
             ],
             mode: BillboardMode::Cylindrical,
             lighting: BillboardLighting::FaceNormal,
-            speed_q8: 256,
-            casts_shadow: true,
-            receives_shadow: true,
+            speed: 1.0,
+            shadows: ShadowFlags::default(),
         };
         self.monster = ctx
             .renderer
@@ -197,16 +196,18 @@ impl DemoScene for DoomScene {
         let flame = Self::clip_from_frames(ctx, FLAME_W, FLAME_H, &flame_frames, 8);
         let fire_def = BillboardActorDef {
             states: vec![ActorState {
-                name: "burn",
+                name: "burn".to_owned(),
                 dirs: vec![flame],
             }],
             mode: BillboardMode::Cylindrical,
             // A flame is emissive — full-bright so it glows instead of being
             // dimmed by the scene's ambient/sun.
             lighting: BillboardLighting::FullBright,
-            speed_q8: 256,
-            casts_shadow: false,
-            receives_shadow: false,
+            speed: 1.0,
+            shadows: ShadowFlags {
+                casts: false,
+                receives: false,
+            },
         };
         ctx.renderer
             .add_billboard_actor(fire_def, [22.0, 86.0, f32::from(FLOOR_TOP_Z as u8)], 0.0);

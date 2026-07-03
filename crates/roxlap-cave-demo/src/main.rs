@@ -47,7 +47,8 @@ use roxlap_formats::edit::set_sphere_with_colfunc;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::vxl::Vxl;
 use roxlap_render::{
-    DynSpriteTransform, FrameParams, RenderOptions, SceneRenderer, SpriteInstanceId, SpriteModelId,
+    BackendPreference, DynSpriteTransform, FrameParams, RenderOptions, SceneRenderer,
+    SpriteInstanceId, SpriteModelId,
 };
 use roxlap_scene::cavegen::CaveChunkGenerator;
 use roxlap_scene::{ChunkGenerator, GridId, GridTransform, Scene, SpanOp, CHUNK_SIZE_XY};
@@ -622,9 +623,13 @@ impl ApplicationHandler for App {
 
         // `ROXLAP_GPU=1` selects the GPU backend; roxlap-render falls
         // back to the CPU path automatically on any wgpu init failure.
-        let want_gpu = std::env::var_os("ROXLAP_GPU").is_some_and(|v| v != "0" && !v.is_empty());
+        let backend = if std::env::var_os("ROXLAP_GPU").is_some_and(|v| v != "0" && !v.is_empty()) {
+            BackendPreference::PreferGpu
+        } else {
+            BackendPreference::Cpu
+        };
         let opts = RenderOptions {
-            want_gpu,
+            backend,
             ..RenderOptions::default()
         };
         let init_size = window.inner_size();

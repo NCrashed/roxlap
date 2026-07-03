@@ -240,7 +240,7 @@ impl DemoScene for LightingScene {
                 ctx.renderer.add_clip_instance_playing(
                     id,
                     Self::pose([(c.x + 22.0) as f32, c.y as f32, (c.z - 8.0) as f32]),
-                    256,
+                    1.0,
                     0,
                 );
             }

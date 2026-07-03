@@ -24,7 +24,8 @@ use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_NO_SHADING};
 use roxlap_formats::vxl;
 use roxlap_render::{
-    Backend, FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc, SpriteSet,
+    Backend, BackendPreference, FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc,
+    SpriteSet,
 };
 use roxlap_scene::{GridId, GridTransform, Scene};
 use wasm_bindgen::prelude::*;
@@ -547,7 +548,7 @@ async fn start() -> Result<(), JsValue> {
     let t_gen_end = perf.as_ref().map_or(0.0, web_sys::Performance::now);
 
     let opts = RenderOptions {
-        want_gpu: true,
+        backend: BackendPreference::PreferGpu,
         ..RenderOptions::default()
     };
     let renderer = SceneRenderer::new_from_canvas_async(canvas.clone(), (XRES, YRES), &opts).await;

@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use roxlap_core::{Camera, Engine, OpticastSettings};
-use roxlap_render::{Backend, FrameParams, RenderOptions, SceneRenderer};
+use roxlap_render::{Backend, BackendPreference, FrameParams, RenderOptions, SceneRenderer};
 use roxlap_scene::Scene;
 use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
@@ -415,7 +415,7 @@ async fn start() -> Result<(), JsValue> {
     // Prefer the WebGPU compute marcher; the facade falls back to the
     // CPU DDA path (presented via WebGL2) when WebGPU is absent.
     let opts = RenderOptions {
-        want_gpu: true,
+        backend: BackendPreference::PreferGpu,
         ..RenderOptions::default()
     };
     let renderer = SceneRenderer::new_from_canvas_async(canvas.clone(), (XRES, YRES), &opts).await;

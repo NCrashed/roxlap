@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use roxlap_core::Engine;
 use roxlap_render::{
-    Backend, DitherMode, PosterizeConfig, RenderOptions, RenderResolution, SceneRenderer, SpriteSet,
+    Backend, BackendPreference, DitherMode, PosterizeConfig, RenderOptions, RenderResolution,
+    SceneRenderer, SpriteSet,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -498,9 +499,14 @@ impl ApplicationHandler for Host {
                 .expect("winit: create_window"),
         );
 
-        let want_gpu = std::env::var_os("ROXLAP_GPU").is_some_and(|v| v != "0" && !v.is_empty());
+        // QE.7b - BackendPreference replaces want_gpu.
+        let backend = if std::env::var_os("ROXLAP_GPU").is_some_and(|v| v != "0" && !v.is_empty()) {
+            BackendPreference::PreferGpu
+        } else {
+            BackendPreference::Cpu
+        };
         let opts = RenderOptions {
-            want_gpu,
+            backend,
             ..RenderOptions::default()
         };
         let init = window.inner_size();
