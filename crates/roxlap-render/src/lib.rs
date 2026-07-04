@@ -53,6 +53,9 @@ mod gpu;
 /// Dynamic lighting types (stages DL + SL) — runtime sun, point and
 /// spot lights, on both backends.
 mod light;
+/// Particle system over dynamic sprite instances (stage PS) — see
+/// `docs/porting/PORTING-PARTICLES.md`.
+mod particles;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -66,6 +69,10 @@ use roxlap_formats::voxel_clip::{duration_prefix_sums, frame_at_prefix};
 use roxlap_scene::Scene;
 
 pub use light::{DirectionalLight, LightRig, PointLight, SpotLight};
+pub use particles::{
+    EmitterId, Particle, ParticleEmitterDef, ParticleSystem, SpawnMode, VelocityDef,
+    DEFAULT_MAX_PARTICLES,
+};
 pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 /// Animated-GIF → [`VoxelClip`] importer for Doom-style billboard sprites
 /// (stage BB). Behind the `gif` feature; see `PORTING-BILLBOARD.md`.

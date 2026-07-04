@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (PS.0): particle-system core — `roxlap_render::ParticleSystem`
+
+Stage PS opens (`docs/porting/PORTING-PARTICLES.md`): a host-owned
+particle layer built on the facade's dynamic sprite instances. PS.0 is
+the renderer-free simulation half — purely additive, no facade methods
+touched:
+
+- **`ParticleSystem`** — emitters + a budgeted particle pool with a
+  deterministic seeded RNG (in-module PCG32, no new dependency): same
+  seed + same `dt` sequence ⇒ bit-identical simulation.
+- **`ParticleEmitterDef`** (construct via `::new(model)` — no
+  `Default`, a def needs a live `SpriteModelId`): position,
+  `SpawnMode::{Rate, Burst, Manual}`, lifetime range, base velocity +
+  isotropic spread, gravity (+z is DOWN — gravity is positive z),
+  linear drag, uniform scale, trailing alpha fade, tint, TV material,
+  `BillboardLighting`, `ShadowFlags` (default **off** for particles).
+- **`EmitterId`** — epoch-generational like every other handle family;
+  stale handles are safe no-ops. `remove_emitter` retires: spawning
+  stops, in-flight particles live out their lifetimes.
+- **Budget** — `set_max_particles` (default 4096,
+  `DEFAULT_MAX_PARTICLES`); when full, spawns are *dropped* (never
+  evicts live particles) and `dropped_spawns()` counts them — no
+  silent cap.
+- `update(dt)` — semi-implicit Euler + age/fade, no renderer, no
+  window: unit-testable. The facade binding (`sync`) lands in PS.1;
+  until then `drain_dead_instances()` already exposes the ids a
+  custom renderer must free.
+
 ### Changed — internal (QE.8): roxlap-gpu de-monolithed
 
 - **Dead pipelines deleted** — `GpuRenderer::render_chunk` /
