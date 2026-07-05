@@ -65,12 +65,12 @@ back to the CPU path presented through WebGL2 — chapter 11).
 
 ## Capability parity: `supports()`
 
-A few features exist on one backend only — sky panoramas are
-GPU-only, terrain/sprite translucency is CPU-only for now, and so on.
-The methods involved stay callable everywhere and degrade to
-documented no-ops; `supports(Feature::..)` is the queryable form of
-that parity table, so you can pick a strategy at startup instead of
-discovering a no-op visually:
+A few features exist on one backend only — sky panoramas and sprite
+carving are GPU-only, free per-frame depth picks are CPU-only, and so
+on. The methods involved stay callable everywhere and degrade to
+documented no-ops (or documented costs); `supports(Feature::..)` is
+the queryable form of that parity table, so you can pick a strategy
+at startup instead of discovering a no-op visually:
 
 ```rust,noplayground
 {{#include ../../../crates/roxlap-render/examples/book_pipeline.rs:supports}}

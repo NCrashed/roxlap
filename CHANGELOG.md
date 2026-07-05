@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security / robustness (fuzzing)
+
+- New `cargo-fuzz` harnesses (`crates/roxlap-formats/fuzz`, 8 targets:
+  every parser + the scene-snapshot envelope) found two
+  crafted-input bugs, both fixed:
+  - `roxlap_formats::vxl::parse` — an unvalidated `vsid` reserved a
+    `vsid² + 1`-entry offset table before reading any column data
+    (capacity-overflow panic / multi-GB allocation). Rejected as the
+    new `ParseError::BadVsid` (every column needs ≥ 4 bytes, so
+    `vsid²` is bounded by the file size).
+  - `roxlap_formats::kfa::parse` — zero hinges + a crafted frame
+    count looped/allocated unboundedly (frame rows are 2 bytes ×
+    hinges, i.e. zero bytes — no read could fail). Rejected as the
+    new `ParseError::FramesWithoutHinges`.
+  - Migration: both `ParseError` enums gained a variant — exhaustive
+    `match`es on them need one new arm. Files rejected by the new
+    checks were never loadable (they crashed the process).
+
+### Fixed
+
+- `SceneRenderer::supports` reported `TranslucentSpriteMaterials` and
+  `TranslucentTerrain` as unsupported on the GPU backend. Both GPU
+  paths have existed (and been visually verified) since the TV stage
+  — TV.3 per-voxel sprite materials, TV.6 terrain accumulation; the
+  QE.7a parity table shipped stale. `supports` now returns `true` for
+  both on either backend; the `Feature` rustdoc table and the book's
+  lighting chapter are corrected to match. No behavioural change to
+  rendering itself — only the capability probe (hosts that branched
+  on it will now take their translucent path on GPU, which is what
+  they asked for).
+
 ## [0.22.0] — 2026-07-05
 
 Stage **PS** — the particle system (`roxlap_render::ParticleSystem`

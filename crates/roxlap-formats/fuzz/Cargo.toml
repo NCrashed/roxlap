@@ -1,0 +1,71 @@
+[package]
+name = "roxlap-formats-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+roxlap-formats = { path = ".." }
+# The snapshot envelope (bincode over attacker bytes) is the most
+# security-relevant surface of the lot.
+roxlap-scene = { path = "../../roxlap-scene" }
+
+# Detached from the parent workspace (see the root Cargo.toml
+# `exclude`): fuzz targets build with sanitizer flags + their own
+# profiles, which must not leak into the engine build.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "vox"
+path = "fuzz_targets/vox.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "kv6"
+path = "fuzz_targets/kv6.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "kvx"
+path = "fuzz_targets/kvx.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "vxl"
+path = "fuzz_targets/vxl.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "kfa"
+path = "fuzz_targets/kfa.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rvc"
+path = "fuzz_targets/rvc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rkc"
+path = "fuzz_targets/rkc.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "snapshot"
+path = "fuzz_targets/snapshot.rs"
+test = false
+doc = false

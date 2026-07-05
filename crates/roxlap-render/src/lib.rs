@@ -1223,8 +1223,8 @@ pub enum Backend {
 /// | [`Capture`](Self::Capture) | ✅ | ✅ native (❌ wasm — WebGPU can't block) |
 /// | [`SkyPanorama`](Self::SkyPanorama) | ❌ (use [`FrameParams::sky`]) | ✅ |
 /// | [`CarveActiveSprite`](Self::CarveActiveSprite) | ❌ | ✅ |
-/// | [`TranslucentSpriteMaterials`](Self::TranslucentSpriteMaterials) | ✅ | ❌ (owed: TV.3b) |
-/// | [`TranslucentTerrain`](Self::TranslucentTerrain) | ✅ | ❌ (owed: TV.6) |
+/// | [`TranslucentSpriteMaterials`](Self::TranslucentSpriteMaterials) | ✅ | ✅ (TV.3) |
+/// | [`TranslucentTerrain`](Self::TranslucentTerrain) | ✅ | ✅ (TV.6) |
 /// | [`FreePickDepth`](Self::FreePickDepth) | ✅ | ❌ (blocking readback) |
 #[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1820,9 +1820,12 @@ impl SceneRenderer {
                 !gpu || cfg!(not(target_arch = "wasm32"))
             }
             Feature::SkyPanorama | Feature::CarveActiveSprite => gpu,
-            Feature::TranslucentSpriteMaterials
-            | Feature::TranslucentTerrain
-            | Feature::FreePickDepth => !gpu,
+            // Translucency landed on BOTH backends in the TV stage
+            // (TV.3 sprites / TV.6 terrain, GPU visually verified);
+            // QE.7a shipped this table stale — saying `!gpu` — and the
+            // author re-confirmed the GPU paths before this fix.
+            Feature::TranslucentSpriteMaterials | Feature::TranslucentTerrain => true,
+            Feature::FreePickDepth => !gpu,
         }
     }
 

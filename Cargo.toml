@@ -33,6 +33,9 @@ default-members = [
     "crates/roxlap-web",
 ]
 resolver = "2"
+# The fuzz crate is its own workspace (sanitizer flags + fuzz
+# profiles must not leak into the engine build).
+exclude = ["crates/roxlap-formats/fuzz"]
 
 [workspace.package]
 version = "0.22.0"

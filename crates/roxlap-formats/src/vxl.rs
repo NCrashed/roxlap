@@ -1192,6 +1192,13 @@ pub enum ParseError {
     /// File total size > `u32::MAX`. The internal `column_offset`
     /// table uses `u32` because realistic maps fit comfortably.
     FileTooLarge { got: usize },
+    /// A `vsid` whose column table cannot fit the file: every column
+    /// needs at least a 4-byte slab header, so `vsid²` is bounded by
+    /// the column-data size. Also rejects `vsid == 0` and a `vsid²`
+    /// that overflows `usize` (32-bit targets). Fuzz finding — a
+    /// crafted vsid previously allocation-bombed the offset table
+    /// (`vsid²` u32s reserved before any data validation).
+    BadVsid { vsid: u32, data_len: usize },
 }
 
 impl fmt::Display for ParseError {
@@ -1219,6 +1226,10 @@ impl fmt::Display for ParseError {
                 f,
                 "vxl file size {got} exceeds {} bytes that this parser handles",
                 u32::MAX
+            ),
+            Self::BadVsid { vsid, data_len } => write!(
+                f,
+                "vxl vsid {vsid} is impossible for {data_len} bytes of column data"
             ),
         }
     }
@@ -1296,7 +1307,16 @@ pub fn parse(bytes: &[u8]) -> Result<Vxl, ParseError> {
     let data_start = cur.pos;
     let data: Box<[u8]> = bytes[data_start..].to_vec().into_boxed_slice();
 
-    let n_cols = (vsid as usize) * (vsid as usize);
+    // Fuzz hardening: bound `vsid` by the data actually present —
+    // every column consumes at least one 4-byte slab header — before
+    // reserving the `vsid² + 1`-entry offset table.
+    let n_cols = (vsid as usize)
+        .checked_mul(vsid as usize)
+        .filter(|&n| n != 0 && n <= data.len() / 4)
+        .ok_or(ParseError::BadVsid {
+            vsid,
+            data_len: data.len(),
+        })?;
     let mut column_offset = Vec::with_capacity(n_cols + 1);
     let mut pos = 0usize;
     for i in 0..n_cols {
@@ -1410,6 +1430,33 @@ mod tests {
     use flate2::read::GzDecoder;
 
     use super::*;
+
+    /// Fuzz regression (2026-07-06): a crafted header with
+    /// `vsid = 0xa5a5a5a5` reserved a `vsid² + 1`-entry offset table
+    /// before validating anything — a capacity-overflow panic /
+    /// allocation bomb. Must fail as `BadVsid`, and `vsid == 0` too.
+    #[test]
+    fn crafted_vsid_is_rejected_not_alloced() {
+        let mut bytes = MAGIC.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&0xa5a5_a5a5u32.to_le_bytes()); // xdim
+        bytes.extend_from_slice(&0xa5a5_a5a5u32.to_le_bytes()); // ydim
+        bytes.extend_from_slice(&[0u8; 96]); // camera doubles
+        bytes.extend_from_slice(&[0xff; 43]); // "column data"
+        assert!(matches!(
+            parse(&bytes),
+            Err(ParseError::BadVsid {
+                vsid: 0xa5a5_a5a5,
+                ..
+            })
+        ));
+
+        let mut zero = MAGIC.to_le_bytes().to_vec();
+        zero.extend_from_slice(&[0u8; 104]);
+        assert!(matches!(
+            parse(&zero),
+            Err(ParseError::BadVsid { vsid: 0, .. })
+        ));
+    }
 
     /// Gzipped `oracle.vxl` produced by voxlaptest's oracle binary
     /// (run with `ROXLAP_SAVE_VXL=oracle.vxl`). At VSID = 2048 the raw

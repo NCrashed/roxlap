@@ -7,3 +7,9 @@
 
 # Local hashes
 roxlap-hashes.txt
+
+# cargo-fuzz build output + evolving corpora (crash regressions are
+# pinned as unit tests in the parsers instead)
+/crates/roxlap-formats/fuzz/target/
+/crates/roxlap-formats/fuzz/corpus/
+/crates/roxlap-formats/fuzz/artifacts/

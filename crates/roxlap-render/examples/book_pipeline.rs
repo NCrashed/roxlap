@@ -161,8 +161,10 @@ impl ApplicationHandler for App {
             ),
             Backend::Cpu => log::info!("CPU backend (software per-pixel DDA)"),
         }
-        if !renderer.supports(Feature::TranslucentTerrain) {
-            log::info!("terrain materials render opaque on this backend");
+        if !renderer.supports(Feature::FreePickDepth) {
+            // GPU depth reads block on a device poll: fine per click,
+            // wrong per frame — so pick a reticle strategy up front.
+            log::info!("per-frame depth picks are expensive here; use view_ray + raycast");
         }
         // ANCHOR_END: supports
 

@@ -96,6 +96,12 @@
               # `docs/book/check-anchors.sh` (CI runs it — mdbook alone
               # exits 0 on broken includes).
               mdbook
+              # QE.6 leftover: fuzz the `&[u8] → Result` parsers.
+              # Harnesses live in `crates/roxlap-formats/fuzz`
+              # (workspace-excluded); run e.g.
+              # `cargo fuzz run vox --fuzz-dir crates/roxlap-formats/fuzz`.
+              # Needs the nightly toolchain the shell already ships.
+              cargo-fuzz
             ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxRuntimeLibs;
 
             # `sdl2` (roxlap-sdl-demo) links libSDL2 at build time via

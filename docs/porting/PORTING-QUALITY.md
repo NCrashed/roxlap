@@ -12,21 +12,46 @@ touching code.
 All phases landed (QE.4's facade-test harness folded into the others'
 per-phase tests; a dedicated CPU↔GPU diff harness remains desirable).
 Every landed change carries CHANGELOG migration notes per the policy
-below. **Still owed**, carried out of the series:
+below. **Author triage 2026-07-06** (every carried item decided):
 
-- `cargo-fuzz` harnesses for the `&[u8] → Result` parsers (QE.6 —
-  tooling unavailable in the dev environment; adversarial unit tests
-  cover the review's findings).
-- WGSL shared-snippet extraction (QE.8 — the copies are structurally
-  similar but not byte-identical; merging = parameterising shader code,
-  which needs render verification on a real GPU. Do alongside TV.3b /
-  TV.6 shader work).
-- The QE-B6 leftovers: `PackedColor` newtype family, generational
-  `ImageId`, splitting `set_sprites`' all-family reset, collapsing the
-  `_with_materials` variants, a `Frame` guard object, typed `BakeMode`.
-- CPU↔GPU pixel-diff harness + more golden scenes (QE-C5).
-- Workspace-wide `missing_docs` (roxlap-gpu/-formats/-core owe ~250
-  field docs; the lint already guards roxlap-render + roxlap-scene).
+- ~~`cargo-fuzz` harnesses~~ — **DONE 2026-07-06.** `cargo-fuzz` is in
+  the dev shell (flake.nix); 8 harnesses live in
+  `crates/roxlap-formats/fuzz` (workspace-excluded), covering every
+  `&[u8] → Result` parser + the scene-snapshot envelope. Run:
+  `cargo fuzz run <target> --fuzz-dir crates/roxlap-formats/fuzz`
+  (needs the shell's nightly; not in CI — sanitizer + nightly).
+  **First runs found two real bugs within 8 s each**, both fixed with
+  in-parser regression tests:
+  - `vxl::parse`: unvalidated `vsid` reserved a `vsid²+1` offset
+    table → capacity-overflow panic / allocation bomb. Now bounded by
+    the column data actually present (`ParseError::BadVsid`).
+  - `kfa::parse`: zero-hinge frame rows consume zero bytes, so the
+    QE.6b capacity clamps never bit and a crafted `numfrm` looped to
+    OOM (`ParseError::FramesWithoutHinges`).
+  Other six targets clean (10⁶–10⁷ execs each; QE.5 snapshot + VCL
+  inflate-cap hardening held).
+- WGSL shared-snippet extraction (QE.8) — **DO.** GPU-side visual
+  verification is now possible: `Capture` works on the GPU backend
+  (QE.7a), so capture-diff before/after on the author's card.
+- QE-B6 leftovers (`PackedColor`, generational `ImageId`,
+  `set_sprites` reset split, `_with_materials` collapse, `Frame`
+  guard, typed `BakeMode`) — **DO** (breaking window still open).
+- CPU↔GPU pixel-diff harness + more golden scenes (QE-C5) —
+  **DROPPED** by author decision.
+- Workspace-wide `missing_docs` (~250 field docs in
+  roxlap-gpu/-formats/-core) — **DO.**
+- QE-C6 `RenderConfig` consolidation — **DO.**
+
+Also resolved 2026-07-06: the QE.7a `Feature` parity table shipped
+stale — it claimed GPU lacks `TranslucentSpriteMaterials` /
+`TranslucentTerrain`, but both GPU paths landed in the TV stage and
+the author re-confirmed them. `supports()`, the rustdoc table, and
+the book's lighting chapter now say ✅/✅.
+
+Queued beyond this doc (author, same triage): stage **CC** (character
+controller — needs its own entry doc), `roxlap-cli` extensions
+(`gif2rvc`/`png2rvc`, `kv6 → vox`), roxlap-cli publish at the next
+release cut. Dropped: CD.2.6 full byte-fixture suite.
 
 ## API stability policy for this stage — LOCKED
 

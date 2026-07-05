@@ -109,6 +109,11 @@ pub enum ParseError {
     /// hung the loader forever (the topological solve in
     /// `sort_hinges` never converged).
     HingeCycle { hinge: usize },
+    /// Fuzz finding — a non-zero frame count on a zero-hinge rig: a
+    /// frame row stores 2 bytes per hinge, so zero-hinge rows consume
+    /// no input, no read can fail `Truncated`, and a crafted count
+    /// looped/allocated unboundedly (OOM pre-fix).
+    FramesWithoutHinges { numfrm: usize },
 }
 
 impl fmt::Display for ParseError {
@@ -125,6 +130,9 @@ impl fmt::Display for ParseError {
             }
             Self::HingeCycle { hinge } => {
                 write!(f, "kfa hinge {hinge}: parent links form a cycle")
+            }
+            Self::FramesWithoutHinges { numfrm } => {
+                write!(f, "kfa declares {numfrm} frame(s) but zero hinges")
             }
         }
     }
@@ -168,6 +176,11 @@ pub fn parse(bytes: &[u8]) -> Result<Kfa, ParseError> {
     validate_hinge_topology(&hinges)?;
 
     let numfrm = cur.read_u32()? as usize;
+    // A zero-hinge frame row consumes zero bytes, so `numfrm` would be
+    // the only bound on the loop below — reject the degenerate shape.
+    if numhin == 0 && numfrm != 0 {
+        return Err(ParseError::FramesWithoutHinges { numfrm });
+    }
     let mut frmval = Vec::with_capacity(cur.clamped_capacity(numfrm, numhin.saturating_mul(2)));
     for _ in 0..numfrm {
         let mut row = Vec::with_capacity(cur.clamped_capacity(numhin, 2));
@@ -677,6 +690,24 @@ pub fn sort_hinges(hinges: &[Hinge]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fuzz regression (2026-07-06): zero hinges + a huge frame count.
+    /// Frame rows are 2 bytes × hinges, so with zero hinges nothing is
+    /// ever read and the row loop ran `numfrm` times — an OOM. Must
+    /// fail as `FramesWithoutHinges` before the loop.
+    #[test]
+    fn zero_hinge_frames_are_rejected_not_looped() {
+        let mut bytes = 0x6b6c_774bu32.to_le_bytes().to_vec(); // magic
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // name_len
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // numhin
+        bytes.extend_from_slice(&0x6c77_4b00u32.to_le_bytes()); // numfrm ≈ 1.8e9
+        assert!(matches!(
+            parse(&bytes),
+            Err(ParseError::FramesWithoutHinges {
+                numfrm: 0x6c77_4b00
+            })
+        ));
+    }
 
     fn synthetic_kfa() -> Kfa {
         Kfa {

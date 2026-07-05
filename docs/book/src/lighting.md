@@ -151,12 +151,15 @@ face only), this is why.
 
 ### Backend parity
 
-Translucent compositing is CPU-complete; the GPU backend currently
-renders sprite and terrain materials **opaque** (the device paths are
-owed — TV.3b/TV.6). Probe at startup:
-`supports(Feature::TranslucentSpriteMaterials)` /
-`supports(Feature::TranslucentTerrain)` — see
-[chapter 4](rendering.md).
+Translucent compositing runs on **both** backends — CPU since the TV
+stage's march rework, GPU via its own per-span accumulation paths
+(sprites and terrain alike). The residual gaps are stylistic, not
+structural: translucent *sprites* stay flat-lit (no side-shades, fog
+or tint on the translucent layers), and compositing is per-pass — a
+translucent sprite over translucent terrain resolves per pass rather
+than through one unified blend. Neither has mattered in practice; if
+one bites you, `supports()` ([chapter 4](rendering.md)) is still the
+place a future split would surface.
 
 ## Further reading
 
