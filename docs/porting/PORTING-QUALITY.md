@@ -47,11 +47,12 @@ below. **Author triage 2026-07-06** (every carried item decided):
   `RenderOptions::gpu_sprite_lod_px` + `ROXLAP_GPU_SPRITE_LOD_PX`.
   Debug method worth reusing: hollow-slab probe scene + encoding
   march counters into output RGB channels.
-  **NEW follow-up found**: the sky *panorama* maps differently on the
-  two backends (same camera shows different panorama content — CPU
-  skycast vs GPU equirect `sky_color()` disagree in orientation /
-  projection). Needs its own small stage; base sky gradient pixels
-  match, so it's mapping-only.
+  ~~NEW follow-up found: the sky *panorama* maps differently on the
+  two backends~~ — **RESOLVED same day**: `sky_color()` used
+  `atan2(dir.x, dir.y)` vs the CPU's `atan2(dir.y, dir.x)` (90°
+  rotation + mirrored heading). One-argument-swap fix; panorama
+  content verified aligned on live captures. Residual: GPU linear vs
+  CPU nearest-texel filtering (sub-texel softness, deliberate).
 - QE-B6 leftovers (`PackedColor`, generational `ImageId`,
   `set_sprites` reset split, `_with_materials` collapse, `Frame`
   guard, typed `BakeMode`) — **DO** (breaking window still open).

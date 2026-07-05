@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ROXLAP_GPU_SPRITE_LOD_PX`). **Old behaviour:** set it to `4.0` —
   worth trying if distant-sprite cost matters more than fidelity.
 
+### Fixed: GPU sky panorama orientation
+
+- The GPU sky sampler used `atan2(dir.x, dir.y)` where the CPU
+  renderer uses `atan2(dir.y, dir.x)` — the swapped arguments rotate
+  the panorama 90° and mirror the heading, so the two backends showed
+  *different panorama content* at the same camera (hills on CPU where
+  GPU showed city). Argument order now matches the CPU; panorama
+  content aligns across backends (verified on live captures).
+  Residual: the GPU samples with linear filtering vs the CPU's
+  nearest-texel — sub-texel softness only.
+
 ### Internal: WGSL shared-snippet extraction (QE.8)
 
 - The five helpers duplicated (with drift) between `scene_dda.wgsl`

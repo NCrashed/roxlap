@@ -398,7 +398,11 @@ fn chunk_has_content(slot_base: u32, chunk_occ_off: u32, slot_idx: u32, chunk_id
 // Repeat is a no-op there; azimuth needs the wrap).
 fn sky_color(dir: vec3<f32>) -> vec3<f32> {
     let pi = 3.1415926535897932;
-    let azimuth = atan2(dir.x, dir.y) * (0.5 / pi) + 0.5;
+    // QE.8 follow-up: CPU sample_sky uses atan2(y, x) — the swapped
+    // argument order here rotated the panorama 90° AND mirrored the
+    // heading, so the two backends showed different panorama content
+    // at the same camera.
+    let azimuth = atan2(dir.y, dir.x) * (0.5 / pi) + 0.5;
     let elevation = clamp(acos(-dir.z) * (1.0 / pi), 0.0, 1.0);
     return textureSampleLevel(
         sky_texture,
