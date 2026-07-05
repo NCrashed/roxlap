@@ -43,7 +43,22 @@ documentation audit so no re-exploration is needed.
   comment. `Vxl::empty(CHUNK_SIZE_XY)` is the canonical chunk shape
   for generators (identical to what `ensure_chunk` makes) — the book
   teaches it instead of the demo's grid-detach idiom.
-- BK.2..7 — not started.
+- BK.2 — **LANDED 2026-07-05.** Ch. 4 (rendering & backends) + ch. 5
+  (render pipeline). One shared anchor example
+  `roxlap-render/examples/book_pipeline.rs` (windowed, quickstart-
+  style; verified live for 8 s on the CPU backend) — anchors
+  `gizmo` / `backend_select` / `supports` / `pipeline` /
+  `frame_params` / `overlay`. Decisions taken while writing:
+  - The `Feature` parity table is NOT copied into the book (ch. 4
+    links the rustdoc — the table changes as parity gaps close).
+  - `paint_egui` has no anchor: the `hud` feature is non-default, so
+    a `required-features` example would be skipped by CI's
+    `--all-targets` (silent rot). Ch. 5 shows the 3-line tessellate/
+    paint idiom inline (≤3 lines = policy-legal) + links the
+    scene-demo host.
+  - MSRV gotcha: `Option::is_none_or` trips `clippy::incompatible_msrv`
+    — examples use `map_or` like the quickstart.
+- BK.3..7 — not started.
 
 ## Goal
 
