@@ -1,19 +1,20 @@
-//! PS.0 — particle-system core: emitters + pure simulation.
+//! Stage PS — particle system over sprite instancing.
 //!
 //! A [`ParticleSystem`] is a **host-owned** layer over the facade's
 //! dynamic sprite instances (see `docs/porting/PORTING-PARTICLES.md`):
-//! every live particle will become one posed kv6 instance, so particles
-//! inherit both backends, per-instance tint/alpha/material, TV
+//! every live particle is one posed kv6 instance, so particles inherit
+//! both backends, per-instance tint/alpha/material, TV
 //! volumetric/additive looks and [`BillboardLighting`] for free. This
 //! module is deliberately **not** part of [`SceneRenderer`]'s method
 //! surface — the system *drives* the facade through its public API.
 //!
-//! PS.0 ships the renderer-free half: emitter definitions, the
-//! deterministic per-frame integration ([`ParticleSystem::update`]),
-//! and the particle budget. The facade binding (`sync`, PS.1) consumes
-//! the state this half maintains — newborn particles carry
-//! `instance == None`, dead ones queue their [`SpriteInstanceId`] for
-//! removal in [`ParticleSystem::drain_dead_instances`].
+//! Two halves: the renderer-free simulation
+//! ([`ParticleSystem::update`] — emitters, deterministic integration,
+//! over-life curves, budget; PS.0/PS.2) and the facade binding
+//! ([`ParticleSystem::sync`] / [`tick`](ParticleSystem::tick) —
+//! spawn/despawn/batch-move; PS.1). Hosts doing their own rendering
+//! can use `update` alone and consume
+//! [`ParticleSystem::drain_dead_instances`] directly.
 //!
 //! Axes reminder: **+z is DOWN** (voxlap convention) — gravity is
 //! positive z, smoke rises with negative z velocity.
@@ -65,8 +66,45 @@ pub enum SpawnMode {
     Manual,
 }
 
-/// Initial particle velocity: a fixed base plus an isotropic spread.
+/// Where new particles appear, relative to the emitter position (PS.2).
 #[derive(Clone, Copy, Debug, Default)]
+pub enum EmitterShape {
+    /// Every particle starts exactly at the emitter position (default).
+    #[default]
+    Point,
+    /// Uniform inside a ball of this radius.
+    Sphere {
+        /// Ball radius, world units.
+        radius: f32,
+    },
+    /// Uniform inside an axis-aligned box of these half-extents.
+    Box {
+        /// Half-extents per axis, world units.
+        half: [f32; 3],
+    },
+}
+
+/// Directional cone emission (PS.2) — fountains, muzzle flashes,
+/// impact sprays: a random direction within `half_angle_deg` of
+/// `axis`, at a speed sampled from `speed`.
+#[derive(Clone, Debug)]
+pub struct ConeDef {
+    /// Cone axis (need not be unit length; a zero vector falls back to
+    /// straight **up**, `[0, 0, -1]` — +z is down).
+    pub axis: [f32; 3],
+    /// Cone half-angle in **degrees** (the [`SpotLight`] convention):
+    /// `0` = a beam along the axis, `180` = fully isotropic. Clamped
+    /// to `0..=180`.
+    ///
+    /// [`SpotLight`]: crate::SpotLight
+    pub half_angle_deg: f32,
+    /// Speed along the sampled direction, world units/second, uniform.
+    pub speed: Range<f32>,
+}
+
+/// Initial particle velocity: a fixed base, an isotropic spread, and
+/// an optional directional cone — the three compose by addition.
+#[derive(Clone, Debug, Default)]
 pub struct VelocityDef {
     /// Velocity every particle starts from, world units/second.
     /// Remember +z is down: a fountain fires with negative z.
@@ -75,6 +113,9 @@ pub struct VelocityDef {
     /// particle adds a uniformly random direction scaled by a uniform
     /// `0..spread` speed. `0.0` (default) = no randomness.
     pub spread: f32,
+    /// Optional cone kick added on top (PS.2). `None` (default) = no
+    /// directional term.
+    pub cone: Option<ConeDef>,
 }
 
 /// Recipe for [`add_emitter`](ParticleSystem::add_emitter). Construct
@@ -90,6 +131,9 @@ pub struct ParticleEmitterDef {
     /// Emitter position, world space. Movable later via
     /// [`set_emitter_pos`](ParticleSystem::set_emitter_pos).
     pub pos: [f32; 3],
+    /// Spawn-position distribution around `pos` (PS.2; default
+    /// [`EmitterShape::Point`]).
+    pub shape: EmitterShape,
     /// Spawn behaviour (default [`SpawnMode::Manual`]).
     pub spawn: SpawnMode,
     /// Per-particle lifetime, seconds, sampled uniformly. A degenerate
@@ -104,15 +148,32 @@ pub struct ParticleEmitterDef {
     /// `drag · vel · dt`. `0.0` = ballistic; smoke wants ~1-3.
     pub drag: f32,
     /// Uniform base scale applied to the instance basis (`1.0` =
-    /// authored model size). PS.1 clamps the rendered scale ≥ 0.05 —
+    /// authored model size). The rendered scale clamps to ≥ 0.05 —
     /// a degenerate basis silently skips drawing.
     pub scale: f32,
+    /// End-of-life scale (PS.2): the particle lerps `scale →
+    /// scale_end` over its lifetime — growing smoke, shrinking sparks.
+    /// `None` (default) = constant.
+    pub scale_end: Option<f32>,
+    /// Spin rate about the world vertical, **radians/second**, sampled
+    /// uniformly per particle (PS.2) — a symmetric range like
+    /// `-3.0..3.0` spins debris both ways. Default `0.0..0.0` = no
+    /// spin.
+    pub spin: Range<f32>,
+    /// Fraction of the lifetime over which alpha ramps 0 → 255 at the
+    /// **start** (PS.2) — smoke that condenses in rather than pops.
+    /// `0.0` (default) = born fully opaque.
+    pub fade_in_frac: f32,
     /// Fraction of the lifetime over which alpha fades 255 → 0 at the
     /// end (`0.25` = the last quarter). `0.0` = no fade, particles
     /// vanish at full opacity.
-    pub fade_frac: f32,
+    pub fade_out_frac: f32,
     /// Per-particle RGB tint, packed `0x00RRGGBB` (white = no-op).
     pub tint: u32,
+    /// End-of-life tint (PS.2): lerped per channel from `tint` over
+    /// the lifetime — white-hot → red → dark ember. `None` (default) =
+    /// constant.
+    pub tint_end: Option<u32>,
     /// Voxel-material id for every particle (TV palette; `0` opaque).
     /// Smoke wants an alpha/volumetric material, sparks additive.
     pub material: u8,
@@ -127,22 +188,28 @@ pub struct ParticleEmitterDef {
 
 impl ParticleEmitterDef {
     /// A def with every field at its documented default: manual spawn
-    /// at the origin, 1-2 s lifetime, no initial velocity, arcade
-    /// gravity, no drag, unit scale, fade over the last quarter, no
-    /// tint, opaque material, face-normal lighting, shadows off.
+    /// at a point at the origin, 1-2 s lifetime, no initial velocity,
+    /// arcade gravity, no drag, constant unit scale, no spin, fade out
+    /// over the last quarter, constant no-op tint, opaque material,
+    /// face-normal lighting, shadows off.
     #[must_use]
     pub fn new(model: SpriteModelId) -> Self {
         Self {
             model,
             pos: [0.0, 0.0, 0.0],
+            shape: EmitterShape::Point,
             spawn: SpawnMode::Manual,
             lifetime: 1.0..2.0,
             velocity: VelocityDef::default(),
             gravity: [0.0, 0.0, 22.0],
             drag: 0.0,
             scale: 1.0,
-            fade_frac: 0.25,
+            scale_end: None,
+            spin: 0.0..0.0,
+            fade_in_frac: 0.0,
+            fade_out_frac: 0.25,
             tint: 0x00FF_FFFF,
+            tint_end: None,
             material: 0,
             lighting: BillboardLighting::FaceNormal,
             shadows: ShadowFlags {
@@ -165,11 +232,17 @@ pub struct Particle {
     pub age: f32,
     /// Seconds this particle lives in total.
     pub lifetime: f32,
-    /// Uniform render scale (the emitter's [`ParticleEmitterDef::scale`]).
+    /// Current uniform render scale (lerps `scale → scale_end` when
+    /// the emitter sets an end scale).
     pub scale: f32,
-    /// Current alpha 0..=255, driven by the emitter's fade curve.
+    /// Current rotation about the world vertical, radians (PS.2).
+    pub yaw: f32,
+    /// Sampled spin rate, radians/second (PS.2).
+    pub spin_rate: f32,
+    /// Current alpha 0..=255, driven by the emitter's fade curves.
     pub alpha: u8,
-    /// Packed `0x00RRGGBB` tint.
+    /// Current packed `0x00RRGGBB` tint (lerps `tint → tint_end` when
+    /// the emitter sets an end tint).
     pub tint: u32,
     /// Owning emitter slot — resolves render params (model, material,
     /// lighting) at sync time.
@@ -181,6 +254,9 @@ pub struct Particle {
     /// instance to 255) — `sync` calls the per-instance alpha setter
     /// only when this differs, since alpha has no batch API.
     pub(crate) last_alpha: u8,
+    /// The tint last written to the facade (fresh-instance default:
+    /// white) — same change-only discipline as `last_alpha`.
+    pub(crate) last_tint: u32,
 }
 
 /// Per-emitter live state.
@@ -395,7 +471,16 @@ impl ParticleSystem {
                 p.vel[a] += (def.gravity[a] - def.drag * p.vel[a]) * dtf;
                 p.pos[a] += p.vel[a] * dtf;
             }
-            p.alpha = fade_alpha(p.age, p.lifetime, def.fade_frac);
+            p.yaw += p.spin_rate * dtf;
+            // Over-life curves (PS.2), all keyed on the life fraction.
+            let frac = p.age / p.lifetime;
+            if let Some(end) = def.scale_end {
+                p.scale = def.scale + (end - def.scale) * frac;
+            }
+            if let Some(end) = def.tint_end {
+                p.tint = lerp_tint(def.tint, end, frac);
+            }
+            p.alpha = fade_alpha(p.age, p.lifetime, def.fade_in_frac, def.fade_out_frac);
         }
 
         // 2. Kill sweep (swap-remove keeps the pool dense).
@@ -522,9 +607,9 @@ impl ParticleSystem {
         let mut i = 0;
         while i < self.particles.len() {
             if self.particles[i].instance.is_none() {
-                let (slot, xf, tint) = {
+                let (slot, xf) = {
                     let p = &self.particles[i];
-                    (p.emitter_slot as usize, particle_xf(p), p.tint)
+                    (p.emitter_slot as usize, particle_xf(p))
                 };
                 let (model, material, lighting, shadows) = {
                     let st = self.emitters[slot]
@@ -556,12 +641,13 @@ impl ParticleSystem {
                 if shadows != ShadowFlags::default() {
                     facade.set_shadows(id, shadows);
                 }
-                if tint != 0x00FF_FFFF {
-                    facade.set_tint(id, tint);
-                }
                 let p = &mut self.particles[i];
                 p.instance = Some(id);
-                p.last_alpha = 255; // fresh-instance facade default
+                // Fresh-instance facade defaults; the change-only
+                // blocks below write the real values (tint rides them
+                // too — it can lerp per frame from PS.2 on).
+                p.last_alpha = 255;
+                p.last_tint = 0x00FF_FFFF;
             } else {
                 // Live: frame-0 pose came from the posed spawn, so
                 // only pre-existing instances join the move batch.
@@ -572,6 +658,10 @@ impl ParticleSystem {
             if p.alpha != p.last_alpha {
                 facade.set_alpha(p.instance.expect("set above"), p.alpha);
                 p.last_alpha = p.alpha;
+            }
+            if p.tint != p.last_tint {
+                facade.set_tint(p.instance.expect("set above"), p.tint);
+                p.last_tint = p.tint;
             }
             i += 1;
         }
@@ -594,6 +684,26 @@ impl ParticleSystem {
                 self.dropped_spawns += u64::from(n - spawned);
                 break;
             }
+            // Position: emitter pos + the shape's offset (PS.2).
+            let mut pos = def.pos;
+            match def.shape {
+                EmitterShape::Point => {}
+                EmitterShape::Sphere { radius } => {
+                    // Uniform in the ball: direction × r·∛u.
+                    let dir = self.rng.unit_vec();
+                    let r = radius * self.rng.next_f32().cbrt();
+                    for a in 0..3 {
+                        pos[a] += dir[a] * r;
+                    }
+                }
+                EmitterShape::Box { half } => {
+                    for a in 0..3 {
+                        pos[a] += (self.rng.next_f32() * 2.0 - 1.0) * half[a];
+                    }
+                }
+            }
+
+            // Velocity: base + isotropic spread + cone, by addition.
             let mut vel = def.velocity.base;
             if def.velocity.spread > 0.0 {
                 let dir = self.rng.unit_vec();
@@ -602,18 +712,29 @@ impl ParticleSystem {
                     vel[a] += dir[a] * speed;
                 }
             }
+            if let Some(cone) = &def.velocity.cone {
+                let dir = cone_dir(&mut self.rng, cone.axis, cone.half_angle_deg);
+                let speed = self.rng.range_f32(&cone.speed);
+                for a in 0..3 {
+                    vel[a] += dir[a] * speed;
+                }
+            }
+
             let lifetime = self.rng.range_f32(&def.lifetime).max(1e-3);
             self.particles.push(Particle {
-                pos: def.pos,
+                pos,
                 vel,
                 age: 0.0,
                 lifetime,
                 scale: def.scale,
-                alpha: fade_alpha(0.0, lifetime, def.fade_frac),
+                yaw: 0.0,
+                spin_rate: self.rng.range_f32(&def.spin),
+                alpha: fade_alpha(0.0, lifetime, def.fade_in_frac, def.fade_out_frac),
                 tint: def.tint,
                 emitter_slot: slot as u32,
                 instance: None,
                 last_alpha: 255,
+                last_tint: 0x00FF_FFFF,
             });
             spawned += 1;
         }
@@ -638,19 +759,76 @@ impl ParticleSystem {
     }
 }
 
-/// The pose a particle renders at: position + an axis-aligned basis
-/// uniformly scaled by [`Particle::scale`] (spin lands in PS.2). The
-/// scale clamps to ≥ 0.05 — a degenerate basis makes the facade
-/// silently skip drawing, which is right for a kill but wrong for a
-/// fade.
+/// The pose a particle renders at: position + a basis rotated by
+/// [`Particle::yaw`] about the world vertical and uniformly scaled by
+/// [`Particle::scale`]. The scale clamps to ≥ 0.05 — a degenerate
+/// basis makes the facade silently skip drawing, which is right for a
+/// kill but wrong for a fade.
 fn particle_xf(p: &Particle) -> DynSpriteTransform {
-    let s = p.scale.max(0.05);
+    let k = p.scale.max(0.05);
+    let (c, s) = (p.yaw.cos() * k, p.yaw.sin() * k);
     DynSpriteTransform {
         pos: p.pos,
-        right: [s, 0.0, 0.0],
-        up: [0.0, s, 0.0],
-        forward: [0.0, 0.0, s],
+        right: [c, s, 0.0],
+        up: [-s, c, 0.0],
+        forward: [0.0, 0.0, k],
     }
+}
+
+/// Uniform random direction within `half_angle_deg` of `axis` —
+/// uniform over the spherical cap, so a wide cone doesn't bunch at the
+/// rim. A degenerate axis falls back to straight up (`[0, 0, -1]`).
+fn cone_dir(rng: &mut Pcg32, axis: [f32; 3], half_angle_deg: f32) -> [f32; 3] {
+    let len2 = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
+    let w = if len2 > 1e-12 {
+        let inv = 1.0 / len2.sqrt();
+        [axis[0] * inv, axis[1] * inv, axis[2] * inv]
+    } else {
+        [0.0, 0.0, -1.0]
+    };
+    // cos θ uniform on [cos half, 1] ⇒ uniform area on the cap.
+    let cos_half = half_angle_deg.clamp(0.0, 180.0).to_radians().cos();
+    let cz = 1.0 - rng.next_f32() * (1.0 - cos_half);
+    let sz = (1.0 - cz * cz).max(0.0).sqrt();
+    let phi = rng.next_f32() * std::f32::consts::TAU;
+    // Any orthonormal frame around `w`: cross with the axis `w` leans
+    // on least.
+    let t = if w[0].abs() < 0.5 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let u = {
+        let c = [
+            w[1] * t[2] - w[2] * t[1],
+            w[2] * t[0] - w[0] * t[2],
+            w[0] * t[1] - w[1] * t[0],
+        ];
+        let inv = 1.0 / (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        [c[0] * inv, c[1] * inv, c[2] * inv]
+    };
+    let v = [
+        w[1] * u[2] - w[2] * u[1],
+        w[2] * u[0] - w[0] * u[2],
+        w[0] * u[1] - w[1] * u[0],
+    ];
+    let (cp, sp) = (phi.cos() * sz, phi.sin() * sz);
+    [
+        w[0] * cz + u[0] * cp + v[0] * sp,
+        w[1] * cz + u[1] * cp + v[1] * sp,
+        w[2] * cz + u[2] * cp + v[2] * sp,
+    ]
+}
+
+/// Per-channel lerp of two packed `0x00RRGGBB` tints.
+fn lerp_tint(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |sh: u32| {
+        let (ca, cb) = ((a >> sh) & 0xff, (b >> sh) & 0xff);
+        let m = ca as f32 + (cb as f32 - ca as f32) * t;
+        ((m as u32) & 0xff) << sh
+    };
+    ch(16) | ch(8) | ch(0)
 }
 
 /// The slice of [`SceneRenderer`] that [`ParticleSystem::sync`]
@@ -698,19 +876,19 @@ impl ParticleFacade for SceneRenderer {
     }
 }
 
-/// Alpha for `age` of `lifetime` with a fade over the trailing
-/// `fade_frac`: 255 until the fade window, then linear to 0 at death.
-fn fade_alpha(age: f32, lifetime: f32, fade_frac: f32) -> u8 {
-    if fade_frac <= 0.0 {
-        return 255;
-    }
+/// Alpha for `age` of `lifetime`: ramps 0 → 255 over the leading
+/// `in_frac` (PS.2), 255 → 0 over the trailing `out_frac`, 255 in
+/// between; overlapping windows take the darker of the two.
+fn fade_alpha(age: f32, lifetime: f32, in_frac: f32, out_frac: f32) -> u8 {
     let frac = age / lifetime;
-    let fade_start = 1.0 - fade_frac.min(1.0);
-    if frac <= fade_start {
-        return 255;
+    let mut a = 1.0_f32;
+    if in_frac > 0.0 {
+        a = a.min((frac / in_frac.min(1.0)).clamp(0.0, 1.0));
     }
-    let k = (1.0 - frac) / fade_frac.min(1.0);
-    (k.clamp(0.0, 1.0) * 255.0) as u8
+    if out_frac > 0.0 {
+        a = a.min(((1.0 - frac) / out_frac.min(1.0)).clamp(0.0, 1.0));
+    }
+    (a * 255.0) as u8
 }
 
 #[cfg(test)]
@@ -728,7 +906,7 @@ mod tests {
             spawn: SpawnMode::Manual,
             lifetime: 1.0..1.0,
             gravity: [0.0, 0.0, 0.0],
-            fade_frac: 0.0,
+            fade_out_frac: 0.0,
             ..ParticleEmitterDef::new(dummy_model())
         }
     }
@@ -743,6 +921,7 @@ mod tests {
                 velocity: VelocityDef {
                     base: [0.0, 0.0, -10.0],
                     spread: 4.0,
+                    ..VelocityDef::default()
                 },
                 gravity: [0.0, 0.0, 22.0],
                 ..ParticleEmitterDef::new(dummy_model())
@@ -844,11 +1023,147 @@ mod tests {
 
     #[test]
     fn fade_curve_hits_endpoints() {
-        assert_eq!(fade_alpha(0.0, 1.0, 0.5), 255);
-        assert_eq!(fade_alpha(0.5, 1.0, 0.5), 255); // window edge
-        assert_eq!(fade_alpha(0.75, 1.0, 0.5), 127); // mid-fade
-        assert_eq!(fade_alpha(1.0, 1.0, 0.5), 0);
-        assert_eq!(fade_alpha(0.99, 1.0, 0.0), 255); // no fade
+        assert_eq!(fade_alpha(0.0, 1.0, 0.0, 0.5), 255);
+        assert_eq!(fade_alpha(0.5, 1.0, 0.0, 0.5), 255); // window edge
+        assert_eq!(fade_alpha(0.75, 1.0, 0.0, 0.5), 127); // mid-fade
+        assert_eq!(fade_alpha(1.0, 1.0, 0.0, 0.5), 0);
+        assert_eq!(fade_alpha(0.99, 1.0, 0.0, 0.0), 255); // no fade
+                                                          // Fade-in (PS.2): born dark, ramps up, then the out-window
+                                                          // takes over; overlap picks the darker.
+        assert_eq!(fade_alpha(0.0, 1.0, 0.25, 0.0), 0);
+        assert_eq!(fade_alpha(0.125, 1.0, 0.25, 0.0), 127);
+        assert_eq!(fade_alpha(0.25, 1.0, 0.25, 0.0), 255);
+        assert_eq!(fade_alpha(0.5, 1.0, 1.0, 1.0), 127); // crossover
+    }
+
+    #[test]
+    fn shapes_sample_within_bounds() {
+        let mut sys = ParticleSystem::new(20);
+        let sphere = sys.add_emitter(ParticleEmitterDef {
+            pos: [10.0, 0.0, 0.0],
+            shape: EmitterShape::Sphere { radius: 3.0 },
+            ..base_def()
+        });
+        let boxy = sys.add_emitter(ParticleEmitterDef {
+            pos: [-10.0, 0.0, 0.0],
+            shape: EmitterShape::Box {
+                half: [1.0, 2.0, 0.5],
+            },
+            ..base_def()
+        });
+        sys.burst(sphere, 64);
+        sys.burst(boxy, 64);
+        let mut spread = false;
+        for p in sys.particles() {
+            if p.pos[0] > 0.0 {
+                let d = [p.pos[0] - 10.0, p.pos[1], p.pos[2]];
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                assert!(r <= 3.0 + 1e-4, "sphere sample outside radius: {r}");
+                spread |= r > 0.1;
+            } else {
+                let d = [p.pos[0] + 10.0, p.pos[1], p.pos[2]];
+                assert!(
+                    d[0].abs() <= 1.0 + 1e-4
+                        && d[1].abs() <= 2.0 + 1e-4
+                        && d[2].abs() <= 0.5 + 1e-4,
+                    "box sample outside half-extents: {d:?}"
+                );
+                spread |= d[1].abs() > 1.0; // uses the wide axis
+            }
+        }
+        assert!(spread, "samples must actually spread out");
+    }
+
+    #[test]
+    fn cone_stays_within_half_angle() {
+        let mut sys = ParticleSystem::new(21);
+        let axis = [0.0, 1.0, -1.0]; // non-unit on purpose
+        let em = sys.add_emitter(ParticleEmitterDef {
+            velocity: VelocityDef {
+                cone: Some(ConeDef {
+                    axis,
+                    half_angle_deg: 30.0,
+                    speed: 5.0..10.0,
+                }),
+                ..VelocityDef::default()
+            },
+            ..base_def()
+        });
+        sys.burst(em, 64);
+        let inv = 1.0 / (2.0_f32).sqrt();
+        let w = [0.0, inv, -inv];
+        let cos_half = 30.0_f32.to_radians().cos();
+        for p in sys.particles() {
+            let sp = (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1] + p.vel[2] * p.vel[2]).sqrt();
+            assert!(
+                (5.0 - 1e-3..10.0 + 1e-3).contains(&sp),
+                "speed in range: {sp}"
+            );
+            let cosang = (p.vel[0] * w[0] + p.vel[1] * w[1] + p.vel[2] * w[2]) / sp;
+            assert!(
+                cosang >= cos_half - 1e-4,
+                "direction within the cone: cos {cosang} < {cos_half}"
+            );
+        }
+        // A zero axis falls back to straight up (-z).
+        assert_eq!(
+            cone_dir(&mut Pcg32::new(1), [0.0; 3], 0.0),
+            [0.0, 0.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn spin_rotates_pose_and_keeps_scale() {
+        let mut sys = ParticleSystem::new(22);
+        let em = sys.add_emitter(ParticleEmitterDef {
+            spin: 2.0..2.0,
+            scale: 3.0,
+            lifetime: 100.0..100.0,
+            ..base_def()
+        });
+        sys.burst(em, 1);
+        sys.update(0.25); // yaw = 0.5 rad
+        let p = sys.particles()[0];
+        assert!((p.yaw - 0.5).abs() < 1e-6);
+        let xf = particle_xf(&p);
+        // Columns stay orthogonal with length == scale.
+        let len = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        assert!((len(xf.right) - 3.0).abs() < 1e-5);
+        assert!((len(xf.up) - 3.0).abs() < 1e-5);
+        assert!(xf.right[1].abs() > 0.1, "yaw actually rotates the basis");
+        let dot = xf.right[0] * xf.up[0] + xf.right[1] * xf.up[1];
+        assert!(dot.abs() < 1e-5);
+    }
+
+    #[test]
+    fn scale_and_tint_lerp_over_life() {
+        let mut sys = ParticleSystem::new(23);
+        let em = sys.add_emitter(ParticleEmitterDef {
+            lifetime: 1.0..1.0,
+            scale: 1.0,
+            scale_end: Some(3.0),
+            tint: 0x00FF_0000,
+            tint_end: Some(0x0000_00FF),
+            ..base_def()
+        });
+        sys.burst(em, 1);
+        sys.update(0.5);
+        let p = sys.particles()[0];
+        assert!((p.scale - 2.0).abs() < 1e-5, "mid-life scale: {}", p.scale);
+        let (r, b) = ((p.tint >> 16) & 0xff, p.tint & 0xff);
+        assert!(
+            (126..=128).contains(&r) && (126..=128).contains(&b),
+            "mid tint: {:#08x}",
+            p.tint
+        );
+
+        // sync writes the lerping tint every frame it changes.
+        let mut f = Mock::default();
+        sys.sync_with(&mut f);
+        assert_eq!(f.tints.len(), 1);
+        sys.update(0.1);
+        sys.sync_with(&mut f);
+        assert_eq!(f.tints.len(), 2, "changed tint re-syncs");
     }
 
     #[test]
@@ -987,7 +1302,7 @@ mod tests {
         let mut sys = ParticleSystem::new(12);
         let em = sys.add_emitter(ParticleEmitterDef {
             lifetime: 1.0..1.0,
-            fade_frac: 0.5,
+            fade_out_frac: 0.5,
             ..base_def()
         });
         sys.burst(em, 2);
@@ -1038,11 +1353,14 @@ mod tests {
             age: 0.0,
             lifetime: 1.0,
             scale: 2.0,
+            yaw: 0.0,
+            spin_rate: 0.0,
             alpha: 255,
             tint: 0,
             emitter_slot: 0,
             instance: None,
             last_alpha: 255,
+            last_tint: 0x00FF_FFFF,
         };
         let xf = particle_xf(&p);
         assert_eq!(xf.pos, [1.0, 2.0, 3.0]);

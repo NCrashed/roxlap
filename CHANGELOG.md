@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added (PS.1): particles render — `ParticleSystem::sync` / `tick`
+### Added (PS.2): full emitter palette
+
+The effect-design layer on the PS.0/PS.1 base (all additive; the
+PS.0 API was still unreleased, so its two touched fields changed in
+place — `fade_frac` is now `fade_out_frac`, and `VelocityDef` gained a
+`cone` field / lost `Copy`):
+
+- **`EmitterShape`** (`ParticleEmitterDef::shape`) — spawn-position
+  distribution: `Point` (default) / `Sphere { radius }` (uniform in
+  the ball) / `Box { half }`.
+- **`ConeDef`** (`VelocityDef::cone`) — directional emission: a random
+  direction uniform on the spherical cap within `half_angle_deg`
+  (degrees, the `SpotLight` convention) of `axis`, at a `speed` range
+  along it; composes additively with `base` + isotropic `spread`.
+  Fountains, muzzle flashes, impact sprays.
+- **`spin: Range<f32>`** — per-particle yaw rate about the world
+  vertical (rad/s, e.g. `-3.0..3.0` for tumbling debris); the rendered
+  basis rotates accordingly.
+- **Over-life curves** — `scale_end: Option<f32>` (growing smoke,
+  shrinking sparks), `tint_end: Option<u32>` (per-channel lerp,
+  white-hot → ember), and `fade_in_frac` (alpha ramp at birth;
+  overlapping in/out windows take the darker). Lerping tints ride the
+  same change-only per-instance sync writes as alpha.
 
 The facade binding for the PS.0 core; with it the particle system is
 usable end to end:

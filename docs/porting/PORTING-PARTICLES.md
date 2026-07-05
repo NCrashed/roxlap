@@ -15,7 +15,13 @@ before touching code.
   by `SpriteInstanceTransform::max_scale` (hazard 1 fixed at all three
   radius sites); CPU scaled-basis parity **verified** (hazard 2 —
   `dda_sprite` smoke test: 2×/0.5× basis ⇒ ~4×/0.25× pixel coverage).
-- PS.2..5 — not started.
+- PS.2 — LANDED 2026-07-05: full emitter palette — `EmitterShape`
+  (Point/Sphere/Box), `ConeDef` cone emission (degrees, SpotLight
+  convention), `spin` (yaw about world vertical), `scale_end` /
+  `tint_end` over-life lerps, `fade_in_frac`. Renames while
+  unreleased: `fade_frac` → `fade_out_frac`; `VelocityDef` grew
+  `cone` (lost `Copy`).
+- PS.3..5 — not started.
 
 ## Goal
 
