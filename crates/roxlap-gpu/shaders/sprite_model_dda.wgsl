@@ -8,8 +8,6 @@
 // terrain depth buffer so the world occludes / is occluded correctly.
 // Precise, no overdraw, no atomics.
 
-const T_INF: f32 = 1.0e30;
-
 struct ModelMeta {
     occupancy_offset: u32,
     colors_offset: u32,
@@ -122,16 +120,6 @@ struct PointLight {
 // normal now, like terrain + CPU, for robustness + the flat-per-voxel look.)
 @group(0) @binding(15) var<storage, read> point_lights: array<PointLight>;
 
-// Defined before the XS.4.2 splice point: the injected terrain-shadow snippet
-// (and `march_instance`) call it, and WGSL has no forward declaration.
-fn shield_parallel(t: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
-    var o = t;
-    if (dir.x == 0.0) { o.x = T_INF; }
-    if (dir.y == 0.0) { o.y = T_INF; }
-    if (dir.z == 0.0) { o.z = T_INF; }
-    return o;
-}
-
 // ── XS.4.2 — sprites RECEIVE terrain shadows. This stub keeps GPU sprites
 // unshadowed (the default / capability-fallback path). On sprite-shadow-capable
 // devices the renderer SPLICES sprite_terrain_shadow.wgsl over the whole marker
@@ -144,13 +132,6 @@ fn shadow_occluded_world(origin_w: vec3<f32>, dir_w: vec3<f32>, max_t: f32) -> b
     return false;
 }
 //XS4_STUB_END
-
-fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
-    let fog_near = u.fog_color.w;
-    // Linear ramp matching the CPU / DDA fog (see scene_dda.wgsl).
-    let factor = clamp((t - fog_near) / max(u.fog_far - fog_near, 1e-6), 0.0, 1.0);
-    return mix(hit_color, u.fog_color.rgb, factor);
-}
 
 fn model_solid(m: ModelMeta, p: vec3<i32>) -> bool {
     let col = u32(p.x) + u32(p.y) * m.dims.x;
@@ -219,31 +200,6 @@ fn apply_tint(c: vec3<f32>, tint: u32) -> vec3<f32> {
         f32(tint & 0xffu),
     ) / 255.0;
     return c * t;
-}
-
-// DL.4 — point-light distance falloff (mirrors scene_dda's): smooth
-// quadratic from 1 at the light to 0 at `radius` (hard cut).
-fn point_falloff(d: f32, radius: f32) -> f32 {
-    let x = clamp(1.0 - d / radius, 0.0, 1.0);
-    return x * x;
-}
-
-// SL — spot (cone) angular mask (mirror of scene_dda's). `ldir` = unit dir
-// from surface TO light; `axis` = cone axis. 1.0 for a pure point light
-// (`cos_outer <= -0.999`); else soft smoothstep outer→inner, hard `step`
-// when the angles coincide (WGSL smoothstep is undefined for equal edges).
-fn spot_cone(ldir: vec3<f32>, axis: vec3<f32>, cos_inner: f32, cos_outer: f32) -> f32 {
-    if (cos_outer <= -0.999) { return 1.0; }
-    let cd = dot(-ldir, axis);
-    if (cos_inner <= cos_outer) { return step(cos_outer, cd); }
-    return smoothstep(cos_outer, cos_inner, cd);
-}
-
-// DL.6 — cel quantization (mirror of scene_dda's): snap a 0..1 factor to
-// `bands + 1` discrete levels.
-fn cel_band(x: f32, bands: u32) -> f32 {
-    let b = f32(bands);
-    return clamp(round(x * b) / b, 0.0, 1.0);
 }
 
 // DL.4/DL.6/DL.7 — dynamic-lighting shade for an opaque sprite voxel: raw

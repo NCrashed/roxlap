@@ -30,9 +30,28 @@ below. **Author triage 2026-07-06** (every carried item decided):
     OOM (`ParseError::FramesWithoutHinges`).
   Other six targets clean (10⁶–10⁷ execs each; QE.5 snapshot + VCL
   inflate-cap hardening held).
-- WGSL shared-snippet extraction (QE.8) — **DO.** GPU-side visual
-  verification is now possible: `Capture` works on the GPU backend
-  (QE.7a), so capture-diff before/after on the author's card.
+- ~~WGSL shared-snippet extraction (QE.8)~~ — **DONE 2026-07-06.**
+  `shaders/common.wgsl` (T_INF + `shield_parallel` / `apply_fog` /
+  `point_falloff` / `spot_cone` / `cel_band`) prepended at assembly by
+  `shader_src.rs`; base files no longer standalone-valid; naga test
+  validates all four assembled variants; headless renderer switched to
+  the assembled source. Verified on live GPU captures (diff within
+  run-to-run animation noise) + all device tests.
+  **The investigation also found the real cause of the CPU↔GPU
+  translucency divergence** (it was NOT compositing): the GPU sprite
+  mip-LOD default `sprite_lod_px = 4.0` collapsed hollow translucent
+  models at range (front/back glass sheets merge when downsampled ⇒
+  denser glass; the shade also pales). Default now `1.0`
+  (pixel-identical to CPU in the A/B slab probe — layer-count parity
+  verified via an instrumented shader); new
+  `RenderOptions::gpu_sprite_lod_px` + `ROXLAP_GPU_SPRITE_LOD_PX`.
+  Debug method worth reusing: hollow-slab probe scene + encoding
+  march counters into output RGB channels.
+  **NEW follow-up found**: the sky *panorama* maps differently on the
+  two backends (same camera shows different panorama content — CPU
+  skycast vs GPU equirect `sky_color()` disagree in orientation /
+  projection). Needs its own small stage; base sky gradient pixels
+  match, so it's mapping-only.
 - QE-B6 leftovers (`PackedColor`, generational `ImageId`,
   `set_sprites` reset split, `_with_materials` collapse, `Frame`
   guard, typed `BakeMode`) — **DO** (breaking window still open).

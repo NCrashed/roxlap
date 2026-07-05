@@ -67,7 +67,7 @@ The PF/PR performance series distilled into host-side rules:
 
 ## Engine environment variables
 
-The library crates read four variables, all **init-time** overrides
+The library crates read five variables, all **init-time** overrides
 of `RenderOptions` / adapter selection (never per frame — see above):
 
 <!-- Source of truth: grep -rhoE '"ROXLAP_[A-Z_0-9]+"' crates/ --include='*.rs' | sort -u,
@@ -80,6 +80,7 @@ of `RenderOptions` / adapter selection (never per frame — see above):
 | `ROXLAP_GPU_CHUNK_BUDGET` | `RenderOptions::gpu_chunk_upload_budget` | Dirty-chunk installs per frame (`0` = unbounded) |
 | `ROXLAP_GPU_CLIP_BUDGET` | `RenderOptions::gpu_clip_upload_budget` | Clip-upload staging flushes (`0` = unbounded) |
 | `ROXLAP_GPU_POWER` | `GpuRendererSettings::power_preference` | `low` \| `high` adapter preference — also the escape hatch when a discrete-GPU driver misbehaves |
+| `ROXLAP_GPU_SPRITE_LOD_PX` | `RenderOptions::gpu_sprite_lod_px` | Sprite mip-LOD threshold, screen px (`1.0` = CPU-identical; raise for distant-sprite speed) |
 
 (`ROXLAP_GPU` itself — the backend switch you've seen in every example
 — is a *demo convention*, not an engine variable: the examples read it

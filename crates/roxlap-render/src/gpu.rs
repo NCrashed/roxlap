@@ -207,6 +207,12 @@ impl GpuBackend {
     /// Backend-agnostic field seeding shared by the native + wasm
     /// constructors, given an already-initialised [`GpuRenderer`].
     fn from_gpu(gpu: GpuRenderer, opts: &RenderOptions) -> Self {
+        let mut gpu = gpu;
+        // QE.8 — sprite mip-LOD threshold (projected mip-0 voxel size,
+        // screen px, below which the pass steps to a coarser mip).
+        gpu.set_sprite_lod_px(
+            env_f32("ROXLAP_GPU_SPRITE_LOD_PX").unwrap_or(opts.gpu_sprite_lod_px),
+        );
         Self {
             gpu,
             resident: None,

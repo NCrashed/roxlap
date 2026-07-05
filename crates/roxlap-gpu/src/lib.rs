@@ -274,8 +274,11 @@ pub struct GpuRenderer {
     sprite_shadows_capable: bool,
     /// GPU.10.4 — LOD aggressiveness: step a sprite to the next mip
     /// once a mip-0 voxel projects below this many screen pixels.
-    /// Defaults to 4.0 (the empirical sweet spot); the host can tune
-    /// via [`Self::set_sprite_lod_px`].
+    /// Defaults to 1.0 — the "no sub-pixel voxels" threshold, which
+    /// keeps GPU sprites visually identical to the CPU backend (QE.8:
+    /// the old 4.0 default collapsed thin/hollow translucent models
+    /// at range — glass read denser than on CPU). Tune via
+    /// [`Self::set_sprite_lod_px`].
     sprite_lod_px: f32,
     /// GPU.11.1 — scene-grid LOD scan distance (world units). A chunk
     /// entered at world-t `t` is marched at the mip level
@@ -1207,7 +1210,7 @@ impl GpuRenderer {
             // GPU.10.4 — default LOD threshold: step to a coarser mip
             // once a voxel projects below 4 px. Empirically the best
             // quality/cost tradeoff; the host can override.
-            sprite_lod_px: 4.0,
+            sprite_lod_px: 1.0,
             // GPU.11.1 — matches the CPU demo's mip_scan_dist=64.
             scene_mip_scan_dist: 64.0,
             scene_side_shades: [[0; 4]; 2],
@@ -3002,7 +3005,9 @@ impl HeadlessSceneRenderer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene_dda.wgsl (headless)"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/scene_dda.wgsl").into()),
+            // QE.8 — assembled source (common snippet + stub variant);
+            // the raw file is no longer standalone-valid WGSL.
+            source: wgpu::ShaderSource::Wgsl(crate::shader_src::scene_shader_source(false).into()),
         });
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("roxlap-gpu headless.bgl"),

@@ -4,16 +4,30 @@
 //! plus the naga validation test covering every shader (including
 //! both spliced variants).
 
-/// XS.4.2 — build the sprite-pass shader source. On a sprite-shadow-capable
-/// device, splice `sprite_terrain_shadow.wgsl` over the `//XS4_STUB_BEGIN`..
+/// QE.8 — helpers shared verbatim by both DDA marchers, prepended to
+/// their sources (WGSL module scope is order-independent). The base
+/// files are NOT standalone-valid any more — always assemble through
+/// [`sprite_shader_source`] / [`scene_shader_source`].
+const COMMON: &str = include_str!("../shaders/common.wgsl");
+
+fn with_common(base: &str) -> String {
+    let mut out = String::with_capacity(COMMON.len() + 1 + base.len());
+    out.push_str(COMMON);
+    out.push('\n');
+    out.push_str(base);
+    out
+}
+
+/// XS.4.2 — build the sprite-pass shader source (always prefixed with
+/// the QE.8 common snippet). On a sprite-shadow-capable device, splice
+/// `sprite_terrain_shadow.wgsl` over the `//XS4_STUB_BEGIN`..
 /// `//XS4_STUB_END` block so `shadow_occluded_world` becomes the real terrain
 /// march (+ the occupancy bindings 16..23); otherwise the stub keeps GPU
-/// sprites unshadowed. The base file is always valid WGSL (the stub variant),
-/// so `wgsl_shaders_validate` covers the fallback path.
+/// sprites unshadowed. `wgsl_shaders_validate` covers both variants.
 pub(crate) fn sprite_shader_source(capable: bool) -> String {
     let base = include_str!("../shaders/sprite_model_dda.wgsl");
     if !capable {
-        return base.to_string();
+        return with_common(base);
     }
     let snippet = include_str!("../shaders/sprite_terrain_shadow.wgsl");
     const BEGIN: &str = "//XS4_STUB_BEGIN";
@@ -27,18 +41,19 @@ pub(crate) fn sprite_shader_source(capable: bool) -> String {
     out.push_str(&base[..b]);
     out.push_str(snippet);
     out.push_str(&base[e_end..]);
-    out
+    with_common(&out)
 }
 
-/// XS.4.3 — build the scene-pass shader source. On a sprite-shadow-capable
-/// device, splice `scene_sprite_shadow.wgsl` over the `//XS4C_STUB_BEGIN`..
+/// XS.4.3 — build the scene-pass shader source (always prefixed with
+/// the QE.8 common snippet). On a sprite-shadow-capable device, splice
+/// `scene_sprite_shadow.wgsl` over the `//XS4C_STUB_BEGIN`..
 /// `//XS4C_STUB_END` block so `sprites_occlude` marches the sprite registry
 /// (+ bindings 19..21) and terrain receives sprite-cast shadows; otherwise the
-/// stub returns false. The base file is always valid WGSL (the stub variant).
+/// stub returns false.
 pub(crate) fn scene_shader_source(capable: bool) -> String {
     let base = include_str!("../shaders/scene_dda.wgsl");
     if !capable {
-        return base.to_string();
+        return with_common(base);
     }
     let snippet = include_str!("../shaders/scene_sprite_shadow.wgsl");
     const BEGIN: &str = "//XS4C_STUB_BEGIN";
@@ -51,7 +66,7 @@ pub(crate) fn scene_shader_source(capable: bool) -> String {
     out.push_str(&base[..b]);
     out.push_str(snippet);
     out.push_str(&base[e_end..]);
-    out
+    with_common(&out)
 }
 
 #[cfg(test)]
@@ -62,12 +77,15 @@ mod tests {
     /// CI without needing a GPU device.
     #[test]
     fn wgsl_shaders_validate() {
+        // QE.8 — the two DDA marchers validate as ASSEMBLED (common
+        // snippet prepended), in their stub variants here; the two
+        // capable spliced variants follow below. The raw base files are
+        // deliberately not standalone-valid any more.
+        let sprite_stub = super::sprite_shader_source(false);
+        let scene_stub = super::scene_shader_source(false);
         let shaders: &[(&str, &str)] = &[
-            (
-                "sprite_model_dda.wgsl",
-                include_str!("../shaders/sprite_model_dda.wgsl"),
-            ),
-            ("scene_dda.wgsl", include_str!("../shaders/scene_dda.wgsl")),
+            ("sprite_model_dda.wgsl (stub)", &sprite_stub),
+            ("scene_dda.wgsl (stub)", &scene_stub),
             ("blit.wgsl", include_str!("../shaders/blit.wgsl")),
             (
                 "scene_blit.wgsl",

@@ -1335,6 +1335,15 @@ pub struct RenderOptions {
     /// (QE.2c — was env-only `ROXLAP_GPU_CLIP_BUDGET`, which still
     /// overrides). `0` = unbounded.
     pub gpu_clip_upload_budget: u32,
+    /// GPU sprite mip-LOD threshold (QE.8; `ROXLAP_GPU_SPRITE_LOD_PX`
+    /// overrides): the pass steps to a coarser sprite mip once a
+    /// mip-0 voxel would project smaller than this many screen pixels.
+    /// `1.0` (the default) is the "don't go sub-pixel" threshold and
+    /// keeps GPU sprites visually identical to the CPU backend (which
+    /// has no sprite LOD); raise it to trade sprite fidelity for
+    /// distant-sprite speed (the pre-QE.8 behaviour was `4.0`, which
+    /// visibly densified thin/hollow translucent models at range).
+    pub gpu_sprite_lod_px: f32,
     /// Unused. Sized the strip-parallel opticast's per-frame scratch
     /// pool; the per-pixel DDA renderer that replaced it needs no
     /// pre-sizing, so the value is ignored.
@@ -1368,6 +1377,7 @@ impl Default for RenderOptions {
             gpu_mip_scan_dist: 64.0,
             gpu_chunk_upload_budget: 2,
             gpu_clip_upload_budget: 8,
+            gpu_sprite_lod_px: 1.0,
             cpu_max_grid_vsid: 32 * roxlap_scene::CHUNK_SIZE_XY,
             cpu_render_threads: 4,
         }

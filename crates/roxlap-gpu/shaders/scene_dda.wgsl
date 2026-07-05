@@ -21,7 +21,6 @@ const OCC_WORDS_PER_COLUMN: u32 = 8u; // CHUNK_Z (256) / 32
 const CHUNK_Z: u32 = 256u;
 const MAX_INNER_STEPS: u32 = 768u;
 const MAX_GPU_MIPS: u32 = 6u; // GPU.11 — must match scene::MAX_GPU_MIPS
-const T_INF: f32 = 1.0e30;
 
 struct PerGridCamera {
     pos: vec3<f32>,
@@ -335,26 +334,6 @@ fn face_normal(axis: i32, ray_dir: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(0.0, 0.0, -sign(ray_dir.z));
 }
 
-// DL — point-light distance falloff: smooth quadratic from 1 at the light
-// to 0 at `radius` (hard cutoff). Stylized, cheap, and never negative.
-fn point_falloff(d: f32, radius: f32) -> f32 {
-    let x = clamp(1.0 - d / radius, 0.0, 1.0);
-    return x * x;
-}
-
-// SL — spot (cone) angular mask. `ldir` = unit direction from the surface TO
-// the light; `axis` = the cone axis (the way the light shines). Returns 1.0
-// for a pure point light (`cos_outer <= -0.999`, the 180° degenerate). Else a
-// soft `smoothstep` from 0 at the outer half-angle to 1 at the inner, falling
-// back to a hard `step` when the two angles coincide (`outer == inner` — WGSL
-// `smoothstep` is undefined for equal edges).
-fn spot_cone(ldir: vec3<f32>, axis: vec3<f32>, cos_inner: f32, cos_outer: f32) -> f32 {
-    if (cos_outer <= -0.999) { return 1.0; }
-    let cd = dot(-ldir, axis);
-    if (cos_inner <= cos_outer) { return step(cos_outer, cd); }
-    return smoothstep(cos_outer, cos_inner, cd);
-}
-
 // GPU.7 modular slot lookup. `pool_dims` are powers of 2 (asserted
 // on the host), so `chunk_idx & (pool_dims - 1)` is the slot index
 // per axis. Slot identity must be verified against
@@ -427,25 +406,6 @@ fn sky_color(dir: vec3<f32>) -> vec3<f32> {
         vec2<f32>(elevation, azimuth),
         0.0,
     ).rgb;
-}
-
-// GPU.8 fog blend. `t` is the world-space hit distance; below
-// `fog_near` the hit shows through fully; above `fog_far` only the
-// fog colour shows. Linear ramp (not smoothstep) to match the CPU /
-// DDA fog `clamp((t - near) / (far - near))` — smoothstep's S-curve
-// gave visibly weaker mid-distance fog than the DDA renderer.
-fn apply_fog(hit_color: vec3<f32>, t: f32) -> vec3<f32> {
-    let fog_near = u.fog_color.w;
-    let factor = clamp((t - fog_near) / max(u.fog_far - fog_near, 1e-6), 0.0, 1.0);
-    return mix(hit_color, u.fog_color.rgb, factor);
-}
-
-fn shield_parallel(t_max: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
-    var t = t_max;
-    if (dir.x == 0.0) { t.x = T_INF; }
-    if (dir.y == 0.0) { t.y = T_INF; }
-    if (dir.z == 0.0) { t.z = T_INF; }
-    return t;
 }
 
 // GPU.11.1 — choose the mip a chunk is marched at, from the world-t
@@ -638,14 +598,6 @@ fn shadow_occluded_world(origin_w: vec3<f32>, dir_w: vec3<f32>, max_t: f32, t_ba
         }
     }
     return false;
-}
-
-// DL.6 — cel quantization: snap a 0..1 light factor to `bands + 1` discrete
-// levels (terraced light instead of a smooth gradient). `bands == 0` never
-// reaches here (the smooth path is taken instead).
-fn cel_band(x: f32, bands: u32) -> f32 {
-    let b = f32(bands);
-    return clamp(round(x * b) / b, 0.0, 1.0);
 }
 
 // DL — dynamic-lighting surface shade (pre-fog), same 0..~2 scale as

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed: GPU sprite mip-LOD default (visual parity with CPU)
+
+- The GPU sprite pass stepped to coarser sprite mips once a mip-0
+  voxel projected below **4** screen pixels; the CPU backend has no
+  sprite LOD at all. Downsampling collapses thin/hollow structure —
+  most visibly, translucent models: a hollow glass model's front/back
+  sheets merge into a solid volume, so glass read *denser/paler* on
+  GPU at moderate distances (the "window looks different per backend"
+  report). The default is now **1.0** (mip only once a voxel goes
+  sub-pixel), which is pixel-identical to CPU in the A/B probe.
+- New knob: `RenderOptions::gpu_sprite_lod_px` (env override
+  `ROXLAP_GPU_SPRITE_LOD_PX`). **Old behaviour:** set it to `4.0` —
+  worth trying if distant-sprite cost matters more than fidelity.
+
+### Internal: WGSL shared-snippet extraction (QE.8)
+
+- The five helpers duplicated (with drift) between `scene_dda.wgsl`
+  and `sprite_model_dda.wgsl` — `shield_parallel`, `apply_fog`,
+  `point_falloff`, `spot_cone`, `cel_band` (+ `T_INF`) — now live once
+  in `shaders/common.wgsl`, prepended at shader assembly. The raw
+  `.wgsl` base files are no longer standalone-valid; naga-validation
+  covers all four assembled variants. No render change (verified
+  within run-to-run noise on live GPU captures; device tests green).
+
 ### Security / robustness (fuzzing)
 
 - New `cargo-fuzz` harnesses (`crates/roxlap-formats/fuzz`, 8 targets:
