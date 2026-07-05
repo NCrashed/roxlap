@@ -1099,13 +1099,65 @@ pub struct Line3 {
 }
 
 /// A handle to an uploaded image-sprite texture, returned by
-/// [`SceneRenderer::upload_image`]. Positional (like [`SpriteModelId`]):
-/// it indexes the backend's texture store. Pass it in an [`ImageSprite`]
-/// for [`SceneRenderer::draw_images`], or to
-/// [`drop_image`](SceneRenderer::drop_image) to release it. Opaque on
-/// purpose — there's no arithmetic to do on it.
+/// [`SceneRenderer::upload_image`]. **Generational** (QE-B6): image
+/// slots are reused after [`drop_image`](SceneRenderer::drop_image),
+/// so each handle carries the slot's generation — a stale handle
+/// (kept across a drop) resolves to a safe no-op instead of aliasing
+/// whatever texture re-took the slot. Pass it in an [`ImageSprite`]
+/// for [`SceneRenderer::draw_images`]. Opaque on purpose — there's no
+/// arithmetic to do on it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ImageId(pub(crate) usize);
+pub struct ImageId {
+    slot: u32,
+    gen: u32,
+}
+
+/// QE-B6 — generational guard for image slots. Unlike
+/// [`EpochSlotMap`] (whose backend indices are append-only), image
+/// slots ARE reused: `drop_image` frees the texture slot and the next
+/// upload may take it. Each slot therefore carries its own
+/// generation; a stale [`ImageId`] resolves to `None`.
+#[derive(Default)]
+struct ImageSlotMap {
+    /// Per backend slot: (current generation, live).
+    slots: Vec<(u32, bool)>,
+}
+
+impl ImageSlotMap {
+    /// Register the slot the backend just filled (append or reuse).
+    fn alloc(&mut self, slot: usize) -> ImageId {
+        if slot >= self.slots.len() {
+            self.slots.resize(slot + 1, (0, false));
+            self.slots[slot] = (0, true);
+        } else {
+            let e = &mut self.slots[slot];
+            e.0 = e.0.wrapping_add(1);
+            e.1 = true;
+        }
+        ImageId {
+            slot: u32::try_from(slot).expect("image slots fit u32"),
+            gen: self.slots[slot].0,
+        }
+    }
+
+    /// Resolve to the backend slot, or `None` when stale / removed.
+    fn index(&self, id: ImageId) -> Option<usize> {
+        let e = *self.slots.get(id.slot as usize)?;
+        (e.0 == id.gen && e.1).then_some(id.slot as usize)
+    }
+
+    /// Tombstone; `false` when the handle was already stale.
+    fn remove(&mut self, id: ImageId) -> bool {
+        let Some(e) = self.slots.get_mut(id.slot as usize) else {
+            return false;
+        };
+        if e.0 != id.gen || !e.1 {
+            return false;
+        }
+        e.1 = false;
+        true
+    }
+}
 
 /// How an [`ImageSprite`]'s quad is oriented in the world.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1180,7 +1232,8 @@ pub struct ImageSprite {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QuadDraw {
     pub corners: [[f32; 3]; 4],
-    pub image: ImageId,
+    /// Backend texture SLOT (facade-resolved; see `draw_images`).
+    pub image: usize,
     pub tint: u32,
     pub depth_test: bool,
     pub alpha_cutoff: f32,
@@ -1522,7 +1575,7 @@ fn resolve_quad(sprite: &ImageSprite, camera: &Camera) -> Option<QuadDraw> {
 
     Some(QuadDraw {
         corners: [tl, tr, bl, br],
-        image: sprite.image,
+        image: 0, // placeholder — draw_images resolves the real slot
         tint: sprite.tint,
         depth_test: sprite.depth_test,
         alpha_cutoff: sprite.alpha_cutoff,
@@ -1679,6 +1732,8 @@ pub struct SceneRenderer {
     /// QE.3a - the once-per-facade scene bookkeeping both backends
     /// read (materials, terrain map, clip-instance frames).
     state: SceneState,
+    /// QE-B6 — generational image-slot guard (see [`ImageSlotMap`]).
+    image_map: ImageSlotMap,
 }
 
 impl SceneRenderer {
@@ -1687,6 +1742,7 @@ impl SceneRenderer {
     fn from_backend(inner: BackendImpl) -> Self {
         Self {
             inner,
+            image_map: ImageSlotMap::default(),
             dyn_map: DynInstanceMap::default(),
             model_map: EpochSlotMap::default(),
             clip_map: EpochSlotMap::default(),
@@ -2026,19 +2082,24 @@ impl SceneRenderer {
         if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
             return None;
         }
-        Some(match &mut self.inner {
+        let slot = match &mut self.inner {
             BackendImpl::Cpu(c) => c.upload_image(rgba, width, height),
             BackendImpl::Gpu(g) => g.upload_image(rgba, width, height),
-        })
+        };
+        Some(self.image_map.alloc(slot))
     }
 
     /// Release a texture uploaded with [`upload_image`](Self::upload_image).
-    /// The id must not be reused afterwards (a later `upload_image` may
-    /// hand the slot back out under a fresh id).
+    /// Stale handles (already dropped, or aliasing a reused slot) are a
+    /// safe no-op — ids are generational since QE-B6.
     pub fn drop_image(&mut self, id: ImageId) {
+        let Some(slot) = self.image_map.index(id) else {
+            return;
+        };
+        self.image_map.remove(id);
         match &mut self.inner {
-            BackendImpl::Cpu(c) => c.drop_image(id),
-            BackendImpl::Gpu(g) => g.drop_image(id),
+            BackendImpl::Cpu(c) => c.drop_image(slot),
+            BackendImpl::Gpu(g) => g.drop_image(slot),
         }
     }
 
@@ -2059,7 +2120,14 @@ impl SceneRenderer {
         }
         let quads: Vec<QuadDraw> = images
             .iter()
-            .filter_map(|s| resolve_quad(s, camera))
+            .filter_map(|s| {
+                // QE-B6 — stale image handles draw nothing (vs aliasing
+                // whatever texture reused the slot).
+                let slot = self.image_map.index(s.image)?;
+                let mut q = resolve_quad(s, camera)?;
+                q.image = slot;
+                Some(q)
+            })
             .collect();
         if quads.is_empty() {
             return;
@@ -2181,9 +2249,10 @@ impl SceneRenderer {
     /// Source dimensions of an uploaded image, or `None` if the id was
     /// dropped / never uploaded. Internal helper for [`Self::pick_image`].
     fn image_dims(&self, id: ImageId) -> Option<(u32, u32)> {
+        let slot = self.image_map.index(id)?;
         match &self.inner {
-            BackendImpl::Cpu(c) => c.image_dims(id),
-            BackendImpl::Gpu(g) => g.image_dims(id),
+            BackendImpl::Cpu(c) => c.image_dims(slot),
+            BackendImpl::Gpu(g) => g.image_dims(slot),
         }
     }
 
@@ -2191,9 +2260,12 @@ impl SceneRenderer {
     /// unknown id / out-of-range texel). Internal helper for
     /// [`Self::pick_image`].
     fn image_alpha_at(&self, id: ImageId, tx: u32, ty: u32) -> u8 {
+        let Some(slot) = self.image_map.index(id) else {
+            return 0;
+        };
         match &self.inner {
-            BackendImpl::Cpu(c) => c.image_alpha_at(id, tx, ty),
-            BackendImpl::Gpu(g) => g.image_alpha_at(id, tx, ty),
+            BackendImpl::Cpu(c) => c.image_alpha_at(slot, tx, ty),
+            BackendImpl::Gpu(g) => g.image_alpha_at(slot, tx, ty),
         }
     }
 
@@ -4426,7 +4498,7 @@ mod tests {
         // Top-left at (-5, 10, -5); u = +X (width), v = +Z (down). A
         // 10×10 quad facing the camera (its +Y normal points back at us).
         let sprite = ImageSprite {
-            image: ImageId(0),
+            image: ImageId { slot: 0, gen: 0 },
             origin: [-5.0, 10.0, -5.0],
             facing: ImageFacing::World {
                 u: [1.0, 0.0, 0.0],
@@ -4450,7 +4522,7 @@ mod tests {
         // Same plane but spanned so its normal (u × v) points *away* from
         // the camera: swap u/v so the winding flips.
         let sprite = ImageSprite {
-            image: ImageId(0),
+            image: ImageId { slot: 0, gen: 0 },
             origin: [-5.0, 10.0, -5.0],
             facing: ImageFacing::World {
                 u: [0.0, 0.0, 1.0], // v-ish
@@ -4477,7 +4549,7 @@ mod tests {
     #[test]
     fn double_sided_never_culls() {
         let mut sprite = ImageSprite {
-            image: ImageId(0),
+            image: ImageId { slot: 0, gen: 0 },
             origin: [-5.0, 10.0, -5.0],
             facing: ImageFacing::World {
                 u: [0.0, 0.0, 1.0],
@@ -4540,7 +4612,7 @@ mod tests {
         // must point away from `up`, and u/v must be ⟂ the view direction.
         let up = [0.0, 0.0, -1.0];
         let sprite = ImageSprite {
-            image: ImageId(0),
+            image: ImageId { slot: 0, gen: 0 },
             origin: [0.0, 50.0, 0.0],
             facing: ImageFacing::Billboard { up },
             size: [4.0, 4.0],
@@ -4560,5 +4632,36 @@ mod tests {
             v_dot(v, up) < 0.0,
             "rows grow away from `up` (top edge toward up)"
         );
+    }
+}
+
+#[cfg(test)]
+mod image_map_tests {
+    use super::{ImageId, ImageSlotMap};
+
+    /// QE-B6 regression — image slots are reused by the backends, so
+    /// a stale handle must resolve to nothing rather than alias the
+    /// texture that re-took its slot (the pre-B6 behaviour).
+    #[test]
+    fn image_ids_are_generational() {
+        let mut m = ImageSlotMap::default();
+        let a = m.alloc(0);
+        assert_eq!(m.index(a), Some(0));
+        assert!(m.remove(a));
+        assert_eq!(m.index(a), None);
+
+        // The backend hands slot 0 out again: a fresh generation.
+        let b = m.alloc(0);
+        assert_ne!(a, b, "reused slot must mint a distinct handle");
+        assert_eq!(m.index(b), Some(0));
+        assert_eq!(m.index(a), None, "stale handle stays stale");
+        assert!(!m.remove(a), "stale drop is refused…");
+        assert_eq!(m.index(b), Some(0), "…and cannot hurt the newcomer");
+
+        // Appending past the end still works.
+        let c = m.alloc(1);
+        assert_eq!(m.index(c), Some(1));
+        let _ = ImageId { slot: 9, gen: 9 };
+        assert_eq!(m.index(ImageId { slot: 9, gen: 9 }), None);
     }
 }

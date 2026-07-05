@@ -51,7 +51,7 @@ fn build_scene() -> Scene {
             );
         }
     }
-    grid.bake_lightmode(1);
+    grid.bake(roxlap_scene::BakeMode::Directional);
     scene
 }
 
@@ -172,7 +172,11 @@ impl ApplicationHandler for App {
                     // Carve a crater, then re-light just the hole.
                     grid.set_sphere(hit.voxel, 4, None);
                     let r = IVec3::splat(4);
-                    grid.bake_lightmode_bbox(hit.voxel - r, hit.voxel + r, 1);
+                    grid.bake_bbox(
+                        hit.voxel - r,
+                        hit.voxel + r,
+                        roxlap_scene::BakeMode::Directional,
+                    );
                 }
                 // ANCHOR_END: click_pick
             }

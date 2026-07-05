@@ -189,7 +189,7 @@ fn regen_cave(grid: &mut roxlap_scene::Grid, preset: Preset, seed: u64) {
     *grid.ensure_chunk(IVec3::ZERO) = vxl;
     let c = spawn_centre();
     grid.set_sphere(c, SPAWN_BUBBLE_RADIUS, Some(SPAWN_BUBBLE_COLOR));
-    grid.bake_lightmode(LIGHTMODE);
+    grid.bake(roxlap_scene::BakeMode::Directional);
     // `set_sphere` bumped the version; bump once more so a re-gen with
     // an identical spawn-bubble edit still differs from the tracker.
     grid.bump_chunk_version(IVec3::ZERO);
@@ -395,7 +395,7 @@ fn step_bullets(state: &mut State, dt: f64) -> bool {
     // Re-bake the (single) chunk's lighting once after all craters so
     // estnorm shading follows the new cavity walls; the carve already
     // bumped the chunk version, so the facade re-uploads this frame.
-    grid.bake_lightmode(LIGHTMODE);
+    grid.bake(roxlap_scene::BakeMode::Directional);
     true
 }
 

@@ -98,7 +98,7 @@ One more thing edits do implicitly: each write bumps the touched
 chunk's version counter and dirty extent, which is how the renderers
 (and the streaming persistence below) know what changed. You don't
 manage that — but after bulk terrain edits you will want to re-bake
-lighting (`bake_lightmode`, chapter 6).
+lighting (`Grid::bake`, chapter 6).
 
 ## Snapshots
 

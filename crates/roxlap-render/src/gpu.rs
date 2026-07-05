@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 
 use crate::{
-    DynSpriteTransform, FrameParams, ImageId, KfaSprite, Kv6, Line3, QuadDraw, RenderOptions,
-    Sprite, SpriteSet,
+    DynSpriteTransform, FrameParams, KfaSprite, Kv6, Line3, QuadDraw, RenderOptions, Sprite,
+    SpriteSet,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{HasDisplayHandle, HasWindowHandle};
@@ -1208,38 +1208,37 @@ impl GpuBackend {
     /// Upload (or replace) an RGBA8 image-sprite texture, keeping a CPU
     /// shadow copy so `pick_image`'s alpha test can sample it (the GPU
     /// texture isn't read back).
-    pub(crate) fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> ImageId {
+    /// Returns the SLOT the image landed in; the facade owns the
+    /// generational handle. Input is facade-validated.
+    pub(crate) fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> usize {
         let id = self.gpu.upload_image(rgba, width, height);
-        let valid =
-            width != 0 && height != 0 && rgba.len() == (width as usize) * (height as usize) * 4;
-        let shadow = valid.then(|| (rgba.to_vec(), width, height));
         if id >= self.image_pixels.len() {
             self.image_pixels.resize_with(id + 1, || None);
         }
-        self.image_pixels[id] = shadow;
-        ImageId(id)
+        self.image_pixels[id] = Some((rgba.to_vec(), width, height));
+        id
     }
 
     /// Release a previously uploaded image-sprite texture.
-    pub(crate) fn drop_image(&mut self, id: ImageId) {
-        self.gpu.drop_image(id.0);
-        if let Some(slot) = self.image_pixels.get_mut(id.0) {
-            *slot = None;
+    pub(crate) fn drop_image(&mut self, slot: usize) {
+        self.gpu.drop_image(slot);
+        if let Some(s) = self.image_pixels.get_mut(slot) {
+            *s = None;
         }
     }
 
     /// Source `(width, height)` of an uploaded image, for `pick_image`.
-    pub(crate) fn image_dims(&self, id: ImageId) -> Option<(u32, u32)> {
+    pub(crate) fn image_dims(&self, slot: usize) -> Option<(u32, u32)> {
         self.image_pixels
-            .get(id.0)
+            .get(slot)
             .and_then(Option::as_ref)
             .map(|(_, w, h)| (*w, *h))
     }
 
     /// Alpha byte of texel `(tx, ty)` from the shadow copy; `0` for an
     /// unknown id / out-of-range texel.
-    pub(crate) fn image_alpha_at(&self, id: ImageId, tx: u32, ty: u32) -> u8 {
-        let Some(Some((rgba, w, h))) = self.image_pixels.get(id.0) else {
+    pub(crate) fn image_alpha_at(&self, slot: usize, tx: u32, ty: u32) -> u8 {
+        let Some(Some((rgba, w, h))) = self.image_pixels.get(slot) else {
             return 0;
         };
         if tx >= *w || ty >= *h {
@@ -1286,7 +1285,7 @@ impl GpuBackend {
                 let b = (q.tint & 0xff) as f32 / 255.0;
                 roxlap_gpu::GpuImageQuad {
                     corners: q.corners,
-                    image: q.image.0,
+                    image: q.image,
                     tint: [r, g, b, a],
                     depth_test: q.depth_test,
                     alpha_cutoff: q.alpha_cutoff,

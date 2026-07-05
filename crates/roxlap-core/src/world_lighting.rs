@@ -65,7 +65,7 @@ pub(crate) const AO_STRENGTH: f32 = 0.8;
 
 /// AO.2 — tunable ambient-occlusion bake parameters (the `lightmode == 3`
 /// knobs). [`Default`] matches the AO.0/AO.1 constants.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AoParams {
     /// Fraction of ambient removed at full occlusion (`0` = off, `1` = black
     /// crevices before `min_floor`).

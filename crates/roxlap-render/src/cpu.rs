@@ -32,7 +32,7 @@ use roxlap_scene::Scene;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{DynDisplay, DynWindow, HasDisplayHandle, HasWindowHandle};
 use crate::{
-    DynSpriteTransform, FrameParams, ImageId, KfaSprite, Line3, QuadDraw, RenderOptions, SpriteSet,
+    DynSpriteTransform, FrameParams, KfaSprite, Line3, QuadDraw, RenderOptions, SpriteSet,
 };
 
 /// An empty (zero-voxel) KV6 — the placeholder a removed CPU model
@@ -1723,10 +1723,12 @@ impl CpuBackend {
 
     /// Upload (or replace) an RGBA8 image; reuses a freed slot when one
     /// exists, else appends. See [`SceneRenderer::upload_image`].
-    pub(crate) fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> ImageId {
-        if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
-            return ImageId(0); // malformed — a draw with this id is a no-op
-        }
+    /// Returns the SLOT the image landed in (append or reuse); the
+    /// facade owns the generational handle. Input is facade-validated.
+    pub(crate) fn upload_image(&mut self, rgba: &[u8], width: u32, height: u32) -> usize {
+        debug_assert!(
+            width > 0 && height > 0 && rgba.len() == (width as usize) * (height as usize) * 4
+        );
         let img = CpuImage {
             rgba: rgba.to_vec(),
             width,
@@ -1734,31 +1736,31 @@ impl CpuBackend {
         };
         if let Some(slot) = self.images.iter().position(Option::is_none) {
             self.images[slot] = Some(img);
-            ImageId(slot)
+            slot
         } else {
             self.images.push(Some(img));
-            ImageId(self.images.len() - 1)
+            self.images.len() - 1
         }
     }
 
     /// Release a previously uploaded image (the slot becomes reusable).
-    pub(crate) fn drop_image(&mut self, id: ImageId) {
-        if let Some(slot) = self.images.get_mut(id.0) {
-            *slot = None;
+    pub(crate) fn drop_image(&mut self, slot: usize) {
+        if let Some(s) = self.images.get_mut(slot) {
+            *s = None;
         }
     }
 
     /// Source `(width, height)` of an uploaded image, for `pick_image`.
-    pub(crate) fn image_dims(&self, id: ImageId) -> Option<(u32, u32)> {
+    pub(crate) fn image_dims(&self, slot: usize) -> Option<(u32, u32)> {
         self.images
-            .get(id.0)
+            .get(slot)
             .and_then(Option::as_ref)
             .map(|img| (img.width, img.height))
     }
 
     /// Alpha byte of texel `(tx, ty)`; `0` for an unknown id / out-of-range.
-    pub(crate) fn image_alpha_at(&self, id: ImageId, tx: u32, ty: u32) -> u8 {
-        let Some(Some(img)) = self.images.get(id.0) else {
+    pub(crate) fn image_alpha_at(&self, slot: usize, tx: u32, ty: u32) -> u8 {
+        let Some(Some(img)) = self.images.get(slot) else {
             return 0;
         };
         if tx >= img.width || ty >= img.height {
@@ -1821,7 +1823,7 @@ impl CpuBackend {
         let zb = &self.zbuffer[..pixel_count];
 
         for quad in quads {
-            let Some(Some(image)) = self.images.get(quad.image.0) else {
+            let Some(Some(image)) = self.images.get(quad.image) else {
                 continue; // dropped or never-uploaded id
             };
             let [tl, tr, bl, br] = quad.corners;

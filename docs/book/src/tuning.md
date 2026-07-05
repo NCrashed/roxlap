@@ -59,7 +59,7 @@ The PF/PR performance series distilled into host-side rules:
 - **Batch bulk transforms** — `set_sprite_instance_transforms`
   (plural) over per-instance calls in a loop
   ([chapter 7](sprites.md)).
-- **Re-light the edit, not the world** — `bake_lightmode_bbox` after
+- **Re-light the edit, not the world** — `bake_bbox` after
   runtime carves ([chapter 6](lighting.md)).
 - **Let quiet frames stay quiet.** Change detection is version-based:
   don't touch chunks (or bump versions) you didn't modify, and the

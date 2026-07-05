@@ -27,17 +27,17 @@ default) you get exactly the classic render — baked byte only.
 
 ## Baked lighting & ambient occlusion
 
-`Grid::bake_lightmode(mode)` walks the grid once and writes shading
-into every voxel's brightness byte. Two modes matter:
+`Grid::bake(mode)` walks the grid once and writes shading into every
+voxel's brightness byte. The two `BakeMode`s:
 
-- **`1` — directional estnorm shading**: the classic Voxlap look
-  (surface-normal-based sun shading, baked). Use it standalone when
-  you don't run a light rig — the cave and terrain demos ship this.
-- **`3` — ambient occlusion** (via `bake_lightmode_with_ao` +
-  `AoParams`): crevices, pillar bases and inner corners darken. This
-  is the right bake *under* a runtime rig: the rig treats the byte as
-  its ambient fill, so AO gives contact shading everywhere the
-  dynamic lights don't reach.
+- **`BakeMode::Directional`** — estnorm shading, the classic Voxlap
+  look (surface-normal-based sun shading, baked). Use it standalone
+  when you don't run a light rig — the cave and terrain demos ship
+  this.
+- **`BakeMode::AmbientOcclusion(AoParams)`** — crevices, pillar bases
+  and inner corners darken. This is the right bake *under* a runtime
+  rig: the rig treats the byte as its ambient fill, so AO gives
+  contact shading everywhere the dynamic lights don't reach.
 
 ```rust,noplayground
 {{#include ../../../crates/roxlap-render/examples/book_lighting.rs:bake}}
@@ -49,7 +49,7 @@ Costs and cadence:
 
 - Bake once after building a grid — it is a bulk operation.
 - After a runtime carve, **don't** re-bake the grid: pass the edit's
-  bbox to `bake_lightmode_bbox` — it re-bakes a few hundred columns
+  bbox to `bake_bbox` — it re-bakes a few hundred columns
   instead of whole chunks (the cave demo measured ~0.04 ms against
   4–7 ms).
 - Streaming grids bake per chunk as they stream in — a scene-wide

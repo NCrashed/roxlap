@@ -24,7 +24,7 @@ use roxlap_render::{
     BackendPreference, DirectionalLight, DynSpriteTransform, FrameParams, Kv6, LightRig, Material,
     PointLight, RenderOptions, SceneRenderer, SpotLight,
 };
-use roxlap_scene::{GridTransform, Scene};
+use roxlap_scene::{BakeMode, GridTransform, Scene};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -74,19 +74,16 @@ fn build_scene() -> Scene {
         Some(GLASS_RGB),
     );
 
-    // Bake ambient occlusion (lightmode 3) into every voxel's
-    // brightness byte: crevices, pillar bases and inner corners
-    // darken. The runtime lights below read this byte as their
-    // ambient/AO fill. Re-bake after bulk edits (for small runtime
-    // carves use `bake_lightmode_bbox` — it re-bakes just the hole).
-    grid.bake_lightmode_with_ao(
-        3,
-        AoParams {
-            strength: 0.85, // fraction of ambient removed in a crevice
-            radius: 1,      // contact reach in voxels (1 = tight edges)
-            ..AoParams::default()
-        },
-    );
+    // Bake ambient occlusion into every voxel's brightness byte:
+    // crevices, pillar bases and inner corners darken. The runtime
+    // lights below read this byte as their ambient/AO fill. Re-bake
+    // after bulk edits (for small runtime carves use `bake_bbox` —
+    // it re-bakes just the hole).
+    grid.bake(BakeMode::AmbientOcclusion(AoParams {
+        strength: 0.85, // fraction of ambient removed in a crevice
+        radius: 1,      // contact reach in voxels (1 = tight edges)
+        ..AoParams::default()
+    }));
     scene
 }
 // ANCHOR_END: bake

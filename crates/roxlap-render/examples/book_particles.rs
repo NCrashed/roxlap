@@ -49,7 +49,7 @@ fn build_arena() -> (Scene, GridId) {
     let id = scene.add_grid(GridTransform::at(DVec3::new(-64.0, -64.0, 200.0)));
     let g = scene.grid_mut(id).expect("arena grid present");
     g.set_rect(IVec3::new(0, 0, 0), IVec3::new(128, 128, 8), Some(GROUND));
-    g.bake_lightmode(1);
+    g.bake(roxlap_scene::BakeMode::Directional);
     (scene, id)
 }
 

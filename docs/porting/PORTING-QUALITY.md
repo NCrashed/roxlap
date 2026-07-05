@@ -53,9 +53,24 @@ below. **Author triage 2026-07-06** (every carried item decided):
   rotation + mirrored heading). One-argument-swap fix; panorama
   content verified aligned on live captures. Residual: GPU linear vs
   CPU nearest-texel filtering (sub-texel softness, deliberate).
-- QE-B6 leftovers (`PackedColor`, generational `ImageId`,
-  `set_sprites` reset split, `_with_materials` collapse, `Frame`
-  guard, typed `BakeMode`) — **DO** (breaking window still open).
+- QE-B6 leftovers — **IN PROGRESS** (breaking window still open):
+  - ~~typed `BakeMode`~~ **DONE 2026-07-06**: `Grid::bake` /
+    `bake_bbox` take `BakeMode::{Directional, AmbientOcclusion(AoParams)}`;
+    the three `bake_lightmode*` methods deprecated-forward; the bbox
+    variant now honours AO params (it silently used defaults). All
+    internal callers + book prose migrated.
+  - ~~generational `ImageId`~~ **DONE 2026-07-06**: facade-side
+    `ImageSlotMap` (per-slot generations — image slots ARE reused,
+    unlike the append-only `EpochSlotMap` families); backends take raw
+    slots; stale handles no-op in draw/pick/drop. Regression test
+    `image_ids_are_generational`.
+  - Audit note: `speed_q8`, `get_` prefix, `ActorState.name`,
+    `ShadowFlags`, env budgets, `BackendPreference` were already fixed
+    in QE.7 — the review list overstated what remained.
+  - Still open: `_with_materials` collapse, `set_sprites` reset
+    split, `PackedColor` newtype family, `Frame` guard object.
+    (`SpriteInstanceDesc.model: usize` — decided to KEEP: the batch
+    struct pre-dates id assignment; documented instead.)
 - CPU↔GPU pixel-diff harness + more golden scenes (QE-C5) —
   **DROPPED** by author decision.
 - Workspace-wide `missing_docs` (~250 field docs in

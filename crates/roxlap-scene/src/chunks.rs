@@ -148,6 +148,40 @@ impl<'a> SolidSampler<'a> {
     }
 }
 
+/// What [`Grid::bake`] / [`Grid::bake_bbox`] write into the per-voxel
+/// brightness byte (QE-B6 — replaces the voxlap magic-`u32` lightmode).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BakeMode {
+    /// Directional estnorm shading (voxlap lightmode 1) — the classic
+    /// standalone look for hosts that don't run a dynamic light rig.
+    Directional,
+    /// Ambient occlusion (lightmode 3): crevices and inner corners
+    /// darken. The right bake *under* a runtime `LightRig`, which
+    /// reads the byte as its ambient/AO fill. Carries its tuning
+    /// parameters — unlike the deprecated `bake_lightmode_bbox`,
+    /// [`Grid::bake_bbox`] honours them.
+    AmbientOcclusion(roxlap_core::AoParams),
+}
+
+impl BakeMode {
+    /// The voxlap wire value the bake internals consume.
+    fn lightmode(self) -> u32 {
+        match self {
+            Self::Directional => 1,
+            Self::AmbientOcclusion(_) => 3,
+        }
+    }
+
+    /// The AO parameters (defaults for the non-AO mode, where the
+    /// bake ignores them).
+    fn ao(self) -> roxlap_core::AoParams {
+        match self {
+            Self::Directional => roxlap_core::AoParams::default(),
+            Self::AmbientOcclusion(ao) => ao,
+        }
+    }
+}
+
 impl Grid {
     /// True if the grid-local integer voxel `voxel` is solid (inside a
     /// solid run of its chunk). An implicit-air or absent chunk reads
@@ -197,12 +231,12 @@ impl Grid {
 
     /// Bake per-voxel lighting (voxlap `updatevxl`/`estnorm` shading)
     /// into every materialised chunk's brightness bytes, in place.
-    /// `lightmode` is voxlap's mode (1 = directional estnorm shading,
-    /// the look the cave + terrain demos use). Both the CPU rasteriser
-    /// and the GPU marcher read these pre-baked brightness bytes, so
-    /// call this once after building a grid and again over edited
-    /// chunks after a carve (then bump their versions so the GPU
-    /// re-uploads — edits already do, via [`Grid::set_voxel`] &c.).
+    /// Both the CPU rasteriser and the GPU marcher read these
+    /// pre-baked brightness bytes, so call this once after building a
+    /// grid and again over edited chunks after a carve (then bump
+    /// their versions so the GPU re-uploads — edits already do, via
+    /// [`Grid::set_voxel`] &c.). For small runtime edits prefer
+    /// [`Self::bake_bbox`] — it re-bakes only the touched columns.
     ///
     /// Each chunk is baked neighbour-aware in all three axes: estnorm's
     /// (and AO's) ±2-voxel padding that crosses a chunk face reads the
@@ -211,15 +245,26 @@ impl Grid {
     /// / occlusion is continuous across every seam. Point lights aren't
     /// applied (directional-only) — matching the demos' bake. No-op for
     /// an empty grid.
-    pub fn bake_lightmode(&mut self, lightmode: u32) {
-        self.bake_lightmode_with_ao(lightmode, roxlap_core::AoParams::default());
+    pub fn bake(&mut self, mode: BakeMode) {
+        self.bake_u32(mode.lightmode(), mode.ao());
     }
 
-    /// [`Self::bake_lightmode`] with explicit [`AoParams`] — the AO bake
-    /// (lightmode 3) tunes `strength`/`radius` through these.
-    ///
-    /// [`AoParams`]: roxlap_core::AoParams
+    /// QE-B6 — magic `u32` lightmode; use [`Self::bake`] with a typed
+    /// [`BakeMode`] instead (`1` → `BakeMode::Directional`, `3` →
+    /// `BakeMode::AmbientOcclusion(AoParams::default())`).
+    #[deprecated(since = "0.23.0", note = "use `bake(BakeMode::..)`")]
+    pub fn bake_lightmode(&mut self, lightmode: u32) {
+        self.bake_u32(lightmode, roxlap_core::AoParams::default());
+    }
+
+    /// QE-B6 — use [`Self::bake`] with
+    /// `BakeMode::AmbientOcclusion(ao)` instead.
+    #[deprecated(since = "0.23.0", note = "use `bake(BakeMode::AmbientOcclusion(ao))`")]
     pub fn bake_lightmode_with_ao(&mut self, lightmode: u32, ao: roxlap_core::AoParams) {
+        self.bake_u32(lightmode, ao);
+    }
+
+    fn bake_u32(&mut self, lightmode: u32, ao: roxlap_core::AoParams) {
         if lightmode == 0 {
             return;
         }
@@ -284,7 +329,20 @@ impl Grid {
     /// NOT performed — near-field renders read mip 0; callers streaming
     /// distant edited chunks should remip as they already do for edits.
     #[allow(clippy::cast_possible_wrap)]
+    pub fn bake_bbox(&mut self, lo: IVec3, hi: IVec3, mode: BakeMode) {
+        self.bake_bbox_u32(lo, hi, mode.lightmode(), mode.ao());
+    }
+
+    /// QE-B6 — magic `u32` lightmode, and this variant silently baked
+    /// AO with default params. Use [`Self::bake_bbox`] with a typed
+    /// [`BakeMode`] (which honours `AmbientOcclusion`'s params).
+    #[deprecated(since = "0.23.0", note = "use `bake_bbox(lo, hi, BakeMode::..)`")]
     pub fn bake_lightmode_bbox(&mut self, lo: IVec3, hi: IVec3, lightmode: u32) {
+        self.bake_bbox_u32(lo, hi, lightmode, roxlap_core::AoParams::default());
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn bake_bbox_u32(&mut self, lo: IVec3, hi: IVec3, lightmode: u32, ao: roxlap_core::AoParams) {
         if lightmode == 0 {
             return;
         }
@@ -341,7 +399,7 @@ impl Grid {
                         &cache,
                         lightmode,
                         &[],
-                        roxlap_core::AoParams::default(),
+                        ao,
                     );
                     // PF.12 — brightness bytes changed within the clipped
                     // region only.
@@ -795,7 +853,7 @@ pub(crate) mod tests {
                 let (x, y) = (23 * i % 240 + 8, 37 * i % 240 + 8);
                 g.set_sphere(IVec3::new(x, y, 165), 6, None);
             }
-            g.bake_lightmode(1);
+            g.bake(BakeMode::Directional);
             g
         };
         let mut full = build();
@@ -808,8 +866,8 @@ pub(crate) mod tests {
         bbox.set_rect(lo, hi, None);
 
         // Ground truth: full re-bake. Candidate: bbox-only re-bake.
-        full.bake_lightmode(1);
-        bbox.bake_lightmode_bbox(lo, hi, 1);
+        full.bake(BakeMode::Directional);
+        bbox.bake_bbox(lo, hi, BakeMode::Directional);
 
         for (idx, a) in &full.chunks {
             let b = bbox.chunks.get(idx).expect("same chunk set");

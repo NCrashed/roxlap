@@ -60,8 +60,10 @@ use serde::{Deserialize, Serialize};
 
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
 pub use billboard::{canonical_viewpoints, BillboardCache, BillboardSnapshot};
+pub use chunks::BakeMode;
 pub use edit::SpanOp;
 pub use lod::{select_lod, Lod, LodThresholds};
+pub use roxlap_core::AoParams;
 pub use streaming::{ChunkGenerator, ChunkStore, StreamRadius};
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps

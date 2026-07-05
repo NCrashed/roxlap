@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed: typed lighting bakes — `Grid::bake(BakeMode)` (QE-B6)
+
+- The voxlap magic-`u32` lightmode is gone from the public bake API:
+
+  | was | now |
+  |---|---|
+  | `grid.bake_lightmode(1)` | `grid.bake(BakeMode::Directional)` |
+  | `grid.bake_lightmode_with_ao(3, ao)` | `grid.bake(BakeMode::AmbientOcclusion(ao))` |
+  | `grid.bake_lightmode_bbox(lo, hi, 1)` | `grid.bake_bbox(lo, hi, BakeMode::Directional)` |
+
+  The old methods remain as `#[deprecated]` forwarders for one minor
+  release. `BakeMode` and `AoParams` re-export from `roxlap_scene`.
+- Fix folded in: `bake_lightmode_bbox` silently baked AO with
+  *default* params; `bake_bbox(.., BakeMode::AmbientOcclusion(ao))`
+  honours the ones you pass.
+
+### Changed: `ImageId` is generational (QE-B6)
+
+- Image slots are reused after `drop_image`, and `ImageId` was a bare
+  positional index — a stale handle silently aliased whatever texture
+  re-took its slot (the one handle family with that hazard left).
+  `ImageId` now carries the slot's generation: stale handles resolve
+  to safe no-ops in `draw_images` / `pick_image` / `drop_image`.
+- Migration: nothing to change for code that treats `ImageId` as
+  opaque (the intended use). Code that constructed or compared raw
+  indices no longer compiles — hold the handle `upload_image`
+  returned instead.
+
 ### Changed: GPU sprite mip-LOD default (visual parity with CPU)
 
 - The GPU sprite pass stepped to coarser sprite mips once a mip-0

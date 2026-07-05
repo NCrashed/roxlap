@@ -127,7 +127,7 @@ impl ParticlesScene {
         g.set_rect(pool_lo, pool_hi, None);
         g.set_rect(pool_lo, pool_hi, Some(WATER_RGB));
         // Baked byte = the ambient/AO channel under the runtime rig.
-        g.bake_lightmode(1);
+        g.bake(roxlap_scene::BakeMode::Directional);
         scene
     }
 

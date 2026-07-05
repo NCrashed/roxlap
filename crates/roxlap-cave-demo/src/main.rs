@@ -791,7 +791,7 @@ fn install_cave_chunk(scene: &mut Scene, grid_id: GridId, preset: Preset, seed: 
     );
 
     // Directional sun-style bake over the whole (single) chunk.
-    grid.bake_lightmode(LIGHTMODE);
+    grid.bake(roxlap_scene::BakeMode::Directional);
 
     // Build the GPU mip ladder up front so the renderer's first upload —
     // and every per-impact re-upload — takes the cheap mip read-path. The

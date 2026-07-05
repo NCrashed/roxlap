@@ -133,7 +133,7 @@ pub fn build_demo() -> SceneAndCamera {
     // [[mip_attempt]] index-out-of-bounds for fragmented chunks.
     // Markers stay unlit (flat colour stripes) which is fine for
     // a LOD-tier visual validation demo.
-    bake_lightmode(&mut scene, 1, roxlap_core::AoParams::default());
+    bake_lightmode(&mut scene, roxlap_scene::BakeMode::Directional);
 
     // S6.6: 10 striped marker pillars along world +y. Built AFTER
     // `bake_lightmode_1` so the markers skip the bake's
@@ -347,7 +347,7 @@ impl SceneAndCamera {
 /// dead-code entry point.
 #[cfg(test)]
 pub fn bake_lightmode_1_pub(scene: &mut Scene) {
-    bake_lightmode(scene, 1, roxlap_core::AoParams::default());
+    bake_lightmode(scene, roxlap_scene::BakeMode::Directional);
 }
 
 /// AO stage — bake **ambient occlusion** (lightmode 3) into the scene's
@@ -357,18 +357,17 @@ pub fn bake_lightmode_1_pub(scene: &mut Scene) {
 pub fn bake_ao_pub(scene: &mut Scene, strength: f32, radius: i32) {
     bake_lightmode(
         scene,
-        3,
-        roxlap_core::AoParams {
+        roxlap_scene::BakeMode::AmbientOcclusion(roxlap_core::AoParams {
             strength,
             radius,
             ..roxlap_core::AoParams::default()
-        },
+        }),
     );
 }
 
 // chx_v / chy_v are voxlap-canonical paired names.
 #[allow(clippy::cast_possible_wrap, clippy::similar_names)]
-fn bake_lightmode(scene: &mut Scene, lightmode: u32, ao: roxlap_core::AoParams) {
+fn bake_lightmode(scene: &mut Scene, mode: roxlap_scene::BakeMode) {
     // S7.6: skip streaming grids — they bake themselves on
     // stream-in inside their `ChunkGenerator::generate`. A
     // scene-wide bake here would only catch the few chunks that
@@ -393,7 +392,7 @@ fn bake_lightmode(scene: &mut Scene, lightmode: u32, ao: roxlap_core::AoParams) 
         // PF.11 — the per-chunk neighbour-aware bake now lives on the
         // Grid (wave-parallel estnorm-cache phase); this demo driver
         // keeps only its mip pass.
-        grid.bake_lightmode_with_ao(lightmode, ao);
+        grid.bake(mode);
 
         // S4B.5 (2026-05-12): generate per-chunk mips after the
         // lighting bake. 6 levels covers a 2048-voxel ray-depth
