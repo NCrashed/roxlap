@@ -21,8 +21,9 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 use crate::scene_api::{CameraRig, DemoScene, InputState, SceneCtx, SceneInput};
 use crate::scenes::{
     animation::AnimationScene, doom::DoomScene, empty::EmptyScene, lighting::LightingScene,
-    picking::PickingScene, primitives::PrimitivesScene, spotlight::SpotlightScene,
-    sprites::SpritesScene, transparency::TransparencyScene, world::WorldScene,
+    particles::ParticlesScene, picking::PickingScene, primitives::PrimitivesScene,
+    spotlight::SpotlightScene, sprites::SpritesScene, transparency::TransparencyScene,
+    world::WorldScene,
 };
 use crate::{
     load_png_sky, load_png_sky_rgba, SCAN_DIST_INITIAL, SCAN_DIST_MAX, SCAN_DIST_MIN,
@@ -232,12 +233,25 @@ impl Host {
             Box::new(TransparencyScene::new()),
             Box::new(LightingScene::new()),
             Box::new(SpotlightScene::new()),
+            Box::new(ParticlesScene::new()),
             Box::new(DoomScene::new()),
             Box::new(PickingScene::new()),
             Box::new(PrimitivesScene::new()),
             Box::new(EmptyScene::new()),
         ];
-        let cam = CameraRig::from_pose(scenes[0].start_pose());
+        // PS.4 — optional initial scene by menu name (case-insensitive),
+        // e.g. `ROXLAP_SCENE=Particles`; unknown names note-and-fall-back
+        // to the first scene.
+        let active = std::env::var("ROXLAP_SCENE").map_or(0, |want| {
+            scenes
+                .iter()
+                .position(|s| s.name().eq_ignore_ascii_case(&want))
+                .unwrap_or_else(|| {
+                    eprintln!("ROXLAP_SCENE={want:?} matches no scene; starting on scene 0");
+                    0
+                })
+        });
+        let cam = CameraRig::from_pose(scenes[active].start_pose());
 
         Self {
             renderer: None,
@@ -249,7 +263,7 @@ impl Host {
             look_accum: (0.0, 0.0),
             scan_dist: SCAN_DIST_INITIAL,
             scenes,
-            active: 0,
+            active,
             pending_switch: None,
             menu_open: false,
             last_frame: Instant::now(),

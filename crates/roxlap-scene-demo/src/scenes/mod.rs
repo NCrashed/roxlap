@@ -10,6 +10,7 @@ pub mod animation;
 pub mod doom;
 pub mod empty;
 pub mod lighting;
+pub mod particles;
 pub mod picking;
 pub mod primitives;
 pub mod spotlight;

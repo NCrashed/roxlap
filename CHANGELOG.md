@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (PS.4): scene-demo "Particles" tab
+
+- New demo scene between Spotlight and Doom: a bouncing **fountain**
+  (cone emission + gravity + `Bounce` off the arena floor), a buoyant
+  **smoke column** (sphere-shaped emitter, alpha-blend material,
+  grow + spin + fade-in/out + tint-to-dark over life), and
+  **left-click explosions** — `pick` → `set_sphere(None)` crater +
+  additive full-bright sparks (`Kill` on contact) + tumbling debris
+  (`Bounce`, spin, shrink). The whole per-frame protocol is one
+  `ParticleSystem::tick_with_scene(renderer, dt, &scene)`; HUD shows
+  live/dropped counts. Verified live on both backends.
+- scene-demo: **`ROXLAP_SCENE=<name>`** — start on a scene by its
+  (case-insensitive) menu name instead of scene 0.
+
 ### Added (PS.3): particle voxel collision
 
 - **`CollisionMode`** (`ParticleEmitterDef::collision`) — `None`

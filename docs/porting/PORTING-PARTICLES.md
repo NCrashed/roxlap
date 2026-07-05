@@ -27,7 +27,11 @@ before touching code.
   documented on the enum: early contact, tunneling, resting particles
   never re-test); bounce reflects the crossed axes and damps by
   restitution.
-- PS.4..5 — not started.
+- PS.4 — LANDED 2026-07-05: scene-demo "Particles" tab (fountain /
+  smoke / click-explosion+carve) + `ROXLAP_SCENE=<name>` initial-scene
+  env var. Ran live on both backends (GPU Intel Vulkan + CPU, 12-15 s
+  each, no errors); visual pass owed to the maintainer's eyeball.
+- PS.5 — not started.
 
 ## Goal
 
