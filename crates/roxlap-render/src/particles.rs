@@ -396,6 +396,9 @@ pub struct ParticleSystem {
     /// [`sync`](Self::sync) removes these from the facade.
     dead_instances: Vec<SpriteInstanceId>,
     max_particles: usize,
+    /// Per-[`carve_debris`](Self::carve_debris) debris cap (default
+    /// [`CARVE_DEBRIS_CAP`]).
+    carve_debris_cap: usize,
     dropped_spawns: u64,
     stale_model_kills: u64,
     /// Persistent scratch for the per-frame transform batch (PF
@@ -416,6 +419,7 @@ impl ParticleSystem {
             particles: Vec::new(),
             dead_instances: Vec::new(),
             max_particles: DEFAULT_MAX_PARTICLES,
+            carve_debris_cap: CARVE_DEBRIS_CAP,
             dropped_spawns: 0,
             stale_model_kills: 0,
             xf_scratch: Vec::new(),
@@ -426,6 +430,15 @@ impl ParticleSystem {
     /// count kills nothing — it only gates future spawns.
     pub fn set_max_particles(&mut self, max: usize) {
         self.max_particles = max;
+    }
+
+    /// Tune how many debris particles one
+    /// [`carve_debris`](Self::carve_debris) call may spawn (default
+    /// [`CARVE_DEBRIS_CAP`]) — the per-explosion load knob. Bigger
+    /// carves stride-sample an even spatial subset down to this;
+    /// clamped to ≥ 1.
+    pub fn set_carve_debris_cap(&mut self, cap: usize) {
+        self.carve_debris_cap = cap.max(1);
     }
 
     /// Register an emitter. [`SpawnMode::Burst`] fires immediately.
@@ -795,7 +808,9 @@ impl ParticleSystem {
     /// retires immediately and drains with its last particle).
     /// `tint_end` still applies, lerping *from the voxel colour*.
     ///
-    /// Big carves are stride-sampled down to [`CARVE_DEBRIS_CAP`]
+    /// Big carves are stride-sampled down to the system's debris cap
+    /// ([`CARVE_DEBRIS_CAP`] by default —
+    /// [`set_carve_debris_cap`](Self::set_carve_debris_cap) tunes it)
     /// debris (an even spatial subset, not the first N); the pool
     /// budget then applies on top, counting overflow in
     /// [`dropped_spawns`](Self::dropped_spawns). Returns how many
@@ -854,7 +869,7 @@ impl ParticleSystem {
         };
         let cw = to_world(centre);
 
-        let stride = samples.len().div_ceil(CARVE_DEBRIS_CAP).max(1);
+        let stride = samples.len().div_ceil(self.carve_debris_cap).max(1);
         let mut spawned: u32 = 0;
         for (v, col) in samples.iter().step_by(stride) {
             if self.particles.len() >= self.max_particles {
@@ -1779,6 +1794,24 @@ mod tests {
             spawned as usize > CARVE_DEBRIS_CAP / 2,
             "stride fills near the cap"
         );
+
+        // A lowered per-system cap throttles the same carve.
+        let mut low = ParticleSystem::new(44);
+        low.set_carve_debris_cap(16);
+        let mut scene3 = scene_with_floor();
+        let spawned = low.carve_debris(
+            &mut scene3,
+            grid,
+            IVec3::new(0, 0, 11),
+            6,
+            1.0..2.0,
+            &ParticleEmitterDef {
+                lifetime: 100.0..100.0,
+                ..base_def()
+            },
+        );
+        assert!(spawned <= 16, "tuned cap respected: {spawned}");
+        assert!(spawned >= 8, "stride still fills near the tuned cap");
 
         // Pool budget on top: a tiny pool drops the rest, counted.
         let mut tiny = ParticleSystem::new(42);

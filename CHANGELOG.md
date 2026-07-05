@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed: scene-demo "Particles" polish (water, lights, crosshair)
+
+- The fountain is **water** now: droplets carry an alpha-blend
+  `MAT_WATER` (150), and a translucent **pool** sits under it — grid
+  voxels in a unique water colour mapped via `set_terrain_materials`
+  (TV.5/TV.6 terrain transparency), inside a recoloured pad rim.
+- **Runtime lighting**: warm shadow-casting sun + a cool fill over the
+  pool + a warm accent by the smoke column, over a freshly baked
+  ambient byte (`bake_lightmode(1)`); every explosion adds a brief
+  orange point-light **flash** that burns down over 0.45 s.
+- **Explosion load halved**: sparks 50 → 24 per click, debris capped
+  at 32 via the new **`ParticleSystem::set_carve_debris_cap`** — a
+  per-system knob over the `CARVE_DEBRIS_CAP` (96) default, clamped
+  ≥ 1, so hosts can tune per-explosion cost without touching the
+  crater size.
+- **Particles are lit** now: the fountain droplets use the default
+  `FaceNormal` lighting (they pick up the sun, the pool fill and the
+  explosion flashes) and the smoke uses `WorldUp` (stable sun shading
+  the warm accent tints). Only the sparks stay `FullBright` — they are
+  emissive by design. The earlier defs had opted the two big effects
+  out of lighting (`FullBright`/`AmbientOnly`), which read as
+  "particles ignore the rig".
+- **Crosshair + centre-aim**: four world-space `Line3` ticks (no depth
+  test, FOV-stable size) mark the screen centre, and the left-click
+  pick now goes through the **centre** — FPS-style, since mouse-look
+  owns the pointer — instead of the invisible cursor position.
+- Fix uncovered by the pool work: `set_rect(Some(colour))` over an
+  already-solid region merges spans but keeps the old colours, so the
+  PS.4 "landing pad" recolour was silently invisible. The demo now
+  carves-then-inserts to recolour (an engine-side recolour story is a
+  separate question).
+
 ### Added (PS.5): debris-from-carve helper — stage PS closes
 
 - **`ParticleSystem::carve_debris(scene, grid, centre, radius,
