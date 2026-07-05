@@ -66,7 +66,19 @@ documentation audit so no re-exploration is needed.
   bands), material palette (glass terrain wall + volumetric fog cloud
   via `from_fn_keep_interior`). Drive-by fix: `LightRig`'s rustdoc
   said "GPU-only" — stale since CPU.1/CPU.2; now says both backends.
-- BK.4..7 — not started.
+- BK.4 — **LANDED 2026-07-05.** Ch. 7 (sprites & animation) + ch. 8
+  (particles). Two anchor examples (both verified live on CPU):
+  - `book_sprites.rs` — anchors `clip_build` / `model_instances` /
+    `clip_instances` / `billboard` / `per_frame` (scale-via-basis,
+    spinning instance, clip player, cylindrical billboard, tick()).
+  - `book_particles.rs` — anchors `system` / `tick` / `explosion`
+    (fountain + smoke defs, tick_with_scene, carve_debris with
+    scripted 4 s explosions).
+  Characters (.rkc) + KFA covered in prose only (asset-driven; the
+  Animation scene + roxlap-host are the worked examples). GIF/PNG
+  billboard import prose-only for the same reason as paint_egui
+  (non-default features ⇒ a required-features example rots).
+- BK.5..7 — not started.
 
 ## Goal
 
