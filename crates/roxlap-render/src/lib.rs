@@ -70,8 +70,8 @@ use roxlap_scene::Scene;
 
 pub use light::{DirectionalLight, LightRig, PointLight, SpotLight};
 pub use particles::{
-    ConeDef, EmitterId, EmitterShape, Particle, ParticleEmitterDef, ParticleSystem, SpawnMode,
-    VelocityDef, DEFAULT_MAX_PARTICLES,
+    CollisionMode, ConeDef, EmitterId, EmitterShape, Particle, ParticleEmitterDef, ParticleSystem,
+    SpawnMode, VelocityDef, DEFAULT_MAX_PARTICLES,
 };
 pub use roxlap_formats::character::{Attachment, Character, MeshRef};
 /// Animated-GIF → [`VoxelClip`] importer for Doom-style billboard sprites

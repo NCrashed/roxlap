@@ -21,7 +21,13 @@ before touching code.
   `tint_end` over-life lerps, `fade_in_frac`. Renames while
   unreleased: `fade_frac` → `fade_out_frac`; `VelocityDef` grew
   `cone` (lost `Copy`).
-- PS.3..5 — not started.
+- PS.3 — LANDED 2026-07-05: `CollisionMode::{None, Kill, Bounce}` +
+  `update_with_scene`/`tick_with_scene`; point sample via
+  `Scene::resolve_voxel`'s half-voxel nudge along velocity (caveats
+  documented on the enum: early contact, tunneling, resting particles
+  never re-test); bounce reflects the crossed axes and damps by
+  restitution.
+- PS.4..5 — not started.
 
 ## Goal
 

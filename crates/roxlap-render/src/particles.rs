@@ -118,6 +118,35 @@ pub struct VelocityDef {
     pub cone: Option<ConeDef>,
 }
 
+/// How particles react to solid voxels (PS.3) — checked only by the
+/// `_with_scene` update/tick variants; the scene-free ones never
+/// collide. The test is a point sample of the post-step position,
+/// nudged half a voxel along the velocity ([`Scene::resolve_voxel`]'s
+/// picking nudge, reused): contact registers slightly before visual
+/// interpenetration, fast particles can tunnel through walls thinner
+/// than one step's travel, and a **resting** particle (zero velocity)
+/// is never re-tested — all acceptable for effects, none of this is a
+/// physics engine.
+///
+/// [`Scene::resolve_voxel`]: roxlap_scene::Scene::resolve_voxel
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum CollisionMode {
+    /// No voxel interaction (default) — particles pass through.
+    #[default]
+    None,
+    /// Die on contact (impact sparks, raindrops).
+    Kill,
+    /// Reflect off the surface: velocity flips on the axes whose voxel
+    /// boundary was crossed this step (the cheapest normal estimate —
+    /// exact for axis-aligned grids, approximate for rotated ones),
+    /// then the whole velocity scales by `restitution` — tangential
+    /// damping included, deliberately arcade.
+    Bounce {
+        /// Energy kept per bounce, `0..=1` (`0.5` = half).
+        restitution: f32,
+    },
+}
+
 /// Recipe for [`add_emitter`](ParticleSystem::add_emitter). Construct
 /// with [`ParticleEmitterDef::new`] and override what the effect needs;
 /// there is no `Default` because a def is meaningless without a live
@@ -147,6 +176,9 @@ pub struct ParticleEmitterDef {
     /// Linear drag coefficient, 1/s: each step removes
     /// `drag · vel · dt`. `0.0` = ballistic; smoke wants ~1-3.
     pub drag: f32,
+    /// Voxel-collision reaction (PS.3; default [`CollisionMode::None`]).
+    /// Only the `_with_scene` update/tick variants test it.
+    pub collision: CollisionMode,
     /// Uniform base scale applied to the instance basis (`1.0` =
     /// authored model size). The rendered scale clamps to ≥ 0.05 —
     /// a degenerate basis silently skips drawing.
@@ -203,6 +235,7 @@ impl ParticleEmitterDef {
             velocity: VelocityDef::default(),
             gravity: [0.0, 0.0, 22.0],
             drag: 0.0,
+            collision: CollisionMode::None,
             scale: 1.0,
             scale_end: None,
             spin: 0.0..0.0,
@@ -451,8 +484,23 @@ impl ParticleSystem {
     /// every particle, retire the dead (their facade instances queue
     /// in [`drain_dead_instances`](Self::drain_dead_instances)), then
     /// run [`SpawnMode::Rate`] emitters. Pure simulation — no facade
-    /// calls, unit-testable without a window or GPU.
+    /// calls, unit-testable without a window or GPU. Never collides;
+    /// for [`CollisionMode`] emitters use
+    /// [`update_with_scene`](Self::update_with_scene).
     pub fn update(&mut self, dt: f64) {
+        self.step(dt, None);
+    }
+
+    /// [`update`](Self::update) + voxel collision (PS.3): emitters
+    /// with a non-[`None`](CollisionMode::None) [`CollisionMode`] test
+    /// each particle's post-step position against `scene`'s solid
+    /// voxels. See [`CollisionMode`] for the sampling caveats.
+    pub fn update_with_scene(&mut self, dt: f64, scene: &roxlap_scene::Scene) {
+        self.step(dt, Some(scene));
+    }
+
+    /// The shared body of the `update` variants.
+    fn step(&mut self, dt: f64, scene: Option<&roxlap_scene::Scene>) {
         let dtf = dt.max(0.0) as f32;
 
         // 1. Age + semi-implicit Euler + fade. Split field borrows:
@@ -467,9 +515,46 @@ impl ParticleSystem {
                 .as_ref()
                 .expect("live particle ⇒ emitter state retained")
                 .def;
+            let prev = p.pos;
             for a in 0..3 {
                 p.vel[a] += (def.gravity[a] - def.drag * p.vel[a]) * dtf;
                 p.pos[a] += p.vel[a] * dtf;
+            }
+            // PS.3 — voxel collision at the post-step position (see
+            // `CollisionMode` for the sampling caveats).
+            if let Some(scene) = scene {
+                if !matches!(def.collision, CollisionMode::None)
+                    && scene_solid_ahead(scene, p.pos, p.vel)
+                {
+                    match def.collision {
+                        CollisionMode::Kill => {
+                            p.age = p.lifetime; // swept below
+                            continue;
+                        }
+                        CollisionMode::Bounce { restitution } => {
+                            // Reflect the axes whose voxel boundary
+                            // was crossed this step; a same-cell hit
+                            // (spawned against a wall / nudge-early
+                            // contact) reverses outright.
+                            let mut crossed = false;
+                            for ((prev_a, pos_a), vel_a) in prev.iter().zip(&p.pos).zip(&mut p.vel)
+                            {
+                                if prev_a.floor() != pos_a.floor() {
+                                    *vel_a = -*vel_a;
+                                    crossed = true;
+                                }
+                            }
+                            for vel_a in &mut p.vel {
+                                if !crossed {
+                                    *vel_a = -*vel_a;
+                                }
+                                *vel_a *= restitution;
+                            }
+                            p.pos = prev;
+                        }
+                        CollisionMode::None => unreachable!("guarded above"),
+                    }
+                }
             }
             p.yaw += p.spin_rate * dtf;
             // Over-life curves (PS.2), all keyed on the life fraction.
@@ -588,7 +673,21 @@ impl ParticleSystem {
     /// the per-frame default, named after the facade's own
     /// [`tick`](SceneRenderer::tick).
     pub fn tick(&mut self, renderer: &mut SceneRenderer, dt: f64) {
-        self.update(dt);
+        self.step(dt, None);
+        self.sync_with(renderer);
+    }
+
+    /// [`update_with_scene`](Self::update_with_scene) +
+    /// [`sync`](Self::sync) — [`tick`](Self::tick) for hosts using
+    /// [`CollisionMode`] emitters. Call before handing the same scene
+    /// to [`render`](SceneRenderer::render).
+    pub fn tick_with_scene(
+        &mut self,
+        renderer: &mut SceneRenderer,
+        dt: f64,
+        scene: &roxlap_scene::Scene,
+    ) {
+        self.step(dt, Some(scene));
         self.sync_with(renderer);
     }
 
@@ -818,6 +917,18 @@ fn cone_dir(rng: &mut Pcg32, axis: [f32; 3], half_angle_deg: f32) -> [f32; 3] {
         w[1] * cz + u[1] * cp + v[1] * sp,
         w[2] * cz + u[2] * cp + v[2] * sp,
     ]
+}
+
+/// Whether a solid voxel sits at `pos` nudged half a voxel along
+/// `vel` — [`Scene::resolve_voxel`]'s picking nudge doing collision
+/// look-ahead duty. Zero velocity returns `false` (a resting particle
+/// never re-collides).
+///
+/// [`Scene::resolve_voxel`]: roxlap_scene::Scene::resolve_voxel
+fn scene_solid_ahead(scene: &roxlap_scene::Scene, pos: [f32; 3], vel: [f32; 3]) -> bool {
+    let world = glam::DVec3::new(f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2]));
+    let dir = glam::DVec3::new(f64::from(vel[0]), f64::from(vel[1]), f64::from(vel[2]));
+    scene.resolve_voxel(world, dir).is_some()
 }
 
 /// Per-channel lerp of two packed `0x00RRGGBB` tints.
@@ -1368,6 +1479,92 @@ mod tests {
         // Degenerate scale clamps to the visible minimum.
         let tiny = particle_xf(&Particle { scale: 0.0, ..p });
         assert_eq!(tiny.right[0], 0.05);
+    }
+
+    /// A scene with a solid slab: z ∈ 10..=12 across generous xy.
+    fn scene_with_floor() -> roxlap_scene::Scene {
+        use glam::{DVec3, IVec3};
+        let mut scene = roxlap_scene::Scene::new();
+        let id = scene.add_grid(roxlap_scene::GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).expect("fresh grid");
+        g.set_rect(
+            IVec3::new(-16, -16, 10),
+            IVec3::new(16, 16, 12),
+            Some(0x80FF_FFFF),
+        );
+        scene
+    }
+
+    /// An emitter dropping one particle straight down (+z) at the slab.
+    fn falling(collision: CollisionMode) -> ParticleEmitterDef {
+        ParticleEmitterDef {
+            pos: [0.0, 0.0, 5.0],
+            velocity: VelocityDef {
+                base: [0.0, 0.0, 20.0],
+                ..VelocityDef::default()
+            },
+            lifetime: 100.0..100.0,
+            collision,
+            ..base_def() // zero gravity — constant fall speed
+        }
+    }
+
+    #[test]
+    fn collision_kill_dies_on_contact() {
+        let scene = scene_with_floor();
+        let mut sys = ParticleSystem::new(30);
+        let em = sys.add_emitter(falling(CollisionMode::Kill));
+        sys.burst(em, 1);
+        for _ in 0..20 {
+            sys.update_with_scene(0.05, &scene);
+        }
+        assert_eq!(sys.particle_count(), 0, "dies at the slab");
+
+        // The scene-free update never collides, whatever the mode.
+        let mut free = ParticleSystem::new(30);
+        let em = free.add_emitter(falling(CollisionMode::Kill));
+        free.burst(em, 1);
+        for _ in 0..20 {
+            free.update(0.05);
+        }
+        assert_eq!(free.particle_count(), 1);
+        assert!(free.particles()[0].pos[2] > 12.0, "fell straight through");
+    }
+
+    #[test]
+    fn collision_none_passes_through() {
+        let scene = scene_with_floor();
+        let mut sys = ParticleSystem::new(31);
+        let em = sys.add_emitter(falling(CollisionMode::None));
+        sys.burst(em, 1);
+        for _ in 0..20 {
+            sys.update_with_scene(0.05, &scene);
+        }
+        assert!(sys.particles()[0].pos[2] > 12.0);
+    }
+
+    #[test]
+    fn collision_bounce_reflects_and_damps() {
+        let scene = scene_with_floor();
+        let mut sys = ParticleSystem::new(32);
+        let em = sys.add_emitter(falling(CollisionMode::Bounce { restitution: 0.5 }));
+        sys.burst(em, 1);
+        let mut bounced = false;
+        for _ in 0..40 {
+            sys.update_with_scene(0.05, &scene);
+            let p = sys.particles()[0];
+            assert!(p.pos[2] < 10.5, "never sinks into the slab: {}", p.pos[2]);
+            if p.vel[2] < 0.0 {
+                bounced = true;
+            }
+        }
+        assert!(bounced, "velocity reflected upward");
+        let p = sys.particles()[0];
+        assert!(
+            p.vel[2].abs() <= 10.0 + 1e-3,
+            "restitution halves the speed: {}",
+            p.vel[2]
+        );
     }
 
     #[test]

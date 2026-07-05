@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (PS.3): particle voxel collision
+
+- **`CollisionMode`** (`ParticleEmitterDef::collision`) — `None`
+  (default, pass-through) / `Kill` (impact sparks, raindrops) /
+  `Bounce { restitution }` (reflects the velocity on the axes whose
+  voxel boundary was crossed this step, then scales it by
+  `restitution` — deliberately arcade).
+- **`ParticleSystem::update_with_scene(dt, &Scene)`** and
+  **`tick_with_scene(renderer, dt, &Scene)`** — the colliding
+  variants; the scene-free `update`/`tick` never collide. The test is
+  a point sample of each post-step position nudged half a voxel along
+  the velocity (`Scene::resolve_voxel` reused), so contact registers
+  slightly early, fast particles can tunnel through sub-step-thin
+  walls, and zero-velocity particles never re-collide — documented
+  effect-grade physics, not a physics engine.
+
 ### Added (PS.2): full emitter palette
 
 The effect-design layer on the PS.0/PS.1 base (all additive; the
