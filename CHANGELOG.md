@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (PS.1): particles render — `ParticleSystem::sync` / `tick`
+
+The facade binding for the PS.0 core; with it the particle system is
+usable end to end:
+
+- **`ParticleSystem::sync(&mut SceneRenderer)`** — despawns the dead,
+  spawns newborns *pre-posed* (no one-frame axis-aligned flash) with
+  their one-time material/lighting/shadow/tint setup, moves everything
+  else through one `set_sprite_instance_transforms` batch, and writes
+  per-instance alpha only when the fade value actually changed.
+  **`tick(&mut renderer, dt)`** = `update` + `sync`, mirroring the
+  facade's own `tick` naming. A spawn against a stale
+  `SpriteModelId` kills the particle and counts it
+  (`stale_model_kills()`).
+- **GPU cull fix (internal)** — the sprite cull sphere and the LOD
+  pick assumed a unit basis; instances scaled **up** under-culled and
+  could pop at screen edges. `SpriteInstanceTransform` now carries
+  `max_scale` (longest basis column, in the former pad slot — GPU
+  layout unchanged), and the cull radius = model bound radius ×
+  `max_scale`, maintained across `upload`/`append_instances`/
+  `update_transforms`/`set_instance_model`. The LOD pick scales the
+  projected voxel size the same way, so a 2× instance holds its fine
+  mip proportionally longer. Unit-basis sprites are byte-identical.
+- **CPU scaled-basis parity verified** — new `dda_sprite` test: the
+  same cube at 2×/0.5× basis covers ~4×/~0.25× the pixels, the
+  contract particle scale-over-life (PS.2) will rely on.
+
 ### Added (PS.0): particle-system core — `roxlap_render::ParticleSystem`
 
 Stage PS opens (`docs/porting/PORTING-PARTICLES.md`): a host-owned

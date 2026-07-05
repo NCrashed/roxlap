@@ -1491,6 +1491,47 @@ mod tests {
         }
     }
 
+    /// PS.1 — the CPU sprite DDA honours a **scaled** basis (voxlap
+    /// heritage: `s/h/f` magnitude = scale). The same cube drawn with
+    /// 2× / 0.5× columns covers roughly 4× / 0.25× the pixels of the
+    /// unit pose — the parity the particle system's scale-over-life
+    /// relies on. Loose bounds: perspective (the scaled cube's front
+    /// face sits nearer/farther) skews the exact ratio.
+    #[test]
+    fn scaled_basis_scales_drawn_extent() {
+        let kv6 = Kv6::from_fn(8, 8, 8, |_, _, _| Some(0x80_C0_40_20));
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let cam = cam_looking_y();
+        let cs = camera_math::derive(&cam, w, h, 32.0, 32.0, 32.0);
+        let cfg = settings(w, h);
+
+        let px_at = |k: f32| -> u32 {
+            let mut sprite = Sprite::axis_aligned(kv6.clone(), [0.0, 40.0, 0.0]);
+            for a in 0..3 {
+                sprite.s[a] *= k;
+                sprite.h[a] *= k;
+                sprite.f[a] *= k;
+            }
+            let mut fb = vec![0u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            draw_sprite_dda(&mut fb, &mut zb, w as usize, w, h, &cs, &cfg, &sprite)
+        };
+
+        let (unit, double, half) = (px_at(1.0), px_at(2.0), px_at(0.5));
+        assert!(unit > 0, "unit-scale cube must draw ({unit} px)");
+        let r2 = f64::from(double) / f64::from(unit);
+        let rh = f64::from(half) / f64::from(unit);
+        assert!(
+            (3.0..8.0).contains(&r2),
+            "2× scale should roughly quadruple coverage: {unit} → {double} px (×{r2:.2})"
+        );
+        assert!(
+            (0.08..0.5).contains(&rh),
+            "0.5× scale should roughly quarter coverage: {unit} → {half} px (×{rh:.2})"
+        );
+    }
+
     /// Build a [`VoxelFrame`] from a dense `fill(x,y,z) -> Option<color>`.
     fn clip_frame(dims: [u32; 3], fill: impl Fn(u32, u32, u32) -> Option<u32>) -> VoxelFrame {
         let owpc = dims[2].div_ceil(32).max(1) as usize;

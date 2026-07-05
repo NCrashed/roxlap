@@ -7,8 +7,15 @@ before touching code.
 
 ## Status
 
-- PS.0 — IN PROGRESS (this doc + pure-simulation core).
-- PS.1..5 — not started.
+- PS.0 — LANDED 2026-07-04 (this doc + pure-simulation core,
+  `roxlap-render/src/particles.rs`, 9 unit tests).
+- PS.1 — LANDED 2026-07-04: `sync`/`tick` facade binding through a
+  crate-internal `ParticleFacade` seam (mock-tested — a real backend
+  needs a window); GPU cull now scales the bounding sphere + LOD pick
+  by `SpriteInstanceTransform::max_scale` (hazard 1 fixed at all three
+  radius sites); CPU scaled-basis parity **verified** (hazard 2 —
+  `dda_sprite` smoke test: 2×/0.5× basis ⇒ ~4×/0.25× pixel coverage).
+- PS.2..5 — not started.
 
 ## Goal
 

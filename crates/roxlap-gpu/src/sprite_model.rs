@@ -263,15 +263,24 @@ pub struct SpriteInstanceTransform {
     pub inv_rot: [[f32; 4]; 3],
     /// Instance world position (the KV6 pivot maps here).
     pub pos: [f32; 3],
-    _pad: f32,
+    /// Longest model→world basis column length (PS.1) — `1.0` for the
+    /// orthonormal poses every pre-PS caller uses. The CPU cull
+    /// multiplies the model's unit-basis [`SpriteModel::bound_radius`]
+    /// by it (exact for rotation × uniform-or-per-axis scale; a
+    /// sheared basis can still exceed it, which nothing produces
+    /// today). Rides the former std430 pad slot, so the GPU layout is
+    /// unchanged.
+    pub max_scale: f32,
 }
 
 impl SpriteInstanceTransform {
     /// Build from a sprite pose. `s/h/f` are the model→world basis
-    /// columns; we invert them so the shader can map world→local.
+    /// columns; we invert them so the shader can map world→local, and
+    /// keep the longest column length for cull-sphere / LOD scaling.
     #[must_use]
     pub fn from_sprite(sprite: &Sprite) -> Self {
         let inv = mat3_inverse([sprite.s, sprite.h, sprite.f]);
+        let len = |c: [f32; 3]| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
         Self {
             inv_rot: [
                 [inv[0][0], inv[0][1], inv[0][2], 0.0],
@@ -279,7 +288,7 @@ impl SpriteInstanceTransform {
                 [inv[2][0], inv[2][1], inv[2][2], 0.0],
             ],
             pos: sprite.p,
-            _pad: 0.0,
+            max_scale: len(sprite.s).max(len(sprite.h)).max(len(sprite.f)),
         }
     }
 }
@@ -556,8 +565,10 @@ impl SpriteModel {
 
     /// Radius of a bounding sphere centred at the instance position
     /// (the pivot maps there): the farthest bbox corner from the
-    /// pivot. Used for frustum culling. Assumes a unit basis; scaled
-    /// instances would multiply this by their max basis length.
+    /// pivot, in **model units** (a unit basis). The cull multiplies
+    /// it by each instance's longest basis column
+    /// ([`SpriteInstanceTransform::max_scale`], PS.1), so scaled
+    /// instances stay conservatively bounded.
     #[must_use]
     pub fn bound_radius(&self) -> f32 {
         let mut r2 = 0.0_f32;
@@ -712,7 +723,17 @@ struct CullInstance {
     /// LOD chain this instance draws (the user-facing `model_id`).
     chain_id: u32,
     center: [f32; 3],
+    /// World-space bounding-sphere radius — the cached product
+    /// `model_radius × max_scale`, kept so the hot cull loop reads one
+    /// float (PS.1).
     radius: f32,
+    /// The chain's unit-basis [`SpriteModel::bound_radius`], reseeded
+    /// by [`SpriteRegistryResident::set_instance_model`].
+    model_radius: f32,
+    /// Longest basis column of the current pose (PS.1) — scaled
+    /// instances (particles) grow/shrink `radius` and the LOD pick
+    /// with it.
+    max_scale: f32,
     /// voxlap `kv6colmul[256]` — per-surface-normal colour modulation
     /// for this instance's pose + lighting. Defaults to identity
     /// (`0x0100` in every channel lane → unshaded) until the facade sets
@@ -789,6 +810,7 @@ struct CullScratch {
 /// [`SpriteRegistryResident::upload`] and the incremental
 /// [`SpriteRegistryResident::append_instances`].
 fn make_cull(registry: &SpriteModelRegistry, i: &SpriteInstance) -> CullInstance {
+    let model_radius = registry.model(i.model_id).bound_radius();
     CullInstance {
         gpu: SpriteInstanceGpu {
             inv_rot0: i.transform.inv_rot[0],
@@ -803,7 +825,9 @@ fn make_cull(registry: &SpriteModelRegistry, i: &SpriteInstance) -> CullInstance
         },
         chain_id: i.model_id,
         center: i.transform.pos,
-        radius: registry.model(i.model_id).bound_radius(),
+        radius: model_radius * i.transform.max_scale,
+        model_radius,
+        max_scale: i.transform.max_scale,
         colmul: identity_colmul(),
     }
 }
@@ -1294,8 +1318,12 @@ impl SpriteRegistryResident {
             // so `set_dyn_instance_tint` (and any flag change) takes effect.
             ci.gpu.flags = inst.flags;
             ci.gpu.tint = inst.tint;
-            // Bounding sphere follows the pivot; radius/chain unchanged.
+            // Bounding sphere follows the pivot and rescales with the
+            // pose's longest basis column (PS.1 — scaled particles
+            // must not under-cull); the chain is unchanged.
             ci.center = inst.transform.pos;
+            ci.max_scale = inst.transform.max_scale;
+            ci.radius = ci.model_radius * inst.transform.max_scale;
         }
     }
 
@@ -1323,7 +1351,7 @@ impl SpriteRegistryResident {
                                // Guard `chain_id` (the `cull.get_mut` below only covers `idx`): a
                                // public caller could pass an out-of-range / tombstoned chain, which
                                // `registry.model` would index-panic on.
-        let Some(radius) = registry
+        let Some(model_radius) = registry
             .model_checked(chain_id)
             .map(SpriteModel::bound_radius)
         else {
@@ -1334,7 +1362,8 @@ impl SpriteRegistryResident {
         };
         ci.chain_id = chain_id;
         ci.gpu.model_id = chain_id; // placeholder; cull rewrites to the LOD entry
-        ci.radius = radius;
+        ci.model_radius = model_radius;
+        ci.radius = model_radius * ci.max_scale;
     }
 
     /// GPU.12 incremental — re-upload only the entries of LOD chain
@@ -1904,7 +1933,10 @@ impl SpriteRegistryResident {
             // force LOD in closer (tuning/inspection).
             let chain = &self.chains[ci.chain_id as usize];
             let level = if z > 1e-3 && chain.len() > 1 {
-                let voxel_px = px_per_world / z; // mip-0 voxel screen size
+                // Mip-0 voxel screen size; a scaled instance's voxels
+                // are `max_scale`× larger in world, so it holds the
+                // fine mip proportionally longer (PS.1).
+                let voxel_px = px_per_world * ci.max_scale / z;
                 ((lod_px / voxel_px).log2().ceil().max(0.0) as usize).min(chain.len() - 1)
             } else {
                 0
@@ -2743,6 +2775,49 @@ mod tests {
             model_id,
             SpriteInstanceTransform::from_sprite(&Sprite::axis_aligned(kv6_unsorted(), pos)),
         )
+    }
+
+    /// PS.1 — a scaled basis grows the cull sphere with the pose: the
+    /// transform keeps the longest basis column, and `make_cull` seeds
+    /// `radius = model.bound_radius() × max_scale`, so scaled-up
+    /// instances (particles) no longer under-cull at screen edges.
+    #[test]
+    fn scaled_basis_scales_cull_radius() {
+        use roxlap_formats::sprite::Sprite;
+
+        let mut reg = SpriteModelRegistry::new();
+        let chain = reg.add(build_sprite_model(&kv6_unsorted()));
+        let model_r = reg.model(chain).bound_radius();
+
+        let scaled = |k: f32, pos: [f32; 3]| {
+            let mut s = Sprite::axis_aligned(kv6_unsorted(), pos);
+            for a in 0..3 {
+                s.s[a] *= k;
+                s.h[a] *= k;
+                s.f[a] *= k;
+            }
+            SpriteInstanceTransform::from_sprite(&s)
+        };
+
+        // Unit basis: max_scale 1, radius = the model's (float-exact).
+        let unit = inst(chain, [0.0; 3]);
+        assert_eq!(unit.transform.max_scale, 1.0);
+        assert_eq!(make_cull(&reg, &unit).radius, model_r);
+
+        // 2× uniform scale doubles both.
+        let xf2 = scaled(2.0, [0.0; 3]);
+        assert!((xf2.max_scale - 2.0).abs() < 1e-6);
+        let big = SpriteInstance::new(chain, xf2);
+        assert!((make_cull(&reg, &big).radius - 2.0 * model_r).abs() < 1e-4);
+
+        // Anisotropic scale takes the longest column.
+        let mut s = Sprite::axis_aligned(kv6_unsorted(), [0.0; 3]);
+        for a in 0..3 {
+            s.h[a] *= 3.0;
+            s.f[a] *= 0.5;
+        }
+        let xf = SpriteInstanceTransform::from_sprite(&s);
+        assert!((xf.max_scale - 3.0).abs() < 1e-6);
     }
 
     #[test]

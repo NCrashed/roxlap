@@ -23,7 +23,8 @@
 use std::ops::Range;
 
 use crate::{
-    BillboardLighting, EpochSlotMap, ShadowFlags, SlotHandle, SpriteInstanceId, SpriteModelId,
+    BillboardLighting, DynSpriteTransform, EpochSlotMap, SceneRenderer, ShadowFlags, SlotHandle,
+    SpriteInstanceId, SpriteModelId,
 };
 
 /// Stable handle to an emitter inside one [`ParticleSystem`] — the
@@ -174,8 +175,12 @@ pub struct Particle {
     /// lighting) at sync time.
     pub(crate) emitter_slot: u32,
     /// The facade instance backing this particle: `None` until the
-    /// first `sync` (PS.1) spawns it.
+    /// first [`sync`](ParticleSystem::sync) spawns it.
     pub(crate) instance: Option<SpriteInstanceId>,
+    /// The alpha last written to the facade (which defaults a fresh
+    /// instance to 255) — `sync` calls the per-instance alpha setter
+    /// only when this differs, since alpha has no batch API.
+    pub(crate) last_alpha: u8,
 }
 
 /// Per-emitter live state.
@@ -269,11 +274,15 @@ pub struct ParticleSystem {
     /// Parallel to `map`'s slots; `None` once a retired emitter drains.
     emitters: Vec<Option<EmitterState>>,
     particles: Vec<Particle>,
-    /// Instances whose particles died since the last drain — PS.1's
-    /// `sync` removes these from the facade.
+    /// Instances whose particles died since the last drain —
+    /// [`sync`](Self::sync) removes these from the facade.
     dead_instances: Vec<SpriteInstanceId>,
     max_particles: usize,
     dropped_spawns: u64,
+    stale_model_kills: u64,
+    /// Persistent scratch for the per-frame transform batch (PF
+    /// lesson: no per-frame allocs in the hot loop).
+    xf_scratch: Vec<(SpriteInstanceId, DynSpriteTransform)>,
 }
 
 impl ParticleSystem {
@@ -290,6 +299,8 @@ impl ParticleSystem {
             dead_instances: Vec::new(),
             max_particles: DEFAULT_MAX_PARTICLES,
             dropped_spawns: 0,
+            stale_model_kills: 0,
+            xf_scratch: Vec::new(),
         }
     }
 
@@ -457,11 +468,117 @@ impl ParticleSystem {
     }
 
     /// Drain the facade instances of particles that died since the
-    /// last drain. `sync` (PS.1) removes each via
+    /// last drain. [`sync`](Self::sync) removes each via
     /// [`remove_sprite_instance`](crate::SceneRenderer::remove_sprite_instance);
     /// hosts doing their own rendering can consume it directly.
     pub fn drain_dead_instances(&mut self) -> impl Iterator<Item = SpriteInstanceId> + '_ {
         self.dead_instances.drain(..)
+    }
+
+    /// Newborn spawns that failed because the emitter's
+    /// [`SpriteModelId`] went stale (the model was removed / the
+    /// registry was reset). Each failure kills its particle — a
+    /// climbing value means an emitter outlived its model.
+    #[must_use]
+    pub fn stale_model_kills(&self) -> u64 {
+        self.stale_model_kills
+    }
+
+    /// Mirror the simulation into `renderer` (PS.1): despawn the dead,
+    /// spawn newborns **pre-posed** (the documented streaming-spawn
+    /// path — no one-frame axis-aligned flash) with their one-time
+    /// material/lighting/shadow/tint setup, batch-move everything else
+    /// via one
+    /// [`set_sprite_instance_transforms`](SceneRenderer::set_sprite_instance_transforms),
+    /// and write alpha only for particles whose fade actually changed
+    /// (alpha has no batch API). Call after
+    /// [`update`](Self::update), before
+    /// [`render`](SceneRenderer::render) — or use
+    /// [`tick`](Self::tick).
+    pub fn sync(&mut self, renderer: &mut SceneRenderer) {
+        self.sync_with(renderer);
+    }
+
+    /// [`update`](Self::update) + [`sync`](Self::sync) in one call —
+    /// the per-frame default, named after the facade's own
+    /// [`tick`](SceneRenderer::tick).
+    pub fn tick(&mut self, renderer: &mut SceneRenderer, dt: f64) {
+        self.update(dt);
+        self.sync_with(renderer);
+    }
+
+    /// [`sync`](Self::sync) against the internal facade seam — the
+    /// testable core (see [`ParticleFacade`]).
+    fn sync_with<F: ParticleFacade>(&mut self, facade: &mut F) {
+        // 1. Dead first — frees instance slots before this frame's
+        //    spawns reuse them.
+        for id in self.dead_instances.drain(..) {
+            facade.despawn(id);
+        }
+
+        // 2. One pass: spawn newborns, batch-collect live moves.
+        let mut batch = std::mem::take(&mut self.xf_scratch);
+        batch.clear();
+        let mut i = 0;
+        while i < self.particles.len() {
+            if self.particles[i].instance.is_none() {
+                let (slot, xf, tint) = {
+                    let p = &self.particles[i];
+                    (p.emitter_slot as usize, particle_xf(p), p.tint)
+                };
+                let (model, material, lighting, shadows) = {
+                    let st = self.emitters[slot]
+                        .as_ref()
+                        .expect("live particle ⇒ emitter state retained");
+                    (
+                        st.def.model,
+                        st.def.material,
+                        st.def.lighting,
+                        st.def.shadows,
+                    )
+                };
+                let Some(id) = facade.spawn(model, xf) else {
+                    // Stale model handle — this particle can never
+                    // render; kill it now rather than retry per frame.
+                    self.stale_model_kills += 1;
+                    self.particles.swap_remove(i);
+                    self.on_particle_died(slot);
+                    continue;
+                };
+                // One-time setup, skipping facade defaults (spawn
+                // already left the instance there).
+                if material != 0 {
+                    facade.set_material(id, material);
+                }
+                if lighting != BillboardLighting::default() {
+                    facade.set_lighting(id, lighting);
+                }
+                if shadows != ShadowFlags::default() {
+                    facade.set_shadows(id, shadows);
+                }
+                if tint != 0x00FF_FFFF {
+                    facade.set_tint(id, tint);
+                }
+                let p = &mut self.particles[i];
+                p.instance = Some(id);
+                p.last_alpha = 255; // fresh-instance facade default
+            } else {
+                // Live: frame-0 pose came from the posed spawn, so
+                // only pre-existing instances join the move batch.
+                let p = &self.particles[i];
+                batch.push((p.instance.expect("checked above"), particle_xf(p)));
+            }
+            let p = &mut self.particles[i];
+            if p.alpha != p.last_alpha {
+                facade.set_alpha(p.instance.expect("set above"), p.alpha);
+                p.last_alpha = p.alpha;
+            }
+            i += 1;
+        }
+        if !batch.is_empty() {
+            facade.set_transforms(&batch);
+        }
+        self.xf_scratch = batch;
     }
 
     /// Spawn up to `n` particles from emitter `slot`; returns how many
@@ -496,6 +613,7 @@ impl ParticleSystem {
                 tint: def.tint,
                 emitter_slot: slot as u32,
                 instance: None,
+                last_alpha: 255,
             });
             spawned += 1;
         }
@@ -517,6 +635,66 @@ impl ParticleSystem {
         if state.retired && state.live == 0 {
             self.emitters[slot] = None;
         }
+    }
+}
+
+/// The pose a particle renders at: position + an axis-aligned basis
+/// uniformly scaled by [`Particle::scale`] (spin lands in PS.2). The
+/// scale clamps to ≥ 0.05 — a degenerate basis makes the facade
+/// silently skip drawing, which is right for a kill but wrong for a
+/// fade.
+fn particle_xf(p: &Particle) -> DynSpriteTransform {
+    let s = p.scale.max(0.05);
+    DynSpriteTransform {
+        pos: p.pos,
+        right: [s, 0.0, 0.0],
+        up: [0.0, s, 0.0],
+        forward: [0.0, 0.0, s],
+    }
+}
+
+/// The slice of [`SceneRenderer`] that [`ParticleSystem::sync`]
+/// drives — an internal seam so the binding logic (spawn ordering,
+/// one-time setup, change-only alpha writes) is unit-testable with a
+/// mock, since constructing a real backend needs a window. The facade
+/// impl is pure forwarding.
+pub(crate) trait ParticleFacade {
+    fn spawn(&mut self, model: SpriteModelId, xf: DynSpriteTransform) -> Option<SpriteInstanceId>;
+    fn despawn(&mut self, id: SpriteInstanceId);
+    fn set_transforms(&mut self, batch: &[(SpriteInstanceId, DynSpriteTransform)]);
+    fn set_alpha(&mut self, id: SpriteInstanceId, alpha: u8);
+    fn set_tint(&mut self, id: SpriteInstanceId, tint: u32);
+    fn set_material(&mut self, id: SpriteInstanceId, material: u8);
+    fn set_lighting(&mut self, id: SpriteInstanceId, mode: BillboardLighting);
+    fn set_shadows(&mut self, id: SpriteInstanceId, flags: ShadowFlags);
+}
+
+impl ParticleFacade for SceneRenderer {
+    fn spawn(&mut self, model: SpriteModelId, xf: DynSpriteTransform) -> Option<SpriteInstanceId> {
+        self.add_sprite_instance_posed(model, xf)
+    }
+    fn despawn(&mut self, id: SpriteInstanceId) {
+        // A stale handle here means the host reset the registry
+        // (`set_sprites`) — already gone, nothing owed.
+        self.remove_sprite_instance(id);
+    }
+    fn set_transforms(&mut self, batch: &[(SpriteInstanceId, DynSpriteTransform)]) {
+        self.set_sprite_instance_transforms(batch);
+    }
+    fn set_alpha(&mut self, id: SpriteInstanceId, alpha: u8) {
+        self.set_sprite_instance_alpha(id, alpha);
+    }
+    fn set_tint(&mut self, id: SpriteInstanceId, tint: u32) {
+        self.set_sprite_instance_tint(id, tint);
+    }
+    fn set_material(&mut self, id: SpriteInstanceId, material: u8) {
+        self.set_sprite_instance_material(id, material);
+    }
+    fn set_lighting(&mut self, id: SpriteInstanceId, mode: BillboardLighting) {
+        self.set_sprite_instance_lighting(id, mode);
+    }
+    fn set_shadows(&mut self, id: SpriteInstanceId, flags: ShadowFlags) {
+        self.set_sprite_instance_shadow_flags(id, flags);
     }
 }
 
@@ -696,6 +874,182 @@ mod tests {
         assert_eq!(sys.particle_count(), 0);
         assert!(live > 0);
         assert!(sys.emitters.iter().all(Option::is_none));
+    }
+
+    /// Records every facade call `sync` makes; mints sequential ids.
+    #[derive(Default)]
+    struct Mock {
+        next_slot: u32,
+        fail_spawn: bool,
+        spawns: Vec<(SpriteModelId, DynSpriteTransform)>,
+        despawns: Vec<SpriteInstanceId>,
+        batch_sizes: Vec<usize>,
+        alphas: Vec<(SpriteInstanceId, u8)>,
+        tints: Vec<u32>,
+        materials: Vec<u8>,
+        lightings: Vec<BillboardLighting>,
+        shadows: Vec<ShadowFlags>,
+    }
+
+    impl ParticleFacade for Mock {
+        fn spawn(
+            &mut self,
+            model: SpriteModelId,
+            xf: DynSpriteTransform,
+        ) -> Option<SpriteInstanceId> {
+            if self.fail_spawn {
+                return None;
+            }
+            self.spawns.push((model, xf));
+            let id = SpriteInstanceId {
+                slot: self.next_slot,
+                gen: 0,
+            };
+            self.next_slot += 1;
+            Some(id)
+        }
+        fn despawn(&mut self, id: SpriteInstanceId) {
+            self.despawns.push(id);
+        }
+        fn set_transforms(&mut self, batch: &[(SpriteInstanceId, DynSpriteTransform)]) {
+            self.batch_sizes.push(batch.len());
+        }
+        fn set_alpha(&mut self, id: SpriteInstanceId, alpha: u8) {
+            self.alphas.push((id, alpha));
+        }
+        fn set_tint(&mut self, _id: SpriteInstanceId, tint: u32) {
+            self.tints.push(tint);
+        }
+        fn set_material(&mut self, _id: SpriteInstanceId, material: u8) {
+            self.materials.push(material);
+        }
+        fn set_lighting(&mut self, _id: SpriteInstanceId, mode: BillboardLighting) {
+            self.lightings.push(mode);
+        }
+        fn set_shadows(&mut self, _id: SpriteInstanceId, flags: ShadowFlags) {
+            self.shadows.push(flags);
+        }
+    }
+
+    #[test]
+    fn sync_spawns_once_then_batch_moves() {
+        let mut sys = ParticleSystem::new(10);
+        let em = sys.add_emitter(ParticleEmitterDef {
+            lifetime: 100.0..100.0,
+            ..base_def()
+        });
+        sys.burst(em, 3);
+        let mut f = Mock::default();
+
+        sys.sync_with(&mut f);
+        // Newborns spawn pre-posed — no move batch for them.
+        assert_eq!(f.spawns.len(), 3);
+        assert!(f.batch_sizes.is_empty());
+        // Particle shadows default off ≠ facade default (cast+receive)
+        // ⇒ set once each; everything else is at facade defaults.
+        assert_eq!(f.shadows.len(), 3);
+        assert!(f.materials.is_empty() && f.tints.is_empty() && f.lightings.is_empty());
+        assert!(f.alphas.is_empty(), "alpha 255 == facade default");
+
+        // Next frame: no new spawns, one batch of 3.
+        sys.update(0.01);
+        sys.sync_with(&mut f);
+        assert_eq!(f.spawns.len(), 3);
+        assert_eq!(f.batch_sizes, vec![3]);
+    }
+
+    #[test]
+    fn sync_one_time_setup_honours_def() {
+        let mut sys = ParticleSystem::new(11);
+        let em = sys.add_emitter(ParticleEmitterDef {
+            lifetime: 100.0..100.0,
+            tint: 0x00FF_0000,
+            material: 5,
+            lighting: BillboardLighting::FullBright,
+            shadows: ShadowFlags::default(), // back to facade default
+            ..base_def()
+        });
+        sys.burst(em, 1);
+        let mut f = Mock::default();
+        sys.sync_with(&mut f);
+        assert_eq!(f.materials, vec![5]);
+        assert_eq!(f.tints, vec![0x00FF_0000]);
+        assert_eq!(f.lightings, vec![BillboardLighting::FullBright]);
+        assert!(f.shadows.is_empty(), "facade-default shadows skip the call");
+        // Re-sync repeats none of it: still one call per family.
+        sys.update(0.01);
+        sys.sync_with(&mut f);
+        assert_eq!(f.materials.len() + f.tints.len() + f.lightings.len(), 3);
+    }
+
+    #[test]
+    fn sync_despawns_dead_and_writes_alpha_on_change_only() {
+        let mut sys = ParticleSystem::new(12);
+        let em = sys.add_emitter(ParticleEmitterDef {
+            lifetime: 1.0..1.0,
+            fade_frac: 0.5,
+            ..base_def()
+        });
+        sys.burst(em, 2);
+        let mut f = Mock::default();
+        sys.sync_with(&mut f);
+
+        // Pre-fade window: alpha stays 255, no writes.
+        sys.update(0.25);
+        sys.sync_with(&mut f);
+        assert!(f.alphas.is_empty());
+
+        // Inside the fade window: one write per particle per change.
+        sys.update(0.5); // age 0.75 ⇒ alpha 127
+        sys.sync_with(&mut f);
+        assert_eq!(f.alphas.len(), 2);
+        assert!(f.alphas.iter().all(|&(_, a)| a == 127));
+
+        // Death ⇒ despawn of exactly the minted ids.
+        sys.update(0.5);
+        assert_eq!(sys.particle_count(), 0);
+        sys.sync_with(&mut f);
+        assert_eq!(f.despawns.len(), 2);
+    }
+
+    #[test]
+    fn stale_model_spawn_kills_particle() {
+        let mut sys = ParticleSystem::new(13);
+        let em = sys.add_emitter(base_def());
+        sys.burst(em, 2);
+        let mut f = Mock {
+            fail_spawn: true,
+            ..Mock::default()
+        };
+        sys.sync_with(&mut f);
+        assert_eq!(sys.particle_count(), 0);
+        assert_eq!(sys.stale_model_kills(), 2);
+        // The emitter's live count drained cleanly: removing it frees
+        // the slot immediately.
+        assert!(sys.remove_emitter(em));
+        assert!(sys.emitters.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn particle_xf_scales_and_clamps() {
+        let p = Particle {
+            pos: [1.0, 2.0, 3.0],
+            vel: [0.0; 3],
+            age: 0.0,
+            lifetime: 1.0,
+            scale: 2.0,
+            alpha: 255,
+            tint: 0,
+            emitter_slot: 0,
+            instance: None,
+            last_alpha: 255,
+        };
+        let xf = particle_xf(&p);
+        assert_eq!(xf.pos, [1.0, 2.0, 3.0]);
+        assert_eq!((xf.right[0], xf.up[1], xf.forward[2]), (2.0, 2.0, 2.0));
+        // Degenerate scale clamps to the visible minimum.
+        let tiny = particle_xf(&Particle { scale: 0.0, ..p });
+        assert_eq!(tiny.right[0], 0.05);
     }
 
     #[test]
