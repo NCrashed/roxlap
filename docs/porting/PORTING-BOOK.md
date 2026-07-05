@@ -23,7 +23,27 @@ documentation audit so no re-exploration is needed.
   (resolves every `{{#include}}`, verifies file + ANCHOR/ANCHOR_END;
   verified red on both failure modes); CI runs it before `mdbook
   build` and additionally greps the build log for WARN/ERROR.
-- BK.1..7 — not started.
+- BK.1 — **LANDED 2026-07-05.** Ch. 2 (concepts) + ch. 3 (scene graph)
+  written. Two new headless, assertion-checked anchor-bearing examples
+  (run them after API changes — their asserts are the book's facts):
+  - `roxlap-core/examples/book_conventions.rs` — anchors
+    `packed_color` / `z_down` / `camera_basis` (incl. the
+    `Camera::default()` left-handed trap, asserted).
+  - `roxlap-scene/examples/book_scene_graph.rs` — anchors
+    `scene_grids` / `edits` / `queries` / `recolour` / `colfunc` /
+    `snapshot` / `generator` / `streaming` / `chunk_store` /
+    `streaming_edit`. The recolour gotcha and the
+    ChunkStore evict→re-stream edit survival are *asserted*, not just
+    stated. Teaching note learned while writing: after walking away,
+    the active set follows the camera (old region evicts, new one
+    streams in) — `chunk_count() == 0` is the wrong expectation.
+  Authoring gotcha: rustfmt glues a `// ANCHOR_END` line to a
+  preceding trailing comment (indents it to the comment column) —
+  never end an anchor block with a line that carries a trailing
+  comment. `Vxl::empty(CHUNK_SIZE_XY)` is the canonical chunk shape
+  for generators (identical to what `ensure_chunk` makes) — the book
+  teaches it instead of the demo's grid-detach idiom.
+- BK.2..7 — not started.
 
 ## Goal
 
