@@ -148,7 +148,8 @@ impl SpotLight {
 }
 
 /// The whole per-frame light environment, borrowed into
-/// [`crate::FrameParams`]. GPU-only.
+/// [`crate::FrameParams`]. Applied by **both** backends (GPU since DL,
+/// CPU since CPU.1/CPU.2) — see the module docs.
 #[derive(Clone, Copy, Debug)]
 pub struct LightRig<'a> {
     /// The sun. `None` ⇒ no directional light this frame.

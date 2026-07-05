@@ -58,7 +58,15 @@ documentation audit so no re-exploration is needed.
     scene-demo host.
   - MSRV gotcha: `Option::is_none_or` trips `clippy::incompatible_msrv`
     — examples use `map_or` like the quickstart.
-- BK.3..7 — not started.
+- BK.3 — **LANDED 2026-07-05.** Ch. 6 (lighting & materials). Anchor
+  example `roxlap-render/examples/book_lighting.rs` (windowed,
+  verified live 8 s CPU) — anchors `bake` / `volumetric` /
+  `materials` / `light_rig`: AO bake (lightmode 3 + AoParams),
+  per-frame LightRig (sun sweep + 2 points + spot cone + stylized
+  bands), material palette (glass terrain wall + volumetric fog cloud
+  via `from_fn_keep_interior`). Drive-by fix: `LightRig`'s rustdoc
+  said "GPU-only" — stale since CPU.1/CPU.2; now says both backends.
+- BK.4..7 — not started.
 
 ## Goal
 
