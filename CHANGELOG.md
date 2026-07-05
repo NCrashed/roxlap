@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pool + a warm accent by the smoke column, over a freshly baked
   ambient byte (`bake_lightmode(1)`); every explosion adds a brief
   orange point-light **flash** that burns down over 0.45 s.
+- **Perf probes** (env-gated, zero cost when off):
+  `ROXLAP_AUTOFIRE=1` fires a scripted explosion every 4 s at fresh
+  floor spots and logs per-second frame stats (`sec: avg/max/frames`)
+  plus >40 ms spikes — the click hitch, measurable headless;
+  `ROXLAP_NOFLASH=1` disables the explosion light flash (the A/B for
+  its per-pixel light-loop cost). Probe findings on the dev box
+  (Intel Xe, 430×260): the carve + chunk refresh cause **no**
+  measurable hitch (fresh crater per shot, no frame > 40 ms); the
+  one-off ~74 ms frame is app warm-up (frame 2, fires with or without
+  explosions); the apparent post-click elevation is the **fountain
+  filling to its ~380-droplet steady state** over its first ~3 s, not
+  the explosion.
 - **Explosion load halved**: sparks 50 → 24 per click, debris capped
   at 32 via the new **`ParticleSystem::set_carve_debris_cap`** — a
   per-system knob over the `CARVE_DEBRIS_CAP` (96) default, clamped

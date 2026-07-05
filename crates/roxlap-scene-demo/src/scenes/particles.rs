@@ -44,6 +44,12 @@ const SEED: u64 = 0x00EF_FEC7;
 /// Explosion light-flash lifetime, seconds.
 const FLASH_SECS: f64 = 0.45;
 
+/// TEMPORARY (click-freeze investigation): `false` disables the
+/// fountain + smoke emitters so a click's explosion is the only
+/// particle source — isolates the click cost from the ~380-droplet
+/// steady state. Flip back to `true` when the investigation closes.
+const AMBIENT_FX: bool = true;
+
 pub struct ParticlesScene {
     /// A flat arena slab the effects live on (and get carved out of).
     scene: Scene,
@@ -54,6 +60,18 @@ pub struct ParticlesScene {
     debris: Option<SpriteModelId>,
     /// Explosion light flashes: `(world pos, seconds remaining)`.
     flashes: Vec<([f32; 3], f64)>,
+    /// `ROXLAP_AUTOFIRE=1` probe (cached at `enter` — PR.1: no per-frame
+    /// env reads): periodic scripted explosions + slow-frame log, for
+    /// profiling the click hitch without an input device.
+    autofire_on: bool,
+    autofire_clock: f64,
+    /// `ROXLAP_NOFLASH=1` (cached at `enter`): skip explosion light
+    /// flashes — the A/B knob for their per-pixel light-loop cost.
+    noflash: bool,
+    /// Per-second frame-time aggregator for the probe.
+    stat_acc: f64,
+    stat_frames: u32,
+    stat_max: f64,
     /// Per-frame point-light scratch (accents + flashes) the render's
     /// [`LightRig`] borrows.
     points: Vec<PointLight>,
@@ -71,6 +89,12 @@ impl ParticlesScene {
             debris: None,
             flashes: Vec::new(),
             points: Vec::new(),
+            autofire_on: false,
+            autofire_clock: 0.0,
+            noflash: false,
+            stat_acc: 0.0,
+            stat_frames: 0,
+            stat_max: 0.0,
             explosions: 0,
         }
     }
@@ -131,6 +155,7 @@ impl ParticlesScene {
     /// colours, carves the crater, and bursts them back as tumbling
     /// tinted debris — plus a hand-rolled spark flash on top.
     fn explode(&mut self, world: [f32; 3], grid: roxlap_scene::GridId, voxel: IVec3) {
+        let t_click = std::time::Instant::now();
         if let Some(debris) = self.debris {
             self.particles.carve_debris(
                 &mut self.scene,
@@ -174,10 +199,22 @@ impl ParticlesScene {
             self.particles.remove_emitter(em);
         }
         // A brief orange light flash at the blast (fades in `update`,
-        // rendered as an extra rig point light).
-        self.flashes
-            .push(([world[0], world[1], world[2] - 2.0], FLASH_SECS));
+        // rendered as an extra rig point light). `ROXLAP_NOFLASH`
+        // disables it — the probe's A/B for the flash's frame cost.
+        if !self.noflash {
+            self.flashes
+                .push(([world[0], world[1], world[2] - 2.0], FLASH_SECS));
+        }
         self.explosions += 1;
+        // Probe: the click's CPU half (carve + sample + spawns) — the
+        // GPU half shows up as the next frames' dt in the sec/spike
+        // log. One line per click, negligible.
+        eprintln!(
+            "explode #{}: cpu {:.2} ms · {} live",
+            self.explosions,
+            t_click.elapsed().as_secs_f64() * 1000.0,
+            self.particles.particle_count(),
+        );
     }
 }
 
@@ -219,10 +256,13 @@ impl DemoScene for ParticlesScene {
         // which crowded the frame together with the spark flash.
         self.particles.set_carve_debris_cap(32);
         self.flashes.clear();
+        self.autofire_on = std::env::var_os("ROXLAP_AUTOFIRE").is_some();
+        self.noflash = std::env::var_os("ROXLAP_NOFLASH").is_some();
+        self.autofire_clock = 0.0;
 
         // Water fountain: a tight upward cone of translucent droplets
         // (MAT_WATER) that fall back and bounce off the pool surface.
-        if let Some(spark) = self.spark {
+        if let Some(spark) = self.spark.filter(|_| AMBIENT_FX) {
             self.particles.add_emitter(ParticleEmitterDef {
                 pos: [0.0, 90.0, 59.0],
                 spawn: SpawnMode::Rate(140.0),
@@ -248,7 +288,7 @@ impl DemoScene for ParticlesScene {
 
         // Smoke column: buoyant, spinning, growing, condensing in and
         // thinning out.
-        if let Some(puff) = self.puff {
+        if let Some(puff) = self.puff.filter(|_| AMBIENT_FX) {
             self.particles.add_emitter(ParticleEmitterDef {
                 pos: [-38.0, 110.0, 58.0],
                 shape: EmitterShape::Sphere { radius: 2.0 },
@@ -288,6 +328,45 @@ impl DemoScene for ParticlesScene {
             f.1 -= dt;
         }
         self.flashes.retain(|f| f.1 > 0.0);
+
+        // ROXLAP_AUTOFIRE probe: scripted explosion every 4 s at a
+        // fixed floor voxel + per-second frame stats, so the click
+        // hitch is measurable headless.
+        if self.autofire_on {
+            if dt > 0.040 {
+                eprintln!("spike: {:.1} ms", dt * 1000.0);
+            }
+            self.stat_acc += dt;
+            self.stat_frames += 1;
+            self.stat_max = self.stat_max.max(dt);
+            if self.stat_acc >= 1.0 {
+                eprintln!(
+                    "sec: avg {:.1} ms · max {:.1} ms · {} frames",
+                    self.stat_acc * 1000.0 / f64::from(self.stat_frames),
+                    self.stat_max * 1000.0,
+                    self.stat_frames,
+                );
+                self.stat_acc = 0.0;
+                self.stat_frames = 0;
+                self.stat_max = 0.0;
+            }
+            self.autofire_clock += dt;
+            if self.autofire_clock >= 4.0 {
+                self.autofire_clock = 0.0;
+                let grid = self.scene.grids().next().map(|(id, _)| id);
+                if let Some(grid) = grid {
+                    // A fresh crater each shot (else repeat carves are
+                    // near no-ops and hide the carve cost): march
+                    // along x. world x = local x − 64, y 80 = local 50.
+                    #[allow(clippy::cast_possible_wrap)]
+                    let n = self.explosions as i32;
+                    let wx = -30 + 12 * (n % 6);
+                    #[allow(clippy::cast_precision_loss)]
+                    self.explode([wx as f32, 80.0, 60.0], grid, IVec3::new(wx + 64, 50, 0));
+                    eprintln!("autofire explosion #{}", self.explosions);
+                }
+            }
+        }
     }
 
     fn on_input(&mut self, ctx: &mut SceneCtx, ev: &SceneInput) {
