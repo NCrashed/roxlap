@@ -18,7 +18,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use crate::scene_api::{CameraRig, DemoScene, InputState, SceneCtx, SceneInput};
+use crate::scene_api::{CameraPose, CameraRig, DemoScene, InputState, SceneCtx, SceneInput};
 use crate::scenes::{
     animation::AnimationScene, doom::DoomScene, empty::EmptyScene, lighting::LightingScene,
     particles::ParticlesScene, picking::PickingScene, primitives::PrimitivesScene,
@@ -214,6 +214,16 @@ pub struct Host {
     fps_frames: u32,
     fps_last: Instant,
     last_fps: f64,
+    /// BK.7 — README-gallery capture mode (`ROXLAP_CAPTURE=<dir>`): a
+    /// PPM frame is written every `ROXLAP_CAPTURE_MS` (default 80) of
+    /// wall time until `ROXLAP_CAPTURE_FRAMES` (default 40) are down,
+    /// then the process exits. HUD forced off. Assemble with
+    /// `magick -delay 8 <dir>/frame_*.ppm -layers Optimize out.gif`.
+    capture_dir: Option<std::path::PathBuf>,
+    capture_ms: u64,
+    capture_left: u32,
+    capture_idx: u32,
+    capture_last: Instant,
 }
 
 impl Host {
@@ -251,7 +261,32 @@ impl Host {
                     0
                 })
         });
-        let cam = CameraRig::from_pose(scenes[active].start_pose());
+        // BK.7 — `ROXLAP_CAMERA=x,y,z,yaw,pitch` overrides the scene's
+        // start pose (gallery-capture framing, pose-pinned repros).
+        let pose = std::env::var("ROXLAP_CAMERA")
+            .ok()
+            .and_then(|v| {
+                let n: Vec<f64> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                (n.len() == 5).then(|| CameraPose {
+                    pos: [n[0], n[1], n[2]],
+                    yaw: n[3],
+                    pitch: n[4],
+                })
+            })
+            .unwrap_or_else(|| scenes[active].start_pose());
+        let cam = CameraRig::from_pose(pose);
+
+        // BK.7 — gallery capture mode (see the field docs).
+        let capture_dir = std::env::var_os("ROXLAP_CAPTURE").map(std::path::PathBuf::from);
+        if let Some(d) = &capture_dir {
+            std::fs::create_dir_all(d).expect("ROXLAP_CAPTURE dir must be creatable");
+        }
+        let env_u64 = |k: &str, default: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(default)
+        };
 
         Self {
             renderer: None,
@@ -269,12 +304,54 @@ impl Host {
             last_frame: Instant::now(),
             egui_ctx: egui::Context::default(),
             egui_state: None,
-            hud_on: true,
+            // Captures want clean frames — no HUD panels baked in.
+            hud_on: capture_dir.is_none(),
             pipe: PipelineUi::from_env(),
             title_base: "roxlap-scene-demo".to_string(),
             fps_frames: 0,
             fps_last: Instant::now(),
             last_fps: 0.0,
+            capture_ms: env_u64("ROXLAP_CAPTURE_MS", 80),
+            #[allow(clippy::cast_possible_truncation)]
+            capture_left: env_u64("ROXLAP_CAPTURE_FRAMES", 40) as u32,
+            capture_idx: 0,
+            capture_last: Instant::now(),
+            capture_dir,
+        }
+    }
+
+    /// BK.7 — write the frame `redraw` armed via `request_capture` as
+    /// a P6 PPM into the capture dir; exit once the budget is spent.
+    fn save_capture(&mut self) {
+        let Some(dir) = self.capture_dir.clone() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some((px, w, h)) = renderer.take_capture() else {
+            return;
+        };
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        ppm.reserve(px.len() * 3);
+        for p in &px {
+            #[allow(clippy::cast_possible_truncation)]
+            ppm.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
+        }
+        let path = dir.join(format!("frame_{:04}.ppm", self.capture_idx));
+        if let Err(e) = std::fs::write(&path, ppm) {
+            eprintln!("capture: writing {} failed: {e}", path.display());
+        }
+        self.capture_idx += 1;
+        self.capture_left -= 1;
+        if self.capture_left == 0 {
+            eprintln!(
+                "capture: done, {} frames in {}",
+                self.capture_idx,
+                dir.display()
+            );
+            self.teardown();
+            std::process::exit(0);
         }
     }
 
@@ -403,6 +480,19 @@ impl Host {
         let dt = (now - self.last_frame).as_secs_f64();
         self.last_frame = now;
 
+        // BK.7 — arm a capture before the render when the gallery
+        // recorder is on and the wall-clock interval elapsed; the
+        // matching `save_capture` runs after `present_frame`.
+        let capture_this = self.capture_dir.is_some()
+            && self.capture_left > 0
+            && now.duration_since(self.capture_last).as_millis() >= u128::from(self.capture_ms);
+        if capture_this {
+            self.capture_last = now;
+            if let Some(r) = self.renderer.as_mut() {
+                r.request_capture();
+            }
+        }
+
         // Mouse-look (accumulated since last frame), then per-scene update +
         // render — split-borrow the disjoint host fields.
         let (lx, ly) = std::mem::take(&mut self.look_accum);
@@ -425,6 +515,9 @@ impl Host {
         }
 
         self.present_frame();
+        if capture_this {
+            self.save_capture();
+        }
 
         if let Some(i) = self.pending_switch.take() {
             self.switch_to(i, size);

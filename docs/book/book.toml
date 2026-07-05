@@ -13,3 +13,5 @@ create-missing = false
 [output.html]
 git-repository-url = "https://github.com/NCrashed/roxlap"
 edit-url-template = "https://github.com/NCrashed/roxlap/edit/master/docs/book/{path}"
+# BK.7 — published via the CI `deploy-book` job.
+site-url = "/roxlap/"

@@ -1,5 +1,9 @@
 //! roxlap-render — unified CPU/GPU renderer facade.
 //!
+//! New to roxlap? **[The roxlap book](https://ncrashed.github.io/roxlap/)**
+//! is the guide (quickstart, concepts, rendering, lighting, sprites);
+//! this page is the API reference.
+//!
 //! One [`SceneRenderer`] hides the choice between the CPU opticast
 //! path (`roxlap-core` / `roxlap-scene`, presented via `softbuffer`)
 //! and the GPU compute-shader path (`roxlap-gpu`, presented via its

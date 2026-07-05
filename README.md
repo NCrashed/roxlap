@@ -14,6 +14,18 @@ per-architecture SIMD. Dual MIT/Apache-2.0, commercial use included.
 
 ![sample render from roxlap](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/screenshot.png)
 
+| ![dynamic lighting](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/gallery/lighting.gif) | ![particles](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/gallery/particles.gif) |
+|:--:|:--:|
+| *Runtime sun + point lights, hard voxel shadows, cel bands* | *Particle fountain + smoke, voxel collision* |
+| ![Doom-style billboards](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/gallery/doom.gif) | ![transparency](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/gallery/transparency.gif) |
+| *GIF billboard sprites that cast real shadows* | *Alpha / additive / volumetric voxel materials* |
+
+*(All captured from `roxlap-scene-demo` at a fixed 480×270 logical
+resolution with Bayer-dithered posterize — the [render
+pipeline](https://ncrashed.github.io/roxlap/render-pipeline.html)'s
+retro look. Every scene is in the [demo
+tour](https://ncrashed.github.io/roxlap/demo-tour.html).)*
+
 ## What is Voxlap?
 
 Voxlap is the voxel rendering engine [Ken Silverman](http://advsys.net/ken/)
@@ -58,8 +70,9 @@ glam          = "0.30"
 
 This README is the pitch and the 40-line quickstart; the full guide —
 concepts, scene graph, lighting, sprites, asset pipeline, tuning — is
-**[the roxlap book](https://github.com/NCrashed/roxlap/tree/master/docs/book)**
-(`mdbook serve docs/book` for a local copy).
+**[the roxlap book](https://ncrashed.github.io/roxlap/)**
+(source in [docs/book](https://github.com/NCrashed/roxlap/tree/master/docs/book);
+`mdbook serve docs/book` for a local copy).
 
 The core loop is: build a [`Scene`], place voxels on a `Grid`, then
 hand the scene + a `Camera` to `SceneRenderer::render` each frame —
@@ -284,8 +297,8 @@ quiet-frame skips).
 
 - **The roxlap book** — the user guide (quickstart, concepts, scene
   graph, rendering, lighting, sprites, assets, tuning):
-  [docs/book](https://github.com/NCrashed/roxlap/tree/master/docs/book),
-  built with `mdbook serve docs/book`.
+  [ncrashed.github.io/roxlap](https://ncrashed.github.io/roxlap/)
+  (source: [docs/book](https://github.com/NCrashed/roxlap/tree/master/docs/book)).
 - API: [docs.rs/roxlap-render](https://docs.rs/roxlap-render),
   [docs.rs/roxlap-scene](https://docs.rs/roxlap-scene),
   [docs.rs/roxlap-core](https://docs.rs/roxlap-core),

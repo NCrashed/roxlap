@@ -50,6 +50,7 @@ variables are in [chapter 12](tuning.md)):
 | `ROXLAP_SPRITE_GRID=n` | Sprites scene: coco field size (default 4) |
 | `ROXLAP_RKC=path`, `ROXLAP_RKC_DUMP=path`, `ROXLAP_KFA_DUMP=path` | Animation scene: load / dump character containers |
 | `ROXLAP_AUTOFIRE=1`, `ROXLAP_NOFLASH=1`, `ROXLAP_FPS_LOG=1` | Particles / host probes: scripted explosions, flash A/B, per-second FPS log |
+| `ROXLAP_CAPTURE=<dir>` (+ `_MS`, `_FRAMES`), `ROXLAP_CAMERA=x,y,z,yaw,pitch` | Gallery recorder: write PPM frames on a wall-clock interval, then exit; override the start pose for framing |
 
 (`roxlap-host` and the GPU probe example carry a few more of the same
 flavour — `ROXLAP_HOST_SPRITE_*`, `ROXLAP_GPU_RES` — documented in

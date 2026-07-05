@@ -1,5 +1,9 @@
 //! roxlap engine core.
 //!
+//! New to roxlap? **[The roxlap book](https://ncrashed.github.io/roxlap/)**
+//! is the guide (its concepts chapter covers this crate's conventions);
+//! this page is the API reference.
+//!
 //! A Rust voxel engine. The CPU renderer is a clean-room per-pixel
 //! 3D-DDA over an 8³ brickmap ([`dda`] + [`dda_sprite`]); it reads the
 //! voxlap-compatible `.vxl` / KV6 / KFA formats from `roxlap-formats`

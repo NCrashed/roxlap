@@ -1,6 +1,6 @@
 # Rendering & backends
 
-Everything your game draws goes through one type:
+Your game draws through one type:
 [`SceneRenderer`](https://docs.rs/roxlap-render), the facade over
 roxlap's two renderers. You build a `Scene`, advance your game, and
 call the same four or five methods every frame — which backend does

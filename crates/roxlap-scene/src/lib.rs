@@ -1,6 +1,10 @@
 //! roxlap scene-graph layer — many independent chunked voxel
 //! grids in a single 3D scene.
 //!
+//! New to roxlap? **[The roxlap book](https://ncrashed.github.io/roxlap/)**
+//! is the guide — its scene-graph chapter walks this crate end to end;
+//! this page is the API reference.
+//!
 //! This crate is the layer **above** the per-chunk renderer
 //! (`roxlap-core`): a [`Scene`] holds a sparse set of [`Grid`]s, each
 //! with its own f64 world position + arbitrary 3D rotation

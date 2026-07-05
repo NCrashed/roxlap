@@ -104,7 +104,30 @@ documentation audit so no re-exploration is needed.
   copied. Grep-verified 23 vars total on 2026-07-05; ROXLAP_DITHER
   values are none|bayer|blue (default blue).
   **All 13 chapters now written** — content-complete; BK.7 remains.
-- BK.7 — not started.
+- BK.7 — **LANDED 2026-07-05. Stage BK CLOSED.** Author confirmed
+  gh-pages deploy + agent-side GIF capture. Delivered:
+  - **gh-pages**: CI `book` job uploads a Pages artifact on master
+    pushes; new `deploy-book` job publishes via actions/deploy-pages
+    to https://ncrashed.github.io/roxlap/ (repo Settings → Pages must
+    be set to "GitHub Actions" once). `site-url = "/roxlap/"` in
+    book.toml. README + all four crate rustdoc headers link the
+    published URL ("New to roxlap? The roxlap book…").
+  - **GIF gallery**: `docs/gallery/{lighting,particles,doom,
+    transparency}.gif` (~324 KB total) in a README table. Captured
+    via a new demo-host recorder: `ROXLAP_CAPTURE=<dir>` (+`_MS`,
+    `_FRAMES`) writes PPMs on a wall-clock interval then exits, HUD
+    forced off; `ROXLAP_CAMERA=x,y,z,yaw,pitch` overrides the start
+    pose (Transparency needed reframing; Animation's start pose shows
+    empty sky — its GIF was dropped, re-shoot after re-framing).
+    Recipe: 480×270 fixed res + POSTERIZE=6 + DITHER=bayer, 40 frames
+    @80 ms, `magick -delay 8 -loop 0 frames -layers Optimize out.gif`.
+  - **Editorial pass** (avoid-ai-writing audit, docs profile): prose
+    came out clean on vocabulary/template patterns; fixed the one
+    structural tell (three chapters opened with the same
+    "Everything …" shape) + a "showcases"; foreword updated now that
+    all chapters exist.
+  Both new env vars added to demo-tour.md's table (the source-of-truth
+  grep found them immediately — the gate works).
 
 ## Goal
 

@@ -78,3 +78,28 @@ jobs:
         run: |
           mdbook build docs/book 2>&1 | tee mdbook-build.log
           ! grep -qE '(ERROR|WARN)' mdbook-build.log
+      # BK.7 — the built book is the Pages artifact; the deploy job
+      # below publishes it on master pushes only (PRs still build +
+      # gate, they just don't deploy).
+      - uses: actions/upload-pages-artifact@v3
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        with:
+          path: docs/book/book
+
+  # BK.7 — publish the book to GitHub Pages
+  # (https://ncrashed.github.io/roxlap/). Needs Pages enabled in the
+  # repo settings with "GitHub Actions" as the source.
+  deploy-book:
+    name: deploy book to gh-pages
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    needs: book
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

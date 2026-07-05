@@ -135,7 +135,8 @@ ROXLAP_SCENE=Lighting cargo run --release -p roxlap-scene-demo  # jump to a tab
 ```
 
 The [demo tour](demo-tour.md) chapter maps each scene to the features
-it showcases; each topic chapter uses its scene as the worked example.
+it demonstrates; each topic chapter uses its scene as the worked
+example.
 
 ## Where next
 

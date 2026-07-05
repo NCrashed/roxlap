@@ -27,6 +27,8 @@ Code in this book is never pasted by hand: every snippet longer than a
 few lines is included directly from a compile-tested crate example or
 doctest, so if the book and the engine disagree, CI is already red.
 
-The book is being written chapter by chapter (stage BK); unwritten
-chapters carry a stub note and the plan lives in
+The book tracks the engine: chapters are re-checked as stages land,
+and every include is CI-gated, so a snippet that stops compiling turns
+the build red before it can mislead you. How the book itself was built
+(and its anti-rot policy) is recorded in
 [`docs/porting/PORTING-BOOK.md`](https://github.com/NCrashed/roxlap/blob/master/docs/porting/PORTING-BOOK.md).

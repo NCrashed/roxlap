@@ -1,5 +1,9 @@
 //! Voxlap on-disk formats and data manipulation.
 //!
+//! New to roxlap? **[The roxlap book](https://ncrashed.github.io/roxlap/)**
+//! is the guide — its asset-pipeline chapter tours every format here;
+//! this page is the API reference.
+//!
 //! Parsers for `.vxl` (heightmap + slab voxel columns), `.kv6` / `.kvx`
 //! (sprite voxel data), and `.kfa` (kv6 transform / animation). Lands
 //! across the R2.* sub-substages of `PORTING-RUST.md`:
