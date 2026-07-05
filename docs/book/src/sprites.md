@@ -25,9 +25,11 @@ of placement is an **instance**. Register once, instance many:
 {{#include ../../../crates/roxlap-render/examples/book_sprites.rs:model_instances}}
 ```
 
-Where models come from: parse a `.kv6` file
-([`roxlap_formats::kv6`](https://docs.rs/roxlap-formats)), import a
-MagicaVoxel `.vox` ([chapter 9](assets.md)), or build one in code —
+Where models come from: paint one in
+[Demiurg](https://github.com/NCrashed/demiurg) (the roxlap asset
+editor) or MagicaVoxel ([chapter 9](assets.md)), parse a `.kv6` file
+([`roxlap_formats::kv6`](https://docs.rs/roxlap-formats)), or build
+one in code —
 `Kv6::from_fn` (surface-only, as here), `solid_cube` / `solid_box`,
 or `from_fn_keep_interior` for filled volumes
 ([chapter 6](lighting.md)).
@@ -127,9 +129,11 @@ is in the assets:
   skeleton + animation clips, where a bone attachment is either a
   static mesh or a voxel clip (a flickering torch in a hand).
   `add_character(&ch, clip)` spawns one; `tick` advances it;
-  `set_character_world_transform` moves it. See
-  [`roxlap_formats::character`](https://docs.rs/roxlap-formats) and
-  the **Animation** demo scene.
+  `set_character_world_transform` moves it. Author them in
+  [Demiurg](https://github.com/NCrashed/demiurg), the roxlap asset
+  editor ([chapter 9](assets.md)); the wire format is
+  [`roxlap_formats::character`](https://docs.rs/roxlap-formats), and
+  the **Animation** demo scene is the loading example.
 - **KFA rigs** — Ken Silverman's original animated-sprite format
   (`.kfa`), supported for asset compatibility: the host owns the
   `KfaSprite`s and calls `set_kfa_sprites` / `update_kfa_poses`. See

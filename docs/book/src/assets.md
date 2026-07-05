@@ -16,6 +16,18 @@ The snippets come from a headless, assertion-checked example:
 cargo run -p roxlap-formats --example book_assets
 ```
 
+## The editor: Demiurg
+
+[Demiurg](https://github.com/NCrashed/demiurg) is the voxel asset
+editor built *on* roxlap — its viewport is the engine itself, so what
+you paint is byte-for-byte what the game shows (same packed colours,
+same z-down world, same lighting). It edits `.kv6`, `.vox` and `.rkc`,
+keeps a lossless `.demiurg` project file, and exports straight to the
+engine formats: `.kv6` sprite models, `.rkc` rigged characters
+(skeleton + keyframe animation), and `.vxl` worlds. If you are
+authoring assets *for* roxlap, start there; MagicaVoxel (next section)
+is the general-purpose alternative.
+
 ## Authoring in MagicaVoxel: `.vox`
 
 The industry-standard voxel editor is the intended authoring tool.
@@ -104,6 +116,21 @@ format: a versioned envelope holding every grid's config plus its
 chunks — each chunk encoded with the same `vxl::serialize` shown
 above. There is no separate "save format" to learn; a snapshot is
 made of the wire formats on this page.
+
+## The command-line tool
+
+Everything above is also scriptable without writing Rust:
+`roxlap-cli` (in the workspace) wraps the common asset operations —
+
+```sh
+cargo run -p roxlap-cli -- info castle.vox      # identify + summarise any asset
+cargo run -p roxlap-cli -- vox2kv6 castle.vox castle.kv6
+cargo run -p roxlap-cli -- vox2rvc walk.vox walk.rvc 100  # models → clip frames
+```
+
+`info` works on every format on this page (including scene
+snapshots — it prints the grid list with chunk and edit counts), so
+it doubles as a save-file debugger.
 
 ## Further reading
 

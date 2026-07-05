@@ -19,6 +19,8 @@ per-architecture SIMD. Dual MIT/Apache-2.0, commercial use included.
 | *Runtime sun + point lights, hard voxel shadows, cel bands* | *Particle fountain + smoke, voxel collision* |
 | ![Doom-style billboards](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/gallery/doom.gif) | ![transparency](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/gallery/transparency.gif) |
 | *GIF billboard sprites that cast real shadows* | *Alpha / additive / volumetric voxel materials* |
+| ![skeletal animation](https://raw.githubusercontent.com/NCrashed/roxlap/master/docs/gallery/animation.gif) | |
+| *KFA rig + `.rkc` character with a flame-clip attachment* | |
 
 *(All captured from `roxlap-scene-demo` at a fixed 480×270 logical
 resolution with Bayer-dithered posterize — the [render
@@ -201,6 +203,7 @@ won't spin up. Full setup + per-host header config in
 | [`roxlap-scene`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-scene) | The scene-graph layer above the per-chunk renderer: many independently-placed chunked voxel grids in one f64 world (`GridTransform` = position + quaternion), cross-chunk raycast composition, runtime edits, serde snapshots, far-LOD billboards, chunk streaming + procedural generation (`ChunkGenerator`), and world queries — `Scene::raycast`, `resolve_voxel`, `Grid::voxel_solid` / `voxel_color`. |
 | [`roxlap-gpu`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-gpu) | Optional GPU renderer — a WGPU/WGSL compute-shader voxel marcher (two-level chunk + voxel DDA, per-chunk decompress/upload, multi-grid composition, sky + fog, edit/stream invalidation, KV6 sprite model-DDA, scene-grid mip LOD, chunk-AABB empty-space skip). Sibling to the CPU opticast, not a replacement; same retro look, much higher frame rates. |
 | [`roxlap-render`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-render) | Unified renderer facade — one `SceneRenderer` over the CPU opticast and the GPU marcher with **automatic CPU fallback**. Owns presentation, the Scene→GPU bridge, sprites + animated voxel clips, **Doom-style GIF billboard sprites** (`gif` feature: `gif_import` + `add_billboard_instance` / `BillboardActor` — camera-facing animated cutouts that cast + receive shadows), screen→world picking (`pick` / `pixel_ray` / `view_ray` / `pick_depth`), depth-tested overlay lines (`draw_lines` — editor gizmos occluded by the scene), and a **fixed-resolution post pipeline** (`set_render_resolution` renders into a fixed logical grid nearest-upscaled to the window so FPS stops tracking window size; `set_ssaa` supersamples; `set_posterize` reduced-palette + dither for the retro look). Hosts stay thin: build a `Scene`, advance it, call `render`. |
+| [`roxlap-cli`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cli) | Command-line asset tool: `info` identifies + summarises any roxlap-readable file (`.vox`/`.kv6`/`.kvx`/`.vxl`/`.kfa`/`.rvc`/`.rkc`/scene snapshots), `vox2kv6` and `vox2rvc` convert MagicaVoxel models into sprite models / animated voxel clips. |
 | [`roxlap-cave-demo`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-cave-demo) | Procedural-cave showcase binary (winit + softbuffer). Cave-gen on startup, real-time edits via plasma bullets, fog, F/R preset+seed toggles. |
 | [`roxlap-scene-demo`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-scene-demo) | Scene-graph + GPU showcase binary: a menu of scenes (World, Sprites, Animation, Transparency, Lighting, **Doom** GIF billboards, Picking, …) on the unified renderer (`ROXLAP_GPU=1` selects the GPU backend). Mouse-pick mode, runtime carving, top-down vantage, and a live **Render pipeline** HUD panel (resolution / SSAA / posterize + dither). |
 | [`roxlap-host`](https://github.com/NCrashed/roxlap/tree/master/crates/roxlap-host) | Engine-feature demo binary (kv6 sprites + KFA animation + panoramic sky on the bundled oracle world). Despite the name it is **not** a host-integration helper — for embedding the engine in your own window/event loop, see `roxlap-render` + the `quickstart` example. |
@@ -299,6 +302,10 @@ quiet-frame skips).
   graph, rendering, lighting, sprites, assets, tuning):
   [ncrashed.github.io/roxlap](https://ncrashed.github.io/roxlap/)
   (source: [docs/book](https://github.com/NCrashed/roxlap/tree/master/docs/book)).
+- **Demiurg** — the voxel asset editor built on roxlap (the viewport
+  *is* the engine): model painting + skeletal animation, imports
+  `.kv6`/`.vox`/`.rkc`, exports `.kv6`/`.rkc`/`.vxl`:
+  [github.com/NCrashed/demiurg](https://github.com/NCrashed/demiurg).
 - API: [docs.rs/roxlap-render](https://docs.rs/roxlap-render),
   [docs.rs/roxlap-scene](https://docs.rs/roxlap-scene),
   [docs.rs/roxlap-core](https://docs.rs/roxlap-core),

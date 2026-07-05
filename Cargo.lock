@@ -2376,6 +2376,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxlap-cli"
+version = "0.22.0"
+dependencies = [
+ "glam",
+ "roxlap-formats",
+ "roxlap-scene",
+]
+
+[[package]]
 name = "roxlap-core"
 version = "0.22.0"
 dependencies = [

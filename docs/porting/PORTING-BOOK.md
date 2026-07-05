@@ -224,7 +224,10 @@ knowledge; the porting docs stay untouched as historical records.
 
 Optional follow-on (own mini-stage, not BK): `roxlap-cli` — `.vox →
 .kv6/.rvc` conversion + snapshot inspection; high indie value, zero
-coupling to the book.
+coupling to the book. **DONE 2026-07-06** — see PORTING-CLI.md.
+(Same day: `docs/gallery/animation.gif` re-shot with
+`ROXLAP_CAMERA=95,-170,30,1.5708,0.15` and added to the README
+gallery — the BK.7 leftover.)
 
 ## Hazards
 

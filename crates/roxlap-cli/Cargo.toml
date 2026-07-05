@@ -1,0 +1,28 @@
+[package]
+name = "roxlap-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Command-line asset tool for the roxlap voxel engine — MagicaVoxel .vox → .kv6/.rvc conversion plus asset + scene-snapshot inspection."
+documentation = "https://docs.rs/roxlap-cli"
+keywords = ["voxel", "magicavoxel", "kv6", "voxlap", "cli"]
+categories = ["command-line-utilities", "game-development"]
+readme.workspace = true
+
+# Deliberately tiny: the parsers/writers all live in roxlap-formats
+# (no renderer dependency), and roxlap-scene is only here for the
+# snapshot envelope. No CLI-framework dependency — the argument
+# grammar is three subcommands (house style: hand-parsed).
+[dependencies]
+roxlap-formats = { path = "../roxlap-formats", version = "0.22" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.22" }
+
+[dev-dependencies]
+# The snapshot-inspection test builds a Scene, whose transforms are glam.
+glam = { workspace = true }
+
+[lints]
+workspace = true
