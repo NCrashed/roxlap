@@ -78,7 +78,21 @@ documentation audit so no re-exploration is needed.
   Animation scene + roxlap-host are the worked examples). GIF/PNG
   billboard import prose-only for the same reason as paint_egui
   (non-default features ⇒ a required-features example rots).
-- BK.5..7 — not started.
+- BK.5 — **LANDED 2026-07-05.** Ch. 9 (asset pipeline) + ch. 10
+  (picking & queries). Anchor examples:
+  - `roxlap-formats/examples/book_assets.rs` — headless,
+    assert-checked; anchors `vox` / `kv6_roundtrip` / `rvc_roundtrip`
+    / `vxl_roundtrip`. Synthesises a minimal .vox **in code** (SIZE +
+    XYZI, default palette) so the import anchor needs no binary asset;
+    asserts byte-stable serialize(parse(x)) == x for kv6.
+  - `roxlap-render/examples/book_picking.rs` — windowed (verified
+    live 8 s CPU); anchors `hover_raycast` (view_ray + Scene::raycast
+    per frame) / `click_pick` (pick → carve → bake_lightmode_bbox).
+    Teaches the two-path split: raycast per-frame, pick click-time
+    (GPU depth readback blocks).
+  Collision stays prose (points at demo collision.rs; CC stage will
+  supersede). gif/png import prose-only (non-default features).
+- BK.6..7 — not started.
 
 ## Goal
 
