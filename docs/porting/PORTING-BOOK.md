@@ -92,7 +92,19 @@ documentation audit so no re-exploration is needed.
     (GPU depth readback blocks).
   Collision stays prose (points at demo collision.rs; CC stage will
   supersede). gif/png import prose-only (non-default features).
-- BK.6..7 — not started.
+- BK.6 — **LANDED 2026-07-05.** Ch. 11 (platforms) + ch. 12 (tuning)
+  + ch. 13 (demo tour) — prose chapters, no new anchor examples
+  (nothing here is snippet-shaped; wasm code is cfg-gated off native
+  CI so anchors there would be unverified). The copy-prone tables per
+  hazard 4: engine env vars (4: GPU_MIP_SCAN_DIST / GPU_CHUNK_BUDGET /
+  GPU_CLIP_BUDGET / GPU_POWER) live in tuning.md, demo vars in
+  demo-tour.md — **both carry an HTML source-of-truth comment naming
+  the grep**; ROXLAP_GPU itself is documented as a demo convention,
+  not an engine variable. Parity table again rustdoc-linked, not
+  copied. Grep-verified 23 vars total on 2026-07-05; ROXLAP_DITHER
+  values are none|bayer|blue (default blue).
+  **All 13 chapters now written** — content-complete; BK.7 remains.
+- BK.7 — not started.
 
 ## Goal
 
