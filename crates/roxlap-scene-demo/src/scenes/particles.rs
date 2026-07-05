@@ -96,16 +96,31 @@ impl ParticlesScene {
         })
     }
 
-    /// One click: carve a crater at the picked voxel and burst sparks
-    /// and debris from the surface point. Emitters are created, burst,
-    /// and removed immediately — retire-drain keeps them alive until
-    /// their last particle dies.
+    /// One click: `carve_debris` (PS.5) samples the floor's voxel
+    /// colours, carves the crater, and bursts them back as tumbling
+    /// tinted debris — plus a hand-rolled spark flash on top.
     fn explode(&mut self, world: [f32; 3], grid: roxlap_scene::GridId, voxel: IVec3) {
-        if let Some(g) = self.scene.grid_mut(grid) {
-            g.set_sphere(voxel, 4, None);
+        if let Some(debris) = self.debris {
+            self.particles.carve_debris(
+                &mut self.scene,
+                grid,
+                voxel,
+                4,
+                8.0..16.0, // radial kick away from the crater
+                &ParticleEmitterDef {
+                    lifetime: 1.4..2.4,
+                    collision: CollisionMode::Bounce { restitution: 0.35 },
+                    spin: -7.0..7.0,
+                    scale: 0.9,
+                    scale_end: Some(0.4),
+                    fade_out_frac: 0.2,
+                    ..ParticleEmitterDef::new(debris)
+                },
+            );
         }
-        // Lift the burst origin half a voxel off the surface so the
-        // first collision sample doesn't sit inside the old floor.
+        // Spark flash: a transient burst emitter, lifted half a voxel
+        // off the surface so the first collision sample doesn't sit
+        // inside the (now carved) floor.
         let origin = [world[0], world[1], world[2] - 0.5];
         if let Some(spark) = self.spark {
             let em = self.particles.add_emitter(ParticleEmitterDef {
@@ -124,30 +139,6 @@ impl ParticlesScene {
                 material: MAT_SPARK,
                 lighting: BillboardLighting::FullBright,
                 ..ParticleEmitterDef::new(spark)
-            });
-            self.particles.remove_emitter(em);
-        }
-        if let Some(debris) = self.debris {
-            let em = self.particles.add_emitter(ParticleEmitterDef {
-                pos: origin,
-                spawn: SpawnMode::Burst(24),
-                lifetime: 1.4..2.4,
-                velocity: VelocityDef {
-                    spread: 5.0,
-                    cone: Some(ConeDef {
-                        axis: [0.0, 0.0, -1.0], // up and out
-                        half_angle_deg: 55.0,
-                        speed: 8.0..18.0,
-                    }),
-                    ..VelocityDef::default()
-                },
-                collision: CollisionMode::Bounce { restitution: 0.35 },
-                spin: -7.0..7.0,
-                scale: 0.9,
-                scale_end: Some(0.4),
-                fade_out_frac: 0.2,
-                tint: 0x0058_6E46, // the floor's colour flying off
-                ..ParticleEmitterDef::new(debris)
             });
             self.particles.remove_emitter(em);
         }

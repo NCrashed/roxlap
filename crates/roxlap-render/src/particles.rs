@@ -290,6 +290,10 @@ pub struct Particle {
     /// The tint last written to the facade (fresh-instance default:
     /// white) — same change-only discipline as `last_alpha`.
     pub(crate) last_tint: u32,
+    /// The tint this particle was born with — the `tint_end` lerp's
+    /// start point. Usually the emitter's `tint`; `carve_debris` seeds
+    /// it with the sampled voxel colour.
+    pub(crate) tint_start: u32,
 }
 
 /// Per-emitter live state.
@@ -366,6 +370,11 @@ impl Pcg32 {
 
 /// Default [`ParticleSystem`] particle budget.
 pub const DEFAULT_MAX_PARTICLES: usize = 4096;
+
+/// Debris cap per [`ParticleSystem::carve_debris`] call: bigger carves
+/// stride-sample an even spatial subset down to this many particles,
+/// so one large explosion can't monopolise the pool budget.
+pub const CARVE_DEBRIS_CAP: usize = 96;
 
 /// A self-contained particle simulation: emitters, a shared particle
 /// pool with a budget, and a deterministic seeded RNG. Host-owned;
@@ -563,7 +572,7 @@ impl ParticleSystem {
                 p.scale = def.scale + (end - def.scale) * frac;
             }
             if let Some(end) = def.tint_end {
-                p.tint = lerp_tint(def.tint, end, frac);
+                p.tint = lerp_tint(p.tint_start, end, frac);
             }
             p.alpha = fade_alpha(p.age, p.lifetime, def.fade_in_frac, def.fade_out_frac);
         }
@@ -770,6 +779,130 @@ impl ParticleSystem {
         self.xf_scratch = batch;
     }
 
+    /// Carve a sphere out of a grid and burst its **actual voxel
+    /// colours** as debris (PS.5) — the "shoot the wall, the wall's
+    /// colours fly off" effect: sample the solid voxels inside the
+    /// ball, `set_sphere(…, None)` them away, then spawn one
+    /// def-driven debris particle per sampled voxel, positioned at its
+    /// voxel's world centre (transform-correct for rotated grids),
+    /// tinted with its colour, and kicked radially away from the carve
+    /// centre at a speed from `outward` (on top of the def's normal
+    /// velocity terms).
+    ///
+    /// `def` supplies the model, physics, lifetime and curves;
+    /// its `pos`/`shape`/`spawn`/`tint` are ignored (position and tint
+    /// are per-voxel; nothing else auto-spawns — the transient emitter
+    /// retires immediately and drains with its last particle).
+    /// `tint_end` still applies, lerping *from the voxel colour*.
+    ///
+    /// Big carves are stride-sampled down to [`CARVE_DEBRIS_CAP`]
+    /// debris (an even spatial subset, not the first N); the pool
+    /// budget then applies on top, counting overflow in
+    /// [`dropped_spawns`](Self::dropped_spawns). Returns how many
+    /// debris actually spawned. A stale `grid` or an all-air ball
+    /// carves/spawns nothing.
+    pub fn carve_debris(
+        &mut self,
+        scene: &mut roxlap_scene::Scene,
+        grid: roxlap_scene::GridId,
+        centre: glam::IVec3,
+        radius: u32,
+        outward: Range<f32>,
+        def: &ParticleEmitterDef,
+    ) -> u32 {
+        let Some(g) = scene.grid_mut(grid) else {
+            return 0;
+        };
+        // 1. Sample the solid voxels' colours before they vanish.
+        #[allow(clippy::cast_possible_wrap)]
+        let r = radius as i32;
+        let mut samples: Vec<(glam::IVec3, u32)> = Vec::new();
+        for z in -r..=r {
+            for y in -r..=r {
+                for x in -r..=r {
+                    if x * x + y * y + z * z > r * r {
+                        continue;
+                    }
+                    let v = centre + glam::IVec3::new(x, y, z);
+                    if let Some(col) = g.voxel_color(v) {
+                        samples.push((v, col));
+                    }
+                }
+            }
+        }
+        let transform = g.transform;
+        // 2. Carve (even when the cap will drop some debris — the
+        //    crater is the ground truth, debris is garnish).
+        g.set_sphere(centre, radius, None);
+        if samples.is_empty() {
+            return 0;
+        }
+
+        // 3. One transient emitter carries the def; retire-drain frees
+        //    it with the last debris particle.
+        let mut def = def.clone();
+        def.spawn = SpawnMode::Manual;
+        let id = self.add_emitter(def.clone());
+        let slot = self.map.index(id).expect("just allocated");
+
+        // World-space carve centre (voxel centres sit at +0.5).
+        let to_world = |v: glam::IVec3| -> [f32; 3] {
+            let w =
+                transform.origin + transform.rotation * (v.as_dvec3() + glam::DVec3::splat(0.5));
+            #[allow(clippy::cast_possible_truncation)]
+            [w.x as f32, w.y as f32, w.z as f32]
+        };
+        let cw = to_world(centre);
+
+        let stride = samples.len().div_ceil(CARVE_DEBRIS_CAP).max(1);
+        let mut spawned: u32 = 0;
+        for (v, col) in samples.iter().step_by(stride) {
+            if self.particles.len() >= self.max_particles {
+                self.dropped_spawns += 1;
+                continue;
+            }
+            let pos = to_world(*v);
+            // Radial kick away from the carve centre; the centre voxel
+            // itself scatters randomly.
+            let d = [pos[0] - cw[0], pos[1] - cw[1], pos[2] - cw[2]];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let dir = if len > 1e-4 {
+                [d[0] / len, d[1] / len, d[2] / len]
+            } else {
+                self.rng.unit_vec()
+            };
+            let mut vel = sample_velocity(&mut self.rng, &def.velocity);
+            let speed = self.rng.range_f32(&outward);
+            for a in 0..3 {
+                vel[a] += dir[a] * speed;
+            }
+            let lifetime = self.rng.range_f32(&def.lifetime).max(1e-3);
+            self.particles.push(Particle {
+                pos,
+                vel,
+                age: 0.0,
+                lifetime,
+                scale: def.scale,
+                yaw: 0.0,
+                spin_rate: self.rng.range_f32(&def.spin),
+                alpha: fade_alpha(0.0, lifetime, def.fade_in_frac, def.fade_out_frac),
+                tint: col & 0x00FF_FFFF,
+                emitter_slot: slot as u32,
+                instance: None,
+                last_alpha: 255,
+                last_tint: 0x00FF_FFFF,
+                tint_start: col & 0x00FF_FFFF,
+            });
+            spawned += 1;
+        }
+        self.emitters[slot]
+            .as_mut()
+            .expect("slot allocated above")
+            .live += spawned;
+        self.remove_emitter(id);
+        spawned
+    }
+
     /// Spawn up to `n` particles from emitter `slot`; returns how many
     /// fit the budget.
     fn spawn_from(&mut self, slot: usize, n: u32) -> u32 {
@@ -802,23 +935,7 @@ impl ParticleSystem {
                 }
             }
 
-            // Velocity: base + isotropic spread + cone, by addition.
-            let mut vel = def.velocity.base;
-            if def.velocity.spread > 0.0 {
-                let dir = self.rng.unit_vec();
-                let speed = self.rng.next_f32() * def.velocity.spread;
-                for a in 0..3 {
-                    vel[a] += dir[a] * speed;
-                }
-            }
-            if let Some(cone) = &def.velocity.cone {
-                let dir = cone_dir(&mut self.rng, cone.axis, cone.half_angle_deg);
-                let speed = self.rng.range_f32(&cone.speed);
-                for a in 0..3 {
-                    vel[a] += dir[a] * speed;
-                }
-            }
-
+            let vel = sample_velocity(&mut self.rng, &def.velocity);
             let lifetime = self.rng.range_f32(&def.lifetime).max(1e-3);
             self.particles.push(Particle {
                 pos,
@@ -834,6 +951,7 @@ impl ParticleSystem {
                 instance: None,
                 last_alpha: 255,
                 last_tint: 0x00FF_FFFF,
+                tint_start: def.tint,
             });
             spawned += 1;
         }
@@ -872,6 +990,27 @@ fn particle_xf(p: &Particle) -> DynSpriteTransform {
         up: [-s, c, 0.0],
         forward: [0.0, 0.0, k],
     }
+}
+
+/// Sample one initial velocity from a [`VelocityDef`]: base +
+/// isotropic spread + cone, by addition.
+fn sample_velocity(rng: &mut Pcg32, v: &VelocityDef) -> [f32; 3] {
+    let mut vel = v.base;
+    if v.spread > 0.0 {
+        let dir = rng.unit_vec();
+        let speed = rng.next_f32() * v.spread;
+        for a in 0..3 {
+            vel[a] += dir[a] * speed;
+        }
+    }
+    if let Some(cone) = &v.cone {
+        let dir = cone_dir(rng, cone.axis, cone.half_angle_deg);
+        let speed = rng.range_f32(&cone.speed);
+        for a in 0..3 {
+            vel[a] += dir[a] * speed;
+        }
+    }
+    vel
 }
 
 /// Uniform random direction within `half_angle_deg` of `axis` —
@@ -1472,6 +1611,7 @@ mod tests {
             instance: None,
             last_alpha: 255,
             last_tint: 0x00FF_FFFF,
+            tint_start: 0,
         };
         let xf = particle_xf(&p);
         assert_eq!(xf.pos, [1.0, 2.0, 3.0]);
@@ -1565,6 +1705,200 @@ mod tests {
             "restitution halves the speed: {}",
             p.vel[2]
         );
+    }
+
+    #[test]
+    fn carve_debris_samples_colours_and_carves() {
+        use glam::{DVec3, IVec3};
+        // A dedicated slab in one recognisable colour.
+        let mut scene = roxlap_scene::Scene::new();
+        let grid = scene.add_grid(roxlap_scene::GridTransform::at(DVec3::ZERO));
+        scene.grid_mut(grid).expect("grid").set_rect(
+            IVec3::new(-8, -8, 10),
+            IVec3::new(8, 8, 12),
+            Some(0x80_12_34_56),
+        );
+        let mut sys = ParticleSystem::new(40);
+        let centre = IVec3::new(0, 0, 11);
+        let spawned = sys.carve_debris(
+            &mut scene,
+            grid,
+            centre,
+            2,
+            4.0..6.0,
+            &ParticleEmitterDef {
+                lifetime: 100.0..100.0,
+                ..base_def()
+            },
+        );
+        assert!(spawned > 0);
+        assert_eq!(sys.particle_count() as u32, spawned);
+        // Every debris particle wears the sampled voxel colour.
+        for p in sys.particles() {
+            assert_eq!(p.tint, 0x0012_3456, "tint is the voxel colour");
+        }
+        // The ball is actually gone from the grid.
+        let g = scene.grid_mut(grid).expect("grid");
+        assert!(g.voxel_color(centre).is_none());
+        // Radial kick: particles off-centre move away from the centre.
+        for p in sys.particles() {
+            let d = [p.pos[0] - 0.5, p.pos[1] - 0.5, p.pos[2] - 11.5];
+            let r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            if r2 > 0.5 {
+                let dot = d[0] * p.vel[0] + d[1] * p.vel[1] + d[2] * p.vel[2];
+                assert!(dot > 0.0, "debris flies outward: {d:?} vs {:?}", p.vel);
+            }
+        }
+        // The transient emitter retired; it drains with its debris.
+        assert_eq!(sys.emitter_count(), 0);
+        sys.update(200.0);
+        assert_eq!(sys.particle_count(), 0);
+        assert!(sys.emitters.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn carve_debris_caps_big_carves_and_respects_budget() {
+        use glam::IVec3;
+        let mut scene = scene_with_floor();
+        let grid = scene.grids().next().expect("one grid").0;
+        let mut sys = ParticleSystem::new(41);
+        // Radius 6 ball in a 3-thick slab ≫ the cap.
+        let spawned = sys.carve_debris(
+            &mut scene,
+            grid,
+            IVec3::new(0, 0, 11),
+            6,
+            1.0..2.0,
+            &ParticleEmitterDef {
+                lifetime: 100.0..100.0,
+                ..base_def()
+            },
+        );
+        assert!(spawned as usize <= CARVE_DEBRIS_CAP);
+        assert!(
+            spawned as usize > CARVE_DEBRIS_CAP / 2,
+            "stride fills near the cap"
+        );
+
+        // Pool budget on top: a tiny pool drops the rest, counted.
+        let mut tiny = ParticleSystem::new(42);
+        tiny.set_max_particles(5);
+        let mut scene2 = scene_with_floor();
+        let spawned = tiny.carve_debris(
+            &mut scene2,
+            grid,
+            IVec3::new(10, 10, 11),
+            4,
+            1.0..2.0,
+            &ParticleEmitterDef {
+                lifetime: 100.0..100.0,
+                ..base_def()
+            },
+        );
+        assert_eq!(spawned, 5);
+        assert!(tiny.dropped_spawns() > 0);
+    }
+
+    #[test]
+    fn carve_debris_tint_end_lerps_from_voxel_colour() {
+        use glam::IVec3;
+        let mut scene = scene_with_floor();
+        let grid = scene.grids().next().expect("one grid").0;
+        let mut sys = ParticleSystem::new(43);
+        sys.carve_debris(
+            &mut scene,
+            grid,
+            IVec3::new(0, 0, 11),
+            1,
+            0.0..0.0,
+            &ParticleEmitterDef {
+                lifetime: 1.0..1.0,
+                tint_end: Some(0x0000_0000),
+                ..base_def()
+            },
+        );
+        assert!(sys.particle_count() > 0);
+        sys.update(0.5);
+        // Slab colour 0x00FF_FFFF darkening toward black: mid ≈ 127.
+        for p in sys.particles() {
+            let r = (p.tint >> 16) & 0xff;
+            assert!(
+                (120..=135).contains(&r),
+                "lerp starts at the voxel colour, not def.tint: {:#08x}",
+                p.tint
+            );
+        }
+    }
+
+    #[test]
+    fn stress_10k_particles_simulate_and_sync() {
+        let mut sys = ParticleSystem::new(50);
+        sys.set_max_particles(10_000);
+        let em = sys.add_emitter(ParticleEmitterDef {
+            // Short life ⇒ the u8 fade actually steps every frame (a
+            // 100 s life would quantise alpha to one write per ~12
+            // frames); 2 s > the 30 simulated frames, so none die.
+            lifetime: 2.0..2.0,
+            velocity: VelocityDef {
+                spread: 10.0,
+                ..VelocityDef::default()
+            },
+            // Fade the whole life ⇒ alpha changes (and syncs) every frame.
+            fade_in_frac: 0.5,
+            fade_out_frac: 0.5,
+            spin: -3.0..3.0,
+            scale_end: Some(2.0),
+            tint_end: Some(0x0000_0000),
+            gravity: [0.0, 0.0, 5.0],
+            ..base_def()
+        });
+        assert_eq!(sys.burst(em, 10_000), 10_000);
+        let mut f = Mock::default();
+        for _ in 0..30 {
+            sys.update(1.0 / 60.0);
+            sys.sync_with(&mut f);
+        }
+        assert_eq!(sys.particle_count(), 10_000);
+        assert_eq!(f.spawns.len(), 10_000);
+        // Every later frame batch-moves all 10k and rewrites the
+        // churning alpha/tint per instance.
+        assert_eq!(*f.batch_sizes.last().expect("batches ran"), 10_000);
+        assert!(f.alphas.len() > 100_000, "alpha churns every frame");
+    }
+
+    /// Manual perf probe (release): `cargo test -p roxlap-render
+    /// --release stress_10k_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual perf probe — prints timings, asserts nothing"]
+    fn stress_10k_probe() {
+        let mut sys = ParticleSystem::new(51);
+        sys.set_max_particles(10_000);
+        let em = sys.add_emitter(ParticleEmitterDef {
+            // 8 s life: the fade steps ~every frame across the 200
+            // timed frames (worst-case alpha churn) and nothing dies.
+            lifetime: 8.0..8.0,
+            velocity: VelocityDef {
+                spread: 10.0,
+                ..VelocityDef::default()
+            },
+            fade_in_frac: 0.5,
+            fade_out_frac: 0.5,
+            spin: -3.0..3.0,
+            scale_end: Some(2.0),
+            tint_end: Some(0x0000_0000),
+            ..base_def()
+        });
+        sys.burst(em, 10_000);
+        let mut f = Mock::default();
+        sys.sync_with(&mut f); // spawn frame excluded from timing
+        let t0 = std::time::Instant::now();
+        const FRAMES: u32 = 200;
+        for _ in 0..FRAMES {
+            sys.update(1.0 / 60.0);
+            sys.sync_with(&mut f);
+        }
+        let per_frame = t0.elapsed() / FRAMES;
+        eprintln!("10k particles: {per_frame:?}/frame (update + sync w/ alpha+tint churn)");
     }
 
     #[test]

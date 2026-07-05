@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (PS.5): debris-from-carve helper — stage PS closes
+
+- **`ParticleSystem::carve_debris(scene, grid, centre, radius,
+  outward, &def)`** — the "shoot the wall, the wall's colours fly off"
+  effect as one call: samples the solid voxel colours inside the ball,
+  `set_sphere(…, None)` carves it, then bursts one debris particle per
+  sampled voxel — positioned at its voxel's world centre
+  (transform-correct for rotated grids), **tinted with its own
+  colour** (a `tint_end` lerp starts from that colour), and kicked
+  radially away from the crater at a speed from `outward` on top of
+  the def's velocity terms. Big carves stride-sample an even subset
+  down to `CARVE_DEBRIS_CAP` (96) so one explosion can't monopolise
+  the pool; the budget applies on top and counts drops. The demo
+  scene's explosion now uses it.
+- **Perf verdict (10k-particle stress, release)**: `update` + `sync`
+  with worst-case per-frame alpha *and* tint churn = **~225 µs/frame**
+  (~1.4 % of a 60 FPS frame). The PS.1 "alpha/tint have no batch API"
+  hazard closes as *not needed*: each setter is a CPU-side vec write
+  and the GPU instance upload is already coalesced once per frame.
+  A `#[ignore]`d probe test (`stress_10k_probe`) reproduces the
+  measurement; a threshold-free 10k stress test guards behaviour.
+
 ### Added (PS.4): scene-demo "Particles" tab
 
 - New demo scene between Spotlight and Doom: a bouncing **fountain**

@@ -5,7 +5,24 @@ quality series closed. This is the **entry doc** for the particle-system
 stage — tag **PS**. A fresh-context session should read it top to bottom
 before touching code.
 
-## Status
+## Status — PS series CLOSED (2026-07-05)
+
+All six phases landed in two days; every phase carries a CHANGELOG
+entry. Purely additive ⇒ ready for the 0.22.0 minor cut. Carried out
+of the series:
+
+- **Visual eyeball pass** of the demo tab (both backends ran 12-15 s
+  headless-verified; nobody has *looked* at it yet) —
+  `ROXLAP_SCENE=Particles cargo run -p roxlap-scene-demo --release`.
+- Hazard 3 (no batch alpha/tint API) closed as **not needed**: 10k
+  particles with worst-case per-frame alpha+tint churn = ~225 µs/frame
+  in release (`stress_10k_probe`); setters are vec writes, the GPU
+  instance upload is already per-frame coalesced.
+- Possible later niceties, deliberately unscoped: sub-frame spawn
+  distribution for high rates, per-particle initial yaw randomisation,
+  emitter parenting to actors/instances.
+
+## Phase log
 
 - PS.0 — LANDED 2026-07-04 (this doc + pure-simulation core,
   `roxlap-render/src/particles.rs`, 9 unit tests).
@@ -31,7 +48,11 @@ before touching code.
   smoke / click-explosion+carve) + `ROXLAP_SCENE=<name>` initial-scene
   env var. Ran live on both backends (GPU Intel Vulkan + CPU, 12-15 s
   each, no errors); visual pass owed to the maintainer's eyeball.
-- PS.5 — not started.
+- PS.5 — LANDED 2026-07-05: `carve_debris` engine helper (sample
+  colours → carve → radial tinted burst; `CARVE_DEBRIS_CAP` stride;
+  per-particle `tint_start` so `tint_end` lerps from the voxel
+  colour); demo explosion dogfoods it; 10k stress test + `#[ignore]`
+  perf probe (~225 µs/frame release).
 
 ## Goal
 
