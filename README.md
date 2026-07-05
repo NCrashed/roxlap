@@ -46,6 +46,7 @@ unified `roxlap-render` facade picks CPU or GPU and falls back automatically.
 Depend on the facade + the scene graph (the other crates come in
 transitively):
 
+<!-- ANCHOR: deps -->
 ```toml
 [dependencies]
 roxlap-render = "0.22"   # SceneRenderer — one renderer over CPU + GPU
@@ -53,6 +54,12 @@ roxlap-scene  = "0.22"   # Scene / Grid / edits / streaming
 roxlap-core   = "0.22"   # Camera + per-frame render settings
 glam          = "0.30"
 ```
+<!-- ANCHOR_END: deps -->
+
+This README is the pitch and the 40-line quickstart; the full guide —
+concepts, scene graph, lighting, sprites, asset pipeline, tuning — is
+**[the roxlap book](https://github.com/NCrashed/roxlap/tree/master/docs/book)**
+(`mdbook serve docs/book` for a local copy).
 
 The core loop is: build a [`Scene`], place voxels on a `Grid`, then
 hand the scene + a `Camera` to `SceneRenderer::render` each frame —
@@ -275,6 +282,10 @@ quiet-frame skips).
 
 ## Documentation
 
+- **The roxlap book** — the user guide (quickstart, concepts, scene
+  graph, rendering, lighting, sprites, assets, tuning):
+  [docs/book](https://github.com/NCrashed/roxlap/tree/master/docs/book),
+  built with `mdbook serve docs/book`.
 - API: [docs.rs/roxlap-render](https://docs.rs/roxlap-render),
   [docs.rs/roxlap-scene](https://docs.rs/roxlap-scene),
   [docs.rs/roxlap-core](https://docs.rs/roxlap-core),

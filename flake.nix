@@ -90,6 +90,12 @@
               # Image inspection — imagemagick converts PPM frame dumps
               # to PNG for eyeballing renderer output and pixel diffing.
               imagemagick
+              # BK.0: the user-facing engine book lives in `docs/book/`
+              # (mdBook). `mdbook serve docs/book` for live preview;
+              # broken include-anchors are caught by
+              # `docs/book/check-anchors.sh` (CI runs it — mdbook alone
+              # exits 0 on broken includes).
+              mdbook
             ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxRuntimeLibs;
 
             # `sdl2` (roxlap-sdl-demo) links libSDL2 at build time via

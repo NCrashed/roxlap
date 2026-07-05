@@ -1,0 +1,15 @@
+[book]
+title = "The roxlap Book"
+description = "User guide for roxlap, the pure-Rust voxel-scene engine"
+authors = ["Anton Gushcha"]
+language = "en"
+src = "src"
+
+[build]
+# Every chapter file is committed; a SUMMARY entry pointing at a
+# missing file is an authoring error, not a request to scaffold.
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/NCrashed/roxlap"
+edit-url-template = "https://github.com/NCrashed/roxlap/edit/master/docs/book/{path}"

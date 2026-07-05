@@ -14,10 +14,14 @@
 //! To depend on roxlap from your own game, add to `Cargo.toml`:
 //!
 //! ```toml
-//! roxlap-render = "0.21"   # SceneRenderer facade (this crate)
-//! roxlap-scene  = "0.21"   # Scene / Grid / edits / streaming
-//! roxlap-core   = "0.21"   # Camera + OpticastSettings
+//! roxlap-render = "0.22"   # SceneRenderer facade (this crate)
+//! roxlap-scene  = "0.22"   # Scene / Grid / edits / streaming
+//! roxlap-core   = "0.22"   # Camera + OpticastSettings
 //! ```
+//!
+//! The `// ANCHOR:` comments mark sections included verbatim by the
+//! engine book (`docs/book/`) — keep them when editing, and expect a
+//! red `mdbook build` CI job if one goes missing.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,13 +36,16 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
+// ANCHOR: colors
 /// Voxel colours are voxlap-packed `0x80_RR_GG_BB` — the high byte is
 /// the flat shading intensity, the low 24 bits the RGB colour.
 const GRASS: u32 = 0x80_4d_8a_3a;
 const DOME: u32 = 0x80_40_60_c0;
 /// Sky colour in the framebuffer's native `0x00_RR_GG_BB` packing.
 const SKY: u32 = 0x00_8f_bc_d4;
+// ANCHOR_END: colors
 
+// ANCHOR: build_scene
 /// A one-grid scene. Grid-local voxel coordinates; **+z is down**, so
 /// the ground surface at `z = 210` fills downward toward the bedrock
 /// placeholder at `z = 255`, and "up" is toward smaller z.
@@ -54,6 +61,29 @@ fn build_scene() -> Scene {
     grid.set_sphere(IVec3::new(0, 0, 205), 30, Some(DOME));
     scene
 }
+// ANCHOR_END: build_scene
+
+// ANCHOR: render_frame
+/// One frame: orbit the camera, render the scene, present.
+fn render_frame(renderer: &mut SceneRenderer, scene: &mut Scene, window: &Window, elapsed: f64) {
+    // `Camera::orbit` / `from_yaw_pitch` / `look_at` produce the
+    // canonical right-handed basis the sprite frustum cull needs —
+    // don't hand-roll one.
+    let camera = Camera::orbit(elapsed * 0.3, 0.35, 220.0, [0.0, 0.0, 195.0]);
+
+    let size = window.inner_size();
+    let settings = OpticastSettings::for_oracle_framebuffer(size.width.max(1), size.height.max(1));
+    // Defaults for everything but the sky; the GPU projection is
+    // derived from `settings`, so both backends show the same field
+    // of view.
+    let mut frame = FrameParams::new(&settings);
+    frame.sky_color = SKY;
+    frame.fog_color = SKY;
+
+    renderer.render(scene, &camera, &frame);
+    renderer.present(); // render() composites; present() finishes
+}
+// ANCHOR_END: render_frame
 
 /// `renderer` is declared **before** `window` so it drops first: the
 /// render surface must release its raw window handles while the window
@@ -67,6 +97,7 @@ struct App {
 }
 
 impl ApplicationHandler for App {
+    // ANCHOR: init
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
@@ -95,6 +126,7 @@ impl ApplicationHandler for App {
         self.scene = Some(build_scene());
         self.started = Some(Instant::now());
     }
+    // ANCHOR_END: init
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let (Some(renderer), Some(scene)) = (self.renderer.as_mut(), self.scene.as_mut()) else {
@@ -104,31 +136,16 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => renderer.resize(size.width.max(1), size.height.max(1)),
             WindowEvent::RedrawRequested => {
-                // Orbit the dome. `Camera::orbit` / `from_yaw_pitch` /
-                // `look_at` produce the canonical right-handed basis the
-                // sprite frustum cull needs — don't hand-roll one.
                 let t = self.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
-                let camera = Camera::orbit(t * 0.3, 0.35, 220.0, [0.0, 0.0, 195.0]);
-
                 let window = self.window.as_ref().expect("window outlives renderer");
-                let size = window.inner_size();
-                let settings =
-                    OpticastSettings::for_oracle_framebuffer(size.width.max(1), size.height.max(1));
-                // Defaults for everything but the sky; the GPU
-                // projection is derived from `settings`, so both
-                // backends show the same field of view.
-                let mut frame = FrameParams::new(&settings);
-                frame.sky_color = SKY;
-                frame.fog_color = SKY;
-
-                renderer.render(scene, &camera, &frame);
-                renderer.present(); // render() composites; present() finishes
+                render_frame(renderer, scene, window, t);
                 window.request_redraw();
             }
             _ => {}
         }
     }
 
+    // ANCHOR: teardown
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // Drain in-flight GPU work before surface/window teardown so
         // quitting never yanks the swapchain mid-submission.
@@ -136,6 +153,7 @@ impl ApplicationHandler for App {
             renderer.wait_idle();
         }
     }
+    // ANCHOR_END: teardown
 }
 
 fn main() {

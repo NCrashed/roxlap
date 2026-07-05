@@ -52,3 +52,29 @@ jobs:
       # caught. (To link it in CI instead, `apt-get install libsdl2-dev`
       # here, or add the sdl2 `bundled` feature for a self-contained build.)
       - run: cargo test --workspace --release --exclude roxlap-sdl-demo
+
+  book:
+    name: book (anchors + mdbook build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # BK.0: the book pulls code via `{{#include ...:anchor}}` from
+      # CI-compiled crate examples / README anchors. mdbook itself does
+      # NOT fail on a broken include (missing file → logged ERROR +
+      # exit 0; missing anchor → silent empty snippet), so the real
+      # anti-rot gate is check-anchors.sh; the grep over the build log
+      # is a belt-and-braces catch for anything else mdbook only warns
+      # about. Version pinned to match the nixpkgs mdbook in the dev
+      # shell (flake.nix).
+      - name: Check include anchors
+        run: docs/book/check-anchors.sh
+      - name: Install mdbook
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL https://github.com/rust-lang/mdBook/releases/download/v0.5.2/mdbook-v0.5.2-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build book (fail on warnings)
+        run: |
+          mdbook build docs/book 2>&1 | tee mdbook-build.log
+          ! grep -qE '(ERROR|WARN)' mdbook-build.log

@@ -8,8 +8,21 @@ documentation audit so no re-exploration is needed.
 
 ## Status
 
-- BK.0 — NOT STARTED (decisions below need author confirmation, then:
-  mdbook into the dev shell, book skeleton, chapter 1, CI job).
+- BK.0 — **LANDED 2026-07-05.** All six decisions confirmed by the
+  author as proposed. Delivered: mdbook in the dev shell (nixpkgs
+  0.5.2, pin CI to match), `docs/book/` skeleton (book.toml +
+  SUMMARY + foreword + 12 chapter stubs), chapter 1 written
+  (anchors `colors`/`build_scene`/`init`/`render_frame`/`teardown`
+  in `quickstart.rs` — per-frame code extracted to a top-level
+  `render_frame` fn so includes aren't 16-deep indented; deps toml
+  included from README via HTML-comment anchors), CI `book` job,
+  README links the book (top + Documentation).
+  **Correction to decision 4:** mdbook 0.5.2 does NOT fail on broken
+  includes — missing file logs ERROR and exits 0, missing anchor is
+  *silent empty output*. The real gate is `docs/book/check-anchors.sh`
+  (resolves every `{{#include}}`, verifies file + ANCHOR/ANCHOR_END;
+  verified red on both failure modes); CI runs it before `mdbook
+  build` and additionally greps the build log for WARN/ERROR.
 - BK.1..7 — not started.
 
 ## Goal

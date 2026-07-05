@@ -1,4 +1,6 @@
 /target
+# mdBook build output (the engine book; source is docs/book/src)
+/docs/book/book/
 *.swp
 .DS_Store
 /roxlap-oracle-out/
