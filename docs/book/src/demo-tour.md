@@ -65,3 +65,9 @@ demos** from [chapter 11](platforms.md). And the book's own examples
 (`quickstart`, `book_*` in `roxlap-render`, `roxlap-scene`,
 `roxlap-core`, `roxlap-formats`) are deliberately minimal single-topic
 hosts — often the better starting point for your own project.
+
+For a *complete game* on the engine, see the community-built
+[**roxlap-game-demo**](https://github.com/Aminion/roxlap-game-demo):
+a mining ship in procedurally generated asteroid fields — physics
+flight, cannon + tractor beam, crystal collection, an energy economy
+— everything this book covers, assembled into one playable loop.

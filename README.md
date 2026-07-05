@@ -193,6 +193,21 @@ without them, `SharedArrayBuffer` is disabled and the thread pool
 won't spin up. Full setup + per-host header config in
 [crates/roxlap-web/README.md](https://github.com/NCrashed/roxlap/blob/master/crates/roxlap-web/README.md).
 
+## Made with roxlap
+
+Community projects built on the engine:
+
+- [**roxlap-game-demo**](https://github.com/Aminion/roxlap-game-demo)
+  (by [@Aminion](https://github.com/Aminion)) — pilot a mining ship
+  through procedurally generated asteroid fields: physics-based
+  flight with a mouse-aim autopilot, cannon fire that exposes
+  crystals inside asteroids, a tractor beam to collect them, and an
+  energy economy tying it all together. A complete game loop on the
+  GPU backend, MIT-licensed — a good reference for what a real host
+  looks like beyond the in-repo demos.
+
+Building something on roxlap? Open a PR to add it here.
+
 ## Crates
 
 | Crate | Purpose |
