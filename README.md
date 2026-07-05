@@ -48,9 +48,9 @@ transitively):
 
 ```toml
 [dependencies]
-roxlap-render = "0.21"   # SceneRenderer — one renderer over CPU + GPU
-roxlap-scene  = "0.21"   # Scene / Grid / edits / streaming
-roxlap-core   = "0.21"   # Camera + per-frame render settings
+roxlap-render = "0.22"   # SceneRenderer — one renderer over CPU + GPU
+roxlap-scene  = "0.22"   # Scene / Grid / edits / streaming
+roxlap-core   = "0.22"   # Camera + per-frame render settings
 glam          = "0.30"
 ```
 

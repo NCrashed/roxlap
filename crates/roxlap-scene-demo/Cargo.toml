@@ -22,14 +22,14 @@ path = "src/main.rs"
 env_logger = "0.11"
 glam = { workspace = true }
 png = "0.17"
-roxlap-core = { path = "../roxlap-core", version = "0.21" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.21" }
+roxlap-core = { path = "../roxlap-core", version = "0.22" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.22" }
 # RF: unified CPU/GPU renderer facade. Owns presentation + the
 # Scene→GPU bridge + the CPU compositor; `ROXLAP_GPU=1` selects the
 # GPU backend with automatic CPU fallback. The demo no longer touches
 # roxlap-gpu or softbuffer directly.
 roxlap-render = { path = "../roxlap-render", features = ["hud", "gif"] }
-roxlap-scene = { path = "../roxlap-scene", version = "0.21" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.22" }
 winit = "0.30"
 # BB.5 — the "Doom" scene synthesises its billboard sprites as animated
 # GIFs at startup (the encoder), then feeds them back through the
