@@ -250,6 +250,18 @@ pub struct GridStaticMeta {
     pub aabb_max: [i32; 3],
     /// std430 `vec3<i32>` padding; always 0.
     pub _pad3: i32,
+    /// GPU.13.1 — `all_chunk_occupancy` u32-word offsets of this
+    /// grid's chunk-occupancy pyramid levels 1..=4 (entry `l - 1` =
+    /// level `l`; entries past [`Self::chunk_occ_levels`] are 0).
+    /// Level `l` has `max(pool_dims >> l, 1)` cells per axis; a set
+    /// bit means "some resident non-empty chunk maps into this
+    /// slot-block" — the outer DDA's read-free empty-block skip.
+    pub chunk_occ_mip_off: [u32; 4],
+    /// GPU.13.1 — pyramid levels stored above L0 (0 = no pyramid,
+    /// the single-chunk-pool degenerate case).
+    pub chunk_occ_levels: u32,
+    /// std430 padding; always 0.
+    pub _pad4: [u32; 3],
 }
 
 /// Sentinel chunk_idx written into empty slot_chunk_idx entries.
@@ -312,6 +324,11 @@ pub struct GpuSceneResident {
     /// `refresh_chunk` / `evict_chunk` flip the right bit + write
     /// the affected word back to the GPU.
     pub(crate) chunk_occupancy_shadow: Vec<Vec<u32>>,
+    /// GPU.13.1 — CPU mirror of each grid's chunk-occupancy pyramid
+    /// (outer Vec: grid; middle: level 1.. — level 0 IS
+    /// [`Self::chunk_occupancy_shadow`]). Ancestor re-OR on
+    /// refresh/evict reads children from here instead of the GPU.
+    pub(crate) chunk_occ_pyramid_shadow: Vec<Vec<Vec<u32>>>,
     /// CPU shadow of `slot_chunk_idx`. Indexed `[scene_idx][slot]`
     /// → `[i32; 4]` (vec3 + pad). Host uses this to detect "slot is
     /// holding a different chunk than expected" + as the eviction
@@ -350,6 +367,7 @@ impl GpuSceneResident {
         let mut all_slot_chunk_idx: Vec<i32> = Vec::new();
         let mut static_meta: Vec<GridStaticMeta> = Vec::with_capacity(info.grids.len());
         let mut chunk_occupancy_shadow: Vec<Vec<u32>> = Vec::with_capacity(info.grids.len());
+        let mut chunk_occ_pyramid_shadow: Vec<Vec<Vec<u32>>> = Vec::with_capacity(info.grids.len());
         let mut slot_chunk_idx_shadow: Vec<Vec<[i32; 4]>> = Vec::with_capacity(info.grids.len());
         let mut color_offsets_shadow: Vec<std::collections::HashMap<usize, Vec<u32>>> =
             Vec::with_capacity(info.grids.len());
@@ -490,12 +508,25 @@ impl GpuSceneResident {
             let slot_chunk_idx_offset = u32::try_from(all_slot_chunk_idx.len()).expect("fits");
             // GPU.13.0 — occupied chunk-AABB for the outer-DDA early-out.
             let (aabb_min, aabb_max) = aabb_of_slots(&grid_slot_chunk_idx);
+            // GPU.13.1 — chunk-occupancy pyramid: levels 1.. appended
+            // right after this grid's L0 words, offsets recorded per
+            // level (word offsets are into `all_chunk_occupancy`).
+            let chunk_occupancy_offset = u32::try_from(all_chunk_occupancy.len()).expect("fits");
+            let pyramid = build_occ_pyramid(grid.pool_dims, &grid_chunk_occupancy);
+            let mut chunk_occ_mip_off = [0u32; 4];
+            {
+                let mut cursor = all_chunk_occupancy.len() + grid_chunk_occupancy.len();
+                for (i, level) in pyramid.iter().enumerate() {
+                    chunk_occ_mip_off[i] = u32::try_from(cursor).expect("fits");
+                    cursor += level.len();
+                }
+            }
             let meta = GridStaticMeta {
                 occupancy_offset: u32::try_from(all_occupancy.len()).expect("fits"),
                 color_offsets_offset: u32::try_from(all_color_offsets.len()).expect("fits"),
                 colors_offset: u32::try_from(all_colors.len()).expect("fits"),
                 chunk_colors_base_offset: u32::try_from(all_chunk_colors_base.len()).expect("fits"),
-                chunk_occupancy_offset: u32::try_from(all_chunk_occupancy.len()).expect("fits"),
+                chunk_occupancy_offset,
                 slot_chunk_idx_offset,
                 vsid,
                 total_slots: total_slots as u32,
@@ -511,9 +542,13 @@ impl GpuSceneResident {
                 _pad2: 0,
                 aabb_max,
                 _pad3: 0,
+                chunk_occ_mip_off,
+                chunk_occ_levels: u32::try_from(pyramid.len()).expect("small"),
+                _pad4: [0; 3],
             };
 
             chunk_occupancy_shadow.push(grid_chunk_occupancy.clone());
+            chunk_occ_pyramid_shadow.push(pyramid.clone());
             slot_chunk_idx_shadow.push(grid_slot_chunk_idx.clone());
             color_offsets_shadow.push(grid_offsets_shadow);
 
@@ -522,6 +557,9 @@ impl GpuSceneResident {
             all_colors.extend_from_slice(&grid_colors);
             all_chunk_colors_base.extend_from_slice(&grid_chunk_colors_base);
             all_chunk_occupancy.extend_from_slice(&grid_chunk_occupancy);
+            for level in &pyramid {
+                all_chunk_occupancy.extend_from_slice(level);
+            }
             for entry in &grid_slot_chunk_idx {
                 all_slot_chunk_idx.extend_from_slice(entry);
             }
@@ -630,6 +668,7 @@ impl GpuSceneResident {
             total_bytes,
             static_meta,
             chunk_occupancy_shadow,
+            chunk_occ_pyramid_shadow,
             slot_chunk_idx_shadow,
             color_offsets_shadow,
             colors_stride_shadow: grid_colors_strides,
@@ -989,6 +1028,57 @@ impl GpuSceneResident {
             (global_word_idx * 4) as u64,
             bytemuck::bytes_of(shadow),
         );
+
+        // GPU.13.1 — re-OR the pyramid ancestors of the touched slot.
+        // Setting a bit can only turn ancestors ON; clearing one can
+        // only turn them OFF — either way, an unchanged ancestor means
+        // every level above it is unchanged too, so stop early.
+        let pool = meta.pool_dims;
+        let slot = [
+            (slot_idx as u32) % pool[0],
+            ((slot_idx as u32) / pool[0]) % pool[1],
+            (slot_idx as u32) / (pool[0] * pool[1]),
+        ];
+        for l in 1..=meta.chunk_occ_levels {
+            let cell = [slot[0] >> l, slot[1] >> l, slot[2] >> l];
+            let bit = {
+                let child: &[u32] = if l == 1 {
+                    &self.chunk_occupancy_shadow[scene_idx]
+                } else {
+                    &self.chunk_occ_pyramid_shadow[scene_idx][(l - 2) as usize]
+                };
+                occ_cell_from_children(pool, l, cell, child)
+            };
+            let d = occ_level_dims(pool, l);
+            let idx = (cell[0] + cell[1] * d[0] + cell[2] * d[0] * d[1]) as usize;
+            let word = &mut self.chunk_occ_pyramid_shadow[scene_idx][(l - 1) as usize][idx >> 5];
+            let was = (*word >> (idx & 31)) & 1 == 1;
+            if bit == was {
+                break;
+            }
+            if bit {
+                *word |= 1u32 << (idx & 31);
+            } else {
+                *word &= !(1u32 << (idx & 31));
+            }
+            let global = meta.chunk_occ_mip_off[(l - 1) as usize] as usize + (idx >> 5);
+            let word_copy = *word;
+            queue.write_buffer(
+                &self.all_chunk_occupancy,
+                (global * 4) as u64,
+                bytemuck::bytes_of(&word_copy),
+            );
+        }
+    }
+
+    /// Read-only view of the chunk-occupancy pyramid shadows (per
+    /// grid, per level above L0) — the CPU mirror the incremental
+    /// maintenance updates; exposed for integration tests to assert
+    /// the re-OR bookkeeping (rendering itself only reads the GPU
+    /// copy).
+    #[must_use]
+    pub fn chunk_occ_pyramid_shadow(&self) -> &[Vec<Vec<u32>>] {
+        &self.chunk_occ_pyramid_shadow
     }
 
     fn set_slot_chunk_idx(
@@ -1034,6 +1124,78 @@ impl GpuSceneResident {
 /// inverted sentinel box (`min = i32::MAX`, `max = i32::MIN`) when no
 /// slot is occupied, which makes the shader's `aabb_passed` early-out
 /// fire for every ray (an empty grid renders nothing).
+/// GPU.13.1 — cells per axis of chunk-occupancy pyramid level `l`
+/// (`l >= 1`): the pool box halves per level, floored at 1.
+fn occ_level_dims(pool: [u32; 3], l: u32) -> [u32; 3] {
+    [
+        (pool[0] >> l).max(1),
+        (pool[1] >> l).max(1),
+        (pool[2] >> l).max(1),
+    ]
+}
+
+/// u32 words holding level `l`'s bits.
+fn occ_level_words(pool: [u32; 3], l: u32) -> usize {
+    let d = occ_level_dims(pool, l);
+    (d[0] * d[1] * d[2]).div_ceil(32) as usize
+}
+
+/// Pyramid levels above L0: enough that the largest pool axis
+/// reaches one cell, capped by the meta's 4 offset slots.
+fn occ_pyramid_levels(pool: [u32; 3]) -> u32 {
+    let max_dim = pool[0].max(pool[1]).max(pool[2]).max(1);
+    max_dim.ilog2().min(4)
+}
+
+/// One level-`l` cell's bit, recomputed as the OR of its (up to
+/// 2×2×2) children in level `l - 1` (level 0 = the per-slot bitmap).
+fn occ_cell_from_children(pool: [u32; 3], l: u32, cell: [u32; 3], child_words: &[u32]) -> bool {
+    let cd = if l == 1 {
+        pool
+    } else {
+        occ_level_dims(pool, l - 1)
+    };
+    for dz in 0..2u32 {
+        for dy in 0..2u32 {
+            for dx in 0..2u32 {
+                let c = [cell[0] * 2 + dx, cell[1] * 2 + dy, cell[2] * 2 + dz];
+                if c[0] >= cd[0] || c[1] >= cd[1] || c[2] >= cd[2] {
+                    continue;
+                }
+                let idx = (c[0] + c[1] * cd[0] + c[2] * cd[0] * cd[1]) as usize;
+                if (child_words[idx >> 5] >> (idx & 31)) & 1 == 1 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Build the whole pyramid (levels 1..=`occ_pyramid_levels`) from the
+/// L0 per-slot bitmap. Returns one word-vec per level.
+fn build_occ_pyramid(pool: [u32; 3], l0: &[u32]) -> Vec<Vec<u32>> {
+    let levels = occ_pyramid_levels(pool);
+    let mut out: Vec<Vec<u32>> = Vec::with_capacity(levels as usize);
+    for l in 1..=levels {
+        let d = occ_level_dims(pool, l);
+        let child: &[u32] = if l == 1 { l0 } else { &out[(l - 2) as usize] };
+        let mut words = vec![0u32; occ_level_words(pool, l)];
+        for z in 0..d[2] {
+            for y in 0..d[1] {
+                for x in 0..d[0] {
+                    if occ_cell_from_children(pool, l, [x, y, z], child) {
+                        let idx = (x + y * d[0] + z * d[0] * d[1]) as usize;
+                        words[idx >> 5] |= 1 << (idx & 31);
+                    }
+                }
+            }
+        }
+        out.push(words);
+    }
+    out
+}
+
 fn aabb_of_slots(slots: &[[i32; 4]]) -> ([i32; 3], [i32; 3]) {
     let mut min = [i32::MAX; 3];
     let mut max = [i32::MIN; 3];
@@ -1170,9 +1332,58 @@ mod tests {
         // the Rust size_of or wgpu rejects the binding.
         // Concretely: 8 u32 (32) + vec3+pad (16) + 4 u32 (16) +
         // 2*[u32;6] (48) = 112, then GPU.13.0 adds two vec3<i32>+pad
-        // (aabb_min, aabb_max) = 32 → 144 bytes.
-        assert_eq!(std::mem::size_of::<GridStaticMeta>(), 144);
+        // (aabb_min, aabb_max) = 32 → 144, and GPU.13.1 adds
+        // [u32;4] pyramid offsets + levels + [u32;3] pad = 32 → 176.
+        assert_eq!(std::mem::size_of::<GridStaticMeta>(), 176);
         assert_eq!(std::mem::align_of::<GridStaticMeta>(), 4);
+    }
+
+    /// GPU.13.1 — the pyramid built from an L0 bitmap must equal a
+    /// brute-force OR over every level's block, and incremental
+    /// child recompute must agree with the builder.
+    #[test]
+    fn occ_pyramid_matches_brute_force() {
+        let pool = [8u32, 8, 4];
+        // A scattered pattern: bits at slots (0,0,0), (7,7,3), (3,4,1).
+        let mut l0 = vec![0u32; (8 * 8 * 4) / 32];
+        for slot in [(0u32, 0u32, 0u32), (7, 7, 3), (3, 4, 1)] {
+            let idx = (slot.0 + slot.1 * 8 + slot.2 * 64) as usize;
+            l0[idx >> 5] |= 1 << (idx & 31);
+        }
+        let pyr = build_occ_pyramid(pool, &l0);
+        assert_eq!(pyr.len(), 3, "log2(8) levels above L0");
+        for l in 1..=3u32 {
+            let d = occ_level_dims(pool, l);
+            for z in 0..d[2] {
+                for y in 0..d[1] {
+                    for x in 0..d[0] {
+                        // Brute force: OR of every L0 slot inside the
+                        // 2^l block (clamped by the pool).
+                        let mut expect = false;
+                        for sz in (z << l)..(((z + 1) << l).min(pool[2])) {
+                            for sy in (y << l)..(((y + 1) << l).min(pool[1])) {
+                                for sx in (x << l)..(((x + 1) << l).min(pool[0])) {
+                                    let i = (sx + sy * 8 + sz * 64) as usize;
+                                    expect |= (l0[i >> 5] >> (i & 31)) & 1 == 1;
+                                }
+                            }
+                        }
+                        let idx = (x + y * d[0] + z * d[0] * d[1]) as usize;
+                        let got = (pyr[(l - 1) as usize][idx >> 5] >> (idx & 31)) & 1 == 1;
+                        assert_eq!(got, expect, "level {l} cell ({x},{y},{z})");
+                        // Incremental recompute path agrees.
+                        let child: &[u32] = if l == 1 { &l0 } else { &pyr[(l - 2) as usize] };
+                        assert_eq!(occ_cell_from_children(pool, l, [x, y, z], child), expect);
+                    }
+                }
+            }
+        }
+        // Top level is a single cell and it is occupied.
+        assert_eq!(pyr[2].len(), 1);
+        assert_eq!(pyr[2][0] & 1, 1);
+        // An empty L0 yields an all-empty pyramid.
+        let empty = build_occ_pyramid(pool, &[0u32; 8]);
+        assert!(empty.iter().all(|lvl| lvl.iter().all(|&w| w == 0)));
     }
 
     #[test]

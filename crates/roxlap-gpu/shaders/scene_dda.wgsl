@@ -72,6 +72,15 @@ struct GridStaticMeta {
     // these mirror the host's `[i32;3] + pad` pair exactly (112→144).
     aabb_min: vec3<i32>,
     aabb_max: vec3<i32>,
+    // GPU.13.1 — chunk-occupancy pyramid: word offsets of levels 1..=4
+    // in `all_chunk_occupancy` (entry l-1 = level l) + the level count
+    // above L0. Mirrors the host's [u32;4] + u32 + [u32;3] pad
+    // (144→176).
+    chunk_occ_mip_off: array<u32, 4>,
+    chunk_occ_levels: u32,
+    _pad4a: u32,
+    _pad4b: u32,
+    _pad4c: u32,
 };
 
 struct Uniforms {
@@ -389,6 +398,24 @@ fn chunk_has_content(slot_base: u32, chunk_occ_off: u32, slot_idx: u32, chunk_id
         & (1u << (slot_idx & 31u))) != 0u;
 }
 
+// GPU.13.1 — is the level-`lvl` chunk-occupancy pyramid cell that
+// chunk `c` maps into EMPTY? The pyramid lives in slot space (the
+// modular pool), so the cell's bit is the OR of every resident slot
+// in the 2^lvl slot-block — a clear bit proves every chunk block
+// aliasing it (including the ray's) holds no resident voxels, and
+// the outer DDA may cross the whole block without touching memory
+// again. A set bit may be an aliased false positive; the caller just
+// descends (conservative, like `chunk_has_content`'s identity check).
+fn chunk_block_empty(g: u32, pool_dims: vec3<u32>, lvl: u32, c: vec3<i32>) -> bool {
+    let d = max(pool_dims >> vec3<u32>(lvl), vec3<u32>(1u));
+    // Arithmetic >> floors negative chunk indices onto their block;
+    // the pow2 mask is the same modular trick as `slot_idx_of`.
+    let cell = (c >> vec3<u32>(lvl)) & (vec3<i32>(d) - vec3<i32>(1));
+    let idx = u32(cell.x) + u32(cell.y) * d.x + u32(cell.z) * d.x * d.y;
+    let off = grid_static_meta[g].chunk_occ_mip_off[lvl - 1u];
+    return (all_chunk_occupancy[off + (idx >> 5u)] & (1u << (idx & 31u))) == 0u;
+}
+
 // Voxlap-convention sky sample. The bundled `assets/sky.png` is
 // `width = elevation` (horizon → zenith), `height = azimuth`
 // (wraps 360°) — the OPPOSITE axes of a standard equirectangular
@@ -449,6 +476,7 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
     let chunk_occ_off = grid_static_meta[g].chunk_occupancy_offset;
     let aabb_mn = grid_static_meta[g].aabb_min;
     let aabb_mx = grid_static_meta[g].aabb_max;
+    let occ_levels = grid_static_meta[g].chunk_occ_levels;
     let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z));
 
     var p_chunk = vec3<i32>(floor(origin / chunk_dim));
@@ -468,7 +496,8 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
         // Left the occupied chunk-AABB along the ray ⇒ nothing ahead.
         if (aabb_passed(aabb_mn, aabb_mx, p_chunk, step_chunk)) { return false; }
         let slot_id = slot_idx_of(pool_dims, p_chunk);
-        if (chunk_has_content(slot_base, chunk_occ_off, slot_id, p_chunk)) {
+        let has_content = chunk_has_content(slot_base, chunk_occ_off, slot_id, p_chunk);
+        if (has_content) {
             // PF.2 — mip for this chunk from the receiver's screen distance
             // plus the travel along the shadow ray (mirrors march_grid).
             let mip = pick_mip(t_base + t_enter, mip_count);
@@ -535,18 +564,34 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
                 }
             }
         }
-        if (t_max_chunk.x < t_max_chunk.y && t_max_chunk.x < t_max_chunk.z) {
-            t_enter = t_max_chunk.x;
-            p_chunk.x = p_chunk.x + step_chunk.x;
-            t_max_chunk.x = t_max_chunk.x + t_delta_chunk.x;
-        } else if (t_max_chunk.y < t_max_chunk.z) {
-            t_enter = t_max_chunk.y;
-            p_chunk.y = p_chunk.y + step_chunk.y;
-            t_max_chunk.y = t_max_chunk.y + t_delta_chunk.y;
-        } else {
-            t_enter = t_max_chunk.z;
-            p_chunk.z = p_chunk.z + step_chunk.z;
-            t_max_chunk.z = t_max_chunk.z + t_delta_chunk.z;
+        // GPU.13.1 — same read-free empty-block skip as march_grid
+        // (see there): shadow rays cross the same empty chunks.
+        var skip_lvl: u32 = 0u;
+        if (!has_content && occ_levels > 0u) {
+            loop {
+                if (skip_lvl >= occ_levels) { break; }
+                if (!chunk_block_empty(g, pool_dims, skip_lvl + 1u, p_chunk)) { break; }
+                skip_lvl = skip_lvl + 1u;
+            }
+        }
+        let block_id = p_chunk >> vec3<u32>(skip_lvl);
+        for (var sstep: u32 = 0u; sstep < 64u; sstep = sstep + 1u) {
+            if (t_max_chunk.x < t_max_chunk.y && t_max_chunk.x < t_max_chunk.z) {
+                t_enter = t_max_chunk.x;
+                p_chunk.x = p_chunk.x + step_chunk.x;
+                t_max_chunk.x = t_max_chunk.x + t_delta_chunk.x;
+            } else if (t_max_chunk.y < t_max_chunk.z) {
+                t_enter = t_max_chunk.y;
+                p_chunk.y = p_chunk.y + step_chunk.y;
+                t_max_chunk.y = t_max_chunk.y + t_delta_chunk.y;
+            } else {
+                t_enter = t_max_chunk.z;
+                p_chunk.z = p_chunk.z + step_chunk.z;
+                t_max_chunk.z = t_max_chunk.z + t_delta_chunk.z;
+            }
+            if (skip_lvl == 0u) { break; }
+            if (any((p_chunk >> vec3<u32>(skip_lvl)) != block_id)) { break; }
+            if (t_enter > max_t) { break; }
         }
     }
     return false;
@@ -772,6 +817,7 @@ fn march_grid(
     let chunk_occ_off = grid_static_meta[g].chunk_occupancy_offset;
     let aabb_mn = grid_static_meta[g].aabb_min;
     let aabb_mx = grid_static_meta[g].aabb_max;
+    let occ_levels = grid_static_meta[g].chunk_occ_levels;
     let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z));
 
     var p_chunk = vec3<i32>(floor(ray_origin / chunk_dim));
@@ -821,7 +867,8 @@ fn march_grid(
         }
         let slot_id = slot_idx_of(pool_dims, p_chunk);
         prev_solid = false; // fresh chunk: start a new solid run
-        if (chunk_has_content(slot_base, chunk_occ_off, slot_id, p_chunk)) {
+        let has_content = chunk_has_content(slot_base, chunk_occ_off, slot_id, p_chunk);
+        if (has_content) {
             // GPU.11.1 — pick the mip for this chunk by entry distance.
             // Voxels are `vsize` world units; the chunk holds
             // `vsid>>mip` × `vsid>>mip` × `CHUNK_Z>>mip` of them.
@@ -989,21 +1036,50 @@ fn march_grid(
             }
         }
 
-        if (t_max_chunk.x < t_max_chunk.y && t_max_chunk.x < t_max_chunk.z) {
-            t_enter = t_max_chunk.x;
-            p_chunk.x = p_chunk.x + step_chunk.x;
-            t_max_chunk.x = t_max_chunk.x + t_delta_chunk.x;
-            entry_axis = 0;
-        } else if (t_max_chunk.y < t_max_chunk.z) {
-            t_enter = t_max_chunk.y;
-            p_chunk.y = p_chunk.y + step_chunk.y;
-            t_max_chunk.y = t_max_chunk.y + t_delta_chunk.y;
-            entry_axis = 1;
-        } else {
-            t_enter = t_max_chunk.z;
-            p_chunk.z = p_chunk.z + step_chunk.z;
-            t_max_chunk.z = t_max_chunk.z + t_delta_chunk.z;
-            entry_axis = 2;
+        // GPU.13.1 — over an empty chunk, climb the occupancy pyramid
+        // to the highest level whose block is provably empty. Inside
+        // that block the incremental steps below run WITHOUT the
+        // per-chunk slot/occupancy reads (and the whole block costs
+        // ONE outer step of the `max_outer_steps` budget). The block
+        // test is pure integer (`p_chunk >> lvl` leaves `block_id`),
+        // so occupied chunks are still entered through the exact same
+        // incremental `t_max_chunk` sums — render output is
+        // byte-identical, only the control flow over empty space
+        // changes.
+        var skip_lvl: u32 = 0u;
+        if (!has_content && occ_levels > 0u) {
+            loop {
+                if (skip_lvl >= occ_levels) { break; }
+                if (!chunk_block_empty(g, pool_dims, skip_lvl + 1u, p_chunk)) { break; }
+                skip_lvl = skip_lvl + 1u;
+            }
+        }
+        let block_id = p_chunk >> vec3<u32>(skip_lvl);
+
+        // Advance at least one chunk; while a skip level is active,
+        // keep stepping (read-free) until the ray leaves the block.
+        // Bound: a 2^4 block crosses at most 3·16 boundaries; 64 is
+        // a safe anti-hang guard.
+        for (var sstep: u32 = 0u; sstep < 64u; sstep = sstep + 1u) {
+            if (t_max_chunk.x < t_max_chunk.y && t_max_chunk.x < t_max_chunk.z) {
+                t_enter = t_max_chunk.x;
+                p_chunk.x = p_chunk.x + step_chunk.x;
+                t_max_chunk.x = t_max_chunk.x + t_delta_chunk.x;
+                entry_axis = 0;
+            } else if (t_max_chunk.y < t_max_chunk.z) {
+                t_enter = t_max_chunk.y;
+                p_chunk.y = p_chunk.y + step_chunk.y;
+                t_max_chunk.y = t_max_chunk.y + t_delta_chunk.y;
+                entry_axis = 1;
+            } else {
+                t_enter = t_max_chunk.z;
+                p_chunk.z = p_chunk.z + step_chunk.z;
+                t_max_chunk.z = t_max_chunk.z + t_delta_chunk.z;
+                entry_axis = 2;
+            }
+            if (skip_lvl == 0u) { break; }
+            if (any((p_chunk >> vec3<u32>(skip_lvl)) != block_id)) { break; }
+            if (t_enter > best_t) { break; }
         }
     }
     return finalize_sky_grid(touched, accum, trans, ray_dir);

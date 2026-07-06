@@ -397,3 +397,47 @@ opticast. Landed as sub-substages GW.0..GW.4; cut in **roxlap 0.9.0**.
   host is `Rc<RefCell>`; rayon workers only touch the CPU
   compositor's framebuffer slices).
 - GPU click-picking returns `None` on wasm (deferred); CPU picks.
+
+## GPU.13.1 — chunk-occupancy pyramid (landed 2026-07-07)
+
+GPU.13.0 (2026-06-09) added the grid-AABB early-out and resolved the
+user-flagged high-altitude FPS drop; 13.1 — the hierarchical lever —
+was deferred until sparse scenes needed it, and landed 2026-07-07.
+
+Design (entry doc: `memory/project_gpu_hier_skip_scope.md`):
+
+- **Pyramid over slot space.** Levels 1..=4 above the per-slot L0
+  bitmap in `all_chunk_occupancy`, one bit per `2^L` slot-block (OR
+  of children). Slot space is the modular pool, so a chunk block maps
+  onto exactly one slot block (`(c >> L) & (pool_dims >> L − 1)` — the
+  same pow2 trick as `slot_idx_of`); a CLEAR bit proves every aliased
+  chunk block empty (safe to skip), a SET bit may be an aliased false
+  positive (descend — conservative, like the L0 identity check).
+  Storage: < 40 extra bytes per grid. `GridStaticMeta` grew the level
+  offsets + count (144 → 176 B).
+- **Maintenance.** `set_chunk_occupancy_bit` re-ORs the touched
+  slot's ancestors from CPU shadows, stopping at the first unchanged
+  level; upload builds the pyramid with the same code path
+  (`build_occ_pyramid`), pinned equal to a brute-force OR by a unit
+  test.
+- **Byte-stable marching.** Both `scene_dda.wgsl` marches (primary +
+  sun shadow) climb the pyramid over an empty chunk and then cross
+  the whole empty block with the UNCHANGED incremental
+  Amanatides-Woo steps — no re-seeding, so occupied chunks are
+  entered through bit-identical `t_max` sums and render output
+  cannot move. The block-exit test is pure integer
+  (`p_chunk >> lvl != block_id`), immune to the codebase's historic
+  float-quantization traps. A whole block costs ONE
+  `max_outer_steps` budget unit, so deep sparse scenes also stop
+  starving the step budget.
+- **Rejected:** true O(log) jump-restarts (re-seed the DDA past the
+  block) — breaks byte-stability for a win that only matters at
+  planet-tier extents; revisit if those land.
+
+Measured (NVK, 960×540, headless, 200-frame mean): rays crossing a
+15-chunk empty gap into a wall — **1.86 → 1.30 ms/frame (−30%)**;
+sky/AABB-dominated diagonal view — neutral within noise (climb
+overhead ≤ ~2%). Gates: all 70 roxlap-gpu tests green, incl. a new
+far-chunk-through-the-gap render test with evict/re-install pyramid
+tracking. USER-OWED: a windowed eyeball at the `H` pose (should look
+identical, just not slower).

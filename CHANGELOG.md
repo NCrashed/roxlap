@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: GPU.13.1 — hierarchical empty-space skip (chunk-occupancy pyramid)
+
+- The outer scene DDA (and the sun-shadow march) now climbs a tiny
+  per-grid occupancy pyramid (levels of 2^L slot-blocks over the
+  modular pool, < 40 B/grid) when it meets an empty chunk, and
+  crosses the whole provably-empty block with read-free incremental
+  steps — one `max_outer_steps` budget unit per block instead of two
+  storage reads per chunk. Occupied chunks are still entered through
+  bit-identical t sums, so render output is unchanged by
+  construction. Maintained live on refresh/evict (ancestor re-OR).
+- Measured (NVK, 960×540): rays crossing a 15-chunk empty gap into a
+  wall go 1.86 → 1.30 ms/frame (−30%); dense or sky-dominated views
+  are neutral within noise. The lever GPU.13.0 deferred — it pays in
+  large sparse worlds where empty space sits INSIDE the occupied
+  AABB.
+
 ### Fixed: billboard actors froze when the camera entered their column
 
 - `billboard_transform` returned `None` for a degenerate view axis

@@ -1331,3 +1331,72 @@ fn scene_dda_renders_floor_through_mip_layout() {
     eprintln!("scene_render: floor fraction = {frac:.3}");
     assert!(frac > 0.6, "expected floor to fill the view, got {frac:.3}");
 }
+
+#[test]
+fn hierarchical_skip_hits_far_chunk_and_tracks_evict() {
+    // GPU.13.1 — a ray crossing a long run of EMPTY chunks (stepped
+    // read-free under the chunk-occupancy pyramid) must still enter
+    // the far occupied chunk exactly — the integer block test cannot
+    // overshoot it. Evicting the chunk must clear the pyramid (same
+    // view → pure sky), and re-installing must set it again.
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&block_chunk(vsid, 0, 31));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 8, 1],
+        pool_dims: [1, 8, 1],
+        chunks: vec![([0, 7, 0], chunk.clone())], // 7 empty chunks in front
+    };
+    let mut scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+    // Pool [1,8,1] → 3 pyramid levels above L0.
+    assert_eq!(scene.static_meta[0].chunk_occ_levels, 3);
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [vsid as f32 * 0.5, 8.0, 16.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0], // toward the far chunk at +y
+        fov_y_rad: 30f32.to_radians(),
+    };
+    let render = |scene: &GpuSceneResident| {
+        let fb = renderer.render(
+            &gpu.device,
+            &gpu.queue,
+            scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        );
+        fb.iter().filter(|&&p| is_block_color(p)).count()
+    };
+
+    let visible = render(&scene);
+    assert!(
+        visible > 0,
+        "far chunk must render through the skipped empty run"
+    );
+
+    scene.evict_chunk(&gpu.queue, 0, [0, 7, 0]);
+    // The maintenance path re-ORed the ancestors down to all-empty.
+    assert!(
+        scene.chunk_occ_pyramid_shadow()[0]
+            .iter()
+            .all(|lvl| lvl.iter().all(|&w| w == 0)),
+        "evicting the only chunk empties every pyramid level"
+    );
+    assert_eq!(render(&scene), 0, "evicted chunk leaves pure sky");
+
+    scene.refresh_chunk(&gpu.queue, 0, [0, 7, 0], &chunk);
+    assert_eq!(
+        render(&scene),
+        visible,
+        "re-installed chunk renders exactly as before"
+    );
+}
