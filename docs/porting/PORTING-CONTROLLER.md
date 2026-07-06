@@ -13,9 +13,24 @@ container, stage RKC) — a `.rkc` character is what you *draw*, a
 character controller is what you *stand on the ground with*. CC.4
 connects the two.
 
-## Status — OPEN (CC.0 landed; CC.1 next)
+## Status — OPEN (CC.0 + CC.1 landed; CC.2 next)
 
 ## Phase log
+
+- CC.1 — LANDED 2026-07-06: `roxlap-scene/src/character.rs` —
+  `CharacterDef` (radius/height/eye_height, gravity/jump_speed,
+  walk_speed + `accel_ground`/`accel_air` approach model, `Solidity`)
+  / `CharacterBody` (feet-positioned, `walk(scene, dt, WalkInput)`)
+  / `WalkInput { wish, jump }`. Substeps ≤ radius (MAX_SUBSTEPS
+  anti-hang truncation), per-axis x→y→z with flush plane clamp
+  (SKIN = 1e-3; rotated-geometry fallback = reject axis), +z contact
+  grounds / −z bumps, end-of-frame skin probe drives `on_ground`,
+  stuck-escape kept verbatim. 8 trajectory tests: land flush on the
+  plane, walk-speed convergence, wall clamp+slide, jump apex vs
+  v²/2g, head bump flush under ceiling, 20-voxel/step fall onto a
+  1-voxel floor (no tunnel), stuck escape, bit-identical determinism.
+  Test lesson: spawn fixtures INSIDE the intended gap — a body
+  dropped from above a ceiling slab settles on top of it.
 
 - CC.0 — LANDED 2026-07-06: `roxlap-scene/src/collide.rs` —
   `Solidity` (bedrock knob only, `Copy`),

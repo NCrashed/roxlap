@@ -9,8 +9,10 @@
 //! tests here:
 //!
 //! - Solidity comes from [`roxlap_core::world_query::getcube`]:
-//!   [`Cube::Color`] *and* [`Cube::UnexposedSolid`] block (slab
-//!   interiors are solid material), [`Cube::Air`] does not.
+//!   [`Cube::Color`](roxlap_core::world_query::Cube::Color) *and*
+//!   [`Cube::UnexposedSolid`](roxlap_core::world_query::Cube::UnexposedSolid)
+//!   block (slab interiors are solid material),
+//!   [`Cube::Air`](roxlap_core::world_query::Cube::Air) does not.
 //! - The voxlap bedrock placeholder at chunk-local
 //!   `z = CHUNK_SIZE_Z - 1` is a *policy*, not a fact —
 //!   [`Solidity::bedrock_blocks`], default `false` to match the

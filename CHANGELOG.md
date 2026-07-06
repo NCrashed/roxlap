@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: character controller body (CC.1)
+
+- `roxlap_scene::character` — `CharacterBody` / `CharacterDef` /
+  `WalkInput`: a walking body over `Scene` with substepped per-axis
+  move-and-slide (flush contact against the blocking cell plane),
+  gravity, jumping, `on_ground()` / `hit_head()` contact flags and
+  the demos' stuck-escape rule. Deterministic: same scene + same
+  input sequence = bit-identical trajectory (pinned by a unit test).
+  Feet-positioned, f64 world; remember +z is DOWN — gravity is
+  positive, a jump impulse negative. Fly/noclip modes, auto step-up
+  and input buffering arrive in CC.2.
+
 ### Added: collision query layer (CC.0)
 
 - `roxlap_scene::collide` — world-space box-vs-voxel overlap tests
