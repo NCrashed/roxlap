@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-07-07
+
 ### Added: roxlap-cli snapshot chunk extraction
 
 - `roxlap-cli chunks <snapshot> <grid>` lists a snapshot grid's
@@ -2807,7 +2809,8 @@ Initial public release of the roxlap workspace.
 [0.1.1]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.1
 [0.1.0]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.0
 
-[Unreleased]: https://github.com/NCrashed/roxlap/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/NCrashed/roxlap/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/NCrashed/roxlap/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/NCrashed/roxlap/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/NCrashed/roxlap/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/NCrashed/roxlap/compare/v0.20.0...v0.21.0

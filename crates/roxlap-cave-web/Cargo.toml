@@ -22,11 +22,11 @@ crate-type = ["cdylib", "rlib"]
 # single-chunk grid + does collision / carving / lighting bake;
 # roxlap-formats builds the bullet sprite kv6; roxlap-core supplies
 # Camera / Engine / OpticastSettings / SpriteLighting; glam types coords.
-roxlap-core = { path = "../roxlap-core", version = "0.23" }
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.23" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.23" }
-roxlap-render = { path = "../roxlap-render", version = "0.23" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.23" }
+roxlap-core = { path = "../roxlap-core", version = "0.24" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.24" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.24" }
+roxlap-render = { path = "../roxlap-render", version = "0.24" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.24" }
 glam = { workspace = true }
 
 # wasm-bindgen / web-sys versions pinned to the same major+minor as

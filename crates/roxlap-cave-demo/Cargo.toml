@@ -21,11 +21,11 @@ path = "src/main.rs"
 # on stderr like the pre-QE.2 eprintln!s did (RUST_LOG adjusts
 # verbosity).
 env_logger = "0.11"
-roxlap-core = { path = "../roxlap-core", version = "0.23" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.23" }
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.23" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.23" }
-roxlap-render = { path = "../roxlap-render", version = "0.23" }
+roxlap-core = { path = "../roxlap-core", version = "0.24" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.24" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.24" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.24" }
+roxlap-render = { path = "../roxlap-render", version = "0.24" }
 glam = { workspace = true }
 winit = "0.30"
 
