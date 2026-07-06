@@ -43,6 +43,9 @@ release cut (the crate carries full publish metadata).
   `vox::VoxFile::from_kv6` + `vox::serialize` (exact ≤ 255 colours,
   6-bit-bucket quantise beyond; pivot lost — `.vox` has none).
   Live-verified: magick-made GIF/PNG assets → rvc → `info`, and
-  coco.kv6 → vox → kv6 keeps all 148 voxels. Still open: snapshot
-  chunk extraction (no demand yet). Publish owed at the next release
-  cut.
+  coco.kv6 → vox → kv6 keeps all 148 voxels. Snapshot chunk
+  extraction LANDED 2026-07-07: `chunks <snap> <grid>` (list resident
+  chunks + edit versions) and `extract <snap> <grid> <chx,chy,chz>
+  <out.(vxl|kv6|vox)>` — a player-carved chunk opens straight in
+  MagicaVoxel; bedrock placeholder plane dropped from kv6/vox, kept
+  in vxl. First published at 0.23.0; nothing left on this doc's list.

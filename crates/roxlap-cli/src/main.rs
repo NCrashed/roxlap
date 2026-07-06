@@ -21,6 +21,15 @@
 //!   still PNG) → billboard voxel clip. For a numbered frame
 //!   sequence, pass the frames then the output:
 //!   `png2rvc <f0.png> <f1.png> … <out.rvc>` (80 ms per frame).
+//! - `chunks <snapshot> <grid>` — list a snapshot grid's resident
+//!   chunks with their edit versions (`grid` = the raw id `info`
+//!   prints).
+//! - `extract <snapshot> <grid> <chx,chy,chz> <out.(vxl|kv6|vox)>` —
+//!   pull one chunk out of a scene snapshot: as a raw `.vxl` world,
+//!   a `.kv6` model, or a MagicaVoxel `.vox` (open a player-carved
+//!   chunk in the editor). The voxlap bedrock placeholder plane
+//!   (chunk-local z = 255) is dropped from `.kv6`/`.vox` — it's
+//!   format bookkeeping, not content — and kept in `.vxl`.
 //!
 //! Exit codes: `0` ok, `1` operation failed, `2` usage error.
 
@@ -56,6 +65,19 @@ fn main() -> ExitCode {
             let frames: Vec<&Path> = parts[..parts.len() - 1].iter().map(Path::new).collect();
             run(png2rvc_frames(&frames, Path::new(parts[parts.len() - 1])))
         }
+        ["chunks", snap, grid] => match grid.parse::<u32>() {
+            Ok(grid) => run(list_chunks(Path::new(snap), grid)),
+            Err(_) => usage(&format!("grid must be the raw integer id, got {grid:?}")),
+        },
+        ["extract", snap, grid, chunk, out] => {
+            match (grid.parse::<u32>(), parse_chunk_idx(chunk)) {
+                (Ok(grid), Some(idx)) => run(extract(Path::new(snap), grid, idx, Path::new(out))),
+                (Err(_), _) => usage(&format!("grid must be the raw integer id, got {grid:?}")),
+                (_, None) => usage(&format!(
+                    "chunk must be three comma-separated integers (chx,chy,chz), got {chunk:?}"
+                )),
+            }
+        }
         _ => usage("expected a subcommand"),
     }
 }
@@ -80,7 +102,9 @@ fn usage(problem: &str) -> ExitCode {
          roxlap-cli kv62vox <in.kv6> <out.vox>\n  \
          roxlap-cli gif2rvc <in.gif> <out.rvc> [thickness]\n  \
          roxlap-cli png2rvc <in.(a)png> <out.rvc> [thickness]\n  \
-         roxlap-cli png2rvc <frame0.png> <frame1.png> … <out.rvc>"
+         roxlap-cli png2rvc <frame0.png> <frame1.png> … <out.rvc>\n  \
+         roxlap-cli chunks <snapshot> <grid>\n  \
+         roxlap-cli extract <snapshot> <grid> <chx,chy,chz> <out.(vxl|kv6|vox)>"
     );
     ExitCode::from(2)
 }
@@ -339,6 +363,107 @@ fn png2rvc_frames(inputs: &[&Path], output: &Path) -> Result<(), String> {
     write(output, &clip.serialize())
 }
 
+// ---- snapshot chunk extraction ---------------------------------------------
+
+/// `"chx,chy,chz"` → chunk index.
+fn parse_chunk_idx(s: &str) -> Option<glam::IVec3> {
+    let parts: Vec<i32> = s
+        .split(',')
+        .map(str::trim)
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (parts.len() == 3).then(|| glam::IVec3::new(parts[0], parts[1], parts[2]))
+}
+
+fn load_scene(path: &Path) -> Result<roxlap_scene::Scene, String> {
+    roxlap_scene::Scene::load_snapshot(&read(path)?)
+        .map_err(|e| format!("{}: not a readable scene snapshot: {e:?}", path.display()))
+}
+
+/// Find a grid by the raw id `info` prints.
+fn grid_by_raw(scene: &roxlap_scene::Scene, raw: u32) -> Result<&roxlap_scene::Grid, String> {
+    scene
+        .grids()
+        .find(|(id, _)| id.raw() == raw)
+        .map(|(_, g)| g)
+        .ok_or_else(|| {
+            let have: Vec<String> = scene.grids().map(|(id, _)| id.raw().to_string()).collect();
+            format!("no grid {raw} in the snapshot (grids: {})", have.join(", "))
+        })
+}
+
+fn list_chunks(snap: &Path, grid_raw: u32) -> Result<(), String> {
+    let scene = load_scene(snap)?;
+    let grid = grid_by_raw(&scene, grid_raw)?;
+    let mut idxs: Vec<(glam::IVec3, u64)> = grid
+        .chunk_versions()
+        .iter()
+        .map(|(&i, &v)| (i, v))
+        .collect();
+    idxs.sort_by_key(|(i, _)| (i.z, i.y, i.x));
+    println!(
+        "grid {grid_raw} ({}): {} chunk(s)",
+        grid.name.as_deref().unwrap_or("-"),
+        idxs.len()
+    );
+    for (i, v) in idxs {
+        let state = if v == 0 {
+            "pristine".to_string()
+        } else {
+            format!("edited v{v}")
+        };
+        println!("  ({}, {}, {}) {state}", i.x, i.y, i.z);
+    }
+    Ok(())
+}
+
+/// The chunk as a kv6 model: every voxel of the chunk except the
+/// voxlap bedrock placeholder plane (chunk-local `z = 255` — format
+/// bookkeeping, not content; the demos render it as air too).
+fn chunk_to_kv6(chunk: &roxlap_formats::vxl::Vxl) -> roxlap_formats::kv6::Kv6 {
+    let vsid = chunk.vsid;
+    roxlap_formats::kv6::Kv6::from_fn(vsid, vsid, 255, |x, y, z| chunk.voxel_color(x, y, z))
+}
+
+fn extract(snap: &Path, grid_raw: u32, idx: glam::IVec3, out: &Path) -> Result<(), String> {
+    let scene = load_scene(snap)?;
+    let bytes = extract_chunk_bytes(&scene, grid_raw, idx, out)?;
+    write(out, &bytes)
+}
+
+/// The conversion core, fs-free for tests: chunk → bytes in the
+/// format `out`'s extension names.
+fn extract_chunk_bytes(
+    scene: &roxlap_scene::Scene,
+    grid_raw: u32,
+    idx: glam::IVec3,
+    out: &Path,
+) -> Result<Vec<u8>, String> {
+    let grid = grid_by_raw(scene, grid_raw)?;
+    let chunk = grid.chunk(idx).ok_or_else(|| {
+        format!(
+            "grid {grid_raw} has no chunk ({}, {}, {}) — `roxlap-cli chunks` lists them",
+            idx.x, idx.y, idx.z
+        )
+    })?;
+    match out
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("vxl") => Ok(vxl::serialize(chunk)),
+        Some("kv6") => Ok(kv6::serialize(&chunk_to_kv6(chunk))),
+        Some("vox") => Ok(vox::serialize(&vox::VoxFile::from_kv6(&chunk_to_kv6(
+            chunk,
+        )))),
+        other => Err(format!(
+            "unsupported output extension {other:?} (use .vxl, .kv6 or .vox)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +540,65 @@ mod tests {
         let s = summarize(Kind::Vox, &bytes).expect("re-exported vox parses");
         assert!(s.contains("1 model(s)"), "got: {s}");
         assert!(s.contains("3x3x3, 1 voxels"), "got: {s}");
+    }
+
+    /// Snapshot → chunk → every export format round-trips: `.vxl`
+    /// reparses as the same chunk, `.kv6`/`.vox` carry the edited
+    /// voxels (minus the bedrock placeholder plane, dropped by
+    /// design).
+    #[test]
+    fn extract_chunk_all_formats() {
+        use glam::{DVec3, IVec3};
+        let mut scene = roxlap_scene::Scene::new();
+        let id = scene.add_grid(roxlap_scene::GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).expect("just added");
+        g.set_voxel(
+            IVec3::new(3, 4, 100),
+            Some(roxlap_scene::VoxColor(0x80_aa_bb_cc)),
+        );
+        g.set_voxel(
+            IVec3::new(3, 5, 100),
+            Some(roxlap_scene::VoxColor(0x80_11_22_33)),
+        );
+        let raw = id.raw();
+        let idx = IVec3::ZERO;
+
+        // .vxl: byte round-trip through the raw chunk serializer.
+        let vxl_bytes = extract_chunk_bytes(&scene, raw, idx, Path::new("c.vxl")).expect("vxl");
+        let reparsed = vxl::parse(&vxl_bytes).expect("self-authored vxl");
+        assert_eq!(reparsed.vsid, 128);
+        assert_eq!(
+            reparsed.voxel_color(3, 4, 100),
+            Some(roxlap_scene::VoxColor(0x80_aa_bb_cc))
+        );
+
+        // .kv6: the two edited voxels, WITHOUT the bedrock plane.
+        let kv6_bytes = extract_chunk_bytes(&scene, raw, idx, Path::new("c.kv6")).expect("kv6");
+        let model = kv6::parse(&kv6_bytes).expect("self-authored kv6");
+        assert_eq!((model.xsiz, model.ysiz, model.zsiz), (128, 128, 255));
+        assert_eq!(model.voxels.len(), 2, "bedrock plane dropped");
+
+        // .vox: same voxel count through the MagicaVoxel exporter.
+        let vox_bytes = extract_chunk_bytes(&scene, raw, idx, Path::new("c.vox")).expect("vox");
+        let f = vox::parse(&vox_bytes).expect("self-authored vox");
+        assert_eq!(f.models[0].voxels.len(), 2);
+
+        // Error paths name the problem.
+        assert!(extract_chunk_bytes(&scene, raw, idx, Path::new("c.png"))
+            .unwrap_err()
+            .contains("unsupported output extension"));
+        assert!(
+            extract_chunk_bytes(&scene, raw, IVec3::new(9, 9, 0), Path::new("c.vxl"))
+                .unwrap_err()
+                .contains("has no chunk")
+        );
+        assert!(extract_chunk_bytes(&scene, 77, idx, Path::new("c.vxl"))
+            .unwrap_err()
+            .contains("no grid 77"));
+        // And the arg parser.
+        assert_eq!(parse_chunk_idx("1,-2, 3"), Some(IVec3::new(1, -2, 3)));
+        assert_eq!(parse_chunk_idx("1,2"), None);
+        assert_eq!(parse_chunk_idx("a,b,c"), None);
     }
 
     #[test]

@@ -19,9 +19,8 @@ readme.workspace = true
 [dependencies]
 roxlap-formats = { path = "../roxlap-formats", version = "0.23", features = ["gif", "png"] }
 roxlap-scene = { path = "../roxlap-scene", version = "0.23" }
-
-[dev-dependencies]
-# The snapshot-inspection test builds a Scene, whose transforms are glam.
+# Chunk indices in the `chunks` / `extract` subcommands are IVec3
+# (roxlap-scene's own coordinate type).
 glam = { workspace = true }
 
 [lints]

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: roxlap-cli snapshot chunk extraction
+
+- `roxlap-cli chunks <snapshot> <grid>` lists a snapshot grid's
+  resident chunks with their edit versions, and
+  `extract <snapshot> <grid> <chx,chy,chz> <out.(vxl|kv6|vox)>` pulls
+  one chunk out — as a raw `.vxl` world, a `.kv6` model, or a
+  MagicaVoxel `.vox` (a player-carved chunk opens straight in the
+  editor). The voxlap bedrock placeholder plane (chunk-local
+  z = 255) is dropped from `.kv6`/`.vox` — bookkeeping, not
+  content — and kept in byte-faithful `.vxl`.
+
 ### Added: GPU.13.1 — hierarchical empty-space skip (chunk-occupancy pyramid)
 
 - The outer scene DDA (and the sun-shadow march) now climbs a tiny
