@@ -30,9 +30,9 @@ use roxlap_scene::render::{
 use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{DynDisplay, DynWindow, HasDisplayHandle, HasWindowHandle, Rgb};
+use crate::{DynDisplay, DynWindow, HasDisplayHandle, HasWindowHandle};
 use crate::{
-    DynSpriteTransform, FrameParams, KfaSprite, Line3, QuadDraw, RenderOptions, SpriteSet,
+    DynSpriteTransform, FrameParams, KfaSprite, Line3, QuadDraw, RenderOptions, Rgb, SpriteSet,
 };
 
 /// An empty (zero-voxel) KV6 — the placeholder a removed CPU model

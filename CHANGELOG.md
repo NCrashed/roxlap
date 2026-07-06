@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: material-aware collision + third person (CC.4)
+
+- `Solidity::passable` — an optional colour veto (`fn(VoxColor) ->
+  bool`) making approved *visible* voxels passable: water, foliage,
+  ladders. Glass stays solid by simply not approving it. Hidden slab
+  interiors (`Cube::UnexposedSolid`) carry no colour in the voxlap
+  format and always block — two rules of thumb (both pinned by
+  tests): pass-through walls work up to 2 voxels thick (3+ grows a
+  colourless core), and must sit at least 1 voxel inside the chunk
+  (edge voxels lose their side colours — the encoder treats
+  out-of-chunk neighbours as solid).
+- Demo dogfood: the Transparency scene's front wall is now half
+  glass / half water (both translucent terrain materials) and the
+  scene flies with collision — the water half lets you through.
+  The World scene gains `C`: third-person view with a synthetic
+  billboard-actor figure walking at the body and a raycast-clamped
+  camera boom.
+- Fixed (wasm blind spot): the web crates are wasm-only
+  (`#![cfg]`), so native CI never type-checked them — the colour
+  newtypes had silently broken both. `roxlap-scene` now builds on
+  plain wasm32 again (rayon unconditional, as in roxlap-core), both
+  web crates are migrated, and CI gained a stable-wasm32 check job.
+
 ### Changed: demos move on the character controller (CC.3)
 
 - The three copy-pasted demo collision hacks (scene-demo

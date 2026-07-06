@@ -303,6 +303,7 @@ impl App {
             fly_speed: MOVE_SPEED,
             solidity: Solidity {
                 bedrock_blocks: true,
+                ..Solidity::default()
             },
             ..CharacterDef::default()
         });

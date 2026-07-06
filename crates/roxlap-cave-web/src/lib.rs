@@ -28,7 +28,8 @@ use roxlap_render::{
     SpriteSet,
 };
 use roxlap_scene::{
-    CharacterBody, CharacterDef, GridId, GridTransform, MoveMode, Scene, Solidity, WalkInput,
+    CharacterBody, CharacterDef, GridId, GridTransform, MoveMode, Rgb, Scene, Solidity, VoxColor,
+    WalkInput,
 };
 use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
@@ -50,10 +51,10 @@ const BULLET_VEL: f64 = 60.0;
 const FIRE_RADIUS: u32 = 4;
 /// Bullet sprite half-extent in voxels (a small glowing sphere).
 const BULLET_SPRITE_RADIUS: u32 = 2;
-const BULLET_COLOR_CORE: u32 = 0x00FF_4080;
+const BULLET_COLOR_CORE: VoxColor = VoxColor(0x00FF_4080);
 
-const CARVE_COLOR: u32 = 0x8050_3018;
-const SPAWN_BUBBLE_COLOR: u32 = 0x8060_6068;
+const CARVE_COLOR: VoxColor = VoxColor(0x8050_3018);
+const SPAWN_BUBBLE_COLOR: VoxColor = VoxColor(0x8060_6068);
 const SPAWN_BUBBLE_RADIUS: u32 = 6;
 
 const LIGHTMODE: u32 = 1;
@@ -422,9 +423,9 @@ fn render(state: &mut State) {
     // both backends).
     let settings = settings.with_fov_y(GPU_FOV_Y_DEG.to_radians());
     let mut frame = FrameParams::new(&settings);
-    frame.sky_color = state.engine.sky_color();
+    frame.sky_color = Rgb(state.engine.sky_color());
     frame.sky = state.engine.sky();
-    frame.fog_color = state.engine.fog_color();
+    frame.fog_color = Rgb(state.engine.fog_color());
     frame.fog_max_scan_dist = state.engine.fog_max_scan_dist();
     state.renderer.render(&mut state.scene, &cam, &frame);
     state.renderer.present();
@@ -568,6 +569,7 @@ async fn start() -> Result<(), JsValue> {
                 fly_speed: MOVE_SPEED,
                 solidity: Solidity {
                     bedrock_blocks: true,
+                    ..Solidity::default()
                 },
                 ..CharacterDef::default()
             });

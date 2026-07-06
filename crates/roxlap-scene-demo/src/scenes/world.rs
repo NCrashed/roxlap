@@ -8,6 +8,10 @@
 //! · `T` streaming telemetry.
 
 use glam::DVec3;
+use roxlap_render::{
+    ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode, Kv6,
+    LoopMode, ShadowFlags, VoxColor, VoxelClip,
+};
 use roxlap_scene::{CharacterBody, CharacterDef, MoveMode, WalkInput};
 use winit::keyboard::KeyCode;
 
@@ -23,6 +27,16 @@ const SPAWN_POS: [f64; 3] = [0.0, -120.0, 50.0];
 /// Grounded speed — terrain-scale rather than the 64 v/s fly rate.
 const WALK_SPEED: f64 = 12.0;
 
+/// Third-person figure: 24 voxels tall at 0.075 world units per voxel
+/// = 1.8 world units — the CharacterDef default height.
+const FIGURE_H_VOX: u32 = 24;
+const FIGURE_W_VOX: u32 = 12;
+const FIGURE_VOXEL: f32 = 0.075;
+
+/// Camera boom length in third person (clamped by a raycast so the
+/// camera never sits inside a hill).
+const BOOM_DIST: f64 = 8.0;
+
 pub struct WorldScene {
     world: SceneAndCamera,
     bake: StreamingBakeTracker,
@@ -36,6 +50,10 @@ pub struct WorldScene {
     /// pose), we re-teleport the body instead of dragging it across
     /// the world.
     last_eye: [f64; 3],
+    /// CC.4 — third-person: a synthetic billboard-actor figure posed
+    /// at the body, camera boomed back along −forward. `None` =
+    /// first person.
+    tp_actor: Option<BillboardActorId>,
 }
 
 impl WorldScene {
@@ -56,12 +74,89 @@ impl WorldScene {
             bake: StreamingBakeTracker::new(),
             body,
             last_eye: [f64::NAN; 3],
+            tp_actor: None,
         }
     }
 
     /// Feet position for a camera (eye) position.
     fn feet_for_eye(&self, eye: [f64; 3]) -> DVec3 {
         DVec3::from(eye) + DVec3::new(0.0, 0.0, self.body.def().eye_height)
+    }
+
+    /// One frame of the synthetic third-person figure: a flat 2-voxel
+    /// slab silhouette — head, torso, and two legs whose spread is
+    /// the walk phase.
+    fn figure_frame(leg_spread: u32) -> Kv6 {
+        const SKIN: VoxColor = VoxColor(0x80_d8_a8_78);
+        const TUNIC: VoxColor = VoxColor(0x80_30_60_a0);
+        const BOOTS: VoxColor = VoxColor(0x80_50_40_30);
+        let cx = FIGURE_W_VOX / 2; // 6
+        Kv6::from_fn(FIGURE_W_VOX, 2, FIGURE_H_VOX, |x, _y, z| {
+            // z is DOWN: 0 = crown, FIGURE_H_VOX-1 = soles.
+            match z {
+                0..=5 => {
+                    // Head: a 4-wide block centred on the body.
+                    (x + 2 >= cx && x < cx + 2).then_some(SKIN)
+                }
+                6..=15 => {
+                    // Torso + arms: 8 wide.
+                    (x + 4 >= cx && x < cx + 4).then_some(TUNIC)
+                }
+                _ => {
+                    // Legs: two 2-wide columns, `leg_spread` voxels
+                    // out from centre.
+                    let left = cx - 2 - leg_spread;
+                    let right = cx + leg_spread;
+                    ((x >= left && x < left + 2) || (x >= right && x < right + 2)).then_some(BOOTS)
+                }
+            }
+        })
+    }
+
+    /// Register the figure's walk (2 frames) + idle (1 frame) states
+    /// and spawn the actor at the body.
+    fn spawn_tp_actor(&mut self, ctx: &mut SceneCtx) -> Option<BillboardActorId> {
+        let clip = |frames: &[Kv6]| {
+            VoxelClip::from_kv6_frames(frames, FIGURE_VOXEL, LoopMode::Loop, &[], 220, 1)
+                .expect("figure frames are non-empty + same dims")
+        };
+        let walk = ctx.renderer.add_voxel_clip(
+            &clip(&[Self::figure_frame(3), Self::figure_frame(0)])
+                .decode()
+                .expect("clip decodes"),
+        );
+        let idle = ctx.renderer.add_voxel_clip(
+            &clip(&[Self::figure_frame(1)])
+                .decode()
+                .expect("clip decodes"),
+        );
+        let def = BillboardActorDef {
+            states: vec![
+                ActorState {
+                    name: "walk".to_owned(),
+                    dirs: vec![walk],
+                },
+                ActorState {
+                    name: "idle".to_owned(),
+                    dirs: vec![idle],
+                },
+            ],
+            mode: BillboardMode::Cylindrical,
+            lighting: BillboardLighting::FaceNormal,
+            speed: 1.0,
+            shadows: ShadowFlags::default(),
+        };
+        ctx.renderer
+            .add_billboard_actor(def, self.actor_pos(), ctx.cam.yaw)
+    }
+
+    /// The actor's anchor: clip pivot is the volume CENTRE, so half
+    /// the figure's height above (−z of) the feet.
+    #[allow(clippy::cast_possible_truncation)]
+    fn actor_pos(&self) -> [f32; 3] {
+        let feet = self.body.pos();
+        let half_h = f64::from(FIGURE_H_VOX) * f64::from(FIGURE_VOXEL) * 0.5;
+        [feet.x as f32, feet.y as f32, (feet.z - half_h) as f32]
     }
 }
 
@@ -71,7 +166,7 @@ impl DemoScene for WorldScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD+mouse fly · G: walk/fly · R: ship spin · B: LOD billboards · T: streaming · H: top-down"
+        "WASD+mouse fly · G: walk/fly · C: third person · R: ship spin · B: LOD · T: streaming"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -106,6 +201,27 @@ impl DemoScene for WorldScene {
             },
         );
         ctx.cam.pos = self.body.eye_pos().into();
+
+        // CC.4 — third person: pose the figure at the body, animate
+        // it, and boom the camera back along −forward (raycast-
+        // clamped so it never sits inside a hill).
+        if let Some(actor) = self.tp_actor {
+            ctx.renderer
+                .set_actor_transform(actor, self.actor_pos(), ctx.cam.yaw);
+            let moving = self.body.vel().truncate().length() > 0.5;
+            ctx.renderer
+                .set_actor_state(actor, if moving { "walk" } else { "idle" });
+            ctx.renderer.tick(&ctx.cam.camera(), dt);
+
+            let eye = self.body.eye_pos();
+            let back = -DVec3::from(ctx.cam.camera().forward);
+            let boom = self
+                .world
+                .scene
+                .raycast(eye, back, BOOM_DIST)
+                .map_or(BOOM_DIST, |hit| (hit.t - 0.5).max(0.5));
+            ctx.cam.pos = (eye + back * boom).into();
+        }
         self.last_eye = ctx.cam.pos;
 
         self.world.tick_ship_spin(dt);
@@ -117,7 +233,7 @@ impl DemoScene for WorldScene {
         }
     }
 
-    fn on_input(&mut self, _ctx: &mut SceneCtx, ev: &SceneInput) {
+    fn on_input(&mut self, ctx: &mut SceneCtx, ev: &SceneInput) {
         let SceneInput::Key {
             code,
             pressed: true,
@@ -126,6 +242,19 @@ impl DemoScene for WorldScene {
             return;
         };
         match code {
+            KeyCode::KeyC => {
+                if let Some(actor) = self.tp_actor.take() {
+                    ctx.renderer.remove_billboard_actor(actor);
+                    // Camera snaps back to the eye next update (the
+                    // body stays authoritative through last_eye).
+                    ctx.cam.pos = self.body.eye_pos().into();
+                    self.last_eye = ctx.cam.pos;
+                    eprintln!("view = FIRST person");
+                } else {
+                    self.tp_actor = self.spawn_tp_actor(ctx);
+                    eprintln!("view = THIRD person (C back to first)");
+                }
+            }
             KeyCode::KeyG => {
                 let next = match self.body.mode() {
                     MoveMode::Walk => MoveMode::Fly,

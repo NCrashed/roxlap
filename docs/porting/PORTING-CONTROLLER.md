@@ -13,9 +13,53 @@ container, stage RKC) — a `.rkc` character is what you *draw*, a
 character controller is what you *stand on the ground with*. CC.4
 connects the two.
 
-## Status — OPEN (CC.0–CC.3 landed; CC.4 next)
+## Status — OPEN (CC.0–CC.4 landed; CC.5 next)
 
 ## Phase log
+
+- CC.4 — LANDED 2026-07-06: the material hook + third person.
+  `Solidity::passable: Option<fn(VoxColor) -> bool>` — a colour veto
+  for VISIBLE voxels (plain `fn`, keeps `Copy`); `cube_blocks`
+  centralises the Cube match. Hidden run interiors
+  (`UnexposedSolid`) always block — the slab format stores no colour
+  for them; documented (swimmable volumes need exposed voxels; the
+  probe test confirmed side-exposed voxels DO carry colour).
+  Dogfood: the Transparency scene's front wall is now split
+  glass/water (new MAT_WATER alpha material), the scene flies on a
+  CharacterBody whose veto passes the water half and bounces off the
+  glass half. Post-land fix (user: "can't fly through the water"):
+  the demo water wall was 4 voxels thick — its y=1,2 core is
+  colourless UnexposedSolid, which no veto can pass. Water is now 2
+  voxels thick, and the rule is pinned as an engine test
+  (`passable_walls_must_be_at_most_two_voxels_thick`: 1-2 pass, 3+
+  block) + spelled out on `Solidity::passable`'s rustdoc. Second
+  post-land fix (user: "can enter but not cross"): the wall ALSO sat
+  at grid-local y=0 — the chunk boundary — where the slab encoder
+  treats the out-of-chunk neighbour as solid and stores no side
+  colours for the edge layer (it renders, but classifies
+  UnexposedSolid; found via a getcube cell dump: front layer
+  colourless, back layer coloured, shifted wall fully coloured).
+  Front wall moved to y-local 1; the chunk-edge fact is pinned in
+  the same engine test and on the rustdoc. Headless verified: the
+  fly trace now CROSSES the water half at full speed and stays
+  flush-blocked at the glass half. Third person: World `C` toggles a synthetic
+  billboard-actor figure (flat 2-voxel slab, 2-frame walk + idle,
+  built with Kv6::from_fn + VoxelClip::from_kv6_frames — pivot is
+  volume CENTRE, so the anchor is feet − half height) posed at the
+  body with walk/idle picked by horizontal speed, camera boomed 8
+  units along −forward with a Scene::raycast clamp. **Visual pass
+  owed** (with CC.3's): wade the water wall, bounce off glass, walk
+  the hills in third person.
+  Fallout paid down in the same phase: the wasm web crates are
+  `#![cfg(target_arch = "wasm32")]`, so native clippy only PARSES
+  them — cave-web's CC.3 code and BOTH web crates' colour-newtype
+  migration had silently never been type-checked. Fixed:
+  roxlap-scene now compiles on plain wasm32 (rayon made an
+  unconditional dep, mirroring roxlap-core; crossbeam stays
+  native-only), cpu.rs' `Rgb` import de-cfg'd, both web crates'
+  colour literals migrated, and CI gained a `wasm-check` job
+  (stable wasm32 `cargo check` of both web crates) so this class of
+  rot can't ship again.
 
 - CC.3 — LANDED 2026-07-06: all three demo collision copies DELETED,
   every host on `CharacterBody`. scene-demo World: Fly by default,

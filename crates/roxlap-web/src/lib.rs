@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use roxlap_core::{Camera, Engine, OpticastSettings};
 use roxlap_render::{Backend, BackendPreference, FrameParams, RenderOptions, SceneRenderer};
-use roxlap_scene::Scene;
+use roxlap_scene::{Rgb, Scene, VoxColor};
 use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
 
@@ -292,9 +292,9 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, perf: &web_sys::Performance, now_ms
         // deliberate FOV is set there (for both backends).
         let settings = settings.with_fov_y(GPU_FOV_Y_DEG.to_radians());
         let mut frame = FrameParams::new(&settings);
-        frame.sky_color = engine.sky_color();
+        frame.sky_color = Rgb(engine.sky_color());
         frame.sky = engine.sky();
-        frame.fog_color = engine.fog_color();
+        frame.fog_color = Rgb(engine.fog_color());
         frame.fog_max_scan_dist = engine.fog_max_scan_dist();
         frame.draw_sprites = false;
         renderer.render(scene, &cam, &frame);

@@ -35,10 +35,6 @@ use roxlap_core::world_query::{getcube, Cube};
 use crate::{voxel_split, Grid, Scene, CHUNK_SIZE_Z};
 
 /// What counts as solid for a collision probe.
-///
-/// Deliberately minimal (CC.0): the material-aware veto hook (glass
-/// solid, water pass-through) is CC.4 — do not grow this
-/// speculatively.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Solidity {
     /// Does the voxlap bedrock placeholder (chunk-local
@@ -49,6 +45,40 @@ pub struct Solidity {
     /// either hits an invisible wall or falls through a visible
     /// floor.
     pub bedrock_blocks: bool,
+    /// The material hook (CC.4): a colour veto for *visible* voxels.
+    /// `Some(f)` makes a voxel whose colour `f` approves passable —
+    /// water, foliage, ladders — while everything else still blocks;
+    /// `None` (default) blocks on any voxel. A plain `fn` (not a
+    /// closure) so `Solidity` stays `Copy`; key it the way material
+    /// maps key their colours (compare `.rgb_part()`, ignore the
+    /// brightness byte — lighting bakes rewrite it).
+    ///
+    /// Limitation, inherent to the voxlap slab format: hidden run
+    /// interiors ([`Cube::UnexposedSolid`](roxlap_core::world_query::Cube::UnexposedSolid))
+    /// store no colour and always block. Rule of thumb: a
+    /// pass-through wall/curtain works up to **2 voxels thick**
+    /// (every voxel still has an exposed face and carries its
+    /// colour); at 3+ a colourless core appears and blocks. Filled
+    /// pools are wade-through only near their visible surface. Also
+    /// keep such geometry at least 1 voxel away from chunk-local
+    /// x/y = 0 and the chunk's far edge: the slab encoder treats
+    /// out-of-chunk neighbours as solid, so edge voxels lose their
+    /// side colours (they render, but classify as UnexposedSolid —
+    /// both facts are pinned in this module's tests).
+    pub passable: Option<fn(crate::VoxColor) -> bool>,
+}
+
+impl Solidity {
+    /// Does this probe result block, under the current policy?
+    fn cube_blocks(self, cube: Cube) -> bool {
+        match cube {
+            Cube::Air => false,
+            Cube::UnexposedSolid => true,
+            Cube::Color(c) => !self
+                .passable
+                .is_some_and(|passes| passes(crate::VoxColor(c))),
+        }
+    }
 }
 
 /// `true` if the axis-aligned world-space box `[min, max]` overlaps
@@ -121,18 +151,15 @@ pub fn grid_box_overlaps_solid(grid: &Grid, min: DVec3, max: DVec3, solidity: So
                 // rem_euclid postcondition: components in [0, chunk
                 // size), far below i32::MAX.
                 #[allow(clippy::cast_possible_wrap)]
-                let solid = !matches!(
-                    getcube(
-                        &chunk.data,
-                        &chunk.column_offset,
-                        chunk.vsid,
-                        in_chunk.x as i32,
-                        in_chunk.y as i32,
-                        in_chunk.z as i32,
-                    ),
-                    Cube::Air,
+                let cube = getcube(
+                    &chunk.data,
+                    &chunk.column_offset,
+                    chunk.vsid,
+                    in_chunk.x as i32,
+                    in_chunk.y as i32,
+                    in_chunk.z as i32,
                 );
-                if solid {
+                if solidity.cube_blocks(cube) {
                     return true;
                 }
             }
@@ -148,6 +175,7 @@ mod tests {
 
     const AIR_BEDROCK: Solidity = Solidity {
         bedrock_blocks: false,
+        passable: None,
     };
 
     /// Single floating voxel at grid-local (10, 10, 50) in a grid at
@@ -219,7 +247,8 @@ mod tests {
             p - 0.3,
             p + 0.3,
             Solidity {
-                bedrock_blocks: true
+                bedrock_blocks: true,
+                passable: None,
             },
         ));
     }
@@ -255,6 +284,48 @@ mod tests {
         ));
     }
 
+    /// CC.4 — the material hook. Water-coloured voxels pass, any
+    /// other colour still blocks, and hidden run interiors block
+    /// regardless (the slab format stores no colour for them).
+    #[test]
+    fn passable_colour_veto() {
+        const WATER: VoxColor = VoxColor(0x80_20_60_c0);
+        const GLASS: VoxColor = VoxColor(0x80_50_c0_e0);
+        fn water_passes(c: VoxColor) -> bool {
+            c.rgb_part() == WATER.rgb_part()
+        }
+        let veto = Solidity {
+            bedrock_blocks: false,
+            passable: Some(water_passes),
+        };
+
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let grid = scene.grid_mut(id).expect("grid present");
+        // A water curtain and a glass wall, 1 voxel thin (fully
+        // visible), plus a THICK water block whose interior is
+        // UnexposedSolid.
+        grid.set_rect(IVec3::new(10, 0, 40), IVec3::new(10, 20, 60), Some(WATER));
+        grid.set_rect(IVec3::new(20, 0, 40), IVec3::new(20, 20, 60), Some(GLASS));
+        grid.set_rect(IVec3::new(30, 0, 40), IVec3::new(40, 20, 60), Some(WATER));
+
+        let probe = |x: f64, z: f64, s: Solidity| {
+            let p = DVec3::new(x, 10.0, z);
+            box_overlaps_solid(&scene, p - 0.3, p + 0.3, s)
+        };
+        // Thin water: blocked without the veto, passable with it.
+        assert!(probe(10.5, 50.0, AIR_BEDROCK));
+        assert!(!probe(10.5, 50.0, veto));
+        // Glass: blocked either way — the veto is colour-selective.
+        assert!(probe(20.5, 50.0, veto));
+        // Thick water body: surface layer passes…
+        assert!(!probe(30.5, 50.0, veto));
+        // …but the hidden interior has no colour and still blocks
+        // (brightness byte differences must not matter either — the
+        // veto compares rgb_part, and bakes rewrite the high byte).
+        assert!(probe(35.5, 50.0, veto));
+    }
+
     #[test]
     fn point_probe_matches_degenerate_box() {
         let scene = floating_voxel_scene();
@@ -268,5 +339,65 @@ mod tests {
             DVec3::new(10.5, 10.5, -55.5),
             AIR_BEDROCK,
         ));
+    }
+
+    /// The passable-veto geometry rule of thumb, pinned: a wall 1 or
+    /// 2 voxels thick is fully side-exposed (every voxel carries its
+    /// colour — the veto sees it all), while 3+ has a hidden core of
+    /// colourless `UnexposedSolid` that blocks regardless of the
+    /// veto. Build pass-through curtains at most 2 voxels thick.
+    #[test]
+    fn passable_walls_must_be_at_most_two_voxels_thick() {
+        const WATER: VoxColor = VoxColor(0x80_30_60_c8);
+        fn water_passes(c: VoxColor) -> bool {
+            c.rgb_part() == WATER.rgb_part()
+        }
+        let veto = Solidity {
+            bedrock_blocks: false,
+            passable: Some(water_passes),
+        };
+        let crossing_blocked = |thick: i32| {
+            let mut scene = Scene::new();
+            let id = scene.add_grid(GridTransform::identity());
+            let g = scene.grid_mut(id).expect("grid");
+            g.set_rect(
+                IVec3::new(0, 10, 0),
+                IVec3::new(50, 10 + thick - 1, 50),
+                Some(WATER),
+            );
+            // A CharacterBody-sized box mid-wall, mid-height.
+            let p = DVec3::new(25.0, 10.0 + f64::from(thick) * 0.5, 25.0);
+            box_overlaps_solid(
+                &scene,
+                p - DVec3::new(0.4, 0.4, 0.9),
+                p + DVec3::new(0.4, 0.4, 0.9),
+                veto,
+            )
+        };
+        assert!(!crossing_blocked(1));
+        assert!(!crossing_blocked(2));
+        assert!(crossing_blocked(3), "3-thick has a hidden core");
+        assert!(crossing_blocked(4));
+
+        // Second format fact: a wall hugging grid-local y = 0 (the
+        // chunk boundary) blocks even at 2 voxels thick — the slab
+        // encoder treats the out-of-chunk neighbour as solid, so the
+        // edge layer's side colours are never stored (it RENDERS,
+        // but classifies as UnexposedSolid). Keep pass-through
+        // geometry at least 1 voxel inside the chunk.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).expect("grid");
+        g.set_rect(IVec3::new(0, 0, 0), IVec3::new(50, 1, 50), Some(WATER));
+        let p = DVec3::new(25.0, 1.0, 25.0);
+        assert!(
+            box_overlaps_solid(
+                &scene,
+                p - DVec3::new(0.4, 0.4, 0.9),
+                p + DVec3::new(0.4, 0.4, 0.9),
+                veto,
+            ),
+            "chunk-edge wall: edge layer has no stored colour"
+        );
     }
 }

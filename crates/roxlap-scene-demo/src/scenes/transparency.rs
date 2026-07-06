@@ -27,19 +27,29 @@ use roxlap_render::VoxColor;
 use roxlap_render::{
     DynSpriteTransform, Kv6, LoopMode, Material, SceneRenderer, SpriteInstanceId, VoxelClip,
 };
-use roxlap_scene::{GridTransform, Scene};
+use roxlap_scene::{
+    CharacterBody, CharacterDef, GridTransform, MoveMode, Scene, Solidity, WalkInput,
+};
 
 use crate::scene_api::{frame_params, opticast_settings, CameraPose, DemoScene, SceneCtx};
 
 /// Palette ids (id 0 is the reserved opaque material).
 const MAT_GLASS: u8 = 1;
+const MAT_WATER: u8 = 5;
 const MAT_GLOW: u8 = 2;
 const MAT_SMOKE: u8 = 3;
 const MAT_FOG: u8 = 4;
 
 pub struct TransparencyScene {
-    /// Empty world — every surface here is a sprite (sky background).
+    /// The terrain grid (red backdrop + glass/water front wall); the
+    /// rest of the showcase is sprites.
     scene: Scene,
+    /// CC.4 — fly-with-collision body whose `Solidity::passable` veto
+    /// lets the water wall through and stops at the glass wall.
+    body: CharacterBody,
+    /// Eye sync (see the World scene) — external camera moves
+    /// re-teleport the body.
+    last_eye: [f64; 3],
     /// The smoke instance whose `alpha_mul` pulses each frame.
     smoke: Option<SpriteInstanceId>,
     /// Seconds since `enter`, driving the smoke pulse.
@@ -49,10 +59,21 @@ pub struct TransparencyScene {
 impl TransparencyScene {
     #[must_use]
     pub fn new() -> Self {
+        let mut body = CharacterBody::new(CharacterDef {
+            fly_speed: crate::scene_api::MOVE_SPEED,
+            solidity: Solidity {
+                bedrock_blocks: false,
+                passable: Some(water_passes),
+            },
+            ..CharacterDef::default()
+        });
+        body.set_mode(MoveMode::Fly);
         Self {
             scene: Self::build_terrain(),
             smoke: None,
             clock: 0.0,
+            body,
+            last_eye: [f64::NAN; 3],
         }
     }
 
@@ -72,8 +93,17 @@ impl TransparencyScene {
             IVec3::new(50, 33, 50),
             Some(VoxColor(0x80_B0_50_40)),
         );
-        // Glass wall in front of it (y-local 0..3) — same span.
-        g.set_rect(IVec3::new(0, 0, 0), IVec3::new(50, 3, 50), Some(GLASS_RGB));
+        // Front wall, split: glass on the left half (solid to the
+        // CC.4 body), water on the right half (collision-passable).
+        // Two format facts shape the water half (pinned in
+        // collide.rs tests): (a) at most 2 voxels thick — a thicker
+        // slab grows a colourless UnexposedSolid core no veto can
+        // pass; (b) NOT at grid-local y=0 — the slab encoder treats
+        // the out-of-chunk neighbour as solid, so chunk-edge voxels
+        // lose their side colours (they render, but classify as
+        // UnexposedSolid).
+        g.set_rect(IVec3::new(0, 1, 0), IVec3::new(24, 4, 50), Some(GLASS_RGB));
+        g.set_rect(IVec3::new(26, 1, 0), IVec3::new(50, 2, 50), Some(WATER_RGB));
         scene
     }
 
@@ -166,13 +196,23 @@ const FOG_RGB: VoxColor = VoxColor(0x80_A0_A0_A8);
 /// The glass voxel colour shared by the window's glass + its material map.
 const GLASS_RGB: VoxColor = VoxColor(0x80_50_C0_E0);
 
+/// The water voxel colour — terrain-translucent AND collision-passable
+/// (the CC.4 `Solidity::passable` veto): you fly THROUGH the water half
+/// of the front wall but bounce off the glass half.
+const WATER_RGB: VoxColor = VoxColor(0x80_30_60_C8);
+
+/// The CC.4 colour veto: water passes, everything else blocks.
+fn water_passes(c: VoxColor) -> bool {
+    c.rgb_part() == WATER_RGB.rgb_part()
+}
+
 impl DemoScene for TransparencyScene {
     fn name(&self) -> &'static str {
         "Transparency"
     }
 
     fn controls(&self) -> &'static str {
-        "WASD+mouse fly — glass (alpha) tints the backdrop · glow (additive) brightens · smoke pulses"
+        "WASD+mouse fly (collision: glass wall blocks, water wall passes) · glow additive · smoke pulses"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -195,9 +235,14 @@ impl DemoScene for TransparencyScene {
         // dense at its core and thin at its rim (thickness-aware).
         r.define_material(MAT_FOG, Material::volumetric(28));
 
-        // TV.5/TV.6 — the world grid's glass-coloured voxels render as the
-        // glass material (the opaque red wall behind tints through).
-        r.set_terrain_materials(&[(GLASS_RGB.rgb_part(), MAT_GLASS)]);
+        // TV.5/TV.6 — the world grid's glass- and water-coloured voxels
+        // render as translucent materials (the opaque red wall behind
+        // tints through both).
+        r.define_material(MAT_WATER, Material::alpha_blend(140));
+        r.set_terrain_materials(&[
+            (GLASS_RGB.rgb_part(), MAT_GLASS),
+            (WATER_RGB.rgb_part(), MAT_WATER),
+        ]);
 
         // Opaque brick backdrop (reference surface the glass tints).
         let _backdrop = Self::spawn(
@@ -272,7 +317,24 @@ impl DemoScene for TransparencyScene {
     }
 
     fn update(&mut self, ctx: &mut SceneCtx, dt: f64) {
-        ctx.cam.fly_free(ctx.input, dt);
+        // CC.4 — collision fly with the water-passable veto.
+        if ctx.cam.pos != self.last_eye {
+            self.body.teleport(
+                glam::DVec3::from(ctx.cam.pos)
+                    + glam::DVec3::new(0.0, 0.0, self.body.def().eye_height),
+            );
+        }
+        self.body.def_mut().fly_speed = crate::scene_api::MOVE_SPEED
+            * if ctx.input.fast {
+                crate::scene_api::FAST_MULT
+            } else {
+                1.0
+            };
+        let wish = glam::DVec3::from(ctx.cam.wish_dir(ctx.input));
+        self.body
+            .walk(&self.scene, dt, WalkInput { wish, jump: false });
+        ctx.cam.pos = self.body.eye_pos().into();
+        self.last_eye = ctx.cam.pos;
         // One tick drives the auto-playing glass-orb clip (QE.1b).
         ctx.renderer.tick(&ctx.cam.camera(), dt);
         self.clock += dt;
