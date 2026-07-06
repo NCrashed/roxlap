@@ -148,7 +148,8 @@ the author re-confirmed them. `supports()`, the rustdoc table, and
 the book's lighting chapter now say ✅/✅.
 
 Queued beyond this doc (author, same triage): stage **CC** (character
-controller — needs its own entry doc), `roxlap-cli` extensions
+controller — entry doc written 2026-07-06, see
+`PORTING-CONTROLLER.md`), `roxlap-cli` extensions
 (`gif2rvc`/`png2rvc`, `kv6 → vox`), roxlap-cli publish at the next
 release cut. Dropped: CD.2.6 full byte-fixture suite.
 
