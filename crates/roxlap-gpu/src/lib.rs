@@ -753,8 +753,9 @@ struct SpriteModelUniform {
 /// GPU.10.3 — sprite screen-tile edge in pixels for instance binning.
 const SPRITE_TILE_SIZE: u32 = 16;
 
-/// One material in the GPU sprite material palette (binding 12). Mirrors
-/// `Mat` in `sprite_model_dda.wgsl` (std430, 8 bytes). TV stage.
+/// One material in the GPU material palettes (scene binding 16, sprite
+/// binding 12). Mirrors `Mat` in `scene_dda.wgsl` / `sprite_model_dda.wgsl`
+/// (std430, 16 bytes). TV stage; EV.2 added `emissive`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct MaterialGpu {
@@ -762,6 +763,13 @@ struct MaterialGpu {
     alpha: f32,
     /// [`roxlap_formats::material::BlendMode`] discriminant.
     mode: u32,
+    /// EV.2 — pre-scaled emissive factor `(128 + (e >> 1)) / 128`
+    /// (~1.0×..2.0× over-bright), or `0.0` for a non-emissive material —
+    /// the shader gates on `> 0.0`. Pre-scaling host-side keeps the WGSL
+    /// branch to one multiply and matches the CPU's `emissive_shade`
+    /// fixed-point ladder.
+    emissive: f32,
+    _pad: u32,
 }
 
 /// Convert the global [`MaterialTable`](roxlap_formats::material::MaterialTable)
@@ -774,6 +782,8 @@ fn material_palette(
         [MaterialGpu {
             alpha: 1.0,
             mode: 0,
+            emissive: 0.0,
+            _pad: 0,
         }; 256],
     );
     let mut any_translucent = false;
@@ -781,6 +791,13 @@ fn material_palette(
         let m = table.get(id as u8);
         slot.alpha = f32::from(m.alpha) / 255.0;
         slot.mode = u32::from(m.mode.as_u8());
+        // EV.2 — `0.0` = not emissive; else the CPU `emissive_shade`
+        // multiplier `(128 + (e >> 1)) / 128`.
+        slot.emissive = if m.emissive == 0 {
+            0.0
+        } else {
+            f32::from(128 + u16::from(m.emissive >> 1)) / 128.0
+        };
         if !m.is_opaque() {
             any_translucent = true;
         }
@@ -922,8 +939,9 @@ struct SceneDdaUniform {
     /// `floor(log2(max(t, msd) / msd))`, clamped to the grid's mip
     /// count. `0` disables LOD (always mip-0).
     mip_scan_dist: f32,
-    /// TV.6 — `1` if any terrain material is translucent (gates the
-    /// accumulate path; `0` ⇒ unchanged opaque first-hit march).
+    /// TV.6 — `1` if any mapped terrain material is translucent OR
+    /// emissive (EV.2) — gates the material lookup + accumulate path;
+    /// `0` ⇒ unchanged opaque first-hit march.
     terrain_has_translucent: u32,
     /// TV.6 — number of `(rgb, material_id)` entries in the terrain map.
     terrain_map_count: u32,
@@ -1223,6 +1241,8 @@ impl GpuRenderer {
                 [MaterialGpu {
                     alpha: 1.0,
                     mode: 0,
+                    emissive: 0.0,
+                    _pad: 0,
                 }; 256],
             ),
             scene_terrain_map: Vec::new(),
@@ -1245,6 +1265,8 @@ impl GpuRenderer {
                 [MaterialGpu {
                     alpha: 1.0,
                     mode: 0,
+                    emissive: 0.0,
+                    _pad: 0,
                 }; 256],
             ),
             sprite_has_translucent: false,
@@ -2914,8 +2936,9 @@ impl GpuRenderer {
 
     /// TV.6 — set the scene (terrain) material palette + colour→material map
     /// for the multi-grid scene pass. Matching-colour terrain voxels render
-    /// translucent; an empty map / all-opaque palette renders unchanged. The
-    /// map is capped at 256 rows (the fixed buffer size).
+    /// translucent (and/or emissive, EV.2); an empty map / all-opaque
+    /// non-emissive palette renders unchanged. The map is capped at 256 rows
+    /// (the fixed buffer size).
     pub fn set_scene_terrain_materials(
         &mut self,
         table: &roxlap_formats::material::MaterialTable,
@@ -2928,7 +2951,12 @@ impl GpuRenderer {
             .take(256)
             .map(|&(c, m)| [c.0 & 0x00ff_ffff, u32::from(m)])
             .collect();
-        self.scene_terrain_translucent = map.iter().any(|&(_, m)| !table.get(m).is_opaque());
+        // EV.2 — the material path also activates for emissive mappings
+        // (an opaque glowing palette must leave the first-hit fast path).
+        self.scene_terrain_translucent = map.iter().any(|&(_, m)| {
+            let mm = table.get(m);
+            !mm.is_opaque() || mm.emissive > 0
+        });
         if let Some(dda) = &self.scene_dda {
             self.queue.write_buffer(
                 &dda.materials_pal_buf,
@@ -3208,7 +3236,9 @@ impl HeadlessSceneRenderer {
             let pal: Vec<MaterialGpu> = vec![
                 MaterialGpu {
                     alpha: 1.0,
-                    mode: 0
+                    mode: 0,
+                    emissive: 0.0,
+                    _pad: 0,
                 };
                 256
             ];

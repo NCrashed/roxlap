@@ -109,8 +109,9 @@ struct Uniforms {
     // to the grid's `mip_count`. `0` disables LOD (always mip-0).
     // Tunable for the axis-aligned-mip-beams mitigation (11.2).
     mip_scan_dist: f32,
-    // TV.6 — 1 if any terrain material is translucent (gates the
-    // accumulate path; 0 ⇒ unchanged first-hit opaque march).
+    // TV.6 — 1 if any mapped terrain material is translucent OR
+    // emissive (EV.2) — gates the material lookup + accumulate path;
+    // 0 ⇒ unchanged first-hit opaque march.
     terrain_has_translucent: u32,
     // TV.6 — number of (rgb, material_id) entries in `terrain_map`.
     terrain_map_count: u32,
@@ -189,8 +190,10 @@ struct Uniforms {
 // indexes `0..grid_count`, so a grid-less scene binds a 1-element dummy.
 @group(0) @binding(15) var<storage, read> grid_cameras: array<PerGridCamera>;
 // TV.6 — global voxel-material palette (256), `mode`: 0=Opaque,
-// 1=AlphaBlend, 2=Additive; alpha normalised 0..1.
-struct Mat { alpha: f32, mode: u32 };
+// 1=AlphaBlend, 2=Additive; alpha normalised 0..1. EV.2 — `emissive` is
+// the pre-scaled over-bright factor (~1.0..2.0, see `MaterialGpu`), or
+// 0.0 for a normal lit material. 16-byte stride, lockstep with lib.rs.
+struct Mat { alpha: f32, mode: u32, emissive: f32, _pad: u32 };
 @group(0) @binding(16) var<storage, read> materials_pal: array<Mat>;
 // TV.6 — terrain colour→material map: `.x` = rgb (0xRRGGBB), `.y` =
 // material id. A hit voxel's colour is matched here to find its material.
@@ -939,12 +942,31 @@ fn march_grid(
                     // loads), shared by the shade paths and the material
                     // lookup (previously fetched twice on translucent scenes).
                     let packed = voxel_packed_in(g, slot_id, mip, p_voxel);
+                    // EV.2 — material lookup FIRST (mirrors the CPU hit
+                    // order in dda.rs): an emissive material bypasses both
+                    // shade paths below. With the gate off the lookup is
+                    // skipped and everything is bit-identical to pre-EV.
+                    var mat_id = 0u;
+                    var mm = Mat(1.0, 0u, 0.0, 0u);
+                    if (u.terrain_has_translucent != 0u) {
+                        mat_id = terrain_material_id(packed);
+                        mm = materials_pal[mat_id];
+                    }
                     // DL — lit path (ambient + sun + point lights) when
                     // dynamic lighting is active (sun_flags bit 2); else the
                     // baked-only path, byte-identical to pre-DL. The hit
                     // position (grid-local) feeds point-light distance/dir.
+                    // EV.2 — an emissive material outranks both: over-bright
+                    // albedo, no face shade, no baked byte, no rig.
                     var base_color: vec3<f32>;
-                    if ((u.sun_flags & 4u) != 0u) {
+                    if (mm.emissive > 0.0) {
+                        let albedo = vec3<f32>(
+                            f32((packed >> 16u) & 0xffu),
+                            f32((packed >> 8u) & 0xffu),
+                            f32(packed & 0xffu),
+                        ) * (1.0 / 255.0);
+                        base_color = min(albedo * mm.emissive, vec3<f32>(1.0));
+                    } else if ((u.sun_flags & 4u) != 0u) {
                         let hit_pos = ray_origin + t_hit * ray_dir;
                         // Voxel centre (grid-local) for flat per-voxel stylized
                         // lighting; ignored by the smooth path.
@@ -962,8 +984,6 @@ fn march_grid(
                         out.color = lit;
                         return out;
                     }
-                    let mat_id = terrain_material_id(packed);
-                    let mm = materials_pal[mat_id];
                     if (mm.mode == 0u) {
                         // Opaque surface backs the translucent layers in front.
                         out.hit = true;

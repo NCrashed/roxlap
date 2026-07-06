@@ -73,6 +73,17 @@ pub struct Material {
     pub alpha: u8,
     /// How the voxel composites with what is behind it.
     pub mode: BlendMode,
+    /// Self-emission (EV stage): `0` = a normal lit voxel; anything
+    /// greater renders the voxel at
+    /// `albedo × ((128 + (emissive >> 1)) / 128)` — from ~1.0× up to
+    /// ~2.0× over-bright at `255` — **skipping** the baked brightness
+    /// byte, per-face side shades, the dynamic light rig, shadows and
+    /// cel bands (fog still applies). Orthogonal to `mode`: an
+    /// [`BlendMode::AlphaBlend`] crystal can glow through its own
+    /// translucency. Emission onto *surrounding* voxels is separate —
+    /// that is the lightmode-2 point-light bake (`BakeMode::PointLights`
+    /// in `roxlap-scene`), not this field.
+    pub emissive: u8,
 }
 
 impl Material {
@@ -81,6 +92,7 @@ impl Material {
     pub const OPAQUE: Self = Self {
         alpha: 255,
         mode: BlendMode::Opaque,
+        emissive: 0,
     };
 
     /// An [`BlendMode::AlphaBlend`] material with opacity `alpha`.
@@ -89,6 +101,7 @@ impl Material {
         Self {
             alpha,
             mode: BlendMode::AlphaBlend,
+            emissive: 0,
         }
     }
 
@@ -98,7 +111,31 @@ impl Material {
         Self {
             alpha,
             mode: BlendMode::Additive,
+            emissive: 0,
         }
+    }
+
+    /// An opaque **emissive** material (EV stage): renders at
+    /// `albedo × ((128 + (emissive >> 1)) / 128)` regardless of baked
+    /// lighting, side shades, the dynamic rig or shadows. Combine with
+    /// a translucent mode via [`with_emissive`](Self::with_emissive)
+    /// (e.g. `Material::alpha_blend(160).with_emissive(255)` for a
+    /// glowing crystal).
+    #[must_use]
+    pub fn glow(emissive: u8) -> Self {
+        Self {
+            alpha: 255,
+            mode: BlendMode::Opaque,
+            emissive,
+        }
+    }
+
+    /// This material with its [`emissive`](Self::emissive) set — the
+    /// builder for translucent glowing materials.
+    #[must_use]
+    pub fn with_emissive(mut self, emissive: u8) -> Self {
+        self.emissive = emissive;
+        self
     }
 
     /// A [`BlendMode::Volumetric`] (Beer–Lambert) material whose `alpha` is
@@ -109,6 +146,7 @@ impl Material {
         Self {
             alpha,
             mode: BlendMode::Volumetric,
+            emissive: 0,
         }
     }
 
@@ -165,10 +203,21 @@ impl MaterialTable {
     }
 
     /// True when every id is [`BlendMode::Opaque`] — lets a backend skip the
-    /// whole transparency path while nothing translucent is defined.
+    /// whole transparency path while nothing translucent is defined. Blend
+    /// mode only: an opaque **emissive** material still returns `true` here —
+    /// gate the emissive path with [`any_emissive`](Self::any_emissive).
     #[must_use]
     pub fn all_opaque(&self) -> bool {
         self.materials.iter().all(|m| m.is_opaque())
+    }
+
+    /// True when any id has a non-zero [`Material::emissive`] (EV stage) —
+    /// backends that gate their material lookup on translucency alone must
+    /// also consult this, or an opaque glowing palette would silently stay
+    /// on the pre-material fast path.
+    #[must_use]
+    pub fn any_emissive(&self) -> bool {
+        self.materials.iter().any(|m| m.emissive > 0)
     }
 
     /// The backing 256-entry array, for backends that upload it wholesale.
@@ -228,6 +277,35 @@ mod tests {
         assert!(Material::OPAQUE.is_opaque());
         assert!(!Material::alpha_blend(128).is_opaque());
         assert!(!Material::additive(200).is_opaque());
+    }
+
+    #[test]
+    fn emissive_defaults_zero_and_builds() {
+        // EV.0 — every existing constructor stays non-emissive.
+        assert_eq!(Material::OPAQUE.emissive, 0);
+        assert_eq!(Material::alpha_blend(128).emissive, 0);
+        assert_eq!(Material::additive(200).emissive, 0);
+        assert_eq!(Material::volumetric(80).emissive, 0);
+        // glow() is opaque-mode (first-hit path) but emissive.
+        let g = Material::glow(255);
+        assert!(g.is_opaque());
+        assert_eq!(g.emissive, 255);
+        // Builder composes with translucent modes.
+        let crystal = Material::alpha_blend(160).with_emissive(255);
+        assert!(!crystal.is_opaque());
+        assert_eq!(crystal.alpha, 160);
+        assert_eq!(crystal.emissive, 255);
+    }
+
+    #[test]
+    fn table_any_emissive() {
+        let mut t = MaterialTable::new();
+        assert!(!t.any_emissive());
+        // An opaque glowing palette is still `all_opaque` (blend-mode
+        // gate) but must trip the emissive gate.
+        assert!(t.set(7, Material::glow(200)));
+        assert!(t.all_opaque());
+        assert!(t.any_emissive());
     }
 
     #[test]

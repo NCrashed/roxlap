@@ -31,9 +31,14 @@ struct Instance {
 };
 // TV: one global-palette material (binding 12). `mode` is the
 // BlendMode discriminant: 0 = Opaque, 1 = AlphaBlend, 2 = Additive.
+// EV.2 — `emissive` rides along for the 16-byte `MaterialGpu` stride
+// (both palettes share the host struct); the sprite pass does not
+// render emissive yet (terrain-only for now, see PORTING-EMISSIVE.md).
 struct Mat {
     alpha: f32,
     mode: u32,
+    emissive: f32,
+    _pad: u32,
 };
 struct Uniform {
     cam_pos: vec3<f32>, _p0: f32,

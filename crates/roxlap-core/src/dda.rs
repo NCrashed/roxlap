@@ -276,6 +276,19 @@ pub(crate) fn shade(color: u32, bright_sub: u32) -> u32 {
     0x8000_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
+/// EV.1 — shade an **emissive** voxel: the baked brightness byte, the
+/// per-face side shade and the dynamic rig are all ignored; the albedo
+/// is scaled by `(128 + (emissive >> 1)) / 128` on the same `>> 7`
+/// fixed-point ladder as [`shade`] — ~1.0× at `emissive = 0..=1` up to
+/// ~2.0× over-bright (channel-clamped) at `255`. Fog is applied by the
+/// caller as for any other hit.
+#[inline]
+pub(crate) fn emissive_shade(color: u32, emissive: u8) -> u32 {
+    let a = 128 + u32::from(emissive >> 1);
+    let ch = |shift: u32| -> u32 { ((((color >> shift) & 0xff) * a) >> 7).min(255) };
+    0x8000_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
 // CPU.1 — cel quantization: snap a 0..1 factor to `bands + 1` levels.
 #[inline]
 fn cel_band(x: f32, bands: u32) -> f32 {
@@ -1609,12 +1622,28 @@ fn cell_walk_skip(
         prof::CELLS.with(|x| x.set(x.get() + 1));
         if let Some(color) = sampler.hit(cellc) {
             let bright_sub = side_shade_sub(env, last_axis, step);
+            // PF.7 (C4) — one colour→material scan per hit: resolve the id
+            // and the material together. EV.1 hoisted this above the shade
+            // so the emissive branch can bypass lighting entirely; with no
+            // terrain material map the result is `OPAQUE` (emissive 0) and
+            // every path below is bit-identical to the pre-material code.
+            let (m, mat_id) = match env.materials {
+                Some(table) if !env.terrain_materials.is_empty() => {
+                    let id = material_for_color(env.terrain_materials, color);
+                    (table.get(id), id)
+                }
+                _ => (Material::OPAQUE, 0),
+            };
             // CPU.1 — dynamic lighting (flat per voxel) when a rig is active;
             // else the baked-byte `shade` path (byte-identical). CPU.2 — a
             // sun/point shadow march reuses this same `sampler` (occupancy +
             // box bounds); only built when a caster is actually flagged so
-            // the no-shadow rig stays march-free.
-            let shaded = if env.lights.enabled {
+            // the no-shadow rig stays march-free. EV.1 — an emissive
+            // material outranks both: full-bright albedo, no face shade,
+            // no rig, no shadow march.
+            let shaded = if m.emissive > 0 {
+                emissive_shade(color, m.emissive)
+            } else if env.lights.enabled {
                 let casts = shadow_casts;
                 // Pick the shadow oracle: the scene-wide one (cross-grid +
                 // sprites, XS.1) when present, else the single-grid Sampler;
@@ -1651,16 +1680,6 @@ fn cell_walk_skip(
                 shade(color, bright_sub)
             };
             let lit = apply_fog(shaded, depth.max(0.0), env);
-            // PF.7 (C4) — one colour→material scan per hit: resolve the id
-            // and the material together (the id was previously re-scanned
-            // for the translucent path below).
-            let (m, mat_id) = match env.materials {
-                Some(table) if !env.terrain_materials.is_empty() => {
-                    let id = material_for_color(env.terrain_materials, color);
-                    (table.get(id), id)
-                }
-                _ => (Material::OPAQUE, 0),
-            };
             if m.is_opaque() {
                 // Opaque surface: the background. Return the first hit verbatim
                 // when nothing translucent preceded it (bit-identical), else
@@ -2609,6 +2628,86 @@ mod tests {
         assert!(
             r_tr > r_op,
             "floor red tints through the glass (op={r_op:02x} tr={r_tr:02x})"
+        );
+    }
+
+    /// EV.1 — an emissive terrain voxel renders at over-bright albedo,
+    /// ignoring the baked brightness byte, per-face side shades and the
+    /// dynamic light rig.
+    #[test]
+    fn terrain_emissive_ignores_lighting() {
+        let crystal = VoxColor(0x40_20_60_80); // deliberately DIM baked byte 0x40
+        let vxl =
+            roxlap_formats::vxl::Vxl::from_dense(
+                16,
+                |_, _, z| if z >= 4 { Some(crystal) } else { None },
+            );
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [8.0, 8.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (w, h) = (32u32, 32u32);
+        let centre = (h / 2 * w + w / 2) as usize;
+
+        // Control: the baked 0x40 byte halves the albedo.
+        let (fb_dim, _) = render_brickmap(grid, &cam, w, h);
+        assert_eq!(
+            fb_dim[centre] & 0x00ff_ffff,
+            0x0010_3040,
+            "baked byte 0x40 = albedo/2"
+        );
+
+        // Emissive: glow(255) ⇒ ×255/128 over-bright, per-channel clamp.
+        let mut table = MaterialTable::new();
+        table.set(1, Material::glow(255));
+        let base = DdaEnv {
+            materials: Some(&table),
+            terrain_materials: &[(crystal.rgb_part(), 1)],
+            ..DdaEnv::default()
+        };
+        let (fb_em, _) = render_brickmap_env(grid, &cam, w, h, &base);
+        assert_eq!(
+            fb_em[centre] & 0x00ff_ffff,
+            0x003f_bfff,
+            "glow(255) ≈ 2× albedo (0x20,0x60,0x80 → 0x3f,0xbf,0xff)"
+        );
+
+        // Max side shades: a normal voxel darkens, an emissive one must not.
+        let shaded_env = DdaEnv {
+            side_shades: [64; 6],
+            ..DdaEnv::default()
+        };
+        let (fb_ss_plain, _) = render_brickmap_env(grid, &cam, w, h, &shaded_env);
+        assert_ne!(
+            fb_ss_plain[centre], fb_dim[centre],
+            "control: side shades darken a non-emissive voxel"
+        );
+        let em_ss = DdaEnv {
+            side_shades: [64; 6],
+            ..base
+        };
+        let (fb_em_ss, _) = render_brickmap_env(grid, &cam, w, h, &em_ss);
+        assert_eq!(
+            fb_em_ss[centre], fb_em[centre],
+            "side shades must not touch an emissive voxel"
+        );
+
+        // Dynamic rig active (no sun, zero ambient ⇒ a normal voxel goes
+        // black): the emissive voxel is rig-independent.
+        let em_rig = DdaEnv {
+            lights: CpuLights {
+                enabled: true,
+                ..CpuLights::default()
+            },
+            ..base
+        };
+        let (fb_em_rig, _) = render_brickmap_env(grid, &cam, w, h, &em_rig);
+        assert_eq!(
+            fb_em_rig[centre], fb_em[centre],
+            "the dynamic rig must not touch an emissive voxel"
         );
     }
 
