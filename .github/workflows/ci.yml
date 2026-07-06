@@ -51,10 +51,22 @@ jobs:
       # `#![cfg(target_arch = "wasm32")]` — on native targets their
       # whole body is cfg'd away, so the workspace clippy job only
       # PARSES them and type errors ship silently (the colour-newtype
-      # migration missed both, and nothing noticed). This plain
-      # wasm32 check (stable, no atomics — the threaded trunk build
-      # stays a local/nightly concern) is the type gate.
+      # migration missed both, and nothing noticed). This stable
+      # wasm32 check is the type gate; the threaded trunk build
+      # (nightly + build-std) stays a local concern.
       - run: cargo check -p roxlap-web -p roxlap-cave-web --target wasm32-unknown-unknown
+        env:
+          # The workflow-global RUSTFLAGS env OVERRIDES
+          # .cargo/config.toml's [target.wasm32-unknown-unknown]
+          # rustflags, silently dropping the +atomics feature set
+          # that wasm-bindgen-rayon compile_error!-asserts on — so
+          # re-state the target features here alongside -D warnings.
+          # (Type-check only: no linking, so the config's link-args
+          # and the nightly build-std std rebuild aren't needed.
+          # rustc's "unstable feature ... atomics" note is a
+          # driver warning without a lint name; -D warnings does
+          # not promote it.)
+          RUSTFLAGS: -D warnings -C target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals
 
   test:
     name: cargo test (workspace)
