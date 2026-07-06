@@ -161,6 +161,16 @@ pub enum BakeMode {
     /// parameters — unlike the deprecated `bake_lightmode_bbox`,
     /// [`Grid::bake_bbox`] honours them.
     AmbientOcclusion(roxlap_core::AoParams),
+    /// EV.3 — voxlap's point-light bake (lightmode 2): a **dim**
+    /// directional base (about a quarter of
+    /// [`Directional`](Self::Directional)'s) plus a cube-law
+    /// Lambertian pool around every light in
+    /// [`Grid::bake_lights`] — glowing crystals, torches, lava.
+    /// [`Grid::bake_bbox`] (the carve-relight primitive) picks the
+    /// grid's lights up automatically, so incremental edits keep
+    /// their glow pools. The dark base is the point: light pools
+    /// read against gloom.
+    PointLights,
 }
 
 impl BakeMode {
@@ -169,16 +179,69 @@ impl BakeMode {
         match self {
             Self::Directional => 1,
             Self::AmbientOcclusion(_) => 3,
+            Self::PointLights => 2,
         }
     }
 
-    /// The AO parameters (defaults for the non-AO mode, where the
+    /// The AO parameters (defaults for the non-AO modes, where the
     /// bake ignores them).
     fn ao(self) -> roxlap_core::AoParams {
         match self {
-            Self::Directional => roxlap_core::AoParams::default(),
+            Self::Directional | Self::PointLights => roxlap_core::AoParams::default(),
             Self::AmbientOcclusion(ao) => ao,
         }
+    }
+}
+
+/// EV.3 — one baked point light (voxlap's `lightsrc[]`), consumed by
+/// [`BakeMode::PointLights`] from [`Grid::bake_lights`]. Baked, not
+/// dynamic: its Lambertian pool is written into the per-voxel
+/// brightness bytes by [`Grid::bake`] / [`Grid::bake_bbox`] and costs
+/// nothing at render time (both backends just read the byte). For a
+/// flickering/moving light use the runtime `LightRig` instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BakeLight {
+    /// Grid-local voxel-space position (the same frame as
+    /// [`Grid::set_voxel`]).
+    pub pos: glam::Vec3,
+    /// Hard cutoff radius in voxels — the cube-law contribution fades
+    /// to exactly zero here.
+    pub radius: f32,
+    /// Voxlap brightness scale: the byte gain at distance `d` is
+    /// roughly `strength · cosθ / d²` (cube-law falloff × Lambert), on
+    /// the 0–255 brightness-byte scale whose neutral is 128. A wall 5
+    /// voxels away therefore gains about `strength / 25` — `2000` is a
+    /// solid reading-torch, `8000` floods a small cavern.
+    pub strength: f32,
+}
+
+impl BakeLight {
+    /// This light rebased into `chunk_idx`'s chunk-local frame as the
+    /// bake-internal [`roxlap_core::LightSrc`], or `None` when its
+    /// influence sphere misses the chunk's voxel box entirely.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    fn chunk_local(&self, chunk_idx: IVec3) -> Option<roxlap_core::LightSrc> {
+        let base = glam::Vec3::new(
+            (chunk_idx.x * CHUNK_SIZE_XY as i32) as f32,
+            (chunk_idx.y * CHUNK_SIZE_XY as i32) as f32,
+            (chunk_idx.z * CHUNK_SIZE_Z as i32) as f32,
+        );
+        let local = self.pos - base;
+        // Sphere-vs-chunk-AABB cull: nearest box point to the light.
+        let ext = glam::Vec3::new(
+            CHUNK_SIZE_XY as f32,
+            CHUNK_SIZE_XY as f32,
+            CHUNK_SIZE_Z as f32,
+        );
+        let nearest = local.clamp(glam::Vec3::ZERO, ext);
+        if (nearest - local).length_squared() > self.radius * self.radius {
+            return None;
+        }
+        Some(roxlap_core::LightSrc {
+            pos: [local.x, local.y, local.z],
+            r2: self.radius * self.radius,
+            sc: self.strength,
+        })
     }
 }
 
@@ -242,9 +305,10 @@ impl Grid {
     /// (and AO's) ±2-voxel padding that crosses a chunk face reads the
     /// actual neighbour chunk (when populated) — XY neighbours and, for
     /// stacked grids, the chunks above/below on `chz±1` — so brightness
-    /// / occlusion is continuous across every seam. Point lights aren't
-    /// applied (directional-only) — matching the demos' bake. No-op for
-    /// an empty grid.
+    /// / occlusion is continuous across every seam. Under
+    /// [`BakeMode::PointLights`] the grid's [`Grid::bake_lights`] are
+    /// applied (EV.3); the other modes ignore them. No-op for an empty
+    /// grid.
     pub fn bake(&mut self, mode: BakeMode) {
         self.bake_u32(mode.lightmode(), mode.ao());
     }
@@ -294,6 +358,10 @@ impl Grid {
                 })
                 .collect();
             for (chunk_idx, cache) in caches {
+                // EV.3 — lightmode 2 pulls the grid's baked point
+                // lights, rebased chunk-local + sphere-culled; the
+                // other modes ignore lights, so skip the translation.
+                let lights = self.chunk_bake_lights(chunk_idx, lightmode);
                 let target = self.chunks.get_mut(&chunk_idx).expect("populated chunk");
                 roxlap_core::apply_lighting_with_cache(
                     &mut target.data,
@@ -307,7 +375,7 @@ impl Grid {
                     cs_z,
                     &cache,
                     lightmode,
-                    &[],
+                    &lights,
                     ao,
                 );
             }
@@ -385,6 +453,9 @@ impl Grid {
                         continue;
                     }
                     let cache = self.build_chunk_estnorm_cache(chunk_idx, lx0, ly0, lx1, ly1);
+                    // EV.3 — carve relights keep their glow pools: the
+                    // grid's baked lights flow into the bbox re-bake too.
+                    let lights = self.chunk_bake_lights(chunk_idx, lightmode);
                     let target = self.chunks.get_mut(&chunk_idx).expect("populated chunk");
                     roxlap_core::apply_lighting_with_cache(
                         &mut target.data,
@@ -398,7 +469,7 @@ impl Grid {
                         lz1,
                         &cache,
                         lightmode,
-                        &[],
+                        &lights,
                         ao,
                     );
                     // PF.12 — brightness bytes changed within the clipped
@@ -411,6 +482,20 @@ impl Grid {
                 }
             }
         }
+    }
+
+    /// EV.3 — the grid's [`BakeLight`]s that reach `chunk_idx`, rebased
+    /// chunk-local for the bake internals. Empty (no allocation beyond
+    /// the `Vec` header) for the non-point-light modes and for chunks
+    /// outside every light's influence sphere.
+    fn chunk_bake_lights(&self, chunk_idx: IVec3, lightmode: u32) -> Vec<roxlap_core::LightSrc> {
+        if lightmode != 2 || self.bake_lights.is_empty() {
+            return Vec::new();
+        }
+        self.bake_lights
+            .iter()
+            .filter_map(|l| l.chunk_local(chunk_idx))
+            .collect()
     }
 
     /// PF.11 — build the neighbour-aware estnorm cache for a chunk-local
@@ -875,6 +960,96 @@ pub(crate) mod tests {
             assert_eq!(
                 a.data, b.data,
                 "chunk {idx:?} bytes diverge between full and bbox rebake",
+            );
+        }
+    }
+
+    /// EV.3 — `BakeMode::PointLights` writes a Lambertian pool around a
+    /// [`BakeLight`]: floor voxels under the light brighten, voxels
+    /// beyond its radius stay at the dim lightmode-2 base, and that
+    /// base is darker than the `Directional` bake.
+    #[test]
+    fn point_light_bake_brightens_near_light() {
+        let floor = |g: &mut Grid| {
+            g.set_rect(
+                IVec3::new(0, 0, 200),
+                IVec3::new(127, 127, 255),
+                Some(VoxColor(0x80_66_77_88)),
+            );
+        };
+        let byte_at = |g: &Grid, x: u32, y: u32| {
+            (g.chunk(IVec3::ZERO)
+                .expect("chunk")
+                .voxel_color(x, y, 200)
+                .expect("floor voxel")
+                .0
+                >> 24)
+                & 0xff
+        };
+
+        let mut g = Grid::new(GridTransform::identity());
+        floor(&mut g);
+        // Crystal light hovering 8 voxels above the floor centre.
+        g.bake_lights.push(BakeLight {
+            pos: glam::Vec3::new(64.0, 64.0, 192.0),
+            radius: 40.0,
+            strength: 4000.0,
+        });
+        g.bake(BakeMode::PointLights);
+        let near = byte_at(&g, 64, 64);
+        let far = byte_at(&g, 4, 4); // ~85 voxels away > radius 40 ⇒ base only
+        assert!(
+            near > far + 20,
+            "light pool must brighten the floor under it (near={near} far={far})"
+        );
+
+        // The lightmode-2 base is deliberately dim vs the Directional bake.
+        let mut dir = Grid::new(GridTransform::identity());
+        floor(&mut dir);
+        dir.bake(BakeMode::Directional);
+        let dir_far = byte_at(&dir, 4, 4);
+        assert!(
+            far < dir_far,
+            "PointLights base ({far}) must be dimmer than Directional ({dir_far})"
+        );
+    }
+
+    /// EV.3 — a bbox re-bake under `PointLights` must reproduce the
+    /// full re-bake byte-for-byte, glow pools included (the carve
+    /// relight path keeps crystal lighting intact).
+    #[test]
+    fn point_light_bbox_rebake_matches_full_rebake() {
+        let build = || {
+            let mut g = Grid::new(GridTransform::identity());
+            g.set_rect(
+                IVec3::new(0, 0, 160),
+                IVec3::new(255, 255, 255),
+                Some(VoxColor(0x80_66_77_88)),
+            );
+            g.bake_lights.push(BakeLight {
+                pos: glam::Vec3::new(126.0, 70.0, 152.0),
+                radius: 48.0,
+                strength: 4000.0,
+            });
+            g.bake(BakeMode::PointLights);
+            g
+        };
+        let mut full = build();
+        let mut bbox = build();
+
+        // Carve inside the light's pool, straddling the chunk seam.
+        let (lo, hi) = (IVec3::new(120, 60, 158), IVec3::new(136, 76, 200));
+        full.set_rect(lo, hi, None);
+        bbox.set_rect(lo, hi, None);
+
+        full.bake(BakeMode::PointLights);
+        bbox.bake_bbox(lo, hi, BakeMode::PointLights);
+
+        for (idx, a) in &full.chunks {
+            let b = bbox.chunks.get(idx).expect("same chunk set");
+            assert_eq!(
+                a.data, b.data,
+                "chunk {idx:?} bytes diverge between full and bbox point-light rebake",
             );
         }
     }

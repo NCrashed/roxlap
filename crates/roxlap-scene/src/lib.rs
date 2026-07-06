@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
 pub use billboard::{canonical_viewpoints, BillboardCache, BillboardSnapshot};
 pub use character::{CharacterBody, CharacterDef, MoveMode, WalkInput};
-pub use chunks::BakeMode;
+pub use chunks::{BakeLight, BakeMode};
 pub use collide::{box_overlaps_solid, grid_box_overlaps_solid, point_overlaps_solid, Solidity};
 pub use edit::SpanOp;
 pub use lod::{select_lod, Lod, LodThresholds};
@@ -443,6 +443,16 @@ pub struct Grid {
     /// [`StreamRadius::DISABLED`] so existing grids see no change
     /// in behaviour until the caller opts in.
     pub stream_radius: StreamRadius,
+    /// EV.3 — baked point lights ([`BakeLight`], grid-local voxel
+    /// coords) consumed by [`BakeMode::PointLights`]: [`Grid::bake`]
+    /// and [`Grid::bake_bbox`] write each light's Lambertian pool
+    /// into the brightness bytes, so incremental carve relights keep
+    /// their glow. Authoring state only — editing this list does
+    /// **not** rebake by itself (call [`Grid::bake`] after) and it is
+    /// not carried through snapshots (the baked bytes are; re-set the
+    /// list after a load if you keep editing). Ignored by the other
+    /// bake modes and by the dynamic `LightRig`.
+    pub bake_lights: Vec<BakeLight>,
     /// Per-chunk edit version counter (S7.2). Each user edit
     /// through [`Self::set_voxel`] / [`Self::set_rect`] /
     /// [`Self::set_sphere`] bumps the counter for every chunk it
@@ -529,6 +539,7 @@ impl Grid {
             name: None,
             store: None,
             stream_radius: StreamRadius::DISABLED,
+            bake_lights: Vec::new(),
             chunk_versions: HashMap::new(),
             pending_gen: HashSet::new(),
             dda_brick_cache: roxlap_core::BrickCache::new(),
