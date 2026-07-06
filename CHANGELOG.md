@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed: the colour family — `VoxColor` / `Rgb` / `OverlayColor` newtypes (QE-B6, breaking)
+
+- Every public colour parameter that used to be a bare `u32` (or
+  `i32`) with an implicit packing is now one of three
+  `#[repr(transparent)]` newtypes, so mixing the packings is a
+  compile error instead of an over-bright voxel or an invisible line:
+  - **`VoxColor`** — voxel colours: RGB + a *brightness* byte (not
+    alpha; `0x80` = neutral). Edits, colfuncs, `voxel_color`,
+    `RayHit::color`, KV6 builders, debris sampling.
+  - **`Rgb`** — plain colour: sprite/particle/actor tints, sky / fog /
+    clear colours, colour→material map keys.
+  - **`OverlayColor`** — real alpha; the overlay APIs only
+    (`Line3.color`, image-sprite tints).
+- All three re-export from `roxlap-formats`, `roxlap-scene` and
+  `roxlap-render`; the wire word is the public `.0` field, so file
+  formats, GPU buffers and golden hashes are byte-identical.
+- Migration (mechanical):
+
+  | was | now |
+  |---|---|
+  | `set_sphere(.., Some(0x80_4d_8a_3a))` | `set_sphere(.., Some(VoxColor::rgb(0x4d, 0x8a, 0x3a)))` |
+  | colfunc `\|x,y,z\| 0x80_....u32` | colfunc `\|x,y,z\| VoxColor(0x80_....)` |
+  | `params.sky_color = 0x0099_b3d9` | `params.sky_color = Rgb(0x0099_b3d9)` |
+  | `set_actor_tint(id, 0x00ff_8040)` | `set_actor_tint(id, Rgb::new(0xff, 0x80, 0x40))` |
+  | `Line3 { color: 0x80ff_d040, .. }` | `Line3 { color: OverlayColor::rgba(0xff, 0xd0, 0x40, 0x80), .. }` |
+  | material map `&[(0x00ff_ffff, 2)]` | `&[(Rgb(0x00ff_ffff), 2)]` |
+
+  When you genuinely need the raw word (framebuffer comparisons,
+  custom wire formats), take `.0` / wrap with the tuple constructor.
+
 ### Added: `Frame` guard + `clear_sprites` (QE-B6)
 
 - `SceneRenderer::frame(scene, camera, params)` returns a `Frame`

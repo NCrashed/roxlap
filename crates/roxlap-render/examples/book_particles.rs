@@ -22,8 +22,8 @@ use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Camera;
 use roxlap_render::{
     BackendPreference, BillboardLighting, CollisionMode, ConeDef, EmitterShape, FrameParams, Kv6,
-    Material, ParticleEmitterDef, ParticleSystem, RenderOptions, SceneRenderer, SpawnMode,
-    SpriteModelId, VelocityDef,
+    Material, ParticleEmitterDef, ParticleSystem, RenderOptions, Rgb, SceneRenderer, SpawnMode,
+    SpriteModelId, VelocityDef, VoxColor,
 };
 use roxlap_scene::{GridId, GridTransform, Scene};
 use winit::application::ApplicationHandler;
@@ -31,8 +31,8 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-const GROUND: u32 = 0x80_58_6e_46;
-const SKY: u32 = 0x00_8f_bc_d4;
+const GROUND: VoxColor = VoxColor(0x80_58_6e_46);
+const SKY: Rgb = Rgb(0x00_8f_bc_d4);
 
 /// Palette ids (0 is the reserved opaque material).
 const MAT_SMOKE: u8 = 1;
@@ -56,11 +56,11 @@ fn build_arena() -> (Scene, GridId) {
 /// White models — the emitter's per-particle tint does the colouring,
 /// so all effects share plain geometry.
 fn spark_kv6() -> Kv6 {
-    Kv6::solid_cube(2, 0x80_ff_ff_ff)
+    Kv6::solid_cube(2, VoxColor(0x80_ff_ff_ff))
 }
 
 fn debris_kv6() -> Kv6 {
-    Kv6::solid_cube(3, 0x80_ff_ff_ff)
+    Kv6::solid_cube(3, VoxColor(0x80_ff_ff_ff))
 }
 
 /// A rough ball for smoke puffs (a surface shell is fine for
@@ -69,7 +69,7 @@ fn puff_kv6() -> Kv6 {
     Kv6::from_fn(7, 7, 7, |x, y, z| {
         let d = |v: u32| v as f32 - 3.0;
         let r2 = d(x).powi(2) + d(y).powi(2) + d(z).powi(2);
-        (r2 <= 3.4 * 3.4).then_some(0x80_ff_ff_ff)
+        (r2 <= 3.4 * 3.4).then_some(VoxColor(0x80_ff_ff_ff))
     })
 }
 
@@ -134,8 +134,8 @@ impl App {
                 collision: CollisionMode::Kill,
                 scale: 0.6,
                 fade_out_frac: 0.5,
-                tint: 0x00ff_c840,           // white-hot…
-                tint_end: Some(0x00ff_3000), // …to ember red
+                tint: Rgb(0x00ff_c840),           // white-hot…
+                tint_end: Some(Rgb(0x00ff_3000)), // …to ember red
                 material: MAT_SPARK,
                 lighting: BillboardLighting::FullBright,
                 ..ParticleEmitterDef::new(spark)
@@ -196,7 +196,7 @@ impl ApplicationHandler for App {
             collision: CollisionMode::Bounce { restitution: 0.45 },
             scale: 0.7,
             fade_out_frac: 0.3,
-            tint: 0x0060_a8ff,
+            tint: Rgb(0x0060_a8ff),
             material: MAT_WATER,
             ..ParticleEmitterDef::new(spark)
         });
@@ -220,8 +220,8 @@ impl ApplicationHandler for App {
             scale_end: Some(2.8),
             fade_in_frac: 0.25,
             fade_out_frac: 0.45,
-            tint: 0x00b8_b8b8,
-            tint_end: Some(0x0050_5050),
+            tint: Rgb(0x00b8_b8b8),
+            tint_end: Some(Rgb(0x0050_5050)),
             material: MAT_SMOKE,
             // WorldUp: stable shading that doesn't swim as the camera
             // orbits (FaceNormal is the default; FullBright for glows).

@@ -90,9 +90,16 @@ below. **Author triage 2026-07-06** (every carried item decided):
     appears.
   - (`SpriteInstanceDesc.model: usize` — decided to KEEP: the batch
     struct pre-dates id assignment; documented instead.)
-  - Still open: `PackedColor` newtype family — **author decision
-    2026-07-06: FULL signature-breaking newtypes** (constructors-only
-    and hybrid rejected). Locked design for the implementing session:
+  - `PackedColor` newtype family — **DONE 2026-07-06** (full
+    signature-breaking newtypes per the author decision below;
+    constructors-only and hybrid rejected). Landed exactly as locked:
+    `formats/src/color.rs` with `VoxColor`/`Rgb`/`OverlayColor`, all
+    public colour params migrated across
+    formats/core/scene/gpu/render/demos/cli, all book anchors +
+    chapter-2 prose reworked, CHANGELOG was→now table added. 736
+    workspace tests green, golden hashes unchanged
+    (`#[repr(transparent)]` ⇒ byte-identical wire). Original locked
+    design (as implemented):
     - `roxlap-formats/src/color.rs`, re-exported everywhere:
       - `VoxColor(u32)` — voxel packing `0xBB_RR_GG_BB` (brightness
         high byte). `VoxColor::rgb(r, g, b)` (neutral 0x80),

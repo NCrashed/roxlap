@@ -84,18 +84,18 @@ renderer automatically.
 ```rust,no_run
 use glam::{DVec3, IVec3};
 use roxlap_core::{opticast::OpticastSettings, Camera};
-use roxlap_render::{BackendPreference, FrameParams, RenderOptions, SceneRenderer};
+use roxlap_render::{BackendPreference, FrameParams, RenderOptions, SceneRenderer, VoxColor};
 use roxlap_scene::{GridTransform, Scene};
 
 // `window` is anything raw-window-handle: winit, SDL, GLFW, …
 fn run(window: std::sync::Arc<winit::window::Window>) {
     // A one-grid world: a plain + a dome. +z points DOWN (voxlap
-    // convention); colours are voxlap-packed 0x80_RR_GG_BB.
+    // convention); `VoxColor` packs RGB + a brightness byte.
     let mut scene = Scene::new();
     let id = scene.add_grid(GridTransform::at(DVec3::ZERO));
     let grid = scene.grid_mut(id).unwrap();
-    grid.set_rect(IVec3::new(-128, -128, 210), IVec3::new(127, 127, 254), Some(0x80_4d_8a_3a));
-    grid.set_sphere(IVec3::new(0, 0, 205), 30, Some(0x80_40_60_c0));
+    grid.set_rect(IVec3::new(-128, -128, 210), IVec3::new(127, 127, 254), Some(VoxColor::rgb(0x4d, 0x8a, 0x3a)));
+    grid.set_sphere(IVec3::new(0, 0, 205), 30, Some(VoxColor::rgb(0x40, 0x60, 0xc0)));
 
     let opts = RenderOptions {
         backend: BackendPreference::PreferGpu, // GPU with CPU fallback

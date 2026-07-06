@@ -1559,9 +1559,14 @@ pub enum DecodeError {
 mod tests {
     use super::*;
 
+    use crate::color::VoxColor;
+
     /// Build a full frame from a dense `solid(x,y,z) -> Option<color>`
     /// closure (the authoring shape demiurg / the encoder will use).
-    fn frame_from_fn(dims: [u32; 3], fill: impl Fn(u32, u32, u32) -> Option<u32>) -> VoxelFrame {
+    fn frame_from_fn(
+        dims: [u32; 3],
+        fill: impl Fn(u32, u32, u32) -> Option<VoxColor>,
+    ) -> VoxelFrame {
         let owpc = occ_words_per_col(dims) as usize;
         let cols = (dims[0] as usize) * (dims[1] as usize);
         let mut occupancy = vec![0u32; cols * owpc];
@@ -1574,7 +1579,7 @@ mod tests {
                 for z in 0..dims[2] {
                     if let Some(c) = fill(x, y, z) {
                         occupancy[col * owpc + (z >> 5) as usize] |= 1u32 << (z & 31);
-                        colors.push(c);
+                        colors.push(c.0);
                     }
                 }
             }
@@ -1605,7 +1610,7 @@ mod tests {
                     // a flickering tip whose height depends on the frame
                     let tip = x == cx && y == cy && z == dims[2] - 2 - (fi % 2);
                     if stem || tip {
-                        Some(0x80FF_8000 | (fi & 0xF)) // vary low bits per frame
+                        Some(VoxColor(0x80FF_8000 | (fi & 0xF))) // vary low bits per frame
                     } else {
                         None
                     }
@@ -1641,7 +1646,7 @@ mod tests {
     fn frame_validate_catches_mismatch() {
         let dims = [4, 4, 8];
         let mut f = frame_from_fn(dims, |x, y, z| {
-            (x == 0 && y == 0 && z < 3).then_some(0x8000_00FF)
+            (x == 0 && y == 0 && z < 3).then_some(VoxColor(0x8000_00FF))
         });
         assert!(f.validate(dims).is_ok());
         // Corrupt column 0: clear one occupancy bit but keep its colour run
@@ -1724,7 +1729,7 @@ mod tests {
         let frames: Vec<VoxelFrame> = (0..3)
             .map(|fi| {
                 frame_from_fn(dims, move |x, y, z| {
-                    (x == 0 && y == 0 && z == fi).then_some(0x8011_2233)
+                    (x == 0 && y == 0 && z == fi).then_some(VoxColor(0x8011_2233))
                 })
             })
             .collect();
@@ -1779,7 +1784,7 @@ mod tests {
         let frames: Vec<VoxelFrame> = (0..3)
             .map(|fi| {
                 frame_from_fn(dims, move |x, y, z| {
-                    (x == 0 && y == 0 && z == fi).then_some(0x8011_2233)
+                    (x == 0 && y == 0 && z == fi).then_some(VoxColor(0x8011_2233))
                 })
             })
             .collect();
@@ -1830,8 +1835,10 @@ mod tests {
     /// so `Kv6::from_fn` (surface-only) keeps all of them — letting the
     /// import be compared against the all-voxels `frame_from_fn` reference.
     /// Spaced on even coords; the colour encodes `(x, y, z)`.
-    fn isolated_fill(x: u32, y: u32, z: u32) -> Option<u32> {
-        (x % 2 == 0 && y % 2 == 0 && z % 2 == 0).then_some(0x8000_0000 | (x << 16) | (y << 8) | z)
+    fn isolated_fill(x: u32, y: u32, z: u32) -> Option<crate::color::VoxColor> {
+        (x % 2 == 0 && y % 2 == 0 && z % 2 == 0).then_some(crate::color::VoxColor(
+            0x8000_0000 | (x << 16) | (y << 8) | z,
+        ))
     }
 
     #[test]
@@ -1850,10 +1857,10 @@ mod tests {
     fn from_kv6_packs_z_across_word_boundary() {
         // A single 1×1 column with voxels straddling the 32-bit word split.
         let kv6 = Kv6::from_fn(1, 1, 41, |_, _, z| match z {
-            0 => Some(0x80FF_0000),
-            5 => Some(0x8000_FF00),
-            33 => Some(0x8000_00FF),
-            40 => Some(0x80FF_FF00),
+            0 => Some(VoxColor(0x80FF_0000)),
+            5 => Some(VoxColor(0x8000_FF00)),
+            33 => Some(VoxColor(0x8000_00FF)),
+            40 => Some(VoxColor(0x80FF_FF00)),
             _ => None,
         });
         let f = VoxelFrame::from_kv6(&kv6);
@@ -1873,10 +1880,10 @@ mod tests {
         let dims = [2u32, 2, 3];
         // Two full xy layers at different z's — every voxel surface-exposed.
         let ka = Kv6::from_fn(dims[0], dims[1], dims[2], |_, _, z| {
-            (z == 0).then_some(0x80FF_0000)
+            (z == 0).then_some(VoxColor(0x80FF_0000))
         });
         let kb = Kv6::from_fn(dims[0], dims[1], dims[2], |_, _, z| {
-            (z == 2).then_some(0x8000_FF00)
+            (z == 2).then_some(VoxColor(0x8000_FF00))
         });
         let clip = VoxelClip::from_kv6_frames(
             &[ka.clone(), kb.clone()],
@@ -1907,8 +1914,8 @@ mod tests {
 
     #[test]
     fn from_kv6_frames_rejects_dims_mismatch() {
-        let ka = Kv6::from_fn(2, 2, 2, |_, _, z| (z == 0).then_some(0x80FF_FFFF));
-        let kb = Kv6::from_fn(3, 2, 2, |_, _, z| (z == 0).then_some(0x80FF_FFFF));
+        let ka = Kv6::from_fn(2, 2, 2, |_, _, z| (z == 0).then_some(VoxColor(0x80FF_FFFF)));
+        let kb = Kv6::from_fn(3, 2, 2, |_, _, z| (z == 0).then_some(VoxColor(0x80FF_FFFF)));
         let err = VoxelClip::from_kv6_frames(&[ka, kb], 1.0, LoopMode::Loop, &[], 50, 0)
             .expect_err("mismatch must fail");
         assert_eq!(
@@ -1927,7 +1934,7 @@ mod tests {
         // z-run crossing the 32-bit word boundary, distinct colours.
         let dims = [3u32, 2, 40];
         let frame = frame_from_fn(dims, |x, y, z| {
-            (z <= (x + y) * 6 + 3).then_some(0x8000_0000 | (z << 8) | (x * 16 + y))
+            (z <= (x + y) * 6 + 3).then_some(VoxColor(0x8000_0000 | (z << 8) | (x * 16 + y)))
         });
         let kv6 = frame.to_kv6(dims, [1.0, 0.5, 20.0]);
         assert_eq!([kv6.xsiz, kv6.ysiz, kv6.zsiz], dims);
@@ -1942,7 +1949,9 @@ mod tests {
         // dirs `decode` caches (the register path), so an edited frame's GPU
         // model is identical to a freshly-registered one.
         let dims = [4u32, 3, 8];
-        let frame = frame_from_fn(dims, |x, y, z| (z <= x + y).then_some(0x80FF_0000));
+        let frame = frame_from_fn(dims, |x, y, z| {
+            (z <= x + y).then_some(VoxColor(0x80FF_0000))
+        });
         let clip = VoxelClip::from_frames(
             dims,
             [0.0; 3],
@@ -1964,7 +1973,7 @@ mod tests {
         // A fully-solid frame: every occupancy word all-set, one repeated
         // colour — maximally compressible.
         let dims = [16u32, 16, 32];
-        let frame = frame_from_fn(dims, |_, _, _| Some(0x80AB_CDEF));
+        let frame = frame_from_fn(dims, |_, _, _| Some(VoxColor(0x80AB_CDEF)));
         let clip = VoxelClip::from_frames(
             dims,
             [8.0, 8.0, 16.0],
@@ -2040,7 +2049,7 @@ mod tests {
     #[test]
     fn legacy_v1_file_still_parses() {
         let dims = [2u32, 2, 3];
-        let frame = frame_from_fn(dims, |_, _, z| (z == 0).then_some(0x80FF_0000));
+        let frame = frame_from_fn(dims, |_, _, z| (z == 0).then_some(VoxColor(0x80FF_0000)));
         let clip =
             VoxelClip::from_frames(dims, [0.0; 3], 1.0, LoopMode::Once, &[frame], &[], 50, 0);
         let v1 = serialize_v1(&clip);
@@ -2075,7 +2084,7 @@ mod tests {
             .map(|i| {
                 let h = 5 + i * 5;
                 frame_from_fn(dims, move |_x, _y, z| {
-                    (z < h).then_some(0x8000_0000 | (i * 0x10))
+                    (z < h).then_some(VoxColor(0x8000_0000 | (i * 0x10)))
                 })
             })
             .collect();
@@ -2160,7 +2169,8 @@ mod tests {
         // Content reaches both far corners → content bbox == dims.
         let dims = [8u32, 8, 8];
         let frame = frame_from_fn(dims, |x, y, z| {
-            ((x == 0 && y == 0 && z == 0) || (x == 7 && y == 7 && z == 7)).then_some(0x80FF_FFFF)
+            ((x == 0 && y == 0 && z == 0) || (x == 7 && y == 7 && z == 7))
+                .then_some(VoxColor(0x80FF_FFFF))
         });
         let s = pad_stats(dims, std::slice::from_ref(&frame));
         assert_eq!(s.content_dims, dims);
@@ -2176,7 +2186,7 @@ mod tests {
         let frames: Vec<VoxelFrame> = (0..3)
             .map(|_| {
                 frame_from_fn(dims, |x, y, z| {
-                    (x < 10 && y < 10 && z < 10).then_some(0x80FF_0000)
+                    (x < 10 && y < 10 && z < 10).then_some(VoxColor(0x80FF_0000))
                 })
             })
             .collect();
@@ -2202,7 +2212,7 @@ mod tests {
     #[test]
     fn decoded_clip_pad_stats_delegates() {
         let dims = [20u32, 4, 4];
-        let frame = frame_from_fn(dims, |x, _, _| (x < 4).then_some(0x80FF_FFFF));
+        let frame = frame_from_fn(dims, |x, _, _| (x < 4).then_some(VoxColor(0x80FF_FFFF)));
         let clip =
             VoxelClip::from_frames(dims, [0.0; 3], 1.0, LoopMode::Loop, &[frame], &[], 33, 0);
         let s = clip.decode().unwrap().pad_stats();
@@ -2232,7 +2242,7 @@ mod tests {
             .map(|i| {
                 let h = 5 + i * 5;
                 frame_from_fn(dims, move |_, _, z| {
-                    (z < h).then_some(0x8000_0000 | (i * 0x10))
+                    (z < h).then_some(VoxColor(0x8000_0000 | (i * 0x10)))
                 })
             })
             .collect();
@@ -2246,12 +2256,12 @@ mod tests {
     #[test]
     fn from_frames_auto_keyframes_scene_change_but_deltas_small_change() {
         let dims = [4u32, 4, 8];
-        let a = frame_from_fn(dims, |_, _, z| (z < 4).then_some(0x80FF_0000));
+        let a = frame_from_fn(dims, |_, _, z| (z < 4).then_some(VoxColor(0x80FF_0000)));
         // Fully different (every column's occupancy + colour changes).
-        let scene_cut = frame_from_fn(dims, |_, _, z| (z >= 4).then_some(0x8000_FF00));
+        let scene_cut = frame_from_fn(dims, |_, _, z| (z >= 4).then_some(VoxColor(0x8000_FF00)));
         // `a` plus one extra voxel in a single column.
         let small = frame_from_fn(dims, |x, y, z| {
-            ((z < 4) || (x == 0 && y == 0 && z == 4)).then_some(0x80FF_0000)
+            ((z < 4) || (x == 0 && y == 0 && z == 4)).then_some(VoxColor(0x80FF_0000))
         });
 
         let cut = VoxelClip::from_frames_auto(
@@ -2282,7 +2292,7 @@ mod tests {
     #[test]
     fn from_frames_auto_gap_caps_keyframe_spacing() {
         let dims = [2u32, 2, 4];
-        let f = frame_from_fn(dims, |_, _, z| (z < 2).then_some(0x80FF_FFFF));
+        let f = frame_from_fn(dims, |_, _, z| (z < 2).then_some(VoxColor(0x80FF_FFFF)));
         let frames = vec![f; 7]; // identical → deltas are empty, never cost-forced
 
         // No cap: only frame 0 is a keyframe.
@@ -2305,10 +2315,10 @@ mod tests {
     fn from_kv6_frames_auto_round_trips() {
         let dims = [3u32, 3, 6];
         let ka = Kv6::from_fn(dims[0], dims[1], dims[2], |_, _, z| {
-            (z == 0).then_some(0x80FF_0000)
+            (z == 0).then_some(VoxColor(0x80FF_0000))
         });
         let kb = Kv6::from_fn(dims[0], dims[1], dims[2], |_, _, z| {
-            (z >= 3).then_some(0x8000_FF00)
+            (z >= 3).then_some(VoxColor(0x8000_FF00))
         });
         let clip = VoxelClip::from_kv6_frames_auto(
             &[ka.clone(), kb.clone()],

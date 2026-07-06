@@ -16,6 +16,7 @@
 //! `[` / `]` narrow/widen the cone · `K` shadows · `P` pause the sweep.
 
 use glam::{DVec3, IVec3};
+use roxlap_render::VoxColor;
 use roxlap_render::{LightRig, SpotLight};
 use roxlap_scene::{GridTransform, Scene};
 use winit::keyboard::KeyCode;
@@ -25,8 +26,8 @@ use crate::scene_api::{
 };
 
 // Voxlap-packed `0x80_RR_GG_BB` (high byte = full ambient brightness).
-const FLOOR: u32 = 0x80_6a_6a_74;
-const PILLAR: u32 = 0x80_9a_92_86;
+const FLOOR: VoxColor = VoxColor(0x80_6a_6a_74);
+const PILLAR: VoxColor = VoxColor(0x80_9a_92_86);
 
 /// Grid origin in world space; grid-local `(x,y,z)` → world `origin + xyz`.
 const GRID_ORIGIN: DVec3 = DVec3::new(-48.0, 30.0, 0.0);

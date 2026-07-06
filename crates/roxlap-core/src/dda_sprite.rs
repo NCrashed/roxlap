@@ -26,6 +26,7 @@ use roxlap_formats::sprite::{
     SPRITE_FLAG_NO_Z,
 };
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
+use roxlap_formats::Rgb;
 
 use std::sync::Arc;
 
@@ -116,7 +117,7 @@ impl SpriteDense {
     /// same all-opaque (uniform) result as `from_kv6`.
     #[must_use]
     #[allow(clippy::cast_possible_wrap)]
-    pub fn from_kv6_with_materials(kv6: &Kv6, material_map: &[(u32, u8)]) -> Self {
+    pub fn from_kv6_with_materials(kv6: &Kv6, material_map: &[(Rgb, u8)]) -> Self {
         let mut dense = Self::from_kv6(kv6);
         if !material_map.is_empty() {
             let n = dense.col.len();
@@ -178,7 +179,7 @@ impl SpriteDense {
         frame: &VoxelFrame,
         dims: [u32; 3],
         pivot: [f32; 3],
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> Self {
         let mut dense = Self::from_voxel_frame(frame, dims, pivot);
         if !material_map.is_empty() {
@@ -1238,7 +1239,7 @@ impl ClipFlipbook {
     /// [`SpriteDense::from_kv6_with_materials`]. An empty map yields the same
     /// all-opaque result as `from_decoded`.
     #[must_use]
-    pub fn from_decoded_with_materials(clip: &DecodedClip, material_map: &[(u32, u8)]) -> Self {
+    pub fn from_decoded_with_materials(clip: &DecodedClip, material_map: &[(Rgb, u8)]) -> Self {
         let frames = clip
             .frames
             .iter()
@@ -1376,6 +1377,7 @@ mod tests {
     use crate::Camera;
     use roxlap_formats::kv6::Kv6;
     use roxlap_formats::material::{Material, MaterialTable};
+    use roxlap_formats::VoxColor;
 
     /// BB.2b — `WorldUp` lights a side-facing billboard as if it faced world
     /// up (the sun directly overhead); `AmbientOnly` drops the sun term.
@@ -1463,7 +1465,9 @@ mod tests {
     #[test]
     fn cast_local_reports_face_normal() {
         // Solid only at z >= 4 (air below), full in x/y.
-        let kv6 = Kv6::from_fn(8, 8, 8, |_, _, z| (z >= 4).then_some(0x80_C0_40_20));
+        let kv6 = Kv6::from_fn(8, 8, 8, |_, _, z| {
+            (z >= 4).then_some(VoxColor(0x80_C0_40_20))
+        });
         let dense = SpriteDense::from_kv6(&kv6);
         // Ray from below, travelling +z: air (z<4) then the block's top face.
         let (_c, _t, n, cell) =
@@ -1499,7 +1503,7 @@ mod tests {
     /// face sits nearer/farther) skews the exact ratio.
     #[test]
     fn scaled_basis_scales_drawn_extent() {
-        let kv6 = Kv6::from_fn(8, 8, 8, |_, _, _| Some(0x80_C0_40_20));
+        let kv6 = Kv6::from_fn(8, 8, 8, |_, _, _| Some(VoxColor(0x80_C0_40_20)));
         let (w, h) = (64u32, 64u32);
         let n = (w * h) as usize;
         let cam = cam_looking_y();
@@ -1677,7 +1681,7 @@ mod tests {
     /// cube colour (shaded) and a sensible centre depth.
     #[test]
     fn cube_sprite_renders() {
-        let kv6 = Kv6::solid_cube(8, 0x80_C0_40_20);
+        let kv6 = Kv6::solid_cube(8, VoxColor(0x80_C0_40_20));
         let sprite = Sprite::axis_aligned(kv6, [0.0, 40.0, 0.0]);
         let (w, h) = (64u32, 64u32);
         let n = (w * h) as usize;
@@ -1718,7 +1722,7 @@ mod tests {
     /// normalised to full on decode.
     #[test]
     fn zero_high_byte_sprite_not_black() {
-        let kv6 = Kv6::solid_cube(8, 0x00_C0_40_20);
+        let kv6 = Kv6::solid_cube(8, VoxColor(0x00_C0_40_20));
         let sprite = Sprite::axis_aligned(kv6, [0.0, 40.0, 0.0]);
         let (w, h) = (64u32, 64u32);
         let n = (w * h) as usize;
@@ -1750,7 +1754,7 @@ mod tests {
     /// pre-filled depth blocks the sprite; a farther one lets it win.
     #[test]
     fn sprite_respects_zbuffer() {
-        let kv6 = Kv6::solid_cube(8, 0x80_FF_FF_FF);
+        let kv6 = Kv6::solid_cube(8, VoxColor(0x80_FF_FF_FF));
         let sprite = Sprite::axis_aligned(kv6, [0.0, 40.0, 0.0]);
         let (w, h) = (32u32, 32u32);
         let n = (w * h) as usize;
@@ -1822,7 +1826,7 @@ mod tests {
     fn posed_basis_reorients_silhouette() {
         // Wide-in-local-x, short-in-local-z box → appears wide on screen
         // (screen-x = world-x via `right`, screen-y = world-z via `down`).
-        let kv6 = Kv6::solid_box(16, 4, 4, 0x80_C0_40_20);
+        let kv6 = Kv6::solid_box(16, 4, 4, VoxColor(0x80_C0_40_20));
         let (w, h) = (64u32, 64u32);
         let n = (w * h) as usize;
         let cam = cam_looking_y();
@@ -1879,7 +1883,7 @@ mod tests {
     /// silently skip rather than panic (the `DynSpriteTransform` guard).
     #[test]
     fn degenerate_basis_draws_nothing() {
-        let kv6 = Kv6::solid_cube(8, 0x80_FF_FF_FF);
+        let kv6 = Kv6::solid_cube(8, VoxColor(0x80_FF_FF_FF));
         let mut sprite = Sprite::axis_aligned(kv6, [0.0, 40.0, 0.0]);
         sprite.f = sprite.s; // two equal columns → det 0
         let (w, h) = (32u32, 32u32);
@@ -1904,7 +1908,7 @@ mod tests {
     /// An invisible sprite draws nothing.
     #[test]
     fn invisible_sprite_skipped() {
-        let kv6 = Kv6::solid_cube(8, 0x80_FF_FF_FF);
+        let kv6 = Kv6::solid_cube(8, VoxColor(0x80_FF_FF_FF));
         let mut sprite = Sprite::axis_aligned(kv6, [0.0, 40.0, 0.0]);
         sprite.flags |= roxlap_formats::sprite::SPRITE_FLAG_INVISIBLE;
         let (w, h) = (32u32, 32u32);
@@ -1934,7 +1938,7 @@ mod tests {
     fn draw_cube_shaded(mat: Material, alpha_mul: u8, bg: u32, zb_v: f32) -> (u32, Vec<u32>) {
         let mut table = MaterialTable::new();
         table.set(1, mat);
-        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_C0_40_20));
+        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, VoxColor(0x80_C0_40_20)));
         let (w, h) = (64u32, 64u32);
         let n = (w * h) as usize;
         let mut fb = vec![bg; n];
@@ -2028,7 +2032,7 @@ mod tests {
     #[test]
     fn opaque_shade_ctx_matches_plain_path() {
         let table = MaterialTable::new();
-        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_C0_40_20));
+        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, VoxColor(0x80_C0_40_20)));
         let (w, h) = (64u32, 64u32);
         let n = (w * h) as usize;
         let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
@@ -2114,7 +2118,7 @@ mod tests {
         fn centre(ysiz: u32) -> u32 {
             let mut table = MaterialTable::new();
             table.set(1, Material::alpha_blend(128));
-            let dense = SpriteDense::from_kv6(&Kv6::solid_box(8, ysiz, 8, 0x80_C0_40_20));
+            let dense = SpriteDense::from_kv6(&Kv6::solid_box(8, ysiz, 8, VoxColor(0x80_C0_40_20)));
             let (w, h) = (64u32, 64u32);
             let n = (w * h) as usize;
             let mut fb = vec![0x80_10_10_10u32; n];
@@ -2171,8 +2175,13 @@ mod tests {
             // traverses `depth` absorbing voxels. `from_fn` would cull the
             // interior to a hollow shell (front+back faces only) — no genuine
             // depth accumulation — so use `from_fn_keep_interior`.
-            let kv6 =
-                Kv6::from_fn_keep_interior(8, depth, 8, |_, _, _| Some(0x80_C0_20_20), |_| true);
+            let kv6 = Kv6::from_fn_keep_interior(
+                8,
+                depth,
+                8,
+                |_, _, _| Some(VoxColor(0x80_C0_20_20)),
+                |_| true,
+            );
             let dense = SpriteDense::from_kv6(&kv6);
             let (w, h) = (64u32, 64u32);
             let n = (w * h) as usize;
@@ -2228,7 +2237,10 @@ mod tests {
         use crate::dda::WorldOccluder;
         // 8³ cube, identity pose at world origin; `from_fn` centres the pivot
         // (4,4,4), so the cube spans world ≈ [-4, 4]³.
-        let dense = Arc::new(SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF)));
+        let dense = Arc::new(SpriteDense::from_kv6(&Kv6::solid_cube(
+            8,
+            VoxColor(0x80_FF_FF_FF),
+        )));
         let mut occ = SpriteOccluder::new();
         occ.push(
             dense,
@@ -2268,11 +2280,14 @@ mod tests {
         // between sphere and sun shadows that lit hemisphere.
         let target = SpriteDense::from_kv6(&Kv6::from_fn(16, 16, 16, |x, y, z| {
             let (dx, dy, dz) = (x as i32 - 8, y as i32 - 8, z as i32 - 8);
-            (dx * dx + dy * dy + dz * dz <= 49).then_some(0x80_C0_C0_C0)
+            (dx * dx + dy * dy + dz * dz <= 49).then_some(VoxColor(0x80_C0_C0_C0))
         }));
         let mut occ = SpriteOccluder::new();
         occ.push(
-            Arc::new(SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF))),
+            Arc::new(SpriteDense::from_kv6(&Kv6::solid_cube(
+                8,
+                VoxColor(0x80_FF_FF_FF),
+            ))),
             [0.0, 25.0, 0.0],
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
@@ -2339,7 +2354,7 @@ mod tests {
     #[test]
     fn sprite_rgb_tint_recolours() {
         let table = MaterialTable::new();
-        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, 0x80_FF_FF_FF));
+        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, VoxColor(0x80_FF_FF_FF)));
         let (w, h) = (64u32, 64u32);
         let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
         let centre = |tint: u32| -> u32 {
@@ -2396,7 +2411,7 @@ mod tests {
         fn center_red(lights: CpuLights) -> u32 {
             let mut table = MaterialTable::new();
             table.set(1, Material::alpha_blend(160));
-            let dense = SpriteDense::from_kv6(&Kv6::solid_box(8, 8, 8, 0x80_E0_30_30));
+            let dense = SpriteDense::from_kv6(&Kv6::solid_box(8, 8, 8, VoxColor(0x80_E0_30_30)));
             let (w, h) = (64u32, 64u32);
             let n = (w * h) as usize;
             let mut fb = vec![0x80_10_10_10u32; n];
@@ -2460,7 +2475,7 @@ mod tests {
         let centre = (h / 2 * w + w / 2) as usize;
 
         // Opaque red backdrop (material 0), far.
-        let backdrop = SpriteDense::from_kv6(&Kv6::solid_cube(12, 0x80_FF_00_00));
+        let backdrop = SpriteDense::from_kv6(&Kv6::solid_cube(12, VoxColor(0x80_FF_00_00)));
         let sh_op = SpriteShade {
             materials: &table,
             lights: CpuLights::default(),
@@ -2493,7 +2508,7 @@ mod tests {
         );
 
         // Cyan glass (material 1), nearer + overlapping.
-        let glass = SpriteDense::from_kv6(&Kv6::solid_cube(12, 0x80_00_FF_FF));
+        let glass = SpriteDense::from_kv6(&Kv6::solid_cube(12, VoxColor(0x80_00_FF_FF)));
         let sh_gl = SpriteShade {
             materials: &table,
             lights: CpuLights::default(),
@@ -2535,9 +2550,9 @@ mod tests {
     /// material ids by colour — mapped colour → its id, unmapped → 0.
     #[test]
     fn from_kv6_with_materials_classifies_by_color() {
-        let col = 0x80_AA_BB_CC;
+        let col = VoxColor(0x80_AA_BB_CC);
         let kv6 = Kv6::solid_cube(6, col);
-        let dense = SpriteDense::from_kv6_with_materials(&kv6, &[(0x00AA_BBCC, 2)]);
+        let dense = SpriteDense::from_kv6_with_materials(&kv6, &[(Rgb(0x00AA_BBCC), 2)]);
         assert_eq!(
             dense.mat.len(),
             dense.col.len(),
@@ -2552,7 +2567,7 @@ mod tests {
         }
         assert!(solids > 0, "cube has solid voxels");
         // A map that doesn't include the cube's colour → all opaque (0).
-        let dense0 = SpriteDense::from_kv6_with_materials(&kv6, &[(0x0012_3456, 5)]);
+        let dense0 = SpriteDense::from_kv6_with_materials(&kv6, &[(Rgb(0x0012_3456), 5)]);
         assert!(
             dense0.mat.iter().all(|&m| m == 0),
             "unmapped colour → material 0"
@@ -2567,7 +2582,7 @@ mod tests {
     fn per_voxel_material_matches_uniform_when_homogeneous() {
         let mut table = MaterialTable::new();
         table.set(1, Material::alpha_blend(120));
-        let col = 0x80_30_A0_F0;
+        let col = VoxColor(0x80_30_A0_F0);
         let kv6 = Kv6::solid_cube(10, col);
         let (w, h) = (64u32, 64u32);
         let n = (w * h) as usize;
@@ -2611,7 +2626,7 @@ mod tests {
         // Per-voxel: every voxel → material 1; instance's uniform material is 0
         // (opaque) but the per-voxel id overrides it.
         let pv = render(
-            &SpriteDense::from_kv6_with_materials(&kv6, &[(col & 0xff_ffff, 1)]),
+            &SpriteDense::from_kv6_with_materials(&kv6, &[(col.rgb_part(), 1)]),
             0,
         );
         // Uniform: no per-voxel data, instance material 1.
@@ -2629,7 +2644,7 @@ mod tests {
     #[test]
     fn clip_flipbook_with_materials_classifies_every_frame() {
         let dims = [6u32, 6, 6];
-        let glass = 0x00AA_BBCC;
+        let glass = Rgb(0x00AA_BBCC);
         let glass_lit = 0x80AA_BBCC;
         // Two distinct frames, both filled with the glass colour.
         let f0 = clip_frame(dims, |_x, _y, z| (z < 3).then_some(glass_lit));

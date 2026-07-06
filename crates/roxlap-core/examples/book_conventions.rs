@@ -11,14 +11,21 @@
 //! the CI `book` job) goes red if one disappears.
 
 use roxlap_core::Camera;
+use roxlap_formats::{OverlayColor, Rgb, VoxColor};
 
 // ANCHOR: packed_color
-/// Pack RGB into roxlap's voxel colour format. The low 24 bits are
-/// the colour; the high byte is the per-voxel *shading intensity* —
-/// NOT alpha. `0x80` is the neutral "unlit" default; lighting bakes
-/// rewrite that byte per voxel (see the lighting chapter).
-fn voxel_color(r: u8, g: u8, b: u8) -> u32 {
-    0x80 << 24 | u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b)
+fn packed_colors() {
+    // The QE-B6 colour family: three packings, three types — mixing
+    // them up is a compile error, not an over-bright voxel.
+    // VoxColor = RGB + a brightness byte (NOT alpha; 0x80 = neutral,
+    // lighting bakes rewrite it per voxel — see the lighting chapter).
+    let grass = VoxColor::rgb(0x4d, 0x8a, 0x3a);
+    assert_eq!(grass.0, 0x80_4d_8a_3a); // .0 is the raw wire word
+    assert_eq!(grass.with_brightness(0xff).0, 0xff_4d_8a_3a);
+    // Rgb = plain colour: tints, sky/fog, material-map keys.
+    assert_eq!(Rgb::new(0x8f, 0xbc, 0xd4).0, 0x00_8f_bc_d4);
+    // OverlayColor = REAL alpha — only the overlay-line API uses it.
+    assert_eq!(OverlayColor::rgba(0xff, 0xd0, 0x40, 0x80).0, 0x80_ff_d0_40);
 }
 // ANCHOR_END: packed_color
 
@@ -37,7 +44,7 @@ fn approx_eq(a: [f64; 3], b: [f64; 3]) -> bool {
 
 fn main() {
     // The grass colour the quickstart uses, packed by hand.
-    assert_eq!(voxel_color(0x4d, 0x8a, 0x3a), 0x80_4d_8a_3a);
+    packed_colors();
 
     // ANCHOR: z_down
     // +z points DOWN. Positive pitch aims the camera downward (the

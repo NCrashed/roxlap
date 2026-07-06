@@ -126,9 +126,7 @@ pub fn pack_dense_grid_to_vxl(grid: &[u8], color: &[u32], vsid: u32) -> Vxl {
     if !air_spans.is_empty() {
         set_spans_with_colfunc(&mut vxl, &air_spans, SpanOp::Carve, |x, y, z| {
             let idx = (y as usize * vsid_u + x as usize) * maxzdim_u + z as usize;
-            #[allow(clippy::cast_possible_wrap)]
-            let c = color[idx] as i32;
-            c
+            roxlap_formats::VoxColor(color[idx])
         });
     }
 

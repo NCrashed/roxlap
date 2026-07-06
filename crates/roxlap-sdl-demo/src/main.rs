@@ -20,6 +20,8 @@
 //! `ROXLAP_GPU=1` asks for the wgpu backend; it falls back to the CPU
 //! softbuffer path automatically if GPU init fails.
 
+use roxlap_render::Rgb;
+use roxlap_render::VoxColor;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,15 +44,15 @@ const HEIGHT: u32 = 600;
 /// Voxel colours are voxlap-format `0x80_RR_GG_BB` — high byte is the
 /// flat shading intensity, low 24 bits are RGB (matches the
 /// `roxlap-scene-demo` terrain palette).
-const GRASS: u32 = 0x80_4d_8a_3a;
-const STONE: u32 = 0x80_7a_7a_82;
-const DOME: u32 = 0x80_40_60_c0;
+const GRASS: VoxColor = VoxColor(0x80_4d_8a_3a);
+const STONE: VoxColor = VoxColor(0x80_7a_7a_82);
+const DOME: VoxColor = VoxColor(0x80_40_60_c0);
 
 /// Sky colour (`0x00_RR_GG_BB`, the framebuffer's native packing).
 /// Both backends honour this: the CPU paints it flat, and the GPU
 /// backend mirrors it onto its sky texture (since 0.7 — no manual
 /// `set_sky_panorama` needed).
-const SKY: u32 = 0x00_8f_bc_d4;
+const SKY: Rgb = Rgb(0x00_8f_bc_d4);
 
 /// Mouse-look sensitivity (radians per pixel of relative motion).
 const LOOK_SENS: f64 = 0.0025;

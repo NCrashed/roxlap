@@ -27,6 +27,7 @@
 //! int32_t okfatim;
 //! ```
 
+use crate::color::{Rgb, VoxColor};
 use crate::kv6::Kv6;
 
 /// Voxlap's sprite-flags bit 0: disable normal-based face shading.
@@ -115,7 +116,7 @@ pub struct Sprite {
     /// (opaque frame + glass, bottle + potion). **Empty** (the default) means
     /// the whole sprite uses [`material`](Self::material) uniformly (the TV.1
     /// path). See [`crate::material::material_for_color`].
-    pub material_map: Vec<(u32, u8)>,
+    pub material_map: Vec<(Rgb, u8)>,
 }
 
 impl Sprite {
@@ -217,7 +218,7 @@ impl Sprite {
         colfunc: C,
     ) where
         S: Fn(i32, i32, i32) -> bool,
-        C: Fn(i32, i32, i32) -> u32,
+        C: Fn(i32, i32, i32) -> VoxColor,
     {
         self.kv6
             .carve_sphere_with_colfunc(centre, radius, solid, colfunc);
@@ -232,7 +233,7 @@ mod tests {
     /// independently of each other.
     #[test]
     fn sprite_shadow_flags_default_on_and_toggle() {
-        let kv6 = Kv6::from_fn_shaded(2, 2, 2, |_, _, _| Some(0x8033_4455));
+        let kv6 = Kv6::from_fn_shaded(2, 2, 2, |_, _, _| Some(VoxColor(0x8033_4455)));
         let s = Sprite::axis_aligned(kv6, [0.0; 3]);
         // Default: casts + receives.
         assert!(s.casts_shadow() && s.receives_shadow());
@@ -259,12 +260,17 @@ mod tests {
 
     #[test]
     fn carve_sphere_delegates_to_kv6_and_leaves_pose() {
-        const BASE: u32 = 0x8033_4455;
+        const BASE: VoxColor = VoxColor(0x8033_4455);
         let kv6 = Kv6::from_fn_shaded(16, 16, 16, |_, _, _| Some(BASE));
         let mut sprite = Sprite::axis_aligned(kv6, [10.0, 20.0, 30.0]);
         let before = sprite.kv6.voxels.len();
 
-        sprite.carve_sphere_with_colfunc([8, 8, 8], 4, |_, _, _| true, |_, _, _| 0x8000_FF00);
+        sprite.carve_sphere_with_colfunc(
+            [8, 8, 8],
+            4,
+            |_, _, _| true,
+            |_, _, _| VoxColor(0x8000_FF00),
+        );
 
         // The hollowed-out shell has more surface voxels than the
         // solid hull did, so the model definitely changed.

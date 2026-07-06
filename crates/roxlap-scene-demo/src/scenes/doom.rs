@@ -24,6 +24,7 @@
 //! `K` toggle sun shadows · `L` cycle the signpost's lighting mode.
 
 use glam::{DVec3, IVec3};
+use roxlap_render::VoxColor;
 use roxlap_render::{
     gif_import::{voxel_clip_from_gif, GifImportOpts},
     ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode,
@@ -36,8 +37,8 @@ use crate::scene_api::{
     frame_params, opticast_settings, CameraPose, DemoScene, SceneCtx, SceneInput,
 };
 
-const GRASS: u32 = 0x80_4d_8a_3a;
-const STONE: u32 = 0x80_8a_8a_92;
+const GRASS: VoxColor = VoxColor(0x80_4d_8a_3a);
+const STONE: VoxColor = VoxColor(0x80_8a_8a_92);
 
 /// Grid origin in world space (grid-local `xyz` → world `origin + xyz`).
 const GRID_ORIGIN: DVec3 = DVec3::new(-40.0, 30.0, 0.0);

@@ -30,7 +30,7 @@ use roxlap_scene::render::{
 use roxlap_scene::Scene;
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{DynDisplay, DynWindow, HasDisplayHandle, HasWindowHandle};
+use crate::{DynDisplay, DynWindow, HasDisplayHandle, HasWindowHandle, Rgb};
 use crate::{
     DynSpriteTransform, FrameParams, KfaSprite, Line3, QuadDraw, RenderOptions, SpriteSet,
 };
@@ -525,7 +525,7 @@ impl CpuBackend {
     fn assemble(present_target: Presenter, size: (u32, u32), opts: &RenderOptions) -> Self {
         let (w, h) = (size.0.max(1), size.1.max(1));
         let zbuffer = vec![f32::INFINITY; (w as usize) * (h as usize)];
-        let framebuffer = vec![opts.clear_sky; (w as usize) * (h as usize)];
+        let framebuffer = vec![opts.clear_sky.0; (w as usize) * (h as usize)];
 
         Self {
             present_target,
@@ -538,7 +538,7 @@ impl CpuBackend {
             zbuffer,
             last_dims: (w, h),
             last_hxyz: (0.0, 0.0, 0.0),
-            clear_sky: opts.clear_sky,
+            clear_sky: opts.clear_sky.0,
             sprites: Vec::new(),
             sprite_models: Vec::new(),
             models: Vec::new(),
@@ -809,7 +809,7 @@ impl CpuBackend {
     pub(crate) fn add_model_with_materials(
         &mut self,
         kv6: &Kv6,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> usize {
         let idx = self.models.len();
         let mut s = Sprite::axis_aligned(kv6.clone(), [0.0, 0.0, 0.0]);
@@ -864,7 +864,7 @@ impl CpuBackend {
     pub(crate) fn add_voxel_clip_with_materials(
         &mut self,
         clip: &DecodedClip,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> usize {
         let idx = self.clip_books.len();
         self.clip_books
@@ -916,7 +916,7 @@ impl CpuBackend {
         vf: &VoxelFrame,
         dims: [u32; 3],
         pivot: [f32; 3],
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> bool {
         let dense = SpriteDense::from_voxel_frame_with_materials(vf, dims, pivot, material_map);
         self.clip_books
@@ -943,7 +943,7 @@ impl CpuBackend {
         &mut self,
         model_index: usize,
         kv6: &Kv6,
-        material_map: Option<&[(u32, u8)]>,
+        material_map: Option<&[(Rgb, u8)]>,
     ) {
         for (s, &m) in self.sprites.iter_mut().zip(&self.sprite_models) {
             if m == model_index {
@@ -1169,7 +1169,7 @@ impl CpuBackend {
         // hit toward `fog_color` over that distance. `side_shades` darkens
         // each voxel face (default `[0; 6]` = no side shading).
         let fog = CpuFog {
-            color: frame.fog_color,
+            color: frame.fog_color.0,
             max_scan_dist: frame.fog_max_scan_dist,
             side_shades: frame.side_shades,
         };
@@ -1350,7 +1350,7 @@ impl CpuBackend {
             scene,
             camera,
             &settings,
-            frame.sky_color,
+            frame.sky_color.0,
             frame.sky,
             Some(&shared.materials),
             &shared.terrain_materials,
@@ -1683,11 +1683,11 @@ impl CpuBackend {
             let sx1 = hx + p1[0] * hz * inv1;
             let sy1 = hy + p1[1] * hz * inv1;
 
-            let alpha = (line.color >> 24) & 0xff;
+            let alpha = (line.color.0 >> 24) & 0xff;
             if alpha == 0 {
                 continue; // fully transparent
             }
-            let rgb = line.color & 0x00ff_ffff;
+            let rgb = line.color.0 & 0x00ff_ffff;
 
             // DDA along the dominant screen axis, stamping `width_px`
             // pixels perpendicular to the segment.
@@ -1868,7 +1868,7 @@ impl CpuBackend {
                         &screen[i],
                         &screen[i + 1],
                         image,
-                        quad.tint,
+                        quad.tint.0,
                         quad.depth_test,
                         quad.alpha_cutoff,
                     );

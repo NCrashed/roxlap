@@ -8,6 +8,7 @@
 
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::sprite::Sprite;
+use roxlap_formats::VoxColor;
 use roxlap_gpu::sprite_model::ViewFrustum;
 use roxlap_gpu::{
     build_sprite_model, GpuRendererSettings, HeadlessGpu, SpriteInstance, SpriteInstanceTransform,
@@ -38,7 +39,7 @@ fn read_u32(gpu: &HeadlessGpu, buf: &wgpu::Buffer, words: u64) -> Vec<u32> {
 }
 
 fn axis_instance(model: u32, pos: [f32; 3]) -> SpriteInstance {
-    let sprite = Sprite::axis_aligned(Kv6::solid_cube(8, 0x80_ff_80_40), pos);
+    let sprite = Sprite::axis_aligned(Kv6::solid_cube(8, VoxColor(0x80_ff_80_40)), pos);
     SpriteInstance::new(model, SpriteInstanceTransform::from_sprite(&sprite))
 }
 
@@ -50,7 +51,10 @@ fn cull_cache_and_identity_colmul() {
     };
 
     let mut registry = SpriteModelRegistry::new();
-    let model = registry.add(build_sprite_model(&Kv6::solid_cube(8, 0x80_ff_80_40)));
+    let model = registry.add(build_sprite_model(&Kv6::solid_cube(
+        8,
+        VoxColor(0x80_ff_80_40),
+    )));
     // Two instances ahead of the camera, one far off to the side (culled).
     let instances = vec![
         axis_instance(model, [0.0, 30.0, 0.0]),

@@ -388,6 +388,7 @@ mod tests {
     use crate::chunks::tests::voxel_is_solid;
     use crate::CHUNK_SIZE_XY;
     use glam::DVec3;
+    use roxlap_formats::color::VoxColor;
 
     impl GridId {
         pub(crate) fn from_raw_for_test(raw: u32) -> Self {
@@ -400,7 +401,7 @@ mod tests {
     /// pattern (one voxel per chunk, colour derived from chunk
     /// index) so the round-trip can verify each chunk byte-by-byte
     /// without relying on edit ordering.
-    fn build_two_grid_scene() -> (Scene, Vec<(GridId, IVec3, u32, u32, u32, u32)>) {
+    fn build_two_grid_scene() -> (Scene, Vec<(GridId, IVec3, u32, u32, u32, VoxColor)>) {
         // Returns (scene, expected_voxels) where each expected entry
         // is (grid, chunk_idx, voxel_x, voxel_y, voxel_z, color) for
         // post-restore verification.
@@ -416,8 +417,9 @@ mod tests {
                 for chx in 0..5 {
                     let chunk_idx = IVec3::new(chx, chy, chz);
                     #[allow(clippy::cast_sign_loss)]
-                    let color =
-                        0x80_00_00_00 | ((chx as u32) << 16) | ((chy as u32) << 8) | (chz as u32);
+                    let color = VoxColor(
+                        0x80_00_00_00 | ((chx as u32) << 16) | ((chy as u32) << 8) | (chz as u32),
+                    );
                     let global_voxel = chunk_idx
                         * IVec3::new(
                             CHUNK_SIZE_XY as i32,
@@ -440,8 +442,9 @@ mod tests {
                 for chx in 0..5 {
                     let chunk_idx = IVec3::new(chx, chy, chz);
                     #[allow(clippy::cast_sign_loss)]
-                    let color =
-                        0x80_ff_00_00 | ((chx as u32) << 16) | ((chy as u32) << 8) | (chz as u32);
+                    let color = VoxColor(
+                        0x80_ff_00_00 | ((chx as u32) << 16) | ((chy as u32) << 8) | (chz as u32),
+                    );
                     let global_voxel = chunk_idx
                         * IVec3::new(
                             CHUNK_SIZE_XY as i32,
@@ -460,7 +463,7 @@ mod tests {
         (scene, expected)
     }
 
-    fn assert_voxels_match(scene: &Scene, expected: &[(GridId, IVec3, u32, u32, u32, u32)]) {
+    fn assert_voxels_match(scene: &Scene, expected: &[(GridId, IVec3, u32, u32, u32, VoxColor)]) {
         for &(grid_id, chunk_idx, vx, vy, vz, _color) in expected {
             let grid = scene.grid(grid_id).expect("grid present");
             let chunk = grid.chunk(chunk_idx).expect("chunk present");
@@ -529,7 +532,7 @@ mod tests {
         restored
             .grid_mut(g0)
             .expect("grid 0 present")
-            .set_voxel(new_voxel, Some(0x80_de_ad_be));
+            .set_voxel(new_voxel, Some(VoxColor(0x80_de_ad_be)));
         let chunk = restored
             .grid(g0)
             .unwrap()
@@ -549,11 +552,11 @@ mod tests {
         let id = scene.add_grid(GridTransform::identity());
         let g = scene.grid_mut(id).unwrap();
         // Three edits on chunk (0,0,0) → version 3.
-        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_aa_bb_cc));
-        g.set_voxel(IVec3::new(1, 1, 1), Some(0x80_dd_ee_ff));
-        g.set_voxel(IVec3::new(2, 2, 2), Some(0x80_11_22_33));
+        g.set_voxel(IVec3::new(0, 0, 0), Some(VoxColor(0x80_aa_bb_cc)));
+        g.set_voxel(IVec3::new(1, 1, 1), Some(VoxColor(0x80_dd_ee_ff)));
+        g.set_voxel(IVec3::new(2, 2, 2), Some(VoxColor(0x80_11_22_33)));
         // One edit on chunk (1,0,0) → version 1.
-        g.set_voxel(IVec3::new(128, 0, 0), Some(0x80_44_55_66));
+        g.set_voxel(IVec3::new(128, 0, 0), Some(VoxColor(0x80_44_55_66)));
         assert_eq!(g.chunk_version(IVec3::ZERO), 3);
         assert_eq!(g.chunk_version(IVec3::new(1, 0, 0)), 1);
 

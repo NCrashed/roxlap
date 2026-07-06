@@ -609,6 +609,7 @@ pub fn billboard_blit_into(
 mod tests {
     use super::*;
     use crate::GridTransform;
+    use roxlap_formats::color::VoxColor;
 
     // Sky pixels in built snapshots are tagged with SKY_SENTINEL
     // (not a caller-supplied colour). The test asserts use this
@@ -671,7 +672,7 @@ mod tests {
         g.set_rect(
             IVec3::new(40, 40, 40),
             IVec3::new(80, 80, 80),
-            Some(0x80_22_aa_22),
+            Some(VoxColor(0x80_22_aa_22)),
         );
         g
     }

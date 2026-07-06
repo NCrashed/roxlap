@@ -12,7 +12,7 @@
 
 use roxlap_formats::voxel_clip::{LoopMode, VoxelClip};
 use roxlap_formats::vxl::Vxl;
-use roxlap_formats::{kv6, vox};
+use roxlap_formats::{kv6, vox, VoxColor};
 
 /// A minimal in-memory `.vox` file (what MagicaVoxel writes): the
 /// `"VOX "` header, a `MAIN` container, one `SIZE` + `XYZI` model pair
@@ -71,7 +71,8 @@ fn main() {
         .map(|&r| {
             kv6::Kv6::from_fn(7, 7, 7, |x, y, z| {
                 let d = |v: u32| (i64::from(v) - 3).unsigned_abs();
-                (d(x).max(d(y)).max(d(z)) <= u64::from(r)).then_some(0x80_d0_a0_50)
+                (d(x).max(d(y)).max(d(z)) <= u64::from(r))
+                    .then_some(VoxColor::rgb(0xd0, 0xa0, 0x50))
             })
         })
         .collect();
@@ -87,11 +88,14 @@ fn main() {
     // → slab format" path), then round-trip the .vxl wire bytes. This
     // is also the per-chunk encoding scene snapshots use internally.
     let world = Vxl::from_dense(64, |x, y, z| {
-        (z >= 200 && x + y < 100).then_some(0x80_4d_8a_3a)
+        (z >= 200 && x + y < 100).then_some(VoxColor::rgb(0x4d, 0x8a, 0x3a))
     });
     let bytes = roxlap_formats::vxl::serialize(&world);
     let reparsed = roxlap_formats::vxl::parse(&bytes).expect("self-authored .vxl");
-    assert_eq!(reparsed.voxel_color(10, 10, 200), Some(0x80_4d_8a_3a));
+    assert_eq!(
+        reparsed.voxel_color(10, 10, 200),
+        Some(VoxColor::rgb(0x4d, 0x8a, 0x3a))
+    );
     // Above the terrain is air.
     assert_eq!(reparsed.voxel_color(10, 10, 100), None);
     // ANCHOR_END: vxl_roundtrip

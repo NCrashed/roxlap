@@ -35,6 +35,7 @@
 //! thresholds can grow a real Mid band.
 
 use glam::{DVec3, IVec3};
+use roxlap_render::VoxColor;
 use roxlap_scene::{Grid, GridId, GridTransform, LodThresholds, Scene};
 
 /// World-y of the first (closest) marker pillar. Picked so the
@@ -88,12 +89,12 @@ pub const LOD_R_MID: f64 = 400.0;
 /// with the alpha-bit pattern voxlap expects (`0x80` brightness +
 /// `0x00` flags). Designed to be distinguishable from the ground +
 /// ship + sky.
-const PALETTE: [(u32, u32); NUM_MARKERS] = [
-    (0x80_aa_22_22, 0x80_ee_ee_ee), // red    + white
-    (0x80_22_aa_22, 0x80_22_22_88), // green  + blue
-    (0x80_22_22_aa, 0x80_ee_ee_22), // blue   + yellow
-    (0x80_aa_aa_22, 0x80_aa_22_aa), // yellow + magenta
-    (0x80_aa_22_aa, 0x80_22_aa_aa), // magenta + cyan
+const PALETTE: [(VoxColor, VoxColor); NUM_MARKERS] = [
+    (VoxColor(0x80_aa_22_22), VoxColor(0x80_ee_ee_ee)), // red    + white
+    (VoxColor(0x80_22_aa_22), VoxColor(0x80_22_22_88)), // green  + blue
+    (VoxColor(0x80_22_22_aa), VoxColor(0x80_ee_ee_22)), // blue   + yellow
+    (VoxColor(0x80_aa_aa_22), VoxColor(0x80_aa_22_aa)), // yellow + magenta
+    (VoxColor(0x80_aa_22_aa), VoxColor(0x80_22_aa_aa)), // magenta + cyan
 ];
 
 /// Build a single marker pillar inside `grid`. The pillar lives in
@@ -117,7 +118,7 @@ const PALETTE: [(u32, u32); NUM_MARKERS] = [
 /// weight here anyway. The S6.3 billboard cache builds its
 /// snapshots via opticast at `mip_levels = 1`, so the missing
 /// ladder doesn't affect the Far-tier render either.
-fn build_one_marker(grid: &mut Grid, base: u32, stripe: u32) {
+fn build_one_marker(grid: &mut Grid, base: VoxColor, stripe: VoxColor) {
     // Solid base — 30×30×100, centred on chunk centre (64, 64, 128).
     grid.set_rect(IVec3::new(49, 49, 78), IVec3::new(78, 78, 177), Some(base));
     // 4-voxel stripes every 8 voxels (4-on, 4-off).

@@ -8,6 +8,7 @@
 
 use roxlap_formats::edit::{set_spans, Vspan};
 use roxlap_formats::vxl::Vxl;
+use roxlap_formats::VoxColor;
 use roxlap_gpu::{
     decompress_chunk, GpuRendererSettings, GpuSceneResident, GridUpload, HeadlessGpu, SceneUpload,
 };
@@ -114,7 +115,7 @@ fn partial_matches_full_and_refuses_reflow() {
             });
         }
     }
-    set_spans(&mut vxl, &spans, Some(0x80_12_34_56));
+    set_spans(&mut vxl, &spans, Some(VoxColor(0x80_12_34_56)));
     vxl.remip_bbox(30, 20, 35, 24, 6);
 
     // Full path on resident A; partial on resident B.

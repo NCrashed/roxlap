@@ -28,6 +28,7 @@
 use std::fmt;
 
 use crate::bytes::{Cursor, OutOfBounds};
+use crate::color::VoxColor;
 use crate::kv6::Kv6;
 
 /// Per-axis model size cap, from the format spec (MagicaVoxel's own
@@ -137,7 +138,7 @@ impl VoxModel {
             }
             let abgr = palette[idx as usize];
             let (r, g, b) = (abgr & 0xff, (abgr >> 8) & 0xff, (abgr >> 16) & 0xff);
-            Some(0x8000_0000 | (r << 16) | (g << 8) | b)
+            Some(VoxColor(0x8000_0000 | (r << 16) | (g << 8) | b))
         })
     }
 }

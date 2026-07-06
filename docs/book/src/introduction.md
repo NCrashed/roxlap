@@ -58,11 +58,12 @@ it cannot drift from what actually compiles.
 Two conventions to absorb immediately (both inherited from Voxlap, both
 covered properly in [Concepts & conventions](concepts.md)):
 
-- **Voxel colours are packed `0x80_RR_GG_BB`.** The high byte is not
-  alpha — it is the flat shading intensity, and `0x80` means "unlit
-  default". Passing `0xFF_...` where a voxel colour is expected gives
-  you an over-bright voxel, not an opaque one.
-- The framebuffer/sky packing is plain `0x00_RR_GG_BB`.
+- **Voxel colours are [`VoxColor`]s** — RGB plus a *brightness* byte
+  (not alpha!). `VoxColor::rgb(r, g, b)` packs at the neutral `0x80`.
+- Sky/fog/tint colours are plain **`Rgb`** — a different type, so
+  mixing the packings is a compile error.
+
+[`VoxColor`]: https://docs.rs/roxlap-formats
 
 ### Building a scene
 

@@ -43,6 +43,7 @@ use crate::raster_target::RasterTarget;
 use crate::sky::Sky;
 use crate::Camera;
 use roxlap_formats::material::{material_for_color, Material, MaterialTable};
+use roxlap_formats::Rgb;
 
 /// Per-frame environment for DDA shading (Substage DDA.5): a textured
 /// sky panorama, distance fog, and per-face side shading.
@@ -69,7 +70,7 @@ pub struct DdaEnv<'a> {
     /// TV: terrain colour→material map (`(rgb, material_id)`). A hit voxel's
     /// colour is looked up here for its material. **Empty** (the default) ⇒
     /// every voxel is opaque, so the march returns the first hit unchanged.
-    pub terrain_materials: &'a [(u32, u8)],
+    pub terrain_materials: &'a [(Rgb, u8)],
     /// CPU.1 — dynamic lighting (stage DL on the CPU): sun + point lights +
     /// stylized cel/ramp, evaluated flat per voxel. Disabled by default ⇒ the
     /// hit uses the baked-byte `shade` path, byte-identical to pre-DL. Lights
@@ -1166,6 +1167,7 @@ impl<'a> Sampler<'a> {
         }
         self.cur_view?
             .surface_color_mip(loc[0], loc[1], loc[2], self.mip)
+            .map(|c| c.0)
     }
 
     /// Chunk size in mip-cells along XY / Z (always a power of two).
@@ -1958,7 +1960,7 @@ fn cast_ray_reference(
         #[allow(clippy::cast_sign_loss)]
         if let Some(color) = grid.surface_color(voxel[0] as u32, voxel[1] as u32, voxel[2] as u32) {
             return Some(Hit {
-                color: shade(color, 0),
+                color: shade(color.0, 0),
                 dist: depth.max(0.0),
             });
         }
@@ -1973,6 +1975,7 @@ fn cast_ray_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roxlap_formats::VoxColor;
 
     // CPU.1 — luminance of a packed colour's low-24-bit RGB.
     fn lum(p: u32) -> u32 {
@@ -2151,9 +2154,9 @@ mod tests {
         // Floor at z>=60; a thin wall at x==32 rising from the floor (z 30..60).
         let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, _y, z| {
             if z >= 60 {
-                Some(0x80_80_80_80) // floor
+                Some(VoxColor(0x80_80_80_80)) // floor
             } else if x == 32 && (30..60).contains(&z) {
-                Some(0x80_70_70_70) // wall (distinct so it's not a dead branch)
+                Some(VoxColor(0x80_70_70_70)) // wall (distinct so it's not a dead branch)
             } else {
                 None
             }
@@ -2329,7 +2332,7 @@ mod tests {
         let vxl = roxlap_formats::vxl::Vxl::from_dense(8, |x, _, z| {
             let lo = (10..=12).contains(&z);
             let hi = (40..=42).contains(&z);
-            (lo || hi).then_some(0x80_10_20_30 + x)
+            (lo || hi).then_some(VoxColor(0x80_10_20_30 + x))
         });
         let grid = GridView::from_single_vxl(&vxl);
         for x in 0..8 {
@@ -2370,7 +2373,7 @@ mod tests {
     #[test]
     fn floor_seen_from_above() {
         const FLOOR_Z: u32 = 40;
-        const FLOOR_COL: u32 = 0x80_30_60_90;
+        const FLOOR_COL: VoxColor = VoxColor(0x80_30_60_90);
         let vxl =
             roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| (z >= FLOOR_Z).then_some(FLOOR_COL));
         let grid = GridView::from_single_vxl(&vxl);
@@ -2394,7 +2397,7 @@ mod tests {
             .iter()
             .find(|(idx, _, _)| *idx == centre)
             .expect("centre ray must hit the floor");
-        assert_eq!(hit.1 & 0x00ff_ffff, FLOOR_COL & 0x00ff_ffff);
+        assert_eq!(hit.1 & 0x00ff_ffff, FLOOR_COL.0 & 0x00ff_ffff);
         let expected = (FLOOR_Z as f32) - 10.0;
         assert!(
             (hit.2 - expected).abs() < 1.5,
@@ -2412,7 +2415,7 @@ mod tests {
     fn horizon_splits_sky_and_floor() {
         const FLOOR_Z: u32 = 40;
         let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| {
-            (z >= FLOOR_Z).then_some(0x80_44_66_88)
+            (z >= FLOOR_Z).then_some(VoxColor(0x80_44_66_88))
         });
         let grid = GridView::from_single_vxl(&vxl);
 
@@ -2508,7 +2511,7 @@ mod tests {
     #[test]
     fn no_sky_leak_through_diagonal_wall() {
         let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
-            ((x + y == 64) && (2..62).contains(&z)).then_some(0x80_40_80_60)
+            ((x + y == 64) && (2..62).contains(&z)).then_some(VoxColor(0x80_40_80_60))
         });
         let grid = GridView::from_single_vxl(&vxl);
         let (w, h) = (160u32, 160u32);
@@ -2535,8 +2538,8 @@ mod tests {
     /// hit; with the map it becomes translucent and the floor tints through.
     #[test]
     fn terrain_glass_tints_floor_behind() {
-        let glass = 0x80_40_C0_E0; // cyan
-        let floor = 0x80_C0_40_40; // red
+        let glass = VoxColor(0x80_40_C0_E0); // cyan
+        let floor = VoxColor(0x80_C0_40_40); // red
         let vxl = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| {
             if z == 4 {
                 Some(glass)
@@ -2570,7 +2573,7 @@ mod tests {
         table.set(1, Material::alpha_blend(128));
         let env = DdaEnv {
             materials: Some(&table),
-            terrain_materials: &[(glass & 0x00ff_ffff, 1)],
+            terrain_materials: &[(glass.rgb_part(), 1)],
             lights: CpuLights::default(),
             ..DdaEnv::default()
         };
@@ -2593,10 +2596,10 @@ mod tests {
     /// smoke grey) — thickness-dependent, unlike per-span AlphaBlend.
     #[test]
     fn terrain_volumetric_thickness_deepens_opacity() {
-        let smoke = 0x80_90_90_90; // grey
-        let floor = 0x80_C0_20_20; // red (low green)
-                                   // Centre green channel for a smoke column `depth` voxels deep (filled),
-                                   // floor at z>=12, camera looking straight down.
+        let smoke = VoxColor(0x80_90_90_90); // grey
+        let floor = VoxColor(0x80_C0_20_20); // red (low green)
+                                             // Centre green channel for a smoke column `depth` voxels deep (filled),
+                                             // floor at z>=12, camera looking straight down.
         let green_at = |depth: u32| -> u32 {
             let vxl = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| {
                 if (4..4 + depth).contains(&z) {
@@ -2619,7 +2622,7 @@ mod tests {
             table.set(1, Material::volumetric(80));
             let env = DdaEnv {
                 materials: Some(&table),
-                terrain_materials: &[(smoke & 0x00ff_ffff, 1)],
+                terrain_materials: &[(smoke.rgb_part(), 1)],
                 lights: CpuLights::default(),
                 ..DdaEnv::default()
             };
@@ -2638,8 +2641,9 @@ mod tests {
     /// floor pixel is closer to the fog colour than a near one.
     #[test]
     fn distance_fog_blends_toward_fog_color() {
-        let vxl =
-            roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| (z >= 40).then_some(0x80_FF_FF_FF));
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| {
+            (z >= 40).then_some(VoxColor(0x80_FF_FF_FF))
+        });
         let grid = GridView::from_single_vxl(&vxl);
         let cam = Camera {
             pos: [32.0, 2.0, 38.0],
@@ -2764,8 +2768,9 @@ mod tests {
     /// `z-` face reduction (index 4).
     #[test]
     fn side_shades_darken_hit_face() {
-        let vxl =
-            roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| (z >= 8).then_some(0x80_FF_FF_FF));
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| {
+            (z >= 8).then_some(VoxColor(0x80_FF_FF_FF))
+        });
         let grid = GridView::from_single_vxl(&vxl);
         let cam = Camera {
             pos: [8.0, 8.0, 2.0],
@@ -2811,7 +2816,7 @@ mod tests {
             let surf = 30 + ((x / 5 + y / 7) % 11);
             let ground = z >= surf;
             let block = (20..=24).contains(&z) && (10..20).contains(&x) && (40..50).contains(&y);
-            (ground || block).then_some(0x80_30_50_70 + (x ^ y) % 0x40)
+            (ground || block).then_some(VoxColor(0x80_30_50_70 + (x ^ y) % 0x40))
         });
         let grid = GridView::from_single_vxl(&vxl);
 
@@ -2855,8 +2860,9 @@ mod tests {
     #[test]
     fn baked_brightness_darkens_color() {
         // Half brightness: alpha 0x40 (64/128). White RGB → ~mid grey.
-        let dim =
-            roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| (z >= 8).then_some(0x40_FF_FF_FF));
+        let dim = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| {
+            (z >= 8).then_some(VoxColor(0x40_FF_FF_FF))
+        });
         let grid = GridView::from_single_vxl(&dim);
         let cam = Camera {
             pos: [8.0, 8.0, 2.0],
@@ -2870,8 +2876,9 @@ mod tests {
         assert_eq!(fb[centre], 0x80_7F_7F_7F, "got {:08x}", fb[centre]);
 
         // Full brightness passes RGB through unchanged.
-        let full =
-            roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| (z >= 8).then_some(0x80_FF_FF_FF));
+        let full = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, z| {
+            (z >= 8).then_some(VoxColor(0x80_FF_FF_FF))
+        });
         let gridf = GridView::from_single_vxl(&full);
         let (fbf, _) = render_brickmap(gridf, &cam, 32, 32);
         assert_eq!(fbf[centre], 0x80_FF_FF_FF, "got {:08x}", fbf[centre]);
@@ -2886,7 +2893,7 @@ mod tests {
     #[test]
     fn cross_chunk_lookdown_sees_lower_stacked_floor() {
         const FLOOR_LOCAL_Z: u32 = 40;
-        const FLOOR_COL: u32 = 0x80_22_88_44;
+        const FLOOR_COL: VoxColor = VoxColor(0x80_22_88_44);
         let upper = roxlap_formats::vxl::Vxl::empty(32); // all air + bedrock
         let lower = roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| {
             (z >= FLOOR_LOCAL_Z).then_some(FLOOR_COL)
@@ -2916,7 +2923,7 @@ mod tests {
         let (fb, zb) = render_brickmap(grid, &cam, w, h);
         let centre = 24 * 48 + 24;
         assert!(
-            fb[centre] & 0x00ff_ffff == FLOOR_COL & 0x00ff_ffff,
+            fb[centre] & 0x00ff_ffff == FLOOR_COL.0 & 0x00ff_ffff,
             "centre ray must reach the lower-chunk floor (got {:08x})",
             fb[centre]
         );
@@ -2935,7 +2942,9 @@ mod tests {
     #[test]
     fn cross_chunk_xy_floor_is_seamless() {
         let mk = || {
-            roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| (z >= 20).then_some(0x80_50_50_50))
+            roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| {
+                (z >= 20).then_some(VoxColor(0x80_50_50_50))
+            })
         };
         let (c0, c1) = (mk(), mk());
         let v0 = GridView::from_single_vxl(&c0);
@@ -3004,7 +3013,7 @@ mod tests {
     fn mip_render_is_coarse_but_complete() {
         let mut vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
             let surf = 24 + ((x / 3 + y / 5) % 17);
-            (z >= surf).then_some(0x80_50_70_90)
+            (z >= surf).then_some(VoxColor(0x80_50_70_90))
         });
         vxl.generate_mips(4);
         assert!(vxl.mip_count() >= 3, "need mips built for this test");
@@ -3050,7 +3059,7 @@ mod tests {
                 let mut v = roxlap_formats::vxl::Vxl::from_dense(128, |x, y, z| {
                     let (gx, gy) = (ox + x as i32, oy + y as i32);
                     let surf = 90 + ((gx / 7 + gy / 9).rem_euclid(40)) + ((gx / 23).rem_euclid(20));
-                    (z as i32 >= surf).then_some(0x80_50_70_90 + (x ^ y) % 0x30)
+                    (z as i32 >= surf).then_some(VoxColor(0x80_50_70_90 + (x ^ y) % 0x30))
                 });
                 v.generate_mips(4);
                 vxls.push(v);
@@ -3134,7 +3143,7 @@ mod tests {
     fn parallel_matches_sequential() {
         let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
             let surf = 28 + ((x / 4 + y / 6) % 13);
-            (z >= surf).then_some(0x80_40_60_80 + (x ^ y) % 0x30)
+            (z >= surf).then_some(VoxColor(0x80_40_60_80 + (x ^ y) % 0x30))
         });
         let grid = GridView::from_single_vxl(&vxl);
         let (w, h) = (96u32, 96u32);
@@ -3186,7 +3195,7 @@ mod tests {
     #[test]
     fn cliff_side_is_solid_not_see_through() {
         const TOP_Z: u32 = 50;
-        const COL: u32 = 0x80_77_88_99;
+        const COL: VoxColor = VoxColor(0x80_77_88_99);
         let vxl = roxlap_formats::vxl::Vxl::from_dense(8, |_, _, z| (z >= TOP_Z).then_some(COL));
         let grid = GridView::from_single_vxl(&vxl);
 
@@ -3205,7 +3214,7 @@ mod tests {
     /// immediately — every ray reports a hit (no skip / no garbage).
     #[test]
     fn camera_inside_solid_hits_everywhere() {
-        let vxl = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, _| Some(0x80_55_55_55));
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(16, |_, _, _| Some(VoxColor(0x80_55_55_55)));
         let grid = GridView::from_single_vxl(&vxl);
         let cam = Camera {
             pos: [8.0, 8.0, 128.0],
@@ -3228,7 +3237,7 @@ mod tests {
     /// rays, so the silhouette is hole-free by construction.
     #[test]
     fn single_voxel_silhouette_has_no_notch() {
-        const C: u32 = 0x80_FF_80_40;
+        const C: VoxColor = VoxColor(0x80_FF_80_40);
         let vxl = roxlap_formats::vxl::Vxl::from_dense(16, |x, y, z| {
             (x == 8 && y == 8 && z == 8).then_some(C)
         });

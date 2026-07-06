@@ -15,6 +15,8 @@
 //! carries no material data resolves every voxel to id 0 and renders exactly
 //! as before.
 
+use crate::color::Rgb;
+
 /// How a voxel's colour combines with what is already behind it along a ray.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -190,10 +192,10 @@ impl Default for MaterialTable {
 /// ([`Material::OPAQUE`]). Linear scan — `map` is tiny (a handful of material
 /// colours), so this stays cheap even called per voxel.
 #[must_use]
-pub fn material_for_color(map: &[(u32, u8)], col: u32) -> u8 {
+pub fn material_for_color(map: &[(Rgb, u8)], col: u32) -> u8 {
     let rgb = col & 0x00ff_ffff;
     for &(c, id) in map {
-        if c & 0x00ff_ffff == rgb {
+        if c.0 & 0x00ff_ffff == rgb {
             return id;
         }
     }

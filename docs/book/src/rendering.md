@@ -118,9 +118,9 @@ rebuild per frame from the current window size.
 ### Overlay lines
 
 `draw_lines` renders world-space segments over the frame — editor
-gizmos, debug paths, hover wireframes. Note the colour packing:
-`Line3.color` is `0xAARRGGBB` with a real **alpha** byte, unlike voxel
-colours (chapter 2). Depth-tested lines are occluded by nearer
+gizmos, debug paths, hover wireframes. Note the colour type:
+`Line3.color` is an `OverlayColor` — the one packing with a real
+**alpha** byte (chapter 2's colour family). Depth-tested lines are occluded by nearer
 voxels; non-depth-tested ones draw on top (hover highlights).
 
 ```rust,noplayground

@@ -143,9 +143,9 @@ fn cam_from_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
 
 // Voxlap-packed colours: `(brightness << 24) | (R << 16) | (G << 8) | B`,
 // `0x80` brightness = the neutral lit baseline.
-const GRASS: u32 = 0x80_4d_8a_3a; // mossy green hilltops
-const DIRT: u32 = 0x80_6b_4a_28; // earthy brown
-const STONE: u32 = 0x80_7a_7a_82; // cool grey rock
+const GRASS: VoxColor = VoxColor(0x80_4d_8a_3a); // mossy green hilltops
+const DIRT: VoxColor = VoxColor(0x80_6b_4a_28); // earthy brown
+const STONE: VoxColor = VoxColor(0x80_7a_7a_82); // cool grey rock
 
 /// Build the demo world: one ground grid of coarse terraced hills
 /// plus a few landmark boulders + a pillar so motion reads clearly.

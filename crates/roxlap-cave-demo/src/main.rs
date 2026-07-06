@@ -31,6 +31,8 @@
 //! Movement is collision-checked: the camera slides along walls instead
 //! of clipping through them.
 
+use roxlap_render::Rgb;
+use roxlap_render::VoxColor;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -96,7 +98,7 @@ const BULLET_SPHERE_RADIUS: u32 = 3;
 /// Bullet sprite colour (voxlap-packed `0x80RRGGBB`, high bit = shaded):
 /// bright plasma pink, visible against both the blue and mag cave
 /// palettes.
-const BULLET_COLOR: u32 = 0x80FF_4080;
+const BULLET_COLOR: VoxColor = VoxColor(0x80FF_4080);
 
 /// Voxlap colour stamped on the inner walls of the carved crater (the
 /// voxels that were buried before the carve and are now newly exposed).
@@ -105,13 +107,13 @@ const BULLET_COLOR: u32 = 0x80FF_4080;
 /// 16) | (G << 8) | B` per voxlap convention; brightness `0x80` is
 /// voxlap's neutral.
 #[allow(clippy::cast_possible_wrap)]
-const CARVE_COLOR: i32 = 0x8050_3018u32 as i32;
+const CARVE_COLOR: VoxColor = VoxColor(0x8050_3018);
 
 /// Voxlap colour used when carving the spawn bubble — neutral mid-grey
 /// that doesn't betray the carve's source as much as the scorched-amber
 /// `CARVE_COLOR`.
 #[allow(clippy::cast_possible_wrap)]
-const SPAWN_BUBBLE_COLOR: i32 = 0x8060_6068u32 as i32;
+const SPAWN_BUBBLE_COLOR: VoxColor = VoxColor(0x8060_6068);
 
 /// Radius of the carve performed at world centre so the camera always
 /// spawns inside an open pocket (cave-gen otherwise leaves the centre
@@ -579,9 +581,9 @@ impl App {
         // QE.2 — `FrameParams::new` + overrides; both backends project
         // from `settings` (one FOV, one derived scan budget).
         let mut frame = FrameParams::new(&settings);
-        frame.sky_color = self.engine.sky_color();
+        frame.sky_color = Rgb(self.engine.sky_color());
         frame.sky = self.engine.sky();
-        frame.fog_color = self.engine.fog_color();
+        frame.fog_color = Rgb(self.engine.fog_color());
         frame.fog_max_scan_dist = self.engine.fog_max_scan_dist();
         frame.side_shades = self.engine.side_shades();
 

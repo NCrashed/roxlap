@@ -22,7 +22,7 @@ use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Camera;
 use roxlap_render::{
     BackendPreference, BillboardMode, DynSpriteTransform, FrameParams, Kv6, LoopMode,
-    RenderOptions, SceneRenderer, SpriteInstanceId, VoxelClip,
+    RenderOptions, Rgb, SceneRenderer, SpriteInstanceId, VoxColor, VoxelClip,
 };
 use roxlap_scene::{GridTransform, Scene};
 use winit::application::ApplicationHandler;
@@ -30,10 +30,10 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-const GRASS: u32 = 0x80_4d_8a_3a;
-const GEM: u32 = 0x80_c8_50_d0;
-const ORB: u32 = 0x80_d0_a0_50;
-const SKY: u32 = 0x00_8f_bc_d4;
+const GRASS: VoxColor = VoxColor(0x80_4d_8a_3a);
+const GEM: VoxColor = VoxColor(0x80_c8_50_d0);
+const ORB: VoxColor = VoxColor(0x80_d0_a0_50);
+const SKY: Rgb = Rgb(0x00_8f_bc_d4);
 
 fn build_scene() -> Scene {
     let mut scene = Scene::new();

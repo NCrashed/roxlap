@@ -366,6 +366,7 @@ pub(crate) mod tests {
     use crate::chunks::tests::voxel_is_solid;
     use crate::{Grid, GridTransform, Scene, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
     use glam::DQuat;
+    use roxlap_formats::color::VoxColor;
     use roxlap_formats::edit::{set_spans, Vspan};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -415,7 +416,7 @@ pub(crate) mod tests {
                     z0: u8::try_from(mark_z).unwrap_or(0),
                     z1: u8::try_from(mark_z).unwrap_or(0),
                 }],
-                Some(0x80_aa_bb_cc),
+                Some(VoxColor(0x80_aa_bb_cc)),
             );
             vxl
         }
@@ -501,7 +502,7 @@ pub(crate) mod tests {
         let mut g = Grid::new(GridTransform::identity());
         let idx = IVec3::new(0, 0, 0);
         // Stamp a manual voxel at chunk-local (10, 10, 10).
-        g.set_voxel(IVec3::new(10, 10, 10), Some(0x80_11_22_33));
+        g.set_voxel(IVec3::new(10, 10, 10), Some(VoxColor(0x80_11_22_33)));
         assert_eq!(g.chunk_count(), 1);
 
         let gen = StubGenerator::new();
@@ -577,7 +578,7 @@ pub(crate) mod tests {
         scene
             .grid_mut(id)
             .unwrap()
-            .set_voxel(IVec3::new(10_000, 0, 0), Some(0x80_11_22_33));
+            .set_voxel(IVec3::new(10_000, 0, 0), Some(VoxColor(0x80_11_22_33)));
         let baseline_chunks = scene.grid(id).unwrap().chunk_count();
         scene.pump_streaming_sync(DVec3::ZERO);
         assert_eq!(scene.grid(id).unwrap().chunk_count(), baseline_chunks);
@@ -736,7 +737,7 @@ pub(crate) mod tests {
         g.stream_radius = StreamRadius::new(200.0, 400.0);
         // Manual chunk at (50, 0, 0): grid-local x=50*128 = 6400, far
         // outside r_evict from origin.
-        g.set_voxel(IVec3::new(50 * 128, 0, 0), Some(0x80_aa_bb_cc));
+        g.set_voxel(IVec3::new(50 * 128, 0, 0), Some(VoxColor(0x80_aa_bb_cc)));
         assert_eq!(scene.grid(id).unwrap().chunk_count(), 1);
 
         scene.pump_streaming_sync(DVec3::ZERO);
@@ -802,7 +803,7 @@ pub(crate) mod tests {
         g.set_generator(Some(Arc::new(gen)));
         let idx = IVec3::ZERO;
         g.ensure_chunk_generated(idx);
-        g.set_voxel(IVec3::new(10, 10, 10), Some(0x80_aa_bb_cc));
+        g.set_voxel(IVec3::new(10, 10, 10), Some(VoxColor(0x80_aa_bb_cc)));
         assert_eq!(g.chunk_version(idx), 1);
     }
 
@@ -814,7 +815,7 @@ pub(crate) mod tests {
         let mut scene = Scene::new();
         let id = scene.add_grid(GridTransform::identity());
         let g = scene.grid_mut(id).unwrap();
-        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_aa_bb_cc));
+        g.set_voxel(IVec3::new(0, 0, 0), Some(VoxColor(0x80_aa_bb_cc)));
         assert_eq!(g.chunk_version(IVec3::ZERO), 1);
         g.stream_radius = StreamRadius::new(10.0, 50.0);
 
@@ -922,7 +923,7 @@ pub(crate) mod tests {
         // NOT clear the cache — there was no bounding-sphere
         // change to invalidate.
         let mut g = Grid::new(GridTransform::identity());
-        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_aa_bb_cc));
+        g.set_voxel(IVec3::new(0, 0, 0), Some(VoxColor(0x80_aa_bb_cc)));
         g.billboards = Some(crate::BillboardCache::new_empty(32));
         // No generator → no install → cache stays.
         let installed = g.ensure_chunk_generated(IVec3::new(5, 5, 0));
@@ -1139,7 +1140,7 @@ pub(crate) mod tests {
         // Edit while the task is blocked.
         let g = scene.grid_mut(id).unwrap();
         // A user voxel at (10, 11, 12) inside chunk (0,0,0).
-        g.set_voxel(IVec3::new(10, 11, 12), Some(0x80_de_ad_be));
+        g.set_voxel(IVec3::new(10, 11, 12), Some(VoxColor(0x80_de_ad_be)));
         assert_eq!(g.chunk_version(IVec3::ZERO), 1);
         let chunk = g.chunk(IVec3::ZERO).unwrap();
         assert!(voxel_is_solid(chunk, 10, 11, 12));
@@ -1277,7 +1278,7 @@ pub(crate) mod tests {
         let id = scene.add_grid(GridTransform::identity());
         let g = scene.grid_mut(id).unwrap();
         // Seed a single chunk to evict and a placeholder cache.
-        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_aa_bb_cc));
+        g.set_voxel(IVec3::new(0, 0, 0), Some(VoxColor(0x80_aa_bb_cc)));
         g.billboards = Some(BillboardCache::new_empty(64));
         g.stream_radius = StreamRadius::new(10.0, 50.0);
 
@@ -1330,7 +1331,7 @@ pub(crate) mod tests {
         let edited_version = {
             let g = scene.grid_mut(id).unwrap();
             assert!(g.chunks.contains_key(&IVec3::ZERO), "chunk streamed in");
-            g.set_voxel(edited_voxel, Some(0x8011_2233));
+            g.set_voxel(edited_voxel, Some(VoxColor(0x8011_2233)));
             assert!(g.voxel_solid(edited_voxel));
             let v = g.chunk_version(IVec3::ZERO);
             assert!(v > 0, "edit bumps the version");
@@ -1374,7 +1375,7 @@ pub(crate) mod tests {
         {
             // Seed the store from a throwaway grid.
             let mut g = Grid::new(GridTransform::identity());
-            g.set_voxel(IVec3::new(2, 2, 50), Some(0x8044_5566));
+            g.set_voxel(IVec3::new(2, 2, 50), Some(VoxColor(0x8044_5566)));
             let vxl = g.chunks.get(&IVec3::ZERO).expect("materialised");
             store.store(IVec3::ZERO, vxl, 7);
         }

@@ -347,7 +347,10 @@ mod tests {
         let id = scene.add_grid(roxlap_scene::GridTransform::at(DVec3::new(4.0, 0.0, 0.0)));
         let g = scene.grid_mut(id).expect("just added");
         g.name = Some("ground".to_string());
-        g.set_voxel(IVec3::new(0, 0, 200), Some(0x80_40_40_40));
+        g.set_voxel(
+            IVec3::new(0, 0, 200),
+            Some(roxlap_scene::VoxColor(0x80_40_40_40)),
+        );
         let s = summarize(Kind::Snapshot, &scene.save_snapshot()).expect("valid snapshot");
         assert!(s.contains("1 grid(s)"), "got: {s}");
         assert!(s.contains("\"ground\", 1 chunk(s) (1 edited)"), "got: {s}");

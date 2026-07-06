@@ -117,6 +117,7 @@ pub fn slide_with_collision(scene: &Scene, pos: &mut [f64; 3], step: [f64; 3]) {
 mod tests {
     use super::*;
     use glam::DVec3;
+    use roxlap_scene::VoxColor;
     use roxlap_scene::{GridTransform, Scene};
 
     /// Single floating voxel at chunk-local (10, 10, 50) in a grid
@@ -126,7 +127,7 @@ mod tests {
         let mut scene = Scene::new();
         let id = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, -100.0)));
         let grid = scene.grid_mut(id).expect("grid present");
-        grid.set_voxel(IVec3::new(10, 10, 50), Some(0x80_aa_bb_cc));
+        grid.set_voxel(IVec3::new(10, 10, 50), Some(VoxColor(0x80_aa_bb_cc)));
         scene
     }
 

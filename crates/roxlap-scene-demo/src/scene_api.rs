@@ -42,9 +42,9 @@ pub fn frame_params<'a>(
     scan_dist: i32,
 ) -> FrameParams<'a> {
     let mut frame = FrameParams::new(settings);
-    frame.sky_color = engine.sky_color();
+    frame.sky_color = roxlap_render::Rgb(engine.sky_color());
     frame.sky = engine.sky();
-    frame.fog_color = engine.sky_color();
+    frame.fog_color = roxlap_render::Rgb(engine.sky_color());
     frame.fog_max_scan_dist = scan_dist;
     frame.side_shades = engine.side_shades();
     frame

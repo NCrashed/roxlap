@@ -64,6 +64,7 @@ pub use chunks::BakeMode;
 pub use edit::SpanOp;
 pub use lod::{select_lod, Lod, LodThresholds};
 pub use roxlap_core::AoParams;
+pub use roxlap_formats::color::{OverlayColor, Rgb, VoxColor};
 pub use streaming::{ChunkGenerator, ChunkStore, StreamRadius};
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
@@ -105,7 +106,7 @@ pub struct RayHit {
     pub t: f64,
     /// Packed colour of the hit voxel, or `None` if it's an untextured
     /// (bedrock / interior) cell. See [`Grid::voxel_color`].
-    pub color: Option<u32>,
+    pub color: Option<VoxColor>,
 }
 
 /// Ray/AABB slab intersection in f64 (`[lo, hi)` box). Returns the
@@ -1353,7 +1354,7 @@ mod tests {
         scene
             .grid_mut(id)
             .unwrap()
-            .set_voxel(IVec3::new(5, 5, 10), Some(0x80_aa_bb_cc));
+            .set_voxel(IVec3::new(5, 5, 10), Some(VoxColor(0x80_aa_bb_cc)));
 
         // Straight down the +z column through (5,5): hits z=10 at t≈10.
         let hit = scene
@@ -1383,7 +1384,7 @@ mod tests {
         scene
             .grid_mut(id)
             .unwrap()
-            .set_voxel(IVec3::new(5, 5, 10), Some(0x80_11_22_33));
+            .set_voxel(IVec3::new(5, 5, 10), Some(VoxColor(0x80_11_22_33)));
 
         let hit = scene
             .raycast(DVec3::new(105.5, 5.5, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
@@ -1403,11 +1404,11 @@ mod tests {
         scene
             .grid_mut(near)
             .unwrap()
-            .set_voxel(IVec3::new(1, 1, 20), Some(0x80_00_ff_00));
+            .set_voxel(IVec3::new(1, 1, 20), Some(VoxColor(0x80_00_ff_00)));
         scene
             .grid_mut(far)
             .unwrap()
-            .set_voxel(IVec3::new(1, 1, 40), Some(0x80_ff_00_00));
+            .set_voxel(IVec3::new(1, 1, 40), Some(VoxColor(0x80_ff_00_00)));
 
         let hit = scene
             .raycast(DVec3::new(1.5, 1.5, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
@@ -1508,7 +1509,7 @@ mod tests {
         let id = scene.add_grid(GridTransform::identity());
         let g = scene.grid_mut(id).unwrap();
         // Populate chunk (0, 0, 0) via the edit API.
-        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_88_88_88));
+        g.set_voxel(IVec3::new(0, 0, 0), Some(VoxColor(0x80_88_88_88)));
         let r = g.bounding_radius();
         let expected = ((64.0_f64).powi(2) * 2.0 + (128.0_f64).powi(2)).sqrt();
         assert!(
@@ -1527,9 +1528,9 @@ mod tests {
         let id = scene.add_grid(GridTransform::identity());
         let g = scene.grid_mut(id).unwrap();
         // Stamp one voxel in chunk (0,0,0).
-        g.set_voxel(IVec3::new(0, 0, 0), Some(0x80_88_88_88));
+        g.set_voxel(IVec3::new(0, 0, 0), Some(VoxColor(0x80_88_88_88)));
         // Stamp one voxel in chunk (3,0,0): grid-local x = 3*128 = 384.
-        g.set_voxel(IVec3::new(384, 0, 0), Some(0x80_88_88_88));
+        g.set_voxel(IVec3::new(384, 0, 0), Some(VoxColor(0x80_88_88_88)));
         assert_eq!(g.chunks.len(), 2);
         let r = g.bounding_radius();
         let expected = (256.0_f64.powi(2) + 64.0_f64.powi(2) + 128.0_f64.powi(2)).sqrt();

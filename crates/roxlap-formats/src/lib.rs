@@ -24,6 +24,7 @@ mod bytes;
 /// on-disk form of a complete animated voxel character. Built on
 /// [`kfa`] / [`kv6`] / [`sprite`].
 pub mod character;
+pub mod color;
 pub mod edit;
 /// Voxlap's `univec[256]` surface-normal direction table + the
 /// `normal → dir` quantiser ([`equivec::nearest_dir`]). Lives here (not
@@ -62,5 +63,6 @@ pub mod voxel_clip;
 pub mod vxl;
 pub mod xform;
 
+pub use color::{OverlayColor, Rgb, VoxColor};
 pub use material::{material_for_color, BlendMode, Material, MaterialTable};
 pub use palette::Rgb6;

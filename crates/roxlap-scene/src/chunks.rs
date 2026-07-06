@@ -216,7 +216,7 @@ impl Grid {
     /// the colour-inspection companion to [`Self::voxel_solid`]. Use it
     /// to read back what a pick / raycast hit looks like.
     #[must_use]
-    pub fn voxel_color(&self, voxel: IVec3) -> Option<u32> {
+    pub fn voxel_color(&self, voxel: IVec3) -> Option<roxlap_formats::color::VoxColor> {
         let (chunk_idx, in_chunk) = crate::voxel_split(voxel);
         self.chunk(chunk_idx)?
             .voxel_color(in_chunk.x, in_chunk.y, in_chunk.z)
@@ -644,6 +644,7 @@ pub struct ChunkXyBacking<'a> {
 pub(crate) mod tests {
     use super::*;
     use crate::{GridTransform, CHUNK_SIZE_Z};
+    use roxlap_formats::color::VoxColor;
 
     /// Decode `column`'s slab bytes and return `true` iff `z` is
     /// covered by any solid run. Mirrors voxlap's column-walk
@@ -660,7 +661,7 @@ pub(crate) mod tests {
         // edit: the set voxel is solid, its neighbour is air, and an
         // unmaterialised chunk reads as air.
         let mut g = Grid::new(GridTransform::identity());
-        g.set_voxel(IVec3::new(5, 6, 7), Some(0x80_aa_bb_cc));
+        g.set_voxel(IVec3::new(5, 6, 7), Some(VoxColor(0x80_aa_bb_cc)));
         assert!(g.voxel_solid(IVec3::new(5, 6, 7)), "set voxel is solid");
         assert!(!g.voxel_solid(IVec3::new(5, 6, 8)), "neighbour is air");
         assert!(
@@ -674,7 +675,7 @@ pub(crate) mod tests {
         // Negative grid-local voxels decompose via div_euclid (addr
         // semantics); the query must follow the same split.
         let mut g = Grid::new(GridTransform::identity());
-        g.set_voxel(IVec3::new(-1, -1, 10), Some(0x80_11_22_33));
+        g.set_voxel(IVec3::new(-1, -1, 10), Some(VoxColor(0x80_11_22_33)));
         assert!(g.voxel_solid(IVec3::new(-1, -1, 10)));
         assert!(!g.voxel_solid(IVec3::new(-1, -1, 11)));
     }
@@ -760,7 +761,7 @@ pub(crate) mod tests {
         // Voxel local (5, 6, 7) inside chunk (2, -1, 0) is
         // grid-local global (2*128 + 5, -1*128 + 6, 0*256 + 7) =
         // (261, -122, 7).
-        g.set_voxel(IVec3::new(261, -122, 7), Some(0x80_aa_bb_cc));
+        g.set_voxel(IVec3::new(261, -122, 7), Some(VoxColor(0x80_aa_bb_cc)));
         let vxl = g.ensure_chunk(chunk);
         assert!(voxel_is_solid(vxl, 5, 6, 7));
         assert_eq!(g.chunk_count(), 1);
@@ -847,7 +848,7 @@ pub(crate) mod tests {
             g.set_rect(
                 IVec3::new(0, 0, 160),
                 IVec3::new(255, 255, 255),
-                Some(0x80_66_77_88),
+                Some(VoxColor(0x80_66_77_88)),
             );
             for i in 0..10 {
                 let (x, y) = (23 * i % 240 + 8, 37 * i % 240 + 8);
@@ -892,7 +893,7 @@ pub(crate) mod tests {
         g.set_rect(
             IVec3::new(0, 0, 150),
             IVec3::new(127, 127, 255),
-            Some(0x80_66_77_88),
+            Some(VoxColor(0x80_66_77_88)),
         );
         for i in 0..8 {
             let (x, y) = (29 * i % 100 + 12, 41 * i % 100 + 12);
@@ -922,7 +923,7 @@ pub(crate) mod tests {
                 let ri = r as i32;
                 for v in [&mut full, &mut inc] {
                     set_sphere_with_colfunc(v, c.into(), r, SpanOp::Carve, |_, _, _| {
-                        0x80_31_41_59_u32 as i32
+                        VoxColor(0x80_31_41_59)
                     });
                 }
                 lo = lo.min(c - IVec3::splat(ri));
@@ -956,7 +957,7 @@ pub(crate) mod tests {
         // plus a sphere for varied neighbours.
         g.set_rect(IVec3::new(3, 4, 40), IVec3::new(4, 5, 60), None);
         g.set_rect(IVec3::new(3, 4, 100), IVec3::new(4, 5, 140), None);
-        g.set_voxel(IVec3::new(3, 4, 120), Some(0x80_11_22_33)); // island inside the pocket
+        g.set_voxel(IVec3::new(3, 4, 120), Some(VoxColor(0x80_11_22_33))); // island inside the pocket
         g.set_sphere(IVec3::new(8, 8, 80), 6, None);
         let vxl = g.chunk(IVec3::ZERO).expect("chunk materialised");
 

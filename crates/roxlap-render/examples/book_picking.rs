@@ -21,16 +21,19 @@ use std::time::Instant;
 use glam::{DVec3, IVec3};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Camera;
-use roxlap_render::{BackendPreference, FrameParams, Line3, RenderOptions, SceneRenderer};
+use roxlap_render::{
+    BackendPreference, FrameParams, Line3, OverlayColor, RenderOptions, Rgb, SceneRenderer,
+    VoxColor,
+};
 use roxlap_scene::{GridTransform, Scene};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-const GRASS: u32 = 0x80_4d_8a_3a;
-const PILLAR: u32 = 0x80_b0_a0_88;
-const SKY: u32 = 0x00_8f_bc_d4;
+const GRASS: VoxColor = VoxColor(0x80_4d_8a_3a);
+const PILLAR: VoxColor = VoxColor(0x80_b0_a0_88);
+const SKY: Rgb = Rgb(0x00_8f_bc_d4);
 
 fn build_scene() -> Scene {
     let mut scene = Scene::new();
@@ -56,7 +59,7 @@ fn build_scene() -> Scene {
 }
 
 /// The 12 edges of a unit voxel's AABB as always-on-top overlay lines.
-fn voxel_outline(world_voxel: IVec3, color: u32) -> Vec<Line3> {
+fn voxel_outline(world_voxel: IVec3, color: OverlayColor) -> Vec<Line3> {
     let lo = [
         f64::from(world_voxel.x),
         f64::from(world_voxel.y),
@@ -204,7 +207,10 @@ impl ApplicationHandler for App {
                 if let Some(hit) = hover {
                     // `hit.voxel` is grid-local; this grid sits at the
                     // world origin, so the outline needs no transform.
-                    renderer.draw_lines(&camera, &voxel_outline(hit.voxel, 0xff_ff_e0_40));
+                    renderer.draw_lines(
+                        &camera,
+                        &voxel_outline(hit.voxel, OverlayColor(0xff_ff_e0_40)),
+                    );
                 }
                 // ANCHOR_END: hover_raycast
 

@@ -481,6 +481,7 @@ pub(crate) fn compilerle(
 // advances (so the 3-row neighborhood is stable). `finish` drains
 // the last 2 rows.
 
+use crate::color::VoxColor;
 use crate::vxl::Vxl;
 
 /// Per-column, per-row stride
@@ -591,12 +592,16 @@ impl<'v> ScumCtx<'v> {
     }
 
     /// Install the colour callback. Called
-    /// for each newly-exposed voxel produced by edits.
-    pub fn set_colfunc<F>(&mut self, f: F)
+    /// for each newly-exposed voxel produced by edits. The internal
+    /// wire stays voxlap's `i32`; the public boundary is [`VoxColor`].
+    pub fn set_colfunc<F>(&mut self, mut f: F)
     where
-        F: FnMut(i32, i32, i32) -> i32 + 'v,
+        F: FnMut(i32, i32, i32) -> VoxColor + 'v,
     {
-        self.colfunc = Box::new(f);
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            self.colfunc = Box::new(move |x, y, z| f(x, y, z).0 as i32);
+        }
     }
 
     /// Open column `(x, y)` for editing; returns its spans buffer.
@@ -935,7 +940,7 @@ pub enum SpanOp {
 /// callback — the closure can capture arbitrary state to implement
 /// flat, jittered, textured, or otherwise procedural colour patterns.
 ///
-/// `colfunc(x, y, z) -> i32` returns the BGRA colour for any voxel
+/// `colfunc(x, y, z) -> VoxColor` returns the colour for any voxel
 /// that needs one: the inserted voxels (Insert op) or the newly-
 /// exposed voxels just outside the carved range (Carve op).
 ///
@@ -954,7 +959,7 @@ pub enum SpanOp {
 #[allow(clippy::cast_possible_wrap)]
 pub fn set_spans_with_colfunc<F>(world: &mut Vxl, spans: &[Vspan], op: SpanOp, colfunc: F)
 where
-    F: FnMut(i32, i32, i32) -> i32,
+    F: FnMut(i32, i32, i32) -> VoxColor,
 {
     if spans.is_empty() {
         return;
@@ -991,15 +996,15 @@ where
 ///
 /// See [`set_spans_with_colfunc`] for the sort-order contract and
 /// panic semantics.
-pub fn set_spans(world: &mut Vxl, spans: &[Vspan], color: Option<u32>) {
+pub fn set_spans(world: &mut Vxl, spans: &[Vspan], color: Option<VoxColor>) {
     let op = if color.is_some() {
         SpanOp::Insert
     } else {
         SpanOp::Carve
     };
     #[allow(clippy::cast_possible_wrap)]
-    let c_i32 = color.unwrap_or(0) as i32;
-    set_spans_with_colfunc(world, spans, op, move |_, _, _| c_i32);
+    let c = color.unwrap_or(VoxColor(0));
+    set_spans_with_colfunc(world, spans, op, move |_, _, _| c);
 }
 
 // ====================================================================
@@ -1021,15 +1026,15 @@ pub fn set_spans(world: &mut Vxl, spans: &[Vspan], color: Option<u32>) {
 ///
 /// Panics if `world.vbit` is empty — call
 /// [`Vxl::reserve_edit_capacity`] first.
-pub fn set_cube(world: &mut Vxl, x: i32, y: i32, z: i32, color: Option<u32>) {
+pub fn set_cube(world: &mut Vxl, x: i32, y: i32, z: i32, color: Option<VoxColor>) {
     let op = if color.is_some() {
         SpanOp::Insert
     } else {
         SpanOp::Carve
     };
     #[allow(clippy::cast_possible_wrap)]
-    let c_i32 = color.unwrap_or(0) as i32;
-    set_cube_with_colfunc(world, x, y, z, op, move |_, _, _| c_i32);
+    let c = color.unwrap_or(VoxColor(0));
+    set_cube_with_colfunc(world, x, y, z, op, move |_, _, _| c);
 }
 
 /// [`set_cube`] with a custom colour callback.
@@ -1040,7 +1045,7 @@ pub fn set_cube(world: &mut Vxl, x: i32, y: i32, z: i32, color: Option<u32>) {
 )]
 pub fn set_cube_with_colfunc<F>(world: &mut Vxl, x: i32, y: i32, z: i32, op: SpanOp, colfunc: F)
 where
-    F: FnMut(i32, i32, i32) -> i32,
+    F: FnMut(i32, i32, i32) -> VoxColor,
 {
     let vsid = world.vsid as i32;
     if x < 0 || x >= vsid || y < 0 || y >= vsid || !(0..MAXZDIM).contains(&z) {
@@ -1067,15 +1072,15 @@ where
 ///
 /// Panics if `world.vbit` is empty — call
 /// [`Vxl::reserve_edit_capacity`] first.
-pub fn set_rect(world: &mut Vxl, lo: [i32; 3], hi: [i32; 3], color: Option<u32>) {
+pub fn set_rect(world: &mut Vxl, lo: [i32; 3], hi: [i32; 3], color: Option<VoxColor>) {
     let op = if color.is_some() {
         SpanOp::Insert
     } else {
         SpanOp::Carve
     };
     #[allow(clippy::cast_possible_wrap)]
-    let c_i32 = color.unwrap_or(0) as i32;
-    set_rect_with_colfunc(world, lo, hi, op, move |_, _, _| c_i32);
+    let c = color.unwrap_or(VoxColor(0));
+    set_rect_with_colfunc(world, lo, hi, op, move |_, _, _| c);
 }
 
 /// [`set_rect`] with a custom colour callback.
@@ -1086,7 +1091,7 @@ pub fn set_rect(world: &mut Vxl, lo: [i32; 3], hi: [i32; 3], color: Option<u32>)
 )]
 pub fn set_rect_with_colfunc<F>(world: &mut Vxl, lo: [i32; 3], hi: [i32; 3], op: SpanOp, colfunc: F)
 where
-    F: FnMut(i32, i32, i32) -> i32,
+    F: FnMut(i32, i32, i32) -> VoxColor,
 {
     let vsid = world.vsid as i32;
     let xs = lo[0].min(hi[0]).max(0);
@@ -1132,15 +1137,15 @@ where
 ///
 /// Panics if `world.vbit` is empty — call
 /// [`Vxl::reserve_edit_capacity`] first.
-pub fn set_sphere(world: &mut Vxl, center: [i32; 3], radius: u32, color: Option<u32>) {
+pub fn set_sphere(world: &mut Vxl, center: [i32; 3], radius: u32, color: Option<VoxColor>) {
     let op = if color.is_some() {
         SpanOp::Insert
     } else {
         SpanOp::Carve
     };
     #[allow(clippy::cast_possible_wrap)]
-    let c_i32 = color.unwrap_or(0) as i32;
-    set_sphere_with_colfunc(world, center, radius, op, move |_, _, _| c_i32);
+    let c = color.unwrap_or(VoxColor(0));
+    set_sphere_with_colfunc(world, center, radius, op, move |_, _, _| c);
 }
 
 /// [`set_sphere`] with a custom colour callback.
@@ -1158,7 +1163,7 @@ pub fn set_sphere_with_colfunc<F>(
     op: SpanOp,
     colfunc: F,
 ) where
-    F: FnMut(i32, i32, i32) -> i32,
+    F: FnMut(i32, i32, i32) -> VoxColor,
 {
     let vsid = world.vsid as i32;
     let cx = center[0];
@@ -1918,7 +1923,7 @@ mod tests {
         vxl.reserve_edit_capacity(4096);
 
         let mut ctx = ScumCtx::new(&mut vxl);
-        ctx.set_colfunc(|_x, _y, _z| 0x80_60_40_20u32 as i32);
+        ctx.set_colfunc(|_x, _y, _z| VoxColor(0x80_60_40_20));
         {
             let spans = ctx.scum2(0, 0).expect("column 0,0 in bounds");
             // Carve [50, 100) to air.
@@ -1969,7 +1974,7 @@ mod tests {
         vxl.reserve_edit_capacity(8192);
 
         let mut ctx = ScumCtx::new(&mut vxl);
-        ctx.set_colfunc(|_x, _y, _z| 0);
+        ctx.set_colfunc(|_x, _y, _z| VoxColor(0));
         {
             let spans = ctx.scum2(1, 2).unwrap();
             delslab(spans, 50, 100);
@@ -2007,7 +2012,7 @@ mod tests {
         vxl.reserve_edit_capacity(8192);
 
         let mut ctx = ScumCtx::new(&mut vxl);
-        ctx.set_colfunc(|_x, _y, _z| 0);
+        ctx.set_colfunc(|_x, _y, _z| VoxColor(0));
         {
             let spans = ctx.scum2(1, 1).unwrap();
             delslab(spans, 60, 80);
@@ -2142,7 +2147,7 @@ mod tests {
             None,
         );
         // Now fill [60, 80) back to solid with a known color.
-        const FILL: u32 = 0x80_aa_bb_cc;
+        const FILL: VoxColor = VoxColor(0x80_aa_bb_cc);
         set_spans(
             &mut vxl,
             &[Vspan {
@@ -2219,7 +2224,7 @@ mod tests {
                 z1: 79,
             }],
             SpanOp::Insert,
-            |_x, _y, z| (0x80ff_ff00u32 as i32) | z,
+            |_x, _y, z| VoxColor(0x80ff_ff00 | z as u32),
         );
         // Walk column (1,1) and find the slab with z1=60; verify each
         // floor colour matches the closure's output.
@@ -2398,7 +2403,7 @@ mod tests {
         // Insert a sphere of radius 2 at (1, 1, 128). Center column
         // gets z=126..130 inclusive (5 voxels) inserted.
         set_sphere_with_colfunc(&mut vxl, [1, 1, 128], 2, SpanOp::Insert, |_, _, z| {
-            (0x80ff_ff00u32 as i32) | z
+            VoxColor(0x80ff_ff00 | z as u32)
         });
         // (a) spans has the expected three solid runs.
         let mut spans = vec![0i32; SPAN_STRIDE];

@@ -66,7 +66,7 @@ fn setspans_5x5_patch_byte_equal_to_voxlap_c() {
         // FIXTURE_COL so newly-exposed voxels (above/below the
         // carved span, which weren't in the original column's
         // floor list) get a deterministic colour. Mirror it here.
-        const FIXTURE_COL: i32 = 0x80aa_bbccu32 as i32;
+        const FIXTURE_COL: roxlap_formats::VoxColor = roxlap_formats::VoxColor(0x80aa_bbcc);
         ctx.set_colfunc(|_x, _y, _z| FIXTURE_COL);
         // Voxlap iterates spans in (y, x) ascending order.
         for dy in 0..PATCH_H {
@@ -126,7 +126,7 @@ fn set_spans_with_colfunc_5x5_patch_byte_equal_to_voxlap_c() {
     // the voxlap-C harness uses. Validates the wrapper composes the
     // full CD.2 stack (ScumCtx + with_column dedup + delslab +
     // colfunc plumb-through) correctly.
-    const FIXTURE_COL: i32 = 0x80aa_bbccu32 as i32;
+    const FIXTURE_COL: roxlap_formats::VoxColor = roxlap_formats::VoxColor(0x80aa_bbcc);
 
     let mut pre = parse_vxl(SETSPANS_PRE);
     let post = parse_vxl(SETSPANS_POST);

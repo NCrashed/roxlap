@@ -358,6 +358,7 @@ fn min_axis(t: [f32; 3]) -> usize {
 mod tests {
     use super::*;
     use crate::{GridTransform, Scene};
+    use roxlap_formats::color::VoxColor;
 
     /// The pre-PF.9 dense per-voxel shadow march, kept verbatim as the
     /// equivalence oracle for the skipping version (`Grid::voxel_solid`
@@ -430,12 +431,12 @@ mod tests {
         grid.set_rect(
             IVec3::new(0, 0, 160),
             IVec3::new(255, 127, 255),
-            Some(0x80_55_66_77),
+            Some(VoxColor(0x80_55_66_77)),
         );
         grid.set_rect(
             IVec3::new(384, 0, 160),
             IVec3::new(511, 127, 255),
-            Some(0x80_55_66_77),
+            Some(VoxColor(0x80_55_66_77)),
         );
         // Caves + pillars for thin/diagonal occluders.
         for i in 0..14 {
@@ -444,7 +445,7 @@ mod tests {
             grid.set_rect(
                 IVec3::new(x + 3, y + 3, 120),
                 IVec3::new(x + 4, y + 4, 159),
-                Some(0x80_99_88_77),
+                Some(VoxColor(0x80_99_88_77)),
             );
         }
 

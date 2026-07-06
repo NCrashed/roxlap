@@ -23,6 +23,7 @@
 //! per voxel), or `set_terrain_materials` (grid). See `PORTING-TRANSPARENCY.md`.
 
 use glam::{DVec3, IVec3};
+use roxlap_render::VoxColor;
 use roxlap_render::{
     DynSpriteTransform, Kv6, LoopMode, Material, SceneRenderer, SpriteInstanceId, VoxelClip,
 };
@@ -69,7 +70,7 @@ impl TransparencyScene {
         g.set_rect(
             IVec3::new(0, 30, 0),
             IVec3::new(50, 33, 50),
-            Some(0x80_B0_50_40),
+            Some(VoxColor(0x80_B0_50_40)),
         );
         // Glass wall in front of it (y-local 0..3) — same span.
         g.set_rect(IVec3::new(0, 0, 0), IVec3::new(50, 3, 50), Some(GLASS_RGB));
@@ -98,7 +99,7 @@ impl TransparencyScene {
     /// it faces the camera. The glass colour maps to `MAT_GLASS`; the frame
     /// colour isn't in the map, so it stays opaque (material 0).
     fn build_window() -> Kv6 {
-        const FRAME: u32 = 0x80_6A_4A_2A; // opaque brown
+        const FRAME: VoxColor = VoxColor(0x80_6A_4A_2A); // opaque brown
         Kv6::from_fn(30, 3, 30, |x, _y, z| {
             let edge = !(4..26).contains(&x) || !(4..26).contains(&z);
             Some(if edge { FRAME } else { GLASS_RGB })
@@ -160,10 +161,10 @@ impl TransparencyScene {
 }
 
 /// The smoke voxel colour shared by the volumetric cloud + its material map.
-const FOG_RGB: u32 = 0x80_A0_A0_A8;
+const FOG_RGB: VoxColor = VoxColor(0x80_A0_A0_A8);
 
 /// The glass voxel colour shared by the window's glass + its material map.
-const GLASS_RGB: u32 = 0x80_50_C0_E0;
+const GLASS_RGB: VoxColor = VoxColor(0x80_50_C0_E0);
 
 impl DemoScene for TransparencyScene {
     fn name(&self) -> &'static str {
@@ -196,27 +197,39 @@ impl DemoScene for TransparencyScene {
 
         // TV.5/TV.6 — the world grid's glass-coloured voxels render as the
         // glass material (the opaque red wall behind tints through).
-        r.set_terrain_materials(&[(GLASS_RGB & 0x00ff_ffff, MAT_GLASS)]);
+        r.set_terrain_materials(&[(GLASS_RGB.rgb_part(), MAT_GLASS)]);
 
         // Opaque brick backdrop (reference surface the glass tints).
-        let _backdrop = Self::spawn(r, &Kv6::solid_cube(22, 0x80_B0_50_40), [40.0, 90.0, 40.0]);
+        let _backdrop = Self::spawn(
+            r,
+            &Kv6::solid_cube(22, VoxColor(0x80_B0_50_40)),
+            [40.0, 90.0, 40.0],
+        );
 
         // Cyan glass pane in front of the backdrop (wide in x, tall in z,
         // thin in y — it faces the camera). AlphaBlend over the backdrop.
         let glass = Self::spawn(
             r,
-            &Kv6::solid_box(28, 3, 28, 0x80_50_C0_E0),
+            &Kv6::solid_box(28, 3, 28, VoxColor(0x80_50_C0_E0)),
             [40.0, 55.0, 38.0],
         );
         r.set_sprite_instance_material(glass, MAT_GLASS);
 
         // Additive glow aura off to the left — brightens the sky / anything
         // behind it, like a spell or muzzle flash.
-        let glow = Self::spawn(r, &Kv6::solid_cube(18, 0x80_FF_A0_30), [-45.0, 70.0, 42.0]);
+        let glow = Self::spawn(
+            r,
+            &Kv6::solid_cube(18, VoxColor(0x80_FF_A0_30)),
+            [-45.0, 70.0, 42.0],
+        );
         r.set_sprite_instance_material(glow, MAT_GLOW);
 
         // Grey smoke puff in the centre, its opacity pulsing each frame.
-        let smoke = Self::spawn(r, &Kv6::solid_cube(22, 0x80_C8_C8_C8), [-2.0, 60.0, 30.0]);
+        let smoke = Self::spawn(
+            r,
+            &Kv6::solid_cube(22, VoxColor(0x80_C8_C8_C8)),
+            [-2.0, 60.0, 30.0],
+        );
         r.set_sprite_instance_material(smoke, MAT_SMOKE);
         self.smoke = Some(smoke);
         self.clock = 0.0;
@@ -226,7 +239,7 @@ impl DemoScene for TransparencyScene {
         // stays opaque (per-voxel materials, no per-instance material needed).
         let window = r.add_sprite_model_with_materials(
             &Self::build_window(),
-            &[(GLASS_RGB & 0x00ff_ffff, MAT_GLASS)],
+            &[(GLASS_RGB.rgb_part(), MAT_GLASS)],
         );
         let _window_inst = r.add_sprite_instance_posed(window, Self::pose([-50.0, 95.0, 40.0]));
 
@@ -237,7 +250,7 @@ impl DemoScene for TransparencyScene {
             &Self::build_glass_orb_clip()
                 .decode()
                 .expect("glass orb clip decodes"),
-            &[(GLASS_RGB & 0x00ff_ffff, MAT_GLASS)],
+            &[(GLASS_RGB.rgb_part(), MAT_GLASS)],
         );
         let _orb_inst =
             r.add_clip_instance_playing(orb_clip, Self::pose([45.0, 70.0, 40.0]), 1.0, 0);
@@ -247,7 +260,7 @@ impl DemoScene for TransparencyScene {
         // thickness-aware counterpart of the flat alpha-blend smoke puff.
         let fog = r.add_sprite_model_with_materials(
             &Self::build_fog_cloud(),
-            &[(FOG_RGB & 0x00ff_ffff, MAT_FOG)],
+            &[(FOG_RGB.rgb_part(), MAT_FOG)],
         );
         let _fog_inst = r.add_sprite_instance_posed(fog, Self::pose([95.0, 85.0, 36.0]));
 

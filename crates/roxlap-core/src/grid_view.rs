@@ -345,7 +345,7 @@ impl<'a> GridView<'a> {
     /// DDA hit colour for voxel `(x, y, z)` at mip 0. See
     /// [`Self::surface_color_mip`].
     #[must_use]
-    pub fn surface_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
+    pub fn surface_color(&self, x: u32, y: u32, z: u32) -> Option<roxlap_formats::VoxColor> {
         self.surface_color_mip(x, y, z, 0)
     }
 
@@ -357,7 +357,13 @@ impl<'a> GridView<'a> {
     /// side-face cells fall back to the colour of their run's top voxel
     /// (the surface colour "bleeds" down a cliff face).
     #[must_use]
-    pub fn surface_color_mip(&self, x: u32, y: u32, z: u32, mip: u32) -> Option<u32> {
+    pub fn surface_color_mip(
+        &self,
+        x: u32,
+        y: u32,
+        z: u32,
+        mip: u32,
+    ) -> Option<roxlap_formats::VoxColor> {
         let top = self.voxel_run_top_mip(x, y, z, mip)?;
         self.voxel_color_mip(x, y, z, mip)
             .or_else(|| self.voxel_color_mip(x, y, u32::try_from(top).ok()?, mip))
@@ -366,7 +372,7 @@ impl<'a> GridView<'a> {
     /// Surface colour of voxel `(x, y, z)` at mip 0. See
     /// [`Self::voxel_color_mip`].
     #[must_use]
-    pub fn voxel_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
+    pub fn voxel_color(&self, x: u32, y: u32, z: u32) -> Option<roxlap_formats::VoxColor> {
         self.voxel_color_mip(x, y, z, 0)
     }
 
@@ -380,7 +386,13 @@ impl<'a> GridView<'a> {
     /// placeholder) reads as `None`. Surface voxels only — use
     /// [`Self::surface_color_mip`] for the full solid-cell hit test.
     #[must_use]
-    pub fn voxel_color_mip(&self, x: u32, y: u32, z: u32, mip: u32) -> Option<u32> {
+    pub fn voxel_color_mip(
+        &self,
+        x: u32,
+        y: u32,
+        z: u32,
+        mip: u32,
+    ) -> Option<roxlap_formats::VoxColor> {
         let maxz = (CHUNK_SIZE_Z >> mip) as i32;
         if i64::from(z) >= i64::from(maxz) {
             return None;
@@ -388,10 +400,10 @@ impl<'a> GridView<'a> {
         let slab = self.column_slab_mip(x, y, mip)?;
         #[allow(clippy::cast_possible_wrap)]
         let zi = z as i32;
-        let texel = |b: &[u8]| -> Option<u32> {
+        let texel = |b: &[u8]| -> Option<roxlap_formats::VoxColor> {
             let rgb = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             // Zero RGB = empty-chunk placeholder → untextured.
-            (rgb & 0x00ff_ffff != 0).then_some(rgb)
+            (rgb & 0x00ff_ffff != 0).then_some(roxlap_formats::VoxColor(rgb))
         };
         let mut v = 0usize;
         loop {

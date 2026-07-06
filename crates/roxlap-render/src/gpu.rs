@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    DynSpriteTransform, FrameParams, KfaSprite, Kv6, Line3, QuadDraw, RenderOptions, Sprite,
+    DynSpriteTransform, FrameParams, KfaSprite, Kv6, Line3, QuadDraw, RenderOptions, Rgb, Sprite,
     SpriteSet,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -481,7 +481,7 @@ impl GpuBackend {
     pub(crate) fn add_model_with_materials(
         &mut self,
         kv6: &Kv6,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> usize {
         self.add_model_chain(build_sprite_model_with_materials(kv6, material_map), kv6)
     }
@@ -564,7 +564,7 @@ impl GpuBackend {
     pub(crate) fn add_voxel_clip_with_materials(
         &mut self,
         clip: &DecodedClip,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> usize {
         let mut registry = self.sprite_registry.take().unwrap_or_default();
         let mut chains = Vec::with_capacity(clip.frames.len());
@@ -707,7 +707,7 @@ impl GpuBackend {
         dims: [u32; 3],
         pivot: [f32; 3],
         voxel_world_size: f32,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> bool {
         let Some(&chain_id) = self.clips.get(clip_idx).and_then(|c| c.get(frame)) else {
             return false;
@@ -874,7 +874,7 @@ impl GpuBackend {
         &mut self,
         model_index: usize,
         kv6: &Kv6,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) {
         let Some(&chain_id) = self.sprite_model_ids.get(model_index) else {
             return;
@@ -1014,10 +1014,10 @@ impl GpuBackend {
     /// `fog_color` every frame. Skips the sky mirror once the host has
     /// uploaded a real panorama.
     fn sync_sky_and_fog(&mut self, frame: &FrameParams) {
-        if !self.host_sky_set && self.auto_sky_color != Some(frame.sky_color) {
-            let [r, g, b] = unpack_rgb(frame.sky_color);
+        if !self.host_sky_set && self.auto_sky_color != Some(frame.sky_color.0) {
+            let [r, g, b] = unpack_rgb(frame.sky_color.0);
             self.gpu.set_sky_panorama(&[r, g, b, 0xff], 1, 1);
-            self.auto_sky_color = Some(frame.sky_color);
+            self.auto_sky_color = Some(frame.sky_color.0);
         }
 
         // Config-driven fog, matching the CPU/DDA path (which reads the
@@ -1031,7 +1031,7 @@ impl GpuBackend {
         } else {
             1.0e30
         };
-        let [r, g, b] = unpack_rgb(frame.fog_color);
+        let [r, g, b] = unpack_rgb(frame.fog_color.0);
         let color = [
             f32::from(r) / 255.0,
             f32::from(g) / 255.0,
@@ -1136,7 +1136,7 @@ impl GpuBackend {
             // viewer). Render through a zero-grid resident so the scene
             // pass fills the sky background + far depth and the sprite
             // pass composites the models over it (CPU/GPU parity). The
-            // sky comes from the 1×1 auto-sky (= `frame.sky_color`), so
+            // sky comes from the 1×1 auto-sky (= `frame.sky_color.0`), so
             // the background matches the CPU backend.
             if self.empty_resident.is_none() {
                 let info = roxlap_gpu::SceneUpload { grids: Vec::new() };
@@ -1189,10 +1189,10 @@ impl GpuBackend {
             .iter()
             .map(|l| {
                 // 0xAARRGGBB → straight RGBA in 0..=1 (alpha = over-blend).
-                let a = ((l.color >> 24) & 0xff) as f32 / 255.0;
-                let r = ((l.color >> 16) & 0xff) as f32 / 255.0;
-                let g = ((l.color >> 8) & 0xff) as f32 / 255.0;
-                let b = (l.color & 0xff) as f32 / 255.0;
+                let a = ((l.color.0 >> 24) & 0xff) as f32 / 255.0;
+                let r = ((l.color.0 >> 16) & 0xff) as f32 / 255.0;
+                let g = ((l.color.0 >> 8) & 0xff) as f32 / 255.0;
+                let b = (l.color.0 & 0xff) as f32 / 255.0;
                 roxlap_gpu::GpuLine {
                     a: [l.a[0] as f32, l.a[1] as f32, l.a[2] as f32],
                     b: [l.b[0] as f32, l.b[1] as f32, l.b[2] as f32],
@@ -1279,10 +1279,10 @@ impl GpuBackend {
             .iter()
             .map(|q| {
                 // 0xAARRGGBB tint → straight RGBA in 0..=1.
-                let a = ((q.tint >> 24) & 0xff) as f32 / 255.0;
-                let r = ((q.tint >> 16) & 0xff) as f32 / 255.0;
-                let g = ((q.tint >> 8) & 0xff) as f32 / 255.0;
-                let b = (q.tint & 0xff) as f32 / 255.0;
+                let a = ((q.tint.0 >> 24) & 0xff) as f32 / 255.0;
+                let r = ((q.tint.0 >> 16) & 0xff) as f32 / 255.0;
+                let g = ((q.tint.0 >> 8) & 0xff) as f32 / 255.0;
+                let b = (q.tint.0 & 0xff) as f32 / 255.0;
                 roxlap_gpu::GpuImageQuad {
                     corners: q.corners,
                     image: q.image,

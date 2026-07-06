@@ -41,6 +41,7 @@ use roxlap_core::dda::{render_dda_parallel, CpuLights, CpuPointLight, DdaEnv};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::sky::Sky;
 use roxlap_core::Camera;
+use roxlap_formats::color::Rgb;
 use roxlap_formats::material::MaterialTable;
 
 use crate::billboard::{self, BillboardCache, DEFAULT_RESOLUTION as BILLBOARD_RESOLUTION};
@@ -612,7 +613,7 @@ pub fn render_scene_composed_with_materials(
     sky_color: u32,
     sky: Option<&Sky>,
     materials: Option<&MaterialTable>,
-    terrain_materials: &[(u32, u8)],
+    terrain_materials: &[(Rgb, u8)],
     lights: CpuLights<'_>,
     // XS.2 — sprite-cast shadow occluder (so sprites darken terrain). `None` ⇒
     // grids-only shadows.
@@ -657,7 +658,7 @@ pub fn render_scene_composed_with_materials_scratch(
     sky_color: u32,
     sky: Option<&Sky>,
     materials: Option<&MaterialTable>,
-    terrain_materials: &[(u32, u8)],
+    terrain_materials: &[(Rgb, u8)],
     lights: CpuLights<'_>,
     sprite_occluder: Option<&dyn WorldOccluder>,
     scratch: &mut SceneRenderScratch,
@@ -704,7 +705,7 @@ fn render_scene_composed_scissored(
     sky: Option<&Sky>,
     scissor: bool,
     materials: Option<&MaterialTable>,
-    terrain_materials: &[(u32, u8)],
+    terrain_materials: &[(Rgb, u8)],
     // CPU.1 — world-space dynamic lights, transformed per grid in the loop.
     lights: CpuLights<'_>,
     // XS.2 — world-space occluder for sprite volumes (so sprites cast shadows
@@ -1135,6 +1136,7 @@ mod tests {
     use glam::{DVec3, IVec3};
     use roxlap_core::opticast::OpticastSettings;
     use roxlap_core::{Camera, Engine};
+    use roxlap_formats::color::VoxColor;
 
     const XRES: u32 = 320;
     const YRES: u32 = 200;
@@ -1150,10 +1152,10 @@ mod tests {
         grid.set_rect(
             IVec3::new(40, 40, 40),
             IVec3::new(55, 55, 55),
-            Some(0x80_88_88_88),
+            Some(VoxColor(0x80_88_88_88)),
         );
         // Sphere at (80, 80, 80) radius 6.
-        grid.set_sphere(IVec3::new(80, 80, 80), 6, Some(0x80_22_aa_22));
+        grid.set_sphere(IVec3::new(80, 80, 80), 6, Some(VoxColor(0x80_22_aa_22)));
         (scene, id)
     }
 
@@ -1217,13 +1219,13 @@ mod tests {
         scene.grid_mut(a).unwrap().set_rect(
             IVec3::new(30, 30, 60),
             IVec3::new(90, 90, 62),
-            Some(0x80_88_88_88),
+            Some(VoxColor(0x80_88_88_88)),
         );
         let b = scene.add_grid(GridTransform::at(DVec3::ZERO));
         scene.grid_mut(b).unwrap().set_rect(
             IVec3::new(50, 50, 40),
             IVec3::new(60, 60, 50),
-            Some(0x80_60_60_60),
+            Some(VoxColor(0x80_60_60_60)),
         );
 
         // Straight-down camera over the floor (voxlap z-down ⇒ forward +z).
@@ -1418,7 +1420,7 @@ mod tests {
         grid.set_rect(
             IVec3::new(40, 40, 40),
             IVec3::new(55, 55, 55),
-            Some(0x80_55_aa_22), // distinctive green
+            Some(VoxColor(0x80_55_aa_22)), // distinctive green
         );
         (scene, id, 0x80_55_aa_22)
     }
@@ -1554,7 +1556,7 @@ mod tests {
         scene.grid_mut(b_id).unwrap().set_rect(
             IVec3::new(0, 0, 100),
             IVec3::new(127, 127, 110),
-            Some(0x80_22_88_22), // green floor
+            Some(VoxColor(0x80_22_88_22)), // green floor
         );
 
         // Grid A (near, sky disabled) — a SMALL marker box that
@@ -1564,7 +1566,7 @@ mod tests {
         scene.grid_mut(a_id).unwrap().set_rect(
             IVec3::new(60, 60, 60),
             IVec3::new(67, 67, 67),
-            Some(0x80_aa_22_22), // red cube
+            Some(VoxColor(0x80_aa_22_22)), // red cube
         );
         scene.grid_mut(a_id).unwrap().render_sky = false;
 
@@ -1700,7 +1702,7 @@ mod tests {
         scene.grid_mut(g0).unwrap().set_rect(
             IVec3::new(56, 56, 92),
             IVec3::new(71, 71, 107),
-            Some(0x80_88_22_22), // dark red
+            Some(VoxColor(0x80_88_22_22)), // dark red
         );
         // Grid 1 at world (200, 200, 0): box centred chunk-local (64, 64, 100).
         let _g1 = scene.add_grid(GridTransform::at(DVec3::new(200.0, 200.0, 0.0)));
@@ -1714,7 +1716,7 @@ mod tests {
         scene.grid_mut(g1_id).unwrap().set_rect(
             IVec3::new(56, 56, 92),
             IVec3::new(71, 71, 107),
-            Some(0x80_22_22_88), // dark blue
+            Some(VoxColor(0x80_22_22_88)), // dark blue
         );
         (scene, 0x80_88_22_22, 0x80_22_22_88)
     }
@@ -1818,7 +1820,7 @@ mod tests {
         scene.grid_mut(g2_id).unwrap().set_rect(
             IVec3::new(56, 56, 92),
             IVec3::new(71, 71, 107),
-            Some(0x80_22_88_22), // green — must never appear (off-screen)
+            Some(VoxColor(0x80_22_88_22)), // green — must never appear (off-screen)
         );
 
         let camera = camera_at([160.0, 100.0, 100.0]);
@@ -1874,7 +1876,7 @@ mod tests {
         scene.grid_mut(g_a).unwrap().set_rect(
             IVec3::new(56, 56, 92),
             IVec3::new(71, 71, 107),
-            Some(0x80_aa_00_00), // red
+            Some(VoxColor(0x80_aa_00_00)), // red
         );
         let _g_b = scene.add_grid(GridTransform::at(DVec3::new(0.0, 200.0, 0.0)));
         let g_b_id = scene
@@ -1886,7 +1888,7 @@ mod tests {
         scene.grid_mut(g_b_id).unwrap().set_rect(
             IVec3::new(56, 56, 92),
             IVec3::new(71, 71, 107),
-            Some(0x80_00_00_aa), // blue
+            Some(VoxColor(0x80_00_00_aa)), // blue
         );
 
         let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
@@ -1928,13 +1930,13 @@ mod tests {
         scene2.grid_mut(g_b2).unwrap().set_rect(
             IVec3::new(56, 56, 92),
             IVec3::new(71, 71, 107),
-            Some(0x80_00_00_aa),
+            Some(VoxColor(0x80_00_00_aa)),
         );
         let g_a2 = scene2.add_grid(GridTransform::at(DVec3::new(0.0, 50.0, 0.0)));
         scene2.grid_mut(g_a2).unwrap().set_rect(
             IVec3::new(56, 56, 92),
             IVec3::new(71, 71, 107),
-            Some(0x80_aa_00_00),
+            Some(VoxColor(0x80_aa_00_00)),
         );
 
         let mut fb2 = vec![sky_color; pixel_count(XRES, YRES)];
@@ -1981,7 +1983,7 @@ mod tests {
         grid.set_rect(
             IVec3::new(0, 0, 100),
             IVec3::new(127, 127, 254),
-            Some(0x80_88_88_88),
+            Some(VoxColor(0x80_88_88_88)),
         );
         // Build the per-chunk mip ladder so `gmipnum` can grow past 1.
         grid.chunk_mut(IVec3::ZERO).unwrap().generate_mips(3);
@@ -2195,7 +2197,7 @@ mod tests {
         scene
             .grid_mut(id)
             .unwrap()
-            .set_voxel(IVec3::new(70, 70, 70), Some(0x80_aa_aa_22));
+            .set_voxel(IVec3::new(70, 70, 70), Some(VoxColor(0x80_aa_aa_22)));
         assert!(scene.grid(id).unwrap().billboards.is_none());
 
         // Second Far render rebuilds.
@@ -2230,14 +2232,14 @@ mod tests {
         scene.grid_mut(a_id).unwrap().set_rect(
             IVec3::new(70, 0, 50),
             IVec3::new(85, 15, 70),
-            Some(0x80_22_88_22), // green
+            Some(VoxColor(0x80_22_88_22)), // green
         );
         // Grid B: forced Far. Box at world (~100, 200, 100).
         let b_id = scene.add_grid(GridTransform::at(DVec3::new(100.0, 200.0, 0.0)));
         scene.grid_mut(b_id).unwrap().set_rect(
             IVec3::new(0, 0, 80),
             IVec3::new(20, 20, 110),
-            Some(0x80_aa_22_22), // red
+            Some(VoxColor(0x80_aa_22_22)), // red
         );
         scene.grid_mut(b_id).unwrap().lod_thresholds = crate::LodThresholds {
             r_near: 0.0,
@@ -2466,7 +2468,7 @@ mod tests {
         g.set_rect(
             IVec3::new(120, 60, 200),
             IVec3::new(136, 67, 215),
-            Some(0x80_aa_55_22),
+            Some(VoxColor(0x80_aa_55_22)),
         );
         // Sanity: ensure both chunks were materialised.
         assert_eq!(g.chunk_count(), 2);
@@ -2553,7 +2555,7 @@ mod tests {
         scene.grid_mut(id).unwrap().set_rect(
             IVec3::new(40, 40, 40),
             IVec3::new(55, 55, 55),
-            Some(0x80_88_88_88),
+            Some(VoxColor(0x80_88_88_88)),
         );
         // S4B.4.a: force mip-1..mip-2 generation on the single
         // chunk directly (the Grid's combined-view cache API was
@@ -2609,7 +2611,7 @@ mod tests {
         scene.grid_mut(id).unwrap().set_rect(
             IVec3::new(120, 60, 200),
             IVec3::new(136, 67, 215),
-            Some(0x80_aa_55_22),
+            Some(VoxColor(0x80_aa_55_22)),
         );
         let (_engine, fog, sky_color) = make_composed_pool(2 * CHUNK_SIZE_XY);
         let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
@@ -2669,7 +2671,7 @@ mod tests {
         g.set_rect(
             IVec3::new(60, 60, 306),
             IVec3::new(72, 72, 310),
-            Some(0x80_33_66_99),
+            Some(VoxColor(0x80_33_66_99)),
         );
         assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
 
@@ -2727,7 +2729,7 @@ mod tests {
         g.set_rect(
             IVec3::new(60, 60, 306),
             IVec3::new(72, 72, 310),
-            Some(0x80_77_aa_44),
+            Some(VoxColor(0x80_77_aa_44)),
         );
         assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
 
@@ -2787,7 +2789,7 @@ mod tests {
         g.set_rect(
             IVec3::new(100, 100, 100),
             IVec3::new(124, 124, 200),
-            Some(0x80_aa_55_22), // distinct brown
+            Some(VoxColor(0x80_aa_55_22)), // distinct brown
         );
         // chz=1 hills filling the floor at world z=336..360 across
         // the chunk EXCEPT a hole around the mountain XY (so the
@@ -2795,7 +2797,7 @@ mod tests {
         g.set_rect(
             IVec3::new(0, 0, 336),
             IVec3::new(128, 128, 360),
-            Some(0x80_22_88_44),
+            Some(VoxColor(0x80_22_88_44)),
         );
         g.set_rect(IVec3::new(100, 100, 336), IVec3::new(124, 124, 360), None);
         // Materialise chz=0 + chz=1 (chz=0 has the mountain; chz=1
@@ -2864,14 +2866,14 @@ mod tests {
         g.set_rect(
             IVec3::new(60, 60, 150),
             IVec3::new(72, 72, 200),
-            Some(0x80_88_44_22), // brown mountain
+            Some(VoxColor(0x80_88_44_22)), // brown mountain
         );
         // chz=1: hills at world z=336..360 across the WHOLE chunk
         // (so DDA rays hit them when chz=0 is air).
         g.set_rect(
             IVec3::new(0, 0, 336),
             IVec3::new(128, 128, 360),
-            Some(0x80_22_88_44), // green hills
+            Some(VoxColor(0x80_22_88_44)), // green hills
         );
         // Carve a hole in chz=1's hill at the mountain's footprint
         // so the mountain doesn't appear to "float" on green.
@@ -2956,7 +2958,7 @@ mod tests {
         g.set_rect(
             IVec3::new(60, 60, 306),
             IVec3::new(72, 72, 310),
-            Some(0x80_77_aa_44),
+            Some(VoxColor(0x80_77_aa_44)),
         );
         assert!(g.chunk(IVec3::new(0, 0, 1)).is_some());
 
@@ -3013,7 +3015,7 @@ mod tests {
         g.set_rect(
             IVec3::new(60, 60, 562),
             IVec3::new(72, 72, 566),
-            Some(0x80_aa_55_22),
+            Some(VoxColor(0x80_aa_55_22)),
         );
         assert!(g.chunk(IVec3::new(0, 0, 2)).is_some());
 
@@ -3075,7 +3077,7 @@ mod tests {
                 glam::IVec3::new(0, 0, 230).into(),
                 glam::IVec3::new((CHUNK_SIZE_XY - 1) as i32, (CHUNK_SIZE_XY - 1) as i32, 239)
                     .into(),
-                Some(0x80_22_aa_22),
+                Some(VoxColor(0x80_22_aa_22)),
             );
             vxl
         }

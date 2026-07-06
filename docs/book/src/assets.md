@@ -45,8 +45,8 @@ Two things the conversion handles for you:
 - **The z-flip.** MagicaVoxel is z-up, roxlap is z-down; `to_kv6`
   maps `(x, y, z)` → `(x, y, zsiz−1−z)`, so right-side-up in the
   editor is right-side-up in the engine.
-- **Colour packing.** Palette colours become voxlap-packed
-  `0x80_RR_GG_BB` (neutral brightness). Palette *alpha* is dropped —
+- **Colour packing.** Palette colours become `VoxColor`s at the
+  neutral brightness (`VoxColor::rgb`). Palette *alpha* is dropped —
   translucency in roxlap is a material, not a colour channel, so pair
   the import with a colour→material map
   ([chapter 6](lighting.md)).

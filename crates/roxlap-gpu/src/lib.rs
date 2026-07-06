@@ -72,6 +72,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use roxlap_formats::color::Rgb;
 
 use lights::{inject_grid_sun_dirs, pack_scene_lights, upload_grid_point_lights, GpuPointLight};
 use overlay::{ImageResident, ImageResources, LineResources, LINE_NEAR_Z};
@@ -2886,14 +2887,14 @@ impl GpuRenderer {
     pub fn set_scene_terrain_materials(
         &mut self,
         table: &roxlap_formats::material::MaterialTable,
-        map: &[(u32, u8)],
+        map: &[(Rgb, u8)],
     ) {
         let (palette, _) = material_palette(table);
         self.scene_materials = palette;
         self.scene_terrain_map = map
             .iter()
             .take(256)
-            .map(|&(c, m)| [c & 0x00ff_ffff, u32::from(m)])
+            .map(|&(c, m)| [c.0 & 0x00ff_ffff, u32::from(m)])
             .collect();
         self.scene_terrain_translucent = map.iter().any(|&(_, m)| !table.get(m).is_opaque());
         if let Some(dda) = &self.scene_dda {

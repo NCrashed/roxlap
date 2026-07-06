@@ -31,12 +31,13 @@
 
 use glam::IVec3;
 use roxlap_formats::edit::{set_spans, Vspan};
+use roxlap_render::VoxColor;
 use roxlap_scene::{Grid, CHUNK_SIZE_XY};
 
 /// Voxlap-packed colours. `0x80` is voxlap's neutral brightness.
-const HULL: u32 = 0x80_8a_8a_8a; // gunmetal
-const ACCENT: u32 = 0x80_d0_60_30; // warning-stripe orange
-const BRIDGE: u32 = 0x80_30_60_e0; // cool blue
+const HULL: VoxColor = VoxColor(0x80_8a_8a_8a); // gunmetal
+const ACCENT: VoxColor = VoxColor(0x80_d0_60_30); // warning-stripe orange
+const BRIDGE: VoxColor = VoxColor(0x80_30_60_e0); // cool blue
 
 /// Hull ellipsoid half-extents in grid-local voxels.
 const HULL_RX: i32 = 220;

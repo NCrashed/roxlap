@@ -22,8 +22,8 @@ use glam::{DVec3, IVec3};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Camera;
 use roxlap_render::{
-    Backend, BackendPreference, DitherMode, Feature, FrameParams, Line3, PosterizeConfig,
-    RenderOptions, RenderResolution, SceneRenderer,
+    Backend, BackendPreference, DitherMode, Feature, FrameParams, Line3, OverlayColor,
+    PosterizeConfig, RenderOptions, RenderResolution, Rgb, SceneRenderer, VoxColor,
 };
 use roxlap_scene::{GridTransform, Scene};
 use winit::application::ApplicationHandler;
@@ -31,11 +31,11 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-const GRASS: u32 = 0x80_4d_8a_3a;
-const DOME: u32 = 0x80_40_60_c0;
-const PILLAR: u32 = 0x80_b0_a0_88;
+const GRASS: VoxColor = VoxColor(0x80_4d_8a_3a);
+const DOME: VoxColor = VoxColor(0x80_40_60_c0);
+const PILLAR: VoxColor = VoxColor(0x80_b0_a0_88);
 /// Framebuffer/sky packing is `0x00_RR_GG_BB` (no intensity byte).
-const SKY: u32 = 0x00_8f_bc_d4;
+const SKY: Rgb = Rgb(0x00_8f_bc_d4);
 
 /// A plain + a dome + an avenue of pillars marching away from the
 /// camera, so the fog and the posterized colour ramps have something
@@ -66,7 +66,7 @@ fn build_scene() -> Scene {
 // ANCHOR: gizmo
 /// The 12 edges of an axis-aligned box as depth-tested overlay lines
 /// — the shape of most editor gizmos.
-fn wire_box(lo: [f64; 3], hi: [f64; 3], color: u32) -> Vec<Line3> {
+fn wire_box(lo: [f64; 3], hi: [f64; 3], color: OverlayColor) -> Vec<Line3> {
     let p = [
         [lo[0], lo[1], lo[2]],
         [hi[0], lo[1], lo[2]],
@@ -222,7 +222,11 @@ impl ApplicationHandler for App {
                 // Overlays go between render and present: they draw into
                 // the composited frame using its camera, projection and
                 // depth buffer — here a gizmo box around the dome.
-                let gizmo = wire_box([-32.0, -32.0, 173.0], [32.0, 32.0, 237.0], 0xff_ff_d0_40);
+                let gizmo = wire_box(
+                    [-32.0, -32.0, 173.0],
+                    [32.0, 32.0, 237.0],
+                    OverlayColor(0xff_ff_d0_40),
+                );
                 renderer.draw_lines(&camera, &gizmo);
                 // Exactly one of present() / paint_egui(..) finishes it.
                 renderer.present();

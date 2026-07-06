@@ -20,6 +20,7 @@
 //! `L` toggle point lights.
 
 use glam::{DVec3, IVec3};
+use roxlap_render::VoxColor;
 use roxlap_render::{
     DirectionalLight, DynSpriteTransform, Kv6, LightRig, LoopMode, PointLight, VoxelClip,
 };
@@ -31,9 +32,9 @@ use crate::scene_api::{
 };
 
 // Voxlap-packed `0x80_RR_GG_BB` (high byte = full ambient brightness).
-const GRASS: u32 = 0x80_4d_8a_3a;
-const STONE: u32 = 0x80_8a_8a_92;
-const MONUMENT: u32 = 0x80_b0_60_48;
+const GRASS: VoxColor = VoxColor(0x80_4d_8a_3a);
+const STONE: VoxColor = VoxColor(0x80_8a_8a_92);
+const MONUMENT: VoxColor = VoxColor(0x80_b0_60_48);
 
 /// Grid origin in world space; grid-local `(x,y,z)` → world `origin + xyz`.
 const GRID_ORIGIN: DVec3 = DVec3::new(-48.0, 30.0, 0.0);
@@ -130,7 +131,7 @@ impl LightingScene {
 
     /// A solid voxel sphere — a curved surface shows the cel ramp + the
     /// coloured point-light pools far better than the flat floor.
-    fn sphere_kv6(dim: u32, color: u32) -> Kv6 {
+    fn sphere_kv6(dim: u32, color: VoxColor) -> Kv6 {
         let c = (dim as f32 - 1.0) * 0.5;
         let r2 = (dim as f32 * 0.46).powi(2);
         Kv6::from_fn(dim, dim, dim, |x, y, z| {
@@ -215,7 +216,7 @@ impl DemoScene for LightingScene {
         let c = Self::orbit_centre();
         let ball = ctx
             .renderer
-            .add_sprite_model(&Self::sphere_kv6(18, 0x80_c8_c8_cc));
+            .add_sprite_model(&Self::sphere_kv6(18, VoxColor(0x80_c8_c8_cc)));
         ctx.renderer.add_sprite_instance_posed(
             ball,
             Self::pose([(c.x - 22.0) as f32, c.y as f32, (c.z - 6.0) as f32]),
@@ -230,7 +231,7 @@ impl DemoScene for LightingScene {
                 let r2 = r * r;
                 Kv6::from_fn(dim, dim, dim, |x, y, z| {
                     let (dx, dy, dz) = (x as f32 - cc, y as f32 - cc, z as f32 - cc);
-                    (dx * dx + dy * dy + dz * dz <= r2).then_some(0x80_d0_a0_50)
+                    (dx * dx + dy * dy + dz * dz <= r2).then_some(VoxColor(0x80_d0_a0_50))
                 })
             })
             .collect();

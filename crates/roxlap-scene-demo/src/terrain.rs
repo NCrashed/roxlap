@@ -34,6 +34,7 @@
 use glam::IVec3;
 use roxlap_formats::edit::{set_spans_with_colfunc, SpanOp, Vspan};
 use roxlap_formats::vxl::Vxl;
+use roxlap_render::VoxColor;
 use roxlap_scene::{ChunkGenerator, Grid, GridTransform, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
 /// Per-column metadata the colfunc closure consults: each
@@ -47,9 +48,9 @@ struct ColMeta {
 
 /// Voxlap-packed colour: `(brightness << 24) | (R << 16) | (G << 8) | B`.
 /// `0x80` brightness is voxlap's neutral / unlit baseline.
-const GRASS: u32 = 0x80_4d_8a_3a; // mossy green
-const DIRT: u32 = 0x80_6b_4a_28; // earthy brown
-const STONE: u32 = 0x80_7a_7a_82; // cool gray
+const GRASS: VoxColor = VoxColor(0x80_4d_8a_3a); // mossy green
+const DIRT: VoxColor = VoxColor(0x80_6b_4a_28); // earthy brown
+const STONE: VoxColor = VoxColor(0x80_7a_7a_82); // cool gray
 
 /// Voxels of dirt sitting between grass and stone.
 const DIRT_BAND_THICKNESS: i32 = 4;
@@ -116,7 +117,7 @@ pub fn build_ground_stacked(grid: &mut Grid) {
 }
 
 /// Stone colour for the tall stacked-demo mountains.
-const MOUNTAIN_STONE: u32 = 0x80_8a_82_7a;
+const MOUNTAIN_STONE: VoxColor = VoxColor(0x80_8a_82_7a);
 
 /// Place a handful of stepped-cone mountains spanning chz=0 + chz=1.
 /// Bases at world z=336 (= the top of chz=1's hills), peaks at
@@ -276,12 +277,12 @@ pub fn build_ground_extent_at_chz(grid: &mut Grid, chunks_x: i32, chunks_y: i32,
             // Colfunc picks grass / dirt / stone by relative z from
             // the column's surface. `x` / `y` are chunk-local voxel
             // coords (Vspan's u32 fields cast to i32 inside set_spans).
-            let colfunc = move |x: i32, y: i32, z: i32| -> i32 {
+            let colfunc = move |x: i32, y: i32, z: i32| -> VoxColor {
                 let lx = x.clamp(0, cs_xy - 1) as usize;
                 let ly = y.clamp(0, cs_xy - 1) as usize;
                 let meta = col_meta[ly * (cs_xy as usize) + lx];
                 let dz = z - meta.surface_z;
-                let colour_u32 = if meta.top_is_stone {
+                if meta.top_is_stone {
                     STONE
                 } else if dz == 0 {
                     GRASS
@@ -289,8 +290,7 @@ pub fn build_ground_extent_at_chz(grid: &mut Grid, chunks_x: i32, chunks_y: i32,
                     DIRT
                 } else {
                     STONE
-                };
-                colour_u32 as i32
+                }
             };
 
             // Materialise empty chunks for the air layers above the
@@ -419,12 +419,12 @@ fn stamp_hills_into(vxl: &mut Vxl, chunk_idx: IVec3) {
             });
         }
     }
-    let colfunc = move |x: i32, y: i32, z: i32| -> i32 {
+    let colfunc = move |x: i32, y: i32, z: i32| -> VoxColor {
         let lx = x.clamp(0, cs_xy - 1) as usize;
         let ly = y.clamp(0, cs_xy - 1) as usize;
         let meta = col_meta[ly * (cs_xy as usize) + lx];
         let dz = z - meta.surface_z;
-        let colour_u32 = if meta.top_is_stone {
+        if meta.top_is_stone {
             STONE
         } else if dz == 0 {
             GRASS
@@ -432,8 +432,7 @@ fn stamp_hills_into(vxl: &mut Vxl, chunk_idx: IVec3) {
             DIRT
         } else {
             STONE
-        };
-        colour_u32 as i32
+        }
     };
     set_spans_with_colfunc(vxl, &spans, SpanOp::Insert, colfunc);
 }

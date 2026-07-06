@@ -18,6 +18,7 @@
 //! carving from already-air voxels is a no-op.
 
 use glam::IVec3;
+use roxlap_formats::color::VoxColor;
 use roxlap_formats::edit::{
     set_cube, set_rect, set_rect_with_colfunc, set_sphere, set_sphere_with_colfunc,
 };
@@ -54,7 +55,7 @@ impl Grid {
     /// is a no-op.
     ///
     /// [`Vxl`]: roxlap_formats::vxl::Vxl
-    pub fn set_voxel(&mut self, voxel: IVec3, color: Option<u32>) {
+    pub fn set_voxel(&mut self, voxel: IVec3, color: Option<VoxColor>) {
         // S6.2: any edit invalidates the billboard impostor cache;
         // S6.3 will rebuild on next Far-tier use.
         self.billboards = None;
@@ -101,7 +102,7 @@ impl Grid {
     ///
     /// `lo` and `hi` may be in any order on each axis — the
     /// decomposition normalises them.
-    pub fn set_rect(&mut self, lo: IVec3, hi: IVec3, color: Option<u32>) {
+    pub fn set_rect(&mut self, lo: IVec3, hi: IVec3, color: Option<VoxColor>) {
         // S6.2: edit invalidates billboard cache (see set_voxel doc).
         self.billboards = None;
         let lo_n = lo.min(hi);
@@ -138,7 +139,7 @@ impl Grid {
     /// chunks but the materialisation cost remains. A subsequent
     /// pre-pass that filters chunks against `radius²` could avoid
     /// this; out of scope for v1.
-    pub fn set_sphere(&mut self, centre: IVec3, radius: u32, color: Option<u32>) {
+    pub fn set_sphere(&mut self, centre: IVec3, radius: u32, color: Option<VoxColor>) {
         // S6.2: edit invalidates billboard cache (see set_voxel doc).
         self.billboards = None;
         #[allow(clippy::cast_possible_wrap)]
@@ -188,7 +189,7 @@ impl Grid {
         op: SpanOp,
         mut colfunc: F,
     ) where
-        F: FnMut(i32, i32, i32) -> i32,
+        F: FnMut(i32, i32, i32) -> VoxColor,
     {
         // S6.2: edit invalidates billboard cache (see set_voxel doc).
         self.billboards = None;
@@ -237,7 +238,7 @@ impl Grid {
     /// grid-local coordinates.
     pub fn set_rect_with_colfunc<F>(&mut self, lo: IVec3, hi: IVec3, op: SpanOp, mut colfunc: F)
     where
-        F: FnMut(i32, i32, i32) -> i32,
+        F: FnMut(i32, i32, i32) -> VoxColor,
     {
         // S6.2: edit invalidates billboard cache (see set_voxel doc).
         self.billboards = None;
@@ -281,7 +282,7 @@ fn apply_set_rect(
     chunk_idx: IVec3,
     local_lo: IVec3,
     local_hi: IVec3,
-    color: Option<u32>,
+    color: Option<VoxColor>,
 ) {
     let mut wrote = false;
     if color.is_some() {
@@ -305,7 +306,7 @@ fn apply_set_sphere(
     chunk_idx: IVec3,
     local_centre: IVec3,
     radius: u32,
-    color: Option<u32>,
+    color: Option<VoxColor>,
 ) {
     let mut wrote = false;
     if color.is_some() {
@@ -357,7 +358,7 @@ mod tests {
     use crate::chunks::tests::voxel_is_solid;
     use crate::GridTransform;
 
-    const TEST_COL: u32 = 0x80_aa_bb_cc;
+    const TEST_COL: VoxColor = VoxColor(0x80_aa_bb_cc);
 
     #[test]
     fn set_voxel_inserts_in_correct_chunk() {
@@ -415,12 +416,12 @@ mod tests {
         g.set_rect(
             IVec3::new(0, 0, 60),
             IVec3::new(64, 64, 63),
-            Some(0x80_4d_8a_3a),
+            Some(VoxColor(0x80_4d_8a_3a)),
         ); // floor z60..62
         g.set_rect(
             IVec3::new(20, 20, 30),
             IVec3::new(30, 30, 60),
-            Some(0x80_8a_8a_92),
+            Some(VoxColor(0x80_8a_8a_92)),
         ); // pillar z30..59
         let vxl = g.chunk(IVec3::ZERO).expect("chunk");
         let cache = roxlap_core::EstNormCache::build(
@@ -704,7 +705,7 @@ mod tests {
     /// `None` / untextured by `voxel_color`).
     #[test]
     fn set_sphere_with_colfunc_paints_exposed_interior() {
-        const CRATER: i32 = 0x00_44_55_66;
+        const CRATER: VoxColor = VoxColor(0x00_44_55_66);
         // A solid block; (64,64,55) starts as a buried interior voxel.
         let mut g = Grid::new(GridTransform::identity());
         g.set_rect(
@@ -723,7 +724,7 @@ mod tests {
         // (64,64,55) is just below the carved z-range [56,72]: still
         // solid, now exposed upward, and painted CRATER.
         assert!(g.voxel_solid(IVec3::new(64, 64, 55)));
-        assert_eq!(g.voxel_color(IVec3::new(64, 64, 55)), Some(CRATER as u32));
+        assert_eq!(g.voxel_color(IVec3::new(64, 64, 55)), Some(CRATER));
 
         // Contrast: a plain None-carve exposes the same voxel as
         // solid-but-black (voxel_color → None).
@@ -747,7 +748,7 @@ mod tests {
     fn set_sphere_with_colfunc_uses_grid_local_coords_across_chunks() {
         // Encode grid-local (x,y,z) into the low 24 bits.
         #[allow(clippy::cast_sign_loss)]
-        let encode = |x: i32, y: i32, z: i32| (x << 16) | (y << 8) | z;
+        let encode = |x: i32, y: i32, z: i32| VoxColor(((x << 16) | (y << 8) | z) as u32);
 
         let mut g = Grid::new(GridTransform::identity());
         // Solid block spanning chunks (0,0,0) and (1,0,0) (seam at 128).
@@ -768,17 +769,17 @@ mod tests {
         let p = IVec3::new(130, 70, 65);
         assert!(g.voxel_solid(p));
         #[allow(clippy::cast_sign_loss)]
-        let want = encode(130, 70, 65) as u32;
+        let want = encode(130, 70, 65);
         assert_eq!(g.voxel_color(p), Some(want));
         // Sanity: it is NOT the chunk-local encoding.
         #[allow(clippy::cast_sign_loss)]
-        let chunk_local = encode(2, 70, 65) as u32;
+        let chunk_local = encode(2, 70, 65);
         assert_ne!(g.voxel_color(p), Some(chunk_local));
     }
 
     #[test]
     fn set_rect_with_colfunc_carve_paints_exposed_face() {
-        const WALL: i32 = 0x00_12_34_56;
+        const WALL: VoxColor = VoxColor(0x00_12_34_56);
         let mut g = Grid::new(GridTransform::identity());
         g.set_rect(
             IVec3::new(40, 40, 40),
@@ -794,7 +795,7 @@ mod tests {
         );
         assert!(!g.voxel_solid(IVec3::new(64, 64, 64)));
         assert!(g.voxel_solid(IVec3::new(64, 64, 49)));
-        assert_eq!(g.voxel_color(IVec3::new(64, 64, 49)), Some(WALL as u32));
+        assert_eq!(g.voxel_color(IVec3::new(64, 64, 49)), Some(WALL));
     }
 
     #[test]
@@ -806,7 +807,9 @@ mod tests {
             Some(TEST_COL),
         );
         stamp_sentinel_cache(&mut g);
-        g.set_sphere_with_colfunc(IVec3::new(64, 64, 64), 6, SpanOp::Carve, |_, _, _| 1);
+        g.set_sphere_with_colfunc(IVec3::new(64, 64, 64), 6, SpanOp::Carve, |_, _, _| {
+            VoxColor(1)
+        });
         assert!(g.billboards.is_none());
     }
 

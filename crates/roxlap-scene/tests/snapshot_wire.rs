@@ -15,6 +15,7 @@
 
 use glam::{DVec3, IVec3};
 use roxlap_scene::snapshot::SnapshotLoadError;
+use roxlap_scene::VoxColor;
 use roxlap_scene::{GridTransform, LodThresholds, Scene, StreamRadius};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/snapshot_v1.rxs");
@@ -37,14 +38,14 @@ fn build_reference_scene() -> Scene {
             mid_mip_scan_dist: Some(32),
         };
         g.stream_radius = StreamRadius::new(128.0, 256.0);
-        g.set_voxel(IVec3::new(3, 4, 100), Some(0x8010_2030));
-        g.set_voxel(IVec3::new(-5, 7, 90), Some(0x8040_5060));
+        g.set_voxel(IVec3::new(3, 4, 100), Some(VoxColor(0x8010_2030)));
+        g.set_voxel(IVec3::new(-5, 7, 90), Some(VoxColor(0x8040_5060)));
     }
     let id2 = scene.add_grid(GridTransform::identity());
     scene
         .grid_mut(id2)
         .expect("grid just added")
-        .set_voxel(IVec3::new(0, 0, 128), Some(0x8077_8899));
+        .set_voxel(IVec3::new(0, 0, 128), Some(VoxColor(0x8077_8899)));
     scene
 }
 

@@ -47,6 +47,7 @@ use crate::bytes::{Cursor, OutOfBounds};
 // `Vxl::empty` / `Vxl::from_dense` build a world by seeding voxlap's
 // `loadnul` slab shape then carving/inserting via the edit pipeline, so
 // callers never hand-roll the slab format.
+use crate::color::VoxColor;
 use crate::edit::{set_spans, set_spans_with_colfunc, SpanOp, Vspan};
 
 const MAGIC: u32 = 0x0907_2000;
@@ -136,7 +137,7 @@ impl Vxl {
     /// reimplementation. Internally an [`Vxl::empty`] world with each
     /// column's solid runs inserted via the colour-callback edit path.
     #[must_use]
-    pub fn from_dense<F: Fn(u32, u32, u32) -> Option<u32>>(vsid: u32, occupied: F) -> Vxl {
+    pub fn from_dense<F: Fn(u32, u32, u32) -> Option<VoxColor>>(vsid: u32, occupied: F) -> Vxl {
         let mut vxl = Self::seeded_air(vsid, DEFAULT_EDIT_HEADROOM_PER_COLUMN);
         // Solid runs per column, in (y, x) ascending then ascending-z
         // order — `set_spans`' sort contract.
@@ -167,7 +168,7 @@ impl Vxl {
             set_spans_with_colfunc(&mut vxl, &spans, SpanOp::Insert, |x, y, z| {
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
                 {
-                    occupied(x as u32, y as u32, z as u32).unwrap_or(0) as i32
+                    occupied(x as u32, y as u32, z as u32).unwrap_or(VoxColor(0))
                 }
             });
         }
@@ -252,16 +253,16 @@ impl Vxl {
     ///
     /// [`column_data`]: Self::column_data
     #[must_use]
-    pub fn voxel_color(&self, x: u32, y: u32, z: u32) -> Option<u32> {
+    pub fn voxel_color(&self, x: u32, y: u32, z: u32) -> Option<VoxColor> {
         if x >= self.vsid || y >= self.vsid || z >= MAXZDIM as u32 {
             return None;
         }
         let zi = z as i32;
         let slab = self.column_data((y * self.vsid + x) as usize);
-        let texel = |b: &[u8]| -> Option<u32> {
+        let texel = |b: &[u8]| -> Option<VoxColor> {
             let rgb = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             // Zero RGB = empty_chunk placeholder → treat as untextured.
-            (rgb & 0x00ff_ffff != 0).then_some(rgb)
+            (rgb & 0x00ff_ffff != 0).then_some(VoxColor(rgb))
         };
         let mut v = 0usize;
         loop {
@@ -1587,7 +1588,7 @@ mod tests {
             let (x, y) = ((i % 2) as u32, (i / 2) as u32);
             assert_eq!(
                 vxl.voxel_color(x, y, 10),
-                Some(c),
+                Some(VoxColor(c)),
                 "surface colour, col {i}"
             );
             assert_eq!(vxl.voxel_color(x, y, 9), None, "air below the floor");
@@ -1711,7 +1712,7 @@ mod tests {
                 z0: 5,
                 z1: 15,
             }],
-            Some(0x80_42_42_42),
+            Some(VoxColor(0x80_42_42_42)),
         );
 
         // First mip build — must succeed.
@@ -1979,8 +1980,8 @@ mod tests {
     fn from_dense_builds_and_round_trips() {
         // A 4³ solid block + one floating voxel elsewhere (no implicit
         // ground beneath either — tests the floating case).
-        const BLOCK: u32 = 0x80_aa_bb_cc;
-        const FLOAT: u32 = 0x80_11_22_33;
+        const BLOCK: VoxColor = VoxColor(0x80_aa_bb_cc);
+        const FLOAT: VoxColor = VoxColor(0x80_11_22_33);
         let model = |x: u32, y: u32, z: u32| {
             if (2..6).contains(&x) && (2..6).contains(&y) && (10..14).contains(&z) {
                 Some(BLOCK)
@@ -2025,7 +2026,7 @@ mod tests {
     #[test]
     fn from_dense_color_packs_exactly() {
         // The 0x80RRGGBB packing round-trips bit-for-bit.
-        let c = 0x80_12_34_56u32;
+        let c = VoxColor(0x80_12_34_56);
         let vxl = Vxl::from_dense(4, |x, y, z| ((x, y, z) == (1, 2, 3)).then_some(c));
         assert_eq!(vxl.voxel_color(1, 2, 3), Some(c));
     }

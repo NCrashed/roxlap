@@ -384,6 +384,8 @@ fn clear_rect(canvas: &mut [u8], cw: usize, ch: usize, fw: usize, fh: usize, fx:
 mod tests {
     use super::*;
 
+    use crate::color::VoxColor;
+
     fn px(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
         [r, g, b, a]
     }

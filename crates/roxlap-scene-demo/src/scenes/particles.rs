@@ -19,8 +19,8 @@ use glam::{DVec3, IVec3};
 use roxlap_core::Camera;
 use roxlap_render::{
     BillboardLighting, CollisionMode, ConeDef, DirectionalLight, EmitterShape, Kv6, LightRig,
-    Line3, Material, ParticleEmitterDef, ParticleSystem, PointLight, SpawnMode, SpriteModelId,
-    VelocityDef,
+    Line3, Material, OverlayColor, ParticleEmitterDef, ParticleSystem, PointLight, Rgb, SpawnMode,
+    SpriteModelId, VelocityDef, VoxColor,
 };
 use roxlap_scene::{GridTransform, Scene};
 use winit::event::MouseButton;
@@ -36,7 +36,7 @@ const MAT_WATER: u8 = 3;
 
 /// Water voxel colour — unique in the arena, so the terrain-material
 /// map (`WATER_RGB → MAT_WATER`) makes exactly the pool translucent.
-const WATER_RGB: u32 = 0x80_2E_6E_C8;
+const WATER_RGB: VoxColor = VoxColor(0x80_2E_6E_C8);
 
 /// Deterministic effects: same seed every `enter`.
 const SEED: u64 = 0x00EF_FEC7;
@@ -113,13 +113,13 @@ impl ParticlesScene {
         g.set_rect(
             IVec3::new(0, 0, 0),
             IVec3::new(128, 128, 6),
-            Some(0x80_58_6E_46), // mossy ground
+            Some(VoxColor(0x80_58_6E_46)), // mossy ground
         );
         // A lighter landing-pad rim under the fountain so the bounce
         // reads (carve + reinsert = recolour).
         let (pad_lo, pad_hi) = (IVec3::new(52, 48, 0), IVec3::new(76, 72, 0));
         g.set_rect(pad_lo, pad_hi, None);
-        g.set_rect(pad_lo, pad_hi, Some(0x80_8A_8A_7A));
+        g.set_rect(pad_lo, pad_hi, Some(VoxColor(0x80_8A_8A_7A)));
         // Translucent water pool inside the rim: `WATER_RGB` maps to
         // `MAT_WATER` via `set_terrain_materials` in `enter`, so these
         // grid voxels render alpha-blended — the slab shows through.
@@ -134,11 +134,11 @@ impl ParticlesScene {
     /// White models — per-instance tint does all the colouring, so the
     /// three effects share plain geometry.
     fn spark_kv6() -> Kv6 {
-        Kv6::solid_cube(2, 0x80_FF_FF_FF)
+        Kv6::solid_cube(2, VoxColor(0x80_FF_FF_FF))
     }
 
     fn debris_kv6() -> Kv6 {
-        Kv6::solid_cube(3, 0x80_FF_FF_FF)
+        Kv6::solid_cube(3, VoxColor(0x80_FF_FF_FF))
     }
 
     /// A rough ball for smoke puffs (surface shell is fine for
@@ -147,7 +147,7 @@ impl ParticlesScene {
         Kv6::from_fn(7, 7, 7, |x, y, z| {
             let d = |v: u32| v as f32 - 3.0;
             let r2 = d(x).powi(2) + d(y).powi(2) + d(z).powi(2);
-            (r2 <= 3.4 * 3.4).then_some(0x80_FF_FF_FF)
+            (r2 <= 3.4 * 3.4).then_some(VoxColor(0x80_FF_FF_FF))
         })
     }
 
@@ -190,8 +190,8 @@ impl ParticlesScene {
                 collision: CollisionMode::Kill,
                 scale: 0.6,
                 fade_out_frac: 0.5,
-                tint: 0x00FF_C840,
-                tint_end: Some(0x00FF_3000),
+                tint: Rgb(0x00FF_C840),
+                tint_end: Some(Rgb(0x00FF_3000)),
                 material: MAT_SPARK,
                 lighting: BillboardLighting::FullBright,
                 ..ParticleEmitterDef::new(spark)
@@ -242,7 +242,7 @@ impl DemoScene for ParticlesScene {
         r.define_material(MAT_WATER, Material::alpha_blend(150));
         // The pool's grid voxels render translucent (TV.5/TV.6 terrain
         // transparency) — same material the fountain droplets use.
-        r.set_terrain_materials(&[(WATER_RGB & 0x00ff_ffff, MAT_WATER)]);
+        r.set_terrain_materials(&[(WATER_RGB.rgb_part(), MAT_WATER)]);
 
         // Fresh models each activation (the host reset the registry) —
         // and a fresh system: the old one holds handles from the
@@ -278,7 +278,7 @@ impl DemoScene for ParticlesScene {
                 collision: CollisionMode::Bounce { restitution: 0.45 },
                 scale: 0.7,
                 fade_out_frac: 0.3,
-                tint: 0x0060_A8FF, // water blue
+                tint: Rgb(0x0060_A8FF), // water blue
                 material: MAT_WATER,
                 // Default FaceNormal lighting: droplets pick up the
                 // sun, the cool pool fill and explosion flashes.
@@ -306,8 +306,8 @@ impl DemoScene for ParticlesScene {
                 scale_end: Some(2.8),
                 fade_in_frac: 0.25,
                 fade_out_frac: 0.45,
-                tint: 0x00B8_B8B8,
-                tint_end: Some(0x0050_5050),
+                tint: Rgb(0x00B8_B8B8),
+                tint_end: Some(Rgb(0x0050_5050)),
                 material: MAT_SMOKE,
                 // WorldUp: stable sun shading that doesn't swim as the
                 // camera orbits, and the warm accent light tints it.
@@ -479,7 +479,7 @@ fn crosshair_lines(cam: &Camera) -> Vec<Line3> {
             out.push(Line3 {
                 a: at(GAP),
                 b: at(GAP + ARM),
-                color: 0xE0_FF_FF_FF, // near-opaque white
+                color: OverlayColor(0xE0_FF_FF_FF), // near-opaque white
                 width_px: 2.0,
                 depth_test: false,
             });

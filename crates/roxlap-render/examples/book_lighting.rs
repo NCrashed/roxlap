@@ -22,7 +22,7 @@ use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::{AoParams, Camera};
 use roxlap_render::{
     BackendPreference, DirectionalLight, DynSpriteTransform, FrameParams, Kv6, LightRig, Material,
-    PointLight, RenderOptions, SceneRenderer, SpotLight,
+    PointLight, RenderOptions, Rgb, SceneRenderer, SpotLight, VoxColor,
 };
 use roxlap_scene::{BakeMode, GridTransform, Scene};
 use winit::application::ApplicationHandler;
@@ -30,13 +30,13 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-const GRASS: u32 = 0x80_4d_8a_3a;
-const STONE: u32 = 0x80_8a_8a_92;
-const MONUMENT: u32 = 0x80_b0_60_48;
+const GRASS: VoxColor = VoxColor(0x80_4d_8a_3a);
+const STONE: VoxColor = VoxColor(0x80_8a_8a_92);
+const MONUMENT: VoxColor = VoxColor(0x80_b0_60_48);
 /// Voxel colours the material map classifies (low 24 bits matter).
-const GLASS_RGB: u32 = 0x80_50_c0_e0;
-const FOG_RGB: u32 = 0x80_a0_a0_a8;
-const SKY: u32 = 0x00_8f_bc_d4;
+const GLASS_RGB: VoxColor = VoxColor(0x80_50_c0_e0);
+const FOG_RGB: VoxColor = VoxColor(0x80_a0_a0_a8);
+const SKY: Rgb = Rgb(0x00_8f_bc_d4);
 
 /// Material palette ids (id 0 is the reserved opaque material).
 const MAT_GLASS: u8 = 1;
@@ -150,13 +150,13 @@ impl ApplicationHandler for App {
         renderer.define_material(MAT_FOG, Material::volumetric(28));
         // Terrain: map voxel colours (low 24 bits) → material ids. Every
         // grid voxel in the glass colour now composites translucently.
-        renderer.set_terrain_materials(&[(GLASS_RGB & 0x00ff_ffff, MAT_GLASS)]);
+        renderer.set_terrain_materials(&[(GLASS_RGB.rgb_part(), MAT_GLASS)]);
         // ANCHOR_END: materials
 
         // The fog cloud: per-voxel colour → material classification at
         // model registration, then a posed instance above the courtyard.
         let cloud = renderer
-            .add_sprite_model_with_materials(&fog_cloud(), &[(FOG_RGB & 0x00ff_ffff, MAT_FOG)]);
+            .add_sprite_model_with_materials(&fog_cloud(), &[(FOG_RGB.rgb_part(), MAT_FOG)]);
         renderer
             .add_sprite_instance_posed(
                 cloud,

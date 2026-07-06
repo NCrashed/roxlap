@@ -29,7 +29,7 @@ use std::time::Instant;
 use glam::{DVec3, IVec3};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Camera;
-use roxlap_render::{BackendPreference, FrameParams, RenderOptions, SceneRenderer};
+use roxlap_render::{BackendPreference, FrameParams, RenderOptions, Rgb, SceneRenderer, VoxColor};
 use roxlap_scene::{GridTransform, Scene};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -37,12 +37,12 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 // ANCHOR: colors
-/// Voxel colours are voxlap-packed `0x80_RR_GG_BB` — the high byte is
-/// the flat shading intensity, the low 24 bits the RGB colour.
-const GRASS: u32 = 0x80_4d_8a_3a;
-const DOME: u32 = 0x80_40_60_c0;
-/// Sky colour in the framebuffer's native `0x00_RR_GG_BB` packing.
-const SKY: u32 = 0x00_8f_bc_d4;
+/// [`VoxColor`] packs a voxel colour: RGB + a brightness byte (NOT
+/// alpha; `rgb()` uses the neutral 0x80 — lighting bakes rewrite it).
+const GRASS: VoxColor = VoxColor::rgb(0x4d, 0x8a, 0x3a);
+const DOME: VoxColor = VoxColor::rgb(0x40, 0x60, 0xc0);
+/// Sky/fog/tints are plain [`Rgb`] — no packing surprises.
+const SKY: Rgb = Rgb::new(0x8f, 0xbc, 0xd4);
 // ANCHOR_END: colors
 
 // ANCHOR: build_scene

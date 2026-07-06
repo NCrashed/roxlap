@@ -17,12 +17,12 @@ use std::sync::{Arc, Mutex};
 use glam::{DQuat, DVec3, IVec3};
 use roxlap_formats::vxl::Vxl;
 use roxlap_scene::{
-    ChunkGenerator, ChunkStore, GridTransform, Scene, SpanOp, StreamRadius, CHUNK_SIZE_XY,
+    ChunkGenerator, ChunkStore, GridTransform, Scene, SpanOp, StreamRadius, VoxColor, CHUNK_SIZE_XY,
 };
 
-const GRASS: u32 = 0x80_4d_8a_3a;
-const STONE: u32 = 0x80_8a_8a_8a;
-const RED: u32 = 0x80_c0_30_30;
+const GRASS: VoxColor = VoxColor::rgb(0x4d, 0x8a, 0x3a);
+const STONE: VoxColor = VoxColor::rgb(0x8a, 0x8a, 0x8a);
+const RED: VoxColor = VoxColor::rgb(0xc0, 0x30, 0x30);
 
 // ANCHOR: generator
 /// A deterministic floor generator: chunk layer `z = 0` gets a solid
@@ -40,7 +40,11 @@ impl ChunkGenerator for FloorGenerator {
         let mut vxl = Vxl::empty(CHUNK_SIZE_XY);
         if chunk_idx.z == 0 {
             let light = (chunk_idx.x + chunk_idx.y).rem_euclid(2) == 0;
-            let color = if light { 0x80_74_9e_58 } else { 0x80_5d_84_46 };
+            let color = if light {
+                VoxColor::rgb(0x74, 0x9e, 0x58)
+            } else {
+                VoxColor::rgb(0x5d, 0x84, 0x46)
+            };
             roxlap_formats::edit::set_rect(&mut vxl, [0, 0, 240], [127, 127, 255], Some(color));
         }
         vxl
@@ -134,9 +138,8 @@ fn main() {
     // stay continuous across chunk seams. Here: a crater whose walls
     // darken with depth.
     ground.set_sphere_with_colfunc(IVec3::new(60, 60, 200), 8, SpanOp::Carve, |_x, _y, z| {
-        let depth = (z - 192).clamp(0, 15) as u32;
-        let green = 0x40 + depth * 3;
-        (0x80_6b_00_2f_u32 | (green << 8)) as i32
+        let depth = (z - 192).clamp(0, 15) as u8;
+        VoxColor::rgb(0x6b, 0x40 + depth * 3, 0x2f)
     });
     // ANCHOR_END: colfunc
 

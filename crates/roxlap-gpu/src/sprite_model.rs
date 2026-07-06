@@ -23,6 +23,7 @@
 )]
 
 use bytemuck::{Pod, Zeroable};
+use roxlap_formats::color::Rgb;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::material::material_for_color;
 use roxlap_formats::sprite::Sprite;
@@ -84,11 +85,11 @@ pub fn build_sprite_model(kv6: &Kv6) -> SpriteModel {
 /// # Panics
 /// As [`build_sprite_model`].
 #[must_use]
-pub fn build_sprite_model_with_materials(kv6: &Kv6, material_map: &[(u32, u8)]) -> SpriteModel {
+pub fn build_sprite_model_with_materials(kv6: &Kv6, material_map: &[(Rgb, u8)]) -> SpriteModel {
     build_sprite_model_inner(kv6, material_map)
 }
 
-fn build_sprite_model_inner(kv6: &Kv6, material_map: &[(u32, u8)]) -> SpriteModel {
+fn build_sprite_model_inner(kv6: &Kv6, material_map: &[(Rgb, u8)]) -> SpriteModel {
     let (mx, my, mz) = (kv6.xsiz, kv6.ysiz, kv6.zsiz);
     let occ_words_per_col = mz.div_ceil(32).max(1);
     let cols = (mx * my) as usize;
@@ -188,7 +189,7 @@ pub fn sprite_model_from_voxel_frame_with_materials(
     dims: [u32; 3],
     pivot: [f32; 3],
     voxel_world_size: f32,
-    material_map: &[(u32, u8)],
+    material_map: &[(Rgb, u8)],
 ) -> SpriteModel {
     let occ_words_per_col = dims[2].div_ceil(32).max(1);
     let cols = (dims[0] * dims[1]) as usize;
@@ -239,7 +240,7 @@ pub fn sprite_model_from_clip_frame(clip: &DecodedClip, frame: usize) -> SpriteM
 pub fn sprite_model_from_clip_frame_with_materials(
     clip: &DecodedClip,
     frame: usize,
-    material_map: &[(u32, u8)],
+    material_map: &[(Rgb, u8)],
 ) -> SpriteModel {
     sprite_model_from_voxel_frame_with_materials(
         &clip.frames[frame],
@@ -3033,7 +3034,7 @@ mod tests {
         let decoded = clip.decode().expect("decode");
 
         // Map only the glass colour → material 2; stone stays opaque (0).
-        let m = sprite_model_from_clip_frame_with_materials(&decoded, 0, &[(0x00AA_BBCC, 2)]);
+        let m = sprite_model_from_clip_frame_with_materials(&decoded, 0, &[(Rgb(0x00AA_BBCC), 2)]);
         assert_eq!(
             m.materials.len(),
             m.colors.len(),
@@ -3065,7 +3066,7 @@ mod tests {
         // One column (x=0,y=0), two voxels: z=0 stone, z=1 glass.
         let kv6 = kv6_from(1, 1, 4, &[(0, 0, 0, stone), (0, 0, 1, glass)]);
 
-        let m = build_sprite_model_with_materials(&kv6, &[(0x00AA_BBCC, 2)]);
+        let m = build_sprite_model_with_materials(&kv6, &[(Rgb(0x00AA_BBCC), 2)]);
         assert_eq!(
             m.materials.len(),
             m.colors.len(),

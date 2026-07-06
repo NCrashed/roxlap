@@ -56,24 +56,28 @@ store voxels in chunks of **128×128×256** (`CHUNK_SIZE_XY` /
 `CHUNK_SIZE_Z`); you address voxels in grid-local integer coordinates
 and the chunk decomposition is invisible to you.
 
-## Packed colours: `0x80_RR_GG_BB`
+## The colour family: `VoxColor`, `Rgb`, `OverlayColor`
 
-Voxel colours are a `u32` with the RGB in the low 24 bits — and the
-high byte is **not alpha**. It is the per-voxel shading intensity:
-`0x80` means "neutral, unlit". Passing `0xFF_...` gives you an
-over-bright voxel, not an opaque one; passing `0x00_...` a black-lit
-one. Lighting bakes (chapter 6) rewrite this byte per voxel — ambient
-and AO live there.
+roxlap inherited three distinct colour packings from Voxlap, and each
+is its own newtype — mixing them up is a compile error rather than a
+visual bug:
+
+- **`VoxColor`** — voxel colours. RGB plus a **brightness byte** in
+  the high bits (NOT alpha!): `VoxColor::rgb(r, g, b)` uses the
+  neutral `0x80`, and lighting bakes (chapter 6) rewrite the byte per
+  voxel — ambient and AO live there. Translucency is a *material*
+  property, never a colour channel.
+- **`Rgb`** — plain colour: sprite/particle tints, the sky / fog /
+  clear colours, and colour→material map keys.
+- **`OverlayColor`** — the one packing with **real alpha**, used only
+  by the overlay-line API (`Line3`).
+
+All three are transparent wrappers over the wire `u32` (the `.0`
+field), so file formats and GPU buffers are unaffected:
 
 ```rust,noplayground
 {{#include ../../../crates/roxlap-core/examples/book_conventions.rs:packed_color}}
 ```
-
-One packing exception: *framebuffer* and sky colours are plain
-`0x00_RR_GG_BB` — no intensity byte. The quickstart's `SKY` constant
-is one of those. (Transparency is separate machinery too: alpha-,
-additive- and volumetric-blended voxels go through the material
-palette, chapter 6 — never through this byte.)
 
 ## The camera basis — and the chirality footgun
 

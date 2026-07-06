@@ -34,6 +34,7 @@ use core::fmt;
 use std::collections::HashMap;
 
 use crate::bytes::{Cursor, OutOfBounds};
+use crate::color::VoxColor;
 use crate::Rgb6;
 
 // Voxlap kv6 `vis` face bits. These must match the `mask` the CPU
@@ -160,7 +161,7 @@ impl Kv6 {
     // fit u16/u32, sizes fit f32 exactly, and the closure-local i64
     // neighbour coords are range-checked before the u32 cast.
     #[must_use]
-    pub fn from_fn<F: Fn(u32, u32, u32) -> Option<u32>>(
+    pub fn from_fn<F: Fn(u32, u32, u32) -> Option<VoxColor>>(
         xsiz: u32,
         ysiz: u32,
         zsiz: u32,
@@ -193,8 +194,8 @@ impl Kv6 {
         keep_interior: G,
     ) -> Kv6
     where
-        F: Fn(u32, u32, u32) -> Option<u32>,
-        G: Fn(u32) -> bool,
+        F: Fn(u32, u32, u32) -> Option<VoxColor>,
+        G: Fn(VoxColor) -> bool,
     {
         Self::build_inner(xsiz, ysiz, zsiz, fill, false, keep_interior)
     }
@@ -213,7 +214,7 @@ impl Kv6 {
     /// neighbourhood (pointing toward empty space). `vis` is the bitmask
     /// of the six exposed faces.
     #[must_use]
-    pub fn from_fn_shaded<F: Fn(u32, u32, u32) -> Option<u32>>(
+    pub fn from_fn_shaded<F: Fn(u32, u32, u32) -> Option<VoxColor>>(
         xsiz: u32,
         ysiz: u32,
         zsiz: u32,
@@ -239,8 +240,8 @@ impl Kv6 {
         keep_interior: G,
     ) -> Kv6
     where
-        F: Fn(u32, u32, u32) -> Option<u32>,
-        G: Fn(u32) -> bool,
+        F: Fn(u32, u32, u32) -> Option<VoxColor>,
+        G: Fn(VoxColor) -> bool,
     {
         let occupied = |x: i64, y: i64, z: i64| -> bool {
             x >= 0
@@ -276,7 +277,7 @@ impl Kv6 {
                             (63, 0)
                         };
                         voxels.push(Voxel {
-                            col,
+                            col: col.0,
                             z: z as u16,
                             vis,
                             dir,
@@ -399,7 +400,7 @@ impl Kv6 {
         colfunc: C,
     ) where
         S: Fn(i32, i32, i32) -> bool,
-        C: Fn(i32, i32, i32) -> u32,
+        C: Fn(i32, i32, i32) -> VoxColor,
     {
         let orig = self.surface_color_map();
         // Preserve identity fields the rebuild would otherwise reset.
@@ -426,7 +427,7 @@ impl Kv6 {
             Some(
                 orig.get(&(x, y, z))
                     .copied()
-                    .unwrap_or_else(|| colfunc(xi, yi, zi)),
+                    .map_or_else(|| colfunc(xi, yi, zi), VoxColor),
             )
         });
 
@@ -442,13 +443,13 @@ impl Kv6 {
     /// A solid axis-aligned box of a single colour (voxlap-packed
     /// `0x80RRGGBB`). Convenience over [`Kv6::from_fn`].
     #[must_use]
-    pub fn solid_box(xsiz: u32, ysiz: u32, zsiz: u32, col: u32) -> Kv6 {
+    pub fn solid_box(xsiz: u32, ysiz: u32, zsiz: u32, col: VoxColor) -> Kv6 {
         Kv6::from_fn(xsiz, ysiz, zsiz, |_, _, _| Some(col))
     }
 
     /// A solid `n³` cube of a single colour.
     #[must_use]
-    pub fn solid_cube(n: u32, col: u32) -> Kv6 {
+    pub fn solid_cube(n: u32, col: VoxColor) -> Kv6 {
         Kv6::solid_box(n, n, n, col)
     }
 }
@@ -674,7 +675,7 @@ mod tests {
 
     #[test]
     fn solid_cube_builder_is_surface_only_and_consistent() {
-        let cube = Kv6::solid_cube(4, 0x8012_3456);
+        let cube = Kv6::solid_cube(4, VoxColor(0x8012_3456));
         assert_eq!((cube.xsiz, cube.ysiz, cube.zsiz), (4, 4, 4));
         // Pivot at the geometric centre.
         assert!((cube.xpiv - 2.0).abs() < f32::EPSILON);
@@ -707,7 +708,7 @@ mod tests {
     /// bodies (keep translucent interiors, still cull opaque ones).
     #[test]
     fn from_fn_keep_interior_retains_matching_interiors() {
-        let col = 0x8012_3456;
+        let col = VoxColor(0x8012_3456);
         // All-solid 4³: from_fn culls the 2³ interior (56 voxels); keeping the
         // interior gives the full 64.
         let shell = Kv6::from_fn(4, 4, 4, |_, _, _| Some(col));
@@ -731,7 +732,7 @@ mod tests {
 
     /// Decode the colour stored at local `(tx, ty, tz)`, or `None` if
     /// no surface voxel sits there.
-    fn color_at(kv6: &Kv6, tx: u32, ty: u32, tz: u32) -> Option<u32> {
+    fn color_at(kv6: &Kv6, tx: u32, ty: u32, tz: u32) -> Option<VoxColor> {
         let mut vi = 0usize;
         for x in 0..kv6.xsiz {
             for y in 0..kv6.ysiz {
@@ -739,7 +740,7 @@ mod tests {
                 for _ in 0..len {
                     let v = kv6.voxels[vi];
                     if x == tx && y == ty && u32::from(v.z) == tz {
-                        return Some(v.col);
+                        return Some(VoxColor(v.col));
                     }
                     vi += 1;
                 }
@@ -750,7 +751,7 @@ mod tests {
 
     #[test]
     fn carve_sphere_exposes_interior_with_colfunc() {
-        const BASE: u32 = 0x8011_2233;
+        const BASE: VoxColor = VoxColor(0x8011_2233);
         // A full solid 16³ cube — its occupancy predicate is "all".
         let mut cube = Kv6::from_fn_shaded(16, 16, 16, |_, _, _| Some(BASE));
         // Custom pivot to verify carve preserves it.
@@ -760,7 +761,7 @@ mod tests {
 
         // colfunc encodes kv6-local coords into the low 24 bits so we
         // can assert the closure sees local (not some shifted) coords.
-        let encode = |x: i32, y: i32, z: i32| ((x << 16) | (y << 8) | z) as u32;
+        let encode = |x: i32, y: i32, z: i32| VoxColor(((x << 16) | (y << 8) | z) as u32);
         cube.carve_sphere_with_colfunc([8, 8, 8], 4, |_, _, _| true, encode);
 
         // Sphere centre removed.
@@ -784,7 +785,7 @@ mod tests {
 
     #[test]
     fn carve_sphere_respects_caller_solid_predicate() {
-        const BASE: u32 = 0x80AA_BBCC;
+        const BASE: VoxColor = VoxColor(0x80AA_BBCC);
         // Build from a half-solid predicate (only x < 8 solid), and
         // pass the SAME predicate as `solid`. A carve centred in the
         // solid half must not resurrect the air half.
@@ -792,7 +793,7 @@ mod tests {
         #[allow(clippy::cast_sign_loss)]
         let mut m =
             Kv6::from_fn_shaded(16, 16, 16, |x, _, _| solid(x as i32, 0, 0).then_some(BASE));
-        m.carve_sphere_with_colfunc([4, 8, 8], 3, solid, |_, _, _| 0x8000_FF00);
+        m.carve_sphere_with_colfunc([4, 8, 8], 3, solid, |_, _, _| VoxColor(0x8000_FF00));
         // Air half stays air (never solid → never emitted).
         assert_eq!(color_at(&m, 12, 8, 8), None);
         // Carved centre gone.
@@ -801,7 +802,7 @@ mod tests {
 
     #[test]
     fn built_cube_round_trips_through_serialize_parse() {
-        let cube = Kv6::solid_cube(5, 0x80AB_CDEF);
+        let cube = Kv6::solid_cube(5, VoxColor(0x80AB_CDEF));
         let bytes = serialize(&cube);
         let back = parse(&bytes).expect("parse built cube");
         assert_eq!(back.xsiz, cube.xsiz);
@@ -817,7 +818,7 @@ mod tests {
     fn from_fn_skips_air_and_keeps_z_order() {
         // A single occupied column at (0,0,*): two voxels (z=0,1), both
         // surface; ordered ascending z.
-        let kv6 = Kv6::from_fn(1, 1, 2, |_, _, _| Some(0x8000_FF00));
+        let kv6 = Kv6::from_fn(1, 1, 2, |_, _, _| Some(VoxColor(0x8000_FF00)));
         assert_eq!(kv6.voxels.len(), 2);
         assert_eq!(kv6.voxels[0].z, 0);
         assert_eq!(kv6.voxels[1].z, 1);
@@ -863,7 +864,7 @@ mod tests {
         // tables — only vis/dir. (A hollow shell: surface of a 5³ cube.)
         let fill = |x: u32, y: u32, z: u32| {
             let on_face = x == 0 || x == 4 || y == 0 || y == 4 || z == 0 || z == 4;
-            on_face.then_some(0x80_44_55_66u32)
+            on_face.then_some(VoxColor(0x80_44_55_66))
         };
         let flat = Kv6::from_fn(5, 5, 5, fill);
         let shaded = Kv6::from_fn_shaded(5, 5, 5, fill);
@@ -887,7 +888,7 @@ mod tests {
         // internal (the two touch); the four side faces + the outer z
         // face are exposed. Validates the VIS_*_Z constants' internal
         // consistency against the neighbour checks.
-        let kv = Kv6::from_fn_shaded(1, 1, 2, |_, _, _| Some(0x80_80_80_80));
+        let kv = Kv6::from_fn_shaded(1, 1, 2, |_, _, _| Some(VoxColor(0x80_80_80_80)));
         assert_eq!(kv.voxels.len(), 2);
         let (lower, upper) = (&kv.voxels[0], &kv.voxels[1]); // ascending z
         assert_eq!(lower.z, 0);
@@ -959,7 +960,7 @@ mod tests {
             let cx = x as f32 - 4.0;
             let cy = y as f32 - 4.0;
             let cz = z as f32 - 4.0;
-            (cx * cx + cy * cy + cz * cz <= 16.0).then_some(0x80_30_60_90u32)
+            (cx * cx + cy * cy + cz * cz <= 16.0).then_some(VoxColor(0x80_30_60_90))
         };
         let shaded = Kv6::from_fn_shaded(9, 9, 9, fill);
         let mut edited = Kv6::from_fn(9, 9, 9, fill); // flat vis/dir
@@ -979,7 +980,7 @@ mod tests {
         // "up" in voxlap z-down) faces empty above, so its outward normal
         // points toward -z. Check an interior-of-face voxel.
         let kv = Kv6::from_fn_shaded(8, 8, 12, |_, _, z| {
-            (2..=9).contains(&z).then_some(0x80_aa_aa_aa)
+            (2..=9).contains(&z).then_some(VoxColor(0x80_aa_aa_aa))
         });
         let v = kv
             .voxels

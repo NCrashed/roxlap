@@ -21,6 +21,7 @@
 use glam::DVec3;
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::{Camera, Engine};
+use roxlap_render::VoxColor;
 use roxlap_scene::render::render_scene_composed;
 use roxlap_scene::render::CpuFog;
 use roxlap_scene::{GridTransform, Scene};
@@ -239,8 +240,8 @@ fn stacked_demo_scene_renders_terrain_from_chz0() {
         None,
     );
     let non_sky_count = fb.iter().filter(|&&p| p != sky).count();
-    const MOUNTAIN_STONE: u32 = 0x80_8a_82_7a;
-    let mountain_count = fb.iter().filter(|&&p| p == MOUNTAIN_STONE).count();
+    const MOUNTAIN_STONE: VoxColor = VoxColor(0x80_8a_82_7a);
+    let mountain_count = fb.iter().filter(|&&p| p == MOUNTAIN_STONE.0).count();
     eprintln!(
         "stacked demo render: {non_sky_count}/{pixel_count} non-sky pixels ({:.1}%), mountain={mountain_count}",
         100.0 * non_sky_count as f64 / pixel_count as f64
@@ -319,7 +320,7 @@ fn stacked_demo_renders_full_mountain_at_user_capture_pose() {
         sky,
         None,
     );
-    const MOUNTAIN_STONE: u32 = 0x80_8a_82_7a;
+    const MOUNTAIN_STONE: VoxColor = VoxColor(0x80_8a_82_7a);
     // Camera at z=101 looking down at mountain peak at z=100 (just
     // 1 voxel above camera). Mountain base at z=336 = depth 235.
     // Sample depths of mountain pixels: shallow ones (= chz=0 top)
@@ -327,7 +328,7 @@ fn stacked_demo_renders_full_mountain_at_user_capture_pose() {
     let mountain_depths: Vec<f32> = fb
         .iter()
         .zip(zb.iter())
-        .filter_map(|(&p, &d)| if p == MOUNTAIN_STONE { Some(d) } else { None })
+        .filter_map(|(&p, &d)| if p == MOUNTAIN_STONE.0 { Some(d) } else { None })
         .collect();
     let mountain_count = mountain_depths.len();
     // For camera at (239,298,101), chz=0 mountain voxels live at
@@ -396,7 +397,7 @@ fn stacked_demo_diagnostic_three_capture_poses() {
     let mut settings = OpticastSettings::for_oracle_framebuffer(W, H);
     settings.mip_levels = 4;
     settings.mip_scan_dist = 64;
-    const MOUNTAIN_STONE: u32 = 0x80_8a_82_7a;
+    const MOUNTAIN_STONE: VoxColor = VoxColor(0x80_8a_82_7a);
     let poses: [(&str, [f64; 3], f64, f64); 4] = [
         ("poseA_partial", [13.50, 169.45, 193.12], 3.0133, 1.2559),
         ("poseB_sky_only", [13.71, 171.04, 193.12], 3.0133, 1.2559),
@@ -447,7 +448,7 @@ fn stacked_demo_diagnostic_three_capture_poses() {
                 }
             }
         }
-        let mountain_total = fb.iter().filter(|&&p| p == MOUNTAIN_STONE).count();
+        let mountain_total = fb.iter().filter(|&&p| p == MOUNTAIN_STONE.0).count();
         let path = format!("/tmp/stacked-{name}.ppm");
         write_ppm(&path, &fb);
         // Bucket mountain (= gray) pixel depths into chz=0 vs

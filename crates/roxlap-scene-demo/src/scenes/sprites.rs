@@ -6,6 +6,7 @@
 //! Controls: click to grab, then left-click shoots a sphere out of the
 //! blob ahead · `G` structurally carves the red model's next z-layer.
 
+use roxlap_render::Rgb;
 use roxlap_render::{Sprite, SpriteInstanceDesc, SpriteInstanceId, SpriteModelId, SpriteSet};
 use roxlap_scene::Scene;
 use winit::event::MouseButton;
@@ -39,7 +40,7 @@ pub struct SpritesScene {
 /// HSV (`s = v = 1`) → packed `0x00RRGGBB`, `h` in `0..1`. A tiny rainbow
 /// helper for the tint showcase.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn hue_rgb(h: f32) -> u32 {
+fn hue_rgb(h: f32) -> Rgb {
     let h6 = (h.rem_euclid(1.0)) * 6.0;
     let i = h6.floor() as i32;
     let f = h6 - i as f32;
@@ -53,7 +54,7 @@ fn hue_rgb(h: f32) -> u32 {
         4 => (t, 0, 255),
         _ => (255, 0, q),
     };
-    (r << 16) | (g << 8) | b
+    Rgb((r << 16) | (g << 8) | b)
 }
 
 impl SpritesScene {

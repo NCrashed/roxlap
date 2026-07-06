@@ -78,6 +78,7 @@ pub use particles::{
     SpawnMode, VelocityDef, CARVE_DEBRIS_CAP, DEFAULT_MAX_PARTICLES,
 };
 pub use roxlap_formats::character::{Attachment, Character, MeshRef};
+pub use roxlap_formats::color::{OverlayColor, Rgb, VoxColor};
 /// Animated-GIF → [`VoxelClip`] importer for Doom-style billboard sprites
 /// (stage BB). Behind the `gif` feature; see `PORTING-BILLBOARD.md`.
 #[cfg(feature = "gif")]
@@ -408,7 +409,7 @@ struct StreamingClipState {
     /// Colour→material map (TV.3), empty for an all-opaque streaming clip.
     /// Re-applied on every per-frame re-upload so the streamed model keeps
     /// its per-voxel materials as it advances.
-    material_map: Vec<(u32, u8)>,
+    material_map: Vec<(Rgb, u8)>,
     /// PF.5 — the clip frame currently resident on `model`. A player driven
     /// at render rate re-applies the same clip frame most ticks (10 fps clip
     /// on a 144 fps render = 14×); when it matches, the dense `to_kv6`
@@ -483,7 +484,7 @@ struct ClipMeta {
     /// all-opaque clip. Retained so an in-place
     /// [`update_clip_frame`](SceneRenderer::update_clip_frame) re-classifies
     /// the edited frame's voxels instead of dropping its per-voxel materials.
-    material_map: Vec<(u32, u8)>,
+    material_map: Vec<(Rgb, u8)>,
 }
 
 /// Public metadata for a registered clip — the inspector view returned by
@@ -915,11 +916,11 @@ pub struct FrameParams<'a> {
     pub settings: &'a OpticastSettings,
     /// Packed engine sky colour: the CPU sky-miss fill + skycast, and
     /// the clear colour if no scene renders.
-    pub sky_color: u32,
+    pub sky_color: Rgb,
     /// Optional sky panorama for the CPU rasterizer's sky sampling.
     pub sky: Option<&'a Sky>,
     /// CPU fog: the packed colour distant voxels fade toward.
-    pub fog_color: u32,
+    pub fog_color: Rgb,
     /// CPU fog: full-fog distance (voxels). `0` disables CPU fog.
     pub fog_max_scan_dist: i32,
     /// CPU: treat z=255 as air (avoids the S1.X bedrock path for
@@ -1026,7 +1027,7 @@ pub(crate) struct SceneState {
     pub(crate) materials: MaterialTable,
     /// Terrain colour→material map (TV.4) — matching-colour world
     /// voxels render with that material (glass walls, water).
-    pub(crate) terrain_materials: Vec<(u32, u8)>,
+    pub(crate) terrain_materials: Vec<(Rgb, u8)>,
     /// PF.5 — set when `materials` / `terrain_materials` change;
     /// cleared after each `render` (the GPU mirrors device palettes
     /// only then). Starts `true` so the first GPU frame seeds them.
@@ -1089,7 +1090,7 @@ pub struct Line3 {
     pub b: [f64; 3],
     /// `0xAARRGGBB` — the high byte is an alpha blend factor (`0xFF`
     /// opaque, `0x00` invisible), the low 24 bits the RGB colour.
-    pub color: u32,
+    pub color: OverlayColor,
     /// Screen-space thickness in pixels (`<= 1.0` draws a 1px line).
     pub width_px: f32,
     /// `true`: the segment is occluded by nearer rendered geometry
@@ -1204,10 +1205,11 @@ pub struct ImageSprite {
     /// World size of the quad along `u` and `v`. For pixel-art traced at
     /// 1 texel = 1 voxel, pass `[width as f32, height as f32]`.
     pub size: [f32; 2],
-    /// Multiplied into every sampled texel (tint + opacity), `0xAARRGGBB`.
-    /// `0xFFFFFFFF` draws the texture unchanged; the high byte scales
-    /// the texel alpha (e.g. `0x80FFFFFF` = 50 % opacity).
-    pub tint: u32,
+    /// Multiplied into every sampled texel (tint + opacity) — real
+    /// alpha, so [`OverlayColor`]. `OverlayColor(0xFFFF_FFFF)` draws the
+    /// texture unchanged; the high byte scales the texel alpha
+    /// (`OverlayColor(0x80FF_FFFF)` = 50 % opacity).
+    pub tint: OverlayColor,
     /// Alpha cutoff in `0.0..=1.0`. Texels whose **own** alpha is below
     /// this are discarded outright (not blended) — crisp pixel-art edges
     /// instead of a semi-transparent haze, and the same threshold decides
@@ -1234,7 +1236,7 @@ pub(crate) struct QuadDraw {
     pub corners: [[f32; 3]; 4],
     /// Backend texture SLOT (facade-resolved; see `draw_images`).
     pub image: usize,
-    pub tint: u32,
+    pub tint: OverlayColor,
     pub depth_test: bool,
     pub alpha_cutoff: f32,
 }
@@ -1367,7 +1369,7 @@ pub struct RenderOptions {
     /// Packed `0x00RRGGBB` (alpha ignored) the empty/clear frame fills
     /// with until a scene render lands. Also the CPU sky-miss colour
     /// default if a frame supplies none.
-    pub clear_sky: u32,
+    pub clear_sky: Rgb,
     /// GPU scene-grid LOD scan distance in world units (GPU.11.1):
     /// rays farther than this from the camera sample coarser chunk
     /// mips. QE.2a — construction-time here (was a per-frame
@@ -1426,7 +1428,7 @@ impl Default for RenderOptions {
         Self {
             backend: BackendPreference::Cpu,
             gpu: GpuRendererSettings::default(),
-            clear_sky: 0x0099_b3d9,
+            clear_sky: Rgb(0x0099_b3d9),
             gpu_mip_scan_dist: 64.0,
             gpu_chunk_upload_budget: 2,
             gpu_clip_upload_budget: 8,
@@ -2451,7 +2453,7 @@ impl SceneRenderer {
         &mut self,
         model: SpriteModelId,
         kv6: &Kv6,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) {
         let Some(idx) = self.model_map.index(model) else {
             return; // stale / removed handle → no-op
@@ -2578,7 +2580,7 @@ impl SceneRenderer {
     /// [`define_material`](Self::define_material). An empty map (the default)
     /// keeps all terrain opaque. The CPU backend composites these today; the
     /// GPU backend renders them once the TV.6 device path lands.
-    pub fn set_terrain_materials(&mut self, map: &[(u32, u8)]) {
+    pub fn set_terrain_materials(&mut self, map: &[(Rgb, u8)]) {
         if self.state.terrain_materials != map {
             self.state.terrain_materials = map.to_vec();
             self.state.materials_dirty = true;
@@ -2619,7 +2621,7 @@ impl SceneRenderer {
     pub fn add_sprite_model_with_materials(
         &mut self,
         kv6: &Kv6,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> SpriteModelId {
         let model_index = match &mut self.inner {
             BackendImpl::Cpu(c) => c.add_model_with_materials(kv6, material_map),
@@ -2748,13 +2750,13 @@ impl SceneRenderer {
     /// stale handles are ignored. Tint is colour only — for transparency, use a
     /// translucent material with
     /// [`set_sprite_instance_alpha`](Self::set_sprite_instance_alpha).
-    pub fn set_sprite_instance_tint(&mut self, id: SpriteInstanceId, tint: u32) {
+    pub fn set_sprite_instance_tint(&mut self, id: SpriteInstanceId, tint: Rgb) {
         let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
             return;
         };
         match &mut self.inner {
-            BackendImpl::Cpu(c) => c.set_dyn_instance_tint(dyn_index as usize, tint),
-            BackendImpl::Gpu(g) => g.set_dyn_instance_tint(dyn_index as usize, tint),
+            BackendImpl::Cpu(c) => c.set_dyn_instance_tint(dyn_index as usize, tint.0),
+            BackendImpl::Gpu(g) => g.set_dyn_instance_tint(dyn_index as usize, tint.0),
         }
     }
 
@@ -2835,7 +2837,7 @@ impl SceneRenderer {
     pub fn add_voxel_clip_with_materials(
         &mut self,
         clip: &DecodedClip,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> VoxelClipId {
         let clip_index = match &mut self.inner {
             BackendImpl::Cpu(c) => c.add_voxel_clip_with_materials(clip, material_map),
@@ -3174,7 +3176,7 @@ impl SceneRenderer {
     /// [`set_sprite_instance_tint`](Self::set_sprite_instance_tint), routed to
     /// its clip instance. `tint` is an `0x00RR_GGBB` colour multiply
     /// (`0x00FF_FFFF` = white = no-op). Returns `false` on a stale id.
-    pub fn set_actor_tint(&mut self, id: BillboardActorId, tint: u32) -> bool {
+    pub fn set_actor_tint(&mut self, id: BillboardActorId, tint: Rgb) -> bool {
         let Some(idx) = self.actor_map.index(id) else {
             return false;
         };
@@ -3366,7 +3368,7 @@ impl SceneRenderer {
     pub fn add_streaming_clip_with_materials(
         &mut self,
         clip: &VoxelClip,
-        material_map: &[(u32, u8)],
+        material_map: &[(Rgb, u8)],
     ) -> Result<StreamingClipId, DecodeError> {
         let cursor = StreamingClip::new(clip)?;
         let dims = cursor.dims();
@@ -4573,7 +4575,7 @@ mod tests {
         assert_eq!(xf.forward, [0.0, 0.0, 1.0]);
 
         let mut s = Sprite::axis_aligned(
-            roxlap_formats::kv6::Kv6::solid_cube(2, 0x80_FF_FF_FF),
+            roxlap_formats::kv6::Kv6::solid_cube(2, roxlap_formats::VoxColor(0x80_FF_FF_FF)),
             [9.0, 9.0, 9.0],
         );
         let posed = DynSpriteTransform {
@@ -4593,7 +4595,7 @@ mod tests {
     fn options_default_is_cpu_intent() {
         let o = RenderOptions::default();
         assert_eq!(o.backend, BackendPreference::Cpu);
-        assert_eq!(o.clear_sky & 0xFF00_0000, 0, "clear_sky is 0x00RRGGBB");
+        assert_eq!(o.clear_sky.0 & 0xFF00_0000, 0, "clear_sky is 0x00RRGGBB");
     }
 
     /// A camera at the origin looking down +Y (voxlap z-down world): right
@@ -4619,7 +4621,7 @@ mod tests {
                 v: [0.0, 0.0, 1.0],
             },
             size: [10.0, 10.0],
-            tint: 0xFFFF_FFFF,
+            tint: OverlayColor(0xFFFF_FFFF),
             alpha_cutoff: 0.0,
             depth_test: true,
             double_sided: true,
@@ -4643,7 +4645,7 @@ mod tests {
                 v: [1.0, 0.0, 0.0], // u-ish → normal flips to -Y... toward camera?
             },
             size: [10.0, 10.0],
-            tint: 0xFFFF_FFFF,
+            tint: OverlayColor(0xFFFF_FFFF),
             alpha_cutoff: 0.0,
             depth_test: true,
             double_sided: false,
@@ -4670,7 +4672,7 @@ mod tests {
                 v: [1.0, 0.0, 0.0],
             },
             size: [10.0, 10.0],
-            tint: 0xFFFF_FFFF,
+            tint: OverlayColor(0xFFFF_FFFF),
             alpha_cutoff: 0.0,
             depth_test: true,
             double_sided: true,
@@ -4730,7 +4732,7 @@ mod tests {
             origin: [0.0, 50.0, 0.0],
             facing: ImageFacing::Billboard { up },
             size: [4.0, 4.0],
-            tint: 0xFFFF_FFFF,
+            tint: OverlayColor(0xFFFF_FFFF),
             alpha_cutoff: 0.0,
             depth_test: false,
             double_sided: false, // billboards must NEVER cull

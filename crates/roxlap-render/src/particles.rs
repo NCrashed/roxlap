@@ -23,6 +23,7 @@
 
 use std::ops::Range;
 
+use crate::Rgb;
 use crate::{
     BillboardLighting, DynSpriteTransform, EpochSlotMap, SceneRenderer, ShadowFlags, SlotHandle,
     SpriteInstanceId, SpriteModelId,
@@ -201,11 +202,11 @@ pub struct ParticleEmitterDef {
     /// vanish at full opacity.
     pub fade_out_frac: f32,
     /// Per-particle RGB tint, packed `0x00RRGGBB` (white = no-op).
-    pub tint: u32,
+    pub tint: Rgb,
     /// End-of-life tint (PS.2): lerped per channel from `tint` over
     /// the lifetime — white-hot → red → dark ember. `None` (default) =
     /// constant.
-    pub tint_end: Option<u32>,
+    pub tint_end: Option<Rgb>,
     /// Voxel-material id for every particle (TV palette; `0` opaque).
     /// Smoke wants an alpha/volumetric material, sparks additive.
     pub material: u8,
@@ -241,7 +242,7 @@ impl ParticleEmitterDef {
             spin: 0.0..0.0,
             fade_in_frac: 0.0,
             fade_out_frac: 0.25,
-            tint: 0x00FF_FFFF,
+            tint: Rgb::WHITE,
             tint_end: None,
             material: 0,
             lighting: BillboardLighting::FaceNormal,
@@ -276,7 +277,7 @@ pub struct Particle {
     pub alpha: u8,
     /// Current packed `0x00RRGGBB` tint (lerps `tint → tint_end` when
     /// the emitter sets an end tint).
-    pub tint: u32,
+    pub tint: Rgb,
     /// Owning emitter slot — resolves render params (model, material,
     /// lighting) at sync time.
     pub(crate) emitter_slot: u32,
@@ -289,11 +290,11 @@ pub struct Particle {
     pub(crate) last_alpha: u8,
     /// The tint last written to the facade (fresh-instance default:
     /// white) — same change-only discipline as `last_alpha`.
-    pub(crate) last_tint: u32,
+    pub(crate) last_tint: Rgb,
     /// The tint this particle was born with — the `tint_end` lerp's
     /// start point. Usually the emitter's `tint`; `carve_debris` seeds
     /// it with the sampled voxel colour.
-    pub(crate) tint_start: u32,
+    pub(crate) tint_start: Rgb,
 }
 
 /// Per-emitter live state.
@@ -768,7 +769,7 @@ impl ParticleSystem {
                 // blocks below write the real values (tint rides them
                 // too — it can lerp per frame from PS.2 on).
                 p.last_alpha = 255;
-                p.last_tint = 0x00FF_FFFF;
+                p.last_tint = Rgb::WHITE;
             } else {
                 // Live: frame-0 pose came from the posed spawn, so
                 // only pre-existing instances join the move batch.
@@ -831,7 +832,7 @@ impl ParticleSystem {
         // 1. Sample the solid voxels' colours before they vanish.
         #[allow(clippy::cast_possible_wrap)]
         let r = radius as i32;
-        let mut samples: Vec<(glam::IVec3, u32)> = Vec::new();
+        let mut samples: Vec<(glam::IVec3, roxlap_formats::VoxColor)> = Vec::new();
         for z in -r..=r {
             for y in -r..=r {
                 for x in -r..=r {
@@ -901,12 +902,12 @@ impl ParticleSystem {
                 yaw: 0.0,
                 spin_rate: self.rng.range_f32(&def.spin),
                 alpha: fade_alpha(0.0, lifetime, def.fade_in_frac, def.fade_out_frac),
-                tint: col & 0x00FF_FFFF,
+                tint: col.rgb_part(),
                 emitter_slot: slot as u32,
                 instance: None,
                 last_alpha: 255,
-                last_tint: 0x00FF_FFFF,
-                tint_start: col & 0x00FF_FFFF,
+                last_tint: Rgb::WHITE,
+                tint_start: col.rgb_part(),
             });
             spawned += 1;
         }
@@ -965,7 +966,7 @@ impl ParticleSystem {
                 emitter_slot: slot as u32,
                 instance: None,
                 last_alpha: 255,
-                last_tint: 0x00FF_FFFF,
+                last_tint: Rgb::WHITE,
                 tint_start: def.tint,
             });
             spawned += 1;
@@ -1085,15 +1086,15 @@ fn scene_solid_ahead(scene: &roxlap_scene::Scene, pos: [f32; 3], vel: [f32; 3]) 
     scene.resolve_voxel(world, dir).is_some()
 }
 
-/// Per-channel lerp of two packed `0x00RRGGBB` tints.
-fn lerp_tint(a: u32, b: u32, t: f32) -> u32 {
+/// Per-channel lerp of two [`Rgb`] tints.
+fn lerp_tint(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let t = t.clamp(0.0, 1.0);
     let ch = |sh: u32| {
-        let (ca, cb) = ((a >> sh) & 0xff, (b >> sh) & 0xff);
+        let (ca, cb) = ((a.0 >> sh) & 0xff, (b.0 >> sh) & 0xff);
         let m = ca as f32 + (cb as f32 - ca as f32) * t;
         ((m as u32) & 0xff) << sh
     };
-    ch(16) | ch(8) | ch(0)
+    Rgb(ch(16) | ch(8) | ch(0))
 }
 
 /// The slice of [`SceneRenderer`] that [`ParticleSystem::sync`]
@@ -1106,7 +1107,7 @@ pub(crate) trait ParticleFacade {
     fn despawn(&mut self, id: SpriteInstanceId);
     fn set_transforms(&mut self, batch: &[(SpriteInstanceId, DynSpriteTransform)]);
     fn set_alpha(&mut self, id: SpriteInstanceId, alpha: u8);
-    fn set_tint(&mut self, id: SpriteInstanceId, tint: u32);
+    fn set_tint(&mut self, id: SpriteInstanceId, tint: Rgb);
     fn set_material(&mut self, id: SpriteInstanceId, material: u8);
     fn set_lighting(&mut self, id: SpriteInstanceId, mode: BillboardLighting);
     fn set_shadows(&mut self, id: SpriteInstanceId, flags: ShadowFlags);
@@ -1127,7 +1128,7 @@ impl ParticleFacade for SceneRenderer {
     fn set_alpha(&mut self, id: SpriteInstanceId, alpha: u8) {
         self.set_sprite_instance_alpha(id, alpha);
     }
-    fn set_tint(&mut self, id: SpriteInstanceId, tint: u32) {
+    fn set_tint(&mut self, id: SpriteInstanceId, tint: Rgb) {
         self.set_sprite_instance_tint(id, tint);
     }
     fn set_material(&mut self, id: SpriteInstanceId, material: u8) {
@@ -1407,19 +1408,19 @@ mod tests {
             lifetime: 1.0..1.0,
             scale: 1.0,
             scale_end: Some(3.0),
-            tint: 0x00FF_0000,
-            tint_end: Some(0x0000_00FF),
+            tint: Rgb(0x00FF_0000),
+            tint_end: Some(Rgb(0x0000_00FF)),
             ..base_def()
         });
         sys.burst(em, 1);
         sys.update(0.5);
         let p = sys.particles()[0];
         assert!((p.scale - 2.0).abs() < 1e-5, "mid-life scale: {}", p.scale);
-        let (r, b) = ((p.tint >> 16) & 0xff, p.tint & 0xff);
+        let (r, b) = ((p.tint.0 >> 16) & 0xff, p.tint.0 & 0xff);
         assert!(
             (126..=128).contains(&r) && (126..=128).contains(&b),
             "mid tint: {:#08x}",
-            p.tint
+            p.tint.0
         );
 
         // sync writes the lerping tint every frame it changes.
@@ -1465,7 +1466,7 @@ mod tests {
         despawns: Vec<SpriteInstanceId>,
         batch_sizes: Vec<usize>,
         alphas: Vec<(SpriteInstanceId, u8)>,
-        tints: Vec<u32>,
+        tints: Vec<Rgb>,
         materials: Vec<u8>,
         lightings: Vec<BillboardLighting>,
         shadows: Vec<ShadowFlags>,
@@ -1497,7 +1498,7 @@ mod tests {
         fn set_alpha(&mut self, id: SpriteInstanceId, alpha: u8) {
             self.alphas.push((id, alpha));
         }
-        fn set_tint(&mut self, _id: SpriteInstanceId, tint: u32) {
+        fn set_tint(&mut self, _id: SpriteInstanceId, tint: Rgb) {
             self.tints.push(tint);
         }
         fn set_material(&mut self, _id: SpriteInstanceId, material: u8) {
@@ -1543,7 +1544,7 @@ mod tests {
         let mut sys = ParticleSystem::new(11);
         let em = sys.add_emitter(ParticleEmitterDef {
             lifetime: 100.0..100.0,
-            tint: 0x00FF_0000,
+            tint: Rgb(0x00FF_0000),
             material: 5,
             lighting: BillboardLighting::FullBright,
             shadows: ShadowFlags::default(), // back to facade default
@@ -1553,7 +1554,7 @@ mod tests {
         let mut f = Mock::default();
         sys.sync_with(&mut f);
         assert_eq!(f.materials, vec![5]);
-        assert_eq!(f.tints, vec![0x00FF_0000]);
+        assert_eq!(f.tints, vec![Rgb(0x00FF_0000)]);
         assert_eq!(f.lightings, vec![BillboardLighting::FullBright]);
         assert!(f.shadows.is_empty(), "facade-default shadows skip the call");
         // Re-sync repeats none of it: still one call per family.
@@ -1621,12 +1622,12 @@ mod tests {
             yaw: 0.0,
             spin_rate: 0.0,
             alpha: 255,
-            tint: 0,
+            tint: Rgb(0),
             emitter_slot: 0,
             instance: None,
             last_alpha: 255,
-            last_tint: 0x00FF_FFFF,
-            tint_start: 0,
+            last_tint: Rgb::WHITE,
+            tint_start: Rgb(0),
         };
         let xf = particle_xf(&p);
         assert_eq!(xf.pos, [1.0, 2.0, 3.0]);
@@ -1645,7 +1646,7 @@ mod tests {
         g.set_rect(
             IVec3::new(-16, -16, 10),
             IVec3::new(16, 16, 12),
-            Some(0x80FF_FFFF),
+            Some(roxlap_formats::VoxColor(0x80FF_FFFF)),
         );
         scene
     }
@@ -1731,7 +1732,7 @@ mod tests {
         scene.grid_mut(grid).expect("grid").set_rect(
             IVec3::new(-8, -8, 10),
             IVec3::new(8, 8, 12),
-            Some(0x80_12_34_56),
+            Some(roxlap_formats::VoxColor(0x80_12_34_56)),
         );
         let mut sys = ParticleSystem::new(40);
         let centre = IVec3::new(0, 0, 11);
@@ -1750,7 +1751,7 @@ mod tests {
         assert_eq!(sys.particle_count() as u32, spawned);
         // Every debris particle wears the sampled voxel colour.
         for p in sys.particles() {
-            assert_eq!(p.tint, 0x0012_3456, "tint is the voxel colour");
+            assert_eq!(p.tint, Rgb(0x0012_3456), "tint is the voxel colour");
         }
         // The ball is actually gone from the grid.
         let g = scene.grid_mut(grid).expect("grid");
@@ -1846,7 +1847,7 @@ mod tests {
             0.0..0.0,
             &ParticleEmitterDef {
                 lifetime: 1.0..1.0,
-                tint_end: Some(0x0000_0000),
+                tint_end: Some(Rgb(0x0000_0000)),
                 ..base_def()
             },
         );
@@ -1854,11 +1855,11 @@ mod tests {
         sys.update(0.5);
         // Slab colour 0x00FF_FFFF darkening toward black: mid ≈ 127.
         for p in sys.particles() {
-            let r = (p.tint >> 16) & 0xff;
+            let r = (p.tint.0 >> 16) & 0xff;
             assert!(
                 (120..=135).contains(&r),
                 "lerp starts at the voxel colour, not def.tint: {:#08x}",
-                p.tint
+                p.tint.0
             );
         }
     }
@@ -1881,7 +1882,7 @@ mod tests {
             fade_out_frac: 0.5,
             spin: -3.0..3.0,
             scale_end: Some(2.0),
-            tint_end: Some(0x0000_0000),
+            tint_end: Some(Rgb(0x0000_0000)),
             gravity: [0.0, 0.0, 5.0],
             ..base_def()
         });
@@ -1918,7 +1919,7 @@ mod tests {
             fade_out_frac: 0.5,
             spin: -3.0..3.0,
             scale_end: Some(2.0),
-            tint_end: Some(0x0000_0000),
+            tint_end: Some(Rgb(0x0000_0000)),
             ..base_def()
         });
         sys.burst(em, 10_000);

@@ -32,6 +32,7 @@ use roxlap_render::{
     DynSpriteTransform, ImageFacing, ImageId, ImageSprite, KfaSprite, Line3, LoopMode,
     SceneRenderer, SpriteInstanceId, SpriteModelId, VoxelClip, VoxelFrame,
 };
+use roxlap_render::{OverlayColor, VoxColor};
 use winit::event_loop::{ControlFlow, EventLoop};
 
 /// Initial max ray-march distance for the per-frame opticast pass.
@@ -173,7 +174,7 @@ const TARGET_WORLD: [f32; 3] = [0.0, 60.0, 95.0];
 /// Radius (voxels) of the sphere each shot subtracts.
 const SHOT_RADIUS: u32 = 5;
 /// Surface colour of the intact blob (voxlap-packed `0x80RRGGBB`).
-const TARGET_SKIN: u32 = 0x8050_70A0;
+const TARGET_SKIN: VoxColor = VoxColor(0x8050_70A0);
 
 /// A procedural blob you can shoot craters into — the demo for
 /// [`Sprite::carve_sphere_with_colfunc`]. Unlike a loaded `.kv6` (which
@@ -275,14 +276,14 @@ impl CarveTarget {
 
         // Molten crater: dark-red rim at the bottom → bright yellow at
         // the top, demonstrating colfunc control over the new surface.
-        let crater = move |_x: i32, _y: i32, z: i32| -> u32 {
+        let crater = move |_x: i32, _y: i32, z: i32| -> VoxColor {
             #[allow(clippy::cast_precision_loss)]
             let up = ((z - cz + r) as f32 / (2.0 * r as f32)).clamp(0.0, 1.0);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let red = 0xC0 + (up * 63.0) as u32;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let grn = 0x20 + (up * 0xB0 as f32) as u32;
-            0x8000_0000 | (red << 16) | (grn << 8) | 0x10
+            VoxColor(0x8000_0000 | (red << 16) | (grn << 8) | 0x10)
         };
 
         // `solid` borrows occ immutably; sprite is a disjoint field.
@@ -667,7 +668,7 @@ fn demo_image_sprite(id: ImageId) -> ImageSprite {
             v: [0.0, 0.0, 1.0],
         },
         size: [64.0, 64.0],
-        tint: 0xFFFF_FFFF,
+        tint: OverlayColor(0xFFFF_FFFF),
         alpha_cutoff: 0.0,
         depth_test: true,
         double_sided: true,
@@ -680,7 +681,7 @@ fn debug_overlay_lines() -> Vec<Line3> {
 
     // Floor grid spanning x∈[-80,80], y∈[0,240], 20-voxel cells, sitting on
     // the terrain. Cyan, depth-tested so it's hidden behind hill silhouettes.
-    let grid_color = 0xC0_30_C0_FF;
+    let grid_color = OverlayColor(0xC0_30_C0_FF);
     let (x0, x1, y0, y1, step) = (-80, 80, 0, 240, 20);
     let mut x = x0;
     while x <= x1 {
@@ -711,7 +712,7 @@ fn debug_overlay_lines() -> Vec<Line3> {
         &mut lines,
         [-20.0, 100.0, 160.0],
         [20.0, 140.0, 200.0],
-        0xFF_FF_D0_00,
+        OverlayColor(0xFF_FF_D0_00),
         2.0,
         true,
     );
@@ -720,9 +721,9 @@ fn debug_overlay_lines() -> Vec<Line3> {
     // Always-on-top (depth_test = false) — visible through the hills.
     let origin = [0.0, 0.0, 195.0];
     for (axis, color) in [
-        ([60.0, 0.0, 0.0], 0xFF_FF_30_30u32),
-        ([0.0, 60.0, 0.0], 0xFF_30_FF_30),
-        ([0.0, 0.0, 60.0], 0xFF_30_30_FF),
+        ([60.0, 0.0, 0.0], OverlayColor(0xFF_FF_30_30)),
+        ([0.0, 60.0, 0.0], OverlayColor(0xFF_30_FF_30)),
+        ([0.0, 0.0, 60.0], OverlayColor(0xFF_30_30_FF)),
     ] {
         lines.push(Line3 {
             a: origin,
@@ -745,7 +746,7 @@ fn push_box_edges(
     out: &mut Vec<Line3>,
     lo: [f64; 3],
     hi: [f64; 3],
-    color: u32,
+    color: OverlayColor,
     width_px: f32,
     depth_test: bool,
 ) {
@@ -813,13 +814,13 @@ const SPINNER_CENTER: [f32; 3] = [0.0, -45.0, 28.0];
 const SPINNER_RADIUS: f32 = 26.0;
 
 /// The spinner's palette (voxlap-packed `0x80RRGGBB`, high bit = shaded).
-const SPINNER_PALETTE: [u32; SPINNER_COLORS] = [
-    0x80FF_4040, // red
-    0x80FF_A030, // orange
-    0x80F0_F040, // yellow
-    0x8040_E060, // green
-    0x8040_A0FF, // blue
-    0x80C0_60FF, // violet
+const SPINNER_PALETTE: [VoxColor; SPINNER_COLORS] = [
+    VoxColor(0x80FF_4040), // red
+    VoxColor(0x80FF_A030), // orange
+    VoxColor(0x80F0_F040), // yellow
+    VoxColor(0x8040_E060), // green
+    VoxColor(0x8040_A0FF), // blue
+    VoxColor(0x80C0_60FF), // violet
 ];
 
 /// Build one spinner block, recoloured `col`. Deliberately **non-cubic**
@@ -827,7 +828,7 @@ const SPINNER_PALETTE: [u32; SPINNER_COLORS] = [
 /// visible — a rotation visibly swings the silhouette's width. Pivot is
 /// centred by `from_fn_shaded`, so an instance's position places the
 /// block's centre.
-fn build_spinner_block(col: u32) -> Kv6 {
+fn build_spinner_block(col: VoxColor) -> Kv6 {
     let (bx, by, bz) = (14u32, 5u32, 5u32);
     Kv6::from_fn_shaded(bx, by, bz, |_, _, _| Some(col))
 }

@@ -1,8 +1,8 @@
 # Lighting & materials
 
 roxlap lights a scene in two layers. **Baked** lighting lives in each
-voxel's brightness byte — remember from [chapter 2](concepts.md): the
-high byte of the packed colour is shading intensity, not alpha — and
+voxel's `VoxColor` brightness byte — remember from
+[chapter 2](concepts.md): that byte is shading intensity, not alpha — and
 costs nothing per frame. **Runtime** lighting is a per-frame rig of
 sun + point + spot lights with stylized hard voxel shadows, composited
 on top. Both layers, and the transparent-voxel materials at the end of
