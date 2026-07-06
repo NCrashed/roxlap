@@ -62,6 +62,18 @@
           rustToolchain =
             pkgs.rust-bin.fromRustupToolchainFile
             ./crates/roxlap-web/rust-toolchain.toml;
+
+          # QE — the workspace's declared MSRV (keep in lockstep with
+          # `rust-version` in Cargo.toml AND the CI `msrv` job). The
+          # nightly above must stay the shell's primary toolchain, so
+          # 1.77 is exposed as a wrapper command instead of on PATH:
+          # `msrv-check` = what CI's msrv job runs.
+          msrvToolchain = pkgs.rust-bin.stable."1.92.0".minimal;
+          msrvCheck = pkgs.writeShellScriptBin "msrv-check" ''
+            export PATH="${msrvToolchain}/bin:$PATH"
+            echo "msrv-check: $(rustc --version)"
+            exec cargo check --workspace --all-targets "$@"
+          '';
         in {
           default = pkgs.mkShell {
             packages = with pkgs; [
@@ -102,6 +114,9 @@
               # `cargo fuzz run vox --fuzz-dir crates/roxlap-formats/fuzz`.
               # Needs the nightly toolchain the shell already ships.
               cargo-fuzz
+              # QE — `msrv-check`: the CI msrv job locally (cargo check
+              # --workspace --all-targets on the pinned 1.77).
+              msrvCheck
             ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxRuntimeLibs;
 
             # `sdl2` (roxlap-sdl-demo) links libSDL2 at build time via

@@ -95,18 +95,21 @@ jobs:
       - run: cargo test --workspace --release --exclude roxlap-sdl-demo
 
   msrv:
-    name: cargo check (MSRV 1.77)
+    name: cargo check (MSRV 1.92)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # QE — the workspace declares `rust-version = "1.77"` but nothing
-      # validated it until now: a dep bump or new syntax could silently
-      # break downstream users pinned to the MSRV. Keep the toolchain
-      # here in lockstep with [workspace.package] rust-version.
-      # `check` doesn't link, so the SDL2-linking demo passes too.
+      # QE — nothing validated the declared `rust-version` until now:
+      # a dep bump or new syntax could silently break downstream users
+      # pinned to the MSRV (the long-declared 1.77 turned out to be
+      # exactly that — egui 0.34 needs 1.92). Keep the toolchain here
+      # in lockstep with [workspace.package] rust-version and
+      # flake.nix's msrvToolchain; `msrv-check` in the dev shell runs
+      # this same command locally. `check` doesn't link, so the
+      # SDL2-linking demo passes too.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.77"
+          toolchain: "1.92"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
@@ -136,19 +139,27 @@ jobs:
       # OOB / OOM) on every PR. cargo-fuzz needs nightly (sanitizer
       # flags); the fuzz crate is its own workspace so its profile
       # doesn't leak into the engine build.
+      # rust-src: belt-and-braces for cargo-fuzz's build-std path.
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/roxlap-formats/fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # --target is EXPLICIT: taiki-e's prebuilt cargo-fuzz is a musl
+      # static binary, so its default target is x86_64-unknown-linux-musl
+      # — which has no prebuilt std and drags in a build-std of the
+      # whole standard library. The host gnu triple uses the normal
+      # prebuilt std and links with the runner's gcc.
       - name: Run each fuzz target briefly
         working-directory: crates/roxlap-formats
         run: |
           for t in $(cargo fuzz list); do
             echo "::group::fuzz $t"
-            cargo fuzz run "$t" -- -max_total_time=30 -timeout=10
+            cargo fuzz run "$t" --target x86_64-unknown-linux-gnu -- -max_total_time=30 -timeout=10
             echo "::endgroup::"
           done
 
