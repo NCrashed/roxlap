@@ -808,9 +808,8 @@ pub struct BillboardActorDef {
     /// 256`); migrate with `speed = speed_q8 as f32 / 256.0`.
     pub speed: f32,
     /// World units per slab voxel (`1.0` = classic 1:1). Applied to
-    /// the instance basis every tick, so it scales identically on
-    /// both backends — unlike the clip's own `voxel_world_size`,
-    /// which today only the GPU clip volumes honour.
+    /// the instance basis every tick. Composes multiplicatively with
+    /// the clip's own `voxel_world_size` (both backends honour both).
     pub scale: f32,
     /// Shadow participation for the actor's voxels.
     pub shadows: ShadowFlags,
@@ -3375,7 +3374,7 @@ impl SceneRenderer {
         let frame = frame as usize;
         match &mut self.inner {
             BackendImpl::Cpu(c) => {
-                c.update_clip_frame(clip_index, frame, vf, dims, pivot, &material_map)
+                c.update_clip_frame(clip_index, frame, vf, dims, pivot, vws, &material_map)
             }
             BackendImpl::Gpu(g) => {
                 g.update_clip_frame(clip_index, frame, vf, dims, pivot, vws, &material_map)

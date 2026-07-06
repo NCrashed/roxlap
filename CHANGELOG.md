@@ -22,9 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - New field: world units per slab voxel (`1.0` = the classic 1:1),
   applied to the instance basis every tick — identical on both
-  backends, unlike the clip's `voxel_world_size`, which today only
-  the GPU clip volumes honour (parity gap noted on the field's doc).
+  backends. Composes with the clip's `voxel_world_size`.
   Construction sites add `scale: 1.0`.
+
+### Fixed: CPU backend now honours clip `voxel_world_size`
+
+- The GPU clip volumes always scaled voxels by the clip's
+  `voxel_world_size`; the CPU sprite pipeline silently rendered
+  clips 1:1 — a scaled clip drew at different sizes per backend.
+  `SpriteDense` now carries the scale and the draw + shadow-occluder
+  entries apply it (`basis · ((v − pivot) · vws)` refactored as a
+  basis scale, so `1.0` stays byte-identical — golden hashes held).
+  Parity pinned by a test: `vws = 2` at a unit basis renders pixel-
+  identically to `vws = 1` at a doubled basis, and the occluder
+  agrees.
 - Demo: the World third-person figure is upright (slab z = 0 is the
   image BOTTOM — the figure was authored head-at-0), draws at 0.03
   scale (0.72 units — a marker, not a giant), and the camera boom now

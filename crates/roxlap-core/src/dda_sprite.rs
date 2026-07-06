@@ -72,6 +72,12 @@ pub struct SpriteDense {
     /// consulted on the [`draw_sprite_dense_shaded`] accumulate path.
     mat: Vec<u8>,
     pivot: [f32; 3],
+    /// World units per voxel (the clip's `voxel_world_size`; `1.0`
+    /// for kv6 models). The draw + occluder entries scale the
+    /// instance basis by it, mirroring the GPU shader's
+    /// `(p - pivot) * voxel_world_size` — CPU/GPU parity for scaled
+    /// clips.
+    voxel_world_size: f32,
 }
 
 impl SpriteDense {
@@ -105,6 +111,7 @@ impl SpriteDense {
             col,
             mat: Vec::new(),
             pivot: [kv6.xpiv, kv6.ypiv, kv6.zpiv],
+            voxel_world_size: 1.0,
         }
     }
 
@@ -166,7 +173,16 @@ impl SpriteDense {
             col,
             mat: Vec::new(),
             pivot,
+            voxel_world_size: 1.0,
         }
+    }
+
+    /// Set the render scale (world units per voxel) — the clip's
+    /// `voxel_world_size`. Chainable; the default is `1.0`.
+    #[must_use]
+    pub fn with_voxel_world_size(mut self, vws: f32) -> Self {
+        self.voxel_world_size = vws;
+        self
     }
 
     /// Like [`from_voxel_frame`](Self::from_voxel_frame) but classifies each
@@ -360,6 +376,10 @@ impl SpriteOccluder {
         h: [f32; 3],
         f: [f32; 3],
     ) {
+        // Same clip render scale as the draw entry (see
+        // `draw_sprite_dense_shaded`) — shadows must match the pixels.
+        let sc = dense.voxel_world_size;
+        let (s, h, f) = (bb_scale3(s, sc), bb_scale3(h, sc), bb_scale3(f, sc));
         let Some(minv) = invert_basis(s, h, f) else {
             return;
         };
@@ -384,6 +404,11 @@ impl WorldOccluder for SpriteOccluder {
 /// March one sprite entry's dense occupancy along a world-space ray; `true` if
 /// a solid voxel blocks it within `max_t` world units.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+/// Scale a basis column by the clip render scale.
+fn bb_scale3(v: [f32; 3], k: f32) -> [f32; 3] {
+    [v[0] * k, v[1] * k, v[2] * k]
+}
+
 fn sprite_entry_occluded(e: &SpriteOccEntry, ow: [f32; 3], dw: [f32; 3], max_t: f32) -> bool {
     // World → sprite-local voxel space (same transform as the draw).
     let rel = [ow[0] - e.pos[0], ow[1] - e.pos[1], ow[2] - e.pos[2]];
@@ -948,6 +973,12 @@ pub fn draw_sprite_dense_shaded(
     if flags & SPRITE_FLAG_INVISIBLE != 0 || dense.occ.is_empty() {
         return 0;
     }
+    // Clip render scale: `basis · ((v − pivot) · vws)` ≡
+    // `(basis · vws) · (v − pivot)`, so scaling the basis once here
+    // reproduces the GPU shader's per-voxel `* voxel_world_size`
+    // without touching any transform below. Exact no-op at 1.0.
+    let sc = dense.voxel_world_size;
+    let (s, h, f) = (bb_scale3(s, sc), bb_scale3(h, sc), bb_scale3(f, sc));
     let Some(minv) = invert_basis(s, h, f) else {
         return 0;
     };
@@ -1251,12 +1282,15 @@ impl ClipFlipbook {
             .frames
             .iter()
             .map(|frame| {
-                Arc::new(SpriteDense::from_voxel_frame_with_materials(
-                    frame,
-                    clip.dims,
-                    clip.pivot,
-                    material_map,
-                ))
+                Arc::new(
+                    SpriteDense::from_voxel_frame_with_materials(
+                        frame,
+                        clip.dims,
+                        clip.pivot,
+                        material_map,
+                    )
+                    .with_voxel_world_size(clip.voxel_world_size),
+                )
             })
             .collect();
         Self { frames }
@@ -2235,6 +2269,67 @@ mod tests {
             deep > shallow,
             "deeper Volumetric volume is more opaque: deep {deep:02x} > shallow {shallow:02x}"
         );
+    }
+
+    /// CPU/GPU parity for scaled clips: rendering a dense volume with
+    /// `voxel_world_size = k` at a unit basis must be pixel-identical
+    /// to rendering it with `voxel_world_size = 1` at a `k`-scaled
+    /// basis — the two factorings of `basis · ((v − pivot) · k)`. The
+    /// occluder must agree so shadows match the pixels.
+    #[test]
+    fn voxel_world_size_matches_scaled_basis() {
+        use crate::dda::WorldOccluder;
+        let kv6 = Kv6::solid_cube(8, VoxColor(0x80_40_C0_40));
+        let scaled = SpriteDense::from_kv6(&kv6).with_voxel_world_size(2.0);
+        let unit = SpriteDense::from_kv6(&kv6);
+
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let draw = |dense: &SpriteDense, basis: f32| {
+            let mut fb = vec![0x80_10_10_10u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+            let written = draw_sprite_dense(
+                &mut fb,
+                &mut zb,
+                w as usize,
+                w,
+                h,
+                &cs,
+                &settings(w, h),
+                dense,
+                [0.0, 40.0, 0.0],
+                [basis, 0.0, 0.0],
+                [0.0, basis, 0.0],
+                [0.0, 0.0, basis],
+                0,
+            );
+            assert!(written > 0, "sprite must be visible");
+            fb
+        };
+        assert_eq!(
+            draw(&scaled, 1.0),
+            draw(&unit, 2.0),
+            "vws=2 @ unit basis == vws=1 @ 2x basis, pixel for pixel"
+        );
+
+        let occludes = |dense: &SpriteDense, basis: f32, x: f32| {
+            let mut occ = SpriteOccluder::new();
+            occ.push(
+                Arc::new(dense.clone()),
+                [0.0, 40.0, 0.0],
+                [basis, 0.0, 0.0],
+                [0.0, basis, 0.0],
+                [0.0, 0.0, basis],
+            );
+            occ.occluded_world([x, 0.0, 0.0], [0.0, 1.0, 0.0], 100.0)
+        };
+        // x = 6: inside the DOUBLED half-extent (8) but outside the
+        // unit one (4) — blocked only under the 2x scale, from either
+        // factoring.
+        assert!(occludes(&scaled, 1.0, 6.0));
+        assert!(occludes(&unit, 2.0, 6.0));
+        assert!(!occludes(&unit, 1.0, 6.0), "unscaled cube ends at 4");
     }
 
     /// XS.2 — the sprite occluder reports a world ray blocked by a sprite

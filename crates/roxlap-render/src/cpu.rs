@@ -916,9 +916,11 @@ impl CpuBackend {
         vf: &VoxelFrame,
         dims: [u32; 3],
         pivot: [f32; 3],
+        voxel_world_size: f32,
         material_map: &[(Rgb, u8)],
     ) -> bool {
-        let dense = SpriteDense::from_voxel_frame_with_materials(vf, dims, pivot, material_map);
+        let dense = SpriteDense::from_voxel_frame_with_materials(vf, dims, pivot, material_map)
+            .with_voxel_world_size(voxel_world_size);
         self.clip_books
             .get_mut(clip_idx)
             .is_some_and(|b| b.set_frame(frame, dense))
