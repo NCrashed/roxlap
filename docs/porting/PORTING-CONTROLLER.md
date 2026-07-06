@@ -13,11 +13,19 @@ container, stage RKC) — a `.rkc` character is what you *draw*, a
 character controller is what you *stand on the ground with*. CC.4
 connects the two.
 
-## Status — OPEN
+## Status — OPEN (CC.0 landed; CC.1 next)
 
 ## Phase log
 
-- CC.0 — not started.
+- CC.0 — LANDED 2026-07-06: `roxlap-scene/src/collide.rs` —
+  `Solidity` (bedrock knob only, `Copy`),
+  `box_overlaps_solid`/`point_overlaps_solid`/`grid_box_overlaps_solid`
+  (the single-grid form is public for the cave demos' one-grid
+  hosts). Exact floor-range probe for axis-aligned grids,
+  corner-AABB conservative for rotated. 7 unit tests: the three
+  ported scene-demo tests, slab-interior `UnexposedSolid`, bedrock
+  policy both ways, rotated-grid block/far-air, point≡degenerate-box.
+  Demos untouched (their copies die in CC.3).
 
 ## Goal
 

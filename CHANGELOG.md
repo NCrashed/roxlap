@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: collision query layer (CC.0)
+
+- `roxlap_scene::collide` — world-space box-vs-voxel overlap tests
+  over a `Scene` (`box_overlaps_solid` / `point_overlaps_solid` /
+  single-grid `grid_box_overlaps_solid`), the query layer under the
+  upcoming character controller (stage CC,
+  `docs/porting/PORTING-CONTROLLER.md`). Axis-aligned grids are
+  probed cell-exactly; rotated grids conservatively (corner-AABB).
+  `Solidity { bedrock_blocks }` makes the voxlap bedrock-placeholder
+  plane a policy: default air, matching how the demos render it.
+  Slab interiors (`Cube::UnexposedSolid`) block; out-of-grid is air.
+
 ### Changed: env overrides consolidated (QE-C6)
 
 - All `ROXLAP_*` environment overrides the library recognises are now

@@ -40,6 +40,9 @@ pub mod addr;
 pub mod billboard;
 pub mod cavegen;
 pub mod chunks;
+/// Collision query layer (stage CC) — box-vs-voxel overlap over a
+/// scene; see `docs/porting/PORTING-CONTROLLER.md`.
+pub mod collide;
 pub mod edit;
 pub mod lod;
 pub mod occluder;
@@ -57,6 +60,7 @@ use serde::{Deserialize, Serialize};
 pub use addr::{grid_local_to_world, voxel_global, voxel_split, world_to_grid_local, GridLocalPos};
 pub use billboard::{canonical_viewpoints, BillboardCache, BillboardSnapshot};
 pub use chunks::BakeMode;
+pub use collide::{box_overlaps_solid, grid_box_overlaps_solid, point_overlaps_solid, Solidity};
 pub use edit::SpanOp;
 pub use lod::{select_lod, Lod, LodThresholds};
 pub use roxlap_core::AoParams;
