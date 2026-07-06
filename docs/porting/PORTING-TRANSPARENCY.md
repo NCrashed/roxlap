@@ -1,5 +1,11 @@
 # roxlap — transparent voxels: per-voxel materials + front-to-back compositing (Substage TV)
 
+> **User-facing documentation lives in the book** — the Lighting &
+> materials chapter ("Materials: transparent voxels" and "Emissive
+> voxels & baked glow", `docs/book/src/lighting.md`) is the canonical
+> how-to and stays current with the API. This file is the stage's
+> design history: rationale, locked decisions, and the substage log.
+
 Start-of-stage brief and locked decisions for **transparent voxels** —
 alpha-blended and additive voxels for effects like spell sprites, smoke,
 fire, magic auras, water, and glass. Companion to

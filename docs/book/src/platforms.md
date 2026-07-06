@@ -70,6 +70,36 @@ plain library consumers on stable are unaffected.) Per-host header
 recipes, mobile touch controls, and the full setup live in
 [`crates/roxlap-web/README.md`](https://github.com/NCrashed/roxlap/blob/master/crates/roxlap-web/README.md).
 
+## Troubleshooting
+
+Symptoms first — each of these has burned somebody:
+
+- **"I asked for the GPU but I'm on the CPU renderer"** — the
+  fallback logs *why* through the [`log`] facade, and nothing shows
+  without a logger: install one (`env_logger::init()` in the demos)
+  before debugging anything else. `adapter_info()` returning `None`
+  is the runtime tell.
+- **No Vulkan on NixOS (and friends)** — outside a dev shell that
+  provides it, wgpu needs `libvulkan.so.1` on `LD_LIBRARY_PATH`
+  (match the ELF bitness). The repo's `flake.nix` wires it up;
+  `nix develop` is the easy path.
+- **Hybrid-GPU laptops (PRIME/offload)** — if the discrete GPU path
+  misbehaves (driver/compositor sync bugs present exactly this way),
+  `ROXLAP_GPU_POWER=low` steers wgpu to the integrated adapter
+  without a rebuild; `high` forces discrete.
+- **`cargo build` fails on `-lSDL2`** — only `roxlap-sdl-demo` links
+  system SDL2, and it is excluded from the workspace's
+  `default-members` for exactly this reason. Install the SDL2 dev
+  package or just don't build `-p roxlap-sdl-demo`.
+- **Web crates fail on stable Rust** — `roxlap-web` /
+  `roxlap-cave-web` pin a nightly via `rust-toolchain.toml`
+  (`-Z build-std` + atomics for the worker pool). Rustup honours the
+  pin automatically inside those directories; library consumers on
+  stable are unaffected.
+- **Browser runs single-threaded** — the COOP/COEP headers above are
+  missing. `crossOriginIsolated === false` in the console confirms
+  it; the thread pool fails *silently* by design.
+
 ## Further reading
 
 - [`PORTING-WASM.md`](https://github.com/NCrashed/roxlap/blob/master/docs/porting/PORTING-WASM.md)

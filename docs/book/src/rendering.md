@@ -29,7 +29,13 @@ frames identically on either:
 - **GPU** — a WGPU/WGSL compute-shader marcher (two-level chunk +
   voxel DDA with chunk-occupancy skip and distance-based mip LOD),
   presented via a wgpu swapchain. Same image, several times the frame
-  rate, and the CPU budget goes back to your game. Design history:
+  rate, and the CPU budget goes back to your game. Empty space costs
+  next to nothing: rays cross provably-empty regions via a per-grid
+  **occupancy pyramid** (< 40 B/grid, maintained live on edits), so
+  sparse worlds — a floating ship over distant terrain — don't pay
+  per-chunk for the air between (measured −30% frame time on
+  empty-gap-dominated views; byte-stable by construction). Design
+  history:
   [`PORTING-GPU.md`](https://github.com/NCrashed/roxlap/blob/master/docs/porting/PORTING-GPU.md).
 
 The facade keeps them in lockstep: scene edits, sprites, materials

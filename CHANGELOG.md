@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed: MSRV corrected to 1.92 (was a stale 1.77)
+
+- The declared `rust-version = "1.77"` had silently rotted: egui
+  0.34.x requires 1.92 (edition2024), image/vello 1.88 — the very
+  first run of the new CI msrv gate caught it. The workspace now
+  declares **1.92**, validated three ways kept in lockstep: the CI
+  `msrv` job, `flake.nix`'s pinned `msrvToolchain`, and the new
+  `msrv-check` dev-shell command that runs the CI check locally.
+
+### Changed: release-gate quality pass (tests, CI, book)
+
+- `roxlap-cli` test coverage 6 → 11: every subcommand's file pipeline
+  now round-trips in tests (multi-model `vox2kv6` numbered-output
+  contract, `vox2rvc`/`kv62vox` through the filesystem, `gif2rvc`
+  thickness + centisecond timing, `png2rvc` sequence + still,
+  `info` success/error reporting), with in-memory GIF/PNG fixtures.
+- CI grew three gates: **MSRV** (`cargo check` on the declared 1.77 —
+  previously unvalidated), **docs** (`cargo doc --no-deps` with
+  `-D warnings`, catching broken intra-doc links before docs.rs
+  does), and **smoke-fuzz** (all 8 `roxlap-formats` fuzz targets,
+  30 s each — corpus replay + short random walk on every PR;
+  previously local-only).
+- Book caught up to 0.24.0: the GPU occupancy pyramid in the
+  Rendering chapter, `BillboardActorDef::scale` + the `.rkc`
+  lifecycle calls in Sprites, and a **Troubleshooting** section in
+  Platforms (logger-first diagnosis, NixOS `libvulkan`,
+  `ROXLAP_GPU_POWER` for hybrid GPUs, SDL2 linking, web nightly pin,
+  silent thread-pool failure). `PORTING-TRANSPARENCY.md` now points
+  to the book as the canonical user-facing doc.
+
 ### Added: emissive voxels + glowing cave crystals (EV stage)
 
 - `Material` grew an `emissive: u8` field (**breaking** for struct

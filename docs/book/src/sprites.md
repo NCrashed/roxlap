@@ -115,9 +115,13 @@ camera's bearing versus the actor's `facing_yaw`, faces it, and
 advances its animation. Drive gameplay with `set_actor_state` /
 `set_actor_transform` / `set_actor_tint`. Lighting per actor or
 instance via `BillboardLighting` — `FullBright` for pickups and
-projectiles that shouldn't darken in shadow. The **Doom** demo scene
-is the worked example (it synthesises its GIFs at startup, so there
-is no binary asset to squint at).
+projectiles that shouldn't darken in shadow.
+`BillboardActorDef::scale` sets world units per slab voxel (`1.0` =
+the classic 1:1) — the knob for a giant boss or a half-height imp
+from the same sheet; it composes with the clip's own
+`voxel_world_size` and behaves identically on both backends. The
+**Doom** demo scene is the worked example (it synthesises its GIFs
+at startup, so there is no binary asset to squint at).
 
 ## Characters (`.rkc`) and KFA rigs
 
@@ -127,8 +131,11 @@ is in the assets:
 
 - **`.rkc` characters** — the modern container: meshes + a bone
   skeleton + animation clips, where a bone attachment is either a
-  static mesh or a voxel clip (a flickering torch in a hand).
-  `add_character(&ch, clip)` spawns one; `tick` advances it;
+  static mesh or a voxel clip (a flickering torch in a hand). The
+  whole lifecycle is four calls:
+  `roxlap_formats::character::parse(&bytes)` loads the container,
+  `add_character(&ch, clip)` spawns one playing the chosen clip,
+  `tick` advances it every frame, and
   `set_character_world_transform` moves it. Author them in
   [Demiurg](https://github.com/NCrashed/demiurg), the roxlap asset
   editor ([chapter 9](assets.md)); the wire format is
