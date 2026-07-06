@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed: billboard actors froze when the camera entered their column
+
+- `billboard_transform` returned `None` for a degenerate view axis
+  (camera exactly overhead / at the actor's xy column), and the tick
+  dropped the WHOLE transform — including the position update — so
+  the actor froze at its last pose. It now falls back to a fixed
+  facing (the card is edge-on at that instant anyway) and the
+  position always lands. Found via the World third-person view,
+  whose camera ticked from the eye — inside the actor's own column —
+  every frame.
+
+### Changed: `BillboardActorDef::scale` (breaking)
+
+- New field: world units per slab voxel (`1.0` = the classic 1:1),
+  applied to the instance basis every tick — identical on both
+  backends, unlike the clip's `voxel_world_size`, which today only
+  the GPU clip volumes honour (parity gap noted on the field's doc).
+  Construction sites add `scale: 1.0`.
+- Demo: the World third-person figure is upright (slab z = 0 is the
+  image BOTTOM — the figure was authored head-at-0), draws at 0.03
+  scale (0.72 units — a marker, not a giant), and the camera boom now
+  applies BEFORE the actor tick so the billboard faces the real
+  boomed camera.
+
 ## [0.23.0] — 2026-07-06
 
 ### Added: character controller — stage CC (CC.0–CC.5)

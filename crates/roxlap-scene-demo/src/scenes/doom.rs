@@ -185,6 +185,7 @@ impl DemoScene for DoomScene {
             mode: BillboardMode::Cylindrical,
             lighting: BillboardLighting::FaceNormal,
             speed: 1.0,
+            scale: 1.0,
             shadows: ShadowFlags::default(),
         };
         self.monster = ctx
@@ -205,6 +206,7 @@ impl DemoScene for DoomScene {
             // dimmed by the scene's ambient/sun.
             lighting: BillboardLighting::FullBright,
             speed: 1.0,
+            scale: 1.0,
             shadows: ShadowFlags {
                 casts: false,
                 receives: false,

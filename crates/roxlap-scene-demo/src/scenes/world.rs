@@ -27,11 +27,13 @@ const SPAWN_POS: [f64; 3] = [0.0, -120.0, 50.0];
 /// Grounded speed — terrain-scale rather than the 64 v/s fly rate.
 const WALK_SPEED: f64 = 12.0;
 
-/// Third-person figure: 24 voxels tall at 0.075 world units per voxel
-/// = 1.8 world units — the CharacterDef default height.
+/// Third-person figure: 24 slab voxels tall, drawn at
+/// `BillboardActorDef::scale` world units per voxel — 0.72 world
+/// units, deliberately smaller than the 1.8 collision body so the
+/// figure reads as a marker, not a giant.
 const FIGURE_H_VOX: u32 = 24;
 const FIGURE_W_VOX: u32 = 12;
-const FIGURE_VOXEL: f32 = 0.075;
+const FIGURE_SCALE: f32 = 0.03;
 
 /// Camera boom length in third person (clamped by a raycast so the
 /// camera never sits inside a hill).
@@ -92,7 +94,10 @@ impl WorldScene {
         const BOOTS: VoxColor = VoxColor(0x80_50_40_30);
         let cx = FIGURE_W_VOX / 2; // 6
         Kv6::from_fn(FIGURE_W_VOX, 2, FIGURE_H_VOX, |x, _y, z| {
-            // z is DOWN: 0 = crown, FIGURE_H_VOX-1 = soles.
+            // Slab convention (formats/src/slab.rs): z = 0 is the
+            // BOTTOM of the rendered card — flip so the crown zones
+            // below land at the top.
+            let z = FIGURE_H_VOX - 1 - z;
             match z {
                 0..=5 => {
                     // Head: a 4-wide block centred on the body.
@@ -117,7 +122,7 @@ impl WorldScene {
     /// and spawn the actor at the body.
     fn spawn_tp_actor(&mut self, ctx: &mut SceneCtx) -> Option<BillboardActorId> {
         let clip = |frames: &[Kv6]| {
-            VoxelClip::from_kv6_frames(frames, FIGURE_VOXEL, LoopMode::Loop, &[], 220, 1)
+            VoxelClip::from_kv6_frames(frames, 1.0, LoopMode::Loop, &[], 220, 1)
                 .expect("figure frames are non-empty + same dims")
         };
         let walk = ctx.renderer.add_voxel_clip(
@@ -144,6 +149,7 @@ impl WorldScene {
             mode: BillboardMode::Cylindrical,
             lighting: BillboardLighting::FaceNormal,
             speed: 1.0,
+            scale: FIGURE_SCALE,
             shadows: ShadowFlags::default(),
         };
         ctx.renderer
@@ -155,7 +161,7 @@ impl WorldScene {
     #[allow(clippy::cast_possible_truncation)]
     fn actor_pos(&self) -> [f32; 3] {
         let feet = self.body.pos();
-        let half_h = f64::from(FIGURE_H_VOX) * f64::from(FIGURE_VOXEL) * 0.5;
+        let half_h = f64::from(FIGURE_H_VOX) * f64::from(FIGURE_SCALE) * 0.5;
         [feet.x as f32, feet.y as f32, (feet.z - half_h) as f32]
     }
 }
@@ -211,8 +217,11 @@ impl DemoScene for WorldScene {
             let moving = self.body.vel().truncate().length() > 0.5;
             ctx.renderer
                 .set_actor_state(actor, if moving { "walk" } else { "idle" });
-            ctx.renderer.tick(&ctx.cam.camera(), dt);
 
+            // Boom BEFORE tick: the billboard must face the real
+            // (boomed) camera. Ticking from the eye — which sits in
+            // the actor's own xy column — fed the cylindrical facing
+            // a degenerate view axis every frame.
             let eye = self.body.eye_pos();
             let back = -DVec3::from(ctx.cam.camera().forward);
             let boom = self
@@ -221,6 +230,7 @@ impl DemoScene for WorldScene {
                 .raycast(eye, back, BOOM_DIST)
                 .map_or(BOOM_DIST, |hit| (hit.t - 0.5).max(0.5));
             ctx.cam.pos = (eye + back * boom).into();
+            ctx.renderer.tick(&ctx.cam.camera(), dt);
         }
         self.last_eye = ctx.cam.pos;
 

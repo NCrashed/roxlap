@@ -685,14 +685,21 @@ fn billboard_transform(
         cam[1] as f32 - pos[1],
         cam[2] as f32 - pos[2],
     ];
-    // `+y` = slab normal toward the camera (horizontal-only for cylindrical).
+    // `+y` = slab normal toward the camera (horizontal-only for
+    // cylindrical). Degenerate view axes (camera exactly overhead /
+    // exactly at the pos — e.g. a third-person camera the instant
+    // before its boom applies) fall back to a fixed facing instead
+    // of returning None: the card is edge-on/invisible right then
+    // anyway, but the POSITION update must never be dropped, or the
+    // actor freezes at its last pose (the CC.4 third-person bug).
+    const FALLBACK: [f32; 3] = [0.0, 1.0, 0.0];
     let ny = match mode {
-        BillboardMode::Cylindrical => bb_norm([to_cam[0], to_cam[1], 0.0])?,
-        BillboardMode::Spherical => bb_norm(to_cam)?,
+        BillboardMode::Cylindrical => bb_norm([to_cam[0], to_cam[1], 0.0]).unwrap_or(FALLBACK),
+        BillboardMode::Spherical => bb_norm(to_cam).unwrap_or(FALLBACK),
         BillboardMode::None => return None,
     };
     // `+x` = image horizontal = screen-right (non-mirrored): up × normal.
-    let nx = bb_norm(bb_cross(BILLBOARD_UP, ny))?;
+    let nx = bb_norm(bb_cross(BILLBOARD_UP, ny)).unwrap_or([1.0, 0.0, 0.0]);
     // `+z` = image vertical (≈ world up; exactly world up for cylindrical).
     let nz = bb_cross(ny, nx);
     Some(DynSpriteTransform {
@@ -800,6 +807,11 @@ pub struct BillboardActorDef {
     /// negative = reverse). QE.7b — was Q8 fixed point (`speed_q8:
     /// 256`); migrate with `speed = speed_q8 as f32 / 256.0`.
     pub speed: f32,
+    /// World units per slab voxel (`1.0` = classic 1:1). Applied to
+    /// the instance basis every tick, so it scales identically on
+    /// both backends — unlike the clip's own `voxel_world_size`,
+    /// which today only the GPU clip volumes honour.
+    pub scale: f32,
     /// Shadow participation for the actor's voxels.
     pub shadows: ShadowFlags,
 }
@@ -811,6 +823,7 @@ impl Default for BillboardActorDef {
             mode: BillboardMode::Cylindrical,
             lighting: BillboardLighting::FaceNormal,
             speed: 1.0,
+            scale: 1.0,
             shadows: ShadowFlags::default(),
         }
     }
@@ -826,6 +839,8 @@ fn speed_to_q8(speed: f32) -> i32 {
 /// A live directional billboard: one clip instance whose directional clip is
 /// reselected by view angle and whose animation plays a named state.
 struct BillboardActor {
+    /// World units per slab voxel (from the def).
+    scale: f32,
     inst: SpriteInstanceId,
     states: Vec<ActorState>,
     cur_state: usize,
@@ -3134,6 +3149,7 @@ impl SceneRenderer {
         self.set_sprite_instance_lighting(inst, def.lighting);
         let clock = self.clock_for_clip(Some(init_clip), def.speed);
         let actor = BillboardActor {
+            scale: def.scale,
             inst,
             states: def.states,
             cur_state: 0,
@@ -3259,7 +3275,14 @@ impl SceneRenderer {
                 desired
             });
             let frame = a.clock.tick(dt);
-            let xf = billboard_transform(a.pos, cam, a.mode);
+            let xf = billboard_transform(a.pos, cam, a.mode).map(|mut xf| {
+                for axis in [&mut xf.right, &mut xf.up, &mut xf.forward] {
+                    for c in axis.iter_mut() {
+                        *c *= a.scale;
+                    }
+                }
+                xf
+            });
             actions.push(Action {
                 inst: a.inst,
                 set_clip,
@@ -4575,20 +4598,24 @@ mod tests {
     }
 
     #[test]
-    fn billboard_degenerate_and_none_yield_no_transform() {
-        // Cylindrical with the camera straight overhead → no horizontal
-        // facing direction → skipped.
-        assert!(billboard_transform(
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, -10.0],
-            BillboardMode::Cylindrical
+    fn billboard_degenerate_keeps_position_none_stays_none() {
+        // Degenerate view axes (camera straight overhead) must still
+        // yield a transform — a fixed fallback facing — because
+        // dropping it also drops the POSITION update and the actor
+        // freezes at its last pose (the CC.4 third-person bug: a
+        // camera at the actor's own xy column degenerated every
+        // frame). The card is edge-on right then, so the facing
+        // itself is cosmetically irrelevant.
+        let xf = billboard_transform(
+            [1.0, 2.0, 0.0],
+            [1.0, 2.0, -10.0],
+            BillboardMode::Cylindrical,
         )
-        .is_none());
-        // Spherical looking straight along world-up → image-right degenerate.
-        assert!(
-            billboard_transform([0.0, 0.0, 0.0], [0.0, 0.0, -10.0], BillboardMode::Spherical)
-                .is_none()
-        );
+        .expect("degenerate cylindrical falls back, not drops");
+        assert_eq!(xf.pos, [1.0, 2.0, 0.0], "position always lands");
+        let xf = billboard_transform([1.0, 2.0, 0.0], [1.0, 2.0, -10.0], BillboardMode::Spherical)
+            .expect("degenerate spherical falls back, not drops");
+        assert_eq!(xf.pos, [1.0, 2.0, 0.0]);
         // None mode is never auto-oriented.
         assert!(
             billboard_transform([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], BillboardMode::None).is_none()
