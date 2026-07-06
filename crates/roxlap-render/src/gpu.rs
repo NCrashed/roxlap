@@ -169,33 +169,10 @@ struct GridSync {
     complete_at: u64,
 }
 
-/// Read a `f32` env override, `None` when unset/unparseable (or on
-/// wasm, which has no process environment).
-fn env_f32(var: &str) -> Option<f32> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = var;
-        None
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::env::var(var).ok().and_then(|v| v.parse().ok())
-    }
-}
-
-/// Resolve an upload budget: the env var (user-side escape hatch) wins
-/// over the [`RenderOptions`] field; `0` means unbounded on both.
-fn budget_option(var: &str, from_opts: u32) -> u32 {
-    #[cfg(target_arch = "wasm32")]
-    let raw = {
-        let _ = var;
-        from_opts
-    };
-    #[cfg(not(target_arch = "wasm32"))]
-    let raw = std::env::var(var)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(from_opts);
+/// An upload budget as stored: the `0 = unbounded` public convention
+/// mapped to `u32::MAX` so the per-frame counters can compare plainly.
+/// Env-vs-option resolution happened upstream (`env_config`, QE-C6).
+fn budget_value(raw: u32) -> u32 {
     if raw == 0 {
         u32::MAX
     } else {
@@ -210,9 +187,7 @@ impl GpuBackend {
         let mut gpu = gpu;
         // QE.8 — sprite mip-LOD threshold (projected mip-0 voxel size,
         // screen px, below which the pass steps to a coarser mip).
-        gpu.set_sprite_lod_px(
-            env_f32("ROXLAP_GPU_SPRITE_LOD_PX").unwrap_or(opts.gpu_sprite_lod_px),
-        );
+        gpu.set_sprite_lod_px(opts.gpu_sprite_lod_px);
         Self {
             gpu,
             resident: None,
@@ -233,17 +208,11 @@ impl GpuBackend {
             carve_z: 0,
             host_sky_set: false,
             auto_sky_color: None,
-            chunk_upload_budget: budget_option(
-                "ROXLAP_GPU_CHUNK_BUDGET",
-                opts.gpu_chunk_upload_budget,
-            ),
-            clip_upload_budget: budget_option(
-                "ROXLAP_GPU_CLIP_BUDGET",
-                opts.gpu_clip_upload_budget,
-            ),
+            chunk_upload_budget: budget_value(opts.gpu_chunk_upload_budget),
+            clip_upload_budget: budget_value(opts.gpu_clip_upload_budget),
             image_pixels: Vec::new(),
             transforms_dirty: false,
-            mip_scan_dist: env_f32("ROXLAP_GPU_MIP_SCAN_DIST").unwrap_or(opts.gpu_mip_scan_dist),
+            mip_scan_dist: opts.gpu_mip_scan_dist,
             capture_armed: false,
         }
     }

@@ -129,7 +129,17 @@ below. **Author triage 2026-07-06** (every carried item decided):
   `GridView`-on-`CHUNK_SIZE_Z`). `missing_docs = "warn"` now lives in
   `[workspace.lints.rust]` (per-crate attrs removed), so CI's
   `-D warnings` gates every new public item workspace-wide.
-- QE-C6 `RenderConfig` consolidation — **DO.**
+- QE-C6 `RenderConfig` consolidation — **DONE 2026-07-06.** Landed
+  smaller than the audit sketch because QE.2a/2c/QE.8 had already
+  given every env-only knob a programmatic `RenderOptions` field: the
+  remaining fix was centralising the reads. `roxlap-render/src/
+  env_config.rs` (`EnvOverrides::from_env().applied(opts)`) is now the
+  ONE env-read site, called once in `try_new` /
+  `new_from_canvas_async`; `env_f32`/`budget_option` deleted from
+  gpu.rs; `ROXLAP_GPU_POWER` moved out of roxlap-gpu (facade resolves
+  it into `settings.power_preference`; direct-GpuRenderer users set
+  the field). Variable table on `RenderOptions` rustdoc; unparseable
+  values now `log::warn!`; `RenderOptions: Clone`.
 
 Also resolved 2026-07-06: the QE.7a `Feature` parity table shipped
 stale — it claimed GPU lacks `TranslucentSpriteMaterials` /

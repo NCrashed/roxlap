@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed: env overrides consolidated (QE-C6)
+
+- All `ROXLAP_*` environment overrides the library recognises are now
+  read in ONE place, once, at `SceneRenderer` construction — the
+  variable table lives on `RenderOptions`' rustdoc. Semantics are
+  unchanged (env wins over the programmatic value; never read per
+  frame), with one improvement: an unparseable value now logs a
+  `log::warn!` instead of being silently ignored.
+- `roxlap-gpu` itself no longer reads the environment:
+  `ROXLAP_GPU_POWER` is resolved by the facade into
+  `GpuRendererSettings::power_preference`. Only affects code driving
+  `roxlap_gpu::GpuRenderer` directly (not via `roxlap-render`) — set
+  `power_preference` yourself there.
+- `RenderOptions` is now `Clone`.
+
 ### Added: workspace-wide `missing_docs` (QE.0 debt paid)
 
 - The ~260 undocumented public items left in `roxlap-formats` /

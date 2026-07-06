@@ -49,6 +49,10 @@ mod cpu;
 mod cpu_blit;
 #[cfg(feature = "hud")]
 mod cpu_egui;
+/// QE-C6 — the one place `ROXLAP_*` env overrides are read (once, at
+/// construction). The user-facing variable table is on
+/// [`RenderOptions`].
+mod env_config;
 mod gpu;
 /// Dynamic lighting types (stages DL + SL) — runtime sun, point and
 /// spot lights, on both backends.
@@ -1354,6 +1358,29 @@ impl std::error::Error for RenderError {
 }
 
 /// Construction-time options for [`SceneRenderer::new`].
+///
+/// # Environment overrides (QE-C6)
+///
+/// Each GPU tuning knob below has a `ROXLAP_*` escape hatch, so a
+/// shipped binary can be re-tuned from the shell. All of them are
+/// read **once**, at `SceneRenderer` construction (never per frame),
+/// the env value wins over the programmatic one, and unparseable
+/// values are dropped with a `log::warn!`. On wasm there is no
+/// process environment and the field values apply as-is.
+///
+/// | variable | overrides | values |
+/// |---|---|---|
+/// | `ROXLAP_GPU_POWER` | [`gpu`](Self::gpu)`.power_preference` | `low` / `high` |
+/// | `ROXLAP_GPU_SPRITE_LOD_PX` | [`gpu_sprite_lod_px`](Self::gpu_sprite_lod_px) | `f32`, screen px |
+/// | `ROXLAP_GPU_MIP_SCAN_DIST` | [`gpu_mip_scan_dist`](Self::gpu_mip_scan_dist) | `f32`, world units |
+/// | `ROXLAP_GPU_CHUNK_BUDGET` | [`gpu_chunk_upload_budget`](Self::gpu_chunk_upload_budget) | `u32`, `0` = unbounded |
+/// | `ROXLAP_GPU_CLIP_BUDGET` | [`gpu_clip_upload_budget`](Self::gpu_clip_upload_budget) | `u32`, `0` = unbounded |
+///
+/// Other `ROXLAP_*` variables you may have seen (`ROXLAP_GPU`,
+/// `ROXLAP_SCENE`, `ROXLAP_CAPTURE`, …) belong to the demo hosts, not
+/// the library — backend selection is [`backend`](Self::backend),
+/// decided by *your* code.
+#[derive(Clone)]
 pub struct RenderOptions {
     /// Which backend to build (QE.7b — replaces `want_gpu: bool`;
     /// migrate `want_gpu: true` → [`BackendPreference::PreferGpu`],
@@ -1788,6 +1815,9 @@ impl SceneRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
     {
+        // QE-C6 — resolve `ROXLAP_*` env overrides once, here, and
+        // thread plain options into the backends (no env reads below).
+        let opts = &env_config::EnvOverrides::from_env().applied(opts);
         if opts.backend != BackendPreference::Cpu {
             match GpuBackend::new(window.clone(), size, opts) {
                 Ok(g) => return Ok(Self::from_backend(BackendImpl::Gpu(Box::new(g)))),
@@ -1842,6 +1872,9 @@ impl SceneRenderer {
         size: (u32, u32),
         opts: &RenderOptions,
     ) -> Self {
+        // QE-C6 mirror of the native path; on wasm every override is
+        // `None` (no process environment), so this is a plain copy.
+        let opts = &env_config::EnvOverrides::from_env().applied(opts);
         if opts.backend != BackendPreference::Cpu {
             // `SurfaceTarget::Canvas` moves the canvas into wgpu, so the
             // GPU attempt gets a clone — the CPU fallback keeps the
