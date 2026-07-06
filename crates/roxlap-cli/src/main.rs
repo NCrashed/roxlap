@@ -601,6 +601,161 @@ mod tests {
         assert_eq!(parse_chunk_idx("a,b,c"), None);
     }
 
+    /// Unique per-test scratch dir under the system temp root (kept
+    /// tiny; the OS reaps it).
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("roxlap-cli-tests-{}", std::process::id()))
+            .join(name);
+        std::fs::create_dir_all(&d).expect("create scratch dir");
+        d
+    }
+
+    /// Encode RGBA frames as in-memory GIF bytes (mirror of the
+    /// `roxlap-formats` gif_import test helper).
+    fn encode_gif(w: u16, h: u16, frames: &[(Vec<u8>, u16)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = gif::Encoder::new(&mut out, w, h, &[]).expect("gif encoder");
+            enc.set_repeat(gif::Repeat::Infinite).expect("repeat");
+            for (rgba, delay) in frames {
+                let mut buf = rgba.clone();
+                let mut frame = gif::Frame::from_rgba(w, h, &mut buf);
+                frame.delay = *delay;
+                enc.write_frame(&frame).expect("write frame");
+            }
+        }
+        out
+    }
+
+    /// Encode one RGBA image as in-memory PNG bytes.
+    fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().expect("png header");
+            writer.write_image_data(rgba).expect("png data");
+        }
+        out
+    }
+
+    /// `vox2kv6`'s file contract: one model writes `output` verbatim,
+    /// a multi-model file fans out to `stem_0.ext`, `stem_1.ext`, …
+    /// (and does NOT write the plain `output` path).
+    #[test]
+    fn vox2kv6_single_and_multi_model_files() {
+        let d = scratch("vox2kv6");
+        let single = d.join("one.vox");
+        std::fs::write(&single, test_vox(1)).expect("write fixture");
+        let out = d.join("out.kv6");
+        vox2kv6(&single, &out).expect("single-model conversion");
+        kv6::parse(&std::fs::read(&out).expect("read out.kv6")).expect("out.kv6 parses");
+
+        let multi = d.join("two.vox");
+        std::fs::write(&multi, test_vox(2)).expect("write fixture");
+        let out2 = d.join("mm.kv6");
+        vox2kv6(&multi, &out2).expect("multi-model conversion");
+        assert!(!out2.exists(), "multi-model must write numbered files only");
+        for i in 0..2 {
+            let p = d.join(format!("mm_{i}.kv6"));
+            kv6::parse(&std::fs::read(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}")))
+                .expect("numbered kv6 parses");
+        }
+    }
+
+    /// `vox2rvc` + `kv62vox` end-to-end through the filesystem: the
+    /// written `.rvc` / `.vox` reparse with the expected content.
+    #[test]
+    fn vox2rvc_and_kv62vox_file_roundtrip() {
+        let d = scratch("file-roundtrip");
+        let vox_in = d.join("anim.vox");
+        std::fs::write(&vox_in, test_vox(3)).expect("write fixture");
+        let rvc_out = d.join("anim.rvc");
+        vox2rvc(&vox_in, &rvc_out, 120).expect("vox2rvc");
+        let clip = VoxelClip::parse(&std::fs::read(&rvc_out).expect("read rvc"))
+            .expect("written rvc parses");
+        assert_eq!(clip.frames.len(), 3);
+        assert_eq!(clip.decode().expect("decodes").durations, vec![120; 3]);
+
+        let kv6_in = d.join("model.kv6");
+        let model = &parse_vox_models(&test_vox(1)).expect("one model")[0];
+        std::fs::write(&kv6_in, kv6::serialize(model)).expect("write fixture");
+        let vox_out = d.join("model.vox");
+        kv62vox(&kv6_in, &vox_out).expect("kv62vox");
+        let f = vox::parse(&std::fs::read(&vox_out).expect("read vox")).expect("written vox");
+        assert_eq!(f.models[0].voxels.len(), 1);
+    }
+
+    /// `gif2rvc` honours the thickness argument and the GIF's frame
+    /// timing (centiseconds → ms) through the written `.rvc`.
+    #[test]
+    fn gif2rvc_thickness_and_timing() {
+        let d = scratch("gif2rvc");
+        let t = [0u8, 0, 0, 0];
+        let opaque = [255u8, 0, 0, 255];
+        let f0: Vec<u8> = [opaque, t, t, t].concat();
+        let f1: Vec<u8> = [opaque, opaque, t, t].concat();
+        let gif_in = d.join("anim.gif");
+        std::fs::write(&gif_in, encode_gif(2, 2, &[(f0, 5), (f1, 10)])).expect("write gif");
+        let out = d.join("anim.rvc");
+        gif2rvc(&gif_in, &out, 3).expect("gif2rvc");
+        let clip = VoxelClip::parse(&std::fs::read(&out).expect("read rvc")).expect("parses");
+        assert_eq!(clip.dims, [2, 3, 2], "thickness extrudes the slab");
+        let dec = clip.decode().expect("decodes");
+        assert_eq!(dec.frame_count(), 2);
+        assert_eq!(dec.durations, vec![50, 100]);
+        assert_eq!(dec.frames[0].colors.len(), 3, "1 opaque px × 3 layers");
+    }
+
+    /// `png2rvc` both ways: a numbered frame sequence and a single
+    /// still (the APNG path's degenerate case).
+    #[test]
+    fn png2rvc_sequence_and_still() {
+        let d = scratch("png2rvc");
+        let t = [0u8, 0, 0, 0];
+        let opaque = [0u8, 255, 0, 255];
+        let p0 = d.join("f0.png");
+        let p1 = d.join("f1.png");
+        std::fs::write(&p0, encode_png(2, 2, &[opaque, t, t, t].concat())).expect("write f0");
+        std::fs::write(&p1, encode_png(2, 2, &[opaque, opaque, t, t].concat())).expect("f1");
+        let out = d.join("seq.rvc");
+        png2rvc_frames(&[&p0, &p1], &out).expect("png2rvc frames");
+        let clip = VoxelClip::parse(&std::fs::read(&out).expect("read rvc")).expect("parses");
+        assert_eq!(clip.decode().expect("decodes").frame_count(), 2);
+
+        let still_out = d.join("still.rvc");
+        png2rvc_apng(&p0, &still_out, 2).expect("png2rvc still");
+        let clip = VoxelClip::parse(&std::fs::read(&still_out).expect("read rvc")).expect("ok");
+        assert_eq!(clip.dims, [2, 2, 2], "thickness 2 slab");
+        assert_eq!(clip.decode().expect("decodes").frame_count(), 1);
+    }
+
+    /// `info` succeeds on a real asset and reports unreadable /
+    /// unrecognised inputs as errors that name the problem.
+    #[test]
+    fn info_reads_assets_and_reports_errors() {
+        let d = scratch("info");
+        let vox_in = d.join("m.vox");
+        std::fs::write(&vox_in, test_vox(1)).expect("write fixture");
+        info(&vox_in).expect("info on a valid .vox");
+
+        let missing = info(Path::new("definitely/not/here.vox")).expect_err("missing file");
+        assert!(
+            missing.contains("not/here.vox"),
+            "names the path: {missing}"
+        );
+
+        let junk = d.join("junk.dat");
+        std::fs::write(&junk, [0u8; 16]).expect("write junk");
+        let unrecognised = info(&junk).expect_err("unrecognised bytes");
+        assert!(
+            unrecognised.contains("unrecognised") || unrecognised.contains("unknown"),
+            "explains the failure: {unrecognised}"
+        );
+    }
+
     #[test]
     fn snapshot_summary_lists_grids() {
         use glam::{DVec3, IVec3};

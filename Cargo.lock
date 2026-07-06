@@ -2379,7 +2379,9 @@ dependencies = [
 name = "roxlap-cli"
 version = "0.24.0"
 dependencies = [
+ "gif",
  "glam",
+ "png 0.17.16",
  "roxlap-formats",
  "roxlap-scene",
 ]

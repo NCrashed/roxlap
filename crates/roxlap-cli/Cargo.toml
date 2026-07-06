@@ -23,5 +23,11 @@ roxlap-scene = { path = "../roxlap-scene", version = "0.24" }
 # (roxlap-scene's own coordinate type).
 glam = { workspace = true }
 
+[dev-dependencies]
+# QE — encode tiny in-memory GIF/PNG fixtures for the gif2rvc /
+# png2rvc conversion tests (mirrors the roxlap-formats test helpers).
+gif = { workspace = true }
+png = { workspace = true }
+
 [lints]
 workspace = true
