@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added: character controller body (CC.1)
+### Added: character controller body (CC.1 + CC.2)
 
 - `roxlap_scene::character` — `CharacterBody` / `CharacterDef` /
   `WalkInput`: a walking body over `Scene` with substepped per-axis
@@ -16,8 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the demos' stuck-escape rule. Deterministic: same scene + same
   input sequence = bit-identical trajectory (pinned by a unit test).
   Feet-positioned, f64 world; remember +z is DOWN — gravity is
-  positive, a jump impulse negative. Fly/noclip modes, auto step-up
-  and input buffering arrive in CC.2.
+  positive, a jump impulse negative.
+- Feel layer (CC.2): auto step-up onto ledges up to
+  `CharacterDef::step_up` voxels (all-or-nothing: lift must fit,
+  landing must find ground), coyote-time jumps after walking off an
+  edge, press-buffered jumps that fire on landing, and
+  `MoveMode::{Walk, Fly, Noclip}` — `Fly` is the demos' sliding fly
+  camera, `Noclip` skips probes.
 
 ### Added: collision query layer (CC.0)
 

@@ -13,9 +13,25 @@ container, stage RKC) — a `.rkc` character is what you *draw*, a
 character controller is what you *stand on the ground with*. CC.4
 connects the two.
 
-## Status — OPEN (CC.0 + CC.1 landed; CC.2 next)
+## Status — OPEN (CC.0–CC.2 landed; CC.3 next)
 
 ## Phase log
+
+- CC.2 — LANDED 2026-07-06: feel pass. `CharacterDef` gains
+  `step_up` (1.05) / `coyote_time` (0.12) / `jump_buffer` (0.12) /
+  `fly_speed` (12.0); new `MoveMode::{Walk, Fly, Noclip}` (named
+  `MoveMode`, not the sketch's `Mode` — avoids a too-generic
+  crate-root re-export next to `BakeMode`). Auto-step:
+  all-or-nothing lift → over → snap-down-must-land, per substep;
+  jump is press-buffered + coyote-gated (window consumed on fire —
+  no double jumps). `slide_move` now *returns* whether stuck-escape
+  fired so the end-of-frame ground probe doesn't "ground" a body
+  buried in a wall (caught by the CC.1 stuck test). 8 new trajectory
+  tests (16 total): 1-voxel ledge climbed flush, 2-voxel wall
+  refused, no-headroom refusal, coyote jump 3 frames off the edge,
+  no coyote double-jump, buffered jump fires on landing (and the
+  physics of why 0.5 voxels is too far for a 0.12 s buffer), fly
+  hovers+slides, noclip ghosts.
 
 - CC.1 — LANDED 2026-07-06: `roxlap-scene/src/character.rs` —
   `CharacterDef` (radius/height/eye_height, gravity/jump_speed,
