@@ -37,6 +37,12 @@ release cut (the crate carries full publish metadata).
 
 - `voxel_clip::ParseError` is Debug-only (no `Display`) — unlike the
   other formats' errors. The CLI formats it with `{e:?}`.
-- Candidate follow-ons, deliberately not done now: `gif2rvc` /
-  `png2rvc` (needs the formats crate's non-default `gif`/`png`
-  features), `kv6 → vox` reverse export, snapshot chunk extraction.
+- Follow-ons LANDED 2026-07-06: `gif2rvc` / `png2rvc` (the cli now
+  enables the formats crate's `gif`/`png` features; png2rvc takes an
+  APNG/still or a frame list) and `kv62vox` over the new
+  `vox::VoxFile::from_kv6` + `vox::serialize` (exact ≤ 255 colours,
+  6-bit-bucket quantise beyond; pivot lost — `.vox` has none).
+  Live-verified: magick-made GIF/PNG assets → rvc → `info`, and
+  coco.kv6 → vox → kv6 keeps all 148 voxels. Still open: snapshot
+  chunk extraction (no demand yet). Publish owed at the next release
+  cut.

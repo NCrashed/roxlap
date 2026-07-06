@@ -17,7 +17,7 @@ readme.workspace = true
 # snapshot envelope. No CLI-framework dependency — the argument
 # grammar is three subcommands (house style: hand-parsed).
 [dependencies]
-roxlap-formats = { path = "../roxlap-formats", version = "0.22" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.22", features = ["gif", "png"] }
 roxlap-scene = { path = "../roxlap-scene", version = "0.22" }
 
 [dev-dependencies]

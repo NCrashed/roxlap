@@ -52,6 +52,20 @@ graph" → *Walking on the world*, with the runnable
   Both fixed; CI gained a stable-wasm32 `cargo check` job for the web
   crates.
 
+### Added: `.vox` export + CLI importer subcommands
+
+- `roxlap_formats::vox` learned to WRITE: `VoxFile::from_kv6` +
+  `vox::serialize` — kv6 sprites export to MagicaVoxel files (z-down
+  flips back to z-up; exact for ≤ 255 distinct colours, 6-bit-bucket
+  frequency quantisation beyond; the kv6 pivot is lost — `.vox` has
+  no pivot). Round-trip pinned by tests.
+- `roxlap-cli` grew three subcommands: `kv62vox <in.kv6> <out.vox>`,
+  `gif2rvc <in.gif> <out.rvc> [thickness]` and
+  `png2rvc <in.(a)png> <out.rvc> [thickness]` (or
+  `png2rvc <f0.png> <f1.png> … <out.rvc>` for numbered sequences) —
+  the BB-stage billboard importers, now reachable without writing
+  Rust.
+
 ### Changed: env overrides consolidated (QE-C6)
 
 - All `ROXLAP_*` environment overrides the library recognises are now

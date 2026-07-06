@@ -297,6 +297,180 @@ pub fn parse(bytes: &[u8]) -> Result<VoxFile, ParseError> {
     Ok(VoxFile { models, palette })
 }
 
+// ---- export (kv6 → vox) ---------------------------------------------------
+
+impl VoxFile {
+    /// Build a single-model file from a kv6 sprite — the inverse of
+    /// [`VoxModel::to_kv6`] up to palette quantisation: voxlap z-down
+    /// flips back to MagicaVoxel z-up, brightness bytes are dropped
+    /// (they belong to the engine's lighting, not the editor), and
+    /// the colour set is packed into the 255 usable palette slots.
+    /// With ≤ 255 distinct colours the mapping is exact; beyond that,
+    /// colours quantise to 6-bit-per-channel buckets and the 255 most
+    /// frequent buckets win (the rest snap to their nearest kept
+    /// entry). The kv6 pivot has no `.vox` counterpart and is lost.
+    #[must_use]
+    pub fn from_kv6(kv6: &Kv6) -> Self {
+        // kv6 voxels carry (z, col) grouped per (x, y) column via the
+        // ylen table — walk it to recover the coordinates.
+        let mut placed: Vec<(u8, u8, u8, u32)> = Vec::with_capacity(kv6.voxels.len());
+        let mut cursor = 0usize;
+        for x in 0..kv6.xsiz as usize {
+            for y in 0..kv6.ysiz as usize {
+                let n = kv6.ylen[x][y] as usize;
+                for v in &kv6.voxels[cursor..cursor + n] {
+                    // z-down → z-up; sizes are ≤ 256 so u8 fits.
+                    let mz = kv6.zsiz - 1 - u32::from(v.z);
+                    #[allow(clippy::cast_possible_truncation)]
+                    placed.push((x as u8, y as u8, mz as u8, v.col & 0x00ff_ffff));
+                }
+                cursor += n;
+            }
+        }
+
+        // Distinct RGB set, insertion-ordered for stable output.
+        let mut order: Vec<u32> = Vec::new();
+        let mut seen = std::collections::HashMap::new();
+        for &(_, _, _, rgb) in &placed {
+            seen.entry(rgb).or_insert_with(|| {
+                order.push(rgb);
+                order.len() - 1
+            });
+        }
+
+        // > 255 distinct: quantise to 6-bit buckets by frequency.
+        let exact = order.len() <= 255;
+        let chosen: Vec<u32> = if exact {
+            order
+        } else {
+            let mut freq = std::collections::HashMap::new();
+            for &(_, _, _, rgb) in &placed {
+                *freq.entry(quant6(rgb)).or_insert(0u32) += 1;
+            }
+            let mut buckets: Vec<(u32, u32)> = freq.into_iter().collect();
+            buckets.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            buckets.truncate(255);
+            buckets.into_iter().map(|(rgb, _)| rgb).collect()
+        };
+
+        // Palette: internal layout, slot 0 empty, ABGR entries.
+        let mut palette = [0u32; 256];
+        for (i, &rgb) in chosen.iter().enumerate() {
+            let (r, g, b) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+            palette[i + 1] = 0xff00_0000 | (b << 16) | (g << 8) | r;
+        }
+
+        let index_of = |rgb: u32| -> u8 {
+            if exact {
+                #[allow(clippy::cast_possible_truncation)]
+                return (seen[&rgb] + 1) as u8;
+            }
+            let q = quant6(rgb);
+            // Exact bucket if kept, else nearest kept bucket.
+            let mut best = (u32::MAX, 1u8);
+            for (i, &c) in chosen.iter().enumerate() {
+                let d = colour_dist2(q, c);
+                if d < best.0 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        best = (d, (i + 1) as u8);
+                    }
+                    if d == 0 {
+                        break;
+                    }
+                }
+            }
+            best.1
+        };
+
+        let voxels = placed
+            .into_iter()
+            .map(|(x, y, z, rgb)| (x, y, z, index_of(rgb)))
+            .collect();
+        Self {
+            models: vec![VoxModel {
+                size_x: kv6.xsiz,
+                size_y: kv6.ysiz,
+                size_z: kv6.zsiz,
+                voxels,
+            }],
+            palette,
+        }
+    }
+}
+
+/// Round an RGB word to 6 bits per channel (the bucket key the > 255
+/// colour quantiser groups by).
+fn quant6(rgb: u32) -> u32 {
+    rgb & 0x00fc_fcfc
+}
+
+fn colour_dist2(a: u32, b: u32) -> u32 {
+    let d = |sh: u32| {
+        let (x, y) = ((a >> sh) & 0xff, (b >> sh) & 0xff);
+        x.abs_diff(y).pow(2)
+    };
+    d(16) + d(8) + d(0)
+}
+
+/// Serialise a [`VoxFile`] to `.vox` bytes (VOX version 150: `SIZE` +
+/// `XYZI` per model and the `RGBA` palette — the exact subset
+/// [`parse`] reads, so files round-trip; MagicaVoxel opens them).
+#[must_use]
+pub fn serialize(file: &VoxFile) -> Vec<u8> {
+    fn chunk(out: &mut Vec<u8>, id: [u8; 4], content: &[u8]) {
+        out.extend_from_slice(&id);
+        out.extend_from_slice(
+            &u32::try_from(content.len())
+                .expect("chunk fits u32")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(content);
+    }
+
+    let mut body = Vec::new();
+    for m in &file.models {
+        let mut size = Vec::with_capacity(12);
+        size.extend_from_slice(&m.size_x.to_le_bytes());
+        size.extend_from_slice(&m.size_y.to_le_bytes());
+        size.extend_from_slice(&m.size_z.to_le_bytes());
+        chunk(&mut body, *b"SIZE", &size);
+        let mut xyzi = Vec::with_capacity(4 + m.voxels.len() * 4);
+        xyzi.extend_from_slice(
+            &u32::try_from(m.voxels.len())
+                .expect("voxel count fits u32")
+                .to_le_bytes(),
+        );
+        for &(x, y, z, i) in &m.voxels {
+            xyzi.extend_from_slice(&[x, y, z, i]);
+        }
+        chunk(&mut body, *b"XYZI", &xyzi);
+    }
+    // RGBA: file entry i = internal palette slot i + 1 (the parse
+    // convention, and the spec's off-by-one); the last entry is the
+    // unreachable slot and writes as zero.
+    let mut rgba = Vec::with_capacity(1024);
+    for i in 0..255 {
+        rgba.extend_from_slice(&file.palette[i + 1].to_le_bytes());
+    }
+    rgba.extend_from_slice(&0u32.to_le_bytes());
+    chunk(&mut body, *b"RGBA", &rgba);
+
+    let mut out = Vec::with_capacity(20 + body.len());
+    out.extend_from_slice(b"VOX ");
+    out.extend_from_slice(&150u32.to_le_bytes());
+    out.extend_from_slice(b"MAIN");
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(body.len())
+            .expect("body fits u32")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&body);
+    out
+}
+
 /// The official default palette (ABGR), applied when a file has no
 /// `RGBA` chunk. Verbatim from the format spec
 /// (`ephtracy/voxel-model`, `MagicaVoxel-file-format-vox.txt`).
@@ -342,6 +516,71 @@ pub const DEFAULT_PALETTE: [u32; 256] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// kv6 → vox → parse → kv6: voxel positions and colours survive
+    /// exactly while the model has ≤ 255 distinct colours. The
+    /// brightness byte normalises to the neutral 0x80 on the way
+    /// back in (it belongs to lighting, not the editor).
+    #[test]
+    fn kv6_roundtrips_through_vox_export() {
+        let source = Kv6::from_fn(5, 4, 6, |x, y, z| {
+            ((x + y + z) % 3 != 0).then(|| {
+                VoxColor(0x8000_0000 | (x << 16) | (y << 8) | (z + 40)).with_brightness(0x9a)
+            })
+        });
+        let vox = super::serialize(&VoxFile::from_kv6(&source));
+        let back = &parse(&vox)
+            .expect("self-authored vox parses")
+            .to_kv6_models()[0];
+
+        assert_eq!(
+            (back.xsiz, back.ysiz, back.zsiz),
+            (source.xsiz, source.ysiz, source.zsiz)
+        );
+        let key = |k: &Kv6| {
+            let mut set = std::collections::BTreeSet::new();
+            let mut cursor = 0usize;
+            for x in 0..k.xsiz as usize {
+                for y in 0..k.ysiz as usize {
+                    let n = k.ylen[x][y] as usize;
+                    for v in &k.voxels[cursor..cursor + n] {
+                        set.insert((x as u32, y as u32, v.z, v.col & 0x00ff_ffff));
+                    }
+                    cursor += n;
+                }
+            }
+            set
+        };
+        assert_eq!(key(back), key(&source), "positions + RGB round-trip");
+    }
+
+    /// More than 255 distinct colours: the export still parses,
+    /// every voxel maps to a non-empty palette index, and the
+    /// quantiser keeps the count inside the format limit.
+    #[test]
+    fn kv6_export_quantises_when_palette_overflows() {
+        // 8x8x8 gradient = up to 512 distinct colours.
+        let source = Kv6::from_fn(8, 8, 8, |x, y, z| {
+            Some(VoxColor(
+                0x8000_0000 | ((x * 32) << 16) | ((y * 32) << 8) | (z * 32 + (x & 1)),
+            ))
+        });
+        let file = VoxFile::from_kv6(&source);
+        let vox = super::serialize(&file);
+        let parsed = parse(&vox).expect("quantised vox parses");
+        let m = &parsed.models[0];
+        assert_eq!(m.voxels.len(), 8 * 8 * 8 - hollow_count(&source));
+        for &(_, _, _, i) in &m.voxels {
+            assert_ne!(i, 0, "no voxel maps to the empty slot");
+        }
+    }
+
+    /// `from_fn` culls enclosed voxels; the gradient cube keeps only
+    /// its surface shell — mirror that here.
+    fn hollow_count(k: &Kv6) -> usize {
+        let all = (k.xsiz * k.ysiz * k.zsiz) as usize;
+        all - k.voxels.len()
+    }
 
     /// Minimal `.vox` writer for the tests: header + MAIN + the given
     /// raw chunks (each already including its 12-byte chunk header).

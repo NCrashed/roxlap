@@ -11,6 +11,16 @@
 //! - `vox2rvc <in.vox> <out.rvc> [frame_ms]` — MagicaVoxel models as
 //!   the frames of one animated voxel clip (all models must share one
 //!   size; default 80 ms per frame, looping).
+//! - `kv62vox <in.kv6> <out.vox>` — the reverse trip: a kv6 sprite
+//!   back into a MagicaVoxel file (exact for ≤ 255 distinct colours,
+//!   palette-quantised beyond; the kv6 pivot is lost — `.vox` has no
+//!   pivot).
+//! - `gif2rvc <in.gif> <out.rvc> [thickness]` — animated GIF →
+//!   billboard voxel clip (Doom-style flat slabs; default thickness 1).
+//! - `png2rvc <in.png> <out.rvc> [thickness]` — APNG (or a single
+//!   still PNG) → billboard voxel clip. For a numbered frame
+//!   sequence, pass the frames then the output:
+//!   `png2rvc <f0.png> <f1.png> … <out.rvc>` (80 ms per frame).
 //!
 //! Exit codes: `0` ok, `1` operation failed, `2` usage error.
 
@@ -31,6 +41,21 @@ fn main() -> ExitCode {
             Ok(ms) if ms > 0 => run(vox2rvc(Path::new(input), Path::new(output), ms)),
             _ => usage(&format!("frame_ms must be a positive integer, got {ms:?}")),
         },
+        ["kv62vox", input, output] => run(kv62vox(Path::new(input), Path::new(output))),
+        ["gif2rvc", input, output] => run(gif2rvc(Path::new(input), Path::new(output), 1)),
+        ["gif2rvc", input, output, th] => match th.parse::<u32>() {
+            Ok(th) if th > 0 => run(gif2rvc(Path::new(input), Path::new(output), th)),
+            _ => usage(&format!("thickness must be a positive integer, got {th:?}")),
+        },
+        ["png2rvc", input, output] => run(png2rvc_apng(Path::new(input), Path::new(output), 1)),
+        ["png2rvc", input, output, th] if th.parse::<u32>().is_ok_and(|t| t > 0) => {
+            let th = th.parse::<u32>().expect("guard checked");
+            run(png2rvc_apng(Path::new(input), Path::new(output), th))
+        }
+        ["png2rvc", parts @ ..] if parts.len() > 2 => {
+            let frames: Vec<&Path> = parts[..parts.len() - 1].iter().map(Path::new).collect();
+            run(png2rvc_frames(&frames, Path::new(parts[parts.len() - 1])))
+        }
         _ => usage("expected a subcommand"),
     }
 }
@@ -51,7 +76,11 @@ fn usage(problem: &str) -> ExitCode {
          Usage:\n  \
          roxlap-cli info <file>\n  \
          roxlap-cli vox2kv6 <in.vox> <out.kv6>\n  \
-         roxlap-cli vox2rvc <in.vox> <out.rvc> [frame_ms]"
+         roxlap-cli vox2rvc <in.vox> <out.rvc> [frame_ms]\n  \
+         roxlap-cli kv62vox <in.kv6> <out.vox>\n  \
+         roxlap-cli gif2rvc <in.gif> <out.rvc> [thickness]\n  \
+         roxlap-cli png2rvc <in.(a)png> <out.rvc> [thickness]\n  \
+         roxlap-cli png2rvc <frame0.png> <frame1.png> … <out.rvc>"
     );
     ExitCode::from(2)
 }
@@ -274,6 +303,42 @@ fn vox_to_clip(bytes: &[u8], frame_ms: u32) -> Result<VoxelClip, String> {
         .map_err(|e| format!("building the clip: {e:?} (all models must share one size)"))
 }
 
+fn kv62vox(input: &Path, output: &Path) -> Result<(), String> {
+    let kv6 = kv6::parse(&read(input)?).map_err(|e| e.to_string())?;
+    let file = vox::VoxFile::from_kv6(&kv6);
+    write(output, &vox::serialize(&file))
+}
+
+fn gif2rvc(input: &Path, output: &Path, thickness: u32) -> Result<(), String> {
+    use roxlap_formats::gif_import::{voxel_clip_from_gif, GifImportOpts};
+    let opts = GifImportOpts {
+        thickness,
+        ..GifImportOpts::default()
+    };
+    let clip = voxel_clip_from_gif(&read(input)?, &opts).map_err(|e| e.to_string())?;
+    write(output, &clip.serialize())
+}
+
+fn png2rvc_apng(input: &Path, output: &Path, thickness: u32) -> Result<(), String> {
+    use roxlap_formats::png_import::{voxel_clip_from_apng, PngImportOpts};
+    let opts = PngImportOpts {
+        thickness,
+        ..PngImportOpts::default()
+    };
+    let clip = voxel_clip_from_apng(&read(input)?, &opts).map_err(|e| e.to_string())?;
+    write(output, &clip.serialize())
+}
+
+fn png2rvc_frames(inputs: &[&Path], output: &Path) -> Result<(), String> {
+    use roxlap_formats::png_import::{voxel_clip_from_png_frames, PngImportOpts};
+    let bytes: Vec<Vec<u8>> = inputs.iter().map(|p| read(p)).collect::<Result<_, _>>()?;
+    let frames: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+    // Uniform default timing; per-frame delays belong to the APNG form.
+    let clip = voxel_clip_from_png_frames(&frames, &[], &PngImportOpts::default())
+        .map_err(|e| e.to_string())?;
+    write(output, &clip.serialize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +403,18 @@ mod tests {
         // And the summary agrees.
         let s = summarize(Kind::Rvc, &clip.serialize()).expect("valid rvc");
         assert!(s.contains("3 frame(s), 360 ms total"), "got: {s}");
+    }
+
+    #[test]
+    fn kv6_to_vox_export_chain() {
+        // vox → kv6 → vox → summary: the reverse trip stays parseable
+        // and keeps the voxel count.
+        let kv6 = &parse_vox_models(&test_vox(1)).expect("one model")[0];
+        let bytes = vox::serialize(&vox::VoxFile::from_kv6(kv6));
+        assert_eq!(sniff(Path::new("x"), &bytes), Some(Kind::Vox));
+        let s = summarize(Kind::Vox, &bytes).expect("re-exported vox parses");
+        assert!(s.contains("1 model(s)"), "got: {s}");
+        assert!(s.contains("3x3x3, 1 voxels"), "got: {s}");
     }
 
     #[test]
