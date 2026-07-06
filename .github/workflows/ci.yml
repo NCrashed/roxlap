@@ -94,6 +94,64 @@ jobs:
       # here, or add the sdl2 `bundled` feature for a self-contained build.)
       - run: cargo test --workspace --release --exclude roxlap-sdl-demo
 
+  msrv:
+    name: cargo check (MSRV 1.77)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # QE — the workspace declares `rust-version = "1.77"` but nothing
+      # validated it until now: a dep bump or new syntax could silently
+      # break downstream users pinned to the MSRV. Keep the toolchain
+      # here in lockstep with [workspace.package] rust-version.
+      # `check` doesn't link, so the SDL2-linking demo passes too.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.77"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
+  docs:
+    name: cargo doc (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # QE — docs.rs builds these crates on every publish; gate broken
+      # intra-doc links / bad code fences here instead of finding out
+      # from a red docs.rs badge. missing_docs is already a workspace
+      # lint (clippy job); this catches what rustdoc alone sees.
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  smoke-fuzz:
+    name: fuzz (roxlap-formats, 30 s/target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # QE — the 8 roxlap-formats fuzz targets only ran locally before;
+      # 30 s per target is no soak, but it replays the committed corpus
+      # + a short random walk, catching parser regressions (panics /
+      # OOB / OOM) on every PR. cargo-fuzz needs nightly (sanitizer
+      # flags); the fuzz crate is its own workspace so its profile
+      # doesn't leak into the engine build.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/roxlap-formats/fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Run each fuzz target briefly
+        working-directory: crates/roxlap-formats
+        run: |
+          for t in $(cargo fuzz list); do
+            echo "::group::fuzz $t"
+            cargo fuzz run "$t" -- -max_total_time=30 -timeout=10
+            echo "::endgroup::"
+          done
+
   book:
     name: book (anchors + mdbook build)
     runs-on: ubuntu-latest
