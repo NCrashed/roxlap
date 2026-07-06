@@ -7,75 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added: material-aware collision + third person (CC.4)
+### Added: character controller — stage CC (CC.0–CC.5)
 
-- `Solidity::passable` — an optional colour veto (`fn(VoxColor) ->
-  bool`) making approved *visible* voxels passable: water, foliage,
-  ladders. Glass stays solid by simply not approving it. Hidden slab
-  interiors (`Cube::UnexposedSolid`) carry no colour in the voxlap
-  format and always block — two rules of thumb (both pinned by
-  tests): pass-through walls work up to 2 voxels thick (3+ grows a
-  colourless core), and must sit at least 1 voxel inside the chunk
-  (edge voxels lose their side colours — the encoder treats
-  out-of-chunk neighbours as solid).
-- Demo dogfood: the Transparency scene's front wall is now half
-  glass / half water (both translucent terrain materials) and the
-  scene flies with collision — the water half lets you through.
-  The World scene gains `C`: third-person view with a synthetic
-  billboard-actor figure walking at the body and a raycast-clamped
-  camera boom.
-- Fixed (wasm blind spot): the web crates are wasm-only
-  (`#![cfg]`), so native CI never type-checked them — the colour
-  newtypes had silently broken both. `roxlap-scene` now builds on
-  plain wasm32 again (rayon unconditional, as in roxlap-core), both
-  web crates are migrated, and CI gained a stable-wasm32 check job.
+A walking body over `Scene`, engine-owned and headless (design
+history: `docs/porting/PORTING-CONTROLLER.md`; book: "The scene
+graph" → *Walking on the world*, with the runnable
+`book_controller` example):
 
-### Changed: demos move on the character controller (CC.3)
-
-- The three copy-pasted demo collision hacks (scene-demo
-  `collision.rs`, cave-demo, cave-web) are DELETED; every demo host
-  moves via `CharacterBody`. The scene-demo World scene gains a `G`
-  walk-mode toggle (gravity, Space jumps, 1-voxel step-up) alongside
-  the classic fly; the cave demos keep their exact old feel (a
-  ±0.3 cube body, solid world bounds via an explicit clamp).
-- New `CharacterBody` API for hosts: `def_mut()` (runtime tuning —
-  sprint/boost) and `set_pos()` (reposition keeping velocity — bounds
-  clamps, platform corrections).
-- `CharacterDef::fly_accel` (default `f64::INFINITY` = instant
-  start/stop): the fly modes are a camera, not a body with inertia —
-  the walking accel model made every fly key feel like "keep going
-  the way you were". Hosts must call `walk()` every frame (a zero
-  wish is what stops the body); the cave demos' idle early-returns
-  are gone.
-
-### Added: character controller body (CC.1 + CC.2)
-
+- `roxlap_scene::collide` — the query layer: `box_overlaps_solid` /
+  `point_overlaps_solid` / single-grid `grid_box_overlaps_solid`.
+  Axis-aligned grids probe cell-exactly, rotated grids conservatively
+  (corner-AABB). `Solidity` policy: `bedrock_blocks` (match your
+  renderer or get invisible walls / fall-through floors) and
+  `passable` — a colour veto (`fn(VoxColor) -> bool`) that lets
+  approved *visible* voxels pass (water, foliage). Two format facts,
+  pinned by tests: pass-through walls work up to 2 voxels thick, and
+  must sit ≥ 1 voxel inside the chunk (edge voxels lose their side
+  colours).
 - `roxlap_scene::character` — `CharacterBody` / `CharacterDef` /
-  `WalkInput`: a walking body over `Scene` with substepped per-axis
-  move-and-slide (flush contact against the blocking cell plane),
-  gravity, jumping, `on_ground()` / `hit_head()` contact flags and
-  the demos' stuck-escape rule. Deterministic: same scene + same
-  input sequence = bit-identical trajectory (pinned by a unit test).
-  Feet-positioned, f64 world; remember +z is DOWN — gravity is
-  positive, a jump impulse negative.
-- Feel layer (CC.2): auto step-up onto ledges up to
-  `CharacterDef::step_up` voxels (all-or-nothing: lift must fit,
-  landing must find ground), coyote-time jumps after walking off an
-  edge, press-buffered jumps that fire on landing, and
-  `MoveMode::{Walk, Fly, Noclip}` — `Fly` is the demos' sliding fly
-  camera, `Noclip` skips probes.
-
-### Added: collision query layer (CC.0)
-
-- `roxlap_scene::collide` — world-space box-vs-voxel overlap tests
-  over a `Scene` (`box_overlaps_solid` / `point_overlaps_solid` /
-  single-grid `grid_box_overlaps_solid`), the query layer under the
-  upcoming character controller (stage CC,
-  `docs/porting/PORTING-CONTROLLER.md`). Axis-aligned grids are
-  probed cell-exactly; rotated grids conservatively (corner-AABB).
-  `Solidity { bedrock_blocks }` makes the voxlap bedrock-placeholder
-  plane a policy: default air, matching how the demos render it.
-  Slab interiors (`Cube::UnexposedSolid`) block; out-of-grid is air.
+  `WalkInput` / `MoveMode::{Walk, Fly, Noclip}`: substepped per-axis
+  move-and-slide (flush contact, no tunneling at any speed), gravity
+  with a `max_fall_speed` terminal clamp, press-buffered +
+  coyote-timed jumps, auto step-up onto ledges, `on_ground()` /
+  `hit_head()`, the demos' stuck-escape rule, `def_mut()` for runtime
+  tuning (sprint) and `set_pos()` (reposition keeping velocity).
+  Deterministic: same scene + same inputs = bit-identical trajectory.
+  Fly mode is the demos' camera: full-3D wish, instant start/stop
+  (`fly_accel`), sliding collision; call `walk()` every frame — the
+  zero wish is what stops the body.
+- Demos: the three copy-pasted fly-collision hacks (scene-demo,
+  cave-demo, cave-web) are DELETED — every host moves on
+  `CharacterBody`. World gains `G` (walk mode: gravity, Space jumps,
+  step-up) and `C` (third person: a synthetic billboard-actor figure
+  at the body, raycast-clamped camera boom); the Transparency scene's
+  front wall is now half glass / half water and flies with collision —
+  the water half lets you through.
+- Perf (release, `stress_probe`): a wall-hugging walker costs
+  ~0.7 µs/frame; a 100-NPC crowd ~65 µs/frame total. No caching
+  needed.
+- Fixed along the way (wasm blind spot): the web crates are wasm-only
+  (`#![cfg]`), so native CI never type-checked them — the colour
+  newtypes had silently broken both, and `roxlap-scene` didn't build
+  on plain wasm32 at all (unconditional rayon in cfg'd-out code).
+  Both fixed; CI gained a stable-wasm32 `cargo check` job for the web
+  crates.
 
 ### Changed: env overrides consolidated (QE-C6)
 

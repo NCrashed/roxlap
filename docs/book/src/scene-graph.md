@@ -178,6 +178,74 @@ every edited chunk (version ≠ 0) to `store`, and stream-in consults
 a writer thread). `load` may block under `pump_streaming` (it runs on
 the background pool) but runs inline under the synchronous paths.
 
+## Walking on the world: the character controller
+
+Everything above edits and streams the world; `CharacterBody` is how
+a player *stands* on it — an engine-owned walking body with
+move-and-slide collision, gravity, jumping, auto step-up and the
+demos' fly camera, all headless (it needs a `Scene` and nothing
+else). The snippets come from a runnable, assertion-checked example:
+
+```sh
+cargo run -p roxlap-scene --example book_controller
+```
+
+```rust,noplayground
+{{#include ../../../crates/roxlap-scene/examples/book_controller.rs:setup}}
+```
+
+The body is a feet-positioned box: `pos.z` is the feet, the head is
+at `pos.z - height` (chapter 2: +z is DOWN — gravity is positive, a
+jump impulse negative, and getting a sign wrong compiles fine and
+runs upside down). All positions are f64 world space, so the body
+composes with `GridTransform` placement and the f64 camera.
+
+```rust,noplayground
+{{#include ../../../crates/roxlap-scene/examples/book_controller.rs:frame}}
+```
+
+The per-frame contract in that loop:
+
+- **Call `walk()` every frame**, input or not — the zero wish is
+  what stops the body. Skipping idle frames leaves stale velocity
+  (the classic symptom: every key briefly moves you the way you were
+  already going).
+- Movement is substepped so fast bodies never tunnel through thin
+  floors, slides clamp flush against the blocking voxel plane, and a
+  grounded body auto-steps ledges up to `step_up` voxels.
+- Jumps are press-buffered and coyote-timed (the small grace windows
+  live in `CharacterDef`); `on_ground()` / `hit_head()` report
+  contact.
+- `MoveMode::{Walk, Fly, Noclip}` switches grounded movement, the
+  sliding fly camera (no gravity, instant start/stop), and
+  probe-free ghosting. The scene demo's World tab binds `G` and `C`
+  to walk mode and a third-person view over exactly this API.
+
+Everything is deterministic — pure f64, no RNG — so the same scene
+and input sequence replays the same trajectory, and gameplay code is
+unit-testable without a renderer.
+
+### What counts as solid
+
+Collision reads the same voxel world the renderer draws, through a
+`Solidity` policy: the voxlap bedrock placeholder plane is a knob
+(`bedrock_blocks` — match it to how you *render* that plane, or you
+get invisible walls / fall-through floors), and an optional colour
+veto makes chosen voxels passable:
+
+```rust,noplayground
+{{#include ../../../crates/roxlap-scene/examples/book_controller.rs:veto}}
+```
+
+Two voxlap-format facts constrain pass-through geometry (both pinned
+as engine tests): only voxels with a stored colour can be vetoed, so
+water curtains work up to **2 voxels thick** (thicker slabs grow a
+colourless hidden core that always blocks) and must sit at least
+**1 voxel inside the chunk** (edge voxels lose their side colours —
+the encoder treats out-of-chunk neighbours as solid). The
+Transparency demo's glass/water wall is the visual version: the
+water half lets you through, the glass half does not.
+
 ## Further reading
 
 - [docs.rs/roxlap-scene](https://docs.rs/roxlap-scene) — the full API,

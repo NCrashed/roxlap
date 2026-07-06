@@ -51,6 +51,12 @@ pub struct CharacterDef {
     /// Initial upward speed of a jump, applied as **negative** z
     /// velocity.
     pub jump_speed: f64,
+    /// Terminal fall speed (+z velocity cap). Besides realism, this
+    /// bounds the per-frame probe cost: substeps scale with
+    /// displacement, so an unbounded fall gets linearly more
+    /// expensive the longer it lasts (the CC.5 stress probe caught
+    /// exactly that).
+    pub max_fall_speed: f64,
     /// Target horizontal speed while walking.
     pub walk_speed: f64,
     /// How fast the horizontal velocity approaches the wish
@@ -93,6 +99,7 @@ impl Default for CharacterDef {
             eye_height: 1.62,
             gravity: 24.0,
             jump_speed: 9.0,
+            max_fall_speed: 60.0,
             walk_speed: 6.0,
             accel_ground: 40.0,
             accel_air: 8.0,
@@ -305,7 +312,7 @@ impl CharacterBody {
         self.vel.x = horizontal.x;
         self.vel.y = horizontal.y;
 
-        self.vel.z += self.def.gravity * dt;
+        self.vel.z = (self.vel.z + self.def.gravity * dt).min(self.def.max_fall_speed);
 
         // -- jump: buffered press + coyote window ------------------
         if input.jump {
@@ -726,7 +733,12 @@ mod tests {
             IVec3::new(160, 160, 100),
             Some(VoxColor(0x80_70_70_70)),
         );
-        let mut body = CharacterBody::new(CharacterDef::default());
+        let mut body = CharacterBody::new(CharacterDef {
+            // The test drives 200 v/s deliberately — lift the
+            // terminal-velocity clamp out of the way.
+            max_fall_speed: 400.0,
+            ..CharacterDef::default()
+        });
         body.teleport(DVec3::new(100.0, 100.0, 60.0));
         body.set_vel(DVec3::new(0.0, 0.0, 200.0)); // 20 voxels per step
         for _ in 0..5 {
@@ -1043,6 +1055,80 @@ mod tests {
             body.pos().x
         );
         assert!(!body.on_ground());
+    }
+
+    /// CC.5 perf probe (not a gate — run by hand):
+    /// `cargo test -p roxlap-scene --release --lib -- --ignored
+    /// character::tests::stress_probe --nocapture`. Measures walk()
+    /// per frame for one wall-hugging walker (worst-ish case: probes
+    /// + flush clamps every substep) and for a 100-NPC crowd.
+    #[test]
+    #[ignore = "perf probe, run by hand with --ignored --nocapture"]
+    fn stress_probe() {
+        let mut scene = ground_scene();
+        {
+            let id = scene.grids().next().expect("grid").0;
+            let grid = scene.grid_mut(id).expect("grid");
+            grid.set_rect(
+                IVec3::new(105, 60, 80),
+                IVec3::new(106, 160, 110),
+                Some(VoxColor(0x80_90_50_50)),
+            );
+        }
+        let input = WalkInput {
+            wish: DVec3::new(1.0, 0.0, 0.0), // straight INTO the wall
+            jump: false,
+        };
+
+        let mut body = body_on_ground(&scene);
+        let t0 = std::time::Instant::now();
+        const FRAMES: u32 = 60_000;
+        for _ in 0..FRAMES {
+            body.walk(&scene, DT, input);
+        }
+        let per_frame = t0.elapsed() / FRAMES;
+        println!("single wall-hugging walker: {per_frame:?}/frame");
+
+        let mut crowd: Vec<CharacterBody> = (0..100)
+            .map(|i| {
+                let mut b = CharacterBody::new(CharacterDef::default());
+                #[allow(clippy::cast_lossless)]
+                b.teleport(DVec3::new(
+                    70.0 + f64::from(i % 10) * 3.0,
+                    70.0 + f64::from(i / 10) * 3.0,
+                    95.0,
+                ));
+                b
+            })
+            .collect();
+        for _ in 0..120 {
+            for b in &mut crowd {
+                b.walk(&scene, DT, WalkInput::default());
+            }
+        }
+        let t0 = std::time::Instant::now();
+        const CROWD_FRAMES: u32 = 600;
+        for _ in 0..CROWD_FRAMES {
+            for b in &mut crowd {
+                b.walk(&scene, DT, input);
+            }
+        }
+        let per_crowd_frame = t0.elapsed() / CROWD_FRAMES;
+        println!("100-NPC crowd: {per_crowd_frame:?}/frame (all 100 walking)");
+    }
+
+    #[test]
+    fn fall_speed_caps_at_terminal_velocity() {
+        // No floor: a long fall must clamp at max_fall_speed (this
+        // also bounds substep count — an unbounded fall gets
+        // linearly more expensive per frame).
+        let scene = Scene::new();
+        let mut body = CharacterBody::new(CharacterDef::default());
+        body.teleport(DVec3::new(0.0, 0.0, 0.0));
+        for _ in 0..600 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        assert_eq!(body.vel().z, body.def().max_fall_speed);
     }
 
     #[test]

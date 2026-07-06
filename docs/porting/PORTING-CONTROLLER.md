@@ -13,9 +13,35 @@ container, stage RKC) — a `.rkc` character is what you *draw*, a
 character controller is what you *stand on the ground with*. CC.4
 connects the two.
 
-## Status — OPEN (CC.0–CC.4 landed; CC.5 next)
+## Status — SERIES CLOSED 2026-07-06 (CC.0–CC.5 all landed, one day)
+
+Carried out of the series:
+
+- **Visual pass owed** (the one standing item): walk the World hills
+  on `G`, try the `C` third person, wade the Transparency water wall
+  (the cave demos + water wall were exercised by the author during
+  the stage's two post-land fixes; World walk/third-person has not
+  been eyeballed).
+- Deliberately unscoped, revisit only on demand: riding moving grids
+  (velocity inheritance), swimming physics (buoyancy — the veto
+  already classifies water), crouch, exact OBB probes for rotated
+  grids, collision against sprites.
 
 ## Phase log
+
+- CC.5 — LANDED 2026-07-06, SERIES CLOSED: book section "Walking on
+  the world" in the scene-graph chapter over a new runnable
+  `roxlap-scene/examples/book_controller.rs` (anchors setup/frame/
+  veto; assertion-checked: fall→walk→step-up trajectory, fly idle,
+  water veto; check-anchors.sh + mdbook green). Perf probe
+  (`stress_probe`, #[ignore], release): wall-hugging walker
+  ~0.7 µs/frame, 100-NPC crowd ~65 µs/frame — no caching warranted
+  (the entry-doc hazard 8 stance holds). The probe's first run
+  caught a real hazard: an unbounded fall's substep count grows
+  linearly with velocity (~183 µs/frame after 990 s of free fall) —
+  fixed with `CharacterDef::max_fall_speed` (terminal velocity,
+  default 60 v/s; the tunneling test lifts it explicitly).
+  CHANGELOG rolled up into one stage section.
 
 - CC.4 — LANDED 2026-07-06: the material hook + third person.
   `Solidity::passable: Option<fn(VoxColor) -> bool>` — a colour veto

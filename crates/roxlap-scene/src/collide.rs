@@ -54,8 +54,8 @@ pub struct Solidity {
     /// brightness byte — lighting bakes rewrite it).
     ///
     /// Limitation, inherent to the voxlap slab format: hidden run
-    /// interiors ([`Cube::UnexposedSolid`](roxlap_core::world_query::Cube::UnexposedSolid))
-    /// store no colour and always block. Rule of thumb: a
+    /// interiors ([`Cube::UnexposedSolid`]) store no colour and
+    /// always block. Rule of thumb: a
     /// pass-through wall/curtain works up to **2 voxels thick**
     /// (every voxel still has an exposed face and carries its
     /// colour); at 3+ a colourless core appears and blocks. Filled
