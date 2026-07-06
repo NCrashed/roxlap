@@ -161,6 +161,49 @@ than through one unified blend. Neither has mattered in practice; if
 one bites you, `supports()` ([chapter 4](rendering.md)) is still the
 place a future split would surface.
 
+## Emissive voxels & baked glow
+
+A material can also **emit**: `Material { emissive, .. }` (or the
+`Material::glow(e)` shorthand, or `.with_emissive(e)` on any blend
+mode) renders the voxel at `albedo × (128 + e/2) / 128` — from 1× up
+to ~2× over-bright at 255 — and skips *everything* that would darken
+it: the baked brightness byte, per-face side shades, the runtime rig,
+shadows, cel bands. Only fog still applies, so a distant glow fades
+like the rest of the world. Emissive composes with translucency: an
+`AlphaBlend` crystal glows *through* its own body. Both backends
+render it identically; the terrain material map above is all the
+wiring it needs (the `MAT_CRYSTAL` lines in the snippet).
+
+Making the voxel bright is half the effect — a glow that doesn't
+light its surroundings reads as a sticker. The other half is the
+**point-light bake** (voxlap's lightmode 2): register the glow
+sources on the grid and bake with `BakeMode::PointLights`, and each
+light writes a cube-law Lambertian pool into the surrounding
+brightness bytes over a deliberately *dim* directional base — light
+pools reading against gloom. Baked means free at render time, on both
+backends:
+
+```rust,noplayground
+{{#include ../../../crates/roxlap-cave-demo/src/main.rs:bake_light}}
+```
+
+```rust,noplayground
+{{#include ../../../crates/roxlap-cave-demo/src/main.rs:crystal_bake}}
+```
+
+`Grid::bake_bbox` — the incremental relight primitive for runtime
+carves — picks the grid's `bake_lights` up automatically, so shooting
+a hole next to a crystal re-bakes the crater *with* its glow pool
+intact. A `BakeLight`'s `strength` is on the brightness-byte scale:
+the gain at distance `d` is roughly `strength / d²`, so `2000` is a
+reading-torch and `8000` floods a small cavern. For a light that
+moves or flickers, use a runtime `PointLight` from the rig instead —
+the bake is for scenery that stays put.
+
+The cave demo is the live showcase: crystal clusters planted on
+cavity walls, each one an emissive translucent blob plus a
+`BakeLight` (`cargo run --release -p roxlap-cave-demo`).
+
 ## Further reading
 
 - The **Lighting**, **Spotlight** and **Transparency** demo scenes —

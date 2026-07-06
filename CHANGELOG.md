@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: emissive voxels + glowing cave crystals (EV stage)
+
+- `Material` grew an `emissive: u8` field (**breaking** for struct
+  literals; every constructor defaults it to `0`): a non-zero value
+  renders the voxel at `albedo × ((128 + (emissive >> 1)) / 128)` —
+  from 1× up to ~2× over-bright at 255 — skipping the baked
+  brightness byte, per-face side shades, the dynamic light rig,
+  shadows and cel bands (fog still applies). Orthogonal to the blend
+  mode: `Material::alpha_blend(a).with_emissive(e)` is a translucent
+  gem, `Material::glow(e)` the opaque shorthand;
+  `MaterialTable::any_emissive` is the new gate. Identical on both
+  backends (the CPU hit path hoists its one-per-hit material lookup
+  above shading; the GPU palettes grew to a 16-byte stride and the
+  scene shader mirrors the CPU branch order). With no emissive
+  material defined every path is bit-identical to before. Terrain
+  only for now — the sprite palette carries the field but the sprite
+  pass doesn't render it yet (see `PORTING-EMISSIVE.md`).
+- `BakeMode::PointLights` + `BakeLight` + `Grid::bake_lights` (EV.3):
+  voxlap's lightmode-2 point-light bake — a dim directional base plus
+  a cube-law Lambertian pool around every registered light, written
+  into the brightness bytes (free at render time, both backends).
+  `Grid::bake_bbox` picks the grid's lights up automatically, so
+  incremental carve relights keep their glow pools (byte-identical to
+  a full re-bake, tested).
+- The cave demo grew **glowing crystals**: clusters planted on cavity
+  walls per preset (icy cyan / warm amber), each an emissive
+  translucent blob plus a `BakeLight`; the whole cave switched from
+  the flat directional bake to `PointLights` gloom, and the
+  background carve worker now relights craters with the crystal
+  lights riding along. One crystal is guaranteed at the spawn bubble.
+- Book: "Emissive voxels & baked glow" section in the Lighting
+  chapter, with anchored snippets from `book_lighting` (which gained
+  an emissive crystal on its monument) and the cave demo's crystal
+  recipe.
+
 ## [0.24.0] — 2026-07-07
 
 ### Added: roxlap-cli snapshot chunk extraction

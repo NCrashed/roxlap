@@ -44,18 +44,19 @@ use roxlap_core::update_lighting;
 use roxlap_core::world_query::{getcube, Cube};
 use roxlap_core::Camera;
 use roxlap_core::Engine;
+use roxlap_core::LightSrc;
 use roxlap_core::OpticastSettings;
 use roxlap_formats::edit::set_sphere_with_colfunc;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::vxl::Vxl;
 use roxlap_render::{
-    BackendPreference, DynSpriteTransform, FrameParams, RenderOptions, SceneRenderer,
+    BackendPreference, DynSpriteTransform, FrameParams, Material, RenderOptions, SceneRenderer,
     SpriteInstanceId, SpriteModelId,
 };
 use roxlap_scene::cavegen::CaveChunkGenerator;
 use roxlap_scene::{
-    CharacterBody, CharacterDef, ChunkGenerator, GridId, GridTransform, MoveMode, Scene, Solidity,
-    SpanOp, WalkInput, CHUNK_SIZE_XY,
+    BakeLight, CharacterBody, CharacterDef, ChunkGenerator, Grid, GridId, GridTransform, MoveMode,
+    Scene, Solidity, SpanOp, WalkInput, CHUNK_SIZE_XY,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -123,11 +124,40 @@ const SPAWN_BUBBLE_COLOR: VoxColor = VoxColor(0x8060_6068);
 /// randomly air or solid).
 const SPAWN_BUBBLE_RADIUS: u32 = 6;
 
-/// Voxlap lightmode driving [`roxlap_scene::Grid::bake_lightmode`]'s
-/// per-voxel brightness bake. `1` = directional sun-style bake (every
-/// visible voxel shaded from its surface normal), the look both the cave
-/// and scene demos use.
-const LIGHTMODE: u32 = 1;
+/// Voxlap lightmode driving the carve worker's [`relight_bbox`] (the
+/// raw [`update_lighting`] path). EV.4 — `2` = point-light bake: the
+/// dim base + the crystal [`BakeLight`] pools, matching the grid-side
+/// `BakeMode::PointLights` full bake so an incremental carve relight
+/// reproduces the same bytes.
+const LIGHTMODE: u32 = 2;
+
+// ── EV.4 — glowing crystals ─────────────────────────────────────────
+//
+// Crystal clusters are planted on cavity walls at world (re)build. The
+// crystal COLOUR doubles as the material key: the renderer's terrain
+// material map routes exactly these RGBs to the translucent emissive
+// crystal material, and the bake routes the matching `BakeLight`s'
+// glow pools into the surrounding brightness bytes. The generator's
+// noise-shaded palette never produces these exact RGBs, so nothing
+// else in the cave picks the material up by accident.
+
+/// Crystal voxel colour for the Blue preset — icy cyan.
+const CRYSTAL_COLOR_BLUE: VoxColor = VoxColor(0x8040_E8FF);
+/// Crystal voxel colour for the Mag preset — warm amber (contrast
+/// against the magenta rock).
+const CRYSTAL_COLOR_MAG: VoxColor = VoxColor(0x80FF_B040);
+/// Material palette slot for the crystal (translucent + emissive).
+const CRYSTAL_MATERIAL_ID: u8 = 1;
+/// Crystal clusters planted per world (re)build.
+const CRYSTAL_COUNT: usize = 16;
+/// Crystal blob radius in voxels ([`roxlap_scene::Grid::set_sphere`]).
+const CRYSTAL_RADIUS: u32 = 2;
+/// Hard cutoff of a crystal's baked glow pool, voxels.
+const CRYSTAL_LIGHT_RADIUS: f32 = 32.0;
+/// Voxlap brightness scale of a crystal's glow (byte gain ≈
+/// `strength / d²` — saturates the wall it sits on, fades out by
+/// ~20 voxels; see [`BakeLight::strength`]).
+const CRYSTAL_LIGHT_STRENGTH: f32 = 6000.0;
 
 /// Fog colour (RGB low-24-bit). The renderer blends each pixel toward
 /// this colour by `depth / fog_max_dist`.
@@ -579,14 +609,25 @@ impl App {
     /// carved chunk is ready, replace chunk `(0, 0, 0)` with it + bump
     /// the version so the renderer re-uploads (cheap mip read-path).
     fn pump_carves(&mut self) {
-        let current = self
-            .scene
-            .grid(self.grid_id)
-            .and_then(|g| g.chunk(IVec3::ZERO));
-        let Some(current) = current else {
+        let Some(grid) = self.scene.grid(self.grid_id) else {
             return;
         };
-        let new_chunk = self.carve.pump(current);
+        let Some(current) = grid.chunk(IVec3::ZERO) else {
+            return;
+        };
+        // EV.4 — the crystal lights ride along so the worker's relight
+        // reproduces the grid bake's glow pools (grid-local == chunk-
+        // local for the single (0,0,0) cave chunk).
+        let lights: Vec<LightSrc> = grid
+            .bake_lights
+            .iter()
+            .map(|l| LightSrc {
+                pos: l.pos.to_array(),
+                r2: l.radius * l.radius,
+                sc: l.strength,
+            })
+            .collect();
+        let new_chunk = self.carve.pump(current, &lights);
         if let Some(new_chunk) = new_chunk {
             if let Some(grid) = self.scene.grid_mut(self.grid_id) {
                 *grid.ensure_chunk(IVec3::ZERO) = new_chunk;
@@ -685,6 +726,19 @@ impl ApplicationHandler for App {
 
         // Register the glowing-sphere bullet model once.
         self.bullet_model = Some(renderer.add_sprite_model(&build_bullet_kv6()));
+
+        // EV.4 — the crystal material: translucent (the rock ghosts
+        // through the gem) AND emissive (renders over-bright, immune to
+        // the bake/shading). Both preset colours route to the same slot
+        // so an F-toggle needs no material churn.
+        renderer.define_material(
+            CRYSTAL_MATERIAL_ID,
+            Material::alpha_blend(180).with_emissive(255),
+        );
+        renderer.set_terrain_materials(&[
+            (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
+            (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
+        ]);
 
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -832,8 +886,16 @@ fn install_cave_chunk(scene: &mut Scene, grid_id: GridId, preset: Preset, seed: 
         |_, _, _| SPAWN_BUBBLE_COLOR,
     );
 
-    // Directional sun-style bake over the whole (single) chunk.
-    grid.bake(roxlap_scene::BakeMode::Directional);
+    // ANCHOR: crystal_bake
+    // EV.4 — plant the glowing crystals (voxels + their bake lights)
+    // BEFORE the bake so the first bake already writes their pools.
+    plant_crystals(grid, preset, seed);
+
+    // EV.4 — point-light bake: the dim voxlap lightmode-2 base plus a
+    // glow pool around every crystal. The gloom is deliberate — the
+    // cave now reads by crystal light.
+    grid.bake(roxlap_scene::BakeMode::PointLights);
+    // ANCHOR_END: crystal_bake
 
     // Build the GPU mip ladder up front so the renderer's first upload —
     // and every per-impact re-upload — takes the cheap mip read-path. The
@@ -848,6 +910,103 @@ fn install_cave_chunk(scene: &mut Scene, grid_id: GridId, preset: Preset, seed: 
     grid.bump_chunk_version(IVec3::ZERO);
 }
 
+/// EV.4 — plant [`CRYSTAL_COUNT`] glowing crystal clusters on cavity
+/// walls: deterministic (seed + preset) rejection sampling picks an air
+/// voxel, marches along a random axis to the nearest wall within reach,
+/// and grows a small crystal blob into it, registering a [`BakeLight`]
+/// floating in the air just off the surface. One extra crystal always
+/// lands on the spawn bubble's floor so the player never spawns in
+/// pitch black. Replaces (clears) any previous build's lights.
+fn plant_crystals(grid: &mut Grid, preset: Preset, seed: u64) {
+    grid.bake_lights.clear();
+    let color = match preset {
+        Preset::Blue => CRYSTAL_COLOR_BLUE,
+        Preset::Mag => CRYSTAL_COLOR_MAG,
+    };
+    // xorshift64* — deterministic per (seed, preset), decoupled from the
+    // generator's own noise seeding.
+    let mut state = seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(match preset {
+            Preset::Blue => 0xB1,
+            Preset::Mag => 0x4A,
+        })
+        | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    // The six axis directions a crystal can grow along (into the wall).
+    const DIRS: [IVec3; 6] = [
+        IVec3::new(1, 0, 0),
+        IVec3::new(-1, 0, 0),
+        IVec3::new(0, 1, 0),
+        IVec3::new(0, -1, 0),
+        IVec3::new(0, 0, 1),
+        IVec3::new(0, 0, -1),
+    ];
+
+    // One guaranteed crystal on the spawn bubble's floor.
+    let plant_at = |grid: &mut Grid, air: IVec3, dir: IVec3| {
+        // March from the air voxel to the wall (≤ 14 voxels away).
+        for k in 1..=14 {
+            let p = air + dir * k;
+            if !(0..VSID as i32).contains(&p.x)
+                || !(0..VSID as i32).contains(&p.y)
+                || !(8..MAXZDIM - 1).contains(&p.z)
+            {
+                return false;
+            }
+            if grid.voxel_solid(p) {
+                // ANCHOR: bake_light
+                grid.set_sphere(p, CRYSTAL_RADIUS, Some(color));
+                // The light floats in the air a few voxels off the
+                // surface so the pool spreads over the wall around it.
+                let lp = air + dir * (k - 3).max(0);
+                grid.bake_lights.push(BakeLight {
+                    pos: glam::Vec3::new(lp.x as f32, lp.y as f32, lp.z as f32),
+                    radius: CRYSTAL_LIGHT_RADIUS,
+                    strength: CRYSTAL_LIGHT_STRENGTH,
+                });
+                // ANCHOR_END: bake_light
+                return true;
+            }
+        }
+        false
+    };
+    plant_at(grid, spawn_centre(), IVec3::new(0, 0, 1));
+
+    let mut planted = 1; // the spawn crystal
+    let mut attempts = 0;
+    while planted < CRYSTAL_COUNT && attempts < 800 {
+        attempts += 1;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let cand = IVec3::new(
+            (8 + next() % u64::from(VSID - 16)) as i32,
+            (8 + next() % u64::from(VSID - 16)) as i32,
+            (24 + next() % 200) as i32,
+        );
+        if grid.voxel_solid(cand) {
+            continue; // need an air pocket to glow into
+        }
+        // Spread the crystals out: reject candidates inside another
+        // light's pool core.
+        let too_close = grid.bake_lights.iter().any(|l| {
+            let d = glam::Vec3::new(cand.x as f32, cand.y as f32, cand.z as f32) - l.pos;
+            d.length_squared() < 24.0 * 24.0
+        });
+        if too_close {
+            continue;
+        }
+        let dir = DIRS[(next() % 6) as usize];
+        if plant_at(grid, cand, dir) {
+            planted += 1;
+        }
+    }
+}
+
 /// A batch of bullet-impact carve centres to apply to a cloned cave
 /// chunk on the worker thread. `epoch` tags the world generation the
 /// clone came from, so a result that lands after a regenerate (F/R) is
@@ -856,6 +1015,10 @@ struct CarveJob {
     chunk: Vxl,
     impacts: Vec<IVec3>,
     epoch: u64,
+    /// EV.4 — the crystal bake lights (chunk-local == grid-local: the
+    /// cave is chunk `(0,0,0)`), so the relight writes the same bytes
+    /// the grid-side `BakeMode::PointLights` bake would.
+    lights: Vec<LightSrc>,
 }
 
 /// A finished carve: the carved + relit + re-mipped chunk, ready to swap
@@ -919,7 +1082,7 @@ impl CarveWorker {
     /// from (or the just-finished result, so queued-while-busy impacts
     /// stack correctly). Returns the chunk to swap into the grid, if one
     /// is ready this frame.
-    fn pump(&mut self, current: &Vxl) -> Option<Vxl> {
+    fn pump(&mut self, current: &Vxl, lights: &[LightSrc]) -> Option<Vxl> {
         let mut ready: Option<Vxl> = None;
         while let Ok(done) = self.done_rx.try_recv() {
             self.busy = false;
@@ -939,6 +1102,7 @@ impl CarveWorker {
                     chunk: base,
                     impacts,
                     epoch: self.epoch,
+                    lights: lights.to_vec(),
                 })
                 .is_ok()
             {
@@ -957,6 +1121,7 @@ fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
         mut chunk,
         impacts,
         epoch,
+        lights,
     }) = job_rx.recv()
     {
         // PF.12 — the batch's edit extent: carve spheres plus the
@@ -974,7 +1139,7 @@ fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
                 SpanOp::Carve,
                 |_, _, _| CARVE_COLOR,
             );
-            relight_bbox(&mut chunk, hit, FIRE_RADIUS);
+            relight_bbox(&mut chunk, hit, FIRE_RADIUS, &lights);
             let pad = FIRE_RADIUS as i32 + roxlap_core::ESTNORMRAD;
             lo = lo.min(hit - IVec3::splat(pad));
             hi = hi.max(hit + IVec3::splat(pad));
@@ -993,13 +1158,15 @@ fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
     }
 }
 
-/// Re-bake directional lighting over just the bounding box of a `radius`
-/// sphere edit at `centre`, clamped to chunk bounds. `update_lighting`
-/// pads by `ESTNORMRAD` internally, so only the geometric edit extent is
-/// needed here — a ~0.04 ms relight vs a ~4 ms whole-chunk bake. The cave
-/// is a single chunk with no neighbours, so the world-bounds clamp gives
-/// the same result as the grid's neighbour-aware `bake_lightmode`.
-fn relight_bbox(chunk: &mut Vxl, centre: IVec3, radius: u32) {
+/// Re-bake lighting over just the bounding box of a `radius` sphere
+/// edit at `centre`, clamped to chunk bounds. `update_lighting` pads by
+/// `ESTNORMRAD` internally, so only the geometric edit extent is needed
+/// here — a ~0.04 ms relight vs a ~4 ms whole-chunk bake. The cave is a
+/// single chunk with no neighbours, so the world-bounds clamp gives the
+/// same result as the grid's neighbour-aware bake. EV.4 — `lights` are
+/// the crystal [`BakeLight`]s as chunk-local [`LightSrc`], so a carve
+/// inside a glow pool keeps its glow.
+fn relight_bbox(chunk: &mut Vxl, centre: IVec3, radius: u32, lights: &[LightSrc]) {
     let r = radius as i32;
     let x0 = (centre.x - r).max(0);
     let y0 = (centre.y - r).max(0);
@@ -1021,7 +1188,7 @@ fn relight_bbox(chunk: &mut Vxl, centre: IVec3, radius: u32) {
         y1,
         z1,
         LIGHTMODE,
-        &[],
+        lights,
     );
 }
 
@@ -1103,6 +1270,50 @@ mod tests {
         );
         // The chunk is the single-chunk lateral size.
         assert_eq!(chunk.vsid, VSID);
+    }
+
+    /// EV.4 — crystals are planted with their bake lights: every light
+    /// has a crystal-coloured voxel within reach, the spawn bubble gets
+    /// its guaranteed crystal, and the presets colour-key differently.
+    #[test]
+    fn crystals_planted_and_lit() {
+        for (preset, color) in [
+            (Preset::Blue, CRYSTAL_COLOR_BLUE),
+            (Preset::Mag, CRYSTAL_COLOR_MAG),
+        ] {
+            let (scene, grid_id) = build_cave_scene(preset, 1234);
+            let grid = scene.grid(grid_id).expect("grid");
+            assert!(
+                grid.bake_lights.len() >= 2,
+                "{preset:?}: expected the spawn crystal + at least one more, got {}",
+                grid.bake_lights.len()
+            );
+            // Every light sits just off its crystal: a crystal-coloured
+            // voxel must exist within a small cube around it.
+            for (i, l) in grid.bake_lights.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let lp = IVec3::new(l.pos.x as i32, l.pos.y as i32, l.pos.z as i32);
+                let mut found = false;
+                'scan: for dz in -6..=6 {
+                    for dy in -6..=6 {
+                        for dx in -6..=6 {
+                            let p = lp + IVec3::new(dx, dy, dz);
+                            if grid
+                                .voxel_color(p)
+                                .is_some_and(|c| c.0 & 0x00ff_ffff == color.0 & 0x00ff_ffff)
+                            {
+                                found = true;
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    found,
+                    "{preset:?}: light {i} at {lp:?} has no crystal voxel nearby"
+                );
+            }
+        }
     }
 
     /// Toggling the preset / bumping the seed re-materialises the chunk

@@ -36,11 +36,13 @@ const MONUMENT: VoxColor = VoxColor(0x80_b0_60_48);
 /// Voxel colours the material map classifies (low 24 bits matter).
 const GLASS_RGB: VoxColor = VoxColor(0x80_50_c0_e0);
 const FOG_RGB: VoxColor = VoxColor(0x80_a0_a0_a8);
+const CRYSTAL_RGB: VoxColor = VoxColor(0x80_40_e8_ff);
 const SKY: Rgb = Rgb(0x00_8f_bc_d4);
 
 /// Material palette ids (id 0 is the reserved opaque material).
 const MAT_GLASS: u8 = 1;
 const MAT_FOG: u8 = 2;
+const MAT_CRYSTAL: u8 = 3;
 
 // ANCHOR: bake
 /// A courtyard: floor, four pillars, a central monument and a glass
@@ -73,6 +75,9 @@ fn build_scene() -> Scene {
         IVec3::new(-30, 1, 209),
         Some(GLASS_RGB),
     );
+    // A crystal capping the monument — the colour maps to an EMISSIVE
+    // material, so it glows through every lighting mode below.
+    grid.set_sphere(IVec3::new(0, 0, 147), 4, Some(CRYSTAL_RGB));
 
     // Bake ambient occlusion into every voxel's brightness byte:
     // crevices, pillar bases and inner corners darken. The runtime
@@ -148,9 +153,17 @@ impl ApplicationHandler for App {
         // it by id.
         renderer.define_material(MAT_GLASS, Material::alpha_blend(110));
         renderer.define_material(MAT_FOG, Material::volumetric(28));
+        // Emissive (EV): the crystal renders at over-bright albedo —
+        // immune to the bake, the runtime rig, shadows and side shades
+        // (only fog still applies). `with_emissive` composes with any
+        // blend mode; `Material::glow(e)` is the opaque shorthand.
+        renderer.define_material(MAT_CRYSTAL, Material::alpha_blend(180).with_emissive(255));
         // Terrain: map voxel colours (low 24 bits) → material ids. Every
         // grid voxel in the glass colour now composites translucently.
-        renderer.set_terrain_materials(&[(GLASS_RGB.rgb_part(), MAT_GLASS)]);
+        renderer.set_terrain_materials(&[
+            (GLASS_RGB.rgb_part(), MAT_GLASS),
+            (CRYSTAL_RGB.rgb_part(), MAT_CRYSTAL),
+        ]);
         // ANCHOR_END: materials
 
         // The fog cloud: per-voxel colour → material classification at
