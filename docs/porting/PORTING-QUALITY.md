@@ -67,10 +67,51 @@ below. **Author triage 2026-07-06** (every carried item decided):
   - Audit note: `speed_q8`, `get_` prefix, `ActorState.name`,
     `ShadowFlags`, env budgets, `BackendPreference` were already fixed
     in QE.7 — the review list overstated what remained.
-  - Still open: `_with_materials` collapse, `set_sprites` reset
-    split, `PackedColor` newtype family, `Frame` guard object.
-    (`SpriteInstanceDesc.model: usize` — decided to KEEP: the batch
+  - ~~`Frame` guard~~ **DONE 2026-07-06** (additive):
+    `SceneRenderer::frame()` → `Frame` guard — overlays carry the
+    frame's camera, present consumes, drop auto-presents. The split
+    `render`/`present` stays canonical in the book until the guard
+    earns its keep.
+  - ~~`set_sprites` reset split~~ **RESOLVED 2026-07-06 as
+    docs + verb, not a split**: the original hazard (silent handle
+    invalidation) was already fixed by QE.1a's epoch maps — stale
+    handles are safe no-ops. What remained was discoverability:
+    `set_sprites` docs now lead with the replace-the-world semantics,
+    and `clear_sprites()` is the explicit scene-switch verb (the demo
+    host migrated). A true static/dynamic registry split = deep
+    backend rework for little residual value; not doing it.
+  - ~~`_with_materials` collapse~~ **DECIDED 2026-07-06: KEEP the
+    pairs.** Every collapse shape makes the common case worse: an
+    options/map param on the base methods taxes the 90% no-materials
+    call (`add_sprite_model(&kv6, &[])`), and making `_with_materials`
+    canonical is verbose for the same reason. The pairs share one
+    implementation and cross-link in rustdoc; the wart is naming
+    surface only. Revisit only if a third variant per family ever
+    appears.
+  - (`SpriteInstanceDesc.model: usize` — decided to KEEP: the batch
     struct pre-dates id assignment; documented instead.)
+  - Still open: `PackedColor` newtype family — **author decision
+    2026-07-06: FULL signature-breaking newtypes** (constructors-only
+    and hybrid rejected). Locked design for the implementing session:
+    - `roxlap-formats/src/color.rs`, re-exported everywhere:
+      - `VoxColor(u32)` — voxel packing `0xBB_RR_GG_BB` (brightness
+        high byte). `VoxColor::rgb(r, g, b)` (neutral 0x80),
+        `.with_brightness(b)`, `from_packed`/`packed` escape hatches.
+        Adopters: `formats::edit` colour params + colfunc returns
+        (kill the `i32` wire at the public boundary), `Kv6::from_fn*`
+        closures, `Vxl::from_dense`, scene `Grid::set_*` /
+        `voxel_color` / `RayHit.color`.
+      - `Rgb(u32)` — plain `0x00RRGGBB`: tints
+        (`set_sprite_instance_tint`, particles `tint`/`tint_end`,
+        `set_actor_tint`), `FrameParams::{sky_color, fog_color}`,
+        `RenderOptions::clear_sky`. `Rgb::new(r, g, b)` + `WHITE`.
+      - `OverlayColor(u32)` — `0xAARRGGBB` with REAL alpha:
+        `Line3::color`, image tints if applicable.
+        `OverlayColor::rgba(..)` / `opaque(..)`.
+    - Wire formats / GPU buffers stay raw `u32` (newtypes are
+      `#[repr(transparent)]`, converted at the boundary).
+    - Every book anchor example + chapter 2's colour section migrate
+      in the same change; CHANGELOG carries a was→now literal table.
 - CPU↔GPU pixel-diff harness + more golden scenes (QE-C5) —
   **DROPPED** by author decision.
 - Workspace-wide `missing_docs` (~250 field docs in

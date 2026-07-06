@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: `Frame` guard + `clear_sprites` (QE-B6)
+
+- `SceneRenderer::frame(scene, camera, params)` returns a `Frame`
+  guard — the type-state form of the `render → overlays →
+  present`/`paint_egui` protocol. Overlays draw with the camera the
+  frame was rendered with (the guard holds it), presenting consumes
+  the guard (double present can't compile), and dropping an
+  unfinished frame presents it (forgetting can't happen). **Purely
+  additive**: the split `render`/`present` calls remain for hosts
+  that need custom control flow between the stages.
+- `SceneRenderer::clear_sprites()` — the explicit scene-switch verb
+  for "drop every model/instance/clip/character/billboard and stale
+  every handle", replacing the "register an empty `SpriteSet`" idiom.
+  `set_sprites`' docs now state its replace-the-world semantics up
+  front.
+
 ### Changed: typed lighting bakes — `Grid::bake(BakeMode)` (QE-B6)
 
 - The voxlap magic-`u32` lightmode is gone from the public bake API:

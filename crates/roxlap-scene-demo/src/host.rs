@@ -9,7 +9,7 @@ use std::time::Instant;
 use roxlap_core::Engine;
 use roxlap_render::{
     Backend, BackendPreference, DitherMode, PosterizeConfig, RenderOptions, RenderResolution,
-    SceneRenderer, SpriteSet,
+    SceneRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -171,16 +171,6 @@ impl PipelineUi {
         renderer.set_render_resolution(self.resolution());
         renderer.set_ssaa(self.ssaa);
         renderer.set_posterize(self.posterize());
-    }
-}
-
-/// An empty sprite set — used to reset the renderer's content layers
-/// (static + dynamic + clip + character) when switching scenes.
-fn empty_sprite_set() -> SpriteSet {
-    SpriteSet {
-        models: Vec::new(),
-        instances: Vec::new(),
-        carve_model: None,
     }
 }
 
@@ -430,7 +420,7 @@ impl Host {
             self.scenes[self.active].exit(&mut ctx);
         }
         // Drop all registered content (static + dynamic + clip + character).
-        renderer.set_sprites(&empty_sprite_set());
+        renderer.clear_sprites();
         self.active = idx;
         self.cam = CameraRig::from_pose(self.scenes[idx].start_pose());
         let mut ctx = SceneCtx {

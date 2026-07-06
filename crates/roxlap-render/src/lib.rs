@@ -2310,6 +2310,34 @@ impl SceneRenderer {
         }
     }
 
+    /// Composite `scene` and return a [`Frame`] guard — the type-state
+    /// form of the `render → overlays → present`/`paint_egui` protocol
+    /// (QE-B6), which the split calls enforce by documentation only.
+    /// With the guard, misuse is unrepresentable: overlays can only be
+    /// drawn on a live frame (with the camera it was rendered with —
+    /// the guard holds it), presenting consumes the guard so a double
+    /// present can't compile, and *dropping* an unfinished frame
+    /// presents it — a bare `renderer.frame(..);` shows the frame.
+    ///
+    /// ```ignore
+    /// renderer
+    ///     .frame(&mut scene, &camera, &params)
+    ///     .draw_lines(&gizmo)
+    ///     .present(); // or .paint_egui(..); or just drop it
+    /// ```
+    ///
+    /// The split [`render`](Self::render) / [`present`](Self::present)
+    /// calls remain available for hosts that need custom control flow
+    /// between the stages.
+    pub fn frame(&mut self, scene: &mut Scene, camera: &Camera, params: &FrameParams) -> Frame<'_> {
+        self.render(scene, camera, params);
+        Frame {
+            renderer: self,
+            camera: *camera,
+            finished: false,
+        }
+    }
+
     /// Overlay an egui UI on the frame [`render`](Self::render)
     /// composited, then present it (`hud` feature). The host runs egui
     /// itself (e.g. `egui` + `egui-winit`) and passes the tessellated
@@ -2334,9 +2362,30 @@ impl SceneRenderer {
         }
     }
 
-    /// Register sprite models + instances. The CPU backend builds a
-    /// per-instance draw list; the GPU backend builds an instanced
-    /// model registry. Call once at setup (or again to replace).
+    /// Reset the whole sprite world: every model, dynamic instance,
+    /// voxel clip, streaming clip, character, billboard and actor is
+    /// dropped, and **every outstanding handle from any of those
+    /// families goes stale** (resolving to safe no-ops — the maps are
+    /// generational). The explicit scene-switch verb (QE-B6): what the
+    /// demo host does between scenes, without the "register an empty
+    /// set" idiom spelling it.
+    pub fn clear_sprites(&mut self) {
+        self.set_sprites(&SpriteSet {
+            models: Vec::new(),
+            instances: Vec::new(),
+            carve_model: None,
+        });
+    }
+
+    /// Register sprite models + instances — **replacing the whole
+    /// sprite world**. This is a bulk *set*, not an append: every
+    /// handle family (models, dynamic instances, clips, streaming
+    /// clips, characters, billboards, actors) is reset and previously
+    /// issued handles go stale (safe no-ops). Call once at setup, or
+    /// again to replace everything; to build up incrementally instead,
+    /// use [`add_sprite_model`](Self::add_sprite_model) /
+    /// [`add_sprite_instance`](Self::add_sprite_instance) &c., and to
+    /// drop everything use [`clear_sprites`](Self::clear_sprites).
     pub fn set_sprites(&mut self, set: &SpriteSet) -> Vec<SpriteModelId> {
         match &mut self.inner {
             BackendImpl::Cpu(c) => c.set_sprites(set),
@@ -4036,6 +4085,71 @@ impl SceneRenderer {
             grid,
             voxel,
         })
+    }
+}
+
+/// A frame in flight (QE-B6) — returned by [`SceneRenderer::frame`].
+/// Overlays draw into the composited frame with the camera it was
+/// rendered with; exactly one present happens, by [`Self::present`] /
+/// [`Self::paint_egui`] or on drop.
+pub struct Frame<'r> {
+    renderer: &'r mut SceneRenderer,
+    /// The camera the frame composited with — overlays must use it.
+    camera: Camera,
+    finished: bool,
+}
+
+impl Frame<'_> {
+    /// Draw world-space overlay lines (see
+    /// [`SceneRenderer::draw_lines`]); chainable.
+    #[must_use = "the frame must still be presented (or dropped)"]
+    pub fn draw_lines(self, lines: &[Line3]) -> Self {
+        let cam = self.camera;
+        self.renderer.draw_lines(&cam, lines);
+        self
+    }
+
+    /// Draw 2D image-sprite quads (see
+    /// [`SceneRenderer::draw_images`]); chainable.
+    #[must_use = "the frame must still be presented (or dropped)"]
+    pub fn draw_images(self, images: &[ImageSprite]) -> Self {
+        let cam = self.camera;
+        self.renderer.draw_images(&cam, images);
+        self
+    }
+
+    /// Present with no UI overlay. Consuming — a second present
+    /// cannot compile.
+    pub fn present(mut self) {
+        self.finish();
+    }
+
+    /// Overlay a tessellated egui UI, then present (`hud` feature) —
+    /// see [`SceneRenderer::paint_egui`] for the arguments. Consuming.
+    #[cfg(feature = "hud")]
+    pub fn paint_egui(
+        mut self,
+        jobs: &[egui::ClippedPrimitive],
+        textures: &egui::TexturesDelta,
+        pixels_per_point: f32,
+    ) {
+        self.finished = true;
+        self.renderer.paint_egui(jobs, textures, pixels_per_point);
+    }
+
+    fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.renderer.present();
+        }
+    }
+}
+
+impl Drop for Frame<'_> {
+    /// An unfinished frame presents itself — forgetting to present is
+    /// not representable.
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
