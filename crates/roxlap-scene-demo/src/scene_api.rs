@@ -51,8 +51,8 @@ pub fn frame_params<'a>(
 }
 
 /// Fly speed (voxels/sec) and look sensitivity shared by every scene.
-const MOVE_SPEED: f64 = 64.0;
-const FAST_MULT: f64 = 4.0;
+pub const MOVE_SPEED: f64 = 64.0;
+pub const FAST_MULT: f64 = 4.0;
 const MOUSE_SENS: f64 = 0.0025;
 /// Pitch clamped just shy of ±90° so the camera basis stays conditioned.
 const PITCH_LIMIT: f64 = 88.0 * PI / 180.0;
@@ -104,13 +104,12 @@ impl CameraRig {
         self.pitch = (self.pitch + dy * MOUSE_SENS).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
-    /// The world-space movement delta this frame from the held keys —
-    /// forward/back along the camera's forward, left/right along its right,
-    /// up/down along world ∓z (voxlap z-down). Diagonals are normalised so
-    /// two-key combos don't move √2× faster. The scene applies the delta
-    /// (directly, or after a collision slide).
+    /// The unit wish direction from the held keys — forward/back along
+    /// the camera's forward, left/right along its right, up/down along
+    /// world ∓z (voxlap z-down). Zero when nothing is held; feeds
+    /// [`roxlap_scene::WalkInput`] or [`fly_delta`](Self::fly_delta).
     #[must_use]
-    pub fn fly_delta(&self, input: InputState, dt: f64) -> [f64; 3] {
+    pub fn wish_dir(&self, input: InputState) -> [f64; 3] {
         let cam = self.camera();
         let mut d = [0.0f64; 3];
         let mut add = |v: [f64; 3], s: f64| {
@@ -140,8 +139,19 @@ impl CameraRig {
         if mag2 <= 1e-9 {
             return [0.0; 3];
         }
+        let k = 1.0 / mag2.sqrt();
+        [d[0] * k, d[1] * k, d[2] * k]
+    }
+
+    /// The world-space movement delta this frame from the held keys —
+    /// [`wish_dir`](Self::wish_dir) scaled by the demo fly speed and
+    /// `dt`. The scene applies the delta (directly, or after a
+    /// collision slide).
+    #[must_use]
+    pub fn fly_delta(&self, input: InputState, dt: f64) -> [f64; 3] {
+        let d = self.wish_dir(input);
         let speed = MOVE_SPEED * if input.fast { FAST_MULT } else { 1.0 };
-        let k = speed * dt / mag2.sqrt();
+        let k = speed * dt;
         [d[0] * k, d[1] * k, d[2] * k]
     }
 

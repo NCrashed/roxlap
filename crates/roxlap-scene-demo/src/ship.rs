@@ -173,3 +173,59 @@ pub fn build_ship(grid: &mut Grid) {
         Some(BRIDGE),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use glam::DVec3;
+    use roxlap_scene::collide::{box_overlaps_solid, Solidity};
+    use roxlap_scene::{GridTransform, Scene};
+
+    /// The demo's ground + ship composition — the fixture behind two
+    /// user-reported collision bugs, kept as content-level regression
+    /// tests over the engine's CC.0 probe (the demo's own collision
+    /// copy died in CC.3).
+    fn user_repro_scene() -> Scene {
+        let mut scene = Scene::new();
+        let ground = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, 0.0)));
+        crate::terrain::build_ground(scene.grid_mut(ground).unwrap());
+        let ship = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, -100.0)));
+        super::build_ship(scene.grid_mut(ship).unwrap());
+        scene
+    }
+
+    fn cube_probe(scene: &Scene, world: [f64; 3]) -> bool {
+        let p = DVec3::from(world);
+        box_overlaps_solid(scene, p - 0.3, p + 0.3, Solidity::default())
+    }
+
+    /// Voxlap's slab format reports the interior of a solid run as
+    /// `Cube::UnexposedSolid` — the probe must treat it as solid or
+    /// the camera flies through the saucer body.
+    #[test]
+    fn saucer_body_interior_blocks() {
+        let scene = user_repro_scene();
+        // World z=-36 → ship-local z=64 = saucer centre (interior).
+        assert!(
+            cube_probe(&scene, [64.0, 64.0, -36.0]),
+            "saucer interior must block (UnexposedSolid is solid)"
+        );
+    }
+
+    /// The user-reported "invisible border" at world z=155 (= ship
+    /// grid's chunk-local z=255 bedrock placeholder): the renderer
+    /// hides that plane (`treat_z_max_as_air`), so the default
+    /// `Solidity` must let the camera pass through it too.
+    #[test]
+    fn ship_bedrock_placeholder_does_not_block() {
+        let scene = user_repro_scene();
+        // F-key capture pose from the original report.
+        assert!(!cube_probe(&scene, [79.33, 48.57, 154.06]));
+        // Across the bedrock plane — blocked before the fix.
+        assert!(
+            !cube_probe(&scene, [79.33, 48.57, 156.0]),
+            "world z=156 (just past ship bedrock) must be air"
+        );
+        // Well below the ship grid's chunk entirely.
+        assert!(!cube_probe(&scene, [79.33, 48.57, 200.0]));
+    }
+}

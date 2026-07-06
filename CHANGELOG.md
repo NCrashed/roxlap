@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed: demos move on the character controller (CC.3)
+
+- The three copy-pasted demo collision hacks (scene-demo
+  `collision.rs`, cave-demo, cave-web) are DELETED; every demo host
+  moves via `CharacterBody`. The scene-demo World scene gains a `G`
+  walk-mode toggle (gravity, Space jumps, 1-voxel step-up) alongside
+  the classic fly; the cave demos keep their exact old feel (a
+  ±0.3 cube body, solid world bounds via an explicit clamp).
+- New `CharacterBody` API for hosts: `def_mut()` (runtime tuning —
+  sprint/boost) and `set_pos()` (reposition keeping velocity — bounds
+  clamps, platform corrections).
+- `CharacterDef::fly_accel` (default `f64::INFINITY` = instant
+  start/stop): the fly modes are a camera, not a body with inertia —
+  the walking accel model made every fly key feel like "keep going
+  the way you were". Hosts must call `walk()` every frame (a zero
+  wish is what stops the body); the cave demos' idle early-returns
+  are gone.
+
 ### Added: character controller body (CC.1 + CC.2)
 
 - `roxlap_scene::character` — `CharacterBody` / `CharacterDef` /

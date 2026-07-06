@@ -10,7 +10,6 @@
 //! content helpers the scenes share (sprite / character / clip / picking
 //! / primitive builders) plus `fn main`.
 
-mod collision;
 mod host;
 mod kv6_sprite;
 mod markers;

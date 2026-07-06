@@ -74,6 +74,11 @@ pub struct CharacterDef {
     /// Target speed in [`MoveMode::Fly`] / [`MoveMode::Noclip`],
     /// where the full 3D `wish` steers.
     pub fly_speed: f64,
+    /// Acceleration toward the wish in the fly modes. The default
+    /// `f64::INFINITY` means instant start/stop — a fly camera, not
+    /// a body with inertia (the demos' classic feel); set a finite
+    /// rate for drifty flight.
+    pub fly_accel: f64,
     /// What counts as solid (bedrock-placeholder policy — must match
     /// how the host *renders* the world; see
     /// [`Solidity::bedrock_blocks`]).
@@ -95,6 +100,7 @@ impl Default for CharacterDef {
             coyote_time: 0.12,
             jump_buffer: 0.12,
             fly_speed: 12.0,
+            fly_accel: f64::INFINITY,
             solidity: Solidity::default(),
         }
     }
@@ -178,11 +184,19 @@ impl CharacterBody {
         self.mode = mode;
     }
 
-    /// The construction parameters (read-only; a body's shape does
-    /// not change after construction).
+    /// The construction parameters.
     #[must_use]
     pub fn def(&self) -> &CharacterDef {
         &self.def
+    }
+
+    /// Tune parameters at runtime — sprint (`walk_speed` /
+    /// `fly_speed`), variable jump height, etc. Growing `radius` /
+    /// `height` while standing in a tight spot can leave the body
+    /// overlapping solid; the stuck-escape rule makes that
+    /// recoverable rather than a jam.
+    pub fn def_mut(&mut self) -> &mut CharacterDef {
+        &mut self.def
     }
 
     /// Feet position, world space.
@@ -221,6 +235,13 @@ impl CharacterBody {
     #[must_use]
     pub fn hit_head(&self) -> bool {
         self.hit_head
+    }
+
+    /// Reposition the feet, KEEPING velocity and contact state — for
+    /// world-bounds clamps and moving-platform style corrections.
+    /// For spawns and respawns use [`teleport`](Self::teleport).
+    pub fn set_pos(&mut self, pos: DVec3) {
+        self.pos = pos;
     }
 
     /// Hard-place the feet at `pos`, zeroing velocity and contact
@@ -326,7 +347,7 @@ impl CharacterBody {
             input.wish
         };
         let target = wish * self.def.fly_speed;
-        let max_delta = self.def.accel_ground * dt;
+        let max_delta = self.def.fly_accel * dt;
         let delta = target - self.vel;
         let len = delta.length();
         self.vel = if len <= max_delta || len < 1e-12 {
@@ -962,6 +983,36 @@ mod tests {
             body.pos().x
         );
         assert!(body.pos().z < 95.0, "the -z wish component climbed");
+    }
+
+    #[test]
+    fn fly_stops_instantly_when_wish_drops() {
+        // The cave-demo regression: walk() with a zero wish must
+        // stop the body (default fly_accel is instant); a host that
+        // skips walk() on idle keeps stale velocity instead.
+        let scene = ground_scene();
+        let mut body = CharacterBody::new(CharacterDef::default());
+        body.set_mode(MoveMode::Fly);
+        body.teleport(DVec3::new(100.0, 100.0, 95.0));
+        body.walk(
+            &scene,
+            DT,
+            WalkInput {
+                wish: DVec3::new(1.0, 0.0, 0.0),
+                jump: false,
+            },
+        );
+        assert!(
+            (body.vel().x - body.def().fly_speed).abs() < 1e-9,
+            "instant spin-up to fly_speed"
+        );
+        let x_after_release = {
+            body.walk(&scene, DT, WalkInput::default());
+            body.pos().x
+        };
+        assert_eq!(body.vel(), DVec3::ZERO, "instant stop on zero wish");
+        body.walk(&scene, DT, WalkInput::default());
+        assert_eq!(body.pos().x, x_after_release, "no drift while idle");
     }
 
     #[test]

@@ -27,7 +27,9 @@ use roxlap_render::{
     Backend, BackendPreference, FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc,
     SpriteSet,
 };
-use roxlap_scene::{GridId, GridTransform, Scene};
+use roxlap_scene::{
+    CharacterBody, CharacterDef, GridId, GridTransform, MoveMode, Scene, Solidity, WalkInput,
+};
 use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
 
@@ -115,6 +117,13 @@ struct State {
     /// instance via the facade's [`SpriteSet`].
     bullet_model: Sprite,
     cam_pos: [f64; 3],
+    /// CC.3 — the engine controller (fly-mode PLAYER_RADIUS cube)
+    /// replaces the wasm copy of the per-axis slide; `cam_pos` stays
+    /// the outward-facing eye, synced after each walk.
+    body: CharacterBody,
+    /// `cam_pos` at our last sync; a mismatch (reseed/preset regen
+    /// respawn) re-teleports the body.
+    last_eye: [f64; 3],
     yaw: f64,
     pitch: f64,
     input: Input,
@@ -222,37 +231,6 @@ fn cam_from_yaw_pitch(pos: [f64; 3], yaw: f64, pitch: f64) -> Camera {
     Camera::from_yaw_pitch(pos, yaw, pitch)
 }
 
-/// `true` if the `PLAYER_RADIUS` box around `pos` overlaps any solid
-/// voxel or leaves the cave's `VSID³`-ish bounds. Grid is identity-
-/// transformed so a world point is also its grid-local voxel.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
-fn is_blocked(grid: &roxlap_scene::Grid, pos: [f64; 3]) -> bool {
-    let lo_x = (pos[0] - PLAYER_RADIUS).floor() as i32;
-    let hi_x = (pos[0] + PLAYER_RADIUS).floor() as i32;
-    let lo_y = (pos[1] - PLAYER_RADIUS).floor() as i32;
-    let hi_y = (pos[1] + PLAYER_RADIUS).floor() as i32;
-    let lo_z = (pos[2] - PLAYER_RADIUS).floor() as i32;
-    let hi_z = (pos[2] + PLAYER_RADIUS).floor() as i32;
-    let vsid = VSID as i32;
-    for vz in lo_z..=hi_z {
-        for vy in lo_y..=hi_y {
-            for vx in lo_x..=hi_x {
-                if vx < 0 || vy < 0 || vz < 0 || vx >= vsid || vy >= vsid || vz >= MAXZDIM {
-                    return true;
-                }
-                if grid.voxel_solid(IVec3::new(vx, vy, vz)) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 fn dt_seconds(prev_ms: f64, now_ms: f64) -> f64 {
     let dt_ms = (now_ms - prev_ms).clamp(0.0, 100.0);
     dt_ms / 1000.0
@@ -305,29 +283,42 @@ fn integrate_input(state: &mut State, dt: f64) {
             *d += c * jx;
         }
     }
-    let mag = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-    if mag <= 1e-6 {
-        return;
-    }
     let speed = if state.input.fast {
         MOVE_SPEED * FAST_MULT
     } else {
         MOVE_SPEED
     };
-    let step = [
-        delta[0] / mag * speed * dt,
-        delta[1] / mag * speed * dt,
-        delta[2] / mag * speed * dt,
-    ];
-    let grid = state.scene.grid(state.grid).expect("cave grid present");
-    let already_stuck = is_blocked(grid, state.cam_pos);
-    for axis in 0..3 {
-        let mut candidate = state.cam_pos;
-        candidate[axis] += step[axis];
-        if already_stuck || !is_blocked(grid, candidate) {
-            state.cam_pos[axis] = candidate[axis];
-        }
+    // CC.3: the engine controller slides the cube body. The wish is
+    // passed UNnormalised (walk clamps length to 1), which finally
+    // honours the joystick comment above: half-stick = half speed.
+    // NO early return on idle — walk() must run every frame so the
+    // wish-zero target stops the body (stale velocity otherwise).
+    let wish = glam::DVec3::new(delta[0], delta[1], delta[2]);
+    if state.cam_pos != state.last_eye {
+        state
+            .body
+            .teleport(glam::DVec3::from(state.cam_pos) + glam::DVec3::new(0.0, 0.0, PLAYER_RADIUS));
     }
+    state.body.def_mut().fly_speed = speed;
+    state
+        .body
+        .walk(&state.scene, dt, WalkInput { wish, jump: false });
+
+    // Out-of-world was SOLID in the old probe; the engine says air,
+    // so the cave bounds become an explicit feet clamp (velocity
+    // survives — boundary sliding stays fast).
+    let mut feet = state.body.pos();
+    let hi_xy = f64::from(VSID) - PLAYER_RADIUS - 1e-3;
+    let hi_z = f64::from(MAXZDIM) - 1e-3;
+    feet.x = feet.x.clamp(PLAYER_RADIUS, hi_xy);
+    feet.y = feet.y.clamp(PLAYER_RADIUS, hi_xy);
+    feet.z = feet.z.clamp(2.0 * PLAYER_RADIUS, hi_z);
+    if feet != state.body.pos() {
+        state.body.set_pos(feet);
+    }
+
+    state.cam_pos = state.body.eye_pos().into();
+    state.last_eye = state.cam_pos;
 }
 
 // ----- Bullets --------------------------------------------------------------
@@ -569,6 +560,21 @@ async fn start() -> Result<(), JsValue> {
             f64::from(VSID) * 0.5,
             f64::from(MAXZDIM) * 0.5,
         ],
+        body: {
+            let mut body = CharacterBody::new(CharacterDef {
+                radius: PLAYER_RADIUS,
+                height: 2.0 * PLAYER_RADIUS,
+                eye_height: PLAYER_RADIUS,
+                fly_speed: MOVE_SPEED,
+                solidity: Solidity {
+                    bedrock_blocks: true,
+                },
+                ..CharacterDef::default()
+            });
+            body.set_mode(MoveMode::Fly);
+            body
+        },
+        last_eye: [f64::NAN; 3],
         yaw: 0.0,
         pitch: 0.0,
         input: Input::default(),

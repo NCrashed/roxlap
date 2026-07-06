@@ -53,7 +53,10 @@ use roxlap_render::{
     SpriteInstanceId, SpriteModelId,
 };
 use roxlap_scene::cavegen::CaveChunkGenerator;
-use roxlap_scene::{ChunkGenerator, GridId, GridTransform, Scene, SpanOp, CHUNK_SIZE_XY};
+use roxlap_scene::{
+    CharacterBody, CharacterDef, ChunkGenerator, GridId, GridTransform, MoveMode, Scene, Solidity,
+    SpanOp, WalkInput, CHUNK_SIZE_XY,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -245,6 +248,13 @@ struct App {
     /// `resumed` (needs the renderer); `None` until then.
     bullet_model: Option<SpriteModelId>,
     cam_pos: [f64; 3],
+    /// CC.3 — the engine controller (fly mode, a PLAYER_RADIUS cube
+    /// body) replaces the demo's per-axis slide copy; `cam_pos` stays
+    /// the outward-facing eye, synced after each walk.
+    body: CharacterBody,
+    /// `cam_pos` as of our last sync — a mismatch means regen/spawn
+    /// moved the camera and the body must re-teleport.
+    last_eye: [f64; 3],
     yaw: f64,
     pitch: f64,
     keys: KeyState,
@@ -283,6 +293,21 @@ impl App {
             f64::from(MAXZDIM) * 0.5,
         ];
 
+        // CC.3: a cube body the size of the old ±PLAYER_RADIUS probe
+        // (eye at its centre), flying, with the cave's solid-bedrock
+        // floor honoured (this world renders its bottom as rock).
+        let mut body = CharacterBody::new(CharacterDef {
+            radius: PLAYER_RADIUS,
+            height: 2.0 * PLAYER_RADIUS,
+            eye_height: PLAYER_RADIUS,
+            fly_speed: MOVE_SPEED,
+            solidity: Solidity {
+                bedrock_blocks: true,
+            },
+            ..CharacterDef::default()
+        });
+        body.set_mode(MoveMode::Fly);
+
         Self {
             renderer: None,
             window: None,
@@ -291,6 +316,8 @@ impl App {
             grid_id,
             bullet_model: None,
             cam_pos,
+            body,
+            last_eye: [f64::NAN; 3],
             yaw: 0.0,
             pitch: 0.0,
             keys: KeyState::default(),
@@ -390,35 +417,47 @@ impl App {
         if self.keys.has(KeyState::DOWN) {
             delta[2] += 1.0;
         }
-        // Normalise diagonal motion so two-key combos don't move √2× faster.
+        // Normalise diagonal motion so two-key combos don't move √2×
+        // faster. NO early return on idle: walk() must run every
+        // frame so the wish-zero target stops the body (an early
+        // return here left stale velocity — "every key moves like W"
+        // right after flying forward).
         let mag = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-        if mag <= 1e-6 {
-            return;
-        }
-        let step = [
-            delta[0] / mag * speed * dt,
-            delta[1] / mag * speed * dt,
-            delta[2] / mag * speed * dt,
-        ];
+        let wish = if mag <= 1e-6 {
+            glam::DVec3::ZERO
+        } else {
+            glam::DVec3::new(delta[0] / mag, delta[1] / mag, delta[2] / mag)
+        };
 
-        // Per-axis collision against the cave chunk: try each axis
-        // independently so the camera slides along walls instead of
-        // jamming when one component collides. If already inside solid
-        // (e.g. a regen edge case), skip the block test for that axis so
-        // we can still escape.
-        let chunk = self
-            .scene
-            .grid(self.grid_id)
-            .and_then(|g| g.chunk(IVec3::ZERO));
-        let already_stuck = chunk.is_some_and(|c| is_blocked(c, self.cam_pos));
-        for axis in 0..3 {
-            let mut candidate = self.cam_pos;
-            candidate[axis] += step[axis];
-            let blocked = chunk.is_some_and(|c| is_blocked(c, candidate));
-            if already_stuck || !blocked {
-                self.cam_pos[axis] = candidate[axis];
-            }
+        // CC.3: the engine controller slides the cube body; regen or
+        // spawn moves `cam_pos` behind our back, so re-teleport when
+        // it no longer matches our last sync.
+        if self.cam_pos != self.last_eye {
+            self.body.teleport(
+                glam::DVec3::from(self.cam_pos) + glam::DVec3::new(0.0, 0.0, PLAYER_RADIUS),
+            );
         }
+        self.body.def_mut().fly_speed = speed;
+        self.body
+            .walk(&self.scene, dt, WalkInput { wish, jump: false });
+
+        // The old probe treated out-of-world cells as SOLID so the
+        // camera couldn't leave the cave volume; the engine treats
+        // out-of-grid as air, so the world bounds become an explicit
+        // clamp on the feet (velocity survives — sliding along the
+        // boundary stays fast).
+        let mut feet = self.body.pos();
+        let hi_xy = f64::from(VSID) - PLAYER_RADIUS - 1e-3;
+        let hi_z = f64::from(MAXZDIM) - 1e-3;
+        feet.x = feet.x.clamp(PLAYER_RADIUS, hi_xy);
+        feet.y = feet.y.clamp(PLAYER_RADIUS, hi_xy);
+        feet.z = feet.z.clamp(2.0 * PLAYER_RADIUS, hi_z);
+        if feet != self.body.pos() {
+            self.body.set_pos(feet);
+        }
+
+        self.cam_pos = self.body.eye_pos().into();
+        self.last_eye = self.cam_pos;
     }
 
     /// LMB fire — spawn a plasma bullet that flies along the camera's
@@ -1027,45 +1066,6 @@ fn bullet_pose(pos: [f64; 3]) -> DynSpriteTransform {
         pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32],
         ..DynSpriteTransform::default()
     }
-}
-
-/// Test whether any voxel intersected by a ±[`PLAYER_RADIUS`] cube
-/// around `pos` is solid (or out-of-world). Out-of-bounds in any axis
-/// counts as solid so the camera can't fly off the edge of the cave
-/// volume.
-///
-/// Cheap: at `PLAYER_RADIUS = 0.3` the cube spans at most 1 voxel per
-/// axis (typically), so this fans out to 1-8 [`getcube`] calls against
-/// the cave chunk.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
-fn is_blocked(chunk: &Vxl, pos: [f64; 3]) -> bool {
-    let lo_x = (pos[0] - PLAYER_RADIUS).floor() as i32;
-    let hi_x = (pos[0] + PLAYER_RADIUS).floor() as i32;
-    let lo_y = (pos[1] - PLAYER_RADIUS).floor() as i32;
-    let hi_y = (pos[1] + PLAYER_RADIUS).floor() as i32;
-    let lo_z = (pos[2] - PLAYER_RADIUS).floor() as i32;
-    let hi_z = (pos[2] + PLAYER_RADIUS).floor() as i32;
-    let vsid = VSID as i32;
-    for vz in lo_z..=hi_z {
-        for vy in lo_y..=hi_y {
-            for vx in lo_x..=hi_x {
-                if vx < 0 || vy < 0 || vz < 0 || vx >= vsid || vy >= vsid || vz >= MAXZDIM {
-                    return true;
-                }
-                if !matches!(
-                    getcube(&chunk.data, &chunk.column_offset, chunk.vsid, vx, vy, vz),
-                    Cube::Air
-                ) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

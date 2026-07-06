@@ -13,9 +13,35 @@ container, stage RKC) — a `.rkc` character is what you *draw*, a
 character controller is what you *stand on the ground with*. CC.4
 connects the two.
 
-## Status — OPEN (CC.0–CC.2 landed; CC.3 next)
+## Status — OPEN (CC.0–CC.3 landed; CC.4 next)
 
 ## Phase log
+
+- CC.3 — LANDED 2026-07-06: all three demo collision copies DELETED,
+  every host on `CharacterBody`. scene-demo World: Fly by default,
+  `G` toggles Walk (Space jumps, step-up), Shift boost via the new
+  `def_mut()` (runtime tuning API); `fly_delta` split into
+  `wish_dir` + speed; the camera rides `eye_pos()`, and an external
+  camera move (scene switch / capture pose) re-teleports the body
+  (`last_eye` sync). The two content repro tests (saucer interior,
+  ship-bedrock invisible wall) moved to `ship.rs` over the engine
+  probe. cave-demo + cave-web: a `PLAYER_RADIUS` cube body (eye at
+  centre — the exact old probe), `bedrock_blocks: true` (their floor
+  is real), and the old "out-of-world = solid" rule became an
+  explicit feet clamp with the new `set_pos()` (keeps velocity, so
+  boundary sliding stays fast). cave-web's wish now passes
+  unnormalised (walk clamps ≤1), which makes half-stick = half
+  speed — the joystick comment finally true. Post-land fix (user
+  report "all WASD move like W"): the cave demos' idle early-return
+  skipped walk(), leaving stale velocity; walk() now runs every
+  frame, and fly got its own `fly_accel` (default INSTANT — the fly
+  modes are cameras, not inertial bodies; the walking accel model
+  was wrong for them). Regression test:
+  `fly_stops_instantly_when_wish_drops`. **Visual pass owed**:
+  movement can't be exercised headless; both demos launch clean but
+  nobody has walked the hills yet. (Pre-existing, untouched:
+  roxlap-scene doesn't `cargo check` on bare wasm32 — chunks.rs
+  rayon — the web demos build through trunk's atomics pipeline.)
 
 - CC.2 — LANDED 2026-07-06: feel pass. `CharacterDef` gains
   `step_up` (1.05) / `coyote_time` (0.12) / `jump_buffer` (0.12) /
