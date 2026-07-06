@@ -27,25 +27,22 @@
 
 use roxlap_formats::vxl::Vxl;
 
-/// Per-frame world borrow that opticast + the rasterizer share.
-///
-/// Today: a single chunk's `(vsid, slab_buf, column_offsets,
-/// mip_base_offsets)`. `Copy` so callers can pass it to opticast
-/// and stash it on the rasterizer without ceremony — every field
-/// is a borrow or a `u32`.
-///
-/// Fields are public on purpose. External callers usually go
-/// through the [`from_single_vxl`](GridView::from_single_vxl) /
-/// [`from_parts`](GridView::from_parts) constructors, but the engine's
-/// internals destructure directly. Keeping the fields exposed
-/// avoids a layer of accessor methods that the borrow checker
-/// would otherwise force at every read.
 /// Z extent of a single chunk's slab table, in voxels. Voxlap's
 /// slab byte format encodes z as `u8`, so each chunk covers exactly
 /// 256 voxels along Z. Tall worlds stack chunks vertically (see
 /// `memory/project_s4b_6_z_stacking_plan.md`).
 pub const CHUNK_SIZE_Z: u32 = 256;
 
+/// Per-frame, zero-copy borrow of one grid's voxel world — the
+/// `(vsid, slab_buf, column_offsets, mip_base_offsets)` tuple the DDA
+/// renderer reads, plus the optional [`ChunkGrid`] backend for
+/// multi-chunk grids. `Copy` so callers pass it by value: every field
+/// is a shared borrow or a small integer.
+///
+/// Fields are public on purpose. External callers usually go through
+/// [`from_single_vxl`](GridView::from_single_vxl) /
+/// [`from_parts`](GridView::from_parts), but the engine's internals
+/// destructure directly.
 #[derive(Clone, Copy)]
 pub struct GridView<'a> {
     /// Square dimension of the currently-active chunk view (matches

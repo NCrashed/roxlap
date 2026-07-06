@@ -28,7 +28,12 @@ pub struct CameraState {
     pub pos: [f32; 3],
     /// Orthonormal basis — screen `+x`, screen `+y`, and view direction.
     pub right: [f32; 3],
+    /// Screen `+y` basis vector (pixel rows grow downward). With
+    /// `right` and `forward` it satisfies the right-handed invariant
+    /// `right × down = forward`.
     pub down: [f32; 3],
+    /// View direction — the ray through the projection centre
+    /// `(hx, hy)`, scaled by the focal length `hz` in the pinhole sum.
     pub forward: [f32; 3],
     /// View-frustum corner ray directions, in screen order: top-left,
     /// top-right, bottom-right, bottom-left. `corn[0]` is the direction

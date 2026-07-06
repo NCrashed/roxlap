@@ -1,20 +1,24 @@
-//! Import PNG sequences and animated PNG (APNG) into a [`VoxelClip`] of flat,
+//! Import PNG sequences and animated PNG (APNG) into a
+//! [`VoxelClip`](crate::voxel_clip::VoxelClip) of flat,
 //! camera-facing voxel **slabs** — the truecolor counterpart of
 //! [`crate::gif_import`] for Doom/Build-style billboard sprites (stage BB).
 //! Feature-gated behind the `png` feature.
 //!
 //! Two entry points:
-//! - [`voxel_clip_from_png_frames`] — N independent PNG files, each a full
+//! - [`voxel_clip_from_png_frames`](crate::png_import::voxel_clip_from_png_frames) —
+//!   N independent PNG files, each a full
 //!   frame (a "frame_000.png … frame_023.png" export), all the same size.
-//! - [`voxel_clip_from_apng`] — a single animated PNG (frames + per-frame
+//! - [`voxel_clip_from_apng`](crate::png_import::voxel_clip_from_apng) — a
+//!   single animated PNG (frames + per-frame
 //!   delays + APNG dispose/blend compositing). A plain (non-animated) PNG is a
 //!   1-frame clip.
 //!
-//! PNG carries real 8-bit alpha, but a [`VoxelClip`] is RGB-only, so alpha is
-//! resolved as a **cutout** at [`PngImportOpts::alpha_cutoff`] (a pixel becomes
+//! PNG carries real 8-bit alpha, but a [`VoxelClip`](crate::voxel_clip::VoxelClip) is RGB-only, so alpha is
+//! resolved as a **cutout** at
+//! [`PngImportOpts::alpha_cutoff`](crate::png_import::PngImportOpts::alpha_cutoff) (a pixel becomes
 //! a voxel iff `alpha >= cutoff`). Per-pixel translucency is not preserved; for
 //! a uniform fade use a translucent instance material + `alpha_mul`. See
-//! [`crate::slab`] for the axis convention.
+//! the crate-internal `slab` module for the axis convention.
 
 use crate::slab::{self, Pivot};
 use crate::voxel_clip::{LoopMode, VoxelClip};
@@ -66,11 +70,21 @@ pub enum PngImportError {
     /// No frames.
     Empty,
     /// Frames in a sequence disagree on size.
-    SizeMismatch { expected: [u32; 2], got: [u32; 2] },
+    SizeMismatch {
+        /// Pixel size (width, height) of the first frame.
+        expected: [u32; 2],
+        /// Pixel size of the frame that disagreed.
+        got: [u32; 2],
+    },
     /// `durations_ms` length didn't match the frame count.
     DurationsLen,
     /// The slab bounding box exceeds [`PngImportOpts::max_dims`].
-    TooLarge { dims: [u32; 3], max: [u32; 3] },
+    TooLarge {
+        /// The would-be slab dimensions, in voxels (x, y, z).
+        dims: [u32; 3],
+        /// The configured [`PngImportOpts::max_dims`] cap it exceeded.
+        max: [u32; 3],
+    },
 }
 
 impl core::fmt::Display for PngImportError {
@@ -383,8 +397,6 @@ fn clear_rect(canvas: &mut [u8], cw: usize, ch: usize, fw: usize, fh: usize, fx:
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::color::VoxColor;
 
     fn px(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
         [r, g, b, a]

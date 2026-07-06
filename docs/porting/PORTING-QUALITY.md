@@ -122,7 +122,13 @@ below. **Author triage 2026-07-06** (every carried item decided):
 - CPU↔GPU pixel-diff harness + more golden scenes (QE-C5) —
   **DROPPED** by author decision.
 - Workspace-wide `missing_docs` (~250 field docs in
-  roxlap-gpu/-formats/-core) — **DO.**
+  roxlap-gpu/-formats/-core) — **DONE 2026-07-06.** 261 items
+  documented (formats 127+2 feature-gated, core 37, gpu 97), each
+  written from its read site (WGSL shaders for the GPU mirrors);
+  two stale glued doc-blocks fixed along the way (`flush_writes` /
+  `GridView`-on-`CHUNK_SIZE_Z`). `missing_docs = "warn"` now lives in
+  `[workspace.lints.rust]` (per-crate attrs removed), so CI's
+  `-D warnings` gates every new public item workspace-wide.
 - QE-C6 `RenderConfig` consolidation — **DO.**
 
 Also resolved 2026-07-06: the QE.7a `Feature` parity table shipped

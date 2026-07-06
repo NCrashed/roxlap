@@ -34,10 +34,6 @@
 //! `set_posterize`).
 
 #![forbid(unsafe_code)]
-// QE.0 — the facade's public surface is fully documented; keep it that
-// way (CI's `-D warnings` turns this into a hard gate for new items).
-#![warn(missing_docs)]
-
 // Compile the workspace README's Rust snippets as doctests so the
 // "Use it in your game" example can never rot the way the pre-QE.0
 // Multicore snippet did (it kept calling API deleted releases earlier).

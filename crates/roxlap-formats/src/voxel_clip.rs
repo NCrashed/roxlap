@@ -311,8 +311,13 @@ impl VoxelFrame {
 /// occupancy words + new ascending-z colour run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDelta {
+    /// Column index (`x + y * dims[0]`); must be `< dims[0] * dims[1]`.
     pub col: u32,
+    /// The column's replacement occupancy bitmask — exactly
+    /// `occ_words_per_col` words, bit `z & 31` of word `z >> 5`.
     pub occ: Vec<u32>,
+    /// The column's replacement colour run (voxlap-packed `0x80RRGGBB`),
+    /// ascending z; length must equal the popcount of `occ`.
     pub colors: Vec<u32>,
 }
 
@@ -331,9 +336,16 @@ pub enum EncodedFrame {
 /// via [`VoxelClip::decode`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoxelClip {
+    /// Fixed bounding box `[xsiz, ysiz, zsiz]` every frame shares, in
+    /// voxels (each axis `1..=4096`, see `MAX_CLIP_DIM`).
     pub dims: [u32; 3],
+    /// Model pivot in fractional voxel units from the box's minimum
+    /// corner — the kv6 pivot the frames share.
     pub pivot: [f32; 3],
+    /// Render scale: 1 voxel of this clip spans this many world units
+    /// (`1.0` = engine-native; `.kv6` carries no scale of its own).
     pub voxel_world_size: f32,
+    /// How playback advances past the last frame.
     pub loop_mode: LoopMode,
     /// Frame duration used when `durations` is empty.
     pub default_frame_ms: u32,
@@ -350,19 +362,32 @@ pub struct VoxelClip {
 /// durations. The runtime flipbook.
 #[derive(Debug, Clone)]
 pub struct DecodedClip {
+    /// Fixed bounding box `[xsiz, ysiz, zsiz]` in voxels, copied from
+    /// the source [`VoxelClip`].
     pub dims: [u32; 3],
+    /// Model pivot in fractional voxel units from the box's minimum
+    /// corner, copied from the source clip.
     pub pivot: [f32; 3],
+    /// Render scale (1 voxel = this many world units), copied from the
+    /// source clip.
     pub voxel_world_size: f32,
+    /// u32 occupancy words per column: `ceil(dims[2] / 32)`.
     pub occ_words_per_col: u32,
+    /// Playback wrap behaviour, copied from the source clip.
     pub loop_mode: LoopMode,
+    /// Every frame fully reconstructed (deltas applied), in playback
+    /// order.
     pub frames: Vec<VoxelFrame>,
     /// Per-frame surface-normal LUT indices, parallel to
     /// `frames[i].colors`.
     pub dirs: Vec<Vec<u32>>,
+    /// Resolved per-frame durations (ms) — always one entry per frame
+    /// (uniform `default_frame_ms` when the clip stored none).
     pub durations: Vec<u32>,
 }
 
 impl DecodedClip {
+    /// Number of frames in the clip (≥ 1 for a decodable clip).
     #[must_use]
     pub fn frame_count(&self) -> usize {
         self.frames.len()
@@ -693,26 +718,33 @@ impl StreamingClip {
         Ok(s)
     }
 
+    /// Number of frames in the encoded stream.
     #[must_use]
     pub fn frame_count(&self) -> usize {
         self.frames.len()
     }
+    /// The clip's fixed bounding box `[xsiz, ysiz, zsiz]`, in voxels.
     #[must_use]
     pub fn dims(&self) -> [u32; 3] {
         self.dims
     }
+    /// The clip's pivot, in fractional voxel units from the box's
+    /// minimum corner.
     #[must_use]
     pub fn pivot(&self) -> [f32; 3] {
         self.pivot
     }
+    /// Render scale: 1 voxel = this many world units.
     #[must_use]
     pub fn voxel_world_size(&self) -> f32 {
         self.voxel_world_size
     }
+    /// Playback wrap behaviour past the last frame.
     #[must_use]
     pub fn loop_mode(&self) -> LoopMode {
         self.loop_mode
     }
+    /// Resolved per-frame durations (ms), one entry per frame.
     #[must_use]
     pub fn durations(&self) -> &[u32] {
         &self.durations
@@ -851,6 +883,7 @@ impl VoxelClip {
         occ_words_per_col(self.dims)
     }
 
+    /// Number of encoded frames (keyframes + deltas combined).
     #[must_use]
     pub fn frame_count(&self) -> usize {
         self.frames.len()
@@ -1501,8 +1534,11 @@ pub enum Kv6ImportError {
     Empty,
     /// A frame's dims differ from the first frame's (clips are fixed-bbox).
     DimsMismatch {
+        /// Index of the offending frame in the input slice.
         frame: usize,
+        /// That frame's `[xsiz, ysiz, zsiz]`.
         dims: [u32; 3],
+        /// The first frame's dims, which every frame must match.
         expected: [u32; 3],
     },
 }
@@ -1510,23 +1546,38 @@ pub enum Kv6ImportError {
 /// Why a [`VoxelFrame`] failed validation against a clip's `dims`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
+    /// `occupancy.len()` ≠ `dims[0] * dims[1] * occ_words_per_col`.
     OccupancyLen,
+    /// `color_offsets.len()` ≠ `dims[0] * dims[1] + 1`.
     OffsetsLen,
+    /// `color_offsets` doesn't start at 0 or doesn't end at
+    /// `colors.len()`.
     OffsetsBounds,
+    /// `color_offsets` decreases somewhere (a negative colour-run
+    /// length).
     OffsetsMonotonic,
     /// Column index whose occupancy popcount ≠ its colour-run length.
     OccupancyColorMismatch(usize),
 }
 
+/// Why [`VoxelClip::parse`] rejected a `.rvc` byte stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
+    /// First 4 bytes are not the `b"RVCL"` magic.
     BadMagic {
+        /// The 4 bytes actually found.
         got: [u8; 4],
     },
+    /// The version word is neither v1 (legacy, raw chunks) nor the
+    /// current v2.
     UnsupportedVersion(u16),
+    /// A read ran past the end of the file (or of a chunk payload).
     Truncated,
+    /// A required chunk (`META` or `FRMS`) was absent.
     MissingChunk([u8; 4]),
+    /// `META`'s `loop_mode` byte is not a known [`LoopMode`] (0..=2).
     BadLoopMode,
+    /// A `FRMS` frame `kind` byte is neither `Key` (0) nor `Delta` (1).
     BadFrameKind(u8),
     /// A `CHUNK_FLAG_DEFLATED` payload failed to inflate, or its inflated
     /// length disagreed with the stored `raw_len`.
@@ -1534,6 +1585,7 @@ pub enum ParseError {
     /// QE.6b - a META chunk with a zero or > 4096 dimension (bounds
     /// every dims-derived allocation; see `MAX_CLIP_DIM`).
     BadDims {
+        /// The declared `[xsiz, ysiz, zsiz]`, in voxels.
         dims: [u32; 3],
     },
 }

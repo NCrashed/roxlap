@@ -68,6 +68,9 @@ pub struct GridUpload {
 }
 
 impl GridUpload {
+    /// Capacity of the grid's bounding box in chunks
+    /// (`chunks_dims.x · y · z`) — an upper bound on `chunks.len()`,
+    /// which may be smaller when interior chunks are absent.
     #[must_use]
     pub fn total_chunks(&self) -> u32 {
         self.chunks_dims[0] * self.chunks_dims[1] * self.chunks_dims[2]

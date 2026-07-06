@@ -11,9 +11,15 @@
 /// renormalize).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quat {
+    /// Vector (imaginary) part, x component — `axis.x * sin(θ/2)` for a
+    /// unit rotation.
     pub x: f32,
+    /// Vector part, y component.
     pub y: f32,
+    /// Vector part, z component.
     pub z: f32,
+    /// Scalar (real) part — `cos(θ/2)` for a unit rotation; `1.0` is
+    /// the identity.
     pub w: f32,
 }
 

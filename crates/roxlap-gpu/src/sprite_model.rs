@@ -310,6 +310,8 @@ pub struct SpriteModelRegistry {
 }
 
 impl SpriteModelRegistry {
+    /// An empty registry (no models, no chains) — equivalent to
+    /// [`Default::default`]. Populate via [`Self::add`] / [`Self::add_lod`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -460,6 +462,9 @@ impl SpriteModelRegistry {
         self.chains.len()
     }
 
+    /// `true` iff no chain was ever registered (`len() == 0`). Note a
+    /// registry whose every chain has been [`removed`](Self::remove) is
+    /// **not** empty by this test — tombstoned ids still count.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.chains.is_empty()
@@ -705,12 +710,23 @@ impl SpriteModel {
 /// camera space).
 #[derive(Clone, Copy, Debug)]
 pub struct ViewFrustum {
+    /// Eye position, world voxel units.
     pub pos: [f32; 3],
+    /// Unit basis toward screen-right (right-handed with `down`/`forward`).
     pub right: [f32; 3],
+    /// Unit basis toward screen-down (+z is down in voxlap space).
     pub down: [f32; 3],
+    /// Unit view direction; the near side of the frustum is the plane
+    /// `z = 0` in this camera space.
     pub forward: [f32; 3],
+    /// `tan(fov_x / 2)`: a camera-space point is inside the side planes
+    /// when `|x| <= half_w * z`.
     pub half_w: f32,
+    /// `tan(fov_y / 2)`: inside the top/bottom planes when
+    /// `|y| <= half_h * z`.
     pub half_h: f32,
+    /// Far-plane distance along `forward`, world units — instances whose
+    /// bounding sphere lies wholly beyond it are culled.
     pub far: f32,
 }
 
@@ -849,7 +865,12 @@ fn instances_buffer(device: &wgpu::Device, cap: u32) -> wgpu::Buffer {
 /// One sprite instance: a model reference + world pose.
 #[derive(Debug, Clone, Copy)]
 pub struct SpriteInstance {
+    /// LOD-chain id from [`SpriteModelRegistry::add`] / `add_lod` —
+    /// which model this instance draws. The per-frame cull substitutes
+    /// the distance-picked concrete mip entry.
     pub model_id: u32,
+    /// World pose: inverse model→world rotation/scale + position (see
+    /// [`SpriteInstanceTransform::from_sprite`]).
     pub transform: SpriteInstanceTransform,
     /// Voxel-material id (TV stage): indexes the renderer's global material
     /// palette for this instance's opacity + blend mode. `0` (the default)
@@ -959,7 +980,14 @@ fn mat3_inverse(cols: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 /// One bind group serves all models (same approach as the multi-grid
 /// scene).
 pub struct SpriteRegistryResident {
+    /// Concatenated per-model occupancy bitmaps (1 bit per voxel,
+    /// 32 per u32 word, z innermost within a column); each model's
+    /// region starts at its `model_meta` `occupancy_offset`.
     pub occupancy: wgpu::Buffer,
+    /// Concatenated packed voxel colours, one u32 per solid voxel
+    /// (blue bits 0-7, green 8-15, red 16-23; the high byte is carried
+    /// through but unread — sprite shading comes from the per-instance
+    /// `kv6colmul` table). Rank-indexed via [`Self::color_offsets`].
     pub colors: wgpu::Buffer,
     /// Per-voxel surface-normal index, concatenated across models in the
     /// same layout as [`colors`](Self::colors). The shader indexes the
@@ -970,11 +998,21 @@ pub struct SpriteRegistryResident {
     /// per-model `has_vox_materials` flag in `model_meta` says whether to use
     /// it (else the shader falls back to the instance's uniform material).
     pub materials_vox: wgpu::Buffer,
+    /// Concatenated per-model `cols + 1` prefix tables: column
+    /// `(x, y)`'s colours span
+    /// `colors[offsets[col] .. offsets[col + 1]]` (offsets are local
+    /// to the model's colour block).
     pub color_offsets: wgpu::Buffer,
+    /// Per-model metadata table (std430, 48 B each): buffer offsets,
+    /// dims, pivot, per-voxel-materials flag, and the mip entry's
+    /// `voxel_world_size`. Indexed by the instance's culled `model_id`.
     pub model_meta: wgpu::Buffer,
     /// Holds up to `instance_capacity` instances; the visible subset
     /// is packed into `[0, count)` each frame by [`Self::cull_bin_upload`].
     pub instances: wgpu::Buffer,
+    /// Allocation size of [`Self::instances`] in records (grown
+    /// power-of-2-style by `append_instances`); the per-frame visible
+    /// count is at most this.
     pub instance_capacity: u32,
     /// Per-visible-instance `kv6colmul[256]` tables, packed in the same
     /// order as the `instances` buffer each frame (two u32 per u64

@@ -44,8 +44,16 @@ pub const MAX_GPU_MIPS: usize = 6;
 /// (absolute) `color_offsets`.
 #[derive(Debug, Clone, Copy)]
 pub struct MipLayout {
+    /// Number of mip levels stored per slot = [`gpu_mip_count`]`(vsid)`,
+    /// always `1..=`[`MAX_GPU_MIPS`].
     pub mip_count: u32,
+    /// Occupancy u32 words per chunk slot, summed over all mips — each
+    /// mip stores its textured **and** solid bitmap back-to-back, so
+    /// this is `Σ 2·(vsid>>m)²·occ_words_per_column_for_mip(m)`.
     pub occ_words_per_slot: u32,
+    /// `color_offsets` u32 words per chunk slot, summed over all mips
+    /// (`Σ (vsid>>m)² + 1` — each mip keeps its own `cols + 1` prefix
+    /// table).
     pub offsets_words_per_slot: u32,
     /// Within-slot u32 offset where mip `m`'s occupancy starts.
     pub mip_occ_rel: [u32; MAX_GPU_MIPS],
@@ -54,6 +62,10 @@ pub struct MipLayout {
 }
 
 impl MipLayout {
+    /// Compute the per-slot layout for a grid whose chunks are
+    /// `vsid × vsid × CHUNK_Z` voxels. Deterministic in `vsid`, so the
+    /// upload, [`GpuSceneResident::refresh_chunk`], and the shader all
+    /// derive identical strides independently.
     #[must_use]
     pub fn for_vsid(vsid: u32) -> Self {
         let mip_count = gpu_mip_count(vsid);
@@ -143,10 +155,16 @@ impl Default for GridRuntimeTransform {
 /// startup; per-grid transforms are recomputed each frame and
 /// passed to `render_scene` separately.
 pub struct SceneUpload {
+    /// One [`GridUpload`] per scene grid, in the order the shader
+    /// iterates them; index = the `scene_idx` handed to
+    /// [`GpuSceneResident::refresh_chunk`] / `evict_chunk` and the
+    /// per-grid camera slot.
     pub grids: Vec<GridUpload>,
 }
 
 impl SceneUpload {
+    /// Number of grids, saturated into `u32` (the type the shader's
+    /// `grid_count` uniform uses).
     #[must_use]
     pub fn grid_count(&self) -> u32 {
         u32::try_from(self.grids.len()).unwrap_or(u32::MAX)
@@ -166,17 +184,39 @@ impl SceneUpload {
 pub struct GridStaticMeta {
     /// `occupancy` u32-word offset where this grid's data starts.
     pub occupancy_offset: u32,
+    /// `all_color_offsets` (binding 2) u32-word offset where this
+    /// grid's per-slot colour-offset tables start; slot `meta_id`'s
+    /// window is `offsets_words_per_slot` words from
+    /// `color_offsets_offset + meta_id * offsets_words_per_slot`.
     pub color_offsets_offset: u32,
+    /// `all_colors` (binding 3) u32-word offset where this grid's
+    /// packed voxel colours start (per-slot blocks of the grid's
+    /// colour stride).
     pub colors_offset: u32,
+    /// `all_chunk_colors_base` (binding 4) u32-word offset of this
+    /// grid's per-slot table mapping `meta_id` → the slot's colour
+    /// base (in words, relative to `colors_offset`).
     pub chunk_colors_base_offset: u32,
+    /// `all_chunk_occupancy` (binding 5) u32-word offset of this
+    /// grid's chunk-occupancy bitmap: bit `slot_idx & 31` of word
+    /// `slot_idx >> 5` is set iff the slot holds a non-empty chunk —
+    /// the outer DDA's whole-chunk skip test.
     pub chunk_occupancy_offset: u32,
     /// New in GPU.7: u32-word offset where this grid's
     /// `slot_chunk_idx` array starts (one `vec3<i32>` per slot,
     /// i.e. 3 u32 words each, plus 1 padding word for std430).
     pub slot_chunk_idx_offset: u32,
+    /// Chunk XY extent in voxels (typically 128); the chunk's Z extent
+    /// is the fixed `CHUNK_Z = 256`.
     pub vsid: u32,
+    /// Slot count in the modular pool
+    /// (`pool_dims.x · pool_dims.y · pool_dims.z`).
     pub total_slots: u32,
+    /// GPU.7 slot-pool dimensions (each a power of 2). Chunk
+    /// `(chx, chy, chz)` lives in slot
+    /// `(chx & (pool_dims.x - 1), chy & …, chz & …)`.
     pub pool_dims: [u32; 3],
+    /// std430 padding; always 0.
     pub _pad0: u32,
     /// GPU.11 — per-slot occupancy stride (sum over all mips).
     /// `meta_id`'s occupancy slab starts at
@@ -186,6 +226,7 @@ pub struct GridStaticMeta {
     pub offsets_words_per_slot: u32,
     /// GPU.11 — number of mip levels stored per slot.
     pub mip_count: u32,
+    /// std430 padding; always 0.
     pub _pad1: u32,
     /// GPU.11 — within-slot u32 offset where mip `m`'s occupancy
     /// starts. `mip_occ_rel[0] == 0` so mip-0 reads are unchanged.
@@ -201,8 +242,13 @@ pub struct GridStaticMeta {
     /// Maintained live: [`GpuSceneResident::refresh_chunk`] /
     /// [`GpuSceneResident::evict_chunk`] recompute + re-upload it.
     pub aabb_min: [i32; 3],
+    /// std430 `vec3<i32>` padding; always 0.
     pub _pad2: i32,
+    /// Inclusive upper corner of the occupied chunk-AABB (chunk-index
+    /// space); `i32::MIN` sentinel when the grid holds no chunks. See
+    /// [`Self::aabb_min`].
     pub aabb_max: [i32; 3],
+    /// std430 `vec3<i32>` padding; always 0.
     pub _pad3: i32,
 }
 
@@ -214,6 +260,8 @@ pub const SLOT_EMPTY_SENTINEL: [i32; 3] = [i32::MIN, i32::MIN, i32::MIN];
 
 /// GPU-resident storage for an entire scene's grids.
 pub struct GpuSceneResident {
+    /// Number of grids uploaded (= `SceneUpload::grid_count()`); the
+    /// shader's grid loop bound and the length of [`Self::static_meta`].
     pub grid_count: u32,
     /// Concatenated per-slot occupancy, split into up to
     /// [`MAX_OCC_PAGES`] storage bindings so no single binding
@@ -229,15 +277,33 @@ pub struct GpuSceneResident {
     pub occupancy_page_words: u32,
     /// Number of real (non-dummy) pages in `occupancy_pages`.
     pub occupancy_num_pages: u32,
+    /// Binding 2 — concatenated per-slot `color_offsets` prefix tables
+    /// (all grids, all mips). Grid `g`'s region starts at
+    /// `static_meta[g].color_offsets_offset` words.
     pub all_color_offsets: wgpu::Buffer,
+    /// Binding 3 — concatenated packed voxel colours (all grids).
+    /// Each word is the voxlap wire format the shader unpacks: blue in
+    /// bits 0-7, green 8-15, red 16-23, and a **brightness** byte (not
+    /// alpha) in bits 24-31 with `0x80` = neutral.
     pub all_colors: wgpu::Buffer,
+    /// Binding 4 — per-slot colour base table: word `meta_id` of grid
+    /// `g`'s region holds the slot's colour start (in words, relative
+    /// to `static_meta[g].colors_offset`) = `meta_id × colour stride`.
     pub all_chunk_colors_base: wgpu::Buffer,
+    /// Binding 5 — per-grid chunk-occupancy bitmaps (one bit per pool
+    /// slot: set iff the slot holds a non-empty chunk). The outer DDA
+    /// tests it to skip whole 128×128×256 chunks per step.
     pub all_chunk_occupancy: wgpu::Buffer,
     /// GPU.7 — per-slot chunk_idx for identity verification in the
     /// shader. Stored as `vec3<i32>` with std430 16-byte stride
     /// (each entry is `[i32; 4]` on the host: x, y, z, _pad).
     pub all_slot_chunk_idx: wgpu::Buffer,
+    /// Binding 6 — the [`GridStaticMeta`] array, one element per grid.
+    /// Mostly upload-time constant; the live chunk-AABB fields are
+    /// patched in place on `refresh_chunk` / `evict_chunk`.
     pub grid_static_meta: wgpu::Buffer,
+    /// Total bytes allocated across all the resident storage buffers,
+    /// for VRAM accounting (see [`Self::resident_bytes`]).
     pub total_bytes: u64,
     /// Cached static metadata for the host's frame-loop work.
     pub static_meta: Vec<GridStaticMeta>,
@@ -570,6 +636,9 @@ impl GpuSceneResident {
         }
     }
 
+    /// GPU memory held by the scene's storage buffers, in bytes —
+    /// [`Self::total_bytes`] as computed at upload time (in-place
+    /// refreshes never change it).
     pub fn resident_bytes(&self) -> u64 {
         self.total_bytes
     }
@@ -856,6 +925,15 @@ impl GpuSceneResident {
         true
     }
 
+    /// Evict `chunk_idx` from grid `scene_idx`: clear the slot's
+    /// chunk-occupancy bit, stamp [`SLOT_EMPTY_SENTINEL`] into its
+    /// `slot_chunk_idx` entry, and shrink the grid's chunk-AABB if the
+    /// box tightened. The bulk voxel data is left in place — the
+    /// cleared occupancy bit + sentinel already make the shader treat
+    /// the slot as empty. A no-op (returning `true`) when the slot
+    /// meanwhile holds a *different* chunk, so a stale evict can never
+    /// wipe a newer occupant. Returns `false` only for an out-of-range
+    /// `scene_idx`.
     pub fn evict_chunk(
         &mut self,
         queue: &wgpu::Queue,
@@ -998,6 +1076,8 @@ pub fn modular_slot_idx(chunk_idx: [i32; 3], pool_dims: [u32; 3]) -> usize {
 /// colour data overflowed the per-slot stride and was clipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshOutcome {
+    /// The chunk was installed/refreshed in full — every mip's
+    /// occupancy, offsets, and colours are resident.
     Ok,
     /// The chunk's colour count exceeded `COLORS_PER_CHUNK_WORDS`;
     /// the GPU sees the first `stride` colours. Bump

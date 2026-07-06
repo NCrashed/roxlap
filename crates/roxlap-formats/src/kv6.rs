@@ -120,11 +120,20 @@ pub struct Voxel {
 /// [`serialize`].
 #[derive(Debug, Clone)]
 pub struct Kv6 {
+    /// Model extent along x, in voxels (`kv6data.xsiz`).
     pub xsiz: u32,
+    /// Model extent along y, in voxels (`kv6data.ysiz`).
     pub ysiz: u32,
+    /// Model extent along z, in voxels (`kv6data.zsiz`). Sprites keep
+    /// voxlap's z-down convention: z=0 is the model's top.
     pub zsiz: u32,
+    /// Pivot x in fractional voxel units from the model's minimum
+    /// corner (`kv6data.xpiv`); the point placement/rotation happens
+    /// about.
     pub xpiv: f32,
+    /// Pivot y, same units/origin as [`xpiv`](Self::xpiv).
     pub ypiv: f32,
+    /// Pivot z, same units/origin as [`xpiv`](Self::xpiv).
     pub zpiv: f32,
     /// Voxel records in file order (`numvoxs == voxels.len() as u32`).
     pub voxels: Vec<Voxel>,
@@ -458,12 +467,23 @@ impl Kv6 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// File too small to contain even the 32-byte header.
-    TooSmall { got: usize },
+    TooSmall {
+        /// Actual file size in bytes.
+        got: usize,
+    },
     /// First 4 bytes are not the `"Kvxl"` magic.
-    BadMagic { got: [u8; 4] },
+    BadMagic {
+        /// The 4 bytes actually found.
+        got: [u8; 4],
+    },
     /// A read of `need` bytes at offset `at` would run past the end of
     /// the buffer.
-    Truncated { at: usize, need: usize },
+    Truncated {
+        /// Byte offset of the failed read.
+        at: usize,
+        /// Number of bytes the read required.
+        need: usize,
+    },
 }
 
 impl fmt::Display for ParseError {

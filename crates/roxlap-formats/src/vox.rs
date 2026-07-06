@@ -41,21 +41,53 @@ pub const MAX_MODEL_DIM: u32 = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
     /// File too small for the 8-byte `VOX ` header.
-    TooSmall { got: usize },
+    TooSmall {
+        /// Actual file size in bytes.
+        got: usize,
+    },
     /// First 4 bytes are not the `"VOX "` magic.
-    BadMagic { got: [u8; 4] },
+    BadMagic {
+        /// The 4 bytes actually found.
+        got: [u8; 4],
+    },
     /// A read of `need` bytes at offset `at` would run past the end
     /// of the buffer.
-    Truncated { at: usize, need: usize },
+    Truncated {
+        /// Byte offset of the failed read.
+        at: usize,
+        /// Number of bytes the read required.
+        need: usize,
+    },
     /// A chunk header declares more content/children bytes than the
     /// file has left.
-    BadChunkSize { id: [u8; 4], at: usize },
+    BadChunkSize {
+        /// The chunk's 4-byte tag (e.g. `b"XYZI"`).
+        id: [u8; 4],
+        /// Byte offset of the chunk header.
+        at: usize,
+    },
     /// A `SIZE` chunk with a zero or > [`MAX_MODEL_DIM`] dimension.
-    BadModelSize { x: u32, y: u32, z: u32 },
+    BadModelSize {
+        /// Declared x dimension, in voxels.
+        x: u32,
+        /// Declared y dimension, in voxels.
+        y: u32,
+        /// Declared z dimension, in voxels.
+        z: u32,
+    },
     /// An `XYZI` chunk with no preceding unpaired `SIZE` chunk.
-    OrphanXyzi { at: usize },
+    OrphanXyzi {
+        /// Byte offset of the orphan `XYZI` chunk.
+        at: usize,
+    },
     /// An `XYZI` voxel count inconsistent with the chunk's size.
-    BadVoxelCount { declared: u32, room_for: u32 },
+    BadVoxelCount {
+        /// The voxel count the chunk header declared.
+        declared: u32,
+        /// How many 4-byte voxel records the payload actually has room
+        /// for.
+        room_for: u32,
+    },
 }
 
 impl fmt::Display for ParseError {

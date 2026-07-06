@@ -36,7 +36,13 @@ pub struct GpuLight {
     pub radius: f32,
     /// Linear RGB, `0..1`.
     pub color: [f32; 3],
+    /// Scalar multiplier on [`Self::color`] in the diffuse term
+    /// (`albedo · color · intensity · N·L · falloff`). `1.0` = nominal;
+    /// values above 1 over-brighten.
     pub intensity: f32,
+    /// Whether this light marches occlusion (shadow) rays. Honoured up
+    /// to the [`MAX_SHADOW_CASTERS`] budget (the sun counts as one);
+    /// over-budget lights are demoted to shadowless with a warning.
     pub casts_shadow: bool,
     /// SL — spot (cone) axis: unit direction the light shines **along**,
     /// in the same frame as [`Self::position`] (grid-local for the scene
@@ -65,17 +71,36 @@ pub struct SceneLights {
     pub enabled: bool,
     /// Per-grid unit direction **to** the sun (grid-local). Empty ⇒ no sun.
     pub grid_sun_dirs: Vec<[f32; 3]>,
+    /// Sun colour, linear RGB `0..1`. The shader's sun term is
+    /// `albedo · sun_color · sun_intensity · N·L · shadow`.
     pub sun_color: [f32; 3],
+    /// Scalar multiplier on [`Self::sun_color`]; `0.0` blacks the sun
+    /// out even when `grid_sun_dirs` is set.
     pub sun_intensity: f32,
+    /// Whether the sun marches shadow rays. When `true` the sun takes
+    /// the first slot of the [`MAX_SHADOW_CASTERS`] budget.
     pub sun_casts_shadow: bool,
     /// Per-grid point lights (grid-local). Outer len == `grid_count`; the
     /// inner len (the point count) is the same for every grid.
     pub grid_point_lights: Vec<Vec<GpuLight>>,
     /// Multiplier on the baked ambient byte.
     pub ambient: [f32; 3],
+    /// Fraction of a caster's light removed at shadowed hits, `0..=1`
+    /// (`1.0` = fully black shadows, `0.0` = shadows invisible). The
+    /// shader applies `in_shadow = 1 - shadow_strength`; the facade
+    /// default is `0.7`.
     pub shadow_strength: f32,
+    /// Shadow-ray origin offset along the hit's surface normal, in
+    /// voxel units — kills self-shadow acne. The facade passes
+    /// `LightRig::shadow_bias_voxels` (default `1.5`).
     pub shadow_bias: f32,
+    /// Length cap for **sun** shadow rays, world/voxel units (facade
+    /// default `512`). Point-light shadow rays stop at the light itself
+    /// instead.
     pub shadow_max_dist: f32,
+    /// Hard cap on voxel steps per shadow ray so the occlusion march
+    /// always terminates (the facade passes `256`). Past the cap the
+    /// point is treated as unshadowed.
     pub shadow_max_steps: u32,
     /// DL.4 — **world-space** unit direction to the sun, for the sprite
     /// pass (sprites render in world space, not grid-local). `[0;3]` ⇒ no

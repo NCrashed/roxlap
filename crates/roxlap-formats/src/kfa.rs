@@ -49,8 +49,13 @@ const SEQ_SIZE: usize = 8;
 /// 3D point (`point3d` in voxlaptest), 12 bytes packed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point3 {
+    /// x component. For [`Hinge`] anchors/axes the space is the limb's
+    /// kv6-local frame (voxel units for anchor points, direction
+    /// vectors for axes).
     pub x: f32,
+    /// y component, same space as [`x`](Self::x).
     pub y: f32,
+    /// z component, same space as [`x`](Self::x).
     pub z: f32,
 }
 
@@ -64,8 +69,15 @@ pub struct Hinge {
     pub p: [Point3; 2],
     /// Rotation axes — same convention as `p`.
     pub v: [Point3; 2],
+    /// Lower hinge-angle limit, in the same angle units as `frmval`
+    /// (65536 units = one full turn, so the i16 range spans −π..π).
+    /// Preserved for round-trip; the roxlap solver doesn't clamp.
     pub vmin: i16,
+    /// Upper hinge-angle limit — see [`vmin`](Self::vmin).
     pub vmax: i16,
+    /// Hinge type byte (voxlap `hingetype.htype`). The solver applies
+    /// the animated transform only for `htype == 0`; any other value
+    /// means "no rotation" (the bone stays at its rest pose).
     pub htype: u8,
     /// Trailing 7 bytes of padding inside the on-disk struct. Stored
     /// verbatim so byte-equal round-trip survives — files in the wild
@@ -76,7 +88,12 @@ pub struct Hinge {
 /// One animation sequence entry (`seqtyp` in voxlaptest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Seq {
+    /// Absolute keyframe timestamp in milliseconds on the animation
+    /// clock (`seqtyp.tim`); entries are ascending.
     pub tim: i32,
+    /// Frame index into `frmval`, or a negative `!target`
+    /// (bitwise-NOT) encoding a jump/loop to sequence entry `target`
+    /// (`seqtyp.frm`).
     pub frm: i32,
 }
 
@@ -87,10 +104,14 @@ pub struct Kfa {
     /// Associated `.kv6` filename (raw bytes, no NUL terminator). Voxlap
     /// uses this to locate the rigged kv6 model.
     pub kv6_name: Vec<u8>,
+    /// Hinge table, in file order. Index here is the hinge index that
+    /// `frmval` columns and [`Hinge::parent`] refer to.
     pub hinges: Vec<Hinge>,
     /// `frmval[frame_idx][hinge_idx]` — outer length is `numfrm`,
     /// inner length must equal `hinges.len()` for every frame.
     pub frmval: Vec<Vec<i16>>,
+    /// Animation sequence — ordered `(tim, frm)` keyframe entries (see
+    /// [`Seq`]).
     pub seq: Vec<Seq>,
 }
 
@@ -98,22 +119,41 @@ pub struct Kfa {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// First 4 bytes are not the `0x6b6c774b` magic.
-    BadMagic { got: u32 },
+    BadMagic {
+        /// The u32 actually found.
+        got: u32,
+    },
     /// A read of `need` bytes at offset `at` would run past EOF.
-    Truncated { at: usize, need: usize },
+    Truncated {
+        /// Byte offset of the failed read.
+        at: usize,
+        /// Number of bytes the read required.
+        need: usize,
+    },
     /// QE.6b — a hinge whose `parent` is neither `-1` (root) nor a
     /// valid hinge index. Pre-QE.6 this panicked out-of-bounds later,
     /// in `sort_hinges`.
-    BadHingeParent { hinge: usize, parent: i32 },
+    BadHingeParent {
+        /// Index of the offending hinge.
+        hinge: usize,
+        /// The out-of-range parent value it declared.
+        parent: i32,
+    },
     /// QE.6b — the hinge parent links contain a cycle. Pre-QE.6 this
     /// hung the loader forever (the topological solve in
     /// `sort_hinges` never converged).
-    HingeCycle { hinge: usize },
+    HingeCycle {
+        /// A hinge on the unresolvable cycle.
+        hinge: usize,
+    },
     /// Fuzz finding — a non-zero frame count on a zero-hinge rig: a
     /// frame row stores 2 bytes per hinge, so zero-hinge rows consume
     /// no input, no read can fail `Truncated`, and a crafted count
     /// looped/allocated unboundedly (OOM pre-fix).
-    FramesWithoutHinges { numfrm: usize },
+    FramesWithoutHinges {
+        /// The declared frame count.
+        numfrm: usize,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -383,7 +423,11 @@ pub struct KfaSprite {
     /// World-space basis for the root limb. Mirror of
     /// `vx5sprite.{s, h, f}` for the root.
     pub s: [f32; 3],
+    /// World-space "height" (down) axis of the root basis — the `h` of
+    /// `vx5sprite.{s, h, f}`.
     pub h: [f32; 3],
+    /// World-space forward axis of the root basis — the `f` of
+    /// `vx5sprite.{s, h, f}`.
     pub f: [f32; 3],
     /// Animation keyframe table — `frmval[frame][hinge]` local transforms.
     /// Empty until [`Self::set_animation`]; an empty table makes

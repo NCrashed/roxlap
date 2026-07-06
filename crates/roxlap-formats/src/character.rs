@@ -113,6 +113,8 @@ pub struct Character {
 /// the identity offset.
 #[derive(Debug, Clone)]
 pub struct Bone {
+    /// Human-facing bone name (e.g. `"hand_l"`). May be empty; not
+    /// required to be unique.
     pub name: String,
     /// What this bone draws (see [`Attachment`]). May be empty (a pure
     /// transform bone).
@@ -195,7 +197,11 @@ pub enum MeshRef {
 /// One named animation clip.
 #[derive(Debug, Clone)]
 pub struct Clip {
+    /// Clip name the host plays it by (e.g. `"walk"`, `"idle"`). May
+    /// be empty; not required to be unique.
     pub name: String,
+    /// The keyframe payload (or an unknown-kind blob kept for
+    /// round-trip) — see [`ClipData`].
     pub data: ClipData,
 }
 
@@ -207,23 +213,40 @@ pub enum ClipData {
     /// the inner length equals [`Character::bones`]`.len()`. `seq` matches
     /// [`Kfa::seq`](crate::kfa::Kfa::seq).
     Skeletal {
+        /// Keyframe table: `frmval[frame][bone]` local TRS; every inner
+        /// row has exactly `Character::bones.len()` entries.
         frmval: Vec<Vec<BoneXform>>,
+        /// Playback sequence — `(tim, frm)` entries, same semantics as
+        /// [`Kfa::seq`](crate::kfa::Kfa::seq).
         seq: Vec<Seq>,
     },
     /// A clip `kind` this build doesn't model — preserved verbatim so it
     /// survives a load/save cycle.
-    Unknown { kind: u16, bytes: Vec<u8> },
+    Unknown {
+        /// The on-disk `kind` discriminant that wasn't recognised.
+        kind: u16,
+        /// The clip's raw payload bytes, kept for byte-exact re-save.
+        bytes: Vec<u8>,
+    },
 }
 
 /// Errors returned by [`parse`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// First 4 bytes are not the `b"RKCH"` magic.
-    BadMagic { got: [u8; 4] },
+    BadMagic {
+        /// The 4 bytes actually found.
+        got: [u8; 4],
+    },
     /// `version` field is not one this build understands.
     UnsupportedVersion(u16),
     /// A sequential read ran past EOF.
-    Truncated { at: usize, need: usize },
+    Truncated {
+        /// Byte offset of the failed read.
+        at: usize,
+        /// Number of bytes the read required.
+        need: usize,
+    },
     /// A bone references a `mesh_kind` this build can't render. Hard
     /// error — you can't render what you can't decode.
     UnsupportedMeshKind(u16),

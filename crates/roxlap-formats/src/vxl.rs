@@ -1180,26 +1180,55 @@ fn ensure_capacity(tbuf: &mut Vec<u8>, len_inclusive: usize) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// File too small to even contain the 108-byte header.
-    TooSmall { got: usize },
+    TooSmall {
+        /// Actual file size in bytes.
+        got: usize,
+    },
     /// Magic bytes are not `0x09072000`.
-    BadMagic { got: u32 },
+    BadMagic {
+        /// The u32 actually found.
+        got: u32,
+    },
     /// xdim and ydim disagree (file format requires square maps).
-    NonSquareVsid { x: u32, y: u32 },
+    NonSquareVsid {
+        /// Declared x dimension, in voxels.
+        x: u32,
+        /// Declared y dimension, in voxels.
+        y: u32,
+    },
     /// A read of `need` bytes at offset `at` would run past EOF.
-    Truncated { at: usize, need: usize },
+    Truncated {
+        /// Byte offset of the failed read.
+        at: usize,
+        /// Number of bytes the read required.
+        need: usize,
+    },
     /// While walking column `idx`'s slab chain, the cursor at offset
     /// `at` would have run past the end of the column data region.
-    BadColumn { idx: u32, at: usize },
+    BadColumn {
+        /// Column index (`x + y * vsid`).
+        idx: u32,
+        /// Byte offset (within the column data region) that overran.
+        at: usize,
+    },
     /// File total size > `u32::MAX`. The internal `column_offset`
     /// table uses `u32` because realistic maps fit comfortably.
-    FileTooLarge { got: usize },
+    FileTooLarge {
+        /// Actual file size in bytes.
+        got: usize,
+    },
     /// A `vsid` whose column table cannot fit the file: every column
     /// needs at least a 4-byte slab header, so `vsid²` is bounded by
     /// the column-data size. Also rejects `vsid == 0` and a `vsid²`
     /// that overflows `usize` (32-bit targets). Fuzz finding — a
     /// crafted vsid previously allocation-bombed the offset table
     /// (`vsid²` u32s reserved before any data validation).
-    BadVsid { vsid: u32, data_len: usize },
+    BadVsid {
+        /// The declared map side length, in voxels.
+        vsid: u32,
+        /// Size of the column-data region actually present, in bytes.
+        data_len: usize,
+    },
 }
 
 impl fmt::Display for ParseError {

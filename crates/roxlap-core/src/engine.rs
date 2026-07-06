@@ -97,10 +97,14 @@ impl Engine {
         Self::default()
     }
 
+    /// Set the camera pose (position + right/down/forward basis) the
+    /// next [`render`](Self::render) uses.
     pub fn set_camera(&mut self, camera: Camera) {
         self.camera = camera;
     }
 
+    /// The current camera pose (a copy — mutate via
+    /// [`set_camera`](Self::set_camera)).
     #[must_use]
     pub fn camera(&self) -> Camera {
         self.camera
@@ -114,6 +118,9 @@ impl Engine {
         self.sky_color = color;
     }
 
+    /// The current sky / background colour, `0xAARRGGBB` with the
+    /// voxlap-style brightness byte (see
+    /// [`set_sky_color`](Self::set_sky_color)).
     #[must_use]
     pub fn sky_color(&self) -> u32 {
         self.sky_color
@@ -129,11 +136,15 @@ impl Engine {
         self.fog_max_scan_dist = max_scan_dist.max(0);
     }
 
+    /// The fog colour set by [`set_fog`](Self::set_fog). Only the low
+    /// 24 RGB bits are blended toward; the alpha byte is ignored.
     #[must_use]
     pub fn fog_color(&self) -> u32 {
         self.fog_color
     }
 
+    /// Distance (PREC-scaled cells, voxlap's `vx5.maxscandist`) at
+    /// which fog reaches full opacity. `0` ⇒ fog disabled.
     #[must_use]
     pub fn fog_max_scan_dist(&self) -> i32 {
         self.fog_max_scan_dist
@@ -149,6 +160,10 @@ impl Engine {
         self.side_shades = [top, bot, left, right, up, down];
     }
 
+    /// The per-side darkening intensities in
+    /// `[top, bot, left, right, up, down]` order (see
+    /// [`set_side_shades`](Self::set_side_shades)). All-zero ⇒ shading
+    /// off.
     #[must_use]
     pub fn side_shades(&self) -> [i8; 6] {
         self.side_shades
@@ -161,6 +176,9 @@ impl Engine {
         self.kv6col = color;
     }
 
+    /// The current sprite material colour — voxlap's `vx5.kv6col`
+    /// (see [`set_kv6col`](Self::set_kv6col)). Defaults to
+    /// [`DEFAULT_KV6COL`].
     #[must_use]
     pub fn kv6col(&self) -> u32 {
         self.kv6col
@@ -173,6 +191,8 @@ impl Engine {
         self.lightmode = mode;
     }
 
+    /// The current sprite lighting mode — voxlap's `vx5.lightmode`
+    /// (see [`set_lightmode`](Self::set_lightmode) for the values).
     #[must_use]
     pub fn lightmode(&self) -> u32 {
         self.lightmode
@@ -185,10 +205,17 @@ impl Engine {
         self.lights.push(light);
     }
 
+    /// Remove every light source — voxlap's `vx5.numlights = 0`.
+    /// Typical per-frame pattern: clear, then re-[`add_light`]
+    /// whatever is active this frame.
+    ///
+    /// [`add_light`]: Self::add_light
     pub fn clear_lights(&mut self) {
         self.lights.clear();
     }
 
+    /// The active point lights, in [`add_light`](Self::add_light)
+    /// insertion order (voxlap's `vx5.lightsrc[0..numlights]`).
     #[must_use]
     pub fn lights(&self) -> &[LightSrc] {
         &self.lights
@@ -200,6 +227,8 @@ impl Engine {
         self.sky = sky;
     }
 
+    /// The current sky texture, if one is loaded (see
+    /// [`set_sky`](Self::set_sky)). `None` ⇒ the solid-fill sky path.
     #[must_use]
     pub fn sky(&self) -> Option<&Sky> {
         self.sky.as_ref()

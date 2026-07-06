@@ -9,8 +9,11 @@
 /// A 6-bit-per-channel palette entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rgb6 {
+    /// Red component, `0..=63` (6 significant bits).
     pub r: u8,
+    /// Green component, `0..=63` (6 significant bits).
     pub g: u8,
+    /// Blue component, `0..=63` (6 significant bits).
     pub b: u8,
 }
 

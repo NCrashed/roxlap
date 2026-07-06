@@ -20,7 +20,10 @@
 /// absolute screen coords, only the viewport edges shrink.
 #[derive(Debug, Clone, Copy)]
 pub struct OpticastSettings {
+    /// Framebuffer width in pixels. The projection centre and the
+    /// strip / band bounds below are all in this full-frame space.
     pub xres: u32,
+    /// Framebuffer height in pixels.
     pub yres: u32,
     /// First y-row this render call covers (inclusive). `0` for
     /// full-frame.
@@ -35,12 +38,41 @@ pub struct OpticastSettings {
     pub x_start: u32,
     /// One past the last x-column (exclusive). `xres` for full-frame.
     pub x_end: u32,
+    /// Projection-centre x in pixels (the voxlap `setcamera` `dahx`).
+    /// `xres / 2` for a centred view; stays in absolute screen coords
+    /// even when a strip sub-range is set.
     pub hx: f32,
+    /// Projection-centre y in pixels (the voxlap `dahy`). `yres / 2`
+    /// for a centred view.
     pub hy: f32,
+    /// Focal length in pixels (the voxlap `dahz`): pixel `(px, py)`
+    /// casts along `(px−hx)·right + (py−hy)·down + hz·forward`, so the
+    /// vertical field of view is `2·atan(yres/2 / hz)` and
+    /// `hz = xres/2` gives 90° horizontal.
     pub hz: f32,
+    /// Voxlap's `anginc` — the deleted opticast's per-column angle
+    /// step (`1` = one ray per pixel column). The per-pixel DDA casts
+    /// every pixel regardless; today the value survives only as the
+    /// `anginc + 1` viewport padding in `roxlap-scene`'s screen-rect
+    /// cull. Leave at the default `1`.
     pub anginc: f32,
+    /// Depth of the distance-mip ladder: how many mip levels the
+    /// renderer may sample, `1` = mip-0 only (level `n` is `2ⁿ`×
+    /// coarser per axis). Also the clamp ceiling for the per-grid LOD
+    /// overrides (`LodThresholds::mid_mip_levels`,
+    /// `Grid::mip_levels_override` in `roxlap-scene`). The demos run 6.
     pub mip_levels: u32,
+    /// Mip-transition distance in voxels: rays step through
+    /// progressively coarser mips beyond it, so scan distance costs
+    /// roughly logarithmically instead of linearly. Smaller ⇒ coarser
+    /// sooner. The demos run 64; per-grid Mid-LOD overrides may only
+    /// shrink it (`min`, never extend).
     pub mip_scan_dist: i32,
+    /// Hard ray-length cap in voxels (voxlap's `vx5.maxscandist`): the
+    /// march gives up (sky / fog) past it, and `roxlap-scene` skips
+    /// whole grids entirely outside this radius. Floored at 1
+    /// downstream; pair with the fog distance so the cutoff reads as
+    /// atmosphere instead of a wall.
     pub max_scan_dist: i32,
 }
 

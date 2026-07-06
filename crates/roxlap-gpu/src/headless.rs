@@ -14,8 +14,13 @@ use crate::{GpuInitError, GpuRendererSettings, PowerPreference};
 /// Bare wgpu device + queue with no surface. Suitable for
 /// `wgpu::ComputePass` work that doesn't present.
 pub struct HeadlessGpu {
+    /// The wgpu device — create buffers/pipelines against this exactly
+    /// as with the windowed renderer's device.
     pub device: wgpu::Device,
+    /// The device's submission queue for uploads + compute dispatches.
     pub queue: wgpu::Queue,
+    /// Human-readable adapter description
+    /// (`"name (backend, device_type)"`) for logs and test skips.
     pub adapter_info: String,
 }
 

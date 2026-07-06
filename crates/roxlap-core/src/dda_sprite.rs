@@ -334,6 +334,8 @@ pub struct SpriteOccluder {
 }
 
 impl SpriteOccluder {
+    /// An empty occluder (casts nothing). Add sprite volumes with
+    /// [`push`](Self::push).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -540,6 +542,11 @@ pub enum SpriteLightMode {
 }
 
 impl SpriteLightMode {
+    /// Decode the mode from a sprite instance's `flags` word (bits
+    /// 6/7 — `SPRITE_FLAG_LIGHT_WORLD_UP` /
+    /// `SPRITE_FLAG_LIGHT_AMBIENT_ONLY`). Neither bit ⇒
+    /// [`FaceNormal`](Self::FaceNormal) (the default); both ⇒
+    /// [`FullBright`](Self::FullBright).
     #[must_use]
     pub fn from_flags(flags: u32) -> Self {
         let world_up = flags & SPRITE_FLAG_LIGHT_WORLD_UP != 0;
@@ -1255,6 +1262,8 @@ impl ClipFlipbook {
         Self { frames }
     }
 
+    /// Number of cached frames. `0` for a tombstone from
+    /// [`empty`](Self::empty).
     #[must_use]
     pub fn frame_count(&self) -> usize {
         self.frames.len()

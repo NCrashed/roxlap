@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: workspace-wide `missing_docs` (QE.0 debt paid)
+
+- The ~260 undocumented public items left in `roxlap-formats` /
+  `roxlap-core` / `roxlap-gpu` (mostly voxlap-parity struct fields
+  and GPU-mirror layouts) now carry real rustdoc — meaning, units,
+  packing, sentinels — written from their read sites (WGSL shaders
+  included), not from their names.
+- `missing_docs = "warn"` moved from per-crate attributes into
+  `[workspace.lints.rust]`: with CI's `-D warnings`, every new public
+  item in any library crate must be documented to build.
+
 ### Changed: the colour family — `VoxColor` / `Rgb` / `OverlayColor` newtypes (QE-B6, breaking)
 
 - Every public colour parameter that used to be a bare `u32` (or

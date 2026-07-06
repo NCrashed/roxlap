@@ -91,6 +91,10 @@ pub struct CpuPointLight {
     pub pos: [f32; 3],
     /// Linear RGB, 0..1.
     pub color: [f32; 3],
+    /// Scalar multiplier on `color` — the light's contribution is
+    /// `albedo · color · intensity · N·L · falloff` per channel.
+    /// `1.0` is nominal; values above it over-drive (the sum clamps at
+    /// pack time).
     pub intensity: f32,
     /// Hard cutoff distance (world/voxel units).
     pub radius: f32,
@@ -123,7 +127,10 @@ pub struct CpuLights<'a> {
     pub sun: bool,
     /// Grid-local unit direction **to** the sun.
     pub sun_dir: [f32; 3],
+    /// Sun colour, linear RGB 0..1.
     pub sun_color: [f32; 3],
+    /// Scalar multiplier on `sun_color` (the sun term is
+    /// `albedo · sun_color · sun_intensity · key`). `1.0` is nominal.
     pub sun_intensity: f32,
     /// CPU.2 — whether the sun casts a hard shadow.
     pub sun_casts_shadow: bool,
@@ -350,6 +357,9 @@ pub(crate) trait ShadowTester {
 /// rayon strip workers in [`render_dda_parallel`]; the occluder is a
 /// read-only borrow of the scene, so this holds.
 pub trait WorldOccluder: Sync {
+    /// `true` iff any solid voxel in the scene blocks the segment from
+    /// world-space `origin` in unit direction `dir` within `max_t`
+    /// world voxel units.
     fn occluded_world(&self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool;
 }
 
@@ -361,8 +371,16 @@ pub trait WorldOccluder: Sync {
 /// grid's world origin.
 #[derive(Clone, Copy)]
 pub struct WorldShadowCtx<'a> {
+    /// The scene-wide occlusion oracle every lifted shadow ray is
+    /// tested against.
     pub occluder: &'a dyn WorldOccluder,
+    /// The current grid's world-space origin — the translation part of
+    /// its local→world transform (added to rotated positions;
+    /// directions skip it).
     pub origin: [f32; 3],
+    /// Columns of the grid's local→world rotation: `cols[i]` is the
+    /// world-space image of grid-local axis `i`. Assumed orthonormal
+    /// so grid-local ray lengths equal world lengths.
     pub cols: [[f32; 3]; 3],
 }
 
@@ -383,7 +401,9 @@ impl<'a> WorldShadowCtx<'a> {
 /// the sprite occluder), so a single shadow query covers both. `true` if
 /// either blocks the ray.
 pub struct CompositeOccluder<'a> {
+    /// First occluder — queried first (short-circuits `b` on a hit).
     pub a: &'a dyn WorldOccluder,
+    /// Second occluder — queried only when `a` reports no hit.
     pub b: &'a dyn WorldOccluder,
 }
 
@@ -957,6 +977,8 @@ pub struct BrickCache {
 }
 
 impl BrickCache {
+    /// An empty cache (same as [`Default`]). Entries appear via
+    /// [`ensure`](Self::ensure) as chunks are first rendered.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

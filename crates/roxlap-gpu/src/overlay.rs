@@ -22,10 +22,19 @@ use crate::GpuRenderer;
 /// segment behind nearer marched geometry.
 #[derive(Clone, Copy, Debug)]
 pub struct GpuLine {
+    /// First endpoint, world voxel units.
     pub a: [f32; 3],
+    /// Second endpoint, world voxel units.
     pub b: [f32; 3],
+    /// Straight (non-premultiplied) RGBA, each channel `0..=1`; alpha
+    /// drives the over-blend onto the frame.
     pub color: [f32; 4],
+    /// Screen-space line thickness in pixels; values below `1.0` are
+    /// clamped up to 1 px.
     pub width_px: f32,
+    /// `true` ⇒ fragments behind nearer marched scene geometry are
+    /// discarded (with a small bias so surface-hugging lines don't
+    /// z-fight); `false` ⇒ always drawn on top.
     pub depth_test: bool,
 }
 
@@ -34,9 +43,15 @@ pub struct GpuLine {
 /// orthonormal, `pos` in world voxel units).
 #[derive(Clone, Copy, Debug)]
 pub struct GpuLineCamera {
+    /// Eye position in world voxel units.
     pub pos: [f32; 3],
+    /// Unit basis toward screen-right (must match the scene camera's
+    /// right-handed `right × down == forward` basis).
     pub right: [f32; 3],
+    /// Unit basis toward screen-down (+z is down in voxlap space).
     pub down: [f32; 3],
+    /// Unit view direction; endpoints with a forward component below
+    /// the near plane are clipped before projection.
     pub forward: [f32; 3],
 }
 
@@ -205,9 +220,20 @@ fn build_line_vertices(
 /// culling, so this is pure geometry.
 #[derive(Clone, Copy, Debug)]
 pub struct GpuImageQuad {
+    /// The four world-space corner points in `TL, TR, BL, BR` order
+    /// (voxel units), mapping to UVs `(0,0) (1,0) (0,1) (1,1)`. Need
+    /// not be planar-axis-aligned; the quad is split into two
+    /// perspective-correct triangles.
     pub corners: [[f32; 3]; 4],
+    /// Texture handle returned by [`GpuRenderer::upload_image`].
+    /// Quads referencing an id that was never uploaded are skipped.
     pub image: usize,
+    /// Straight RGBA multiplier `0..=1` applied to every texel
+    /// (`[1.0; 4]` = untinted); the combined alpha drives the
+    /// over-blend.
     pub tint: [f32; 4],
+    /// `true` ⇒ fragments behind nearer marched scene geometry are
+    /// discarded; `false` ⇒ always drawn on top.
     pub depth_test: bool,
     /// Texels with alpha below this (`0..=1`) are discarded in the FS.
     /// `0.0` keeps the plain over-blend.

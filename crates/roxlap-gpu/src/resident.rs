@@ -30,12 +30,28 @@ struct ProbeUniform {
 /// GPU-side storage for one decompressed chunk. Owns its buffers;
 /// dropping releases them.
 pub struct GpuChunkResident {
+    /// XY extent of the chunk in voxels (typically 128). Copied from
+    /// [`ChunkUpload::vsid`]; the probe shader needs it to index columns.
     pub vsid: u32,
+    /// Storage buffer holding [`ChunkUpload::occupancy`]: 1 bit per
+    /// voxel, `bit(x, y, z) = (word[i >> 5] >> (i & 31)) & 1` with
+    /// `i = x + y*vsid + z*vsid*vsid`.
     pub occupancy: wgpu::Buffer,
+    /// Storage buffer holding [`ChunkUpload::color_offsets`]:
+    /// `vsid² + 1` u32s; column `(x, y)`'s colours span
+    /// `colors[offsets[x + y*vsid] .. offsets[x + y*vsid + 1]]`.
     pub color_offsets: wgpu::Buffer,
+    /// Storage buffer holding [`ChunkUpload::colors`]: one packed u32
+    /// per solid voxel in ascending-z column order — voxlap wire format
+    /// (blue in bits 0-7, green 8-15, red 16-23, brightness 24-31 with
+    /// `0x80` = neutral).
     pub colors: wgpu::Buffer,
+    /// Size of [`Self::occupancy`] in bytes (word count × 4), for
+    /// memory accounting.
     pub occupancy_bytes: u64,
+    /// Size of [`Self::color_offsets`] in bytes.
     pub color_offsets_bytes: u64,
+    /// Size of [`Self::colors`] in bytes.
     pub colors_bytes: u64,
 
     // Debug-read scaffolding. In GPU.3+ the main render shader

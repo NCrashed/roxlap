@@ -36,10 +36,6 @@
 //!
 //! [`parse`]: roxlap_formats::vxl::parse
 
-// QE.0 — the scene crate's public surface is fully documented; keep it
-// that way (CI's `-D warnings` turns this into a hard gate).
-#![warn(missing_docs)]
-
 pub mod addr;
 pub mod billboard;
 pub mod cavegen;

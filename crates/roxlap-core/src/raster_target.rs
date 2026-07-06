@@ -20,6 +20,12 @@
 
 use std::marker::PhantomData;
 
+/// A `Copy`-able raw-pointer view over a borrowed `(framebuffer,
+/// zbuffer)` pair. Mint one via [`RasterTarget::new`] — the lifetime
+/// `'a` pins the source slices' exclusive borrows for as long as any
+/// copy lives. Copies handed to multiple threads must write
+/// pairwise-disjoint pixel indices (see the module docs for the full
+/// safety contract).
 #[derive(Clone, Copy, Debug)]
 pub struct RasterTarget<'a> {
     fb_ptr: *mut u32,

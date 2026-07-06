@@ -13,10 +13,22 @@
 /// (`std::f32::consts::FRAC_PI_3`).
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
+    /// Eye position in world voxel units (1 voxel = 1 world unit).
     pub position: [f32; 3],
+    /// Unit basis vector toward screen-right. Must satisfy
+    /// `right × down == forward` (right-handed) or frustum culling
+    /// silently rejects sprites.
     pub right: [f32; 3],
+    /// Unit basis vector toward screen-down. In the voxlap convention
+    /// +z points down (z = 0 sky, z = 255 bedrock), so a level camera
+    /// has `down = [0, 0, 1]`.
     pub down: [f32; 3],
+    /// Unit view direction (into the screen); the third leg of the
+    /// right-handed `right`/`down`/`forward` basis.
     pub forward: [f32; 3],
+    /// Vertical field of view in radians, `(0, π)`. Default is
+    /// `FRAC_PI_3` (≈60°, voxlap's default); the horizontal FOV
+    /// follows from the render aspect ratio.
     pub fov_y_rad: f32,
 }
 

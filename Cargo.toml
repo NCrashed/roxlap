@@ -94,11 +94,10 @@ log = "0.4"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
-# QE.0: `missing_docs` is enabled per-crate (`#![warn(missing_docs)]`
-# in roxlap-scene + roxlap-render, the two crates a game host reads
-# first). Workspace-wide enablement is owed once roxlap-gpu /
-# roxlap-formats / roxlap-core document their remaining struct fields
-# (~250 items, mostly voxlap-parity field names).
+# QE.0 debt paid 2026-07-06: every library crate documents its public
+# surface, so the lint is workspace-wide (CI's `-D warnings` makes it
+# a hard gate for new API).
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -84,6 +84,10 @@ use shader_src::{scene_shader_source, sprite_shader_source};
 /// measure the FPS ceiling.
 #[derive(Debug, Clone, Copy)]
 pub struct GpuRendererSettings {
+    /// Which adapter class to request from wgpu. [`PowerPreference::High`]
+    /// (the default) picks the discrete GPU on hybrid systems;
+    /// [`PowerPreference::Low`] the integrated/software one (the
+    /// `ROXLAP_GPU_POWER=low` escape hatch).
     pub power_preference: PowerPreference,
     /// Initial clear colour cycled by GPU.1's empty render path.
     /// The voxel-rendering substages overwrite this entirely.
@@ -93,9 +97,14 @@ pub struct GpuRendererSettings {
     pub uncapped_present: bool,
 }
 
+/// Adapter power class requested at init — mirrors
+/// `wgpu::PowerPreference` without leaking the wgpu type into host
+/// signatures.
 #[derive(Debug, Clone, Copy)]
 pub enum PowerPreference {
+    /// Prefer the low-power adapter (integrated / software rasterizer).
     Low,
+    /// Prefer the highest-performance adapter (discrete GPU). The default.
     High,
 }
 
@@ -113,8 +122,14 @@ impl Default for GpuRendererSettings {
 /// expected flow is "try this, fall back to the CPU path on Err".
 #[derive(Debug)]
 pub enum GpuInitError {
+    /// Creating the presentation surface from the host's raw window
+    /// handle failed (headless init never returns this).
     CreateSurface(wgpu::CreateSurfaceError),
+    /// No compatible adapter — typically no Vulkan/Metal/DX12 driver on
+    /// the system.
     NoAdapter,
+    /// The adapter refused the device request (e.g. the required
+    /// storage-buffer limits exceed what it supports).
     RequestDevice(wgpu::RequestDeviceError),
 }
 
@@ -158,7 +173,13 @@ impl From<wgpu::RequestDeviceError> for GpuInitError {
 /// `2`=blue-noise (IGN). Mirror of `roxlap_render::PosterizeConfig`.
 #[derive(Clone, Copy, Debug)]
 pub struct PosterizeGpu {
+    /// Quantization levels per RGB channel (`[r, g, b]`). `n >= 2`
+    /// snaps that channel to `n` output values; `0` or `1` leaves the
+    /// channel untouched.
     pub levels: [u32; 3],
+    /// Dither pattern applied before quantization: `0` = none,
+    /// `1` = ordered Bayer 4×4, `2` = blue-noise (interleaved-gradient
+    /// noise). Other values behave as `0`.
     pub dither: u32,
 }
 
@@ -171,7 +192,13 @@ pub enum RenderResolution {
     #[default]
     Native,
     /// Fixed logical grid, nearest-upscaled to the swapchain.
-    Fixed { w: u32, h: u32 },
+    Fixed {
+        /// Logical render width in pixels (min 1; independent of the
+        /// swapchain width).
+        w: u32,
+        /// Logical render height in pixels (min 1).
+        h: u32,
+    },
     /// Logical = `round(swapchain * factor)`, clamped to `>= 1px`.
     Scale(f32),
 }
@@ -196,6 +223,16 @@ impl RenderResolution {
     }
 }
 
+/// WGPU-backed renderer bound to a host window: owns the device,
+/// queue, surface, and every lazily-built pass (multi-grid scene DDA,
+/// sprite DDA, resolve/posterize, overlays, egui HUD).
+/// [`Self::render_scene`] marches the frame; [`Self::present`] shows
+/// it. Construct with [`Self::new`] / [`Self::new_blocking`] and fall
+/// back to the CPU path on error.
+///
+/// The window handle is consumed only at construction — wgpu's
+/// `Surface<'static>` keeps its own `Arc` clone, so the renderer holds
+/// no window field of its own.
 #[allow(clippy::struct_excessive_bools)] // independent per-frame flags, not a state enum
 pub struct GpuRenderer {
     surface: wgpu::Surface<'static>,
@@ -837,7 +874,11 @@ impl SceneDdaPerGridCamera {
 /// handed to `SceneRenderer::render_scene` alongside the per-grid cameras.
 #[derive(Clone, Copy)]
 pub struct GridWorldTransform {
+    /// World position of the grid's local origin, voxel units.
     pub origin: [f32; 3],
+    /// Local→world rotation as columns: `rot_cols[i]` is the world
+    /// image of grid-local axis `i` (unit vectors for a pure rotation).
+    /// Identity for an unrotated grid.
     pub rot_cols: [[f32; 3]; 3],
 }
 
@@ -2578,26 +2619,6 @@ impl GpuRenderer {
             .and_then(|reg| reg.remove_instance(index))
     }
 
-    /// Incrementally add a new model (its full LOD chain) to the resident
-    /// sprite registry **without** re-uploading the existing models — the
-    /// counterpart to [`Self::append_sprite_instances`] for streaming in
-    /// new geometry (unique asteroids, generated meshes).
-    ///
-    /// Usage mirrors `update_sprite_model`: you own the
-    /// [`SpriteModelRegistry`], append
-    /// the model with [`add_lod`](sprite_model::SpriteModelRegistry::add_lod)
-    /// (or `add`), then pass the returned `chain_id` here to sync that one
-    /// chain to the GPU. Afterwards [`Self::append_sprite_instances`] may
-    /// reference it.
-    ///
-    /// If no registry is resident yet, this performs the initial full
-    /// upload of `registry` (all its current models, zero instances) to
-    /// establish residency — so call it for your *first* model; only
-    /// chains appended *after* residency exists are added incrementally.
-    ///
-    /// Cost is amortised O(new model voxels): the shared volume buffers
-    /// carry slack and bump-append, growing (and rebuilding once from the
-    /// registry) only on overflow.
     /// Flush queued `write_buffer` uploads by submitting an empty command
     /// stream. wgpu stages `write_buffer` data and flushes it on the next
     /// `Queue::submit`; calling this between batches of uploads (e.g. a
@@ -2608,6 +2629,18 @@ impl GpuRenderer {
         self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
     }
 
+    /// Incrementally add model `chain_id` (its full LOD chain) from
+    /// `registry` to the resident sprite registry **without**
+    /// re-uploading the existing models — the streaming-in counterpart
+    /// to [`Self::append_sprite_instances`]. Register the model on the
+    /// CPU registry first (`add` / `add_lod`), then pass the returned
+    /// `chain_id` here; afterwards instances may reference it.
+    ///
+    /// If no registry is resident yet, this instead performs the
+    /// initial full upload of `registry` (all current models, zero
+    /// instances) to establish residency. Cost is amortised O(new
+    /// model voxels): the shared volume buffers carry slack and
+    /// bump-append, rebuilding from the registry only on overflow.
     pub fn add_sprite_model(
         &mut self,
         registry: &sprite_model::SpriteModelRegistry,

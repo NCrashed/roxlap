@@ -81,7 +81,12 @@ pub enum GifImportError {
     /// No frames decoded (empty / zero-sized GIF).
     Empty,
     /// The slab bounding box exceeds [`GifImportOpts::max_dims`].
-    TooLarge { dims: [u32; 3], max: [u32; 3] },
+    TooLarge {
+        /// The would-be slab dimensions, in voxels (x, y, z).
+        dims: [u32; 3],
+        /// The configured [`GifImportOpts::max_dims`] cap it exceeded.
+        max: [u32; 3],
+    },
 }
 
 impl core::fmt::Display for GifImportError {

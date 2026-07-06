@@ -51,13 +51,19 @@ pub struct Slab {
 /// [`serialize`].
 #[derive(Debug, Clone)]
 pub struct Kvx {
+    /// Model extent along x, in voxels.
     pub xsiz: u32,
+    /// Model extent along y, in voxels.
     pub ysiz: u32,
+    /// Model extent along z (vertical), in voxels — Build/voxlap
+    /// convention: z=0 is the model's top.
     pub zsiz: u32,
     /// Pivot point in 8.8 fixed-point voxel units (i.e. divide by 256
     /// to get fractional voxels).
     pub xpivot: u32,
+    /// Pivot y, same 8.8 fixed-point encoding as [`xpivot`](Self::xpivot).
     pub ypivot: u32,
+    /// Pivot z, same 8.8 fixed-point encoding as [`xpivot`](Self::xpivot).
     pub zpivot: u32,
     /// xoffset table, length `xsiz + 1`. Stored verbatim from the file;
     /// not interpreted by this crate beyond round-trip.
@@ -78,16 +84,34 @@ pub struct Kvx {
 pub enum ParseError {
     /// File too small to contain even the 28-byte header + 768-byte
     /// palette.
-    TooSmall { got: usize },
+    TooSmall {
+        /// Actual file size in bytes.
+        got: usize,
+    },
     /// A read of `need` bytes at offset `at` would run past the end of
     /// the buffer.
-    Truncated { at: usize, need: usize },
+    Truncated {
+        /// Byte offset of the failed read.
+        at: usize,
+        /// Number of bytes the read required.
+        need: usize,
+    },
     /// xyoffset values for column `x` are non-monotonic (would imply a
     /// negative slab list length).
-    NonMonotonicOffsets { x: u32, y: u32 },
+    NonMonotonicOffsets {
+        /// x coordinate of the offending column.
+        x: u32,
+        /// y coordinate of the offending column.
+        y: u32,
+    },
     /// A slab record's declared length runs past the end of its
     /// column's slab list.
-    SlabOverrun { x: u32, y: u32 },
+    SlabOverrun {
+        /// x coordinate of the offending column.
+        x: u32,
+        /// y coordinate of the offending column.
+        y: u32,
+    },
 }
 
 impl fmt::Display for ParseError {

@@ -60,6 +60,7 @@ impl Rgb {
     /// The no-op tint.
     pub const WHITE: Self = Self(0x00ff_ffff);
 
+    /// Pack `r`/`g`/`b` into the low 24 bits; the high byte stays zero.
     #[must_use]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self(((r as u32) << 16) | ((g as u32) << 8) | b as u32)
@@ -76,6 +77,8 @@ impl Rgb {
 pub struct OverlayColor(pub u32);
 
 impl OverlayColor {
+    /// Pack an `0xAA_RR_GG_BB` word; `a` is real opacity (`0xff` =
+    /// opaque, `0` = invisible).
     #[must_use]
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self(((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32)

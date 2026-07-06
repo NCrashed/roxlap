@@ -915,9 +915,16 @@ fn wrap_radar(off: usize) -> usize {
 /// offset machinery — not needed here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vspan {
+    /// Full-world column x coordinate, in voxels (`0..vsid`;
+    /// out-of-bounds spans are skipped by [`set_spans`]).
     pub x: u32,
+    /// Full-world column y coordinate, in voxels (`0..vsid`).
     pub y: u32,
+    /// Top of the span (+z points down, so `z0` is the *highest* voxel;
+    /// `z0 <= z1`).
     pub z0: u8,
+    /// Bottom of the span, INCLUSIVE — the edited range is
+    /// `[z0, z1 + 1)`.
     pub z1: u8,
 }
 
@@ -932,7 +939,9 @@ pub struct Vspan {
 /// — the colfunc is consulted for the inserted voxels themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpanOp {
+    /// Flip the listed voxels to air (dig / destroy).
     Carve,
+    /// Flip the listed voxels to solid (build / fill).
     Insert,
 }
 
