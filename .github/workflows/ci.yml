@@ -43,17 +43,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The channel matches crates/roxlap-web/rust-toolchain.toml —
+      # bump both together.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-04-15
           targets: wasm32-unknown-unknown
+          # nightly cargo honours the [unstable] build-std table in
+          # .cargo/config.toml, which rebuilds std from rust-src.
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
       # CC.4 lesson: `roxlap-web` / `roxlap-cave-web` are
       # `#![cfg(target_arch = "wasm32")]` — on native targets their
       # whole body is cfg'd away, so the workspace clippy job only
       # PARSES them and type errors ship silently (the colour-newtype
-      # migration missed both, and nothing noticed). This stable
-      # wasm32 check is the type gate; the threaded trunk build
-      # (nightly + build-std) stays a local concern.
+      # migration missed both, and nothing noticed). This wasm32
+      # check is the type gate. It must run on the SAME pinned
+      # nightly as the web crates' rust-toolchain.toml: stable rustc
+      # applies unstable target features to codegen but does NOT
+      # reflect them in cfg(target_feature = ...), so
+      # wasm-bindgen-rayon's atomics compile_error! fires on stable
+      # no matter what RUSTFLAGS say. (Full linking/build-std still
+      # stays a local trunk concern — this job only type-checks.)
       - run: cargo check -p roxlap-web -p roxlap-cave-web --target wasm32-unknown-unknown
         env:
           # The workflow-global RUSTFLAGS env OVERRIDES
