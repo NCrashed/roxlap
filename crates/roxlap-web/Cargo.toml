@@ -26,9 +26,9 @@ crate-type = ["cdylib", "rlib"]
 # roxlap-scene builds the voxel world (Scene + Grid edits); glam types
 # the grid coords. The WebGL2 presenter + opticast call site that used
 # to live here now live inside roxlap-render.
-roxlap-core = { path = "../roxlap-core", version = "0.24" }
-roxlap-render = { path = "../roxlap-render", version = "0.24" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.24" }
+roxlap-core = { path = "../roxlap-core", version = "0.25" }
+roxlap-render = { path = "../roxlap-render", version = "0.25" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.25" }
 glam = { workspace = true }
 
 # wasm-bindgen / web-sys versions pinned to the same major+minor as

@@ -17,8 +17,8 @@ readme.workspace = true
 # snapshot envelope. No CLI-framework dependency — the argument
 # grammar is three subcommands (house style: hand-parsed).
 [dependencies]
-roxlap-formats = { path = "../roxlap-formats", version = "0.24", features = ["gif", "png"] }
-roxlap-scene = { path = "../roxlap-scene", version = "0.24" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.25", features = ["gif", "png"] }
+roxlap-scene = { path = "../roxlap-scene", version = "0.25" }
 # Chunk indices in the `chunks` / `extract` subcommands are IVec3
 # (roxlap-scene's own coordinate type).
 glam = { workspace = true }

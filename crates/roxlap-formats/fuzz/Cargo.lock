@@ -189,14 +189,14 @@ dependencies = [
 
 [[package]]
 name = "roxlap-cavegen"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "roxlap-formats",
 ]
 
 [[package]]
 name = "roxlap-core"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "rayon",
  "roxlap-formats",
@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-formats"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "miniz_oxide",
 ]
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-scene"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "bincode",
  "crossbeam-channel",

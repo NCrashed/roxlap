@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-07-07
+
 ### Added: voxel-aware acoustics — `roxlap-audio` (AU stage)
 
 - New crate `roxlap-audio`: sound that knows about the voxels. The
