@@ -880,9 +880,7 @@ pub(crate) mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             scene.pump_streaming(cam);
-            let idle = scene
-                .grid(grid_id)
-                .map_or(true, |g| g.pending_gen.is_empty());
+            let idle = scene.grid(grid_id).is_none_or(|g| g.pending_gen.is_empty());
             if idle {
                 return;
             }

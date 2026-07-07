@@ -107,7 +107,7 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         // QE.7b - BackendPreference replaces want_gpu; the demos prefer
         // GPU with automatic CPU fallback.
-        let backend = if std::env::var_os("ROXLAP_GPU").map_or(true, |v| v != "0") {
+        let backend = if std::env::var_os("ROXLAP_GPU").is_none_or(|v| v != "0") {
             BackendPreference::PreferGpu
         } else {
             BackendPreference::Cpu

@@ -1013,7 +1013,8 @@ impl VoxelClip {
 
         let mut encoded = Vec::with_capacity(frames.len());
         for (i, frame) in frames.iter().enumerate() {
-            let is_key = i == 0 || (keyframe_interval != 0 && (i as u32) % keyframe_interval == 0);
+            let is_key =
+                i == 0 || (keyframe_interval != 0 && (i as u32).is_multiple_of(keyframe_interval));
             if is_key {
                 encoded.push(EncodedFrame::Key(frame.clone()));
             } else {
@@ -1888,9 +1889,9 @@ mod tests {
     /// import be compared against the all-voxels `frame_from_fn` reference.
     /// Spaced on even coords; the colour encodes `(x, y, z)`.
     fn isolated_fill(x: u32, y: u32, z: u32) -> Option<crate::color::VoxColor> {
-        (x % 2 == 0 && y % 2 == 0 && z % 2 == 0).then_some(crate::color::VoxColor(
-            0x8000_0000 | (x << 16) | (y << 8) | z,
-        ))
+        (x.is_multiple_of(2) && y.is_multiple_of(2) && z.is_multiple_of(2)).then_some(
+            crate::color::VoxColor(0x8000_0000 | (x << 16) | (y << 8) | z),
+        )
     }
 
     #[test]

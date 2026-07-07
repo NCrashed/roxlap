@@ -121,7 +121,7 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
         let size = window.inner_size();
-        let want_gpu = std::env::var_os("ROXLAP_GPU").map_or(true, |v| v != "0");
+        let want_gpu = std::env::var_os("ROXLAP_GPU").is_none_or(|v| v != "0");
 
         // ANCHOR: backend_select
         // PreferGpu tries WGPU and falls back to the CPU renderer with

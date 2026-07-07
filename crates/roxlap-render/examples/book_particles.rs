@@ -154,7 +154,7 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
         let size = window.inner_size();
-        let backend = if std::env::var_os("ROXLAP_GPU").map_or(true, |v| v != "0") {
+        let backend = if std::env::var_os("ROXLAP_GPU").is_none_or(|v| v != "0") {
             BackendPreference::PreferGpu
         } else {
             BackendPreference::Cpu

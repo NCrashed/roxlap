@@ -653,7 +653,7 @@ impl Vxl {
             "voxalloc requires reserve_edit_capacity"
         );
         assert!(
-            n_bytes > 0 && n_bytes % 4 == 0,
+            n_bytes > 0 && n_bytes.is_multiple_of(4),
             "voxalloc n_bytes must be a positive multiple of 4 (got {n_bytes})"
         );
 

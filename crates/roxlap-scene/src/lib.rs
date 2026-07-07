@@ -958,7 +958,7 @@ impl Scene {
             let lo = inv * (origin - grid.transform.origin);
             let ld = inv * dn;
             if let Some((voxel, t)) = voxel_dda(grid, lo, ld, max_dist) {
-                if best.as_ref().map_or(true, |b| t < b.t) {
+                if best.as_ref().is_none_or(|b| t < b.t) {
                     best = Some(RayHit {
                         grid: id,
                         voxel,

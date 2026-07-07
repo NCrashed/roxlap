@@ -1037,7 +1037,7 @@ impl CpuBackend {
                 continue;
             };
             let key = kv6_key(&t.kv6);
-            if slot.as_ref().map_or(true, |e| e.key != key) {
+            if slot.as_ref().is_none_or(|e| e.key != key) {
                 *slot = Some(DenseCacheEntry {
                     key,
                     dense: std::sync::Arc::new(decode_dense(t)),
@@ -1049,7 +1049,7 @@ impl CpuBackend {
         }
         for (slot, limb) in self.limb_dense.iter_mut().zip(&self.kfa_limbs) {
             let key = kv6_key(&limb.kv6);
-            if slot.as_ref().map_or(true, |e| e.key != key) {
+            if slot.as_ref().is_none_or(|e| e.key != key) {
                 *slot = Some(DenseCacheEntry {
                     key,
                     dense: std::sync::Arc::new(decode_dense(limb)),

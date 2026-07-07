@@ -550,7 +550,7 @@ impl GpuBackend {
             // N volumes of `write_buffer`s before the next submit; flush in
             // batches so a big clip (or many at once) can't exhaust it.
             if self.clip_upload_budget != u32::MAX
-                && (frame as u32 + 1) % self.clip_upload_budget == 0
+                && (frame as u32 + 1).is_multiple_of(self.clip_upload_budget)
             {
                 self.gpu.flush_writes();
             }

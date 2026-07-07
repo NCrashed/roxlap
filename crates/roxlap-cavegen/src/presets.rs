@@ -316,7 +316,7 @@ mod tests {
                 i += 2;
             }
             // i+2 entries ≥ sentinel; (i+2)/2 = number of solid runs.
-            total_runs += (i + 2) / 2;
+            total_runs += usize::midpoint(i, 2);
         }
         // 16x16 = 256 columns. Even pathological "every column is one
         // run" would give 256. Cave with carved air gaps should have
@@ -452,7 +452,7 @@ mod tests {
             while b2[i + 1] < MAXZDIM {
                 i += 2;
             }
-            total_runs += (i + 2) / 2;
+            total_runs += usize::midpoint(i, 2);
         }
         assert!(
             total_runs > 256,

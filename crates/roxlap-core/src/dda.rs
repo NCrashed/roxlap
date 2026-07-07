@@ -1001,7 +1001,7 @@ impl BrickCache {
     /// from `view`); rebuilds only when the cached `version` differs.
     pub fn ensure(&mut self, chunk: [i32; 3], mip: u32, version: u64, view: &GridView<'_>) {
         let key = (chunk[0], chunk[1], chunk[2], mip);
-        let stale = self.maps.get(&key).map_or(true, |(v, _)| *v != version);
+        let stale = self.maps.get(&key).is_none_or(|(v, _)| *v != version);
         if stale {
             self.maps.insert(key, (version, BrickMap::build(view, mip)));
         }
