@@ -128,6 +128,14 @@ pub struct GridSnapshot {
     /// QE.5b — [`crate::Grid::stream_radius`].
     #[serde(default)]
     pub stream_radius: StreamRadius,
+    // SC NOTE: per-grid `voxel_world_size` is NOT persisted yet. bincode
+    // is strictly positional (a missing trailing field is
+    // "unexpected end of file", NOT a serde default — the checked-in v1
+    // fixture proves it), so persisting scale needs a real version-2
+    // migration (a v1-shadow deserialize), deferred to a later SC
+    // substage. Until then a scaled grid restores at `voxel_world_size
+    // = 1.0`. The `GridTransform` wire form stays frozen
+    // (`#[serde(skip)]` on the field), so v1 saves load unchanged.
 }
 
 /// `render_sky`'s [`crate::Grid::new`] default, for
@@ -246,6 +254,10 @@ impl Scene {
         let mut scene = Self::new();
         scene.next_grid_id = snap.next_grid_id;
         for (id, gsnap) in &snap.grids {
+            // SC — `transform`'s wire form omits `voxel_world_size`
+            // (`#[serde(skip)]`), so it restores at 1.0 here (snapshot
+            // scale persistence is a deferred substage — see the
+            // GridSnapshot note).
             let mut grid = Grid::new(gsnap.transform);
             for (addr, bytes) in &gsnap.chunks {
                 let mut vxl =
@@ -284,10 +296,17 @@ impl Scene {
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"RXSS";
 
 /// Current snapshot wire version. Bumped whenever the
-/// [`SceneSnapshot`] payload shape changes; [`Scene::load_snapshot`]
-/// dispatches on it, so an old save either loads correctly or fails
-/// with [`SnapshotLoadError::UnsupportedVersion`] — never a silent
-/// misparse (the pre-QE.5 failure mode of bare positional bincode).
+/// [`SceneSnapshot`] payload shape changes in a way `#[serde(default)]`
+/// trailing fields can't cover; [`Scene::load_snapshot`] dispatches on
+/// it, so an old save either loads correctly or fails with
+/// [`SnapshotLoadError::UnsupportedVersion`] — never a silent misparse
+/// (the pre-QE.5 failure mode of bare positional bincode).
+///
+/// SC — per-grid `voxel_world_size` is persisted as a NEW trailing
+/// `#[serde(default)]` field on [`GridSnapshot`] (not inside the
+/// serialized `GridTransform`, whose wire form stays frozen), so old v1
+/// saves still load (their missing field defaults to `1.0`) — no
+/// version bump, the checked-in v1 fixture stays valid.
 pub const SNAPSHOT_VERSION: u32 = 1;
 
 /// Errors from [`Scene::load_snapshot`].
@@ -372,7 +391,7 @@ impl Scene {
             return Err(SnapshotLoadError::BadMagic);
         }
         let version = u32::from_le_bytes(version.try_into().expect("4-byte slice"));
-        if version != 1 {
+        if version != SNAPSHOT_VERSION {
             return Err(SnapshotLoadError::UnsupportedVersion(version));
         }
         let snap: SceneSnapshot = bincode::deserialize(&bytes[8..])

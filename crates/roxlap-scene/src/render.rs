@@ -1333,6 +1333,7 @@ mod tests {
         let transform = GridTransform {
             origin: DVec3::ZERO,
             rotation: DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2),
+            voxel_world_size: 1.0,
         };
         let local = super::world_camera_to_grid_local(&camera, &transform);
         // World +y == grid-local +x.
@@ -1381,6 +1382,7 @@ mod tests {
         let transform = GridTransform {
             origin: DVec3::new(1.0, 2.0, 3.0),
             rotation: DQuat::from_axis_angle(glam::DVec3::new(0.3, 0.8, 0.5).normalize(), 0.7),
+            voxel_world_size: 1.0,
         };
         let local = super::world_camera_to_grid_local(&camera, &transform);
         let r = DVec3::from_array(local.right);
@@ -1470,6 +1472,7 @@ mod tests {
         let (mut scene_b, _, _) = build_one_grid_marker_scene(GridTransform {
             origin: DVec3::ZERO,
             rotation: q,
+            voxel_world_size: 1.0,
         });
         let fb_b = render_via_scene(&mut scene_b, &rotated_camera);
 
@@ -1492,6 +1495,7 @@ mod tests {
         let (mut scene, _, marker) = build_one_grid_marker_scene(GridTransform {
             origin: DVec3::ZERO,
             rotation,
+            voxel_world_size: 1.0,
         });
 
         // World position of the marker's centre. Grid-local

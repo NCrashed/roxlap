@@ -288,6 +288,7 @@ mod tests {
         let xform_rot = GridTransform {
             origin: DVec3::ZERO,
             rotation: DQuat::from_rotation_z(std::f64::consts::FRAC_PI_3),
+            voxel_world_size: 1.0,
         };
         assert_eq!(select_lod(cam, &xform_id, t), Lod::Mid);
         assert_eq!(select_lod(cam, &xform_rot, t), Lod::Mid);

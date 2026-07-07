@@ -90,6 +90,7 @@ fn main() {
     let ship_id = scene.add_grid(GridTransform {
         origin: DVec3::new(300.0, -80.0, -40.0),
         rotation: DQuat::from_rotation_z(0.5),
+        voxel_world_size: 1.0,
     });
     // Object grids should not paint their own (grid-local, rotating)
     // sky — leave the sky to the world grid.

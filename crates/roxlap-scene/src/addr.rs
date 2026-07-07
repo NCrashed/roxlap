@@ -6,9 +6,10 @@
 //! 1. **World** (f64). Universe-level positions; one [`DVec3`]
 //!    per point.
 //! 2. **Grid-local** (f64). Position in a grid's local frame
-//!    (origin + rotation already applied). Voxel size is fixed
-//!    at 1 unit / voxel; integer voxel coordinate `v` covers
-//!    grid-local space `[v, v+1)` on each axis.
+//!    (origin + rotation undone, then divided by the grid's
+//!    `voxel_world_size` — SC). Integer voxel coordinate `v`
+//!    covers grid-local space `[v, v+1)` on each axis; one voxel
+//!    spans `voxel_world_size` world units (default `1.0` = 1:1).
 //! 3. **Chunk + voxel-in-chunk** (i32 + u32). A grid-local voxel
 //!    coordinate `v: IVec3` decomposes into a chunk index
 //!    `c: IVec3` and a voxel offset `u: UVec3` within that
@@ -144,7 +145,11 @@ pub fn voxel_global(chunk: IVec3, voxel_in_chunk: UVec3) -> IVec3 {
 /// at typical voxel scales).
 #[must_use]
 pub fn world_to_grid_local(world_pos: DVec3, transform: &GridTransform) -> GridLocalPos {
-    let local_d = transform.rotation.inverse() * (world_pos - transform.origin);
+    // SC — un-rotate, un-translate, then divide by the grid's world
+    // units per voxel to land in voxel coordinates (`1.0` = the classic
+    // 1:1, byte-identical to the pre-SC path).
+    let local_d = (transform.rotation.inverse() * (world_pos - transform.origin))
+        / transform.voxel_world_size;
     let voxel_d = local_d.floor();
     // After `.floor()` the components are integer-valued; truncating
     // to i32 is equivalent to flooring. Out-of-range coords saturate,
@@ -181,7 +186,9 @@ pub fn grid_local_to_world(
     transform: &GridTransform,
 ) -> DVec3 {
     let voxel = voxel_global(chunk, voxel_in_chunk);
-    let local = voxel.as_dvec3() + fract.as_dvec3();
+    // SC — voxel coordinates → world: scale by the grid's world units
+    // per voxel BEFORE rotating + translating.
+    let local = (voxel.as_dvec3() + fract.as_dvec3()) * transform.voxel_world_size;
     transform.origin + transform.rotation * local
 }
 
@@ -334,6 +341,7 @@ mod tests {
         let t = GridTransform {
             origin: DVec3::ZERO,
             rotation: DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2),
+            voxel_world_size: 1.0,
         };
         let p = world_to_grid_local(DVec3::new(0.0, 5.5, 0.0), &t);
         assert_eq!(p.chunk, IVec3::ZERO);
@@ -377,6 +385,7 @@ mod tests {
         let t = GridTransform {
             origin: DVec3::new(10.0, 20.0, 30.0),
             rotation: DQuat::from_rotation_z(0.5).normalize(),
+            voxel_world_size: 1.0,
         };
         // Sample several points to exercise the rotation math.
         let samples = [
@@ -463,6 +472,7 @@ mod tests {
                 let t = GridTransform {
                     origin: grid_origin,
                     rotation,
+                    voxel_world_size: 1.0,
                 };
                 for world in world_positions {
                     let p = world_to_grid_local(world, &t);
@@ -472,6 +482,49 @@ mod tests {
                         "rotation={rot_name} origin={grid_origin:?} world={world:?} back={back:?}"
                     );
                 }
+            }
+        }
+    }
+
+    // ---- SC: per-grid voxel scale ----
+
+    #[test]
+    fn scaled_grid_maps_world_to_smaller_voxel_index() {
+        // voxel_world_size 2.0 ⇒ each voxel is 2 world units, so world
+        // (10.5, 4.5, 6.5) lands in voxel (5, 2, 3).
+        let t = GridTransform::at_scale(DVec3::ZERO, 2.0);
+        let p = world_to_grid_local(DVec3::new(10.5, 4.5, 6.5), &t);
+        assert_eq!(p.chunk, IVec3::ZERO);
+        assert_eq!(p.voxel, UVec3::new(5, 2, 3));
+        // 0.5 world into a 2-unit voxel = 0.25 of the cell.
+        assert!(
+            p.fract.abs_diff_eq(Vec3::splat(0.25), 1e-6),
+            "fract={:?}",
+            p.fract
+        );
+    }
+
+    #[test]
+    fn scaled_grid_round_trips() {
+        // world → local → world with a scaled + translated + rotated
+        // grid must reconstruct the original world point.
+        for vws in [0.25, 1.0, 2.0, 4.0] {
+            let t = GridTransform {
+                origin: DVec3::new(100.0, -50.0, 30.0),
+                rotation: DQuat::from_rotation_z(0.6).normalize(),
+                voxel_world_size: vws,
+            };
+            for world in [
+                DVec3::new(101.5, -48.25, 33.75),
+                DVec3::new(100.0, -50.0, 30.0),
+                DVec3::new(140.0, -20.0, 60.0),
+            ] {
+                let p = world_to_grid_local(world, &t);
+                let back = grid_local_to_world(p.chunk, p.voxel, p.fract, &t);
+                assert!(
+                    back.abs_diff_eq(world, 1e-4),
+                    "vws={vws} world={world:?} back={back:?}"
+                );
             }
         }
     }
@@ -489,6 +542,7 @@ mod tests {
         let t = GridTransform {
             origin: DVec3::ZERO,
             rotation: DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2),
+            voxel_world_size: 1.0,
         };
         let p_rotated = world_to_grid_local(DVec3::new(0.0, 5.5, 0.0), &t);
         let p_identity = world_to_grid_local(DVec3::new(0.0, 5.5, 0.0), &GridTransform::identity());

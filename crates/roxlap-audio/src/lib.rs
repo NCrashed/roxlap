@@ -464,6 +464,7 @@ mod tests {
         let id = scene.add_grid(GridTransform {
             origin: DVec3::new(0.0, 0.0, 0.0),
             rotation: rot,
+            voxel_world_size: 1.0,
         });
         wall(scene.grid_mut(id).expect("rotated grid"), 30, 3);
         // Local +x maps to world +y: the local x = 30..33 wall lies at

@@ -297,35 +297,73 @@ fn voxel_dda(grid: &Grid, lo: DVec3, ld: DVec3, max_t: f64) -> Option<(IVec3, f6
 
 /// f64 world placement of one grid: position + orientation.
 ///
-/// `origin` is the grid's local-space origin in world coords —
-/// chunk `(0, 0, 0)`'s `(0, 0, 0)` voxel maps to
-/// `origin + rotation * vec3(0, 0, 0)` (i.e. just `origin`).
-/// Voxel size is fixed at 1 world unit / voxel for v1.
+/// `origin` is the grid's local-space origin in world coords — a
+/// grid-local point `p` (in voxel units) maps to
+/// `origin + rotation * (p * voxel_world_size)`.
+///
+/// SC — `voxel_world_size` is the grid's **world units per voxel**
+/// (`1.0` = the classic 1:1). A coarse planet grid might use `4.0`
+/// (big voxels) and a finely detailed ship `0.25`, so they coexist at
+/// the right relative sizes in one scene. The scale enters ONLY at the
+/// world↔grid-local boundary (`crate::world_to_grid_local` /
+/// `crate::grid_local_to_world`, `Scene::raycast`, shadows); the
+/// per-grid voxel storage, marchers and bakes are scale-agnostic. Only
+/// a uniform scalar is supported (anisotropic scale would break the
+/// ray-length invariant the raycast/shadow `t` conversion relies on).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GridTransform {
     /// The grid's local-space origin, in world coordinates.
     pub origin: DVec3,
     /// The grid's orientation about `origin`.
     pub rotation: DQuat,
+    /// SC — world units per voxel (`1.0` = 1:1). See the type docs.
+    /// **`#[serde(skip)]`**: this field is NOT part of `GridTransform`'s
+    /// wire form (which stays frozen for snapshot back-compat). The
+    /// snapshot persists it as a trailing field on
+    /// [`crate::snapshot::GridSnapshot`] instead, so old saves — which
+    /// predate it — still load (defaulting to `1.0`). A standalone
+    /// `GridTransform` deserialize also defaults it to `1.0`.
+    #[serde(skip, default = "one_f64")]
+    pub voxel_world_size: f64,
+}
+
+/// serde default for [`GridTransform::voxel_world_size`].
+fn one_f64() -> f64 {
+    1.0
 }
 
 impl GridTransform {
-    /// Identity transform at world origin. Useful as a default for
-    /// the first grid added to an otherwise empty scene.
+    /// Identity transform at world origin, 1 world unit per voxel.
+    /// Useful as a default for the first grid added to an otherwise
+    /// empty scene.
     #[must_use]
     pub fn identity() -> Self {
         Self {
             origin: DVec3::ZERO,
             rotation: DQuat::IDENTITY,
+            voxel_world_size: 1.0,
         }
     }
 
-    /// Axis-aligned grid placed at `origin` with no rotation.
+    /// Axis-aligned grid placed at `origin` with no rotation, 1 world
+    /// unit per voxel.
     #[must_use]
     pub fn at(origin: DVec3) -> Self {
         Self {
             origin,
             rotation: DQuat::IDENTITY,
+            voxel_world_size: 1.0,
+        }
+    }
+
+    /// SC — axis-aligned grid at `origin` with `voxel_world_size` world
+    /// units per voxel (no rotation). `1.0` = the classic 1:1.
+    #[must_use]
+    pub fn at_scale(origin: DVec3, voxel_world_size: f64) -> Self {
+        Self {
+            origin,
+            rotation: DQuat::IDENTITY,
+            voxel_world_size,
         }
     }
 }
@@ -951,13 +989,21 @@ impl Scene {
         let dn = dir / len; // unit world direction → t is world distance
         let mut best: Option<RayHit> = None;
         for (id, grid) in self.grids() {
-            // World ray → grid-local: undo translation + rotation. The
-            // inverse rotation preserves length, so `t` stays in world
-            // units and is comparable across grids.
+            // World ray → grid-local voxel space. `ld = inv * dn` stays
+            // UNIT (rotation preserves length), so `voxel_dda` marches
+            // in voxel units and returns a voxel-distance `t`. SC — the
+            // grid's `voxel_world_size` scales the boundary both ways:
+            // the origin divides into voxel coords, the world march cap
+            // divides into voxel units, and the returned voxel `t`
+            // multiplies back to a WORLD distance so it stays
+            // comparable across grids of different scale. `vws == 1.0`
+            // is the pre-SC path, bit-for-bit.
             let inv = grid.transform.rotation.inverse();
-            let lo = inv * (origin - grid.transform.origin);
+            let vws = grid.transform.voxel_world_size;
+            let lo = (inv * (origin - grid.transform.origin)) / vws;
             let ld = inv * dn;
-            if let Some((voxel, t)) = voxel_dda(grid, lo, ld, max_dist) {
+            if let Some((voxel, t_local)) = voxel_dda(grid, lo, ld, max_dist / vws) {
+                let t = t_local * vws;
                 if best.as_ref().is_none_or(|b| t < b.t) {
                     best = Some(RayHit {
                         grid: id,
@@ -1430,6 +1476,74 @@ mod tests {
             .expect("hits the nearer voxel");
         assert_eq!(hit.grid, near);
         assert_eq!(hit.voxel, IVec3::new(1, 1, 20));
+    }
+
+    #[test]
+    fn raycast_into_scaled_grid_returns_world_t() {
+        // SC — a grid at voxel_world_size 2.0: the voxel at grid-local
+        // (5,5,10) sits at WORLD z = 20 (10 voxels × 2 units). The ray
+        // must hit at world t ≈ 20 and report the grid-local voxel.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 2.0));
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .set_voxel(IVec3::new(5, 5, 10), Some(VoxColor(0x80_aa_bb_cc)));
+        // World column through grid-local (5,5): world x/y = 11 (5.5 vox × 2).
+        let hit = scene
+            .raycast(DVec3::new(11.0, 11.0, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
+            .expect("ray hits the scaled voxel");
+        assert_eq!(hit.voxel, IVec3::new(5, 5, 10), "grid-local voxel");
+        assert!((hit.t - 20.0).abs() < 1e-4, "world t≈20, got {}", hit.t);
+        assert!((hit.world.z - 20.0).abs() < 1e-4, "world hit z≈20");
+    }
+
+    #[test]
+    fn raycast_nearest_is_by_world_distance_across_scales() {
+        // SC — two grids on the SAME world column (world xy = 1.0):
+        //  - fine grid (vws 0.5): voxel at grid-local (2,2,30) → world
+        //    xy [1.0,1.5), world z [15,15.5). Voxel-local depth 30.
+        //  - coarse grid (vws 2.0): voxel at grid-local (0,0,5) → world
+        //    xy [0,2), world z [10,12). Voxel-local depth 5.
+        // The coarse voxel is FARTHER in voxel-local units? No — it's
+        // nearer in BOTH here; the point is the fine voxel's huge
+        // voxel-local t (30) must NOT beat the coarse voxel's small
+        // world t. A voxel-local `t` compare would rank coarse (5) <
+        // fine (30) and happen to agree; to make the test bite, the
+        // world distances (coarse 10 < fine 15) are what the assert
+        // pins — a missing `* vws` on either grid would shift these.
+        let mut scene = Scene::new();
+        let fine = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 0.5));
+        let coarse = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 2.0));
+        scene
+            .grid_mut(fine)
+            .unwrap()
+            .set_voxel(IVec3::new(2, 2, 30), Some(VoxColor(0x80_00_ff_00)));
+        scene
+            .grid_mut(coarse)
+            .unwrap()
+            .set_voxel(IVec3::new(0, 0, 5), Some(VoxColor(0x80_ff_00_00)));
+        let hit = scene
+            .raycast(DVec3::new(1.0, 1.0, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
+            .expect("hits the world-nearer voxel");
+        assert_eq!(hit.grid, coarse, "coarse voxel is nearer in WORLD units");
+        assert!((hit.t - 10.0).abs() < 1e-4, "world t≈10, got {}", hit.t);
+        // And the fine voxel alone reports its WORLD t (15), not its
+        // voxel-local t (30) — the t-conversion in action.
+        let mut fine_only = Scene::new();
+        let f = fine_only.add_grid(GridTransform::at_scale(DVec3::ZERO, 0.5));
+        fine_only
+            .grid_mut(f)
+            .unwrap()
+            .set_voxel(IVec3::new(2, 2, 30), Some(VoxColor(0x80_00_ff_00)));
+        let fh = fine_only
+            .raycast(DVec3::new(1.0, 1.0, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
+            .expect("fine voxel hit");
+        assert!(
+            (fh.t - 15.0).abs() < 1e-4,
+            "fine world t≈15 (not voxel-local 30), got {}",
+            fh.t
+        );
     }
 
     #[test]

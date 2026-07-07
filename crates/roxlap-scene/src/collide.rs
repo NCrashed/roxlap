@@ -264,6 +264,7 @@ mod tests {
         let id = scene.add_grid(GridTransform {
             origin: DVec3::new(200.0, 0.0, 0.0),
             rotation: rot,
+            voxel_world_size: 1.0,
         });
         let grid = scene.grid_mut(id).expect("grid present");
         grid.set_voxel(IVec3::new(10, 10, 50), Some(VoxColor(0x80_11_22_33)));

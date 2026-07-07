@@ -756,6 +756,7 @@ pub(crate) mod tests {
         let transform = GridTransform {
             origin: DVec3::ZERO,
             rotation: DQuat::from_axis_angle(DVec3::Z, std::f64::consts::PI),
+            voxel_world_size: 1.0,
         };
         let mut scene = Scene::new();
         let id = scene.add_grid(transform);
