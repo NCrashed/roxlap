@@ -215,6 +215,7 @@ fn grid_local_lights<'a>(
         return CpuLights::default();
     }
     let inv = transform.rotation.inverse();
+    let vws = transform.voxel_world_size;
     #[allow(clippy::cast_possible_truncation)]
     let sun_dir = if world.sun {
         let d = inv
@@ -247,7 +248,6 @@ fn grid_local_lights<'a>(
         // and its RADIUS too (a world distance → voxel distance), so the
         // reach sphere stays the same world size. The cone axis is a
         // direction — scale-invariant (uniform scale), rotate only.
-        let vws = transform.voxel_world_size;
         let lp = (inv
             * (DVec3::new(
                 f64::from(p.pos[0]),
@@ -286,11 +286,18 @@ fn grid_local_lights<'a>(
         ambient: world.ambient,
         bands: world.bands,
         shadow_tint: world.shadow_tint,
-        // CPU.2 — shadows: the rig is world-space here; shadow distances are
-        // grid-uniform (no scaling), so they carry through unchanged.
         shadow_strength: world.shadow_strength,
         shadow_bias: world.shadow_bias,
-        shadow_max_dist: world.shadow_max_dist,
+        // SC.2 — `shadow_max_dist` is a WORLD distance (uniform across grids):
+        // the sun shadow ray works in this grid's VOXEL frame, so divide by
+        // vws to a voxel cap. `WorldShadow`'s ×vws lift (or a single-grid
+        // `SamplerShadow`'s voxel march) then reaches `shadow_max_dist` world
+        // units on every grid — a fine grid (vws<1) gets full world shadow
+        // reach instead of `shadow_max_dist·vws`. Point-light shadows are
+        // unaffected (they march to the light's actual `dist`, not this cap).
+        // Byte-identical at vws == 1.0.
+        #[allow(clippy::cast_possible_truncation)]
+        shadow_max_dist: (f64::from(world.shadow_max_dist) / vws) as f32,
     }
 }
 
@@ -1191,10 +1198,15 @@ fn render_scene_composed_scissored(
                 [w.x as f32, w.y as f32, w.z as f32]
             };
             let o = grid.transform.origin;
+            #[allow(clippy::cast_possible_truncation)]
             WorldShadowCtx {
                 occluder: occ,
-                origin: [o.x as f32, o.y as f32, o.z as f32],
+                // SC.2 — keep the grid world origin at full f64 precision.
+                origin: [o.x, o.y, o.z],
                 cols: [col(DVec3::X), col(DVec3::Y), col(DVec3::Z)],
+                // SC.2 — caster vws: the shade's grid-local voxel ray scales
+                // to world by this before the scene-wide occlusion test.
+                voxel_world_size: grid.transform.voxel_world_size as f32,
             }
         });
         #[allow(clippy::cast_precision_loss)]
@@ -1419,6 +1431,151 @@ mod tests {
         assert!(
             (lit - shadowed) * 200 > lit,
             "cross-grid shadow should remove >0.5% of total luminance: lit={lit} shadowed={shadowed}"
+        );
+    }
+
+    #[test]
+    fn sc2_sun_shadow_cap_is_world_uniform() {
+        // SC.2 finding #1 — `shadow_max_dist` is a WORLD distance. The sun
+        // shadow ray marches the grid's VOXEL frame, so the per-grid cap is
+        // `shadow_max_dist / vws`: a fine grid (vws<1) then reaches MORE
+        // voxels (= the same world distance), a coarse grid fewer. Without
+        // this a global cap gives `shadow_max_dist·vws` world reach — a
+        // flying vws=0.25 grid would only see occluders within 1/4 the range.
+        let world = CpuLights {
+            enabled: true,
+            sun: true,
+            shadow_max_dist: 40.0,
+            ..CpuLights::default()
+        };
+        let mut scratch = Vec::new();
+        // vws == 1.0: unchanged (byte-identical to pre-SC).
+        let unit = grid_local_lights(&world, &GridTransform::identity(), &mut scratch, None);
+        assert!((unit.shadow_max_dist - 40.0).abs() < 1e-3);
+        // vws == 0.5 (fine grid): the voxel cap doubles → same 40 world units.
+        let fine = grid_local_lights(
+            &world,
+            &GridTransform::at_scale(DVec3::ZERO, 0.5),
+            &mut scratch,
+            None,
+        );
+        assert!(
+            (fine.shadow_max_dist - 80.0).abs() < 1e-3,
+            "vws=0.5 sun cap must be 40/0.5 = 80 voxels (40 world): got {}",
+            fine.shadow_max_dist
+        );
+        // vws == 4.0 (coarse grid): the voxel cap quarters → same 40 world.
+        let coarse = grid_local_lights(
+            &world,
+            &GridTransform::at_scale(DVec3::ZERO, 4.0),
+            &mut scratch,
+            None,
+        );
+        assert!(
+            (coarse.shadow_max_dist - 10.0).abs() < 1e-3,
+            "vws=4.0 sun cap must be 40/4 = 10 voxels (40 world): got {}",
+            coarse.shadow_max_dist
+        );
+    }
+
+    #[test]
+    fn sc2_scaled_grid_casts_world_correct_shadow() {
+        // SC.2 — a SCALED occluder grid must drop its shadow at the same WORLD
+        // place as the equivalent unscaled block. Grid B at vws 2.0 with a
+        // block at local [25,25,20]..[29,29,24] fills world [50,60)×[50,60)×
+        // [40,50) — the identical world box the unscaled [50,50,40]..[59,59,49]
+        // block fills. Its shadow on A's unscaled floor must MATCH the
+        // unscaled reference, not merely darken. Without the occluder-side
+        // /vws the world shadow ray (x≈55) would miss B's voxel AABB
+        // (x∈[25,30]) entirely → zero shadow (scaled_delta ≈ 0 fails).
+        let cam = Camera {
+            pos: [55.0, 55.0, 6.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let inv = 1.0f32 / 2.0f32.sqrt();
+        let base = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_dir: [inv, 0.0, -inv], // to-sun: +x and up
+            sun_color: [1.0; 3],
+            sun_intensity: 1.0,
+            ambient: [0.3; 3],
+            shadow_strength: 0.85,
+            shadow_bias: 1.5,
+            shadow_max_dist: 128.0,
+            ..CpuLights::default()
+        };
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+
+        // Render A (unscaled floor) + B (block at `b_vws`), return luminance.
+        let render_lum = |b_vws: f64, b_lo: IVec3, b_hi: IVec3, casts: bool| -> u64 {
+            let mut scene = Scene::new();
+            let a = scene.add_grid(GridTransform::at(DVec3::ZERO));
+            scene.grid_mut(a).unwrap().set_rect(
+                IVec3::new(30, 30, 60),
+                IVec3::new(90, 90, 62),
+                Some(VoxColor(0x80_88_88_88)),
+            );
+            let b = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, b_vws));
+            scene
+                .grid_mut(b)
+                .unwrap()
+                .set_rect(b_lo, b_hi, Some(VoxColor(0x80_60_60_60)));
+            let n = (XRES as usize) * (YRES as usize);
+            let mut fb = vec![0u32; n];
+            let mut zb = vec![f32::INFINITY; n];
+            render_scene_composed_scissored(
+                &mut fb,
+                &mut zb,
+                XRES as usize,
+                XRES,
+                YRES,
+                CpuFog::default(),
+                &mut scene,
+                &cam,
+                &settings,
+                0x0011_2233,
+                None,
+                false,
+                None,
+                &[],
+                CpuLights {
+                    sun_casts_shadow: casts,
+                    ..base
+                },
+                None,
+                &mut SceneRenderScratch::default(),
+            );
+            fb.iter()
+                .map(|&p| u64::from((p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff)))
+                .sum()
+        };
+
+        let unscaled_lo = IVec3::new(50, 50, 40);
+        let unscaled_hi = IVec3::new(59, 59, 49);
+        let scaled_lo = IVec3::new(25, 25, 20);
+        let scaled_hi = IVec3::new(29, 29, 24);
+        let lit = render_lum(1.0, unscaled_lo, unscaled_hi, false);
+        let ref_shadow = render_lum(1.0, unscaled_lo, unscaled_hi, true);
+        let scaled_shadow = render_lum(2.0, scaled_lo, scaled_hi, true);
+
+        assert!(ref_shadow < lit, "sanity: the unscaled block must shadow A");
+        assert!(
+            scaled_shadow < lit,
+            "the scaled occluder must cast a shadow — a missing occluder-side \
+             /vws makes the world ray miss its voxel AABB: scaled={scaled_shadow} lit={lit}"
+        );
+        // World-correctness: the scaled block fills the identical world box, so
+        // its shadow footprint tracks the unscaled reference (only voxel edge
+        // quantization differs). A mis-scaled ray would land elsewhere / miss.
+        let ref_delta = lit - ref_shadow;
+        let scaled_delta = lit - scaled_shadow;
+        assert!(
+            scaled_delta * 10 > ref_delta * 7 && scaled_delta * 7 < ref_delta * 10,
+            "scaled shadow must match the unscaled world shadow within ~30% \
+             (world-placement check): ref_delta={ref_delta} scaled_delta={scaled_delta}"
         );
     }
 

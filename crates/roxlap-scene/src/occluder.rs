@@ -33,6 +33,10 @@ struct GridOcc<'a> {
     origin: DVec3,
     /// World→grid-local rotation (the inverse of the grid's rotation).
     rot_inv: DQuat,
+    /// SC.2 — the grid's `voxel_world_size`. The world ray is divided by this
+    /// (after the inverse-rotation) to reach the grid's VOXEL frame, in which
+    /// `lo`/`hi` and the DDA march live. `1.0` for an unscaled grid.
+    vws: f32,
     /// Grid-local voxel AABB `[lo, hi)` (mip-0 voxel coords) covering every
     /// materialised chunk; the shadow march is clipped to it.
     lo: [f32; 3],
@@ -53,10 +57,12 @@ impl<'a> SceneOccluder<'a> {
         let mut grids = Vec::new();
         for (_id, grid) in scene.grids() {
             if let Some((lo, hi)) = grid_voxel_aabb(grid) {
+                #[allow(clippy::cast_possible_truncation)]
                 grids.push(GridOcc {
                     grid,
                     origin: grid.transform.origin,
                     rot_inv: grid.transform.rotation.inverse(),
+                    vws: grid.transform.voxel_world_size as f32,
                     lo,
                     hi,
                 });
@@ -73,12 +79,10 @@ impl<'a> SceneOccluder<'a> {
 }
 
 impl roxlap_core::WorldOccluder for SceneOccluder<'_> {
-    fn occluded_world(&self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
-        let ow = DVec3::new(
-            f64::from(origin[0]),
-            f64::from(origin[1]),
-            f64::from(origin[2]),
-        );
+    fn occluded_world(&self, origin: [f64; 3], dir: [f32; 3], max_t: f32) -> bool {
+        // SC.2 — `origin` arrives f64 (full world precision); only `dir`
+        // (unit-ish) is widened from f32.
+        let ow = DVec3::new(origin[0], origin[1], origin[2]);
         let dw = DVec3::new(f64::from(dir[0]), f64::from(dir[1]), f64::from(dir[2]));
         for g in &self.grids {
             if occluded_in_grid(g, ow, dw, max_t) {
@@ -137,9 +141,12 @@ fn grid_voxel_aabb(grid: &Grid) -> Option<([f32; 3], [f32; 3])> {
 /// to the dense per-voxel walk — conservative, never wrong.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
-    // World → grid-local (rotation is rigid, so `t` stays world distance).
-    let o: Vec3 = (g.rot_inv * (ow - g.origin)).as_vec3();
-    let d: Vec3 = (g.rot_inv * dw).as_vec3();
+    // World → grid-local VOXEL frame: inverse-rotate (rigid) then divide by
+    // `vws` (world units → voxel indices, in which `lo`/`hi` live). Dividing
+    // both `o` and `d` by the same factor preserves the ray parameter `t`, so
+    // `max_t` still clips at the right point. `vws == 1.0` is byte-identical.
+    let o: Vec3 = (g.rot_inv * (ow - g.origin)).as_vec3() / g.vws;
+    let d: Vec3 = (g.rot_inv * dw).as_vec3() / g.vws;
     let o = [o.x, o.y, o.z];
     let d = [d.x, d.y, d.z];
 
@@ -365,8 +372,8 @@ mod tests {
     /// per cell, one step per iteration).
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn occluded_dense(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
-        let o: Vec3 = (g.rot_inv * (ow - g.origin)).as_vec3();
-        let d: Vec3 = (g.rot_inv * dw).as_vec3();
+        let o: Vec3 = (g.rot_inv * (ow - g.origin)).as_vec3() / g.vws;
+        let d: Vec3 = (g.rot_inv * dw).as_vec3() / g.vws;
         let o = [o.x, o.y, o.z];
         let d = [d.x, d.y, d.z];
         let Some((t0, t1)) = intersect_aabb(o, d, g.lo, g.hi) else {

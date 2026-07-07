@@ -191,10 +191,46 @@ pattern from sprite volumes to terrain grids** — not greenfield.
   a fine grid's voxels project smaller and could take a coarser mip
   sooner. Proper vws-aware projected-size LOD folds a /vws there with the
   LOD thresholds. Shadow distances under scale = SC.2.
-- **SC.2 — CPU cross-grid shadows.** `WorldShadowCtx` + `occluded_in_grid`
-  scale (ray + max_t). Test: a scaled grid casts a world-correct shadow
-  onto another grid (extend `cross_grid_sun_shadow_darkens_other_grid`
-  with a vws≠1 caster grid). vws=1.0 byte-identical.
+- **SC.2 — LANDED 2026-07-07: CPU cross-grid shadows.** Two scale factors,
+  handled on the two sides of the world-space shadow test:
+  - **Caster** (grid being shaded): `WorldShadowCtx` gains
+    `voxel_world_size`; `WorldShadow::occluded` (dda.rs) lifts the
+    grid-local voxel shadow ray to world by scaling the local **position
+    AND direction** by vws (`max_t` is a caster-voxel distance → world
+    segment covers `t·vws`).
+  - **Occluder** (each grid tested): `GridOcc` gains `vws`;
+    `occluded_in_grid` (occluder.rs) divides the inverse-rotated world ray
+    (`o` and `d`) by vws to reach that grid's voxel frame. Dividing both
+    preserves `t`, so `max_t` still clips correctly.
+  A grid shadowing **itself** is scale-invariant (the two cancel), and
+  `vws==1.0` everywhere is byte-identical to XS.1. Tests
+  `sc2_scaled_grid_casts_world_correct_shadow` (a vws=2 occluder block
+  filling the same WORLD box as an unscaled block casts a matching shadow
+  within ~30%; negative-verified — drops to zero shadow without the
+  occluder-side /vws) and `sc2_sun_shadow_cap_is_world_uniform`. Both
+  `occluded_in_grid` and its dense test oracle scaled.
+  **Review fixes (3):**
+  1. **`shadow_max_dist` is WORLD-uniform**, not a voxel cap.
+     `grid_local_lights` divides it by vws (parallel to point-radius/vws),
+     so the sun shadow ray reaches the same world distance on every grid —
+     a fine flying grid (vws<1) gets full cross-grid shadow reach instead
+     of `shadow_max_dist·vws`. (Point-light shadows already march to the
+     light's true `dist`, so unaffected.) Correct for both `WorldShadow`
+     (×vws lift) and single-grid `SamplerShadow` (voxel march).
+  2. **Sprite casters verified.** A sprite's shade builds world-space
+     sample points + normals via its basis `s/h/f`, which is pre-scaled by
+     the sprite's own `voxel_world_size` (`bb_scale3`, and the
+     `voxel_world_size_matches_scaled_basis` pixel-identity test). So the
+     shadow rays it emits are already world — the identity `WorldShadowCtx`
+     (vws=1) is correct; no sprite-vs-grid vws double-apply (hazard 4).
+  3. **Lift precision (hazard 2).** `WorldOccluder::occluded_world`'s
+     `origin` and `WorldShadowCtx::origin` are now **f64** so a scaled
+     grid's large world coordinates survive the lift (occluders are already
+     f64 internally; sprite origin subtraction now in f64 too, avoiding
+     cancellation). Narrows to f32 only at the voxel-frame DDA entry. `dir`
+     stays f32. Does NOT solve floating-origin (still deferred) — just stops
+     discarding f64 precision at an internal boundary.
+  210+ scene + core shadow tests green, vws=1.0 byte-identical.
 - **SC.3 — collision + streaming + LOD.** `grid_box_overlaps_solid`,
   `world_to_grid_local_pos`, `lod::from_radius`. Tests: box overlap
   hits the right world region in a scaled grid; LOD tier flips at the

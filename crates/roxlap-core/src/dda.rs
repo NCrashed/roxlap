@@ -366,14 +366,20 @@ pub(crate) trait ShadowTester {
 /// current grid. `occluded_world(origin, dir, max_t)` is in **world** voxel
 /// units: `true` iff any solid voxel anywhere blocks the segment.
 ///
+/// SC.2 — `origin` is **f64**: a scaled scene puts a fine grid's voxels at
+/// large world coordinates, and each occluder re-projects the ray into its
+/// own voxel frame (dividing by that grid's `vws`), so the world origin must
+/// keep full precision through the lift. `dir` stays f32 (a unit-ish
+/// direction); implementations narrow to f32 only at their voxel-frame entry.
+///
 /// `Sync` because [`DdaEnv`] (which borrows it) is shared across the
 /// rayon strip workers in [`render_dda_parallel`]; the occluder is a
 /// read-only borrow of the scene, so this holds.
 pub trait WorldOccluder: Sync {
     /// `true` iff any solid voxel in the scene blocks the segment from
-    /// world-space `origin` in unit direction `dir` within `max_t`
+    /// world-space `origin` (f64) in unit direction `dir` within `max_t`
     /// world voxel units.
-    fn occluded_world(&self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool;
+    fn occluded_world(&self, origin: [f64; 3], dir: [f32; 3], max_t: f32) -> bool;
 }
 
 /// XS.1 — per-grid context for a cross-scene shadow query: the scene-wide
@@ -389,12 +395,21 @@ pub struct WorldShadowCtx<'a> {
     pub occluder: &'a dyn WorldOccluder,
     /// The current grid's world-space origin — the translation part of
     /// its local→world transform (added to rotated positions;
-    /// directions skip it).
-    pub origin: [f32; 3],
+    /// directions skip it). SC.2 — **f64**: kept full-precision so a
+    /// scaled grid's large world coordinates survive the lift (see
+    /// [`WorldOccluder`]).
+    pub origin: [f64; 3],
     /// Columns of the grid's local→world rotation: `cols[i]` is the
-    /// world-space image of grid-local axis `i`. Assumed orthonormal
-    /// so grid-local ray lengths equal world lengths.
+    /// world-space image of grid-local axis `i`. Kept **orthonormal** (pure
+    /// rotation) — the grid's voxel scale rides in `voxel_world_size`, not
+    /// folded into the columns.
     pub cols: [[f32; 3]; 3],
+    /// SC.2 — the caster grid's `voxel_world_size` (world units per voxel).
+    /// The shade works in the grid's voxel frame, so lifting a shadow ray to
+    /// world scales the local **position** and **direction** by this (a
+    /// voxel offset becomes `vws` world units). `1.0` for an unscaled grid
+    /// (byte-identical to XS.1) and for already-world-space sprites.
+    pub voxel_world_size: f32,
 }
 
 impl<'a> WorldShadowCtx<'a> {
@@ -406,6 +421,7 @@ impl<'a> WorldShadowCtx<'a> {
             occluder,
             origin: [0.0; 3],
             cols: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            voxel_world_size: 1.0,
         }
     }
 }
@@ -421,7 +437,7 @@ pub struct CompositeOccluder<'a> {
 }
 
 impl WorldOccluder for CompositeOccluder<'_> {
-    fn occluded_world(&self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
+    fn occluded_world(&self, origin: [f64; 3], dir: [f32; 3], max_t: f32) -> bool {
         self.a.occluded_world(origin, dir, max_t) || self.b.occluded_world(origin, dir, max_t)
     }
 }
@@ -437,16 +453,28 @@ pub(crate) struct WorldShadow<'a> {
 impl ShadowTester for WorldShadow<'_> {
     fn occluded(&mut self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
         let c = &self.ctx.cols;
-        // world = grid_origin + R · local (R columns = `cols`); dir rotates only.
+        // SC.2 — the shade works in the caster grid's VOXEL frame. Lift to
+        // world: a voxel offset becomes `vws` world units, so the local
+        // position scales by vws before rotate+translate, and the ray
+        // direction scales by vws too (the world segment then covers
+        // `t · vws` world units — `max_t` is a caster-voxel distance). The
+        // occluder side divides back out by its own vws, so a grid shadowing
+        // ITSELF is scale-invariant and vws==1.0 is byte-identical to XS.1.
+        let s = self.ctx.voxel_world_size;
+        let l = [origin[0] * s, origin[1] * s, origin[2] * s];
+        // world = grid_origin + R · (local · vws) (R columns = `cols`). The
+        // rotated-local term is small (voxel offset), so it's summed in f32;
+        // the large `origin` stays f64 so `wo` keeps full world precision.
         let wo = [
-            self.ctx.origin[0] + c[0][0] * origin[0] + c[1][0] * origin[1] + c[2][0] * origin[2],
-            self.ctx.origin[1] + c[0][1] * origin[0] + c[1][1] * origin[1] + c[2][1] * origin[2],
-            self.ctx.origin[2] + c[0][2] * origin[0] + c[1][2] * origin[1] + c[2][2] * origin[2],
+            self.ctx.origin[0] + f64::from(c[0][0] * l[0] + c[1][0] * l[1] + c[2][0] * l[2]),
+            self.ctx.origin[1] + f64::from(c[0][1] * l[0] + c[1][1] * l[1] + c[2][1] * l[2]),
+            self.ctx.origin[2] + f64::from(c[0][2] * l[0] + c[1][2] * l[1] + c[2][2] * l[2]),
         ];
+        // dir rotates then scales by vws (skips the origin translation).
         let wd = [
-            c[0][0] * dir[0] + c[1][0] * dir[1] + c[2][0] * dir[2],
-            c[0][1] * dir[0] + c[1][1] * dir[1] + c[2][1] * dir[2],
-            c[0][2] * dir[0] + c[1][2] * dir[1] + c[2][2] * dir[2],
+            (c[0][0] * dir[0] + c[1][0] * dir[1] + c[2][0] * dir[2]) * s,
+            (c[0][1] * dir[0] + c[1][1] * dir[1] + c[2][1] * dir[2]) * s,
+            (c[0][2] * dir[0] + c[1][2] * dir[1] + c[2][2] * dir[2]) * s,
         ];
         self.ctx.occluder.occluded_world(wo, wd, max_t)
     }

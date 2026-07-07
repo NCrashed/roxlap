@@ -394,7 +394,7 @@ impl SpriteOccluder {
 }
 
 impl WorldOccluder for SpriteOccluder {
-    fn occluded_world(&self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
+    fn occluded_world(&self, origin: [f64; 3], dir: [f32; 3], max_t: f32) -> bool {
         self.entries
             .iter()
             .any(|e| sprite_entry_occluded(e, origin, dir, max_t))
@@ -409,9 +409,17 @@ fn bb_scale3(v: [f32; 3], k: f32) -> [f32; 3] {
     [v[0] * k, v[1] * k, v[2] * k]
 }
 
-fn sprite_entry_occluded(e: &SpriteOccEntry, ow: [f32; 3], dw: [f32; 3], max_t: f32) -> bool {
-    // World → sprite-local voxel space (same transform as the draw).
-    let rel = [ow[0] - e.pos[0], ow[1] - e.pos[1], ow[2] - e.pos[2]];
+fn sprite_entry_occluded(e: &SpriteOccEntry, ow: [f64; 3], dw: [f32; 3], max_t: f32) -> bool {
+    // World → sprite-local voxel space (same transform as the draw). SC.2 —
+    // the origin subtraction runs in f64 (both are large world coords, so this
+    // avoids catastrophic cancellation) then narrows to f32 for the local
+    // basis apply; the sprite frame's coords are small.
+    #[allow(clippy::cast_possible_truncation)]
+    let rel = [
+        (ow[0] - f64::from(e.pos[0])) as f32,
+        (ow[1] - f64::from(e.pos[1])) as f32,
+        (ow[2] - f64::from(e.pos[2])) as f32,
+    ];
     let ol = mat_apply(&e.minv, rel);
     let origin = [ol[0] + e.pivot[0], ol[1] + e.pivot[1], ol[2] + e.pivot[2]];
     let dir = mat_apply(&e.minv, dw);
@@ -2313,7 +2321,7 @@ mod tests {
             "vws=2 @ unit basis == vws=1 @ 2x basis, pixel for pixel"
         );
 
-        let occludes = |dense: &SpriteDense, basis: f32, x: f32| {
+        let occludes = |dense: &SpriteDense, basis: f32, x: f64| {
             let mut occ = SpriteOccluder::new();
             occ.push(
                 Arc::new(dense.clone()),
