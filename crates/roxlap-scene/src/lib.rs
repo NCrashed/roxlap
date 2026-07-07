@@ -358,8 +358,18 @@ impl GridTransform {
 
     /// SC — axis-aligned grid at `origin` with `voxel_world_size` world
     /// units per voxel (no rotation). `1.0` = the classic 1:1.
+    ///
+    /// `voxel_world_size` must be finite and `> 0`: it scales every
+    /// world↔grid boundary, and a `0` collapses the GPU marcher's
+    /// `chunk_dim` to zero → `floor(origin / 0)` = NaN (garbage geometry),
+    /// worse than the CPU's divide. Debug-asserted here; release builds
+    /// trust the caller.
     #[must_use]
     pub fn at_scale(origin: DVec3, voxel_world_size: f64) -> Self {
+        debug_assert!(
+            voxel_world_size.is_finite() && voxel_world_size > 0.0,
+            "voxel_world_size must be finite and > 0, got {voxel_world_size}"
+        );
         Self {
             origin,
             rotation: DQuat::IDENTITY,
@@ -903,7 +913,16 @@ impl Scene {
     }
 
     /// Register a new grid. Returns its fresh, unique [`GridId`].
+    ///
+    /// SC — debug-asserts `transform.voxel_world_size` is finite and `> 0`
+    /// (catches a direct `GridTransform { .. }` literal that bypasses
+    /// [`GridTransform::at_scale`]); a `0` breaks the scaled marcher.
     pub fn add_grid(&mut self, transform: GridTransform) -> GridId {
+        debug_assert!(
+            transform.voxel_world_size.is_finite() && transform.voxel_world_size > 0.0,
+            "grid voxel_world_size must be finite and > 0, got {}",
+            transform.voxel_world_size
+        );
         let id = GridId(self.next_grid_id);
         self.next_grid_id += 1;
         self.grids.insert(id, Grid::new(transform));

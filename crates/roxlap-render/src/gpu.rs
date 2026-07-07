@@ -1656,6 +1656,8 @@ impl GpuBackend {
             out.push(roxlap_gpu::GridWorldTransform {
                 origin: [o.x as f32, o.y as f32, o.z as f32],
                 rot_cols: [col(DVec3::X), col(DVec3::Y), col(DVec3::Z)],
+                // SC.4 — the shader marcher scales chunk/voxel dims by this.
+                voxel_world_size: grid.transform.voxel_world_size as f32,
             });
         }
         out

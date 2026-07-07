@@ -289,10 +289,46 @@ pattern from sprite volumes to terrain grids** — not greenfield.
   fine grid's voxels project smaller so they *could* take a coarser mip
   sooner (a perf win) — but a finer-than-needed mip is never wrong, so this
   is an optional future optimization, not a scale bug.
-- **SC.4 — GPU parity.** `world_origin.w` scale, `grid_local_camera`,
-  the `scene_dda.wgsl` edits, `sprite_terrain_shadow.wgsl`, volumetric.
-  Headless CPU-vs-GPU diff at vws≠1 (extend the HeadlessSceneRenderer
-  harness with a scaled grid). vws=1.0 headless byte-identical.
+- **SC.4 — LANDED 2026-07-07: GPU parity.** Turned out **much simpler than
+  the CPU** (and than this recon predicted), because the GPU marcher uses a
+  **normalized `ray_dir`**, so `t` is already a world distance along a unit
+  ray and the marcher runs in a grid-local frame where 1 voxel = 1 unit.
+  The whole implementation is: **scale `chunk_dim` and `vsize` by vws** in
+  the two marchers (`march_grid` + `shadow_occluded` in scene_dda.wgsl, and
+  the mip-0 marcher in sprite_terrain_shadow.wgsl). That makes the entire
+  march run in **world-local units** — so automatically, with NO extra
+  edits:
+  - `t` / `best_t` stay world → cross-grid min-t compositing is correct;
+  - voxel indexing (`entry_in_chunk / vsize`) still yields correct indices;
+  - the volumetric `seg_len = t_span / vsize` stays a voxel count;
+  - `shadow_max_dist` (a world uniform) is **world-uniform by
+    construction** — no per-grid ÷vws needed (unlike the CPU, whose shadow
+    marcher was voxel-frame);
+  - point-light positions (already `grid_local_point` = rotate+translate,
+    world-local) and radii (world) are already right.
+  So `grid_local_camera`, the shader transform helpers
+  (`grid_local_to_world` / `world_to_grid_local`), and the shadow cap are
+  **unchanged** — the recon's "divide camera pos by vws / scale seg_len by
+  vsize·vws / scale transform helpers" would have been wrong for a
+  normalized-ray world-frame marcher. Host plumbing: `GridWorldTransform`
+  gains `voxel_world_size`; `SceneDdaPerGridCamera::set_world_transform`
+  stamps it into the spare `world_origin.w` (default 1.0 so ×vws is always
+  identity, never 0); `roxlap-render/gpu.rs grid_world_transforms` fills it
+  from `grid.transform.voxel_world_size`. Test
+  `scene_dda_scaled_grid_composites_by_world_depth` (a vws=2 blue grid
+  world-FARTHER than a vws=1 red grid but voxel-NEARER — red wins the min-t
+  composite; negative-verified BLUE wins with the shader vws forced to 1).
+  47 gpu + 17 scene-render tests green, vws=1.0 byte-identical.
+  **Deferred:** a full headless CPU-vs-GPU pixel diff at vws≠1. Note the
+  depth buffers do NOT differ by vws²: the CPU composite depth is WORLD
+  (`scale_depth_rect` already multiplies the written `world/vws²` by vws²)
+  and the GPU's `best_t` is world by construction — so both are world and
+  should agree. The real blocker is the same one at vws==1: **colour float
+  precision** between the CPU and GPU shading paths (why the existing GPU
+  tests use *loose* colour classifiers), which is not vws-specific. So a
+  vws≠1 **depth** parity diff (both buffers world) is actually feasible and
+  would be the strongest SC.4 regression — worth adding when the harness
+  gains a depth readback. The composite test already pins world-t ordering.
 - **SC.5 — demo + docs.** Scene-demo: give the World scene's ship a
   different `voxel_world_size` (or a new "Scale" tab: a big coarse
   planet + a tiny detailed ship), eyeball both backends. Book: a short

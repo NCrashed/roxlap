@@ -111,7 +111,11 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> boo
     let aabb_mx = grid_static_meta[g].aabb_max;
     // mip-0 SOLID block start within a slot (mip_occ_rel[0] == 0).
     let solid_rel0 = vsid * vsid * OCC_WORDS_PER_COLUMN_S;
-    let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z));
+    // SC.4 — world-local march: chunk + (mip-0, size-1) voxel cells scale by
+    // the grid's voxel_world_size so a scaled terrain grid occludes sprites at
+    // its true world footprint. 1.0 ⇒ identity (byte-identical).
+    let vws = grid_cameras[g].world_origin.w;
+    let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z)) * vws;
     let vsid_i = i32(vsid);
     let cz_i = i32(CHUNK_Z);
     var p_chunk = vec3<i32>(floor(origin / chunk_dim));
@@ -137,17 +141,18 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> boo
             let chunk_origin_world = vec3<f32>(p_chunk) * chunk_dim;
             let entry_in_chunk = entry_world - chunk_origin_world;
             var p_voxel = clamp(
-                vec3<i32>(floor(entry_in_chunk)),
+                vec3<i32>(floor(entry_in_chunk / vws)), // SC.4 — world → voxel index
                 vec3<i32>(0),
                 vec3<i32>(vsid_i - 1, vsid_i - 1, cz_i - 1),
             );
+            // SC.4 — voxel boundaries at integer-index × vws (world units).
             let next_voxel_world = vec3<f32>(
-                select(f32(p_voxel.x), f32(p_voxel.x + 1), step_chunk.x > 0) + chunk_origin_world.x,
-                select(f32(p_voxel.y), f32(p_voxel.y + 1), step_chunk.y > 0) + chunk_origin_world.y,
-                select(f32(p_voxel.z), f32(p_voxel.z + 1), step_chunk.z > 0) + chunk_origin_world.z,
+                select(f32(p_voxel.x), f32(p_voxel.x + 1), step_chunk.x > 0) * vws + chunk_origin_world.x,
+                select(f32(p_voxel.y), f32(p_voxel.y + 1), step_chunk.y > 0) * vws + chunk_origin_world.y,
+                select(f32(p_voxel.z), f32(p_voxel.z + 1), step_chunk.z > 0) * vws + chunk_origin_world.z,
             );
             var t_max_voxel = shield_parallel((next_voxel_world - origin) / dir, dir);
-            let t_delta_voxel = abs(vec3<f32>(1.0) / dir);
+            let t_delta_voxel = abs(vec3<f32>(vws) / dir); // SC.4 — world voxel size
             loop {
                 let z_u = u32(p_voxel.z);
                 let widx = solid_col0

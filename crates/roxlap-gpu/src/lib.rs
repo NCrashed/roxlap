@@ -869,7 +869,10 @@ impl SceneDdaPerGridCamera {
             sun_dir: [0.0; 4],
             // Identity world transform by default; the per-grid build
             // (`grid_cameras`) overwrites it with the grid's real transform.
-            world_origin: [0.0; 4],
+            // SC.4 — `world_origin.w` is the grid's `voxel_world_size`;
+            // default 1.0 so the shader's `× vws` marcher scaling is identity
+            // even if `set_world_transform` is never called (never 0).
+            world_origin: [0.0, 0.0, 0.0, 1.0],
             rot0: [1.0, 0.0, 0.0, 0.0],
             rot1: [0.0, 1.0, 0.0, 0.0],
             rot2: [0.0, 0.0, 1.0, 0.0],
@@ -880,7 +883,9 @@ impl SceneDdaPerGridCamera {
     /// `rot_cols[i]` is the world image of grid-local axis `i` (the
     /// local→world rotation's columns).
     fn set_world_transform(&mut self, t: &GridWorldTransform) {
-        self.world_origin = [t.origin[0], t.origin[1], t.origin[2], 0.0];
+        // SC.4 — `.w` carries voxel_world_size (world units per voxel); the
+        // scene DDA marcher scales chunk_dim + vsize by it.
+        self.world_origin = [t.origin[0], t.origin[1], t.origin[2], t.voxel_world_size];
         self.rot0 = [t.rot_cols[0][0], t.rot_cols[0][1], t.rot_cols[0][2], 0.0];
         self.rot1 = [t.rot_cols[1][0], t.rot_cols[1][1], t.rot_cols[1][2], 0.0];
         self.rot2 = [t.rot_cols[2][0], t.rot_cols[2][1], t.rot_cols[2][2], 0.0];
@@ -899,6 +904,11 @@ pub struct GridWorldTransform {
     /// image of grid-local axis `i` (unit vectors for a pure rotation).
     /// Identity for an unrotated grid.
     pub rot_cols: [[f32; 3]; 3],
+    /// SC.4 — world units per voxel. The scene DDA marcher scales its
+    /// chunk/voxel cell dimensions by this, so a scaled grid renders,
+    /// shadows, and composites at its true world footprint. `1.0` for an
+    /// unscaled grid (byte-identical to pre-SC).
+    pub voxel_world_size: f32,
 }
 
 impl Default for GridWorldTransform {
@@ -906,6 +916,7 @@ impl Default for GridWorldTransform {
         Self {
             origin: [0.0; 3],
             rot_cols: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            voxel_world_size: 1.0,
         }
     }
 }

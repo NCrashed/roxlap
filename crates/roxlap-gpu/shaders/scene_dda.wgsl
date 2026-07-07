@@ -480,7 +480,11 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
     let aabb_mn = grid_static_meta[g].aabb_min;
     let aabb_mx = grid_static_meta[g].aabb_max;
     let occ_levels = grid_static_meta[g].chunk_occ_levels;
-    let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z));
+    // SC.4 — world-local march (chunk/voxel dims × vws); the world shadow ray
+    // `origin`/`dir` and `max_t` are already world, so a scaled grid occludes
+    // at its true world footprint and `shadow_max_dist` stays world-uniform.
+    let vws = grid_cameras[g].world_origin.w;
+    let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z)) * vws;
 
     var p_chunk = vec3<i32>(floor(origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(dir));
@@ -504,7 +508,7 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
             // PF.2 — mip for this chunk from the receiver's screen distance
             // plus the travel along the shadow ray (mirrors march_grid).
             let mip = pick_mip(t_base + t_enter, mip_count);
-            let vsize = f32(1u << mip);
+            let vsize = f32(1u << mip) * vws; // SC.4 — world-unit voxel size
             let vsid_mip_u = vsid >> mip;
             let vsid_mip = i32(vsid_mip_u);
             let cz_mip = i32(CHUNK_Z >> mip);
@@ -821,7 +825,13 @@ fn march_grid(
     let aabb_mn = grid_static_meta[g].aabb_min;
     let aabb_mx = grid_static_meta[g].aabb_max;
     let occ_levels = grid_static_meta[g].chunk_occ_levels;
-    let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z));
+    // SC.4 — per-grid voxel_world_size (world units per voxel). Scaling the
+    // chunk + voxel cell dims by it makes the WHOLE march run in world-local
+    // units: `t` (unit ray_dir) stays world, so `best_t` compares across
+    // grids, voxel indexing (entry_in_chunk / vsize) stays correct, and the
+    // volumetric seg_len (t_span / vsize) stays a voxel count. 1.0 ⇒ identity.
+    let vws = grid_cameras[g].world_origin.w;
+    let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z)) * vws;
 
     var p_chunk = vec3<i32>(floor(ray_origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(ray_dir));
@@ -876,7 +886,7 @@ fn march_grid(
             // Voxels are `vsize` world units; the chunk holds
             // `vsid>>mip` × `vsid>>mip` × `CHUNK_Z>>mip` of them.
             let mip = pick_mip(t_enter, mip_count);
-            let vsize = f32(1u << mip);
+            let vsize = f32(1u << mip) * vws; // SC.4 — world-unit voxel size
             let vsid_mip_u = vsid >> mip;
             let vsid_mip = i32(vsid_mip_u);
             let cz_mip = i32(CHUNK_Z >> mip);

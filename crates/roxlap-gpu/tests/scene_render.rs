@@ -104,6 +104,35 @@ fn block_chunk(vsid: u32, top: u8, bot: u8) -> Vxl {
     }
 }
 
+/// [`block_chunk`] with an explicit BGRA colour (SC.4 — two colours so a
+/// two-grid composite test can tell which grid won the min-t depth test).
+fn block_chunk_bgra(vsid: u32, top: u8, bot: u8, bgra: [u8; 4]) -> Vxl {
+    let n_cols = (vsid as usize) * (vsid as usize);
+    let n_vox = (bot - top + 1) as usize;
+    let mut data: Vec<u8> = Vec::with_capacity(n_cols * (4 + n_vox * 4));
+    let mut column_offset: Vec<u32> = Vec::with_capacity(n_cols + 1);
+    for _ in 0..n_cols {
+        column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+        data.extend_from_slice(&[0, top, bot, 0]);
+        for _ in 0..n_vox {
+            data.extend_from_slice(&bgra);
+        }
+    }
+    column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+    Vxl {
+        vsid,
+        ipo: [0.0; 3],
+        ist: [1.0, 0.0, 0.0],
+        ihe: [0.0, 0.0, 1.0],
+        ifo: [0.0, 1.0, 0.0],
+        data: data.into_boxed_slice(),
+        column_offset: column_offset.into_boxed_slice(),
+        mip_base_offsets: Box::new([0, n_cols + 1]),
+        vbit: Box::new([]),
+        vbiti: 0,
+    }
+}
+
 /// Recognisably the orange block (`0x80ff_8000` at brightness 1.0 →
 /// ~(255,128,0)), not the bluish sky (~(120,150,220)). Loose because
 /// coarse mips average the (uniform) block colour.
@@ -983,6 +1012,164 @@ fn scene_dda_cross_grid_sun_shadow() {
     assert!(
         lum(shadowed) < lum(lit),
         "grid B's wall must cast a cross-grid sun shadow on grid A: lit {lit:#08x} -> shadowed {shadowed:#08x}",
+    );
+}
+
+#[test]
+fn scene_dda_scaled_grid_composites_by_world_depth() {
+    // SC.4 — GPU per-grid voxel_world_size. Two grids at the same origin,
+    // both blocks on the camera column but different scale, so the world and
+    // voxel-frame depth metrics DISAGREE:
+    //  - Grid A (vws 1.0): RED block at chunk y=4 → world y-near 128.
+    //  - Grid B (vws 2.0): BLUE block at chunk y=3 → world y-near 3·32·2 = 192
+    //    (FARTHER in world), but voxel-near 96 (< A's 128).
+    // Correct (world depth): A (128) occludes B (192) → RED wins the min-t
+    // composite. Without the shader's chunk_dim/vsize × vws the marcher would
+    // put B at t≈96 < 128 → BLUE would win.
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let red = [0x00u8, 0x00, 0xff, 0x80]; // BGRA → R=0xff
+    let blue = [0xffu8, 0x00, 0x00, 0x80]; // BGRA → B=0xff
+    let grid_a = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 8, 1],
+        pool_dims: [1, 8, 1],
+        chunks: vec![(
+            [0, 4, 0],
+            decompress_chunk(&block_chunk_bgra(vsid, 0, 31, red)),
+        )],
+    };
+    let grid_b = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 8, 1],
+        pool_dims: [1, 8, 1],
+        chunks: vec![(
+            [0, 3, 0],
+            decompress_chunk(&block_chunk_bgra(vsid, 0, 31, blue)),
+        )],
+    };
+    let scene = GpuSceneResident::upload(
+        &gpu.device,
+        &SceneUpload {
+            grids: vec![grid_a, grid_b],
+        },
+    );
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // World camera at (16,0,16) looking +y. Both grids sit at origin (0,0,0),
+    // so each per-grid (world-local) camera equals the world camera.
+    let cam = Camera {
+        position: [16.0, 0.0, 16.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let xf_a = GridWorldTransform::default(); // vws 1.0
+    let xf_b = GridWorldTransform {
+        voxel_world_size: 2.0,
+        ..GridWorldTransform::default()
+    };
+    let fb = renderer.render_with_transforms(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam, cam],
+        &[xf_a, xf_b],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+    let centre = (h / 2 * w + w / 2) as usize;
+    let p = fb[centre];
+    let (r, b) = (p & 0xff, (p >> 16) & 0xff);
+    // Shading scales all channels uniformly, so the R>B ratio is preserved.
+    assert!(
+        r > b,
+        "the world-nearer vws=1 RED grid must win the min-t composite; BLUE \
+         here means grid B's vws=2 depth (chunk_dim/vsize × vws) wasn't applied: {p:#08x}"
+    );
+}
+
+#[test]
+fn scene_dda_fine_scaled_grid_composites_by_world_depth() {
+    // SC.4 — the vws<1 (fine grid) mirror of the coarse test, for symmetry.
+    //  - Grid A (vws 1.0): RED block at chunk y=3 → world y-near 96.
+    //  - Grid B (vws 0.5): BLUE block at chunk y=4 → world y-near 4·32·0.5 = 64
+    //    (NEARER in world), but voxel-near 128 (> A's 96).
+    // Correct (world depth): B (64) occludes A (96) → BLUE wins. Without the
+    // × vws the marcher would put B at t≈128 > 96 → RED would win.
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let red = [0x00u8, 0x00, 0xff, 0x80];
+    let blue = [0xffu8, 0x00, 0x00, 0x80];
+    let grid_a = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 8, 1],
+        pool_dims: [1, 8, 1],
+        chunks: vec![(
+            [0, 3, 0],
+            decompress_chunk(&block_chunk_bgra(vsid, 0, 31, red)),
+        )],
+    };
+    let grid_b = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 8, 1],
+        pool_dims: [1, 8, 1],
+        chunks: vec![(
+            [0, 4, 0],
+            decompress_chunk(&block_chunk_bgra(vsid, 0, 31, blue)),
+        )],
+    };
+    let scene = GpuSceneResident::upload(
+        &gpu.device,
+        &SceneUpload {
+            grids: vec![grid_a, grid_b],
+        },
+    );
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // Camera at (8,0,8): inside both blocks' world x/z spans (grid B's
+    // vws=0.5 block only reaches world 16 in x and z).
+    let cam = Camera {
+        position: [8.0, 0.0, 8.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let xf_a = GridWorldTransform::default(); // vws 1.0
+    let xf_b = GridWorldTransform {
+        voxel_world_size: 0.5,
+        ..GridWorldTransform::default()
+    };
+    let fb = renderer.render_with_transforms(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam, cam],
+        &[xf_a, xf_b],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+    let centre = (h / 2 * w + w / 2) as usize;
+    let p = fb[centre];
+    let (r, b) = (p & 0xff, (p >> 16) & 0xff);
+    assert!(
+        b > r,
+        "the world-nearer vws=0.5 BLUE grid must win the min-t composite; RED \
+         here means grid B's vws=0.5 depth wasn't applied: {p:#08x}"
     );
 }
 
