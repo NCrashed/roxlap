@@ -26,6 +26,11 @@ serde = { workspace = true }
 # themselves. Pinned to 1.x for wire stability.
 bincode = "1"
 
+# QE.2b house convention: library diagnostics go through the `log`
+# facade (not eprintln). SC — `save_snapshot` warns when a grid carries
+# a non-1.0 `voxel_world_size`, which the wire format doesn't persist yet.
+log = { workspace = true }
+
 # rayon everywhere, mirroring roxlap-core: the bake waves (chunks.rs)
 # and the scissor row-bands (render.rs) par_iter unconditionally.
 # rayon compiles on plain wasm32 (single-threaded until the host's

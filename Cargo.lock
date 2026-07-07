@@ -2678,6 +2678,7 @@ dependencies = [
  "bincode",
  "crossbeam-channel",
  "glam 0.30.10",
+ "log",
  "rayon",
  "roxlap-cavegen",
  "roxlap-core",

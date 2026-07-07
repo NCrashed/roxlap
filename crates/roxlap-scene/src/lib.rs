@@ -1500,50 +1500,33 @@ mod tests {
 
     #[test]
     fn raycast_nearest_is_by_world_distance_across_scales() {
-        // SC — two grids on the SAME world column (world xy = 1.0):
-        //  - fine grid (vws 0.5): voxel at grid-local (2,2,30) → world
-        //    xy [1.0,1.5), world z [15,15.5). Voxel-local depth 30.
-        //  - coarse grid (vws 2.0): voxel at grid-local (0,0,5) → world
-        //    xy [0,2), world z [10,12). Voxel-local depth 5.
-        // The coarse voxel is FARTHER in voxel-local units? No — it's
-        // nearer in BOTH here; the point is the fine voxel's huge
-        // voxel-local t (30) must NOT beat the coarse voxel's small
-        // world t. A voxel-local `t` compare would rank coarse (5) <
-        // fine (30) and happen to agree; to make the test bite, the
-        // world distances (coarse 10 < fine 15) are what the assert
-        // pins — a missing `* vws` on either grid would shift these.
+        // SC — the two metrics DISAGREE, so a missing `* vws` on `t`
+        // flips the winner. Both voxels on the world column at xy = 1.0:
+        //  - grid A (vws 2.0): voxel (0,0,6) → WORLD z 12, voxel-LOCAL 6.
+        //  - grid B (vws 0.5): voxel (2,2,20) → WORLD z 10, voxel-LOCAL 20.
+        // Correct (world t): B(10) < A(12) → hit B.
+        // Broken (voxel-local t, no `* vws`): A(6) < B(20) → hit A.
+        // So `hit.grid == B` bites iff the conversion is applied.
         let mut scene = Scene::new();
-        let fine = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 0.5));
-        let coarse = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 2.0));
+        let a = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 2.0));
+        let b = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 0.5));
         scene
-            .grid_mut(fine)
+            .grid_mut(a)
             .unwrap()
-            .set_voxel(IVec3::new(2, 2, 30), Some(VoxColor(0x80_00_ff_00)));
+            .set_voxel(IVec3::new(0, 0, 6), Some(VoxColor(0x80_ff_00_00)));
         scene
-            .grid_mut(coarse)
+            .grid_mut(b)
             .unwrap()
-            .set_voxel(IVec3::new(0, 0, 5), Some(VoxColor(0x80_ff_00_00)));
+            .set_voxel(IVec3::new(2, 2, 20), Some(VoxColor(0x80_00_ff_00)));
         let hit = scene
             .raycast(DVec3::new(1.0, 1.0, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
             .expect("hits the world-nearer voxel");
-        assert_eq!(hit.grid, coarse, "coarse voxel is nearer in WORLD units");
-        assert!((hit.t - 10.0).abs() < 1e-4, "world t≈10, got {}", hit.t);
-        // And the fine voxel alone reports its WORLD t (15), not its
-        // voxel-local t (30) — the t-conversion in action.
-        let mut fine_only = Scene::new();
-        let f = fine_only.add_grid(GridTransform::at_scale(DVec3::ZERO, 0.5));
-        fine_only
-            .grid_mut(f)
-            .unwrap()
-            .set_voxel(IVec3::new(2, 2, 30), Some(VoxColor(0x80_00_ff_00)));
-        let fh = fine_only
-            .raycast(DVec3::new(1.0, 1.0, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
-            .expect("fine voxel hit");
-        assert!(
-            (fh.t - 15.0).abs() < 1e-4,
-            "fine world t≈15 (not voxel-local 30), got {}",
-            fh.t
+        assert_eq!(
+            hit.grid, b,
+            "grid B is nearer in WORLD units (10 < 12) though FARTHER in \
+             voxel-local units (20 > 6) — the t-conversion must decide by world"
         );
+        assert!((hit.t - 10.0).abs() < 1e-4, "world t≈10, got {}", hit.t);
     }
 
     #[test]

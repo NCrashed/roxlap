@@ -302,11 +302,17 @@ pub const SNAPSHOT_MAGIC: [u8; 4] = *b"RXSS";
 /// [`SnapshotLoadError::UnsupportedVersion`] — never a silent misparse
 /// (the pre-QE.5 failure mode of bare positional bincode).
 ///
-/// SC — per-grid `voxel_world_size` is persisted as a NEW trailing
-/// `#[serde(default)]` field on [`GridSnapshot`] (not inside the
-/// serialized `GridTransform`, whose wire form stays frozen), so old v1
-/// saves still load (their missing field defaults to `1.0`) — no
-/// version bump, the checked-in v1 fixture stays valid.
+/// SC — per-grid `voxel_world_size` is NOT persisted yet, and this is
+/// still v1. bincode is strictly positional: a trailing field with
+/// `#[serde(default)]` does NOT rescue an old blob (a short read is
+/// "unexpected end of file", not a default — the checked-in v1 fixture
+/// proves it; the existing `#[serde(default)]` fields on [`GridSnapshot`]
+/// are present in the regenerated fixture, not bincode-tolerated). So
+/// `GridTransform`'s wire form is frozen (`#[serde(skip)]` on the field)
+/// and a scaled grid restores at `voxel_world_size = 1.0`. Persisting it
+/// is a deferred substage (SC.snap): bump to **2** and keep a
+/// `GridTransformV1`/`GridSnapshotV1` shadow shape to deserialize v1
+/// blobs (→ 1.0), so the forever-loadable v1 fixture survives.
 pub const SNAPSHOT_VERSION: u32 = 1;
 
 /// Errors from [`Scene::load_snapshot`].
@@ -364,6 +370,21 @@ impl Scene {
     /// format's evolution story.
     #[must_use]
     pub fn save_snapshot(&self) -> Vec<u8> {
+        // SC — the v1 wire format doesn't persist per-grid
+        // `voxel_world_size` (see [`SNAPSHOT_VERSION`]); a scaled grid
+        // restores at 1.0. Warn so a silent flatten of a "planet + tiny
+        // ship" scene doesn't go unnoticed until SC.snap lands.
+        if let Some((id, vws)) = self
+            .grids()
+            .map(|(id, g)| (id, g.transform.voxel_world_size))
+            .find(|&(_, vws)| (vws - 1.0).abs() > f64::EPSILON)
+        {
+            log::warn!(
+                "save_snapshot: grid {id:?} has voxel_world_size {vws} but the \
+                 snapshot format does not persist per-grid scale yet — it will \
+                 restore at 1.0 (SC.snap)"
+            );
+        }
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&SNAPSHOT_MAGIC);
         out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());

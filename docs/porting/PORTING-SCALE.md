@@ -27,7 +27,12 @@ sweeps (CPU/scene + GPU), both 2026-07-07.
 - SC.2 — pending (CPU cross-grid shadows: WorldShadowCtx + occluder).
 - SC.3 — pending (collision + streaming + LOD thresholds).
 - SC.4 — pending (GPU: scale in `world_origin.w`, shaders, sprite shadows).
-- SC.5 — pending (demo + book chapter + CHANGELOG).
+- SC.5 — pending (demo + book chapter + CHANGELOG). **GATE: a
+  user-facing scaled scene (the planet+ship demo) MUST NOT ship before
+  SC.snap** — until scale persists, saving such a scene silently
+  restores flat at 1.0. `save_snapshot` `log::warn!`s on a non-1.0
+  grid as a stopgap, but the demo shouldn't advertise a feature that
+  doesn't survive a save. Order: SC.snap before SC.5's scaled demo.
 
 ## Goal
 
