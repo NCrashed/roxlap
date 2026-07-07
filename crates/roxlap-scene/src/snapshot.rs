@@ -323,20 +323,22 @@ impl Scene {
             // SC.snap — `transform`'s wire form omits `voxel_world_size`
             // (`#[serde(skip)]`); the persisted value rides in the sibling
             // `gsnap.voxel_world_size`. Fold it back into the transform.
-            // Guard untrusted bytes: a non-finite / ≤0 scale would break the
-            // marcher (GPU `chunk_dim = 0` → NaN), so fall back to 1.0.
+            // Guard untrusted bytes to a sane range: not just ≤0 / non-finite
+            // (which break the marcher — GPU `chunk_dim = 0` → NaN) but also
+            // subnormal-near-zero (1e-300 > 0 yet `vsid · 1e-300 ≈ 0`) and
+            // absurdly-huge finite values. `[1e-6, 1e6]` spans any sane
+            // planet↔grain ratio with margin; out-of-range → fall back to 1.0.
             let mut transform = gsnap.transform;
-            transform.voxel_world_size =
-                if gsnap.voxel_world_size.is_finite() && gsnap.voxel_world_size > 0.0 {
-                    gsnap.voxel_world_size
-                } else {
-                    log::warn!(
-                        "load_snapshot: grid {id:?} has invalid voxel_world_size \
-                         {} — restoring at 1.0",
-                        gsnap.voxel_world_size
-                    );
-                    1.0
-                };
+            let vws = gsnap.voxel_world_size;
+            transform.voxel_world_size = if vws.is_finite() && (1e-6..=1e6).contains(&vws) {
+                vws
+            } else {
+                log::warn!(
+                    "load_snapshot: grid {id:?} has out-of-range \
+                         voxel_world_size {vws} — restoring at 1.0"
+                );
+                1.0
+            };
             let mut grid = Grid::new(transform);
             for (addr, bytes) in &gsnap.chunks {
                 let mut vxl =
@@ -533,6 +535,62 @@ mod tests {
         );
         assert_eq!(g.transform.origin, DVec3::new(5.0, -3.0, 0.0));
         assert!(g.voxel_solid(IVec3::new(1, 2, 100)));
+    }
+
+    #[test]
+    fn sc_snap_out_of_range_scale_restores_at_one() {
+        // The load-side guard rejects corrupt/absurd persisted scale — not
+        // just ≤0 / non-finite but subnormal-near-zero and huge finite values,
+        // any of which collapse the marcher's chunk_dim toward 0 (→ NaN on
+        // GPU). All fall back to 1.0.
+        for bad in [0.0, -2.0, f64::NAN, f64::INFINITY, 1e-300, 1e300] {
+            let snap = SceneSnapshot {
+                next_grid_id: 1,
+                grids: vec![(
+                    GridId::from_raw_for_test(0),
+                    GridSnapshot {
+                        transform: GridTransform::identity(),
+                        chunks: vec![],
+                        chunk_versions: vec![],
+                        name: None,
+                        render_sky: true,
+                        mip_levels_override: None,
+                        lod_thresholds: LodThresholds::always_near(),
+                        stream_radius: StreamRadius::default(),
+                        voxel_world_size: bad,
+                    },
+                )],
+            };
+            let scene = Scene::from_snapshot(&snap).expect("restore");
+            let (_, g) = scene.grids().next().expect("one grid");
+            assert_eq!(
+                g.transform.voxel_world_size, 1.0,
+                "out-of-range vws {bad} must restore at 1.0"
+            );
+        }
+        // A sane extreme within [1e-6, 1e6] is preserved verbatim.
+        let ok = SceneSnapshot {
+            next_grid_id: 1,
+            grids: vec![(
+                GridId::from_raw_for_test(0),
+                GridSnapshot {
+                    transform: GridTransform::identity(),
+                    chunks: vec![],
+                    chunk_versions: vec![],
+                    name: None,
+                    render_sky: true,
+                    mip_levels_override: None,
+                    lod_thresholds: LodThresholds::always_near(),
+                    stream_radius: StreamRadius::default(),
+                    voxel_world_size: 1000.0,
+                },
+            )],
+        };
+        let scene = Scene::from_snapshot(&ok).expect("restore");
+        assert_eq!(
+            scene.grids().next().unwrap().1.transform.voxel_world_size,
+            1000.0
+        );
     }
 
     /// A 2-grid scene with ~100 chunks total — the validation

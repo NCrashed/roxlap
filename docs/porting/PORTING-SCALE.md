@@ -20,14 +20,21 @@ sweeps (CPU/scene + GPU), both 2026-07-07.
   persists `voxel_world_size` as a sibling field on `GridSnapshot`;
   `GridTransform`'s own wire form stays `#[serde(skip)]`-frozen. The v1
   fixture still loads via a `GridSnapshotV1` shadow shape (→ 1.0).
-- SC.1 — pending (CPU render: camera + lights scaling).
-- SC.2 — pending (CPU cross-grid shadows: WorldShadowCtx + occluder).
-- SC.3 — pending (collision + streaming + LOD thresholds).
-- SC.4 — pending (GPU: scale in `world_origin.w`, shaders, sprite shadows).
-- SC.snap — LANDED (see the substage entry below). Scale now survives a
-  save, so the SC.5 gate is cleared.
+- SC.1 — LANDED (CPU render: camera/lights /vws + depth ×vws² + ray
+  thresholds ÷vws²). Detailed entry below.
+- SC.2 — LANDED (CPU cross-grid shadows: caster ×vws + occluder ÷vws +
+  world-uniform shadow cap + f64 lift). Detailed entry below.
+- SC.3 — LANDED (collision + streaming + LOD + render cull scaled).
+  Detailed entry below.
+- SC.4 — LANDED (GPU: `world_origin.w` = vws, marcher chunk_dim/vsize
+  ×vws). Detailed entry below.
+- SC.snap — LANDED (snapshot v2 persists vws). Detailed entry below; the
+  SC.5 gate is cleared (scale now survives a save).
 - SC.5 — pending (demo + book chapter + CHANGELOG). The SC.snap gate is
-  now cleared: a scaled scene persists correctly across save/load.
+  cleared: a scaled scene persists correctly across save/load. Last
+  substage.
+(Per-substage detail — tests, gotchas, exact edits — is in the "Substages"
+section below; this list is just the at-a-glance status.)
 
 ## Goal
 
@@ -141,8 +148,11 @@ pattern from sprite volumes to terrain grids** — not greenfield.
   transform's frozen shape). `load_snapshot` dispatches on version: v2
   decodes `GridSnapshot` directly; v1 decodes a private `GridSnapshotV1`
   shadow shape (the exact frozen v1 field list, no `voxel_world_size`) and
-  `From`-converts → vws 1.0. Restore guards untrusted bytes (non-finite/≤0
-  vws → 1.0 + warn). Checked-in **`snapshot_v2.rxs`** fixture + `v2_fixture_
+  `From`-converts → vws 1.0. Restore guards untrusted bytes to a sane range
+  **`[1e-6, 1e6]`** (not just ≤0/non-finite but subnormal-near-zero like
+  1e-300, which `vsid·vws ≈ 0` → NaN on GPU, and absurd huge values) →
+  out-of-range falls back to 1.0 + warn. Checked-in **`snapshot_v2.rxs`**
+  fixture + `v2_fixture_
   loads` lock the v2 wire alongside the forever-frozen v1 fixture; the
   regen helper is repointed to v2 so it can't clobber v1 (the footgun now
   that `save_snapshot` emits v2). Tests: `sc_snap_scaled_grid_survives_
