@@ -44,8 +44,50 @@ against crates.io/docs.rs).
   0.5 outdoors and must read as FULLY dry. Tests use ABSOLUTE bounds
   (`dry.mix < 0.05`, `dry.feedback < min+0.15`) so this can't
   regress behind a wetter cavern. 5 tests total.
-- AU.2 — pending (kira playback backend, feature-gated).
-- AU.3 — pending (cave-demo integration).
+- AU.2 — LANDED 2026-07-07: playback backend behind the `kira`
+  feature (off by default — CI's default build/test never touches
+  it, no ALSA on the runner). `synth` module (deterministic LCG
+  shot/impact/hum `SoundBuffer`s, no binary assets); `backend` module
+  = the `AudioOut` trait boundary (every kira type stays behind it,
+  hazard 1) + public `SourcePool` voice policy (pure, unit-tested:
+  one-shots stealable oldest-first, loops held till stopped —
+  reusable by custom backends); `kira_out::KiraAudio` implements it
+  with the entry-doc topology (one `SendTrack`+`Reverb`, a pool of 24
+  `SpatialTrack`s each with a lowpass `Filter` + per-source reverb
+  send; 120 ms source tweens / 1 s listener tweens). `audio_probe`
+  example (`--features kira`) walks a listener out of a sealed room
+  through a doorway for a live listen. **kira 0.12 API reality
+  check** (research sketch was partly wrong): filter/reverb param
+  setters ARE runtime (macro-generated `set_cutoff/set_feedback/…(v,
+  Tween)`), but `StaticSoundData` lives at
+  `kira::sound::static_sound`, `SpatialTrackHandle` has NO `stop`
+  (keep the `StaticSoundHandle` and stop THAT for loops), positions
+  are `mint` types (via `glam/mint`), and `set_send` returns a
+  `Result`. Native-only; flake gained `alsa-lib` (build+runtime) for
+  the dev shell. 21 crate tests (synth shapes/loop/determinism +
+  pool policy + a device-free `AudioOut` mock pinning the trait
+  contract) — all backend-agnostic, so they run in CI's default
+  (no-kira) build.
+  Review round (user, same day):
+  - **Reverb wired as a proper aux send**: the reverb runs FULLY WET
+    (`Mix(1.0)`), room wetness is the send-track VOLUME (`mix_to_db`),
+    NOT the reverb dry/wet. The original `Mix(0..0.5)` on a parallel
+    send re-added each source's dry signal to the master — sources got
+    LOUDER and comb-filtered the MORE open the space (backwards).
+  - **Voice stealing now cuts the old sound**: dropping a
+    `StaticSoundHandle` doesn't stop it in kira, so `start` `stop`s
+    the old sound (15 ms fade) before reusing the slot.
+  - Renamed tweens (`FAST_TWEEN_MS` pose+occlusion / `ENV_TWEEN_MS`
+    reverb env); documented f64→f32 `mint_pos` truncation and the
+    deliberate 96 (spatial) < 128 (occlusion) distance nesting.
+- AU.3 — pending (cave-demo integration). **Voice-budget design (from
+  the AU.2 review): loops never steal and never reclaim, so a pool of
+  24 shared slots will STARVE one-shots if there are ~20+ crystal-hum
+  loops — `play` for a gunshot silently returns `None`.** AU.3 must
+  either split the pool (a small loop budget + a larger one-shot
+  budget) or, better, distance-cull the hums host-side so only the
+  nearest N crystals loop at once (start/stop loops as the listener
+  moves). The latter also bounds CPU. Decide before wiring crystals.
 - AU.4 — pending (book chapter + CHANGELOG).
 - Deferred beyond the stage: wasm audio (see decision 7), per-material
   acoustics, Doppler, scene-demo tab.

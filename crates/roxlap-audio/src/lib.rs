@@ -24,9 +24,19 @@
 use glam::{DVec3, IVec3};
 use roxlap_scene::Scene;
 
+mod backend;
 mod cavity;
+pub mod synth;
 
+#[cfg(feature = "kira")]
+mod kira_out;
+
+pub use backend::{AudioOut, SoundKey, SourceId, SourcePool};
 pub use cavity::{probe_cavity, CavityConfig, CavityEstimator, CavityProbe, ListenerAcoustics};
+pub use synth::SoundBuffer;
+
+#[cfg(feature = "kira")]
+pub use kira_out::KiraAudio;
 
 /// Tuning knobs for [`source_acoustics`]. The defaults are the cave-demo
 /// tuning; every field is plain data so hosts can persist or lerp them.

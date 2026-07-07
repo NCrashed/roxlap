@@ -50,6 +50,13 @@
             # it via pkg-config — see `buildInputs` below — and the
             # runtime loader needs it on LD_LIBRARY_PATH too).
             SDL2
+            # AU.2: `roxlap-audio`'s optional `kira` feature uses cpal,
+            # whose `alsa-sys` links libasound on Linux (pkg-config at
+            # build via `buildInputs`, `libasound.so` at runtime here).
+            # The feature is off by default, so a plain `cargo build`
+            # (and CI) never touches ALSA — only
+            # `--features kira` / the audio_probe example do.
+            alsa-lib
           ];
 
           # R10.X.2: pin a specific nightly via rust-toolchain.toml.
@@ -123,7 +130,8 @@
             # pkg-config; mkShell exposes `buildInputs` on
             # PKG_CONFIG_PATH so `sdl2.pc` is discoverable. macOS uses
             # the SDL2 framework / Homebrew copy on the default path.
-            buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.SDL2 ];
+            buildInputs =
+              pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.SDL2 pkgs.alsa-lib ];
 
             # winit + softbuffer link these via dlopen at runtime;
             # nix mkShell only sets PATH / PKG_CONFIG_PATH, so we add

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: voxel-aware acoustics — `roxlap-audio` (AU stage, in progress)
+
+- New crate `roxlap-audio`: sound that knows about the voxels. The
+  acoustics **core** is pure parameter computation over a `Scene` (no
+  audio device, no threads, fully unit-tested): `source_acoustics`
+  casts a 9-ray fan from each source to the listener accumulating
+  exact solid path *thickness* (a doorway leaks, five voxels of rock
+  muffle more than one) into an occlusion gain + lowpass cutoff +
+  reverb send; `CavityEstimator` casts a 32-ray golden-spiral fan
+  from the listener (room size from the enclosed free path, openness
+  from sky escape) into smoothed reverb feedback/mix — a cavern
+  rings, open ground is dry.
+- Playback is opt-in behind the `kira` feature (native; kira 0.12):
+  `KiraAudio` wires one shared reverb send + a pool of spatial voices,
+  each with a per-source lowpass and reverb send, applying the core's
+  parameters with tweens. Off by default — a plain build/test never
+  pulls in an audio backend. Demo sounds are synthesized (no binary
+  assets); an `audio_probe` example walks a listener out of a sealed
+  room through a doorway for a live listen.
+
 ### Changed: MSRV corrected to 1.92 (was a stale 1.77)
 
 - The declared `rust-version = "1.77"` had silently rotted: egui
