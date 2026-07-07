@@ -172,6 +172,21 @@ pub fn parse(bytes: &[u8]) -> Result<Kvx, ParseError> {
     let ypivot = cur.read_u32()?;
     let zpivot = cur.read_u32()?;
 
+    // Fuzz hardening: `xsiz`/`ysiz` come straight from the header, so
+    // bound every table allocation by the bytes actually present BEFORE
+    // allocating — a hostile header otherwise buys a multi-GiB
+    // `with_capacity` from a hand-sized input (found by the CI
+    // smoke-fuzz job on its first run). The offset tables alone need
+    // `(xsiz+1)·4 + xsiz·(ysiz+1)·2` bytes between header and palette.
+    let body = (bytes.len() - HEADER_LEN - PALETTE_LEN) as u64;
+    let table_bytes = (u64::from(xsiz) + 1) * 4 + u64::from(xsiz) * (u64::from(ysiz) + 1) * 2;
+    if table_bytes > body {
+        return Err(ParseError::Truncated {
+            at: HEADER_LEN,
+            need: usize::try_from(table_bytes).unwrap_or(usize::MAX),
+        });
+    }
+
     let xoff_len = xsiz as usize + 1;
     let mut xoffset = Vec::with_capacity(xoff_len);
     for _ in 0..xoff_len {
@@ -371,5 +386,32 @@ mod tests {
     fn parse_truncated_fails() {
         let r = parse(&[0u8; 16]);
         assert!(matches!(r, Err(ParseError::TooSmall { .. })));
+    }
+
+    /// Regression for the CI smoke-fuzz OOM: a hand-sized input whose
+    /// header claims `xsiz = ysiz = 0x7d7d_7d7d` must be rejected by
+    /// the table-budget check BEFORE any dimension-sized allocation
+    /// (the original code did `Vec::with_capacity(xsiz + 1)` first —
+    /// an 8.4 GB malloc from ~700 bytes).
+    #[test]
+    fn parse_hostile_dims_rejected_without_alloc() {
+        let mut b = vec![0x7du8; HEADER_LEN + PALETTE_LEN + 64];
+        b[0..4].copy_from_slice(&0u32.to_le_bytes()); // numbytes (unused)
+                                                      // xsiz/ysiz/zsiz/pivots stay 0x7d7d7d7d from the fill.
+        let r = parse(&b);
+        assert!(
+            matches!(r, Err(ParseError::Truncated { at: 28, .. })),
+            "hostile dims must fail the pre-alloc table budget: {r:?}"
+        );
+
+        // And a header whose tables just barely overrun a tiny body.
+        let mut small = vec![0u8; HEADER_LEN + PALETTE_LEN + 4];
+        small[4..8].copy_from_slice(&2u32.to_le_bytes()); // xsiz = 2
+        small[8..12].copy_from_slice(&2u32.to_le_bytes()); // ysiz = 2
+        let r = parse(&small);
+        assert!(
+            matches!(r, Err(ParseError::Truncated { .. })),
+            "undersized table region must be rejected: {r:?}"
+        );
     }
 }
