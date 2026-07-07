@@ -61,7 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-D warnings`, catching broken intra-doc links before docs.rs
   does), and **smoke-fuzz** (all 8 `roxlap-formats` fuzz targets,
   30 s each — corpus replay + short random walk on every PR;
-  previously local-only).
+  previously local-only). It earned its keep immediately, hardening
+  the `.kvx` parser against two crafted-header bugs a hostile file
+  could trigger: an OOM from a dimension-sized `Vec::with_capacity`
+  before any bounds check, and an integer overflow in the very budget
+  check that fixes it (`xsiz·ysiz·2` past `u64` — now computed in
+  `u128`). Both are bounded before allocation and pinned by tests.
 - Book caught up to 0.24.0: the GPU occupancy pyramid in the
   Rendering chapter, `BillboardActorDef::scale` + the `.rkc`
   lifecycle calls in Sprites, and a **Troubleshooting** section in

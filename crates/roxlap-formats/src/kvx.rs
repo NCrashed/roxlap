@@ -176,10 +176,13 @@ pub fn parse(bytes: &[u8]) -> Result<Kvx, ParseError> {
     // bound every table allocation by the bytes actually present BEFORE
     // allocating — a hostile header otherwise buys a multi-GiB
     // `with_capacity` from a hand-sized input (found by the CI
-    // smoke-fuzz job on its first run). The offset tables alone need
+    // smoke-fuzz job). The offset tables alone need
     // `(xsiz+1)·4 + xsiz·(ysiz+1)·2` bytes between header and palette.
-    let body = (bytes.len() - HEADER_LEN - PALETTE_LEN) as u64;
-    let table_bytes = (u64::from(xsiz) + 1) * 4 + u64::from(xsiz) * (u64::from(ysiz) + 1) * 2;
+    // Compute in u128: `xsiz·ysiz·2` with both at `u32::MAX` overflows
+    // u64 (≈3.7e19 > 1.8e19) — the fuzzer's second find, an overflow in
+    // this very guard.
+    let body = (bytes.len() - HEADER_LEN - PALETTE_LEN) as u128;
+    let table_bytes = (u128::from(xsiz) + 1) * 4 + u128::from(xsiz) * (u128::from(ysiz) + 1) * 2;
     if table_bytes > body {
         return Err(ParseError::Truncated {
             at: HEADER_LEN,
@@ -389,20 +392,31 @@ mod tests {
     }
 
     /// Regression for the CI smoke-fuzz OOM: a hand-sized input whose
-    /// header claims `xsiz = ysiz = 0x7d7d_7d7d` must be rejected by
-    /// the table-budget check BEFORE any dimension-sized allocation
-    /// (the original code did `Vec::with_capacity(xsiz + 1)` first —
-    /// an 8.4 GB malloc from ~700 bytes).
+    /// header claims a huge `xsiz`/`ysiz` must be rejected by the
+    /// table-budget check BEFORE any dimension-sized allocation (the
+    /// original code did `Vec::with_capacity(xsiz + 1)` first — an
+    /// 8.4 GB malloc from ~700 bytes). `xsiz = ysiz = u32::MAX` also
+    /// exercises the budget's own overflow: `xsiz·ysiz·2` blows past
+    /// u64 (the fuzzer's second find), so the guard computes in u128.
     #[test]
     fn parse_hostile_dims_rejected_without_alloc() {
-        let mut b = vec![0x7du8; HEADER_LEN + PALETTE_LEN + 64];
+        let mut b = vec![0xffu8; HEADER_LEN + PALETTE_LEN + 64];
         b[0..4].copy_from_slice(&0u32.to_le_bytes()); // numbytes (unused)
-                                                      // xsiz/ysiz/zsiz/pivots stay 0x7d7d7d7d from the fill.
+                                                      // xsiz/ysiz/zsiz/pivots stay 0xffffffff from the fill.
         let r = parse(&b);
         assert!(
             matches!(r, Err(ParseError::Truncated { at: 28, .. })),
             "hostile dims must fail the pre-alloc table budget: {r:?}"
         );
+
+        // The mid-range case the earlier fix already covered (no u64
+        // overflow, but still a multi-GiB table budget vs a tiny body).
+        let mut mid = vec![0x7du8; HEADER_LEN + PALETTE_LEN + 64];
+        mid[0..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            parse(&mid),
+            Err(ParseError::Truncated { at: 28, .. })
+        ));
 
         // And a header whose tables just barely overrun a tiny body.
         let mut small = vec![0u8; HEADER_LEN + PALETTE_LEN + 4];
