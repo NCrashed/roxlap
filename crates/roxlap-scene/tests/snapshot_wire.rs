@@ -1,17 +1,18 @@
 //! QE.5b — snapshot **wire-format** compatibility gate.
 //!
-//! `tests/fixtures/snapshot_v1.rxs` is a checked-in
-//! [`Scene::save_snapshot`] blob (magic + version 1 + bincode
-//! payload) frozen when the envelope landed. [`v1_fixture_loads`]
+//! `tests/fixtures/snapshot_v{1,2}.rxs` are checked-in
+//! [`Scene::save_snapshot`] blobs (magic + version + bincode payload)
+//! frozen at each wire version. [`v1_fixture_loads`] / [`v2_fixture_loads`]
 //! must keep passing on every future engine version — that is the
-//! backward-compatibility promise the envelope exists for. If the
-//! payload shape ever has to change, bump
-//! `roxlap_scene::snapshot::SNAPSHOT_VERSION`, teach `load_snapshot`
-//! to migrate version 1, and leave this fixture untouched.
+//! backward-compatibility promise the envelope exists for. If the payload
+//! shape ever has to change, bump `roxlap_scene::snapshot::SNAPSHOT_VERSION`,
+//! add a version-N shadow shape to `load_snapshot`, and leave BOTH fixtures
+//! untouched (SC.snap did exactly this for v1→v2 + `voxel_world_size`).
 //!
-//! To regenerate after deliberately changing the reference scene
-//! (NOT after changing the wire format — see above):
-//! `cargo test -p roxlap-scene --test snapshot_wire -- --ignored`
+//! To regenerate the **v2** fixture after deliberately changing its
+//! reference scene (NOT after a wire-format change — see above):
+//! `cargo test -p roxlap-scene --test snapshot_wire -- --ignored`. The v1
+//! fixture is intentionally frozen (current `save_snapshot` emits v2).
 
 use glam::{DVec3, IVec3};
 use roxlap_scene::snapshot::SnapshotLoadError;
@@ -19,6 +20,8 @@ use roxlap_scene::VoxColor;
 use roxlap_scene::{GridTransform, LodThresholds, Scene, StreamRadius};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/snapshot_v1.rxs");
+/// SC.snap — a v2 blob with a scaled grid (see [`build_scaled_scene`]).
+const FIXTURE_V2: &[u8] = include_bytes!("fixtures/snapshot_v2.rxs");
 
 /// The scene the fixture encodes: two grids — a fully-configured
 /// named "terrain" grid with edits (versions non-zero) spanning a
@@ -115,15 +118,51 @@ fn rejects_bad_magic_truncation_and_future_versions() {
     ));
 }
 
-/// Regenerate the checked-in fixture from the reference scene. Only
-/// run deliberately (see the module docs):
-/// `cargo test -p roxlap-scene --test snapshot_wire -- --ignored`
+/// SC.snap — the v2 reference scene: one grid with a non-1
+/// `voxel_world_size` (the capability v2 adds) plus a couple of edits, so
+/// the v2 fixture proves persisted scale survives.
+fn build_scaled_scene() -> Scene {
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at_scale(DVec3::new(5.0, -3.0, 0.0), 0.25));
+    let g = scene.grid_mut(id).expect("grid just added");
+    g.name = Some("ship".to_owned());
+    g.set_voxel(IVec3::new(2, 3, 100), Some(VoxColor(0x8012_3456)));
+    scene
+}
+
+/// Assert `scene` matches [`build_scaled_scene`] — the persisted scale is
+/// the point.
+fn assert_scaled_scene(scene: &Scene) {
+    let (_, g) = scene.grids().next().expect("one grid");
+    assert_eq!(g.transform.voxel_world_size, 0.25, "v2 must persist scale");
+    assert_eq!(g.transform.origin, DVec3::new(5.0, -3.0, 0.0));
+    assert_eq!(g.name.as_deref(), Some("ship"));
+    assert!(g.voxel_solid(IVec3::new(2, 3, 100)));
+}
+
+/// SC.snap — a v2 blob (with a scaled grid) stays loadable, the same
+/// forever-promise as [`v1_fixture_loads`].
 #[test]
-#[ignore = "writes tests/fixtures/snapshot_v1.rxs; run manually"]
-fn regenerate_fixture() {
+fn v2_fixture_loads() {
+    let scene =
+        Scene::load_snapshot(FIXTURE_V2).expect("checked-in v2 fixture must stay loadable forever");
+    assert_scaled_scene(&scene);
+}
+
+/// Regenerate the checked-in **v2** fixture. Only run deliberately after a
+/// deliberate reference-scene change (NOT after a wire-format change — bump
+/// SNAPSHOT_VERSION and add a shadow shape instead):
+/// `cargo test -p roxlap-scene --test snapshot_wire -- --ignored`
+///
+/// The v1 fixture is intentionally NOT regenerable here: current
+/// `save_snapshot` emits v2, so the frozen `snapshot_v1.rxs` (the
+/// backward-compat gate) is left untouched by design.
+#[test]
+#[ignore = "writes tests/fixtures/snapshot_v2.rxs; run manually"]
+fn regenerate_v2_fixture() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/snapshot_v1.rxs"
+        "/tests/fixtures/snapshot_v2.rxs"
     );
-    std::fs::write(path, build_reference_scene().save_snapshot()).expect("write fixture");
+    std::fs::write(path, build_scaled_scene().save_snapshot()).expect("write fixture");
 }

@@ -128,14 +128,77 @@ pub struct GridSnapshot {
     /// QE.5b — [`crate::Grid::stream_radius`].
     #[serde(default)]
     pub stream_radius: StreamRadius,
-    // SC NOTE: per-grid `voxel_world_size` is NOT persisted yet. bincode
-    // is strictly positional (a missing trailing field is
-    // "unexpected end of file", NOT a serde default — the checked-in v1
-    // fixture proves it), so persisting scale needs a real version-2
-    // migration (a v1-shadow deserialize), deferred to a later SC
-    // substage. Until then a scaled grid restores at `voxel_world_size
-    // = 1.0`. The `GridTransform` wire form stays frozen
-    // (`#[serde(skip)]` on the field), so v1 saves load unchanged.
+    /// SC.snap (v2) — the grid's [`GridTransform::voxel_world_size`]. Stored
+    /// as a sibling field (not inside the transform, whose wire form stays
+    /// frozen with `#[serde(skip)]`). The `#[serde(default)]` covers
+    /// self-describing formats; the bincode positional gap between v1 and v2
+    /// is handled by [`GridSnapshotV1`] + the version dispatch in
+    /// [`Scene::load_snapshot`]. v1 blobs restore this at `1.0`.
+    #[serde(default = "one_f64")]
+    pub voxel_world_size: f64,
+}
+
+/// `voxel_world_size`'s default (`1.0`) for `#[serde(default)]` on
+/// self-describing formats — an unscaled grid.
+fn one_f64() -> f64 {
+    1.0
+}
+
+/// SC.snap — the **frozen v1** wire shape of [`SceneSnapshot`], used only to
+/// deserialize version-1 blobs (which predate the persisted scale). bincode
+/// is positional, so this must mirror v1's fields exactly — it has NO
+/// `voxel_world_size` (grids restore at `1.0` via [`From`]).
+#[derive(Deserialize)]
+struct SceneSnapshotV1 {
+    next_grid_id: u32,
+    grids: Vec<(GridId, GridSnapshotV1)>,
+}
+
+/// SC.snap — the frozen v1 [`GridSnapshot`] shape (no `voxel_world_size`).
+/// The field list + `#[serde(default)]`s must byte-match what v1
+/// `save_snapshot` wrote (the checked-in fixture is the gate).
+#[derive(Deserialize)]
+struct GridSnapshotV1 {
+    transform: GridTransform,
+    chunks: Vec<(IVec3, Vec<u8>)>,
+    #[serde(default)]
+    chunk_versions: Vec<(IVec3, u64)>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_render_sky")]
+    render_sky: bool,
+    #[serde(default)]
+    mip_levels_override: Option<u32>,
+    #[serde(default = "LodThresholds::always_near")]
+    lod_thresholds: LodThresholds,
+    #[serde(default)]
+    stream_radius: StreamRadius,
+}
+
+impl From<SceneSnapshotV1> for SceneSnapshot {
+    fn from(v1: SceneSnapshotV1) -> Self {
+        Self {
+            next_grid_id: v1.next_grid_id,
+            grids: v1.grids.into_iter().map(|(id, g)| (id, g.into())).collect(),
+        }
+    }
+}
+
+impl From<GridSnapshotV1> for GridSnapshot {
+    fn from(g: GridSnapshotV1) -> Self {
+        Self {
+            transform: g.transform,
+            chunks: g.chunks,
+            chunk_versions: g.chunk_versions,
+            name: g.name,
+            render_sky: g.render_sky,
+            mip_levels_override: g.mip_levels_override,
+            lod_thresholds: g.lod_thresholds,
+            stream_radius: g.stream_radius,
+            // v1 predates persisted scale — an unscaled grid.
+            voxel_world_size: 1.0,
+        }
+    }
 }
 
 /// `render_sky`'s [`crate::Grid::new`] default, for
@@ -231,6 +294,9 @@ impl Scene {
                     mip_levels_override: grid.mip_levels_override,
                     lod_thresholds: grid.lod_thresholds,
                     stream_radius: grid.stream_radius,
+                    // SC.snap — persist the grid's scale (transform's own wire
+                    // form omits it via #[serde(skip)]).
+                    voxel_world_size: grid.transform.voxel_world_size,
                 },
             ));
         }
@@ -254,11 +320,24 @@ impl Scene {
         let mut scene = Self::new();
         scene.next_grid_id = snap.next_grid_id;
         for (id, gsnap) in &snap.grids {
-            // SC — `transform`'s wire form omits `voxel_world_size`
-            // (`#[serde(skip)]`), so it restores at 1.0 here (snapshot
-            // scale persistence is a deferred substage — see the
-            // GridSnapshot note).
-            let mut grid = Grid::new(gsnap.transform);
+            // SC.snap — `transform`'s wire form omits `voxel_world_size`
+            // (`#[serde(skip)]`); the persisted value rides in the sibling
+            // `gsnap.voxel_world_size`. Fold it back into the transform.
+            // Guard untrusted bytes: a non-finite / ≤0 scale would break the
+            // marcher (GPU `chunk_dim = 0` → NaN), so fall back to 1.0.
+            let mut transform = gsnap.transform;
+            transform.voxel_world_size =
+                if gsnap.voxel_world_size.is_finite() && gsnap.voxel_world_size > 0.0 {
+                    gsnap.voxel_world_size
+                } else {
+                    log::warn!(
+                        "load_snapshot: grid {id:?} has invalid voxel_world_size \
+                         {} — restoring at 1.0",
+                        gsnap.voxel_world_size
+                    );
+                    1.0
+                };
+            let mut grid = Grid::new(transform);
             for (addr, bytes) in &gsnap.chunks {
                 let mut vxl =
                     vxl::parse(bytes).map_err(|source| FromSnapshotError::ChunkParse {
@@ -302,18 +381,17 @@ pub const SNAPSHOT_MAGIC: [u8; 4] = *b"RXSS";
 /// [`SnapshotLoadError::UnsupportedVersion`] — never a silent misparse
 /// (the pre-QE.5 failure mode of bare positional bincode).
 ///
-/// SC — per-grid `voxel_world_size` is NOT persisted yet, and this is
-/// still v1. bincode is strictly positional: a trailing field with
-/// `#[serde(default)]` does NOT rescue an old blob (a short read is
-/// "unexpected end of file", not a default — the checked-in v1 fixture
-/// proves it; the existing `#[serde(default)]` fields on [`GridSnapshot`]
-/// are present in the regenerated fixture, not bincode-tolerated). So
-/// `GridTransform`'s wire form is frozen (`#[serde(skip)]` on the field)
-/// and a scaled grid restores at `voxel_world_size = 1.0`. Persisting it
-/// is a deferred substage (SC.snap): bump to **2** and keep a
-/// `GridTransformV1`/`GridSnapshotV1` shadow shape to deserialize v1
-/// blobs (→ 1.0), so the forever-loadable v1 fixture survives.
-pub const SNAPSHOT_VERSION: u32 = 1;
+/// SC.snap — **v2** persists per-grid `voxel_world_size`. bincode is
+/// strictly positional, so the trailing `voxel_world_size` field on
+/// [`GridSnapshot`] would make a v1 blob short-read ("unexpected end of
+/// file") — hence the version bump. [`Scene::load_snapshot`] dispatches:
+/// v2 blobs decode [`GridSnapshot`] directly; v1 blobs decode the frozen
+/// [`GridSnapshotV1`] shadow shape (which lacks the field) and restore at
+/// `voxel_world_size = 1.0`. `GridTransform`'s own wire form stays frozen
+/// (`#[serde(skip)]` on the field) in BOTH versions — the persisted scale
+/// is a sibling field on the snapshot, not inside the transform — so the
+/// forever-loadable v1 fixture keeps loading unchanged.
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// Errors from [`Scene::load_snapshot`].
 #[derive(Debug)]
@@ -370,21 +448,8 @@ impl Scene {
     /// format's evolution story.
     #[must_use]
     pub fn save_snapshot(&self) -> Vec<u8> {
-        // SC — the v1 wire format doesn't persist per-grid
-        // `voxel_world_size` (see [`SNAPSHOT_VERSION`]); a scaled grid
-        // restores at 1.0. Warn so a silent flatten of a "planet + tiny
-        // ship" scene doesn't go unnoticed until SC.snap lands.
-        if let Some((id, vws)) = self
-            .grids()
-            .map(|(id, g)| (id, g.transform.voxel_world_size))
-            .find(|&(_, vws)| (vws - 1.0).abs() > f64::EPSILON)
-        {
-            log::warn!(
-                "save_snapshot: grid {id:?} has voxel_world_size {vws} but the \
-                 snapshot format does not persist per-grid scale yet — it will \
-                 restore at 1.0 (SC.snap)"
-            );
-        }
+        // SC.snap — v2 persists per-grid `voxel_world_size` (see
+        // [`SNAPSHOT_VERSION`]); no scale is lost across a round-trip.
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&SNAPSHOT_MAGIC);
         out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
@@ -412,11 +477,18 @@ impl Scene {
             return Err(SnapshotLoadError::BadMagic);
         }
         let version = u32::from_le_bytes(version.try_into().expect("4-byte slice"));
-        if version != SNAPSHOT_VERSION {
-            return Err(SnapshotLoadError::UnsupportedVersion(version));
-        }
-        let snap: SceneSnapshot = bincode::deserialize(&bytes[8..])
-            .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?;
+        let payload = &bytes[8..];
+        // SC.snap — dispatch on the wire version. v1 blobs decode the frozen
+        // `SceneSnapshotV1` shadow shape (no persisted scale → 1.0); v2 blobs
+        // decode `SceneSnapshot` directly. Both funnel through `from_snapshot`.
+        let snap: SceneSnapshot = match version {
+            1 => bincode::deserialize::<SceneSnapshotV1>(payload)
+                .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?
+                .into(),
+            2 => bincode::deserialize(payload)
+                .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?,
+            v => return Err(SnapshotLoadError::UnsupportedVersion(v)),
+        };
         Self::from_snapshot(&snap).map_err(SnapshotLoadError::Restore)
     }
 }
@@ -434,6 +506,33 @@ mod tests {
         pub(crate) fn from_raw_for_test(raw: u32) -> Self {
             Self(raw)
         }
+    }
+
+    #[test]
+    fn sc_snap_scaled_grid_survives_round_trip() {
+        // SC.snap — v2 persists per-grid voxel_world_size. A vws=0.25 grid must
+        // restore at 0.25, not the pre-SC.snap 1.0 (transform's own wire form
+        // still omits it via #[serde(skip)] — the value rides the sibling
+        // GridSnapshot field).
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at_scale(DVec3::new(5.0, -3.0, 0.0), 0.25));
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .set_voxel(IVec3::new(1, 2, 100), Some(VoxColor(0x8011_2233)));
+
+        let bytes = scene.save_snapshot();
+        assert_eq!(&bytes[4..8], &2u32.to_le_bytes(), "expected v2 wire");
+        let restored = Scene::load_snapshot(&bytes).expect("round trip");
+
+        let (_, g) = restored.grids().next().expect("one grid");
+        assert!(
+            (g.transform.voxel_world_size - 0.25).abs() < 1e-12,
+            "scale must survive: got {}",
+            g.transform.voxel_world_size
+        );
+        assert_eq!(g.transform.origin, DVec3::new(5.0, -3.0, 0.0));
+        assert!(g.voxel_solid(IVec3::new(1, 2, 100)));
     }
 
     /// A 2-grid scene with ~100 chunks total — the validation

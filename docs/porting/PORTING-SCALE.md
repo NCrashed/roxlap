@@ -16,23 +16,18 @@ sweeps (CPU/scene + GPU), both 2026-07-07.
   scaled+rotated round-trip (vws 0.25..4), raycast returns world t,
   cross-scale nearest-hit by WORLD distance. All 207 scene lib +
   workspace tests green ⇒ vws=1.0 byte-identical.
-  **Snapshot persistence DEFERRED**: bincode is strictly positional
-  (a missing trailing field is a decode error, NOT a serde default —
-  the checked-in v1 fixture proves it), so `voxel_world_size` is
-  `#[serde(skip)]` on `GridTransform` (wire form frozen, v1 fixture
-  still loads) and NOT yet stored in `GridSnapshot`. A scaled grid
-  restores at 1.0. Persisting it needs a real snapshot version-2
-  migration (a v1-shadow deserialize) — its own SC substage.
+  **Snapshot persistence LANDED in SC.snap** (see below): snapshot **v2**
+  persists `voxel_world_size` as a sibling field on `GridSnapshot`;
+  `GridTransform`'s own wire form stays `#[serde(skip)]`-frozen. The v1
+  fixture still loads via a `GridSnapshotV1` shadow shape (→ 1.0).
 - SC.1 — pending (CPU render: camera + lights scaling).
 - SC.2 — pending (CPU cross-grid shadows: WorldShadowCtx + occluder).
 - SC.3 — pending (collision + streaming + LOD thresholds).
 - SC.4 — pending (GPU: scale in `world_origin.w`, shaders, sprite shadows).
-- SC.5 — pending (demo + book chapter + CHANGELOG). **GATE: a
-  user-facing scaled scene (the planet+ship demo) MUST NOT ship before
-  SC.snap** — until scale persists, saving such a scene silently
-  restores flat at 1.0. `save_snapshot` `log::warn!`s on a non-1.0
-  grid as a stopgap, but the demo shouldn't advertise a feature that
-  doesn't survive a save. Order: SC.snap before SC.5's scaled demo.
+- SC.snap — LANDED (see the substage entry below). Scale now survives a
+  save, so the SC.5 gate is cleared.
+- SC.5 — pending (demo + book chapter + CHANGELOG). The SC.snap gate is
+  now cleared: a scaled scene persists correctly across save/load.
 
 ## Goal
 
@@ -139,13 +134,20 @@ pattern from sprite volumes to terrain grids** — not greenfield.
 
 ## Substages
 
-- **SC.snap — snapshot scale persistence** (added mid-SC.0; deferrable,
-  do before shipping SC to users who save scaled scenes). bincode
-  positional format can't gain a trailing field without breaking the
-  forever-loadable v1 fixture, so: version the envelope to 2, keep a
-  `GridSnapshotV1`/`GridTransformV1` shadow shape for v1 deserialize
-  (→ vws 1.0), and store `voxel_world_size` on v2. Until this lands,
-  `GridTransform::voxel_world_size` is `#[serde(skip)]` (frozen wire).
+- **SC.snap — LANDED 2026-07-08: snapshot scale persistence.** Envelope
+  versioned to **2**. `voxel_world_size` is stored as a **sibling field on
+  `GridSnapshot`** (NOT inside `GridTransform`, whose wire form stays
+  `#[serde(skip)]`-frozen — so the persisted scale is decoupled from the
+  transform's frozen shape). `load_snapshot` dispatches on version: v2
+  decodes `GridSnapshot` directly; v1 decodes a private `GridSnapshotV1`
+  shadow shape (the exact frozen v1 field list, no `voxel_world_size`) and
+  `From`-converts → vws 1.0. Restore guards untrusted bytes (non-finite/≤0
+  vws → 1.0 + warn). Checked-in **`snapshot_v2.rxs`** fixture + `v2_fixture_
+  loads` lock the v2 wire alongside the forever-frozen v1 fixture; the
+  regen helper is repointed to v2 so it can't clobber v1 (the footgun now
+  that `save_snapshot` emits v2). Tests: `sc_snap_scaled_grid_survives_
+  round_trip` (vws 0.25 → 0.25), `v2_fixture_loads`, and the untouched
+  `v1_fixture_loads` (→ 1.0). 216 scene lib + 4 wire tests green.
 - **SC.0 — field + transform boundary + raycast t-fix.**
   `GridTransform::voxel_world_size` + `at_scale`; `addr` transforms;
   `Scene::raycast` t-conversion. Tests: round-trip
