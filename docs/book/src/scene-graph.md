@@ -27,9 +27,9 @@ Three layers, top to bottom:
   Inserting into empty space materialises the touched chunks;
   carving air is a no-op.
 
-Grids move rigidly (translate + rotate, never scale), and each one
-rotates as a whole — the classic use is a static "world" grid plus a
-handful of dynamic object grids:
+Each grid carries an f64 origin + quaternion and a **`voxel_world_size`**
+(world units per voxel — [Grid scale](#grid-scale) below); the classic use
+is a static "world" grid plus a handful of dynamic object grids:
 
 ```rust,noplayground
 {{#include ../../../crates/roxlap-scene/examples/book_scene_graph.rs:scene_grids}}
@@ -39,6 +39,32 @@ handful of dynamic object grids:
 pixels are rendered in each grid's local frame, so a rotating ship
 that paints its own sky visibly fights the world's sky. One grid owns
 the sky; the rest opt out.
+
+## Grid scale
+
+Every grid also has a **`voxel_world_size`** — how many world units one
+voxel spans. The default `1.0` is the classic 1:1; `GridTransform::at_scale`
+sets it. This lets a coarse **planet** grid (`4.0`, big chunky voxels) and a
+finely detailed **ship** grid (`0.25`, small smooth voxels) share one scene
+at their true relative sizes — a 16× ratio — without either grid changing
+its voxel budget.
+
+```rust,noplayground
+{{#include ../../../crates/roxlap-scene/examples/book_scene_graph.rs:grid_scale}}
+```
+
+The design keeps it cheap: **scale is applied only at the world↔grid-local
+boundary**. Every marcher, sampler, edit and bake below that boundary still
+works in plain voxels — so `set_voxel` / `voxel_solid` are unchanged, and a
+grid's own geometry doesn't care about its scale. What *does* change is
+world-space: a raycast marches the grid's voxels but returns a **world**
+`t`, so hits across grids of different scale compare correctly; shadows,
+collision, streaming radii and LOD all resolve in world units too. The Scale
+demo tab shows it live — a fine ship casting a hard **cross-grid** sun shadow
+onto the coarse planet, on both backends.
+
+Scale survives a save: `save_snapshot` persists `voxel_world_size` (wire
+version 2), and older v1 snapshots load as unscaled `1.0`.
 
 ## Editing voxels
 

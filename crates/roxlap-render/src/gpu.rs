@@ -1533,8 +1533,14 @@ impl GpuBackend {
             shadow_strength: rig.shadow_strength,
             shadow_bias: rig.shadow_bias_voxels,
             shadow_max_dist: rig.shadow_max_dist,
-            // Shadow-ray step budget (consumed in DL.3); a sane default.
-            shadow_max_steps: 256,
+            // Shadow-ray voxel-step budget (consumed in DL.3). SC.4 — a
+            // shadow ray crossing a *fine* grid's chunk marches many tiny
+            // voxels of empty space (the shadow inner loop has no empty-skip),
+            // so a fine occluder (a mini ship over a coarse planet) can need
+            // more than the pre-scale 256; 768 matches the primary ray's
+            // `MAX_INNER_STEPS` and is still bounded by `shadow_max_dist`. The
+            // CPU occluder uses 4096 + a three-tier skip.
+            shadow_max_steps: 768,
             // DL.6 — stylized lighting (cel banding + gradient-map ramp).
             style_bands: rig.bands,
             shadow_tint: rig.shadow_tint,

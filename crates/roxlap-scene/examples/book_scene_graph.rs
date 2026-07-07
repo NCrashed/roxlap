@@ -200,5 +200,29 @@ fn main() {
     assert!(!grid.voxel_solid(IVec3::new(5, 5, 240)));
     // ANCHOR_END: streaming_edit
 
+    // ANCHOR: grid_scale
+    // Per-grid scale: `voxel_world_size` is world units per voxel. A grid
+    // built with `at_scale(origin, 2.0)` has voxels twice world size — a
+    // coarse "planet" — while `0.25` gives a fine detail grid; both coexist
+    // at their true relative sizes. Only the world↔grid boundary scales:
+    // edits + queries stay in voxels, unchanged.
+    let mut scaled = Scene::new();
+    let planet = scaled.add_grid(GridTransform::at_scale(DVec3::ZERO, 2.0));
+    scaled
+        .grid_mut(planet)
+        .expect("just added")
+        // Same voxel edit API — grid-local coordinates.
+        .set_voxel(IVec3::new(5, 5, 10), Some(STONE));
+    // Grid-local voxel z=10 sits at WORLD z = 20 (10 voxels × 2.0). A world
+    // raycast down that column reports the grid-local voxel it hit AND a
+    // WORLD-space `t` — so hits across grids of different scale compare
+    // correctly (the raycaster marches voxels but returns world distance).
+    let hit = scaled
+        .raycast(DVec3::new(11.0, 11.0, 0.0), DVec3::new(0.0, 0.0, 1.0), 64.0)
+        .expect("ray hits the scaled voxel");
+    assert_eq!(hit.voxel, IVec3::new(5, 5, 10)); // grid-local, unscaled
+    assert!((hit.t - 20.0).abs() < 1e-4); // WORLD distance: 10 voxels × 2.0
+                                          // ANCHOR_END: grid_scale
+
     println!("book_scene_graph: all scene-graph assertions hold");
 }

@@ -13,6 +13,7 @@ pub mod lighting;
 pub mod particles;
 pub mod picking;
 pub mod primitives;
+pub mod scale;
 pub mod spotlight;
 pub mod sprites;
 pub mod transparency;

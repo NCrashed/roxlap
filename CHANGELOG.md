@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: per-grid voxel scale (SC stage)
+
+- Each grid now carries a **`voxel_world_size`** — world units per voxel,
+  set via `GridTransform::at_scale`. A coarse **planet** grid (`4.0`, big
+  chunky voxels) and a fine **ship** grid (`0.25`, small smooth voxels)
+  coexist in one scene at their true relative sizes (a 16× ratio) without
+  either changing its voxel budget. Scale is applied **only at the
+  world↔grid-local boundary**, so every marcher, sampler, edit and bake
+  below it is unchanged; `voxel_world_size = 1.0` (the default) is
+  byte-identical to before on **both** backends.
+- Threaded through the whole pipeline: `Scene::raycast` marches voxels but
+  returns a **world** `t`; the CPU compose + GPU compute renderers (per-grid
+  camera, cross-grid depth composite, ray-terminating scan/fog cutoffs);
+  **cross-grid hard shadows** — a fine grid correctly shadows a coarse one,
+  with a world-uniform sun-shadow reach; and collision, streaming radii, LOD
+  tiers and the per-frame distance cull all resolve in world units.
+- Snapshots **persist scale** (wire version 2); older v1 saves load as
+  unscaled `1.0`, and the checked-in v1 fixture stays loadable forever.
+- New scene-demo **Scale** tab (a planet + a ship casting a cross-grid sun
+  shadow, on both backends) and a book **Grid scale** section.
+
 ## [0.25.0] — 2026-07-07
 
 ### Added: voxel-aware acoustics — `roxlap-audio` (AU stage)

@@ -22,8 +22,8 @@ use crate::scene_api::{CameraPose, CameraRig, DemoScene, InputState, SceneCtx, S
 use crate::scenes::{
     animation::AnimationScene, doom::DoomScene, empty::EmptyScene, lighting::LightingScene,
     particles::ParticlesScene, picking::PickingScene, primitives::PrimitivesScene,
-    spotlight::SpotlightScene, sprites::SpritesScene, transparency::TransparencyScene,
-    world::WorldScene,
+    scale::ScaleScene, spotlight::SpotlightScene, sprites::SpritesScene,
+    transparency::TransparencyScene, world::WorldScene,
 };
 use crate::{
     load_png_sky, load_png_sky_rgba, SCAN_DIST_INITIAL, SCAN_DIST_MAX, SCAN_DIST_MIN,
@@ -233,6 +233,7 @@ impl Host {
             Box::new(TransparencyScene::new()),
             Box::new(LightingScene::new()),
             Box::new(SpotlightScene::new()),
+            Box::new(ScaleScene::new()),
             Box::new(ParticlesScene::new()),
             Box::new(DoomScene::new()),
             Box::new(PickingScene::new()),

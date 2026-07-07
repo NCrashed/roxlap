@@ -1016,6 +1016,123 @@ fn scene_dda_cross_grid_sun_shadow() {
 }
 
 #[test]
+fn scene_dda_fine_occluder_cross_grid_shadow_survives_lod() {
+    // SC.4 bug: on the GPU a fine (vws < 1) grid casts NO cross-grid sun
+    // shadow when LOD is on (the demo: a mini ship over a coarse planet). The
+    // shadow ray marches the occluder at pick_mip(receiver world-t), and a
+    // coarse mip of a small fine grid mis-resolves → the shadow vanishes.
+    // Repro: an unscaled floor + a fine (vws=0.25) slab above it, rendered
+    // with LOD OFF (mip_scan_dist=0) and ON (>0); the shadow must survive.
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let grid_a = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], decompress_chunk(&floor_chunk(vsid)))],
+    };
+    // Fine slab low in its chunk (local z 8..12); decompress_chunk builds its
+    // mip ladder, so LOD can pick a coarse mip for the shadow march.
+    let grid_b = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], decompress_chunk(&block_chunk(vsid, 8, 12)))],
+    };
+    let scene = GpuSceneResident::upload(
+        &gpu.device,
+        &SceneUpload {
+            grids: vec![grid_a, grid_b],
+        },
+    );
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [14.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let b_origin = [10.0f32, 12.0, 30.0];
+    let cam_b = Camera {
+        position: [
+            cam.position[0] - b_origin[0],
+            cam.position[1] - b_origin[1],
+            cam.position[2] - b_origin[2],
+        ],
+        ..cam
+    };
+    let xf_a = GridWorldTransform::default();
+    let xf_b = GridWorldTransform {
+        origin: b_origin,
+        voxel_world_size: 0.25,
+        ..GridWorldTransform::default()
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let render = |r: &mut HeadlessSceneRenderer, msd: f32| -> u32 {
+        r.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam, cam_b],
+            &[xf_a, xf_b],
+            cam.fov_y_rad,
+            64,
+            msd,
+        )[centre]
+    };
+
+    let sd = glam::Vec3::new(0.12, 0.0, -0.99).normalize();
+    let sun = |casts_shadow: bool| SceneLights {
+        enabled: true,
+        grid_sun_dirs: vec![[sd.x, sd.y, sd.z], [sd.x, sd.y, sd.z]],
+        sun_color: [1.0; 3],
+        sun_intensity: 3.0,
+        sun_casts_shadow: casts_shadow,
+        ambient: [0.5; 3],
+        shadow_strength: 1.0,
+        shadow_bias: 1.5,
+        shadow_max_dist: 512.0,
+        shadow_max_steps: 768,
+        ..SceneLights::default()
+    };
+
+    renderer.set_scene_lights(sun(false));
+    let lit = render(&mut renderer, 0.0);
+    renderer.set_scene_lights(sun(true));
+    let shadowed_lod_off = render(&mut renderer, 0.0);
+    let shadowed_lod_on = render(&mut renderer, 8.0);
+    eprintln!(
+        "fine occluder LOD: lit={}({}) lod_off={}({}) lod_on={}({})",
+        lit,
+        lum(lit),
+        shadowed_lod_off,
+        lum(shadowed_lod_off),
+        shadowed_lod_on,
+        lum(shadowed_lod_on),
+    );
+
+    // The fine occluder must cast a cross-grid shadow with LOD off…
+    assert!(
+        lum(shadowed_lod_off) < lum(lit),
+        "fine occluder must cast a shadow (LOD off): lit {lit:#08x} -> {shadowed_lod_off:#08x}"
+    );
+    // …and it must NOT vanish when LOD is on (the reported bug).
+    assert!(
+        lum(shadowed_lod_on) < lum(lit),
+        "fine occluder shadow must survive LOD (the ship-over-planet bug): \
+         lit {lit:#08x} -> lod_on {shadowed_lod_on:#08x}"
+    );
+}
+
+#[test]
 fn scene_dda_scaled_grid_composites_by_world_depth() {
     // SC.4 — GPU per-grid voxel_world_size. Two grids at the same origin,
     // both blocks on the camera column but different scale, so the world and

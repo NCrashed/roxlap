@@ -695,7 +695,16 @@ fn shade_lit(
     // form, so the shadow ray can be tested against every grid (cross-grid).
     // PF.2 (G6) — the world-space lift (4 vec4 reads of grid_cameras[g] +
     // 9 fma) is computed lazily, only when a caster actually fires a ray.
-    let shadow_origin = sample + n * u.shadow_bias;
+    // SC.4 — `shadow_bias` is in VOXELS, but the shadow marches in a
+    // world-scale frame, so scale it by the grid's voxel_world_size. On a
+    // big-voxel (vws > 1) grid a fixed world bias is far too small — e.g. the
+    // vws=4 planet biased only 1.5/4 = 0.375 voxels → self-shadow acne. `×
+    // vws` restores the intended 1.5-voxel offset without overshooting a
+    // nearby occluder (scaling by the coarse-mip factor too would push the
+    // origin metres off a big grid and skip past a low-hovering caster).
+    // vws == 1 ⇒ × 1, byte-identical.
+    let vws = grid_cameras[g].world_origin.w;
+    let shadow_origin = sample + n * (u.shadow_bias * vws);
     var shadow_origin_w = vec3<f32>(0.0);
     var sow_ready = false;
     // Light remaining in shadow (the strength floor); 1.0 ⇒ unshadowed.
