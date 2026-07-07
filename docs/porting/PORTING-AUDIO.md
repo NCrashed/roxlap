@@ -7,7 +7,15 @@ bottom before touching code. Recon sources: engine-infrastructure
 sweep + audio-crate landscape review (both 2026-07-07, verified
 against crates.io/docs.rs).
 
-## Status — IN PROGRESS (scope locked by user 2026-07-07)
+## Status — STAGE AU CLOSED 2026-07-07 (AU.0–4 all landed)
+
+Voxel-aware audio shipped: occlusion muffling through rock + cavity
+reverb, `roxlap-audio` crate (pure core + optional kira backend), cave
+demo showcase (`--features audio`), book Audio chapter. User listening
+pass passed ("работает отлично"). Purely additive to the workspace
+(new crate + a demo feature + a book chapter) ⇒ folds into the next
+minor cut. Owed beyond the stage: wasm audio, Doppler, HRTF,
+per-material acoustics (all noted as deferred below).
 
 - AU.0 — LANDED 2026-07-07: `roxlap-audio` crate (workspace member,
   cavegen-style metadata); `AcousticsConfig` / `SourceAcoustics`;
@@ -114,7 +122,14 @@ against crates.io/docs.rs).
   - `reset` zeroes the throttle timers; documented the identity-grid
     assumption (world == grid-local) and the eye-centre-only in-solid
     guard as caveats.
-- AU.4 — pending (book chapter + CHANGELOG).
+- AU.4 — LANDED 2026-07-07: book "Audio" chapter (`docs/book/src/audio.md`,
+  SUMMARY position 9 — renumbered the shifted cross-refs in
+  demo-tour/rendering/scene-graph/sprites) + a device-free
+  `book_audio` example (core only, no kira: prints occlusion +
+  cavity params for a wall/room/doorway scene, anchored into the
+  chapter) + CHANGELOG. Book renders (mdbook via `nix shell
+  nixpkgs#mdbook`), check-anchors green. **Stage AU CLOSED** — user
+  listening pass passed 2026-07-07.
 - Deferred beyond the stage: wasm audio (see decision 7), per-material
   acoustics, Doppler, scene-demo tab.
 

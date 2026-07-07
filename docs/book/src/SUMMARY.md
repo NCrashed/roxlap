@@ -10,6 +10,7 @@
 - [Lighting & materials](lighting.md)
 - [Sprites & animation](sprites.md)
 - [Particles](particles.md)
+- [Audio](audio.md)
 - [The asset pipeline](assets.md)
 - [Picking & world queries](picking.md)
 - [Platforms](platforms.md)

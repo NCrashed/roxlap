@@ -16,7 +16,7 @@ cargo run -p roxlap-scene --example book_scene_graph
 Three layers, top to bottom:
 
 - **`Scene`** — owns the grids, hands out stable `GridId`s, answers
-  world-level queries (`raycast`, `resolve_voxel` — chapter 10).
+  world-level queries (`raycast`, `resolve_voxel` — chapter 11).
 - **`Grid`** — one voxel volume: a `GridTransform` (f64 origin + f64
   quaternion) plus a sparse map of chunks. A missing chunk *is* air —
   nothing is stored for empty space, and a grid has no intrinsic
@@ -249,6 +249,6 @@ water half lets you through, the glass half does not.
 ## Further reading
 
 - [docs.rs/roxlap-scene](https://docs.rs/roxlap-scene) — the full API,
-  including the world queries deferred to chapter 10.
+  including the world queries deferred to chapter 11.
 - [`PORTING-SCENE.md`](https://github.com/NCrashed/roxlap/blob/master/docs/porting/PORTING-SCENE.md)
   — why the scene graph is built this way (the S1–S7 design history).

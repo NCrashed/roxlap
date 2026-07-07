@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added: voxel-aware acoustics — `roxlap-audio` (AU stage, in progress)
+### Added: voxel-aware acoustics — `roxlap-audio` (AU stage)
 
 - New crate `roxlap-audio`: sound that knows about the voxels. The
   acoustics **core** is pure parameter computation over a `Scene` (no
@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crystal hums are distance-culled to the nearest few so a
   crystal-rich cave never starves the shot/boom voices. Off by
   default; the demo ships and builds silent without it.
+- Documented in the book's new **Audio** chapter (occlusion + cavity
+  reverb walked through a runnable device-free `book_audio` example
+  that prints the computed parameters, plus the playback boundary and
+  the cave-demo showcase).
 
 ### Changed: MSRV corrected to 1.92 (was a stale 1.77)
 

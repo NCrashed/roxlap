@@ -67,7 +67,7 @@ The window parameter is anything
 [raw-window-handle](https://docs.rs/raw-window-handle) in an `Arc` —
 winit, SDL, GLFW, your own. On wasm, construct with
 `new_from_canvas_async` over an HTML canvas instead (WebGPU, falling
-back to the CPU path presented through WebGL2 — chapter 11).
+back to the CPU path presented through WebGL2 — chapter 12).
 
 ## Capability parity: `supports()`
 

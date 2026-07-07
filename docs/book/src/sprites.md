@@ -27,7 +27,7 @@ of placement is an **instance**. Register once, instance many:
 
 Where models come from: paint one in
 [Demiurg](https://github.com/NCrashed/demiurg) (the roxlap asset
-editor) or MagicaVoxel ([chapter 9](assets.md)), parse a `.kv6` file
+editor) or MagicaVoxel ([chapter 10](assets.md)), parse a `.kv6` file
 ([`roxlap_formats::kv6`](https://docs.rs/roxlap-formats)), or build
 one in code —
 `Kv6::from_fn` (surface-only, as here), `solid_cube` / `solid_box`,
@@ -138,7 +138,7 @@ is in the assets:
   `tick` advances it every frame, and
   `set_character_world_transform` moves it. Author them in
   [Demiurg](https://github.com/NCrashed/demiurg), the roxlap asset
-  editor ([chapter 9](assets.md)); the wire format is
+  editor ([chapter 10](assets.md)); the wire format is
   [`roxlap_formats::character`](https://docs.rs/roxlap-formats), and
   the **Animation** demo scene is the loading example.
 - **KFA rigs** — Ken Silverman's original animated-sprite format
