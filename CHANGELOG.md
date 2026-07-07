@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added / Fixed: per-grid scale follow-ups
+
+- **Audio on scale**: `roxlap-audio`'s occlusion path-thickness now honours a
+  grid's `voxel_world_size`, so a coarse grid's thicker voxels muffle sound
+  proportionally more (previously identity-only).
+- **Projected-size mip LOD** (GPU): a fine grid's small voxels now take a
+  coarser mip sooner and a coarse grid's big voxels stay fine longer —
+  matched on-screen detail, a perf win for scaled scenes.
+- **Coarse-mip shadow acne**: a scaled/distant surface no longer
+  self-shadows its own coarse cell (the thin dark "shell" on a chunky
+  planet's hills), without over-biasing past real occluders.
+
 ## [0.26.0] — 2026-07-08
 
 ### Added: per-grid voxel scale (SC stage)
