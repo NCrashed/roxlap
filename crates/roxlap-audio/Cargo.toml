@@ -1,0 +1,24 @@
+[package]
+name = "roxlap-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Voxel-aware acoustics for the roxlap engine — occlusion/muffling through voxel walls and cavity-driven reverb parameters, playback-backend agnostic."
+documentation = "https://docs.rs/roxlap-audio"
+keywords = ["voxlap", "voxel", "audio", "acoustics", "occlusion"]
+categories = ["game-development", "multimedia::audio"]
+
+# AU.0 — the acoustics CORE only: pure parameter computation over a
+# `roxlap_scene::Scene` (no audio device, no audio thread, fully
+# unit-testable). The optional playback backend arrives in AU.2 behind
+# a `kira` feature; see docs/porting/PORTING-AUDIO.md.
+[dependencies]
+roxlap-scene = { path = "../roxlap-scene", version = "0.24" }
+glam = { workspace = true }
+
+[lints]
+workspace = true

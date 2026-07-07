@@ -261,6 +261,17 @@ impl Grid {
         }
     }
 
+    /// AU.0 — the chunk-local half of [`Self::voxel_solid`], for
+    /// external DDA marches with strong chunk locality: split the
+    /// voxel with [`crate::voxel_split`], borrow the chunk once via
+    /// [`Self::chunk`], and test cells against the borrow — one
+    /// HashMap probe per chunk instead of per voxel. `in_chunk` is
+    /// the chunk-local coordinate `voxel_split` returned.
+    #[must_use]
+    pub fn chunk_voxel_solid(vxl: &Vxl, in_chunk: glam::UVec3) -> bool {
+        vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z)
+    }
+
     /// PF.6 — a chunk-cached [`SolidSampler`] over this grid, for DDA
     /// marches that issue many [`Self::voxel_solid`]-style queries with
     /// strong chunk locality (shadow rays, `Scene::raycast`).

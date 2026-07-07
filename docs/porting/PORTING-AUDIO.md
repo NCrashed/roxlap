@@ -1,0 +1,176 @@
+# roxlap — voxel-aware acoustics + audio playback (Stage AU)
+
+Entry doc written 2026-07-07 at workspace 0.24.0+ (post-EV, post
+release-gate quality pass). This is the **entry doc** for the audio
+stage — tag **AU**. A fresh-context session should read it top to
+bottom before touching code. Recon sources: engine-infrastructure
+sweep + audio-crate landscape review (both 2026-07-07, verified
+against crates.io/docs.rs).
+
+## Status — IN PROGRESS (scope locked by user 2026-07-07)
+
+- AU.0 — LANDED 2026-07-07: `roxlap-audio` crate (workspace member,
+  cavegen-style metadata); `AcousticsConfig` / `SourceAcoustics`;
+  `path_thickness` (per-grid Amanatides–Woo accumulating exact
+  in-solid segment lengths, transform-aware like `Scene::raycast`);
+  `source_acoustics` (direct + fixed 8-spoke jitter ring →
+  transmission → log-lerp cutoff + linear dB). 8 unit tests:
+  exact perpendicular/diagonal thickness, monotonic muffling
+  (1/2/5-voxel walls), doorway leak (NB: the ring converges toward
+  the listener — at a wall 40% of the way the ±1.5 jitter is ±0.9
+  voxels; tests must place slots inside that reach), chunk-seam,
+  cross-grid sum, max-distance cap, determinism. Review round
+  (user, same day) added: rotated-grid world-true thickness test
+  (the one previously untested claim), a one-entry chunk borrow
+  cache in the march (new public
+  `Grid::chunk_voxel_solid(&Vxl, UVec3)` in roxlap-scene — one
+  HashMap probe per crossed chunk, not per voxel),
+  beyond-max-distance now reports `clear()` (was "buried" — see
+  tuning notes), and the bedrock-plane caveat (doc + pinning test).
+  10 tests total.
+- AU.1 — pending (cavity/reverb estimator).
+- AU.2 — pending (kira playback backend, feature-gated).
+- AU.3 — pending (cave-demo integration).
+- AU.4 — pending (book chapter + CHANGELOG).
+- Deferred beyond the stage: wasm audio (see decision 7), per-material
+  acoustics, Doppler, scene-demo tab.
+
+## Goal
+
+Sound that *knows about the voxels*:
+
+1. **Occlusion/muffling** — a sound behind a voxel wall gets quieter
+   and darker (lowpass), proportional to how much rock the path
+   crosses; a doorway leaks sound realistically (partial occlusion).
+2. **Cavity reverb** — a shot in a large cavern rings; the same shot
+   in a crawl-space is dry; outdoors is drier still. Reverb decay and
+   wet mix follow the measured space around the listener.
+3. A **`roxlap-audio` crate**: a backend-agnostic acoustics core
+   (parameters from `&Scene`) plus an optional playback backend, and
+   the cave demo wired up as the live showcase.
+
+## Locked design decisions
+
+1. **Two layers, hard boundary.** The acoustics core is pure
+   parameter computation — no audio device, no audio thread, fully
+   unit-testable against synthetic scenes. Output per source:
+   `{ gain_db, lowpass_cutoff_hz, reverb_send_db }`; output per
+   listener: `{ reverb_feedback, reverb_damping, reverb_mix }`.
+   Playback lives behind a cargo feature and a small trait, so the
+   backend is swappable (kira has a history of API redesigns — pin
+   the minor, keep the boundary clean).
+2. **Playback backend = kira 0.12** (verified 0.12.1, 2026-05-25;
+   MIT/Apache-2.0 dual; pure-Rust DSP, cpal links OS audio only).
+   The required topology exists natively, zero custom DSP: one
+   `SpatialTrack` per source carrying a runtime-tweenable
+   `Filter` (lowpass) + volume + a per-source **send** into one
+   shared `SendTrack` holding a `Reverb` whose
+   feedback/damping/mix tween at runtime. Runner-up fyrox-sound 1.0
+   (HRTF, but MIT-only, per-bus filters, drags Fyrox infra);
+   firewheel is the one to re-evaluate in a year.
+3. **Occlusion = 9 jittered thickness rays** (Sound Physics
+   Remastered's recipe: 1 direct + 8 offset marches source→listener),
+   each accumulating **solid path length** (voxel units) through the
+   scene — not boolean hits. The engine has no thickness query today
+   (`Scene::raycast` returns first hit; Beer–Lambert thickness lives
+   only inside the renderers), so AU.0 builds a small DDA
+   thickness march over public `Grid::voxel_solid`/chunk queries
+   inside roxlap-audio; if it proves generally useful, upstream a
+   `Scene::raycast_thickness` later. Mapping: summed thickness →
+   lowpass cutoff (exponential toward ~800 Hz) + gain reduction;
+   the 9-ray average gives soft doorway transitions.
+4. **Cavity estimate = 32-ray golden-spiral fan from the listener**,
+   free path per ray (capped ~64 voxels) + sky-escape fraction
+   (rays that exit the populated AABB upward). Mean free path →
+   reverb feedback (decay); enclosure fraction → wet mix;
+   sky-openness kills reverb outdoors (Sound Filters' pattern).
+   Heavy smoothing — `(3·old + new) / 4` per update — so the
+   environment converges over seconds (Teardown ships exactly this
+   lag; players read it as natural).
+5. **Cheap by construction, decoupled from frame rate.** Budget per
+   acoustic tick ≈ 9 rays × N audible sources at ~4 Hz per source
+   (round-robin) + 32 listener rays at ~2 Hz. Prior art runs this
+   on far weaker query stacks than roxlap's chunk-cached DDA
+   (~hundreds of ray segments per second total — noise). Host-owned
+   system following the ParticleSystem pattern: pure
+   `update(dt, &Scene, listener, sources)` + `tick(backend)` sync.
+6. **Demo sounds are synthesized** — no binary assets (house
+   pattern: the Doom scene synthesizes its GIFs). Shot transient =
+   filtered noise burst; impact boom = low sine + noise tail;
+   crystal hum = detuned sine pair looping. Generated once at
+   startup into `StaticSoundData`.
+7. **wasm deferred out of the stage.** kira runs on wasm via cpal's
+   WebAudio path (no atomics/COOP-COEP; streaming sounds are
+   desktop-only; AudioContext must start from a user gesture — the
+   web demos' existing click-to-pointer-lock flow is the natural
+   gate). Nothing in the design blocks it; it's scoped out of AU to
+   keep the stage shippable. Same for Doppler (kira roadmap, not
+   ours), HRTF, and per-material reflectivity/absorption (the
+   colour→material map gives a hook when wanted).
+
+## Substages
+
+- **AU.0 — crate + occlusion core.** `roxlap-audio` scaffold
+  (cavegen-style Cargo.toml, workspace lints, members +
+  default-members); acoustics types; the thickness DDA march;
+  `occlusion(scene, src, listener) -> SourceAcoustics` with the
+  9-ray average. Tests: 0 walls ⇒ open params; 1/2/5-voxel walls ⇒
+  monotonically stronger muffling; doorway ⇒ partial; cross-chunk
+  and cross-grid paths.
+- **AU.1 — cavity estimator.** Golden-spiral fan, mean free path,
+  sky fraction, smoothing state. `listener_env(scene, pos, dt) ->
+  ListenerAcoustics`. Tests: synthetic closed box (small vs large ⇒
+  decay ordering), open plane ⇒ dry, half-open pit in between;
+  smoothing converges monotonically.
+- **AU.2 — kira backend** (`feature = "kira"`, native-only in AU).
+  `AudioOut` trait boundary; kira impl with the
+  spatial-track/send-track topology; tween times 120 ms (per-source)
+  / 1 s (environment); synthesized test tones; a `#[ignore]`d
+  listening probe binary for the maintainer's ears.
+- **AU.3 — cave-demo integration.** Listener = camera; sources:
+  gunshot (at muzzle), impact boom (at carve centre — the existing
+  `impacts` queue), crystal hum loops (at each `BakeLight` position,
+  EV synergy); reverb follows the cavern. Tuning pass on both
+  presets. Feature-gated so `--no-default-features` still builds
+  silent.
+- **AU.4 — docs.** Book chapter ("Sound in a voxel world"),
+  CHANGELOG, this doc's status, memory note.
+
+## Tuning notes (post-AU.0 review)
+
+- **Listener-side undersampling**: the jitter ring sits at the SOURCE
+  and every ray converges through the listener point, so "listener
+  pressed against a wall / standing in a doorway" is sampled by one
+  point. SPR ships this too; if it reads badly in the demo, symmetric
+  jitter (offset both endpoints) is the fix — revisit in AU.3 tuning.
+- **`rotation.inverse()` per ray×grid** in `path_thickness` — trivial
+  cost today; hoist per-grid if the function ever goes hot.
+- **Doorway-test geometry** is tied to the default
+  `jitter_radius = 1.5` (±0.9 voxels at a wall 40% along the path) —
+  re-derive the slot position if the default changes.
+- **max_distance semantics locked**: beyond the budget the source
+  reports `clear()` (never "buried") — distance attenuation belongs
+  to the spatial backend, and clamping to muffled would put a lowpass
+  step function at the boundary.
+- **Bedrock plane counts as solid** (documented on `grid_thickness`,
+  pinned by a test): keep acoustic endpoints above z = 255.
+
+## Hazards
+
+1. **kira API churn** — 0.9→0.10→0.12 each broke the track API. Pin
+   the minor; keep every kira type behind the `AudioOut` trait; the
+   acoustics core must compile without the feature.
+2. **Audio-thread allocation discipline** — kira's handles are
+   cheap, but create tracks up front and reuse; a per-shot track
+   allocation storm is the classic mistake. Pool N spatial tracks
+   (sources beyond the pool steal the quietest).
+3. **Parameter zippering** — always set via tweens, never raw jumps;
+   the 4 Hz acoustic tick + 120 ms tweens must overlap or fast
+   listeners hear steps.
+4. **Ray budget creep** — the estimator must stay round-robin;
+   "just re-trace everything every frame" reads fine at 3 sources
+   and melts at 50.
+5. **Synth sounds that read as programmer art** — accept it for the
+   demo (retro engine, retro bleeps), but keep the asset path open:
+   `StaticSoundData::from_cursor` loads ogg/wav if the maintainer
+   drops real files in later.

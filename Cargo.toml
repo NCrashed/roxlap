@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/roxlap-audio",
     "crates/roxlap-cave-demo",
     "crates/roxlap-cave-web",
     "crates/roxlap-cavegen",
@@ -19,6 +20,7 @@ members = [
 # SDL dev headers. Build it explicitly with `-p roxlap-sdl-demo` (or
 # `--workspace`, as CI's clippy job does).
 default-members = [
+    "crates/roxlap-audio",
     "crates/roxlap-cave-demo",
     "crates/roxlap-cave-web",
     "crates/roxlap-cavegen",
