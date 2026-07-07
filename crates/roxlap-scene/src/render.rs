@@ -100,17 +100,96 @@ pub struct CpuFog {
 /// component); position is rotated about the grid origin.
 fn world_camera_to_grid_local(camera: &Camera, transform: &GridTransform) -> Camera {
     let inv = transform.rotation.inverse();
+    // SC — un-rotate into the grid frame, then divide the origin AND the
+    // pinhole basis by the grid's world units per voxel so the whole
+    // world ray `pos + t·(px·right + py·down + hz·forward)` maps into
+    // voxel space; opticast then marches integer voxels and its depth
+    // comes back in VOXEL units (the caller scales it back to world by
+    // `voxel_world_size` before compositing). `vws == 1.0` is the pre-SC
+    // path, bit-for-bit.
+    let vws = transform.voxel_world_size;
     let world_offset = DVec3::from_array(camera.pos) - transform.origin;
-    let local_pos = inv * world_offset;
-    let local_right = inv * DVec3::from_array(camera.right);
-    let local_down = inv * DVec3::from_array(camera.down);
-    let local_forward = inv * DVec3::from_array(camera.forward);
+    let local_pos = (inv * world_offset) / vws;
+    let local_right = (inv * DVec3::from_array(camera.right)) / vws;
+    let local_down = (inv * DVec3::from_array(camera.down)) / vws;
+    let local_forward = (inv * DVec3::from_array(camera.forward)) / vws;
     Camera {
         pos: local_pos.to_array(),
         right: local_right.to_array(),
         down: local_down.to_array(),
         forward: local_forward.to_array(),
     }
+}
+
+/// SC — scale a rendered grid's depth buffer back to WORLD units so the
+/// cross-grid min-z compose ([`compose_into`] / [`compose_rect`]) stays
+/// world-comparable across grids of different scale.
+///
+/// The factor is **`voxel_world_size²`**, not `vws`. opticast writes
+/// `depth = t · (dir·forward)` (`dda.rs`, perpendicular depth). With a
+/// `world_camera_to_grid_local` camera whose whole pinhole basis is
+/// divided by `vws`, the ray parameter `t` stays the world value, but
+/// `dir·forward` shrinks by `vws²` (both `dir` and `forward` are
+/// `/vws`) — so the written depth is `world / vws²`. Multiplying by
+/// `vws²` recovers world. `INFINITY` (a miss / sky sentinel) stays
+/// `INFINITY`. Only the grid's screen rect is touched. No-op — and
+/// skipped entirely — at `vws == 1.0`.
+fn scale_depth_rect(zb: &mut [f32], pitch_pixels: usize, rect: ScreenRect, voxel_world_size: f64) {
+    if (voxel_world_size - 1.0).abs() <= f64::EPSILON {
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let vws2 = (voxel_world_size * voxel_world_size) as f32;
+    for y in rect.y0..rect.y1 {
+        let row = y as usize * pitch_pixels;
+        for d in &mut zb[row + rect.x0 as usize..row + rect.x1 as usize] {
+            // INFINITY · vws² == INFINITY (vws > 0), so misses stay misses.
+            *d *= vws2;
+        }
+    }
+}
+
+/// SC — the world→grid-local camera divides the whole pinhole basis by
+/// `vws` (see [`world_camera_to_grid_local`]), so opticast writes
+/// `depth = world / vws²` (see [`scale_depth_rect`]). Any WORLD distance
+/// opticast compares against that depth must be divided by `vws²` so the
+/// comparison fires at the intended world range.
+///
+/// This governs the two ray-*terminating* thresholds — the scan cutoff
+/// (`max_scan_dist`, `depth > max_dist`) and the opaque-fog distance
+/// (`fog_max_dist`, `depth >= fog_max_dist`). Both stop the ray, so
+/// leaving them unscaled is **geometry-affecting**, not merely cosmetic: a
+/// fine grid (`vws < 1`) would have its visible terrain clipped to
+/// `range · vws²` — only 6 % of the intended distance at `vws = 0.25`.
+///
+/// (`mip_scan_dist` is a *scene-LOD-picker* input, not compared against the
+/// depth buffer inside the ray, so it is not scaled here — proper
+/// vws-aware projected-size LOD is deferred to SC.3.)
+///
+/// Identity — and byte-identical — at `vws == 1.0`.
+fn scale_world_dist_f32(world_dist: f32, voxel_world_size: f64) -> f32 {
+    if (voxel_world_size - 1.0).abs() <= f64::EPSILON {
+        return world_dist;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let scaled = (f64::from(world_dist) / (voxel_world_size * voxel_world_size)) as f32;
+    scaled
+}
+
+/// SC — [`scale_world_dist_f32`] for the integer `max_scan_dist` handed to
+/// opticast. Rounds and clamps to `[1, i32::MAX]`. Identity at
+/// `vws == 1.0` (byte-identical). The world-space grid distance cull uses
+/// the *unscaled* `settings.max_scan_dist`, so only the copy passed to the
+/// ray is rescaled here.
+fn scale_scan_dist_i32(max_scan_dist: i32, voxel_world_size: f64) -> i32 {
+    if (voxel_world_size - 1.0).abs() <= f64::EPSILON {
+        return max_scan_dist;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let scaled = (f64::from(max_scan_dist) / (voxel_world_size * voxel_world_size))
+        .round()
+        .clamp(1.0, f64::from(i32::MAX)) as i32;
+    scaled
 }
 
 /// CPU.1 — transform world-space dynamic lights into a grid's local frame
@@ -163,12 +242,19 @@ fn grid_local_lights<'a>(
                 continue;
             }
         }
-        let lp = inv
+        // SC — the shade evaluates falloff in the grid's VOXEL frame, so
+        // the light's POSITION divides by `voxel_world_size` (a point)
+        // and its RADIUS too (a world distance → voxel distance), so the
+        // reach sphere stays the same world size. The cone axis is a
+        // direction — scale-invariant (uniform scale), rotate only.
+        let vws = transform.voxel_world_size;
+        let lp = (inv
             * (DVec3::new(
                 f64::from(p.pos[0]),
                 f64::from(p.pos[1]),
                 f64::from(p.pos[2]),
-            ) - transform.origin);
+            ) - transform.origin))
+            / vws;
         // SL — the cone axis is a vector: inverse-rotate only (no origin).
         let sd = inv
             * DVec3::new(
@@ -181,7 +267,8 @@ fn grid_local_lights<'a>(
             pos: [lp.x as f32, lp.y as f32, lp.z as f32],
             color: p.color,
             intensity: p.intensity,
-            radius: p.radius,
+            #[allow(clippy::cast_possible_truncation)]
+            radius: (f64::from(p.radius) / vws) as f32,
             casts_shadow: p.casts_shadow,
             spot_dir: [sd.x as f32, sd.y as f32, sd.z as f32],
             cos_inner: p.cos_inner,
@@ -321,12 +408,17 @@ pub fn render_scene(
             *d = f32::INFINITY;
         }
         let fog_on = fog.max_scan_dist > 0;
+        // SC — opticast writes WORLD/vws² depth under a scaled basis, so the
+        // ray-terminating world thresholds (scan cutoff + opaque fog) are
+        // divided by vws² to fire at the intended world range. Identity at
+        // vws == 1.0 (byte-identical). See `scale_world_dist_f32`.
+        let vws = grid.transform.voxel_world_size;
         #[allow(clippy::cast_precision_loss)]
         let env = DdaEnv {
             sky,
             fog_color: if fog_on { fog.color } else { 0 },
             fog_max_dist: if fog_on {
-                fog.max_scan_dist.max(1) as f32
+                scale_world_dist_f32(fog.max_scan_dist.max(1) as f32, vws)
             } else {
                 0.0
             },
@@ -340,9 +432,20 @@ pub fn render_scene(
             lights: CpuLights::default(),
             world_shadow: None,
         };
+        // Scan-cutoff copy (identity at vws == 1.0 → same &settings).
+        let grid_settings;
+        let ray_settings = if (vws - 1.0).abs() <= f64::EPSILON {
+            settings
+        } else {
+            grid_settings = OpticastSettings {
+                max_scan_dist: scale_scan_dist_i32(settings.max_scan_dist, vws),
+                ..*settings
+            };
+            &grid_settings
+        };
         render_dda_parallel(
             &local_cam,
-            settings,
+            ray_settings,
             grid_view,
             fb,
             zb,
@@ -351,6 +454,18 @@ pub fn render_scene(
             &grid.dda_brick_cache,
             dda_mip,
         );
+        // SC — opticast wrote VOXEL-unit depth (the camera is voxel-frame);
+        // scale it back to WORLD so the buffer is world-consistent (this
+        // path clears + renders per grid, so only this grid's pixels are
+        // present). No-op at vws == 1.0. INFINITY misses stay misses.
+        if (vws - 1.0).abs() > f64::EPSILON {
+            // world = written · vws² (see `scale_depth_rect`).
+            #[allow(clippy::cast_possible_truncation)]
+            let vws2 = (vws * vws) as f32;
+            for d in zb.iter_mut() {
+                *d *= vws2;
+            }
+        }
         grids_drawn += 1;
     }
     if grids_drawn == 0 {
@@ -1033,9 +1148,16 @@ fn render_scene_composed_scissored(
         // band joins it now that the radar-era `angstart` fragility is
         // gone (see the rect computation above). Byte-identical to the
         // full frame when the rect is `0..width × 0..height`.
-        let scissored = (*active_settings)
+        // SC — the scan cutoff (`max_scan_dist`) is a WORLD distance the ray
+        // compares against its WORLD/vws² depth, so it is divided by vws² for
+        // the ray to reach the intended world range (a fine grid would
+        // otherwise be clipped short). Identity at vws == 1.0 (byte-identical).
+        // The world-space distance cull above uses the *unscaled* setting.
+        let vws = grid.transform.voxel_world_size;
+        let mut scissored = (*active_settings)
             .with_y_range(rect.y0, rect.y1)
             .with_x_range(rect.x0, rect.x1);
+        scissored.max_scan_dist = scale_scan_dist_i32(scissored.max_scan_dist, vws);
         // DDA backend. temp_fb / temp_zb are already pre-filled with
         // sky / INFINITY for this grid's rect, so a miss with no
         // textured sky yields the correct solid sky.
@@ -1079,8 +1201,10 @@ fn render_scene_composed_scissored(
         let env = DdaEnv {
             sky: if owns_sky { sky } else { None },
             fog_color: if fog_on { fog.color } else { 0 },
+            // SC — opaque-fog distance also terminates the ray, so it is
+            // divided by vws² alongside the scan cutoff (identity at vws==1.0).
             fog_max_dist: if fog_on {
-                fog.max_scan_dist.max(1) as f32
+                scale_world_dist_f32(fog.max_scan_dist.max(1) as f32, vws)
             } else {
                 0.0
             },
@@ -1103,6 +1227,10 @@ fn render_scene_composed_scissored(
             &grid.dda_brick_cache,
             dda_eff_mip,
         );
+        // SC — voxel-unit depth → world, so the cross-grid min-z compose
+        // below is world-comparable across grids of different scale.
+        // No-op at vws == 1.0 (byte-identical).
+        scale_depth_rect(temp_zb, pitch_pixels, rect, grid.transform.voxel_world_size);
 
         if !owns_sky {
             // Mask sentinel pixels so compose drops them — only within
@@ -1962,6 +2090,121 @@ mod tests {
         assert_eq!(
             fb, fb2,
             "composition should be order-independent — same scene in different add order should produce identical output"
+        );
+    }
+
+    #[test]
+    fn sc1_scaled_grid_composites_by_world_depth() {
+        // SC.1 — two grids at the same origin, boxes on the SAME world
+        // column but different scale, so the raw-written and world depth
+        // metrics DISAGREE. Camera at y=-10; perpendicular world depth to a
+        // box's near face is `world_y_near + 10`:
+        //  - grid B (vws 1.0): box world y-near = 92 → written depth 102
+        //    (vws==1 so raw == world).
+        //  - grid A (vws 2.0): box world y-near = 104 → world depth 114, but
+        //    opticast writes `world / vws² = 114 / 4 ≈ 28.5` (the scaled
+        //    basis shrinks `dir·forward` by vws²). `scale_depth_rect` then
+        //    multiplies by vws² = 4 → 114.
+        // Correct (world depth): A (114) is FARTHER than B (102) → the
+        // world-nearer BLUE box wins.
+        // Broken (no `scale_depth_rect`): A's raw 28.5 < B's 102 → RED wins.
+        // (This test only pins the ORDER; `sc1_scaled_grid_depth_is_world`
+        // pins the exact vws² factor by asserting the world depth value.)
+        let red = 0x80_aa_00_00;
+        let blue = 0x80_00_00_aa;
+        let mut scene = Scene::new();
+        // Grid B, unscaled, nearer in world.
+        let b = scene.add_grid(GridTransform::at(DVec3::ZERO));
+        scene.grid_mut(b).unwrap().set_rect(
+            IVec3::new(56, 92, 92),
+            IVec3::new(71, 107, 107),
+            Some(VoxColor(blue)),
+        );
+        // Grid A, vws 2.0, farther in world (local coords = world / 2).
+        let a = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 2.0));
+        scene.grid_mut(a).unwrap().set_rect(
+            IVec3::new(28, 52, 50),
+            IVec3::new(35, 57, 57),
+            Some(VoxColor(red)),
+        );
+
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let camera = camera_at([64.0, -10.0, 100.0]); // looks +y
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            fog,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 2 });
+
+        let centre = (YRES / 2) as usize * XRES as usize + (XRES / 2) as usize;
+        assert_eq!(
+            fb[centre], blue,
+            "the world-nearer unscaled grid must win the depth test; RED here \
+             means the scaled grid's depth wasn't converted to world units"
+        );
+    }
+
+    #[test]
+    fn sc1_scaled_grid_depth_is_world() {
+        // SC.1 — render ONLY a scaled grid (vws 2.0) and assert the composited
+        // depth buffer holds the WORLD perpendicular depth, pinning the vws²
+        // factor exactly (the ordering test above only bounds it below).
+        //
+        // Box A local y 52..57 → world y-near = 52·2 = 104. Camera at y=-10
+        // looks +y, centre ray horizontal, so the world perpendicular depth is
+        // 104 - (-10) = 114. opticast writes world/vws² = 114/4 ≈ 28.5;
+        // `scale_depth_rect` (×vws²) recovers 114. Wrong factors miss badly:
+        // no scale → 28.5, ×vws → 57, ×vws³ → 228. Only ×vws² lands on 114.
+        let red = 0x80_aa_00_00;
+        let mut scene = Scene::new();
+        let a = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 2.0));
+        // Local box centred on the camera column (world x 56..70 → centre 63,
+        // world z 100..114 → centre 107) so the centre ray hits the interior.
+        scene.grid_mut(a).unwrap().set_rect(
+            IVec3::new(28, 52, 50),
+            IVec3::new(35, 57, 57),
+            Some(VoxColor(red)),
+        );
+
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let camera = camera_at([63.0, -10.0, 107.0]); // looks +y, hits box A
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            fog,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+
+        let centre = (YRES / 2) as usize * XRES as usize + (XRES / 2) as usize;
+        assert_eq!(fb[centre], red, "centre ray should hit the scaled box");
+        let depth = zb[centre];
+        assert!(
+            (depth - 114.0).abs() <= 3.0,
+            "expected WORLD perpendicular depth ≈ 114 (pins the vws² factor); \
+             got {depth} — 28.5 means no scale, 57 means ×vws, 228 means ×vws³"
         );
     }
 

@@ -128,8 +128,11 @@ pattern from sprite volumes to terrain grids** — not greenfield.
   pos/right/down/forward by vws.
 - `scene_dda.wgsl`: `grid_local_to_world`/`world_to_grid_local`/
   `world_dir_to_grid_local` (603–623, ×/÷ vws); `march_grid` chunk_dim
-  `*vws` + `mip_scan_dist /vws`; `shadow_occluded` same; volumetric
-  `/(vsize·vws)`.
+  `*vws`; the ray-terminating world thresholds (scan cutoff + opaque fog)
+  divide by **vws²** to match CPU SC.1 (opticast/shader depth is
+  `world/vws²` under the /vws basis — vws², NOT vws); `shadow_occluded`
+  same; volumetric `/(vsize·vws)`. (`mip_scan_dist` is an LOD-picker
+  input, deferred like the CPU side — SC.3.)
 - `sprite_terrain_shadow.wgsl` transform fns + chunk_dim (sprites RECEIVE
   scaled-grid shadows). `scene_sprite_shadow.wgsl` sprite CAST already
   handles `m.voxel_world_size` — unchanged.
@@ -150,9 +153,44 @@ pattern from sprite volumes to terrain grids** — not greenfield.
   world-correct `t`; a two-grid scene (vws 1.0 + 2.0) raycast picks the
   nearer WORLD hit regardless of voxel-local distance; vws=1.0
   byte-identical to today.
-- **SC.1 — CPU render (camera + lights).** `world_camera_to_grid_local`
-  + `grid_local_lights` scaling. A scaled grid renders at the right
-  world footprint; lights land correctly. vws=1.0 golden-hash unchanged.
+- **SC.1 — LANDED 2026-07-07: CPU render (camera + lights + depth).**
+  `world_camera_to_grid_local` divides the whole pinhole basis + pos by
+  vws (opticast marches the world ray in voxel space);
+  `grid_local_lights` divides point positions AND radius by vws (falloff
+  is evaluated in the voxel frame); cross-grid depth composited world-
+  correctly via a new `scale_depth_rect` × **vws²** (opticast's
+  `depth = t·(dir·forward)` shrinks by vws² under the /vws basis — the
+  factor is vws², NOT vws; a test with disagreeing voxel/world metrics
+  pinned it after the vws attempt drew the wrong grid). Both the direct
+  and scissored render paths corrected; all guarded on vws≠1. Tests:
+  `sc1_scaled_grid_composites_by_world_depth` (order — world-nearer
+  unscaled grid wins over a voxel-nearer scaled one) and
+  `sc1_scaled_grid_depth_is_world` (value — a scaled grid rendered alone
+  has zb ≈ world depth 114, pinning the vws² factor exactly: 28.5/57/228
+  for no-scale/×vws/×vws³ all fail). 209 scene tests green, vws=1.0
+  byte-identical.
+  **Ray-terminating world thresholds scaled /vws² (SC.1, geometry).**
+  opticast writes `depth = world/vws²`; the thresholds it compares
+  against that depth to *stop the ray* — the scan cutoff `max_scan_dist`
+  (`depth > max_dist`) and the opaque-fog distance `fog_max_dist`
+  (`depth >= fog_max_dist`) — are world distances, so each is divided by
+  vws² (`scale_scan_dist_i32` / `scale_world_dist_f32`) for the ray to
+  reach the intended world range. Without this a fine grid (vws<1) has
+  its visible terrain clipped to `range·vws²` (6 % at vws=0.25) — a
+  geometry bug, not cosmetic. The world-space grid *distance cull* keeps
+  the unscaled `max_scan_dist` (it's already a world compare). Both
+  render paths.
+  **Light-radius semantics (SC.1).** A *dynamic* point light's radius is
+  WORLD (divided by vws → constant world reach across scales). A
+  *baked* `BakeLight.radius` stays VOXEL (bake runs in the grid-local
+  frame → world reach = `radius·vws`). Parallel to the StreamRadius
+  voxel-vs-world note (hazard 5); revisit if bakes gain world radii.
+  **DEFERRED to SC.3**: `mip_scan_dist` is a *scene-LOD-picker* input
+  (chooses the per-grid render mip by world distance), not compared
+  against the depth buffer inside the ray, so it clips no geometry — but
+  a fine grid's voxels project smaller and could take a coarser mip
+  sooner. Proper vws-aware projected-size LOD folds a /vws there with the
+  LOD thresholds. Shadow distances under scale = SC.2.
 - **SC.2 — CPU cross-grid shadows.** `WorldShadowCtx` + `occluded_in_grid`
   scale (ray + max_t). Test: a scaled grid casts a world-correct shadow
   onto another grid (extend `cross_grid_sun_shadow_darkens_other_grid`
