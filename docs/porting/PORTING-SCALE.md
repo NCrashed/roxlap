@@ -185,12 +185,13 @@ pattern from sprite volumes to terrain grids** — not greenfield.
   *baked* `BakeLight.radius` stays VOXEL (bake runs in the grid-local
   frame → world reach = `radius·vws`). Parallel to the StreamRadius
   voxel-vs-world note (hazard 5); revisit if bakes gain world radii.
-  **DEFERRED to SC.3**: `mip_scan_dist` is a *scene-LOD-picker* input
-  (chooses the per-grid render mip by world distance), not compared
-  against the depth buffer inside the ray, so it clips no geometry — but
-  a fine grid's voxels project smaller and could take a coarser mip
-  sooner. Proper vws-aware projected-size LOD folds a /vws there with the
-  LOD thresholds. Shadow distances under scale = SC.2.
+  **NOT scaled (optional future perf, resolved in SC.3):** `mip_scan_dist`
+  is a *scene-LOD-picker* input, not compared against the depth buffer
+  inside the ray, and is dead config for the DDA backend. A fine grid's
+  voxels project smaller and *could* take a coarser mip sooner, but a
+  finer-than-needed mip is never wrong — see the SC.3 status, which
+  confirms this is an optional optimization, not a scale bug. Shadow
+  distances under scale = SC.2.
 - **SC.2 — LANDED 2026-07-07: CPU cross-grid shadows.** Two scale factors,
   handled on the two sides of the world-space shadow test:
   - **Caster** (grid being shaded): `WorldShadowCtx` gains
@@ -254,6 +255,34 @@ pattern from sprite volumes to terrain grids** — not greenfield.
     directly in world comparisons → a scaled grid would be mis-culled /
     mis-projected.
   All 60 collide/stream/lod/render-cull tests green, vws=1.0 byte-identical.
+
+  **Scale-correctness now closed across the CPU pipeline** — the two
+  correctness fixes landed alongside SC.3 in review rounds are DONE, not
+  open: (i) the **ray-terminating thresholds** (`max_scan_dist`,
+  `fog_max_dist`) divide by **vws²** so a fine grid (vws<1) isn't clipped to
+  `range·vws²` — see the SC.1 status; the ONE vws<1 render test exercising
+  this clip is `sc3_fine_grid_renders_beyond_unscaled_range` (vws=0.5 box
+  past `max_scan_dist·vws²`, negative-verified it clips to sky without the
+  fix). (ii) the **sun `shadow_max_dist`** is WORLD-uniform (`grid_local_
+  lights ÷vws`) — see the SC.2 status; pinned by `sc2_sun_shadow_cap_is_
+  world_uniform` (vws=0.5 → 80, vws=4 → 10 voxels, all = the same world
+  reach).
+
+  **Intentional inconsistency (do not "fix" back):** *shadow reach* is now
+  WORLD-uniform (a shadow is a "does X occlude Y" world question), but
+  `BakeLight.radius` and `StreamRadius` stay **VOXEL** (authoring/perf
+  knobs whose world reach is `value·vws`). Different by design — spelled out
+  so a later refactor doesn't unify them.
+
+  **Perf note (finding — no re-clip):** the primary `cast_ray` step budget
+  is bounded by the grid's **voxel-AABB span**, not `max_scan_dist`, so the
+  ÷vws² reach extension never hits a hard cap that would silently re-clip a
+  fine grid. But a fine grid genuinely costs **~vws²-more marcher steps per
+  ray** for the same world reach (a vws=0.25 grid marches ~16× the voxels) —
+  inherent to having more voxels along the ray. (The *shadow* march keeps a
+  `SHADOW_MAX_STEPS = 1024` degenerate-ray backstop; only reachable at
+  extreme vws + large shadow distance.)
+
   **Deferred (perf, not correctness):** vws-aware *projected-size* mip LOD.
   The DDA backend picks the per-grid mip from `select_lod` (now world-
   correct) + the Mid-tier config; `mip_scan_dist` is dead config for it. A

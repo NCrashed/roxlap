@@ -163,8 +163,9 @@ fn scale_depth_rect(zb: &mut [f32], pitch_pixels: usize, rect: ScreenRect, voxel
 /// `range · vws²` — only 6 % of the intended distance at `vws = 0.25`.
 ///
 /// (`mip_scan_dist` is a *scene-LOD-picker* input, not compared against the
-/// depth buffer inside the ray, so it is not scaled here — proper
-/// vws-aware projected-size LOD is deferred to SC.3.)
+/// depth buffer inside the ray, so it is not scaled here. It is also dead
+/// config for the DDA backend — vws-aware projected-size LOD is an optional
+/// future perf optimization, not a scale bug; see the SC.3 status.)
 ///
 /// Identity — and byte-identical — at `vws == 1.0`.
 fn scale_world_dist_f32(world_dist: f32, voxel_world_size: f64) -> f32 {
@@ -2372,6 +2373,57 @@ mod tests {
             (depth - 114.0).abs() <= 3.0,
             "expected WORLD perpendicular depth ≈ 114 (pins the vws² factor); \
              got {depth} — 28.5 means no scale, 57 means ×vws, 228 means ×vws³"
+        );
+    }
+
+    #[test]
+    fn sc3_fine_grid_renders_beyond_unscaled_range() {
+        // SC.1/SC.3 finding — the ray-terminating scan cutoff is a WORLD
+        // distance divided by vws² (opticast writes depth = world/vws²). This
+        // is the ONE vws<1 test that exercises the clip the fix removes: a
+        // fine grid (vws=0.5) with geometry PAST `max_scan_dist·vws²` but
+        // within `max_scan_dist` world. Without the /vws² scale the ray stops
+        // at `max_scan_dist·vws²` (25 world here) and the box (world y≈50) is
+        // clipped to sky; with it the ray reaches 100 world and the box draws.
+        let red = 0x80_aa_00_00;
+        let mut scene = Scene::new();
+        // vws=0.5: local (·) → world (·)/2. Box near face local y=100 →
+        // world y=50; local x/z 28..36 → world 14..18 (centre 16).
+        let g = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 0.5));
+        scene.grid_mut(g).unwrap().set_rect(
+            IVec3::new(28, 100, 28),
+            IVec3::new(36, 110, 36),
+            Some(VoxColor(red)),
+        );
+
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        // Camera in world coords, looking +y at the box.
+        let camera = camera_at([16.0, 0.0, 16.0]);
+        // max_scan_dist = 100 WORLD. Unscaled reach at vws=0.5 would be
+        // 100·0.25 = 25 world (box at 50 clipped); scaled reach is 100.
+        let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        settings.max_scan_dist = 100;
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            fog,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let centre = (YRES / 2) as usize * XRES as usize + (XRES / 2) as usize;
+        assert_eq!(
+            fb[centre], red,
+            "fine grid's box at world y≈50 (> max_scan_dist·vws²=25) must \
+             render; sky here means the scan cutoff wasn't scaled by vws²"
         );
     }
 
