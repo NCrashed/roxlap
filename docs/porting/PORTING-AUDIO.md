@@ -28,7 +28,22 @@ against crates.io/docs.rs).
   beyond-max-distance now reports `clear()` (was "buried" — see
   tuning notes), and the bedrock-plane caveat (doc + pinning test).
   10 tests total.
-- AU.1 — pending (cavity/reverb estimator).
+- AU.1 — LANDED 2026-07-07: `cavity` module — `probe_cavity` (fixed
+  32-ray golden-spiral fan over `Scene::raycast`), `CavityProbe` /
+  `ListenerAcoustics` / `CavityConfig`, and `CavityEstimator`
+  (per-update exponential smoothing, default 0.75 = the prior art's
+  `(3·old+new)/4`; first update seeds from raw; `reset()` for
+  teleports). Review round (user, same day) reworked the mapping —
+  the original leaked audible reverb outdoors (mix 0.25 at feedback
+  0.63 in an open field, hidden by a relative test assert):
+  (a) room size now comes from `enclosed_free_path` (hit rays only —
+  escaped rays must not read open sky as a huge hall; all-miss
+  sentinel = cap, moot since mix is 0 there), and (b) the wet mix
+  hits zero at `outdoor_openness` (default 0.5) — standing on ground
+  the lower hemisphere always hits, so raw openness tops out near
+  0.5 outdoors and must read as FULLY dry. Tests use ABSOLUTE bounds
+  (`dry.mix < 0.05`, `dry.feedback < min+0.15`) so this can't
+  regress behind a wetter cavern. 5 tests total.
 - AU.2 — pending (kira playback backend, feature-gated).
 - AU.3 — pending (cave-demo integration).
 - AU.4 — pending (book chapter + CHANGELOG).
@@ -154,6 +169,18 @@ Sound that *knows about the voxels*:
   step function at the boundary.
 - **Bedrock plane counts as solid** (documented on `grid_thickness`,
   pinned by a test): keep acoustic endpoints above z = 255.
+- **Listener inside solid** reads as a tiny sealed box (max wet, min
+  feedback) — documented on `probe_cavity`. AU.3 must guard the
+  camera-clipped-into-wall case (skip the update or nudge the probe
+  point out of solid).
+- **Two separate distance budgets by design**: occlusion
+  `max_distance = 128` (as far as sources are audible) vs cavity
+  `max_ray_dist = 64` (only the local room) — cross-documented on
+  both configs so tuning doesn't conflate them.
+- **The cavity fan rides `Scene::raycast`**, not AU.0's
+  chunk-borrow-cached thickness march — when profiling AU.2/3, the
+  32 listener rays have `raycast`'s cost profile (its own march, no
+  borrow cache).
 
 ## Hazards
 

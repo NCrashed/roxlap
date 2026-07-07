@@ -24,6 +24,10 @@
 use glam::{DVec3, IVec3};
 use roxlap_scene::Scene;
 
+mod cavity;
+
+pub use cavity::{probe_cavity, CavityConfig, CavityEstimator, CavityProbe, ListenerAcoustics};
+
 /// Tuning knobs for [`source_acoustics`]. The defaults are the cave-demo
 /// tuning; every field is plain data so hosts can persist or lerp them.
 #[derive(Debug, Clone, PartialEq)]
