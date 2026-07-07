@@ -230,9 +230,14 @@ pub(crate) fn chunk_aabb_dist_sq(p_local: DVec3, chunk_idx: IVec3) -> f64 {
 /// chunk + voxel + fract decomposition. Used by
 /// [`crate::Scene::pump_streaming_sync`] which only needs the
 /// continuous grid-local position to test chunk-AABB distances.
+///
+/// SC.3 — divides by `voxel_world_size` so the result is in grid-local
+/// VOXEL units, matching the chunk-AABB coordinates and the voxel-space
+/// [`StreamRadius`] it's compared against (so a grid's WORLD stream radius
+/// is `r_voxels · voxel_world_size`). `vws == 1.0` is byte-identical.
 #[must_use]
 pub(crate) fn world_to_grid_local_pos(world_pos: DVec3, transform: &crate::GridTransform) -> DVec3 {
-    transform.rotation.inverse() * (world_pos - transform.origin)
+    transform.rotation.inverse() * (world_pos - transform.origin) / transform.voxel_world_size
 }
 
 // ===========================================================
@@ -522,6 +527,23 @@ pub(crate) mod tests {
     }
 
     // ---- S7.1: StreamRadius + Scene::pump_streaming_sync ----
+
+    #[test]
+    fn sc3_world_to_grid_local_pos_scales_by_vws() {
+        // SC.3 — StreamRadius is in grid-local VOXELS, so the camera world
+        // position must be divided by vws to compare against chunk-AABB
+        // (voxel) distances. A world point at (40,0,0) on a vws=4.0 grid maps
+        // to voxel (10,0,0); the grid's WORLD stream radius is thus r·vws.
+        let t = GridTransform::at_scale(DVec3::new(0.0, 0.0, 0.0), 4.0);
+        let local = world_to_grid_local_pos(DVec3::new(40.0, 0.0, 0.0), &t);
+        assert!(
+            (local - DVec3::new(10.0, 0.0, 0.0)).length() < 1e-9,
+            "world (40,0,0) at vws=4 must be voxel (10,0,0): got {local:?}"
+        );
+        // vws == 1.0 is byte-identical to the pre-SC translate-only form.
+        let unit = world_to_grid_local_pos(DVec3::new(40.0, 0.0, 0.0), &GridTransform::identity());
+        assert!((unit - DVec3::new(40.0, 0.0, 0.0)).length() < 1e-9);
+    }
 
     #[test]
     fn stream_radius_disabled_is_truly_zero_infty() {

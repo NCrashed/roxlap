@@ -231,10 +231,35 @@ pattern from sprite volumes to terrain grids** — not greenfield.
      stays f32. Does NOT solve floating-origin (still deferred) — just stops
      discarding f64 precision at an internal boundary.
   210+ scene + core shadow tests green, vws=1.0 byte-identical.
-- **SC.3 — collision + streaming + LOD.** `grid_box_overlaps_solid`,
-  `world_to_grid_local_pos`, `lod::from_radius`. Tests: box overlap
-  hits the right world region in a scaled grid; LOD tier flips at the
-  scaled world distance.
+- **SC.3 — LANDED 2026-07-07: collision + streaming + LOD + render cull.**
+  Every world↔grid-local boundary that treated 1 world unit = 1 voxel now
+  divides/multiplies by vws:
+  - `collide.rs grid_box_overlaps_solid` — the world box → grid-local box
+    divides by vws (both the axis-aligned and rotated-OBB branches), so a
+    scaled grid collides at its true WORLD footprint. Test
+    `sc3_scaled_grid_collides_at_world_position`.
+  - `streaming.rs world_to_grid_local_pos` — divides by vws (mirrors
+    `addr::world_to_grid_local`), so the camera position is voxel-space to
+    compare against chunk-AABB distances. StreamRadius stays grid-local
+    voxels (world reach = `r·vws`). Test `sc3_world_to_grid_local_pos_scales_by_vws`.
+  - `lib.rs Grid::bounding_radius` — now returns **world** units (voxel
+    half-extent × vws), pairing with the world-distance LOD thresholds so
+    `select_lod` picks the right tier for a scaled grid. Test
+    `sc3_bounding_radius_is_world_scaled`. `from_radius` unchanged (its
+    input is now a world radius; only test-called today).
+  - `render.rs` per-frame **distance cull + screen-rect projection +
+    billboard blit + light-reach cull** — new `grid_world_bounds` helper
+    folds vws into BOTH the sphere centre (×vws, then rotate+translate) and
+    radius (×vws). Previously used `billboard::grid_bounds` (grid-local)
+    directly in world comparisons → a scaled grid would be mis-culled /
+    mis-projected.
+  All 60 collide/stream/lod/render-cull tests green, vws=1.0 byte-identical.
+  **Deferred (perf, not correctness):** vws-aware *projected-size* mip LOD.
+  The DDA backend picks the per-grid mip from `select_lod` (now world-
+  correct) + the Mid-tier config; `mip_scan_dist` is dead config for it. A
+  fine grid's voxels project smaller so they *could* take a coarser mip
+  sooner (a perf win) — but a finer-than-needed mip is never wrong, so this
+  is an optional future optimization, not a scale bug.
 - **SC.4 — GPU parity.** `world_origin.w` scale, `grid_local_camera`,
   the `scene_dda.wgsl` edits, `sprite_terrain_shadow.wgsl`, volumetric.
   Headless CPU-vs-GPU diff at vws≠1 (extend the HeadlessSceneRenderer

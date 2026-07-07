@@ -107,10 +107,16 @@ pub fn point_overlaps_solid(scene: &Scene, p: DVec3, solidity: Solidity) -> bool
 /// their own grid (the cave demos collide against one grid only).
 #[must_use]
 pub fn grid_box_overlaps_solid(grid: &Grid, min: DVec3, max: DVec3, solidity: Solidity) -> bool {
-    // World box → grid-local box.
+    // World box → grid-local VOXEL box. SC.3 — the grid-local offset is in
+    // world units; divide by `voxel_world_size` to reach voxel indices (in
+    // which the cell probe below lives). `vws == 1.0` is byte-identical.
+    let vws = grid.transform.voxel_world_size;
     let (lmin, lmax) = if grid.transform.rotation == DQuat::IDENTITY {
-        // Axis-aligned: translate — the probe below is cell-exact.
-        (min - grid.transform.origin, max - grid.transform.origin)
+        // Axis-aligned: translate + scale — the probe below is cell-exact.
+        (
+            (min - grid.transform.origin) / vws,
+            (max - grid.transform.origin) / vws,
+        )
     } else {
         // Rotated: local AABB of the 8 transformed corners —
         // conservative (a fat OBB approximation), never leaky.
@@ -123,7 +129,7 @@ pub fn grid_box_overlaps_solid(grid: &Grid, min: DVec3, max: DVec3, solidity: So
                 if corner & 2 == 0 { min.y } else { max.y },
                 if corner & 4 == 0 { min.z } else { max.z },
             );
-            let local = inv * (world - grid.transform.origin);
+            let local = inv * (world - grid.transform.origin) / vws;
             lmin = lmin.min(local);
             lmax = lmax.max(local);
         }
@@ -199,6 +205,31 @@ mod tests {
         let scene = floating_voxel_scene();
         // World (10, 10, -50) → grid-local (10, 10, 50): the voxel.
         assert!(cube_probe(&scene, [10.0, 10.0, -50.0], 0.3));
+    }
+
+    #[test]
+    fn sc3_scaled_grid_collides_at_world_position() {
+        // SC.3 — a vws=2.0 grid with a voxel at grid-local (10,10,50) puts it
+        // at WORLD (20,20,100); the collision box probe must hit there, not at
+        // the unscaled world (10,10,50). Without the /vws in
+        // `grid_box_overlaps_solid` the world box would map to grid-local
+        // (20,20,100) — a different, empty voxel — and miss.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 2.0));
+        scene
+            .grid_mut(id)
+            .expect("grid present")
+            .set_voxel(IVec3::new(10, 10, 50), Some(VoxColor(0x80_aa_bb_cc)));
+        // The voxel's world cell is [20,22)×[20,22)×[100,102) (local·vws).
+        assert!(
+            cube_probe(&scene, [21.0, 21.0, 101.0], 0.3),
+            "scaled voxel must block at its WORLD position (20,20,100)"
+        );
+        // The unscaled position (where a missing /vws would place it) is air.
+        assert!(
+            !cube_probe(&scene, [10.5, 10.5, 50.5], 0.3),
+            "nothing at the un-scaled world position"
+        );
     }
 
     #[test]

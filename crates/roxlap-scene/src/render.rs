@@ -192,6 +192,19 @@ fn scale_scan_dist_i32(max_scan_dist: i32, voxel_world_size: f64) -> i32 {
     scaled
 }
 
+/// SC.3 — a grid's bounding sphere in **world** space. [`billboard::grid_bounds`]
+/// returns grid-local (voxel) units, so the world sphere scales the centre
+/// AND radius by `voxel_world_size` (the centre is then rotated + translated
+/// into world). Used by the per-frame distance cull, screen-rect projection,
+/// billboard blit, and light-reach cull — all world-space. Identity — and
+/// byte-identical — at `vws == 1.0`.
+fn grid_world_bounds(grid: &crate::Grid) -> (DVec3, f64) {
+    let b = billboard::grid_bounds(grid);
+    let vws = grid.transform.voxel_world_size;
+    let centre = grid.transform.origin + grid.transform.rotation * (b.centre * vws);
+    (centre, b.radius * vws)
+}
+
 /// CPU.1 — transform world-space dynamic lights into a grid's local frame
 /// (the same translate + inverse-rotation as [`world_camera_to_grid_local`]):
 /// point positions are points (origin-relative + inverse-rotated); the sun
@@ -940,10 +953,8 @@ fn render_scene_composed_scissored(
             if grid.chunks.is_empty() {
                 continue;
             }
-            // Grid bounds + world-space centre. Rotation preserves
-            // length, so `bounds.radius` is the world-space radius.
-            let bounds = billboard::grid_bounds(grid);
-            let centre_world = grid.transform.origin + grid.transform.rotation * bounds.centre;
+            // Grid bounds → world-space centre + radius (SC.3 folds in vws).
+            let (centre_world, world_radius) = grid_world_bounds(grid);
             // Query direction = unit vector from grid centre TO
             // camera, in grid-local space (snapshots' `view_dir`s
             // live in that frame).
@@ -976,7 +987,7 @@ fn render_scene_composed_scissored(
                 height,
                 snapshot,
                 centre_world,
-                bounds.radius,
+                world_radius,
                 camera,
                 settings,
             );
@@ -1015,11 +1026,10 @@ fn render_scene_composed_scissored(
         // `grid_bounds` walks `grid.chunks.keys()`; for the ground's
         // ~1024 chunks it costs ~10 µs amortised against the ~50 ms
         // it might save by culling 4-of-5 markers in the live demo.
-        let bounds = billboard::grid_bounds(grid);
-        let centre_world = grid.transform.origin + grid.transform.rotation * bounds.centre;
+        let (centre_world, world_radius) = grid_world_bounds(grid);
         let cam_pos = DVec3::from_array(camera.pos);
         let dist_to_centre = (centre_world - cam_pos).length();
-        if dist_to_centre - bounds.radius > f64::from(settings.max_scan_dist) {
+        if dist_to_centre - world_radius > f64::from(settings.max_scan_dist) {
             continue;
         }
 
@@ -1048,7 +1058,7 @@ fn render_scene_composed_scissored(
             y1: height,
         };
         let rect = if scissor {
-            match project_sphere_to_screen(camera, centre_world, bounds.radius, settings) {
+            match project_sphere_to_screen(camera, centre_world, world_radius, settings) {
                 // Off-screen on either axis → the grid can't appear.
                 Some(r) if r.is_empty() => continue,
                 Some(r) => r,
@@ -1185,7 +1195,7 @@ fn render_scene_composed_scissored(
             &lights,
             &grid.transform,
             &mut scratch.lights,
-            Some((centre_world, bounds.radius)),
+            Some((centre_world, world_radius)),
         );
         // XS.1 — cross-grid shadows: hand the shade the scene-wide occluder
         // plus this grid's local→world transform, so a grid-local shadow ray

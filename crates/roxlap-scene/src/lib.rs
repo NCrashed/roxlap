@@ -813,7 +813,9 @@ impl Grid {
     }
 
     /// Bounding-sphere radius of the populated chunk set in
-    /// grid-local space.
+    /// **world** space (SC.3 — the voxel half-extent is scaled by
+    /// `voxel_world_size`, so it pairs directly with the world-distance
+    /// LOD thresholds in [`crate::LodThresholds::from_radius`]).
     ///
     /// Walks the sparse chunk map once, computes the chunk-index
     /// AABB, converts to voxel-space half-extent, returns its
@@ -855,7 +857,8 @@ impl Grid {
             f64::from(max.z + 1) * sz,
         );
         let half_extent = (hi - lo) * 0.5;
-        half_extent.length()
+        // SC.3 — voxel half-extent → world radius (byte-identical at vws==1).
+        half_extent.length() * self.transform.voxel_world_size
     }
 
     /// Pick this grid's LOD tier for the given world-space camera
@@ -1627,6 +1630,35 @@ mod tests {
         assert!(
             (r - expected).abs() < 1e-9,
             "bounding_radius={r} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn sc3_bounding_radius_is_world_scaled() {
+        // SC.3 — bounding_radius returns WORLD units, so a vws=3.0 grid's
+        // radius is 3× the voxel half-extent. This pairs with the
+        // world-distance LOD thresholds so a scaled grid picks the right tier.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(crate::GridTransform::at_scale(DVec3::ZERO, 3.0));
+        let g = scene.grid_mut(id).unwrap();
+        g.set_voxel(IVec3::new(0, 0, 0), Some(VoxColor(0x80_88_88_88)));
+        let voxel_half = ((64.0_f64).powi(2) * 2.0 + (128.0_f64).powi(2)).sqrt();
+        let r = g.bounding_radius();
+        assert!(
+            (r - voxel_half * 3.0).abs() < 1e-9,
+            "world radius must be voxel half-extent × vws: got {r}"
+        );
+        // select_lod uses world distance vs world thresholds. from_radius(r)
+        // sets r_near = r; a camera just inside/outside it flips Near↔Mid.
+        g.lod_thresholds = crate::LodThresholds::from_radius(r);
+        assert_eq!(
+            g.select_lod(DVec3::new(r * 0.5, 0.0, 0.0)),
+            crate::Lod::Near
+        );
+        assert_eq!(
+            g.select_lod(DVec3::new(r * 2.0, 0.0, 0.0)),
+            crate::Lod::Mid,
+            "tier must flip at the WORLD (scaled) distance"
         );
     }
 
