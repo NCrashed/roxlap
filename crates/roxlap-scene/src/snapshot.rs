@@ -132,8 +132,8 @@ pub struct GridSnapshot {
     /// as a sibling field (not inside the transform, whose wire form stays
     /// frozen with `#[serde(skip)]`). The `#[serde(default)]` covers
     /// self-describing formats; the bincode positional gap between v1 and v2
-    /// is handled by [`GridSnapshotV1`] + the version dispatch in
-    /// [`Scene::load_snapshot`]. v1 blobs restore this at `1.0`.
+    /// is handled by the private `GridSnapshotV1` shadow shape + the version
+    /// dispatch in [`Scene::load_snapshot`]. v1 blobs restore this at `1.0`.
     #[serde(default = "one_f64")]
     pub voxel_world_size: f64,
 }
@@ -388,8 +388,8 @@ pub const SNAPSHOT_MAGIC: [u8; 4] = *b"RXSS";
 /// [`GridSnapshot`] would make a v1 blob short-read ("unexpected end of
 /// file") — hence the version bump. [`Scene::load_snapshot`] dispatches:
 /// v2 blobs decode [`GridSnapshot`] directly; v1 blobs decode the frozen
-/// [`GridSnapshotV1`] shadow shape (which lacks the field) and restore at
-/// `voxel_world_size = 1.0`. `GridTransform`'s own wire form stays frozen
+/// private `GridSnapshotV1` shadow shape (which lacks the field) and restore
+/// at `voxel_world_size = 1.0`. `GridTransform`'s own wire form stays frozen
 /// (`#[serde(skip)]` on the field) in BOTH versions — the persisted scale
 /// is a sibling field on the snapshot, not inside the transform — so the
 /// forever-loadable v1 fixture keeps loading unchanged.

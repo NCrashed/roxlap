@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-07-08
+
 ### Added: per-grid voxel scale (SC stage)
 
 - Each grid now carries a **`voxel_world_size`** — world units per voxel,
@@ -27,6 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unscaled `1.0`, and the checked-in v1 fixture stays loadable forever.
 - New scene-demo **Scale** tab (a planet + a ship casting a cross-grid sun
   shadow, on both backends) and a book **Grid scale** section.
+
+### Breaking
+
+- `GridTransform` and `roxlap-gpu`'s `GridWorldTransform` gain a
+  `voxel_world_size` field — struct literals must add it (use
+  `GridTransform::at`/`at_scale` or `..Default::default()`).
+- `roxlap_core::WorldOccluder::occluded_world`'s `origin` is now `[f64; 3]`
+  (was `[f32; 3]`), so a scaled grid's large world coordinates survive the
+  cross-grid shadow lift.
+
+### Fixed
+
+- GPU cross-grid shadows on scaled grids: the shadow-ray bias now scales
+  with `voxel_world_size` (a big-voxel grid no longer self-shadows its own
+  surface — the "shell" on a coarse planet), and the GPU shadow step budget
+  is raised so a ray crossing a fine grid's chunk reaches the occluder (a
+  fine ship now casts onto a coarse planet).
 
 ## [0.25.0] — 2026-07-07
 
