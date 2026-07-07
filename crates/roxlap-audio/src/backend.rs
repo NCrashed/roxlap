@@ -34,14 +34,31 @@ pub trait AudioOut {
     /// Update the listener pose (world position + orientation).
     fn set_listener(&mut self, pos: DVec3, orientation: DQuat);
 
-    /// Fire a one-shot at a world position. Returns `None` when every
-    /// pooled track is busy with something more important (the pool
-    /// steals finished/oldest one-shots first, never loops).
-    fn play(&mut self, sound: SoundKey, at: DVec3) -> Option<SourceId>;
+    /// Fire a one-shot at a world position. `initial` sets the source's
+    /// occlusion parameters **instantly** at spawn (no tween) — a fresh
+    /// voice has nothing to zipper against, and a one-shot's envelope is
+    /// often gone before a 120 ms ramp would arrive, so it must start
+    /// already muffled; pass `None` for a fully-clear start. Returns
+    /// `None` when every pooled track is busy with something more
+    /// important (the pool steals finished/oldest one-shots first, never
+    /// loops).
+    fn play(
+        &mut self,
+        sound: SoundKey,
+        at: DVec3,
+        initial: Option<&SourceAcoustics>,
+    ) -> Option<SourceId>;
 
-    /// Start a looping source (crystal hum). Loops hold their track
-    /// until [`stop`](Self::stop).
-    fn play_loop(&mut self, sound: SoundKey, at: DVec3) -> Option<SourceId>;
+    /// Start a looping source (crystal hum) with the same instant
+    /// `initial` occlusion as [`play`](Self::play) — a hum entering
+    /// earshot through rock must start muffled, not blip clear for
+    /// 120 ms. Loops hold their track until [`stop`](Self::stop).
+    fn play_loop(
+        &mut self,
+        sound: SoundKey,
+        at: DVec3,
+        initial: Option<&SourceAcoustics>,
+    ) -> Option<SourceId>;
 
     /// Stop a source and free its track. Stale ids are ignored.
     fn stop(&mut self, id: SourceId);
@@ -221,11 +238,21 @@ mod tests {
             k
         }
         fn set_listener(&mut self, _pos: glam::DVec3, _orientation: glam::DQuat) {}
-        fn play(&mut self, _sound: SoundKey, _at: glam::DVec3) -> Option<SourceId> {
+        fn play(
+            &mut self,
+            _sound: SoundKey,
+            _at: glam::DVec3,
+            _initial: Option<&SourceAcoustics>,
+        ) -> Option<SourceId> {
             let p = self.pool.get_or_insert_with(|| SourcePool::new(2));
             p.allocate(false, |_| false).map(|(_, id)| id)
         }
-        fn play_loop(&mut self, _sound: SoundKey, _at: glam::DVec3) -> Option<SourceId> {
+        fn play_loop(
+            &mut self,
+            _sound: SoundKey,
+            _at: glam::DVec3,
+            _initial: Option<&SourceAcoustics>,
+        ) -> Option<SourceId> {
             let p = self.pool.get_or_insert_with(|| SourcePool::new(2));
             p.allocate(true, |_| false).map(|(_, id)| id)
         }
@@ -261,8 +288,8 @@ mod tests {
         let k1 = out.register(&buf);
         assert_ne!(k0, k1, "distinct sound keys");
 
-        let a = out.play(k0, glam::DVec3::ZERO).expect("first voice");
-        let b = out.play(k1, glam::DVec3::ZERO).expect("second voice");
+        let a = out.play(k0, glam::DVec3::ZERO, None).expect("first voice");
+        let b = out.play(k1, glam::DVec3::ZERO, None).expect("second voice");
         // Applying to live sources is honoured.
         let clear = SourceAcoustics::clear(&AcousticsConfig::default());
         out.apply_source(a, &clear);

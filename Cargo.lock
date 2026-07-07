@@ -2557,6 +2557,7 @@ version = "0.24.0"
 dependencies = [
  "env_logger",
  "glam 0.30.10",
+ "roxlap-audio",
  "roxlap-cavegen",
  "roxlap-core",
  "roxlap-formats",

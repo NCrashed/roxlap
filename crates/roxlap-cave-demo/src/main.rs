@@ -38,6 +38,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+#[cfg(feature = "audio")]
+mod audio;
+
 use glam::IVec3;
 use roxlap_cavegen::{BlueCaveGenerator, CaveParams, MagCaveGenerator, MAXZDIM};
 use roxlap_core::update_lighting;
@@ -302,6 +305,10 @@ struct App {
     /// relight + mip rebuild off the main thread, swapping the result in
     /// when ready so impacts don't hitch the frame.
     carve: CarveWorker,
+    /// AU.3 — voxel-aware audio (feature `audio`). `None` when no audio
+    /// device is available; the demo then runs silent.
+    #[cfg(feature = "audio")]
+    audio: Option<audio::DemoAudio>,
 }
 
 impl App {
@@ -358,8 +365,57 @@ impl App {
             seed,
             bullets: Vec::new(),
             carve: CarveWorker::new(),
+            #[cfg(feature = "audio")]
+            audio: audio::DemoAudio::new(),
         }
     }
+
+    // AU.3 — audio hooks. Gated so the whole subsystem compiles out
+    // (and the demo ships silent) without the `audio` feature; the
+    // call sites below stay clean either way.
+    #[cfg(feature = "audio")]
+    fn audio_fire(&mut self, muzzle: [f64; 3]) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.fire(muzzle, &self.scene, glam::DVec3::from(self.cam_pos));
+        }
+    }
+    #[cfg(feature = "audio")]
+    fn audio_impacts(&mut self, hits: &[IVec3]) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.impacts(hits, &self.scene, glam::DVec3::from(self.cam_pos));
+        }
+    }
+    #[cfg(feature = "audio")]
+    fn audio_tick(&mut self, dt: f64) {
+        if self.audio.is_none() {
+            return; // silent: skip the per-frame camera/quat build
+        }
+        let orientation = audio::listener_orientation(&self.camera());
+        let listener = glam::DVec3::from(self.cam_pos);
+        let grid_id = self.grid_id;
+        if let Some(audio) = self.audio.as_mut() {
+            audio.tick(dt, &self.scene, grid_id, listener, orientation);
+        }
+    }
+    #[cfg(feature = "audio")]
+    fn audio_reset(&mut self) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.reset();
+        }
+    }
+
+    #[cfg(not(feature = "audio"))]
+    #[allow(clippy::unused_self)]
+    fn audio_fire(&mut self, _muzzle: [f64; 3]) {}
+    #[cfg(not(feature = "audio"))]
+    #[allow(clippy::unused_self)]
+    fn audio_impacts(&mut self, _hits: &[IVec3]) {}
+    #[cfg(not(feature = "audio"))]
+    #[allow(clippy::unused_self)]
+    fn audio_tick(&mut self, _dt: f64) {}
+    #[cfg(not(feature = "audio"))]
+    #[allow(clippy::unused_self)]
+    fn audio_reset(&mut self) {}
 
     /// Clean GPU teardown: drain in-flight work, then drop the renderer
     /// (wgpu device/queue/surface) before the window. Dropping the surface
@@ -390,6 +446,10 @@ impl App {
         // Drop any in-flight background carve so its result (carved into
         // the OLD world) can't clobber the fresh chunk.
         self.carve.invalidate();
+
+        // The crystal set is rebuilt below (indices change meaning), so
+        // stop every hum and clear the reverb history first.
+        self.audio_reset();
 
         install_cave_chunk(&mut self.scene, self.grid_id, self.preset, self.seed);
 
@@ -525,6 +585,7 @@ impl App {
             travelled: 0.0,
             inst,
         });
+        self.audio_fire(pos);
     }
 
     /// Integrate bullet positions, check collision, apply impact carves,
@@ -584,6 +645,9 @@ impl App {
                 true
             });
         }
+
+        // Impact booms before the vec is consumed by the carve worker.
+        self.audio_impacts(&impacts);
 
         // Hand impact carves to the background worker; it carves +
         // relights + re-mips a chunk clone off-thread, and `pump_carves`
@@ -655,6 +719,7 @@ impl App {
         self.integrate(dt);
         self.step_bullets(dt);
         self.pump_carves();
+        self.audio_tick(dt);
 
         let cam = self.camera();
         let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);

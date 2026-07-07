@@ -80,14 +80,40 @@ against crates.io/docs.rs).
   - Renamed tweens (`FAST_TWEEN_MS` pose+occlusion / `ENV_TWEEN_MS`
     reverb env); documented f64→f32 `mint_pos` truncation and the
     deliberate 96 (spatial) < 128 (occlusion) distance nesting.
-- AU.3 — pending (cave-demo integration). **Voice-budget design (from
-  the AU.2 review): loops never steal and never reclaim, so a pool of
-  24 shared slots will STARVE one-shots if there are ~20+ crystal-hum
-  loops — `play` for a gunshot silently returns `None`.** AU.3 must
-  either split the pool (a small loop budget + a larger one-shot
-  budget) or, better, distance-cull the hums host-side so only the
-  nearest N crystals loop at once (start/stop loops as the listener
-  moves). The latter also bounds CPU. Decide before wiring crystals.
+- AU.3 — LANDED 2026-07-07: cave-demo integration behind the `audio`
+  feature (off by default — the default build/CI/ship stays silent,
+  no kira/cpal/ALSA). `crates/roxlap-cave-demo/src/audio.rs`:
+  `DemoAudio` registers synth shot/impact/hum; `fire` → shot at the
+  muzzle (occlusion-shaded once), `impacts` → boom per carve (capped
+  2/frame), `tick` → listener pose every frame + reverb at 2 Hz + hum
+  occlusion at 4 Hz. **Voice budget (the AU.2 review's concern)
+  solved by distance-cull**: only the nearest `MAX_HUMS = 8` crystals
+  within `HUM_RADIUS = 80` loop at once, started/stopped as the
+  listener moves — one-shots never starved. `DemoAudio::new` returns
+  `None` on no device ⇒ silent. In-solid guard: the cavity update is
+  skipped while the camera is buried (else the reverb collapses to a
+  sealed box). Listener orientation from the camera basis (positions
+  + orientation both in roxlap world coords, so kira's azimuthal
+  panning is self-consistent). Regen (F/R) calls `audio_reset` (stop
+  all hums, clear reverb history — crystal indices change meaning).
+  cfg'd `audio_*` helper methods on `App` keep the call sites clean
+  with no-op twins.
+  Review round (user, same day):
+  - **One-shots now start already muffled** (was: reset-to-clear then
+    a 120 ms occlusion ramp that arrived AFTER the ~120 ms shot
+    envelope decayed — the attack, the audible tell, went unoccluded).
+    AU.2 border fix: `AudioOut::play`/`play_loop` gained an
+    `Option<&SourceAcoustics>` initial applied at `tween(0)` before
+    `track.play`; the demo shades shots/booms/entering-hums at spawn.
+  - **Near-set de-thrashed**: recompute throttled to `NEAR_HZ = 5`
+    (off the per-frame path), with radius hysteresis (enter 80 / exit
+    92) and cap-membership hysteresis (an active hum sorts 6 units
+    nearer so a marginal newcomer can't evict it). Extracted to a pure
+    `select_near` — 4 unit tests (cap, radius hysteresis, cap
+    hysteresis, empty/far), device-free.
+  - `reset` zeroes the throttle timers; documented the identity-grid
+    assumption (world == grid-local) and the eye-centre-only in-solid
+    guard as caveats.
 - AU.4 — pending (book chapter + CHANGELOG).
 - Deferred beyond the stage: wasm audio (see decision 7), per-material
   acoustics, Doppler, scene-demo tab.

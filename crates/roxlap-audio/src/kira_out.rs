@@ -30,7 +30,7 @@ use kira::{
 
 use crate::backend::{AudioOut, SourceId, SourcePool};
 use crate::synth::SoundBuffer;
-use crate::{ListenerAcoustics, SoundKey, SourceAcoustics};
+use crate::{AcousticsConfig, ListenerAcoustics, SoundKey, SourceAcoustics};
 
 /// Fast tween for per-frame parameters — per-source occlusion (gain,
 /// cutoff, send) and the listener pose — short so a moving listener
@@ -197,8 +197,18 @@ impl KiraAudio {
     }
 
     /// Shared body of `play` / `play_loop`: allocate a pool slot, point
-    /// its track at `at`, reset its filter, and start the sound.
-    fn start(&mut self, sound: SoundKey, at: DVec3, looping: bool) -> Option<SourceId> {
+    /// its track at `at`, set its occlusion params **instantly** (from
+    /// `initial`, else fully clear), and start the sound. Setting at
+    /// `tween(0)` before `play` is the fix for one-shots whose envelope
+    /// outruns a 120 ms occlusion ramp — the voice is already muffled
+    /// when it sounds.
+    fn start(
+        &mut self,
+        sound: SoundKey,
+        at: DVec3,
+        looping: bool,
+        initial: Option<&SourceAcoustics>,
+    ) -> Option<SourceId> {
         let data = self.sounds.get(sound.0)?.clone();
         let tracks = &self.tracks;
         let (idx, id) = self.pool.allocate(looping, |i| {
@@ -206,6 +216,7 @@ impl KiraAudio {
             tracks[i].track.num_sounds() == 0
         })?;
         let data = if looping { data.loop_region(..) } else { data };
+        let send_id = self.send_id;
         let slot = &mut self.tracks[idx];
         // If this slot was STOLEN from a still-playing voice, silence
         // the old sound first — dropping a `StaticSoundHandle` does NOT
@@ -216,10 +227,15 @@ impl KiraAudio {
             old.stop(tween(STEAL_TWEEN_MS));
         }
         slot.track.set_position(mint_pos(at), tween(0));
-        // Reset occlusion state to "clear" for the new source.
-        slot.track.set_volume(Decibels(0.0), tween(0));
-        slot.filter.set_cutoff(20_000.0, tween(0));
-        let _ = slot.track.set_send(self.send_id, Decibels(0.0), tween(0));
+        // Instant initial occlusion (or clear) — no ramp on a fresh voice.
+        let clear = SourceAcoustics::clear(&AcousticsConfig::default());
+        let a = initial.unwrap_or(&clear);
+        slot.track.set_volume(Decibels(a.gain_db), tween(0));
+        slot.filter
+            .set_cutoff(f64::from(a.lowpass_cutoff_hz), tween(0));
+        let _ = slot
+            .track
+            .set_send(send_id, Decibels(a.reverb_send_db), tween(0));
         slot.sound = slot.track.play(data).ok();
         slot.sound.as_ref()?;
         Some(id)
@@ -242,12 +258,22 @@ impl AudioOut for KiraAudio {
         );
     }
 
-    fn play(&mut self, sound: SoundKey, at: DVec3) -> Option<SourceId> {
-        self.start(sound, at, false)
+    fn play(
+        &mut self,
+        sound: SoundKey,
+        at: DVec3,
+        initial: Option<&SourceAcoustics>,
+    ) -> Option<SourceId> {
+        self.start(sound, at, false, initial)
     }
 
-    fn play_loop(&mut self, sound: SoundKey, at: DVec3) -> Option<SourceId> {
-        self.start(sound, at, true)
+    fn play_loop(
+        &mut self,
+        sound: SoundKey,
+        at: DVec3,
+        initial: Option<&SourceAcoustics>,
+    ) -> Option<SourceId> {
+        self.start(sound, at, true, initial)
     }
 
     fn stop(&mut self, id: SourceId) {

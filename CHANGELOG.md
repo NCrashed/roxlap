@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pulls in an audio backend. Demo sounds are synthesized (no binary
   assets); an `audio_probe` example walks a listener out of a sealed
   room through a doorway for a live listen.
+- The **cave demo** grew optional audio (`--features audio`): plasma
+  shots at the muzzle, impact booms at each carve, and a looping hum
+  at every glowing crystal — all muffled by the rock between them and
+  you, with reverb that swells in caverns and dries in the open. The
+  crystal hums are distance-culled to the nearest few so a
+  crystal-rich cave never starves the shot/boom voices. Off by
+  default; the demo ships and builds silent without it.
 
 ### Changed: MSRV corrected to 1.92 (was a stale 1.77)
 

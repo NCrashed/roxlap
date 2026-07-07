@@ -28,6 +28,16 @@ roxlap-scene = { path = "../roxlap-scene", version = "0.24" }
 roxlap-render = { path = "../roxlap-render", version = "0.24" }
 glam = { workspace = true }
 winit = "0.30"
+# AU.3 — voxel-aware audio, opt-in (native, needs an audio device +
+# ALSA on Linux). Off by default so the demo builds/ships silent
+# without pulling in kira/cpal:
+#   cargo run -p roxlap-cave-demo --features audio
+roxlap-audio = { path = "../roxlap-audio", version = "0.24", features = [
+    "kira",
+], optional = true }
+
+[features]
+audio = ["dep:roxlap-audio"]
 
 [lints]
 workspace = true

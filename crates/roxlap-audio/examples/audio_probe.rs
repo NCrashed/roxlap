@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut audio = KiraAudio::new()?;
     let hum = audio.register(&roxlap_audio::synth::hum(44_100));
     let source = DVec3::new(22.0, 64.0, 120.0);
-    let src_id = audio.play_loop(hum, source).expect("a free voice");
+    let src_id = audio.play_loop(hum, source, None).expect("a free voice");
 
     let acfg = AcousticsConfig::default();
     let ccfg = CavityConfig::default();
