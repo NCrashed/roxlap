@@ -295,12 +295,25 @@ pattern from sprite volumes to terrain grids** — not greenfield.
   `SHADOW_MAX_STEPS = 1024` degenerate-ray backstop; only reachable at
   extreme vws + large shadow distance.)
 
-  **Deferred (perf, not correctness):** vws-aware *projected-size* mip LOD.
-  The DDA backend picks the per-grid mip from `select_lod` (now world-
-  correct) + the Mid-tier config; `mip_scan_dist` is dead config for it. A
-  fine grid's voxels project smaller so they *could* take a coarser mip
-  sooner (a perf win) — but a finer-than-needed mip is never wrong, so this
-  is an optional future optimization, not a scale bug.
+  **Post-SC follow-ups — LANDED 2026-07-08:**
+  - **Audio on scale** (`roxlap-audio path_thickness`): rebases the segment
+    into each grid's VOXEL frame (`/vws`) and scales the accumulated solid
+    length back by vws, so a coarse grid's thicker voxels muffle
+    proportionally more. Mirrors the raycast t-invariant; vws=1 unchanged.
+    Test `scaled_grid_thickness_is_world_scaled`.
+  - **vws-aware projected-size mip LOD** (GPU `scene_dda.wgsl` primary ray):
+    a voxel of world size vws at distance `t` projects like a vws=1 voxel at
+    `t/vws`, so the per-chunk `pick_mip(t/vws)` coarsens a fine grid sooner
+    and keeps a coarse grid fine longer — matched screen detail. Primary ray
+    only (coarsening a fine occluder's *shadow* could drop it). The CPU LOD
+    tier already accounts for grid world-size via `bounding_radius`. vws=1
+    byte-identical.
+  - **Coarse-mip shadow acne** (the residual "shell" at any vws): the shadow
+    march now skips its ORIGIN cell at `mip > 0` (only when the ray starts in
+    that chunk, `t_enter == 0`), so a surface doesn't self-shadow its own
+    coarse cell. No bigger bias (that overshoots real occluders — the SC.5
+    lesson); no effect on mip 0 or cross-grid occluders. Eyeball on the Scale
+    planet at distance.
 - **SC.4 — LANDED 2026-07-07: GPU parity.** Turned out **much simpler than
   the CPU** (and than this recon predicted), because the GPU marcher uses a
   **normalized `ray_dir`**, so `t` is already a world distance along a unit

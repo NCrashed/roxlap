@@ -128,19 +128,29 @@ impl SourceAcoustics {
 /// segment lengths from a voxel DDA against [`roxlap_scene::Grid::voxel_solid`]
 /// (a diagonal crossing of a 1-voxel wall correctly reports ~√2).
 ///
-/// Grid transforms are honoured the same way `Scene::raycast` does it:
-/// the segment is rebased into each grid's local frame (rotation is an
-/// isometry, so lengths stay world-true). Cost is O(segment length in
-/// voxels) per grid — audio queries are short and infrequent, so no
-/// chunk-level skip is attempted (noted future optimisation).
+/// Grid transforms — including per-grid `voxel_world_size` — are honoured
+/// the same way `Scene::raycast` does it: the segment is rebased into each
+/// grid's voxel frame (un-rotate, un-translate, divide by vws), the DDA
+/// accumulates a voxel-unit solid length, and that is scaled back by vws to
+/// a world length. So a coarse grid's thicker voxels muffle proportionally
+/// more. Cost is O(segment length in voxels) per grid — audio queries are
+/// short and infrequent, so no chunk-level skip is attempted (noted future
+/// optimisation).
 #[must_use]
 pub fn path_thickness(scene: &Scene, a: DVec3, b: DVec3) -> f64 {
     let mut total = 0.0;
     for (_, grid) in scene.grids() {
+        // SC — rebase into the grid's VOXEL frame: un-rotate, un-translate,
+        // then divide by `voxel_world_size` (the DDA below marches voxels).
+        // `grid_thickness` returns the solid length in voxel units, so scale
+        // it back by vws to a WORLD length (a vws=4 grid's voxels are 4×
+        // thicker). Mirrors `Scene::raycast`'s t-invariant. vws == 1 is
+        // unchanged.
+        let vws = grid.transform.voxel_world_size;
         let inv = grid.transform.rotation.inverse();
-        let la = inv * (a - grid.transform.origin);
-        let lb = inv * (b - grid.transform.origin);
-        total += grid_thickness(grid, la, lb);
+        let la = (inv * (a - grid.transform.origin)) / vws;
+        let lb = (inv * (b - grid.transform.origin)) / vws;
+        total += grid_thickness(grid, la, lb) * vws;
     }
     total
 }
@@ -487,6 +497,26 @@ mod tests {
             DVec3::new(-40.5, 60.0, 140.5),
         );
         assert!(t.abs() < 1e-9, "identity control must miss: {t}");
+    }
+
+    #[test]
+    fn scaled_grid_thickness_is_world_scaled() {
+        // SC — a vws=2.0 grid: its voxels are 2× the world size, so a wall of
+        // 3 local voxels muffles 6 WORLD units of solid. Local x 30..32 → world
+        // x 60..66; local y 0..127 → world y 0..254; local z 100..180 → world
+        // z 200..360. A world +x probe through it must report 6, not 3.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 2.0));
+        wall(scene.grid_mut(id).expect("scaled grid"), 30, 3);
+        let t = path_thickness(
+            &scene,
+            DVec3::new(40.0, 80.0, 280.0),
+            DVec3::new(140.0, 80.0, 280.0),
+        );
+        assert!(
+            (t - 6.0).abs() < 1e-6,
+            "vws=2 wall of 3 voxels must be 6 world units thick: {t}"
+        );
     }
 
     #[test]

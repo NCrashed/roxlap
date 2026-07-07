@@ -539,6 +539,14 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
             );
             var t_max_voxel = shield_parallel((next_voxel_world - origin) / dir, dir);
             let t_delta_voxel = abs(vsize / dir);
+            // SC — coarse-mip self-shadow acne: at mip>0 the ray's ORIGIN cell
+            // is a big coarse block that also contains the shading surface, so
+            // the ray would immediately self-hit it (the thin "shell" on
+            // distant / scaled terrain). Skip that first cell — but only when
+            // the ray originates in this chunk (`t_enter == 0`), so a real
+            // cross-grid occluder (entered at `t_enter > 0`) is never skipped,
+            // there's no overshoot, and mip 0 stays byte-identical.
+            var skip_origin_cell = (t_enter == 0.0) && (mip > 0u);
             loop {
                 // Solid-bit test with a last-word cache: consecutive
                 // z-steps land in the same 32-voxel word up to 32 times.
@@ -550,7 +558,8 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
                     occ_idx_cached = widx;
                     occ_word_cached = occ_word(widx);
                 }
-                if ((occ_word_cached & (1u << (z_u & 31u))) != 0u) { return true; }
+                if (!skip_origin_cell && (occ_word_cached & (1u << (z_u & 31u))) != 0u) { return true; }
+                skip_origin_cell = false;
                 steps = steps + 1u;
                 if (steps >= u.shadow_max_steps) { return false; }
                 if (t_max_voxel.x < t_max_voxel.y && t_max_voxel.x < t_max_voxel.z) {
@@ -894,7 +903,13 @@ fn march_grid(
             // GPU.11.1 — pick the mip for this chunk by entry distance.
             // Voxels are `vsize` world units; the chunk holds
             // `vsid>>mip` × `vsid>>mip` × `CHUNK_Z>>mip` of them.
-            let mip = pick_mip(t_enter, mip_count);
+            // SC — projected-size LOD: a voxel of world size `vws` at distance
+            // `t` projects like a vws=1 voxel at `t/vws`, so a fine grid
+            // (vws<1) coarsens sooner and a coarse grid (vws>1) stays fine
+            // longer — matched screen detail. Shadows keep the unscaled
+            // distance (coarsening a fine occluder could drop its shadow).
+            // vws == 1 ⇒ identity.
+            let mip = pick_mip(t_enter / vws, mip_count);
             let vsize = f32(1u << mip) * vws; // SC.4 — world-unit voxel size
             let vsid_mip_u = vsid >> mip;
             let vsid_mip = i32(vsid_mip_u);
