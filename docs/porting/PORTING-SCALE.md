@@ -344,16 +344,16 @@ pattern from sprite volumes to terrain grids** — not greenfield.
   world-FARTHER than a vws=1 red grid but voxel-NEARER — red wins the min-t
   composite; negative-verified BLUE wins with the shader vws forced to 1).
   47 gpu + 17 scene-render tests green, vws=1.0 byte-identical.
-  **Deferred:** a full headless CPU-vs-GPU pixel diff at vws≠1. Note the
-  depth buffers do NOT differ by vws²: the CPU composite depth is WORLD
-  (`scale_depth_rect` already multiplies the written `world/vws²` by vws²)
-  and the GPU's `best_t` is world by construction — so both are world and
-  should agree. The real blocker is the same one at vws==1: **colour float
-  precision** between the CPU and GPU shading paths (why the existing GPU
-  tests use *loose* colour classifiers), which is not vws-specific. So a
-  vws≠1 **depth** parity diff (both buffers world) is actually feasible and
-  would be the strongest SC.4 regression — worth adding when the harness
-  gains a depth readback. The composite test already pins world-t ordering.
+  **Depth parity — LANDED 2026-07-08.** The `HeadlessSceneRenderer` gained a
+  depth readback (`render_depth_with_transforms` → `Vec<f32>` of `best_t`,
+  depth_buffer now `COPY_SRC` + `write_depth=1`), and
+  `scene_dda_scaled_grid_depth_is_world` asserts a vws=2 grid's GPU depth
+  reads the **world** value (128, not the voxel-frame 64). Paired with the
+  CPU `sc1_scaled_grid_depth_is_world` (which asserts its zbuffer at a world
+  value too), this pins CPU↔GPU depth agreement at vws≠1 without a combined
+  harness. (A full *colour* pixel diff stays impractical — CPU/GPU shading
+  floats differ even at vws=1, why the colour tests use loose classifiers;
+  not vws-specific.)
 - **SC.5 — demo + docs.** Scene-demo: give the World scene's ship a
   different `voxel_world_size` (or a new "Scale" tab: a big coarse
   planet + a tiny detailed ship), eyeball both backends. Book: a short
@@ -369,11 +369,22 @@ pattern from sprite volumes to terrain grids** — not greenfield.
    wrong length). Grep every `max_t`, every `t`-return, every cross-grid
    `t` compare. The `1.0` byte-identity gate catches *regressions* but
    NOT a wrong scale factor — write explicit vws≠1 assertions.
-2. **f32 precision at extreme ratios.** A planet at vws 4.0 next to a
-   ship at 0.25 is a 16× ratio; the GPU camera is f32 and large world
-   coords already stress it. Note the "floating origin" mitigation
-   (PORTING-SCENE.md R7) as the escape hatch for very large worlds;
-   don't solve it in SC, just document the limit.
+2. **f32 precision at extreme ratios — its OWN future stage, not SC.**
+   A planet at vws 4.0 next to a ship at 0.25 is a 16× ratio; the GPU
+   camera + per-grid transforms narrow to f32 (`roxlap-render/gpu.rs`
+   `grid_local_camera`; the absolute world camera pos at ~line 1152), and
+   large world coordinates lose sub-unit precision → jitter far from the
+   origin. The fix is **camera-relative rendering (floating origin)**:
+   rebase every world position (camera, grid origins, sprites, lights,
+   shadow lift, sky) relative to the camera *in f64 on the CPU* before
+   narrowing to f32, so the shader's frame is centred on the camera and f32
+   stays precise near it. This is CROSS-CUTTING on **both** backends and
+   can't be verified headlessly (needs visual inspection at ~1e6 world
+   coords), so it deserves a focused stage of its own (an entry doc + a
+   scaled-world demo to eyeball) — DO NOT rush it into a scale/precision
+   patch. The SC.4 f64 shadow lift was one bounded down-payment; the rest
+   is the floating-origin stage. Escape hatch today: keep worlds within a
+   few 1e4 of the origin.
 3. **Volumetric fog density** shifts if the `/(vsize·vws)` isn't applied
    (decision 7). Easy to miss; pin with a test.
 4. **Sprite `voxel_world_size` vs grid `voxel_world_size` are separate.**

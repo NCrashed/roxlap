@@ -1214,6 +1214,68 @@ fn scene_dda_scaled_grid_composites_by_world_depth() {
 }
 
 #[test]
+fn scene_dda_scaled_grid_depth_is_world() {
+    // SC.4 — the GPU depth buffer stores `best_t` in WORLD units even for a
+    // scaled grid, so it agrees with the CPU compose depth. This is the GPU
+    // half of the CPU-vs-GPU depth parity: the CPU test
+    // `sc1_scaled_grid_depth_is_world` (roxlap-scene) asserts its zbuffer at a
+    // world VALUE, and this asserts the GPU depth at a world value too — both
+    // world ⇒ they agree. A vws=2 grid whose block near-face is at world
+    // y=128 must read depth 128, not the voxel-frame 64.
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    // Block chunk at index y=2 → voxel y 64.. → world y 128.. (× vws 2).
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 4, 1],
+        pool_dims: [1, 4, 1],
+        chunks: vec![([0, 2, 0], decompress_chunk(&block_chunk(vsid, 0, 31)))],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // World camera at (32,0,32) looking +y; centre ray hits the block interior
+    // (voxel x=16, z=16 under vws=2). Grid at origin ⇒ per-grid cam == world.
+    let cam = Camera {
+        position: [32.0, 0.0, 32.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let xf = GridWorldTransform {
+        voxel_world_size: 2.0,
+        ..GridWorldTransform::default()
+    };
+    let depth = renderer.render_depth_with_transforms(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam],
+        &[xf],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+    let centre = (h / 2 * w + w / 2) as usize;
+    let d = depth[centre];
+    assert!(
+        d.is_finite(),
+        "centre ray must hit the scaled block, got {d}"
+    );
+    // Near face: chunk 2 · vsid 32 · vws 2 = world y 128; camera at y=0.
+    assert!(
+        (d - 128.0).abs() <= 4.0,
+        "GPU depth must be WORLD (128); {d} ≈ 64 would mean the voxel-frame \
+         t wasn't scaled by vws"
+    );
+}
+
+#[test]
 fn scene_dda_fine_scaled_grid_composites_by_world_depth() {
     // SC.4 — the vws<1 (fine grid) mirror of the coarse test, for symmetry.
     //  - Grid A (vws 1.0): RED block at chunk y=3 → world y-near 96.

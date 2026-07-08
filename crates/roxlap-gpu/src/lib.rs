@@ -3005,6 +3005,8 @@ pub struct HeadlessSceneRenderer {
     bgl: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     readback: wgpu::Buffer,
+    /// Staging copy of `depth_buffer` for the depth-readback path.
+    depth_readback: wgpu::Buffer,
     /// Per-face side-shades for the gate render (default none). Packed
     /// `[(top,bot,left,right), (up,down,_,_)]`; set via
     /// [`Self::set_side_shades`].
@@ -3038,7 +3040,11 @@ impl HeadlessSceneRenderer {
         let depth_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("roxlap-gpu headless.depth"),
             size: u64::from(width) * u64::from(height) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            // COPY_SRC so the depth-readback path can stage it (the vws≠1
+            // depth-parity test reads back `best_t`).
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -3146,6 +3152,12 @@ impl HeadlessSceneRenderer {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        let depth_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("roxlap-gpu headless.depth_readback"),
+            size: u64::from(width) * u64::from(height) * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
         Self {
             width,
@@ -3159,6 +3171,7 @@ impl HeadlessSceneRenderer {
             bgl,
             pipeline,
             readback,
+            depth_readback,
             side_shades: [[0; 4]; 2],
             lights: SceneLights::default(),
         }
@@ -3213,6 +3226,7 @@ impl HeadlessSceneRenderer {
     /// every grid (cross-grid shadows). Empty `grid_world` ⇒ identity.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn render_with_transforms(
         &self,
         device: &wgpu::Device,
@@ -3224,6 +3238,62 @@ impl HeadlessSceneRenderer {
         max_outer_steps: u32,
         mip_scan_dist: f32,
     ) -> Vec<u32> {
+        self.dispatch(
+            device,
+            queue,
+            scene,
+            cameras,
+            grid_world,
+            fov_y_rad,
+            max_outer_steps,
+            mip_scan_dist,
+            false,
+        )
+        .0
+    }
+
+    /// Like [`Self::render_with_transforms`] but also reads back the depth
+    /// buffer (`best_t` per pixel, WORLD units) — the vws≠1 CPU-vs-GPU depth
+    /// parity check. `f32::INFINITY` where a ray hit nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_depth_with_transforms(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &GpuSceneResident,
+        cameras: &[Camera],
+        grid_world: &[GridWorldTransform],
+        fov_y_rad: f32,
+        max_outer_steps: u32,
+        mip_scan_dist: f32,
+    ) -> Vec<f32> {
+        self.dispatch(
+            device,
+            queue,
+            scene,
+            cameras,
+            grid_world,
+            fov_y_rad,
+            max_outer_steps,
+            mip_scan_dist,
+            true,
+        )
+        .1
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &GpuSceneResident,
+        cameras: &[Camera],
+        grid_world: &[GridWorldTransform],
+        fov_y_rad: f32,
+        max_outer_steps: u32,
+        mip_scan_dist: f32,
+        want_depth: bool,
+    ) -> (Vec<u32>, Vec<f32>) {
         assert_eq!(
             cameras.len(),
             scene.grid_count as usize,
@@ -3285,7 +3355,7 @@ impl HeadlessSceneRenderer {
             // Fog off: near/far past any reachable t → factor 0.
             fog_color: [0.0, 0.0, 0.0, 1.0e29],
             fog_far: 1.0e30,
-            write_depth: 0,
+            write_depth: u32::from(want_depth),
             occ_page_words: scene.occupancy_page_words,
             occ_num_pages: scene.occupancy_num_pages,
             mip_scan_dist,
@@ -3429,13 +3499,11 @@ impl HeadlessSceneRenderer {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(self.width.div_ceil(8), self.height.div_ceil(8), 1);
         }
-        enc.copy_buffer_to_buffer(
-            &self.framebuffer,
-            0,
-            &self.readback,
-            0,
-            u64::from(self.width) * u64::from(self.height) * 4,
-        );
+        let bytes = u64::from(self.width) * u64::from(self.height) * 4;
+        enc.copy_buffer_to_buffer(&self.framebuffer, 0, &self.readback, 0, bytes);
+        if want_depth {
+            enc.copy_buffer_to_buffer(&self.depth_buffer, 0, &self.depth_readback, 0, bytes);
+        }
         queue.submit(Some(enc.finish()));
 
         let slice = self.readback.slice(..);
@@ -3456,7 +3524,28 @@ impl HeadlessSceneRenderer {
             .collect();
         drop(data);
         self.readback.unmap();
-        out
+
+        // Depth: `best_t` is stored as the bit pattern of the f32 world-t.
+        let depth: Vec<f32> = if want_depth {
+            let ds = self.depth_readback.slice(..);
+            let (dtx, drx) = std::sync::mpsc::channel();
+            ds.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = dtx.send(r);
+            });
+            device.poll(wgpu::PollType::wait_indefinitely()).ok();
+            drx.recv().expect("depth channel").expect("depth map");
+            let dd = ds.get_mapped_range();
+            let v: Vec<f32> = dd
+                .chunks_exact(4)
+                .map(|b| f32::from_bits(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                .collect();
+            drop(dd);
+            self.depth_readback.unmap();
+            v
+        } else {
+            Vec::new()
+        };
+        (out, depth)
     }
 }
 
