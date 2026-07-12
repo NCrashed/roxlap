@@ -24,12 +24,12 @@
 
 use glam::{DVec3, IVec3};
 use roxlap_scene::islands::Island;
-use roxlap_scene::{box_overlaps_solid, BakeMode, GridId, Scene, Solidity};
+use roxlap_scene::{box_overlaps_solid, BakeMode, GridId, Rgb, Scene, Solidity};
 
 use crate::{DynSpriteTransform, SceneRenderer, SpriteInstanceId, SpriteModelId};
 
 /// One landed island, drained via [`DebrisSystem::drain_impacts`]:
-/// everything DT.3's shatter needs.
+/// everything the shatter needs.
 #[derive(Debug)]
 pub struct DebrisImpact {
     /// The island's voxels + colours (grid-local, as detected) — the
@@ -42,6 +42,38 @@ pub struct DebrisImpact {
     pub pos: DVec3,
     /// Impact speed in world units/second (≤ the terminal clamp).
     pub speed: f64,
+    /// The source grid's world units per voxel at extraction time —
+    /// kept here so [`Self::burst_sites`] stays self-contained even if
+    /// the grid is gone by shatter time.
+    pub voxel_world_size: f64,
+}
+
+impl DebrisImpact {
+    /// DT.3 — the world-space burst sites for the shatter: every
+    /// island voxel's centre, translated to where the body **landed**
+    /// (its grid-local offset from the bbox centre, scaled by the
+    /// source grid's voxel size, applied around [`Self::pos`]; the
+    /// cosmetic yaw is ignored, matching the axis-aligned collision
+    /// box). Feed straight into
+    /// [`ParticleSystem::voxel_debris`](crate::ParticleSystem::voxel_debris)
+    /// with `from = pos` for the colour-true shatter.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn burst_sites(&self) -> Vec<([f32; 3], Rgb)> {
+        let (lo, hi) = self.island.bbox;
+        // The bbox centre in voxel units — exactly where `world_pivot`
+        // anchored the body: lo + dims/2 = (lo + hi + 1) / 2.
+        let centre = (lo.as_dvec3() + hi.as_dvec3() + DVec3::ONE) * 0.5;
+        self.island
+            .voxels
+            .iter()
+            .map(|&(v, c)| {
+                let off = (v.as_dvec3() + DVec3::splat(0.5) - centre) * self.voxel_world_size;
+                let p = self.pos + off;
+                ([p.x as f32, p.y as f32, p.z as f32], c.rgb_part())
+            })
+            .collect()
+    }
 }
 
 /// One falling island: simulation state + the (lazily created) sprite
@@ -163,6 +195,7 @@ impl DebrisSystem {
                 grid: body.grid,
                 pos: body.pos,
                 speed: 0.0,
+                voxel_world_size: vws,
             });
             return true;
         }
@@ -228,6 +261,7 @@ impl DebrisSystem {
                 grid: body.grid,
                 pos: body.pos,
                 speed: body.vel,
+                voxel_world_size: f64::from(body.scale),
             });
         }
     }
@@ -673,6 +707,125 @@ mod tests {
         assert!(f.batch_sizes.iter().all(|&n| n == 1));
         assert_eq!(f.despawns.len(), 1, "instance retired on impact");
         assert_eq!(f.models_removed.len(), 1, "model retired on impact");
+    }
+
+    /// DT.3 — the shatter path end-to-end: a two-colour island falls,
+    /// lands, and its burst sites (a) sit around the LANDED position,
+    /// not the detach position, and (b) feed `voxel_debris` a
+    /// colour-true burst whose tint histogram matches the island.
+    #[test]
+    fn shatter_burst_matches_island_colours() {
+        const OTHER: VoxColor = VoxColor(0x80_20_60_A0);
+        let mut scene = Scene::new();
+        let grid = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(grid).expect("grid");
+        g.set_rect(IVec3::new(2, 2, 100), IVec3::new(2, 2, 255), Some(STONE));
+        for (x, c) in [(4, STONE), (5, OTHER), (6, STONE)] {
+            g.set_voxel(IVec3::new(x, 2, 100), Some(c));
+        }
+        g.set_voxel(IVec3::new(3, 2, 100), Some(STONE));
+        g.set_voxel(IVec3::new(3, 2, 100), None);
+        g.set_rect(IVec3::new(0, 0, 140), IVec3::new(12, 6, 140), Some(STONE));
+        let islands = detect_islands(g, IVec3::new(3, 2, 100), IVec3::new(3, 2, 100), 4096);
+
+        let mut sys = DebrisSystem::new();
+        assert!(sys.spawn_island(&mut scene, grid, islands[0].clone(), BakeMode::Directional));
+        for _ in 0..600 {
+            sys.update(&scene, 1.0 / 60.0);
+        }
+        let impacts: Vec<DebrisImpact> = sys.drain_impacts().collect();
+        assert_eq!(impacts.len(), 1);
+        let hit = &impacts[0];
+
+        let sites = hit.burst_sites();
+        assert_eq!(sites.len(), 3);
+        // (a) Sites surround the landed pivot, at the original
+        // relative offsets (x spread ±1, y and z on the pivot).
+        for (p, _) in &sites {
+            assert!((f64::from(p[2]) - hit.pos.z).abs() < 1e-4, "landed z");
+            assert!((f64::from(p[0]) - hit.pos.x).abs() <= 1.0 + 1e-4);
+        }
+        // (b) Colour-true burst: tint histogram matches the island.
+        let mut ps = crate::ParticleSystem::new(9);
+        let def = crate::ParticleEmitterDef {
+            lifetime: 100.0..100.0,
+            ..crate::ParticleEmitterDef::new(SpriteModelId::mint(0, 0))
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let from = [hit.pos.x as f32, hit.pos.y as f32, hit.pos.z as f32];
+        let n = ps.voxel_debris(&sites, from, 4.0..6.0, &def);
+        assert_eq!(n, 3);
+        let mut tints: Vec<Rgb> = ps.particles().iter().map(|p| p.tint).collect();
+        tints.sort_by_key(|t| t.0);
+        let mut expect = vec![STONE.rgb_part(), STONE.rgb_part(), OTHER.rgb_part()];
+        expect.sort_by_key(|t| t.0);
+        assert_eq!(tints, expect, "burst wears the island's own colours");
+    }
+
+    /// DT.3 leak gate: 100 full crumble cycles (rebuild → detect →
+    /// spawn → fall → land → shatter) reclaim every facade handle and
+    /// every particle — nothing accumulates.
+    #[test]
+    fn hundred_crumble_cycles_leak_nothing() {
+        let mut scene = Scene::new();
+        let grid = scene.add_grid(GridTransform::identity());
+        scene.grid_mut(grid).expect("grid").set_rect(
+            IVec3::new(2, 2, 100),
+            IVec3::new(2, 2, 255),
+            Some(STONE),
+        );
+        scene.grid_mut(grid).expect("grid").set_rect(
+            IVec3::new(0, 0, 120),
+            IVec3::new(12, 6, 120),
+            Some(STONE),
+        );
+
+        let mut sys = DebrisSystem::new();
+        let mut ps = crate::ParticleSystem::new(5);
+        let def = crate::ParticleEmitterDef {
+            lifetime: 0.05..0.05,
+            ..crate::ParticleEmitterDef::new(SpriteModelId::mint(0, 0))
+        };
+        let mut f = Mock::default();
+
+        for cycle in 0..100 {
+            let g = scene.grid_mut(grid).expect("grid");
+            g.set_rect(IVec3::new(3, 2, 100), IVec3::new(6, 2, 100), Some(STONE));
+            g.set_voxel(IVec3::new(3, 2, 100), None);
+            let islands = detect_islands(g, IVec3::new(3, 2, 100), IVec3::new(3, 2, 100), 4096);
+            assert_eq!(islands.len(), 1, "cycle {cycle} re-detects the beam");
+            assert!(sys.spawn_island(&mut scene, grid, islands[0].clone(), BakeMode::Directional));
+            for _ in 0..120 {
+                sys.update(&scene, 1.0 / 30.0);
+                sys.sync_with(&mut f);
+            }
+            let impacts: Vec<DebrisImpact> = sys.drain_impacts().collect();
+            assert_eq!(impacts.len(), 1, "cycle {cycle} lands");
+            #[allow(clippy::cast_possible_truncation)]
+            let from = [
+                impacts[0].pos.x as f32,
+                impacts[0].pos.y as f32,
+                impacts[0].pos.z as f32,
+            ];
+            let n = ps.voxel_debris(&impacts[0].burst_sites(), from, 4.0..6.0, &def);
+            assert_eq!(n, 3);
+            ps.update(1.0); // 0.05 s lifetime: the burst dies out
+        }
+
+        assert_eq!(sys.debris_count(), 0);
+        assert_eq!(f.models_added, 100, "one model per island");
+        assert_eq!(f.models_removed.len(), 100, "every model reclaimed");
+        assert_eq!(f.spawns.len(), 100);
+        assert_eq!(f.despawns.len(), 100, "every instance reclaimed");
+        assert_eq!(ps.particle_count(), 0, "every burst died out");
+        assert_eq!(ps.dropped_spawns(), 0, "no budget pressure");
+        // Each burst allocates a transient emitter; dead particles
+        // alone would keep this test green if retire-drain ever
+        // stopped freeing the slots — pin the emitter side too.
+        assert!(
+            ps.emitter_slots_all_free(),
+            "every transient emitter slot reclaimed"
+        );
     }
 
     /// An empty island or a stale grid id is refused.

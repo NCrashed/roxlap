@@ -108,7 +108,34 @@ stage** (DT.5) after the plain crumble loop works.
   `swap_remove` path (batches 2 → 1 → 0); binary search 32 → 16
   iterations; per-sync move batch reuses a scratch buffer. 84 render
   lib tests green, clippy + fmt clean.
-- DT.3 — impact shatter + audio: NOT STARTED
+- DT.3 — LANDED 2026-07-12: the shatter. **`ParticleSystem::voxel_debris(sites,
+  from, outward, def)`** — the burst half of `carve_debris` factored
+  out (world-space `(pos, Rgb)` sites, radial kick from `from`,
+  stride-sample to the debris cap, transient emitter); `carve_debris`
+  reimplemented on top, **bit-compatibly** — gated by
+  `carve_debris_equals_sample_plus_voxel_debris` (same-seed systems,
+  hand-replicated sample half, particles compared field-by-field) +
+  the three pre-existing carve tests untouched.
+  **`DebrisImpact::burst_sites()`** — island voxel centres translated
+  to the LANDED position (offsets from the bbox centre × the new
+  `voxel_world_size` field, self-contained even if the grid is gone;
+  cosmetic yaw ignored, matching the collision box). Shatter glue for
+  the demo is two lines: `drain_impacts()` →
+  `voxel_debris(&hit.burst_sites(), hit.pos, …)` + the existing
+  `impacts()` audio hook fed `hit.pos` (DT.4). Tests:
+  `shatter_burst_matches_island_colours` (two-colour island falls,
+  sites surround the landed pivot, burst tint histogram exact) and
+  the entry-doc leak gate `hundred_crumble_cycles_leak_nothing`
+  (100 full rebuild→detect→spawn→fall→shatter cycles: 100/100 models
+  and instances reclaimed, particles die out, zero dropped spawns).
+  87 render lib tests green, clippy + fmt clean. Maintainer-review
+  follow-ups (2026-07-13): the leak gate also pins **emitter-slot**
+  reclamation (dead particles alone would mask a broken retire-drain;
+  via a test-only `emitter_slots_all_free`); `carve_debris` strides
+  BEFORE the world conversion (a big carve no longer converts samples
+  the cap drops; the pre-strided list is ≤ cap so the inner stride
+  resolves to 1 — byte-identical, equivalence + cap tests green);
+  the audio half is explicitly owed by DT.4 (see its bullet).
 - DT.4 — cave-demo crumble: NOT STARTED
 - DT.5 — per-material fracture patterns: NOT STARTED
 - DT.6 — docs: NOT STARTED
@@ -266,9 +293,13 @@ Three user-visible things:
   matches island colours; models/instances fully reclaimed after
   shatter (no leak across 100 cycles).
 - **DT.4 — cave-demo crumble.** Worker detects after each carve
-  batch (budget-capped), main thread spawns via DebrisSystem; boom on
-  impact through the existing audio path; `ROXLAP_NO_CRUMBLE=1`
-  escape hatch. Visual eyeball pass owed to the user: shoot out an
+  batch (budget-capped), main thread spawns via DebrisSystem;
+  **the DT.3 audio half lands HERE and is owed by this substage**:
+  feed each drained impact's `hit.pos` to the existing `impacts()`
+  hook (DT.3 shipped the burst only — the boom belongs to no written
+  code until DT.4 wires it); fold the extraction bbox into the
+  worker's `remip_bbox` (hazard 3b); `ROXLAP_NO_CRUMBLE=1` escape
+  hatch. Visual eyeball pass owed to the user: shoot out an
   overhang, watch it drop and burst; both backends.
 - **DT.5 — per-material fracture patterns.** `FracturePattern` table
   + Voronoi/planar partitioners (pure functions over a voxel set,

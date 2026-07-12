@@ -652,6 +652,17 @@ impl ParticleSystem {
             .count()
     }
 
+    /// Leak-gate introspection (DT.3): `true` when every emitter slot
+    /// has been reclaimed — the strict form of [`Self::emitter_count`]
+    /// `== 0`, which ignores retired-but-not-yet-drained slots (a
+    /// transient `voxel_debris` emitter lingers until its last
+    /// particle dies). Test-only: the debris leak gate lives in a
+    /// sibling module, so it cannot reach `emitters` directly.
+    #[cfg(test)]
+    pub(crate) fn emitter_slots_all_free(&self) -> bool {
+        self.emitters.iter().all(Option::is_none)
+    }
+
     /// Spawns dropped by the budget since construction. A steadily
     /// climbing value means the effect design outruns
     /// [`set_max_particles`](Self::set_max_particles).
@@ -850,37 +861,71 @@ impl ParticleSystem {
         // 2. Carve (even when the cap will drop some debris — the
         //    crater is the ground truth, debris is garnish).
         g.set_sphere(centre, radius, None);
-        if samples.is_empty() {
-            return 0;
-        }
 
-        // 3. One transient emitter carries the def; retire-drain frees
-        //    it with the last debris particle.
-        let mut def = def.clone();
-        def.spawn = SpawnMode::Manual;
-        let id = self.add_emitter(def.clone());
-        let slot = self.map.index(id).expect("just allocated");
-
-        // World-space carve centre (voxel centres sit at +0.5).
+        // 3. Burst the sampled colours (DT.3 factored this half out so
+        //    a landed island can shatter without a carve). Stride
+        //    BEFORE the world conversion so a big carve never converts
+        //    samples the cap would drop anyway; the pre-strided list is
+        //    ≤ cap, so `voxel_debris`'s own stride resolves to 1 and
+        //    the spawn sequence is byte-identical to the unfactored
+        //    original.
         let to_world = |v: glam::IVec3| -> [f32; 3] {
             let w =
                 transform.origin + transform.rotation * (v.as_dvec3() + glam::DVec3::splat(0.5));
             #[allow(clippy::cast_possible_truncation)]
             [w.x as f32, w.y as f32, w.z as f32]
         };
-        let cw = to_world(centre);
-
         let stride = samples.len().div_ceil(self.carve_debris_cap).max(1);
+        let sites: Vec<([f32; 3], Rgb)> = samples
+            .iter()
+            .step_by(stride)
+            .map(|&(v, col)| (to_world(v), col.rgb_part()))
+            .collect();
+        self.voxel_debris(&sites, to_world(centre), outward, def)
+    }
+
+    /// Burst a set of **world-space voxel sites** as debris — the
+    /// spawn half of [`carve_debris`](Self::carve_debris), factored
+    /// out (DT.3) so a landed island's voxels can shatter without a
+    /// carve: one def-driven particle per site, positioned there,
+    /// tinted with the site's colour, kicked radially away from
+    /// `from` at a speed from `outward` (a site at `from` itself
+    /// scatters in a random direction).
+    ///
+    /// Same contract as `carve_debris` (which is now this on top of a
+    /// sphere sample+carve): `def`'s `pos`/`shape`/`spawn`/`tint` are
+    /// ignored, `tint_end` lerps from the site colour, big sets are
+    /// stride-sampled to the debris cap, the pool budget counts
+    /// overflow in [`dropped_spawns`](Self::dropped_spawns). Returns
+    /// how many debris actually spawned.
+    pub fn voxel_debris(
+        &mut self,
+        sites: &[([f32; 3], Rgb)],
+        from: [f32; 3],
+        outward: Range<f32>,
+        def: &ParticleEmitterDef,
+    ) -> u32 {
+        if sites.is_empty() {
+            return 0;
+        }
+        // One transient emitter carries the def; retire-drain frees
+        // it with the last debris particle.
+        let mut def = def.clone();
+        def.spawn = SpawnMode::Manual;
+        let id = self.add_emitter(def.clone());
+        let slot = self.map.index(id).expect("just allocated");
+
+        let stride = sites.len().div_ceil(self.carve_debris_cap).max(1);
         let mut spawned: u32 = 0;
-        for (v, col) in samples.iter().step_by(stride) {
+        for (pos, col) in sites.iter().step_by(stride) {
             if self.particles.len() >= self.max_particles {
                 self.dropped_spawns += 1;
                 continue;
             }
-            let pos = to_world(*v);
-            // Radial kick away from the carve centre; the centre voxel
-            // itself scatters randomly.
-            let d = [pos[0] - cw[0], pos[1] - cw[1], pos[2] - cw[2]];
+            let pos = *pos;
+            // Radial kick away from the burst origin; a site at the
+            // origin itself scatters randomly.
+            let d = [pos[0] - from[0], pos[1] - from[1], pos[2] - from[2]];
             let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
             let dir = if len > 1e-4 {
                 [d[0] / len, d[1] / len, d[2] / len]
@@ -902,12 +947,12 @@ impl ParticleSystem {
                 yaw: 0.0,
                 spin_rate: self.rng.range_f32(&def.spin),
                 alpha: fade_alpha(0.0, lifetime, def.fade_in_frac, def.fade_out_frac),
-                tint: col.rgb_part(),
+                tint: *col,
                 emitter_slot: slot as u32,
                 instance: None,
                 last_alpha: 255,
                 last_tint: Rgb::WHITE,
-                tint_start: col.rgb_part(),
+                tint_start: *col,
             });
             spawned += 1;
         }
@@ -1770,6 +1815,80 @@ mod tests {
         sys.update(200.0);
         assert_eq!(sys.particle_count(), 0);
         assert!(sys.emitters.iter().all(Option::is_none));
+    }
+
+    /// DT.3 — `carve_debris` is byte-compatible with its factored
+    /// halves: manually sampling the sphere (the same z, y, x order),
+    /// carving, and calling `voxel_debris` yields **bit-identical**
+    /// particles from same-seed systems (the RNG is consumed in the
+    /// same order) — the regression the refactor is gated on.
+    #[test]
+    fn carve_debris_equals_sample_plus_voxel_debris() {
+        use glam::{DVec3, IVec3};
+        let build = || {
+            let mut scene = roxlap_scene::Scene::new();
+            let grid = scene.add_grid(roxlap_scene::GridTransform::at(DVec3::ZERO));
+            scene.grid_mut(grid).expect("grid").set_rect(
+                IVec3::new(-8, -8, 10),
+                IVec3::new(8, 8, 12),
+                Some(roxlap_formats::VoxColor(0x80_12_34_56)),
+            );
+            (scene, grid)
+        };
+        let def = ParticleEmitterDef {
+            lifetime: 1.0..3.0,
+            spin: -2.0..2.0,
+            velocity: VelocityDef {
+                spread: 3.0,
+                ..VelocityDef::default()
+            },
+            ..base_def()
+        };
+        let centre = IVec3::new(0, 0, 11);
+
+        let (mut scene_a, grid_a) = build();
+        let mut a = ParticleSystem::new(77);
+        let na = a.carve_debris(&mut scene_a, grid_a, centre, 2, 4.0..6.0, &def);
+
+        let (mut scene_b, grid_b) = build();
+        let mut b = ParticleSystem::new(77);
+        let g = scene_b.grid_mut(grid_b).expect("grid");
+        let mut sites = Vec::new();
+        let r = 2i32;
+        for z in -r..=r {
+            for y in -r..=r {
+                for x in -r..=r {
+                    if x * x + y * y + z * z > r * r {
+                        continue;
+                    }
+                    let v = centre + IVec3::new(x, y, z);
+                    if let Some(col) = g.voxel_color(v) {
+                        let w = v.as_dvec3() + DVec3::splat(0.5); // identity transform
+                        #[allow(clippy::cast_possible_truncation)]
+                        sites.push(([w.x as f32, w.y as f32, w.z as f32], col.rgb_part()));
+                    }
+                }
+            }
+        }
+        g.set_sphere(centre, 2, None);
+        let cw = centre.as_dvec3() + DVec3::splat(0.5);
+        #[allow(clippy::cast_possible_truncation)]
+        let nb = b.voxel_debris(
+            &sites,
+            [cw.x as f32, cw.y as f32, cw.z as f32],
+            4.0..6.0,
+            &def,
+        );
+
+        assert_eq!(na, nb, "same debris count");
+        assert!(na > 0);
+        for (pa, pb) in a.particles().iter().zip(b.particles()) {
+            assert_eq!(pa.pos, pb.pos);
+            assert_eq!(pa.vel, pb.vel);
+            assert_eq!(pa.tint, pb.tint);
+            assert_eq!(pa.lifetime, pb.lifetime);
+            assert_eq!(pa.spin_rate, pb.spin_rate);
+        }
     }
 
     #[test]
