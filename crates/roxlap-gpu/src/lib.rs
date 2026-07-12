@@ -302,9 +302,12 @@ pub struct GpuRenderer {
     sprite_model_dda: Option<SpriteModelDdaResources>,
     /// TV — global voxel-material palette mirrored to the sprite pass (256
     /// entries, default all-opaque), set via [`Self::set_sprite_materials`].
-    /// `sprite_has_translucent` gates the shader's accumulate path.
+    /// `sprite_has_translucent` gates the shader's accumulate path;
+    /// `sprite_has_emissive` gates the opaque marcher's per-hit material
+    /// fetch (EV — emissive sprite voxels render full-bright).
     sprite_materials: Box<[MaterialGpu; 256]>,
     sprite_has_translucent: bool,
+    sprite_has_emissive: bool,
     /// XS.4 — whether this device grants enough storage buffers per shader
     /// stage for GPU sprite shadows (the cross-pass occupancy bindings push a
     /// pass past the baseline 16). `false` ⇒ GPU sprites render unshadowed (the
@@ -728,7 +731,11 @@ struct SpriteModelUniform {
     /// bit0 = sun enabled, bit2 = dynamic lighting active (use the lit path).
     sun_flags: u32,
     point_light_count: u32,
-    _pad_dl: [u32; 2],
+    /// EV — 1 if any palette material is emissive: gates the opaque
+    /// marcher's per-hit material fetch (an emissive-free palette never
+    /// touches the palette there).
+    has_emissive: u32,
+    _pad_dl: u32,
     // ── DL.6 — stylized sprite lighting (cel + ramp + flat per voxel) ──
     /// `rgb` = cool unlit end of the sun ramp; `w` unused.
     shadow_tint: [f32; 4],
@@ -773,11 +780,12 @@ struct MaterialGpu {
 }
 
 /// Convert the global [`MaterialTable`](roxlap_formats::material::MaterialTable)
-/// into the GPU palette + a flag of whether any material is non-opaque (the
-/// shader gate — an all-opaque palette runs the unchanged first-hit path).
+/// into the GPU palette + flags of whether any material is non-opaque and
+/// whether any is emissive (the shader gates — an all-opaque emissive-free
+/// palette runs the unchanged first-hit path).
 fn material_palette(
     table: &roxlap_formats::material::MaterialTable,
-) -> (Box<[MaterialGpu; 256]>, bool) {
+) -> (Box<[MaterialGpu; 256]>, bool, bool) {
     let mut out = Box::new(
         [MaterialGpu {
             alpha: 1.0,
@@ -787,6 +795,7 @@ fn material_palette(
         }; 256],
     );
     let mut any_translucent = false;
+    let mut any_emissive = false;
     for (id, slot) in out.iter_mut().enumerate() {
         let m = table.get(id as u8);
         slot.alpha = f32::from(m.alpha) / 255.0;
@@ -801,8 +810,11 @@ fn material_palette(
         if !m.is_opaque() {
             any_translucent = true;
         }
+        if m.emissive > 0 {
+            any_emissive = true;
+        }
     }
-    (out, any_translucent)
+    (out, any_translucent, any_emissive)
 }
 
 /// Build the per-grid camera storage buffer bound at `scene_dda.wgsl`
@@ -1281,6 +1293,7 @@ impl GpuRenderer {
                 }; 256],
             ),
             sprite_has_translucent: false,
+            sprite_has_emissive: false,
             // GPU.10.4 — default LOD threshold: step to a coarser mip
             // once a voxel projects below 4 px. Empirically the best
             // quality/cost tradeoff; the host can override.
@@ -1929,7 +1942,8 @@ impl GpuRenderer {
                     ambient_color: [dl.ambient[0], dl.ambient[1], dl.ambient[2], 0.0],
                     sun_flags: sprite_sun_flags,
                     point_light_count: sprite_point_count,
-                    _pad_dl: [0; 2],
+                    has_emissive: u32::from(self.sprite_has_emissive),
+                    _pad_dl: 0,
                     shadow_tint: [dl.shadow_tint[0], dl.shadow_tint[1], dl.shadow_tint[2], 0.0],
                     style_bands: dl.style_bands,
                     // XS.4.2 — sprite-shadow (receive) ABI, mirroring the scene
@@ -2933,9 +2947,10 @@ impl GpuRenderer {
     /// each frame). While every material is opaque the shader stays on the
     /// unchanged first-hit path.
     pub fn set_sprite_materials(&mut self, table: &roxlap_formats::material::MaterialTable) {
-        let (palette, any_translucent) = material_palette(table);
+        let (palette, any_translucent, any_emissive) = material_palette(table);
         self.sprite_materials = palette;
         self.sprite_has_translucent = any_translucent;
+        self.sprite_has_emissive = any_emissive;
         if let Some(smd) = &self.sprite_model_dda {
             self.queue.write_buffer(
                 &smd.materials_buf,
@@ -2955,7 +2970,7 @@ impl GpuRenderer {
         table: &roxlap_formats::material::MaterialTable,
         map: &[(Rgb, u8)],
     ) {
-        let (palette, _) = material_palette(table);
+        let (palette, _, _) = material_palette(table);
         self.scene_materials = palette;
         self.scene_terrain_map = map
             .iter()
@@ -3015,6 +3030,15 @@ pub struct HeadlessSceneRenderer {
     /// surface path). Default = none (baked-only). Set via
     /// [`Self::set_scene_lights`]; lets tests exercise the lit path.
     lights: SceneLights,
+    /// EV — terrain material palette + colour→material map for the render
+    /// (mirror of the surface path's `set_scene_terrain_materials`).
+    /// Default: all-opaque non-emissive palette + empty map ⇒ the gate
+    /// stays 0 and the shader keeps the pre-material fast path. Set via
+    /// [`Self::set_terrain_materials`]; lets CI diff the GPU emissive /
+    /// translucent material branch against the CPU.
+    terrain_materials: Box<[MaterialGpu; 256]>,
+    terrain_map: Vec<[u32; 2]>,
+    terrain_translucent: bool,
 }
 
 impl HeadlessSceneRenderer {
@@ -3174,7 +3198,43 @@ impl HeadlessSceneRenderer {
             depth_readback,
             side_shades: [[0; 4]; 2],
             lights: SceneLights::default(),
+            terrain_materials: Box::new(
+                [MaterialGpu {
+                    alpha: 1.0,
+                    mode: 0,
+                    emissive: 0.0,
+                    _pad: 0,
+                }; 256],
+            ),
+            terrain_map: Vec::new(),
+            terrain_translucent: false,
         }
+    }
+
+    /// EV — set the terrain material palette + colour→material map for
+    /// subsequent renders (the headless mirror of
+    /// [`GpuRenderer::set_scene_terrain_materials`]): matching-colour
+    /// terrain voxels render translucent and/or emissive. An empty map /
+    /// all-opaque non-emissive mapping keeps the gate 0 — the unchanged
+    /// pre-material fast path.
+    pub fn set_terrain_materials(
+        &mut self,
+        table: &roxlap_formats::material::MaterialTable,
+        map: &[(Rgb, u8)],
+    ) {
+        let (palette, _, _) = material_palette(table);
+        self.terrain_materials = palette;
+        self.terrain_map = map
+            .iter()
+            .take(256)
+            .map(|&(c, m)| [c.0 & 0x00ff_ffff, u32::from(m)])
+            .collect();
+        // EV.2 — the material path also activates for emissive mappings
+        // (an opaque glowing palette must leave the first-hit fast path).
+        self.terrain_translucent = map.iter().any(|&(_, m)| {
+            let mm = table.get(m);
+            !mm.is_opaque() || mm.emissive > 0
+        });
     }
 
     /// Set per-face side-shades for subsequent [`Self::render`] calls —
@@ -3310,27 +3370,26 @@ impl HeadlessSceneRenderer {
         for (c, t) in cam_vec.iter_mut().zip(grid_world.iter()) {
             c.set_world_transform(t);
         }
-        // TV.6 — opaque dummies for the material palette + terrain map
-        // bindings (headless renders opaque-only: terrain_has_translucent=0).
-        let (dummy_pal, dummy_map) = {
+        // TV.6/EV — material palette + terrain map bindings, from the
+        // renderer's plumbed state (defaults: all-opaque non-emissive +
+        // empty map ⇒ gate 0, the pre-material fast path). An empty map
+        // pads one zero row (wgpu rejects a zero-sized storage binding).
+        let (mat_pal_buf, terrain_map_buf) = {
             use wgpu::util::DeviceExt;
-            let pal: Vec<MaterialGpu> = vec![
-                MaterialGpu {
-                    alpha: 1.0,
-                    mode: 0,
-                    emissive: 0.0,
-                    _pad: 0,
-                };
-                256
-            ];
             let p = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("roxlap-gpu headless.materials_pal"),
-                contents: bytemuck::cast_slice(&pal),
+                contents: bytemuck::cast_slice(self.terrain_materials.as_slice()),
                 usage: wgpu::BufferUsages::STORAGE,
             });
+            let zero_row = [[0u32; 2]];
+            let rows: &[[u32; 2]] = if self.terrain_map.is_empty() {
+                &zero_row
+            } else {
+                &self.terrain_map
+            };
             let m = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("roxlap-gpu headless.terrain_map"),
-                contents: bytemuck::cast_slice(&[[0u32; 2]]),
+                contents: bytemuck::cast_slice(rows),
                 usage: wgpu::BufferUsages::STORAGE,
             });
             (p, m)
@@ -3359,8 +3418,8 @@ impl HeadlessSceneRenderer {
             occ_page_words: scene.occupancy_page_words,
             occ_num_pages: scene.occupancy_num_pages,
             mip_scan_dist,
-            terrain_has_translucent: 0, // headless gate: opaque only
-            terrain_map_count: 0,
+            terrain_has_translucent: u32::from(self.terrain_translucent),
+            terrain_map_count: u32::try_from(self.terrain_map.len()).unwrap_or(0),
             _pad4: 0,
             // Sky direction from the first grid camera (the world frame
             // in these tests); a default forward camera when there are
@@ -3473,11 +3532,11 @@ impl HeadlessSceneRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 16,
-                    resource: dummy_pal.as_entire_binding(),
+                    resource: mat_pal_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 17,
-                    resource: dummy_map.as_entire_binding(),
+                    resource: terrain_map_buf.as_entire_binding(),
                 },
                 // DL — dummy per-grid point lights (18). Sun dir rides in
                 // PerGridCamera (binding 15).

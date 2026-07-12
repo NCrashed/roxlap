@@ -1766,3 +1766,109 @@ fn hierarchical_skip_hits_far_chunk_and_tracks_evict() {
         "re-installed chunk renders exactly as before"
     );
 }
+
+/// EV — headless material plumbing + GPU emissive parity: an emissive
+/// terrain mapping renders full-bright through the real `scene_dda.wgsl`
+/// pipeline, matching the CPU `emissive_shade` ladder exactly, and is
+/// independent of both the baked byte and a hostile dynamic rig. Also
+/// gates: an empty map re-renders byte-identically to the pre-material
+/// baseline (the fast path stays byte-exact).
+#[test]
+fn scene_dda_emissive_ignores_lighting() {
+    use roxlap_formats::material::{Material, MaterialTable};
+    use roxlap_formats::Rgb;
+
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    // A **dim** floor at z=100: baked byte 0x40 ⇒ the baked path renders at
+    // half albedo, so full-bright emissive is unmistakable. BGRA, R=0xff.
+    let chunk = decompress_chunk(&block_chunk_bgra(vsid, 100, 100, [0x00, 0x80, 0xff, 0x40]));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )
+    };
+    // Readback is 0xAABBGGRR — R in the low byte.
+    let rgb = |p: u32| (p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff);
+
+    // Baseline: the dim baked floor (≈ half of R=0xff / G=0x80).
+    let baked_fb = render(&mut renderer);
+    let (br, bg, _) = rgb(baked_fb[centre]);
+    assert!(
+        (100..=160).contains(&br) && bg < 90,
+        "baked floor should be dim orange: {:#010x}",
+        baked_fb[centre]
+    );
+
+    // Map the floor colour to an opaque **emissive** material: the centre
+    // must hit the exact CPU ladder value — emissive_shade(0xff8000, 255)
+    // = (255, 255, 0) — ignoring the dim baked byte.
+    let mut table = MaterialTable::new();
+    table.set(1, Material::OPAQUE.with_emissive(255));
+    renderer.set_terrain_materials(&table, &[(Rgb(0x00ff_8000), 1)]);
+    let glow = render(&mut renderer)[centre];
+    assert_eq!(
+        rgb(glow),
+        (255, 255, 0),
+        "emissive must ignore the baked byte and match the CPU ladder: {glow:#010x}"
+    );
+
+    // A hostile rig (zero ambient, back-facing sun) blacks out a plain
+    // floor but must not touch the emissive one.
+    renderer.set_scene_lights(SceneLights {
+        enabled: true,
+        grid_sun_dirs: vec![[0.0, 0.0, 1.0]], // to-sun below: N·L = 0 on top
+        sun_color: [1.0; 3],
+        sun_intensity: 1.0,
+        ambient: [0.0; 3],
+        ..SceneLights::default()
+    });
+    let glow_lit = render(&mut renderer)[centre];
+    assert_eq!(
+        rgb(glow_lit),
+        (255, 255, 0),
+        "emissive must outrank the dynamic rig: {glow_lit:#010x}"
+    );
+    renderer.set_terrain_materials(&table, &[]); // gate off again
+    let (dr, dg, db) = rgb(render(&mut renderer)[centre]);
+    assert!(
+        dr == 0 && dg == 0 && db == 0,
+        "zero rig must black out the plain floor: ({dr},{dg},{db})"
+    );
+
+    // Byte-exactness gate: with the rig off and an empty map the whole
+    // frame is identical to the pre-material baseline.
+    renderer.set_scene_lights(SceneLights::default());
+    assert_eq!(
+        render(&mut renderer),
+        baked_fb,
+        "empty material map must re-render byte-identically"
+    );
+}

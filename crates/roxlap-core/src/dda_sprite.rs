@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use crate::camera_math::CameraState;
 use crate::dda::{
-    dda_setup, intersect_aabb, min_axis, pixel_ray, shade, shade_dynamic, CpuLights, ShadowTester,
-    WorldOccluder, WorldShadow, WorldShadowCtx,
+    dda_setup, emissive_shade, intersect_aabb, min_axis, pixel_ray, shade, shade_dynamic,
+    CpuLights, ShadowTester, WorldOccluder, WorldShadow, WorldShadowCtx,
 };
 use crate::opticast::OpticastSettings;
 use crate::raster_target::RasterTarget;
@@ -703,7 +703,14 @@ fn cast_local_layers(
     let mut tester = shade_ctx.shadow.map(|occ| WorldShadow {
         ctx: WorldShadowCtx::identity(occ),
     });
-    let mut shade_layer = |idx: usize, cell: [i32; 3], n_local: [f32; 3]| -> u32 {
+    let mut shade_layer = |idx: usize, cell: [i32; 3], n_local: [f32; 3], emissive: u8| -> u32 {
+        // EV — an emissive layer outranks both the baked and the dynamic
+        // shade (albedo × emissive factor only; the per-instance tint still
+        // applies), mirroring the terrain hit order. `emissive == 0` keeps
+        // the pre-EV branches byte-identical.
+        if emissive > 0 {
+            return tint_packed(emissive_shade(dense.col[idx], emissive), tint);
+        }
         if !lights.enabled {
             return tint_packed(shade(dense.col[idx], 0), tint);
         }
@@ -765,7 +772,7 @@ fn cast_local_layers(
             };
             let m = shade_ctx.materials.get(mat_id);
             if m.is_opaque() {
-                acc.opaque = Some((shade_layer(idx, cell, normal), t_curr));
+                acc.opaque = Some((shade_layer(idx, cell, normal, m.emissive), t_curr));
                 touched = true;
                 break;
             }
@@ -776,7 +783,7 @@ fn cast_local_layers(
                 // filled volume thickens smoothly with depth. Always occludes.
                 let seg_len = (t_exit - t_curr).max(0.0) * dir_len;
                 let eff_a = 1.0 - (1.0 - a).powf(seg_len);
-                let lit = rgb_to_f32(shade_layer(idx, cell, normal));
+                let lit = rgb_to_f32(shade_layer(idx, cell, normal, m.emissive));
                 acc.rgb[0] += acc.trans * eff_a * lit[0];
                 acc.rgb[1] += acc.trans * eff_a * lit[1];
                 acc.rgb[2] += acc.trans * eff_a * lit[2];
@@ -789,7 +796,7 @@ fn cast_local_layers(
             } else if !prev_solid || mat_id != prev_mat {
                 // AlphaBlend / Additive: one alpha layer per solid-run entry or
                 // material change (thickness-independent — shells, glass).
-                let lit = rgb_to_f32(shade_layer(idx, cell, normal));
+                let lit = rgb_to_f32(shade_layer(idx, cell, normal, m.emissive));
                 acc.rgb[0] += acc.trans * a * lit[0];
                 acc.rgb[1] += acc.trans * a * lit[1];
                 acc.rgb[2] += acc.trans * a * lit[2];
@@ -1109,7 +1116,21 @@ pub fn draw_sprite_dense_shaded(
                 // (byte-identical). The model-local face normal + voxel centre
                 // are rotated into world space via the instance basis (s,h,f).
                 let dl = shade_ctx.map_or(CpuLights::default(), |s| s.lights);
-                let lit = if dl.enabled {
+                // EV — sprite emissive: the hit voxel's material (per-voxel
+                // id, or the whole-sprite uniform id) outranks both the lit
+                // and baked paths, mirroring the terrain hit order. No
+                // shade_ctx / emissive 0 ⇒ the pre-EV branches, byte-identical.
+                let emissive = shade_ctx.map_or(0, |sc| {
+                    let mat_id = if dense.mat.is_empty() {
+                        sc.material
+                    } else {
+                        dense.mat[dense.idx_of(cell)]
+                    };
+                    sc.materials.get(mat_id).emissive
+                });
+                let lit = if emissive > 0 {
+                    emissive_shade(color, emissive)
+                } else if dl.enabled {
                     let to_world = |v: [f32; 3]| {
                         [
                             v[0] * s[0] + v[1] * h[0] + v[2] * f[0],
@@ -2075,6 +2096,100 @@ mod tests {
             "alpha_mul=255 ({r_full:02x}) more opaque than 64 ({r_faded:02x})"
         );
         assert!(r_faded > 0x20, "even faded lifts above bg");
+    }
+
+    // ---------- EV: sprite emissive ----------
+
+    /// Like [`draw_cube_shaded`] but with an explicit light rig and a black
+    /// background, so the emissive tests can prove the branch outranks
+    /// dynamic lighting. Returns the centre pixel.
+    fn draw_cube_lit(mat: Material, lights: CpuLights) -> u32 {
+        let mut table = MaterialTable::new();
+        table.set(1, mat);
+        let dense = SpriteDense::from_kv6(&Kv6::solid_cube(8, VoxColor(0x80_C0_40_20)));
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize;
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let cs = camera_math::derive(&cam_looking_y(), w, h, 32.0, 32.0, 32.0);
+        let sh = SpriteShade {
+            materials: &table,
+            lights,
+            material: 1,
+            alpha_mul: 255,
+            tint: 0x00FF_FFFF,
+            shadow: None,
+        };
+        let _ = draw_sprite_dense_shaded(
+            &mut fb,
+            &mut zb,
+            w as usize,
+            w,
+            h,
+            &cs,
+            &settings(w, h),
+            &dense,
+            [0.0, 40.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            0,
+            Some(sh),
+        );
+        fb[(h / 2 * w + w / 2) as usize]
+    }
+
+    /// EV — an **opaque emissive** sprite voxel renders at its albedo × the
+    /// emissive factor, independent of the dynamic rig: a zero-ambient rig
+    /// blacks out a plain cube but leaves the glowing one untouched, and the
+    /// value equals the terrain ladder's [`emissive_shade`] exactly — CPU
+    /// sprite/terrain parity by construction.
+    #[test]
+    fn sprite_emissive_ignores_lighting() {
+        // Zero rig: enabled, no sun, zero ambient — a plain cube goes black.
+        let dark = CpuLights {
+            enabled: true,
+            ambient: [0.0; 3],
+            ..CpuLights::default()
+        };
+        let plain = draw_cube_lit(Material::OPAQUE, dark);
+        assert_eq!(
+            plain & 0x00ff_ffff,
+            0,
+            "zero rig must black out a plain cube: {plain:#010x}"
+        );
+
+        let expect = emissive_shade(0x80_C0_40_20, 255) & 0x00ff_ffff;
+        let glow = draw_cube_lit(Material::OPAQUE.with_emissive(255), dark);
+        assert_eq!(
+            glow & 0x00ff_ffff,
+            expect,
+            "emissive must outrank the rig: {glow:#010x} vs {expect:#010x}"
+        );
+
+        // Rig disabled ⇒ the same value: emissive is rig-invariant.
+        let unlit = draw_cube_lit(Material::OPAQUE.with_emissive(255), CpuLights::default());
+        assert_eq!(unlit & 0x00ff_ffff, expect, "emissive is rig-invariant");
+    }
+
+    /// EV — an **AlphaBlend emissive** sprite glows *through* its
+    /// translucency: over a black background the composited layer is
+    /// brighter than the same non-emissive glass.
+    #[test]
+    fn sprite_emissive_glows_through_alpha_blend() {
+        let (plain, _) =
+            draw_cube_shaded(Material::alpha_blend(128), 255, 0x8000_0000, f32::INFINITY);
+        let (glow, _) = draw_cube_shaded(
+            Material::alpha_blend(128).with_emissive(255),
+            255,
+            0x8000_0000,
+            f32::INFINITY,
+        );
+        let r = |p: u32| (p >> 16) & 0xff;
+        assert!(
+            r(glow) > r(plain),
+            "emissive glass must beat plain glass over black: {glow:#010x} vs {plain:#010x}"
+        );
     }
 
     /// A `SpriteShade` whose effective material is **opaque** (id 0) renders

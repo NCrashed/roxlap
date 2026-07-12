@@ -5,23 +5,40 @@ engine-state audit. This is the **entry doc** for the emissive-voxel
 stage — tag **EV**. A fresh-context session should read it top to
 bottom before touching code.
 
-## Status — EV.0..5 ALL LANDED 2026-07-07; owed items below
+## Status — EV.0..5 ALL LANDED 2026-07-07; owed items CLOSED 2026-07-12
 
-Carried out of the series:
+The visual eyeball pass on the crystals passed (2026-07-07). The two
+carried items landed 2026-07-12:
 
-- **Visual eyeball pass owed** — nobody has *looked* at the crystals
-  yet: `cargo run --release -p roxlap-cave-demo` (CPU) and
-  `ROXLAP_GPU=1 …` (GPU). Tuning knobs if the gloom is too heavy:
-  `CRYSTAL_COUNT` / `CRYSTAL_LIGHT_STRENGTH` / `CRYSTAL_LIGHT_RADIUS`
-  in `crates/roxlap-cave-demo/src/main.rs`.
-- **Headless GPU emissive test owed** — the headless harness
-  hardcodes `terrain_has_translucent: 0`; growing it material
-  plumbing would let CI diff the GPU emissive branch against CPU.
-- **Sprite emissive deferred** — the sprite palette carries the field
-  (16-byte stride landed everywhere) but `sprite_model_dda.wgsl` and
-  the CPU sprite path don't branch on it yet.
-- Carving *through* a crystal keeps its light (accepted
-  simplification, documented in the demo).
+- **Sprite emissive LANDED** — both sprite paths now branch on the
+  material's emissive, mirroring the terrain hit order (emissive
+  outranks the dynamic rig and the baked shade; the per-instance tint
+  still applies; per-voxel TV.3 material ids honoured). CPU:
+  `dda_sprite.rs` opaque first-hit + `shade_layer` (translucent
+  layers). GPU: `sprite_model_dda.wgsl` `march_instance` (the palette
+  fetch is gated per hit on a new `has_emissive` uniform, repurposed
+  pad — an emissive-free palette never touches the palette in the
+  opaque marcher) + `march_instance_layers` (`mm` already fetched).
+  Host: `material_palette` also returns `any_emissive`;
+  `set_sprite_materials` stamps the gate; the facade's existing
+  `materials_dirty` sync carries it — no facade change. Tests:
+  `sprite_emissive_ignores_lighting` (value == `emissive_shade`
+  exactly — CPU sprite/terrain parity by construction),
+  `sprite_emissive_glows_through_alpha_blend`.
+- **Headless GPU emissive test LANDED** —
+  `HeadlessSceneRenderer::set_terrain_materials` (mirror of the
+  surface path's `set_scene_terrain_materials`, same gate logic)
+  replaces the hardcoded opaque dummies; `terrain_has_translucent` /
+  `terrain_map_count` now come from the plumbed state. Gate test
+  `scene_dda_emissive_ignores_lighting` (scene_render.rs): the GPU
+  emissive branch matches the CPU ladder **exactly** ((255,255,0) for
+  0xff8000 @ e=255), ignores a dim baked byte and a zero-ambient rig,
+  and an empty map re-renders byte-identically to the pre-material
+  baseline.
+
+Remaining accepted simplification:
+
+- Carving *through* a crystal keeps its light (documented in the demo).
 
 - EV.0 — LANDED 2026-07-07: `Material.emissive: u8` +
   `Material::glow` / `with_emissive` + `MaterialTable::any_emissive`;

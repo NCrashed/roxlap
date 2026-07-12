@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: sprite emissive + headless GPU emissive gate (EV owed items)
+
+- **Sprite emissive**: a sprite/clip voxel whose material glows now
+  renders full-bright on **both** backends (previously terrain-only) —
+  the emissive branch outranks the dynamic rig and the baked shade in
+  the CPU sprite raycaster (opaque first-hit + translucent layers) and
+  in `sprite_model_dda.wgsl` (`march_instance` +
+  `march_instance_layers`), honouring per-voxel material ids and the
+  per-instance tint. The GPU opaque marcher's palette fetch is gated on
+  a new `has_emissive` uniform flag (a repurposed pad — no ABI growth),
+  so an emissive-free palette renders byte-identically to before. No
+  facade API change: the existing material sync carries the gate.
+- **Headless GPU emissive test**: `HeadlessSceneRenderer` grew
+  `set_terrain_materials` (the headless mirror of
+  `set_scene_terrain_materials`), unblocking CI coverage of the GPU
+  material branch — the new gate test proves the GPU emissive path
+  matches the CPU `emissive_shade` ladder exactly and that an empty
+  material map still re-renders byte-identically.
+
 ### Added / Fixed: per-grid scale follow-ups
 
 - **Audio on scale**: `roxlap-audio`'s occlusion path-thickness now honours a

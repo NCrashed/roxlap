@@ -31,9 +31,10 @@ struct Instance {
 };
 // TV: one global-palette material (binding 12). `mode` is the
 // BlendMode discriminant: 0 = Opaque, 1 = AlphaBlend, 2 = Additive.
-// EV.2 — `emissive` rides along for the 16-byte `MaterialGpu` stride
-// (both palettes share the host struct); the sprite pass does not
-// render emissive yet (terrain-only for now, see PORTING-EMISSIVE.md).
+// EV — `emissive` is the pre-scaled full-bright factor (0.0 = none);
+// an emissive voxel outranks both the lit and flat/kv6colmul paths
+// (gated per hit on `u.has_emissive` so an emissive-free palette
+// never touches the palette in the opaque marcher).
 struct Mat {
     alpha: f32,
     mode: u32,
@@ -59,7 +60,7 @@ struct Uniform {
     ambient_color: vec4<f32>, // rgb ambient multiplier on albedo
     sun_flags: u32,         // bit0 sun enabled, bit2 dynamic lighting active
     point_light_count: u32,
-    _pad_dl0: u32,
+    has_emissive: u32,      // EV: 1 ⇒ consult the material palette per opaque hit
     _pad_dl1: u32,
     // ── DL.6 — stylized lighting for sprites (cel + ramp + flat per voxel) ──
     shadow_tint: vec4<f32>, // rgb = cool unlit end of the sun ramp
@@ -380,10 +381,26 @@ fn march_instance(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limit: f32)
                 res.hit = true;
                 res.t = t_hit;
                 let vidx = voxel_index(m, p); // PF.3 — one rank scan per hit
-                // DL.4/DL.7 — lit path when dynamic lighting is active; else the
-                // unchanged flat/kv6colmul colour. The model-local face normal
-                // points back toward the ray on the crossed axis.
-                if ((u.sun_flags & 4u) != 0u) {
+                // EV — sprite emissive: the hit voxel's material outranks
+                // both the lit and flat/kv6colmul paths, mirroring the
+                // terrain hit order. The palette fetch is gated on the
+                // uniform so an emissive-free palette stays untouched.
+                var mm_emissive = 0.0;
+                if (u.has_emissive != 0u) {
+                    mm_emissive = materials[voxel_material(m, vidx, inst.material)].emissive;
+                }
+                if (mm_emissive > 0.0) {
+                    let packed = colors[vidx];
+                    let albedo = vec3<f32>(
+                        f32((packed >> 16u) & 0xffu),
+                        f32((packed >> 8u) & 0xffu),
+                        f32(packed & 0xffu),
+                    ) / 255.0;
+                    res.color = min(albedo * mm_emissive, vec3<f32>(1.0));
+                } else if ((u.sun_flags & 4u) != 0u) {
+                    // DL.4/DL.7 — lit path when dynamic lighting is active;
+                    // else the unchanged flat/kv6colmul colour. The model-local
+                    // face normal points back toward the ray on the crossed axis.
                     var n_model = vec3<f32>(0.0);
                     if (hit_axis == 0) { n_model.x = -f32(step.x); }
                     else if (hit_axis == 1) { n_model.y = -f32(step.y); }
@@ -488,8 +505,18 @@ fn march_instance_layers(inst: Instance, inst_idx: u32, ray_dir: vec3<f32>, limi
             // flat-per-voxel `shade_sprite_lit`, model-local face normal on the
             // crossed axis), else the baked `model_color`. Mirror of the opaque
             // `march_instance` path so translucent sprite layers shade too.
+            // EV — an emissive layer outranks both (`mm` is already fetched
+            // here; `emissive == 0.0` keeps the pre-EV branches).
             var lc: vec3<f32>;
-            if ((u.sun_flags & 4u) != 0u) {
+            if (mm.emissive > 0.0) {
+                let packed = colors[vidx];
+                let albedo = vec3<f32>(
+                    f32((packed >> 16u) & 0xffu),
+                    f32((packed >> 8u) & 0xffu),
+                    f32(packed & 0xffu),
+                ) / 255.0;
+                lc = min(albedo * mm.emissive, vec3<f32>(1.0));
+            } else if ((u.sun_flags & 4u) != 0u) {
                 var n_model = vec3<f32>(0.0);
                 if (hit_axis == 0) { n_model.x = -f32(step.x); }
                 else if (hit_axis == 1) { n_model.y = -f32(step.y); }
