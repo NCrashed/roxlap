@@ -22,7 +22,13 @@
 //! - Hold `LCtrl` for fast-fly (≈4× speed).
 //! - `LMB` (while grabbed) → fire a plasma bullet (a glowing voxel
 //!   sphere sprite) that flies along camera-forward and carves a sphere
-//!   into the world on impact.
+//!   into the world on impact. DT.4 — rock the carve disconnects from
+//!   the cave **crumbles**: it detaches as a falling sprite and bursts
+//!   into colour-true debris (with an occlusion-shaded boom) where it
+//!   lands. By design, a detached region bigger than the detection
+//!   budget (~4096 voxels) stays put — shooting the single support out
+//!   from under a whole gallery will NOT drop the gallery.
+//!   `ROXLAP_NO_CRUMBLE=1` restores plain carves.
 //! - `F` → toggle blue ↔ mag cave preset (regenerates the world).
 //! - `R` → regenerate the world with the next seed (preset preserved).
 //! - `Esc` → release cursor (or exit if already released).
@@ -41,7 +47,7 @@ use std::time::Instant;
 #[cfg(feature = "audio")]
 mod audio;
 
-use glam::IVec3;
+use glam::{IVec3, Vec3};
 use roxlap_cavegen::{BlueCaveGenerator, CaveParams, MagCaveGenerator, MAXZDIM};
 use roxlap_core::update_lighting;
 use roxlap_core::world_query::{getcube, Cube};
@@ -53,13 +59,15 @@ use roxlap_formats::edit::set_sphere_with_colfunc;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::vxl::Vxl;
 use roxlap_render::{
-    BackendPreference, DynSpriteTransform, FrameParams, Material, RenderOptions, SceneRenderer,
-    SpriteInstanceId, SpriteModelId,
+    BackendPreference, CollisionMode, DebrisSystem, DynSpriteTransform, FrameParams, Material,
+    ParticleEmitterDef, ParticleSystem, RenderOptions, SceneRenderer, SpriteInstanceId,
+    SpriteModelId,
 };
 use roxlap_scene::cavegen::CaveChunkGenerator;
+use roxlap_scene::islands::{detect_islands, Island, DEFAULT_ISLAND_BUDGET};
 use roxlap_scene::{
-    BakeLight, CharacterBody, CharacterDef, ChunkGenerator, Grid, GridId, GridTransform, MoveMode,
-    Scene, Solidity, SpanOp, WalkInput, CHUNK_SIZE_XY,
+    BakeLight, BakeMode, CharacterBody, CharacterDef, ChunkGenerator, Grid, GridId, GridTransform,
+    MoveMode, Scene, Solidity, SpanOp, WalkInput, CHUNK_SIZE_XY,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -96,6 +104,16 @@ const BULLET_VEL: f64 = 60.0;
 
 /// Sphere carve radius applied at bullet impact, in voxels.
 const FIRE_RADIUS: u32 = 4;
+
+/// DT.4 — flood budget for the worker's post-carve island detection:
+/// a disconnected region bigger than this stays put (assumed
+/// supported), the engine default. `ROXLAP_NO_CRUMBLE=1` disables
+/// detection entirely.
+const CRUMBLE_BUDGET: usize = DEFAULT_ISLAND_BUDGET;
+
+/// DT.4 — shatters between sprite-model-pool compactions (removed
+/// island models are tombstoned until compacted).
+const CRUMBLE_COMPACT_EVERY: u32 = 32;
 
 /// Radius (voxels) of the glowing sphere kv6 each bullet renders as. A
 /// voxel-accurate sprite, so it occludes against the cave + scales with
@@ -305,6 +323,17 @@ struct App {
     /// relight + mip rebuild off the main thread, swapping the result in
     /// when ready so impacts don't hitch the frame.
     carve: CarveWorker,
+    /// DT.4 — falling voxel islands the worker's detection detaches;
+    /// ticked each frame, drained impacts shatter into `particles`.
+    debris: DebrisSystem,
+    /// DT.4 — shatter debris particles (colour-true bursts from a
+    /// landed island's own voxels).
+    particles: ParticleSystem,
+    /// One-voxel cube model every shatter particle instances.
+    /// Registered in `resumed` alongside the bullet model.
+    debris_model: Option<SpriteModelId>,
+    /// Shatters since the last sprite-model-pool compaction.
+    shatters_since_compact: u32,
     /// AU.3 — voxel-aware audio (feature `audio`). `None` when no audio
     /// device is available; the demo then runs silent.
     #[cfg(feature = "audio")]
@@ -365,6 +394,10 @@ impl App {
             seed,
             bullets: Vec::new(),
             carve: CarveWorker::new(),
+            debris: DebrisSystem::new(),
+            particles: ParticleSystem::new(0xCA5E),
+            debris_model: None,
+            shatters_since_compact: 0,
             #[cfg(feature = "audio")]
             audio: audio::DemoAudio::new(),
         }
@@ -691,12 +724,68 @@ impl App {
                 sc: l.strength,
             })
             .collect();
-        let new_chunk = self.carve.pump(current, &lights);
-        if let Some(new_chunk) = new_chunk {
-            if let Some(grid) = self.scene.grid_mut(self.grid_id) {
-                *grid.ensure_chunk(IVec3::ZERO) = new_chunk;
-                grid.bump_chunk_version(IVec3::ZERO);
+        let Some((new_chunk, islands)) = self.carve.pump(current, &lights) else {
+            return;
+        };
+        if let Some(grid) = self.scene.grid_mut(self.grid_id) {
+            *grid.ensure_chunk(IVec3::ZERO) = new_chunk;
+            grid.bump_chunk_version(IVec3::ZERO);
+        }
+        // DT.4 — spawn each detached island as a falling sprite. The
+        // worker already extracted them from the chunk we just swapped
+        // in (and remipped the extraction bbox — hazard 3b), so the
+        // spawn's own extract is a no-op carve + a cheap re-bake, and
+        // its spawn-inside-geometry check runs against the real grid.
+        for isl in islands {
+            self.debris
+                .spawn_island(&mut self.scene, self.grid_id, isl, BakeMode::PointLights);
+        }
+    }
+
+    /// DT.4 — advance the falling islands, shatter the landed ones
+    /// into colour-true debris particles (the DT.3 audio half lands
+    /// here too: every impact booms through the same occlusion-shaded
+    /// path as a bullet hit), and periodically compact the
+    /// sprite-model pool (island models are tombstoned on removal).
+    fn tick_crumble(&mut self, dt: f64) {
+        let mut booms: Vec<IVec3> = Vec::new();
+        if let Some(renderer) = self.renderer.as_mut() {
+            self.debris.tick(renderer, &self.scene, dt);
+            if let Some(model) = self.debris_model {
+                for hit in self.debris.drain_impacts() {
+                    let from = [hit.pos.x as f32, hit.pos.y as f32, hit.pos.z as f32];
+                    // Harder landings kick the shards faster.
+                    let kick = hit.speed as f32 * 0.25;
+                    self.particles.voxel_debris(
+                        &hit.burst_sites(),
+                        from,
+                        (2.0 + 0.5 * kick)..(5.0 + kick),
+                        &ParticleEmitterDef {
+                            lifetime: 0.6..1.4,
+                            drag: 0.4,
+                            collision: CollisionMode::Bounce { restitution: 0.35 },
+                            fade_out_frac: 0.4,
+                            scale_end: Some(0.4),
+                            ..ParticleEmitterDef::new(model)
+                        },
+                    );
+                    // Identity grid: world == grid-local voxel coords.
+                    booms.push(IVec3::new(
+                        hit.pos.x.floor() as i32,
+                        hit.pos.y.floor() as i32,
+                        hit.pos.z.floor() as i32,
+                    ));
+                    self.shatters_since_compact += 1;
+                }
             }
+            self.particles.tick_with_scene(renderer, dt, &self.scene);
+            if self.shatters_since_compact >= CRUMBLE_COMPACT_EVERY {
+                renderer.compact_sprite_models();
+                self.shatters_since_compact = 0;
+            }
+        }
+        if !booms.is_empty() {
+            self.audio_impacts(&booms);
         }
     }
 
@@ -719,6 +808,7 @@ impl App {
         self.integrate(dt);
         self.step_bullets(dt);
         self.pump_carves();
+        self.tick_crumble(dt);
         self.audio_tick(dt);
 
         let cam = self.camera();
@@ -791,6 +881,10 @@ impl ApplicationHandler for App {
 
         // Register the glowing-sphere bullet model once.
         self.bullet_model = Some(renderer.add_sprite_model(&build_bullet_kv6()));
+        // DT.4 — one white voxel; every shatter particle instances it,
+        // tinted with its source voxel's colour.
+        self.debris_model =
+            Some(renderer.add_sprite_model(&Kv6::solid_cube(1, VoxColor(0x80FF_FFFF))));
 
         // EV.4 — the crystal material: translucent (the rock ghosts
         // through the gem) AND emissive (renders over-bright, immune to
@@ -1087,10 +1181,13 @@ struct CarveJob {
 }
 
 /// A finished carve: the carved + relit + re-mipped chunk, ready to swap
-/// into the grid.
+/// into the grid, plus the floating islands the batch disconnected
+/// (DT.4 — already extracted from `chunk` and covered by its remip;
+/// the main thread spawns them as falling debris).
 struct CarveDone {
     chunk: Vxl,
     epoch: u64,
+    islands: Vec<Island>,
 }
 
 /// Background carve pipeline. The heavy per-impact work — carve, local
@@ -1147,19 +1244,27 @@ impl CarveWorker {
     /// from (or the just-finished result, so queued-while-busy impacts
     /// stack correctly). Returns the chunk to swap into the grid, if one
     /// is ready this frame.
-    fn pump(&mut self, current: &Vxl, lights: &[LightSrc]) -> Option<Vxl> {
-        let mut ready: Option<Vxl> = None;
+    fn pump(&mut self, current: &Vxl, lights: &[LightSrc]) -> Option<(Vxl, Vec<Island>)> {
+        let mut ready: Option<(Vxl, Vec<Island>)> = None;
         while let Ok(done) = self.done_rx.try_recv() {
             self.busy = false;
             // Keep only a result from the current world generation.
+            // Islands accumulate across drained results (a superseding
+            // chunk was carved from its predecessor, post-extraction,
+            // so they never duplicate).
             if done.epoch == self.epoch {
-                ready = Some(done.chunk);
+                let mut islands = done.islands;
+                if let Some((_, mut prev)) = ready.take() {
+                    prev.append(&mut islands);
+                    islands = prev;
+                }
+                ready = Some((done.chunk, islands));
             }
         }
         if !self.busy && !self.pending.is_empty() {
             // Carve from the freshest state: the result we're about to
             // swap in, else the live grid chunk.
-            let base = ready.as_ref().unwrap_or(current).clone();
+            let base = ready.as_ref().map_or(current, |(c, _)| c).clone();
             let impacts = std::mem::take(&mut self.pending);
             if self
                 .job_tx
@@ -1182,6 +1287,9 @@ impl CarveWorker {
 /// cloned chunk, rebuild the mip ladder once for the batch, and send it
 /// back. Exits when the main thread drops the job sender.
 fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
+    // DT.4 — `ROXLAP_NO_CRUMBLE=1` skips island detection entirely
+    // (the escape hatch back to plain carves).
+    let crumble = !std::env::var_os("ROXLAP_NO_CRUMBLE").is_some_and(|v| v != "0" && !v.is_empty());
     while let Ok(CarveJob {
         mut chunk,
         impacts,
@@ -1194,7 +1302,7 @@ fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
         // incremental `remip_bbox` below.
         let mut lo = IVec3::splat(i32::MAX);
         let mut hi = IVec3::splat(i32::MIN);
-        for hit in impacts {
+        for &hit in &impacts {
             // Newly-exposed crater walls (previously buried solid) take
             // CARVE_COLOR; a plain carve would leave them black.
             set_sphere_with_colfunc(
@@ -1209,6 +1317,45 @@ fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
             lo = lo.min(hit - IVec3::splat(pad));
             hi = hi.max(hit + IVec3::splat(pad));
         }
+        // DT.4 — floating-island crumble: detect the regions this batch
+        // disconnected and extract them here, in the worker chunk, so
+        // the remip below covers the extraction too (hazard 3b in
+        // PORTING-DESTRUCTION.md — extraction on the main thread would
+        // leave mip-N drawing the island beyond mip_scan_dist).
+        // Chunk-local detection is exact for the single-(0,0,0) cave.
+        // The chunk rides through a temporary identity Grid so the
+        // grid-level detect/extract primitives apply; the crystal
+        // lights become its bake_lights, so `BakeMode::PointLights`
+        // writes the same bytes `relight_bbox` would (EV.4).
+        let mut islands: Vec<Island> = Vec::new();
+        if crumble && lo.x <= hi.x {
+            let mut tmp = Grid::new(GridTransform::identity());
+            tmp.bake_lights = lights
+                .iter()
+                .map(|l| BakeLight {
+                    pos: Vec3::from(l.pos),
+                    radius: l.r2.sqrt(),
+                    strength: l.sc,
+                })
+                .collect();
+            tmp.chunks.insert(IVec3::ZERO, chunk);
+            let r = IVec3::splat(FIRE_RADIUS as i32);
+            for &hit in &impacts {
+                for isl in detect_islands(&tmp, hit - r, hit + r, CRUMBLE_BUDGET) {
+                    // Extract immediately: a later impact's flood then
+                    // cannot re-find (duplicate) this island.
+                    isl.extract(&mut tmp, BakeMode::PointLights);
+                    let pad = IVec3::splat(roxlap_core::ESTNORMRAD);
+                    lo = lo.min(isl.bbox.0 - pad);
+                    hi = hi.max(isl.bbox.1 + pad);
+                    islands.push(isl);
+                }
+            }
+            chunk = tmp
+                .chunks
+                .remove(&IVec3::ZERO)
+                .expect("chunk moved in above");
+        }
         // PF.12 — incremental re-mip: byte-identical to the old full
         // `generate_mips(GPU_MIP_LEVELS)` but only the edited columns'
         // mip data is recomputed (clean columns memcpy their old bytes).
@@ -1217,7 +1364,14 @@ fn carve_worker_loop(job_rx: &Receiver<CarveJob>, done_tx: &Sender<CarveDone>) {
         if lo.x <= hi.x {
             chunk.remip_bbox(lo.x, lo.y, hi.x, hi.y, GPU_MIP_LEVELS);
         }
-        if done_tx.send(CarveDone { chunk, epoch }).is_err() {
+        if done_tx
+            .send(CarveDone {
+                chunk,
+                epoch,
+                islands,
+            })
+            .is_err()
+        {
             break; // main thread gone
         }
     }
@@ -1315,6 +1469,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DT.4 — the carve worker detects and extracts the islands its
+    /// batch disconnects: a beam severed by the carve sphere comes
+    /// back in `CarveDone::islands`, its voxels already air in the
+    /// returned (remipped) chunk, the supported root untouched.
+    #[test]
+    fn carve_worker_detects_and_extracts_islands() {
+        let mut g = Grid::new(GridTransform::identity());
+        // Pillar to bedrock + a long beam; the r=4 carve at x=16
+        // removes x ∈ [12, 20], leaving the tip x ∈ [21, 30] afloat.
+        g.set_rect(
+            IVec3::new(10, 10, 100),
+            IVec3::new(10, 10, 255),
+            Some(VoxColor(0x80B0_8040)),
+        );
+        g.set_rect(
+            IVec3::new(11, 10, 100),
+            IVec3::new(30, 10, 100),
+            Some(VoxColor(0x80B0_8040)),
+        );
+        let chunk = g.chunks.remove(&IVec3::ZERO).expect("chunk built");
+
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<CarveJob>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<CarveDone>();
+        thread::spawn(move || carve_worker_loop(&job_rx, &done_tx));
+        job_tx
+            .send(CarveJob {
+                chunk,
+                impacts: vec![IVec3::new(16, 10, 100)],
+                epoch: 0,
+                lights: Vec::new(),
+            })
+            .expect("worker alive");
+        let done = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("worker answers");
+        drop(job_tx);
+
+        assert_eq!(done.islands.len(), 1, "the severed tip is one island");
+        let isl = &done.islands[0];
+        assert_eq!(isl.voxels.len(), 10, "x ∈ [21, 30] at z=100");
+
+        let mut tmp = Grid::new(GridTransform::identity());
+        tmp.chunks.insert(IVec3::ZERO, done.chunk);
+        for &(v, _) in &isl.voxels {
+            assert!(!tmp.voxel_solid(v), "{v} extracted in the worker");
+        }
+        assert!(
+            tmp.voxel_solid(IVec3::new(11, 10, 100)),
+            "the supported beam root stays"
+        );
+    }
 
     /// `build_cave_scene` materialises chunk `(0, 0, 0)` and the spawn
     /// bubble leaves the camera spawn voxel as air.

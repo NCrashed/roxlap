@@ -136,7 +136,42 @@ stage** (DT.5) after the plain crumble loop works.
   the cap drops; the pre-strided list is ≤ cap so the inner stride
   resolves to 1 — byte-identical, equivalence + cap tests green);
   the audio half is explicitly owed by DT.4 (see its bullet).
-- DT.4 — cave-demo crumble: NOT STARTED
+- DT.4 — LANDED 2026-07-13 (visual pass owed, see below): the demo
+  crumbles. **Worker** (`carve_worker_loop`): after the batch's
+  carves, the chunk rides through a temporary identity `Grid`
+  (crystal `LightSrc`s converted back to `bake_lights`, so
+  `Island::extract`'s `BakeMode::PointLights` writes the same bytes
+  `relight_bbox` does — EV.4 parity); `detect_islands` per impact
+  (±FIRE_RADIUS bbox, engine-default budget), each island extracted
+  immediately (no duplicates across impacts), its bbox folded into
+  the batch `remip_bbox` — **hazard 3b closed where it was owed**.
+  `CarveDone` grew `islands`; `pump` returns `(chunk, islands)` and
+  accumulates across drained results. **Main thread**: after the
+  swap-in, `spawn_island(…, PointLights)` per island (its extract is
+  a no-op carve + cheap re-bake — the worker already did the real
+  one; the inside-geometry check runs against the live grid);
+  `tick_crumble` each frame = `debris.tick` → drain →
+  `voxel_debris(burst_sites, from = hit.pos)` with a bounce-and-fade
+  def whose radial kick scales with impact speed → **the DT.3 audio
+  half: every landing booms through the same occlusion-shaded
+  `impacts()` path as a bullet hit** → `particles.tick_with_scene`
+  → `compact_sprite_models` every 32 shatters. `ROXLAP_NO_CRUMBLE=1`
+  read once in the worker; budget false-negative documented in the
+  demo's module doc (hazard 6). Test:
+  `carve_worker_detects_and_extracts_islands` — a real worker thread
+  gets a pillar+beam chunk, one impact severs the beam, the tip
+  comes back as a 10-voxel island already extracted from the
+  returned chunk, the supported root intact. 4 demo tests green,
+  clippy 0 (default features; the `audio` feature build needs the
+  full dev shell's ALSA — pre-existing). **Owed: the user's visual
+  eyeball pass** — `cargo run --release -p roxlap-cave-demo` (CPU)
+  and `ROXLAP_GPU=1 …` (GPU): shoot the thin rock fins/arches near
+  the spawn bubble; the disconnected piece should detach as a
+  sprite, drop with a slow spin, and burst into rock-coloured
+  debris with a boom. Known v1 seams: debris bodies survive an
+  `R`/`F` regen (they keep falling in the new world — cosmetic);
+  crystal voxels in a fallen island render opaque, not glowing
+  (island models carry no material map — DT.5 territory).
 - DT.5 — per-material fracture patterns: NOT STARTED
 - DT.6 — docs: NOT STARTED
 
