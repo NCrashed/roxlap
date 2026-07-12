@@ -70,7 +70,7 @@ use roxlap_render::{
     SpriteModelId,
 };
 use roxlap_scene::cavegen::CaveChunkGenerator;
-use roxlap_scene::islands::{detect_islands, Island, DEFAULT_ISLAND_BUDGET};
+use roxlap_scene::islands::{detect_islands, FracturePattern, Island, DEFAULT_ISLAND_BUDGET};
 use roxlap_scene::{
     BakeLight, BakeMode, CharacterBody, CharacterDef, ChunkGenerator, Grid, GridId, GridTransform,
     MoveMode, Scene, Solidity, SpanOp, WalkInput, CHUNK_SIZE_XY,
@@ -904,6 +904,21 @@ impl ApplicationHandler for App {
             (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
             (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
         ]);
+        // DT.5 — per-material crumble: rock (material 0) breaks into
+        // rounded Voronoi lumps, crystal into sharp plates. The same
+        // colour map switches island models to material-mapped
+        // registration, so a falling crystal shard keeps its
+        // translucent+emissive material and glows on the way down.
+        self.debris.set_fracture_patterns(
+            &[
+                (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
+                (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
+            ],
+            &[
+                (0, FracturePattern::Chunks { cell: 6 }),
+                (CRYSTAL_MATERIAL_ID, FracturePattern::Shards { plates: 3 }),
+            ],
+        );
 
         self.window = Some(window);
         self.renderer = Some(renderer);

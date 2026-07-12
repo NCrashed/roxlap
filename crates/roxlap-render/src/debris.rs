@@ -22,9 +22,12 @@
 //! likewise not applied to the falling sprite's pose (v1 targets
 //! axis-aligned grids; the cave demo's is identity).
 
+use std::collections::HashMap;
+
 use glam::{DVec3, IVec3};
-use roxlap_scene::islands::Island;
-use roxlap_scene::{box_overlaps_solid, BakeMode, GridId, Rgb, Scene, Solidity};
+use roxlap_formats::material::material_for_color;
+use roxlap_scene::islands::{FracturePattern, Island};
+use roxlap_scene::{box_overlaps_solid, BakeMode, GridId, Rgb, Scene, Solidity, VoxColor};
 
 use crate::{DynSpriteTransform, SceneRenderer, SpriteInstanceId, SpriteModelId};
 
@@ -85,8 +88,11 @@ struct DebrisBody {
     inst: Option<SpriteInstanceId>,
     /// World position of the pivot (bbox centre).
     pos: DVec3,
-    /// Vertical speed, world units/s, +z (down).
-    vel: f64,
+    /// Velocity, world units/s, +z down. The vertical component
+    /// integrates gravity and collides; x/y is the DT.5 fracture
+    /// drift — fragments spread apart as they fall, with **no**
+    /// horizontal collision (v1: the collision march is vertical).
+    vel: DVec3,
     /// Cosmetic spin about the world vertical.
     yaw: f32,
     yaw_rate: f32,
@@ -113,6 +119,18 @@ pub struct DebrisSystem {
     /// What counts as solid ground (bedrock-placeholder policy) —
     /// the same knob [`box_overlaps_solid`] takes.
     pub solidity: Solidity,
+    /// DT.5 — outward drift a fracture fragment inherits, world
+    /// units/s (directed from the parent island's centre to the
+    /// fragment's; zero for unsplit islands).
+    pub fracture_impulse: f64,
+    /// DT.5 — the colour→material map (the host's terrain map).
+    /// Non-empty ⇒ island/fragment models register **with** it
+    /// ([`add_sprite_model_with_materials`](SceneRenderer::add_sprite_model_with_materials)),
+    /// so e.g. a fallen crystal keeps its translucent+emissive
+    /// material and glows on the way down.
+    material_map: Vec<(Rgb, u8)>,
+    /// DT.5 — material id → fracture pattern (unmapped = `Whole`).
+    patterns: HashMap<u8, FracturePattern>,
     bodies: Vec<DebrisBody>,
     impacts: Vec<DebrisImpact>,
     /// Handles of retired bodies awaiting facade removal in `sync`.
@@ -137,6 +155,9 @@ impl DebrisSystem {
             terminal_speed: 60.0,
             max_yaw_rate: 0.6,
             solidity: Solidity::default(),
+            fracture_impulse: 2.0,
+            material_map: Vec::new(),
+            patterns: HashMap::new(),
             bodies: Vec::new(),
             impacts: Vec::new(),
             dead: Vec::new(),
@@ -144,18 +165,39 @@ impl DebrisSystem {
         }
     }
 
+    /// DT.5 — install the fracture side tables: `colour_map` is the
+    /// host's colour→material terrain map (also switches island
+    /// models to material-mapped registration, so translucent /
+    /// emissive voxels keep their look in flight), `patterns` maps
+    /// material ids to [`FracturePattern`]s. An island splits **per
+    /// material group** before falling: its rock breaks per the rock
+    /// pattern, its crystal per the crystal pattern, each fragment its
+    /// own body with a small outward [`Self::fracture_impulse`].
+    /// Empty tables (the default) keep every island `Whole`.
+    pub fn set_fracture_patterns(
+        &mut self,
+        colour_map: &[(Rgb, u8)],
+        patterns: &[(u8, FracturePattern)],
+    ) {
+        self.material_map = colour_map.to_vec();
+        self.patterns = patterns.iter().copied().collect();
+    }
+
     /// Extract `island` from `grid` (via [`Island::extract`] — carve +
     /// `bake_bbox`; **mips are the caller's obligation**, same as any
-    /// edit) and register it as a falling body at the exact world pose
-    /// of the voxels it replaced. The sprite model/instance appear on
-    /// the next [`Self::sync`]. Returns `false` (and does nothing) for
-    /// a missing grid or an empty island.
+    /// edit), split it per the fracture tables (DT.5 —
+    /// [`Self::set_fracture_patterns`]; no tables ⇒ one piece), and
+    /// register each fragment as a falling body at the exact world
+    /// pose of the voxels it replaced, with an outward drift for
+    /// fragments of a split. Sprite models/instances appear on the
+    /// next [`Self::sync`]. Returns `false` (and does nothing) for a
+    /// missing grid or an empty island.
     ///
     /// **Spawn inside geometry** (an L-shaped island whose bbox wraps
-    /// a surviving support, a detach flush under a shelf): the body's
-    /// AABB already overlaps foreign solid, so it cannot fall — it is
-    /// queued as an **immediate [`DebrisImpact`] at zero speed** (the
-    /// shatter replaces it in place) and never becomes a body. An
+    /// a surviving support, a detach flush under a shelf): a
+    /// fragment's AABB already overlapping foreign solid cannot fall —
+    /// it is queued as an **immediate [`DebrisImpact`] at zero speed**
+    /// (the shatter replaces it in place) and never becomes a body. An
     /// explicit policy, not an accident of the contact search: the
     /// accepted degradation of AABB-only collision (decision 4).
     pub fn spawn_island(
@@ -173,34 +215,88 @@ impl DebrisSystem {
         };
         let transform = g.transform;
         island.extract(g, bake);
-        let pos = island.world_pivot(&transform);
-        let dims = (island.bbox.1 - island.bbox.0 + IVec3::ONE).as_dvec3();
+        let centre = island.world_pivot(&transform);
         let vws = transform.voxel_world_size;
-        #[allow(clippy::cast_possible_truncation)]
-        let body = DebrisBody {
-            yaw_rate: spin_from_pos(island.bbox.0, self.max_yaw_rate),
-            island,
-            grid,
-            model: None,
-            inst: None,
-            pos,
-            vel: 0.0,
-            yaw: 0.0,
-            half: dims * (vws * 0.5),
-            scale: vws as f32,
-        };
-        if aabb_hits_ground(scene, &body, body.pos.z, self.solidity) {
-            self.impacts.push(DebrisImpact {
-                island: body.island,
-                grid: body.grid,
-                pos: body.pos,
-                speed: 0.0,
-                voxel_world_size: vws,
-            });
-            return true;
+        for frag in self.fracture(island) {
+            let pos = frag.world_pivot(&transform);
+            // DT.5 — fragments drift apart: outward from the parent
+            // island's centre (zero for an unsplit island, whose pivot
+            // IS the centre).
+            let vel = (pos - centre).normalize_or_zero() * self.fracture_impulse;
+            let dims = (frag.bbox.1 - frag.bbox.0 + IVec3::ONE).as_dvec3();
+            #[allow(clippy::cast_possible_truncation)]
+            let body = DebrisBody {
+                yaw_rate: spin_from_pos(frag.bbox.0, self.max_yaw_rate),
+                island: frag,
+                grid,
+                model: None,
+                inst: None,
+                pos,
+                vel,
+                yaw: 0.0,
+                half: dims * (vws * 0.5),
+                scale: vws as f32,
+            };
+            if aabb_hits_ground(scene, &body, body.pos.z, self.solidity) {
+                self.impacts.push(DebrisImpact {
+                    island: body.island,
+                    grid: body.grid,
+                    pos: body.pos,
+                    speed: 0.0,
+                    voxel_world_size: vws,
+                });
+            } else {
+                self.bodies.push(body);
+            }
         }
-        self.bodies.push(body);
         true
+    }
+
+    /// DT.5 — split an island per the fracture tables: voxels group by
+    /// their material's pattern (first-seen order — deterministic),
+    /// each group splits with its pattern, seeded from the island's
+    /// position (stateless; replays bit-identical). Empty tables or
+    /// all-`Whole` materials return the island unsplit.
+    fn fracture(&self, island: Island) -> Vec<Island> {
+        if self.patterns.is_empty() {
+            return vec![island];
+        }
+        let mut order: Vec<FracturePattern> = Vec::new();
+        let mut groups: Vec<Vec<(IVec3, VoxColor)>> = Vec::new();
+        for &(v, c) in &island.voxels {
+            let mat = material_for_color(&self.material_map, c.0);
+            let pat = self
+                .patterns
+                .get(&mat)
+                .copied()
+                .unwrap_or(FracturePattern::Whole);
+            match order.iter().position(|&p| p == pat) {
+                Some(i) => groups[i].push((v, c)),
+                None => {
+                    order.push(pat);
+                    groups.push(vec![(v, c)]);
+                }
+            }
+        }
+        if order.len() == 1 && order[0] == FracturePattern::Whole {
+            return vec![island];
+        }
+        let seed = seed_from_pos(island.bbox.0);
+        let mut out = Vec::new();
+        for (i, (pat, voxels)) in order.into_iter().zip(groups).enumerate() {
+            let mut lo = IVec3::MAX;
+            let mut hi = IVec3::MIN;
+            for &(v, _) in &voxels {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            let sub = Island {
+                voxels,
+                bbox: (lo, hi),
+            };
+            out.extend(sub.split(pat, seed.wrapping_add(i as u64)));
+        }
+        out
     }
 
     /// Advance every body by `dt` seconds: semi-implicit Euler with
@@ -219,13 +315,17 @@ impl DebrisSystem {
         let mut i = 0;
         while i < self.bodies.len() {
             let b = &mut self.bodies[i];
-            b.vel = (b.vel + self.gravity * dt).min(self.terminal_speed);
+            b.vel.z = (b.vel.z + self.gravity * dt).min(self.terminal_speed);
             b.yaw += b.yaw_rate * dtf;
+            // DT.5 — horizontal fracture drift: integrated without
+            // collision (v1 — the collision march is vertical only).
+            b.pos.x += b.vel.x * dt;
+            b.pos.y += b.vel.y * dt;
             // Substep stride: half the overlap window of the box vs a
             // one-voxel plate (window = 2·half.z + vws), so consecutive
             // endpoint tests cannot straddle the thinnest obstacle.
             let stride = b.half.z + 0.5 * f64::from(b.scale);
-            let mut remaining = b.vel * dt;
+            let mut remaining = b.vel.z * dt;
             let mut blocked_at = None;
             while remaining > 0.0 {
                 let step = remaining.min(stride);
@@ -260,7 +360,7 @@ impl DebrisSystem {
                 island: body.island,
                 grid: body.grid,
                 pos: body.pos,
-                speed: body.vel,
+                speed: body.vel.length(),
                 voxel_world_size: f64::from(body.scale),
             });
         }
@@ -293,7 +393,14 @@ impl DebrisSystem {
             if let Some(inst) = b.inst {
                 self.move_scratch.push((inst, xf));
             } else {
-                let model = facade.add_model(&b.island.to_kv6());
+                // DT.5 — with a colour→material map installed, models
+                // register mapped: a crystal fragment keeps its
+                // translucent+emissive material and glows in flight.
+                let model = if self.material_map.is_empty() {
+                    facade.add_model(&b.island.to_kv6())
+                } else {
+                    facade.add_model_mapped(&b.island.to_kv6(), &self.material_map)
+                };
                 if let Some(inst) = facade.spawn(model, xf) {
                     b.model = Some(model);
                     b.inst = Some(inst);
@@ -336,6 +443,11 @@ impl DebrisSystem {
 /// window). The facade impl is pure forwarding.
 pub(crate) trait DebrisFacade {
     fn add_model(&mut self, kv6: &roxlap_formats::kv6::Kv6) -> SpriteModelId;
+    fn add_model_mapped(
+        &mut self,
+        kv6: &roxlap_formats::kv6::Kv6,
+        map: &[(Rgb, u8)],
+    ) -> SpriteModelId;
     fn remove_model(&mut self, id: SpriteModelId);
     fn spawn(&mut self, model: SpriteModelId, xf: DynSpriteTransform) -> Option<SpriteInstanceId>;
     fn despawn(&mut self, id: SpriteInstanceId);
@@ -345,6 +457,13 @@ pub(crate) trait DebrisFacade {
 impl DebrisFacade for SceneRenderer {
     fn add_model(&mut self, kv6: &roxlap_formats::kv6::Kv6) -> SpriteModelId {
         self.add_sprite_model(kv6)
+    }
+    fn add_model_mapped(
+        &mut self,
+        kv6: &roxlap_formats::kv6::Kv6,
+        map: &[(Rgb, u8)],
+    ) -> SpriteModelId {
+        self.add_sprite_model_with_materials(kv6, map)
     }
     fn remove_model(&mut self, id: SpriteModelId) {
         self.remove_sprite_model(id);
@@ -384,6 +503,15 @@ fn debris_xf(pos: DVec3, yaw: f32, k: f32) -> DynSpriteTransform {
         up: [-s, c, 0.0],
         forward: [0.0, 0.0, k],
     }
+}
+
+/// Deterministic fracture-split seed from the island's bbox-min voxel
+/// — stateless, so identical scenes fracture identically.
+#[allow(clippy::cast_sign_loss)]
+fn seed_from_pos(p: IVec3) -> u64 {
+    (p.x as u64).wrapping_mul(0x9E37_79B9)
+        ^ (p.y as u64).wrapping_mul(0x85EB_CA6B).rotate_left(21)
+        ^ (p.z as u64).wrapping_mul(0xC2B2_AE35).rotate_left(42)
 }
 
 /// Deterministic per-island spin rate in `[-max, max]`, hashed from
@@ -448,11 +576,11 @@ mod tests {
             "nothing to land on above bedrock yet"
         );
         assert!(
-            sys.bodies[0].vel <= sys.terminal_speed + 1e-9,
+            sys.bodies[0].vel.z <= sys.terminal_speed + 1e-9,
             "speed clamps at terminal"
         );
         // Long enough to have saturated.
-        assert!((sys.bodies[0].vel - sys.terminal_speed).abs() < 1e-9);
+        assert!((sys.bodies[0].vel.z - sys.terminal_speed).abs() < 1e-9);
     }
 
     /// With a floor below, the body lands flush on the voxel plane
@@ -634,6 +762,8 @@ mod tests {
     struct Mock {
         next: u32,
         models_added: usize,
+        /// Map lengths of `add_model_mapped` calls (DT.5).
+        mapped_adds: Vec<usize>,
         models_removed: Vec<SpriteModelId>,
         spawns: Vec<(SpriteModelId, DynSpriteTransform)>,
         despawns: Vec<SpriteInstanceId>,
@@ -643,6 +773,15 @@ mod tests {
     impl DebrisFacade for Mock {
         fn add_model(&mut self, _kv6: &roxlap_formats::kv6::Kv6) -> SpriteModelId {
             self.models_added += 1;
+            SpriteModelId::mint(0, self.next)
+        }
+        fn add_model_mapped(
+            &mut self,
+            _kv6: &roxlap_formats::kv6::Kv6,
+            map: &[(Rgb, u8)],
+        ) -> SpriteModelId {
+            self.models_added += 1;
+            self.mapped_adds.push(map.len());
             SpriteModelId::mint(0, self.next)
         }
         fn remove_model(&mut self, id: SpriteModelId) {
@@ -707,6 +846,100 @@ mod tests {
         assert!(f.batch_sizes.iter().all(|&n| n == 1));
         assert_eq!(f.despawns.len(), 1, "instance retired on impact");
         assert_eq!(f.models_removed.len(), 1, "model retired on impact");
+    }
+
+    /// DT.5 — a mixed rock+crystal island splits per material (rock →
+    /// `Chunks`, crystal → `Shards`), every fragment colour-pure per
+    /// its group, voxels conserved, fragments drifting outward, and —
+    /// with the colour map installed — every fragment model registers
+    /// **mapped** (the crystal keeps its emissive material in flight).
+    #[test]
+    fn fracture_splits_by_material_with_drift_and_mapped_models() {
+        const CRYSTAL: VoxColor = VoxColor(0x8030_C0E0);
+        const CRYSTAL_ID: u8 = 7;
+        let mut scene = Scene::new();
+        let grid = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(grid).expect("grid");
+        g.set_rect(IVec3::new(2, 5, 100), IVec3::new(2, 5, 255), Some(STONE));
+        for x in 3..=10 {
+            let c = if (6..=7).contains(&x) { CRYSTAL } else { STONE };
+            g.set_voxel(IVec3::new(x, 5, 100), Some(c));
+        }
+        g.set_voxel(IVec3::new(3, 5, 100), None);
+        let islands = detect_islands(g, IVec3::new(3, 5, 100), IVec3::new(3, 5, 100), 4096);
+        assert_eq!(
+            islands[0].voxels.len(),
+            7,
+            "x ∈ [4, 10]: 5 rock + 2 crystal"
+        );
+
+        let mut sys = DebrisSystem::new();
+        sys.set_fracture_patterns(
+            &[(CRYSTAL.rgb_part(), CRYSTAL_ID)],
+            &[
+                (0, FracturePattern::Chunks { cell: 2 }),
+                (CRYSTAL_ID, FracturePattern::Shards { plates: 2 }),
+            ],
+        );
+        assert!(sys.spawn_island(&mut scene, grid, islands[0].clone(), BakeMode::Directional));
+
+        assert!(sys.bodies.len() >= 2, "the island split into fragments");
+        let total: usize = sys.bodies.iter().map(|b| b.island.voxels.len()).sum();
+        assert_eq!(total, 7, "no voxel lost or duplicated by the split");
+        for b in &sys.bodies {
+            let crystal = b
+                .island
+                .voxels
+                .iter()
+                .filter(|&&(_, c)| c == CRYSTAL)
+                .count();
+            assert!(
+                crystal == 0 || crystal == b.island.voxels.len(),
+                "fragments are colour-pure per material group"
+            );
+        }
+        assert!(
+            sys.bodies
+                .iter()
+                .any(|b| b.vel.x.abs() + b.vel.y.abs() > 1e-9),
+            "fragments drift outward from the island centre"
+        );
+
+        // Same-scene determinism: an identical setup fragments identically.
+        let mut scene2 = Scene::new();
+        let grid2 = scene2.add_grid(GridTransform::identity());
+        let g2 = scene2.grid_mut(grid2).expect("grid");
+        g2.set_rect(IVec3::new(2, 5, 100), IVec3::new(2, 5, 255), Some(STONE));
+        for x in 4..=10 {
+            let c = if (6..=7).contains(&x) { CRYSTAL } else { STONE };
+            g2.set_voxel(IVec3::new(x, 5, 100), Some(c));
+        }
+        let islands2 = detect_islands(g2, IVec3::new(3, 5, 100), IVec3::new(3, 5, 100), 4096);
+        let mut sys2 = DebrisSystem::new();
+        sys2.set_fracture_patterns(
+            &[(CRYSTAL.rgb_part(), CRYSTAL_ID)],
+            &[
+                (0, FracturePattern::Chunks { cell: 2 }),
+                (CRYSTAL_ID, FracturePattern::Shards { plates: 2 }),
+            ],
+        );
+        assert!(sys2.spawn_island(
+            &mut scene2,
+            grid2,
+            islands2[0].clone(),
+            BakeMode::Directional
+        ));
+        assert_eq!(sys.bodies.len(), sys2.bodies.len(), "deterministic split");
+
+        // Mapped model registration through the facade seam.
+        let mut f = Mock::default();
+        sys.sync_with(&mut f);
+        assert_eq!(
+            f.mapped_adds.len(),
+            sys.bodies.len(),
+            "every fragment model registers with the colour→material map"
+        );
+        assert!(f.mapped_adds.iter().all(|&n| n == 1), "the map rode along");
     }
 
     /// DT.3 — the shatter path end-to-end: a two-colour island falls,

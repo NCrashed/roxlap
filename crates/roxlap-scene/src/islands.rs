@@ -131,6 +131,168 @@ impl Island {
     }
 }
 
+/// DT.5 — how a detached region breaks apart before it falls, keyed
+/// by material in a debris system's side table (deliberately NOT a
+/// `Material` field — the render palette stays render-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FracturePattern {
+    /// One piece — the default for unmapped materials.
+    Whole,
+    /// Rounded rubble (stone): jittered-Voronoi cells on a grid of
+    /// roughly `cell`-voxel spacing. `cell` is clamped to ≥ 2.
+    Chunks {
+        /// Approximate fragment edge length in voxels.
+        cell: u32,
+    },
+    /// Sharp plates (glass/crystal): the region sliced by 1–7
+    /// near-parallel planes of one random orientation into `plates`
+    /// slabs (clamped to `2..=8`), boundaries jittered.
+    Shards {
+        /// Number of plates to slice into.
+        plates: u32,
+    },
+}
+
+/// Tiny deterministic generator for the partitioners (SplitMix64) —
+/// keeps `split` reproducible from its explicit seed with no RNG
+/// state anywhere else.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    /// Uniform in `[0, 1)`.
+    #[allow(clippy::cast_precision_loss)]
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    /// Uniform integer in `[0, n)` (`n ≥ 1`).
+    #[allow(clippy::cast_possible_truncation)]
+    fn below(&mut self, n: u32) -> i32 {
+        (self.next() % u64::from(n.max(1))) as i32
+    }
+}
+
+impl Island {
+    /// DT.5 — partition this island into fragments per `pattern`: a
+    /// **disjoint cover** of the original voxels (colours ride along),
+    /// each fragment with a recomputed bbox, deterministic in
+    /// `(island, pattern, seed)`. [`FracturePattern::Whole`] returns
+    /// the island unsplit; degenerate cases (an island smaller than a
+    /// cell, all sites in one plate) collapse gracefully to fewer
+    /// fragments. A fragment may be internally disconnected (a
+    /// Voronoi cell straddling a concave gap) — it falls as one piece
+    /// (accepted v1 simplification).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    pub fn split(&self, pattern: FracturePattern, seed: u64) -> Vec<Island> {
+        let (lo, hi) = self.bbox;
+        let assign: Vec<usize> = match pattern {
+            FracturePattern::Whole => return vec![self.clone()],
+            FracturePattern::Chunks { cell } => {
+                let cell = i32::try_from(cell.max(2)).unwrap_or(i32::MAX);
+                let mut rng = SplitMix(seed ^ 0xC0C0);
+                // One jittered Voronoi site per cell-grid node over the
+                // bbox; every voxel joins its nearest site (ties → the
+                // lower site index, deterministic).
+                let dims = (hi - lo) / cell + IVec3::ONE;
+                let mut sites: Vec<IVec3> = Vec::new();
+                for gz in 0..dims.z {
+                    for gy in 0..dims.y {
+                        for gx in 0..dims.x {
+                            let base = lo + IVec3::new(gx, gy, gz) * cell;
+                            let jitter = IVec3::new(
+                                rng.below(cell as u32),
+                                rng.below(cell as u32),
+                                rng.below(cell as u32),
+                            );
+                            sites.push(base + jitter);
+                        }
+                    }
+                }
+                self.voxels
+                    .iter()
+                    .map(|&(v, _)| {
+                        let mut best = 0usize;
+                        let mut best_d = i64::MAX;
+                        for (i, s) in sites.iter().enumerate() {
+                            let d = (v - *s).as_i64vec3().length_squared();
+                            if d < best_d {
+                                best_d = d;
+                                best = i;
+                            }
+                        }
+                        best
+                    })
+                    .collect()
+            }
+            FracturePattern::Shards { plates } => {
+                let k = plates.clamp(2, 8);
+                let mut rng = SplitMix(seed ^ 0x5AAD);
+                // One random unit normal (uniform on the sphere), then
+                // k slabs over the projection range with jittered
+                // boundaries — near-parallel plates.
+                let z = 2.0 * rng.unit() - 1.0;
+                let phi = std::f64::consts::TAU * rng.unit();
+                let r = (1.0 - z * z).max(0.0).sqrt();
+                let n = glam::DVec3::new(r * phi.cos(), r * phi.sin(), z);
+                let projs: Vec<f64> = self
+                    .voxels
+                    .iter()
+                    .map(|&(v, _)| v.as_dvec3().dot(n))
+                    .collect();
+                let (mut pmin, mut pmax) = (f64::MAX, f64::MIN);
+                for &p in &projs {
+                    pmin = pmin.min(p);
+                    pmax = pmax.max(p);
+                }
+                let range = (pmax - pmin).max(1e-9);
+                let step = range / f64::from(k);
+                let bounds: Vec<f64> = (1..k)
+                    .map(|i| pmin + step * (f64::from(i) + 0.4 * (rng.unit() - 0.5)))
+                    .collect();
+                projs
+                    .iter()
+                    .map(|&p| bounds.iter().filter(|&&b| p >= b).count())
+                    .collect()
+            }
+        };
+        // Group by fragment id, preserving first-seen order (stable,
+        // deterministic), dropping empty cells/plates.
+        let mut order: Vec<usize> = Vec::new();
+        let mut groups: HashMap<usize, Vec<(IVec3, VoxColor)>> = HashMap::new();
+        for (i, &(v, c)) in self.voxels.iter().enumerate() {
+            let g = assign[i];
+            groups.entry(g).or_insert_with(|| {
+                order.push(g);
+                Vec::new()
+            });
+            groups.get_mut(&g).expect("just inserted").push((v, c));
+        }
+        order
+            .into_iter()
+            .map(|g| {
+                let voxels = groups.remove(&g).expect("grouped above");
+                let mut lo = IVec3::MAX;
+                let mut hi = IVec3::MIN;
+                for &(v, _) in &voxels {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+                Island {
+                    voxels,
+                    bbox: (lo, hi),
+                }
+            })
+            .collect()
+    }
+}
+
 /// One solid z-run of a column in **grid-local** z (chz stacking
 /// already applied), `[top, bot)` half-open, z-down. `anchored` marks
 /// the bedrock run that counts as support.
@@ -757,6 +919,118 @@ mod tests {
         let t = GridTransform::at_scale(DVec3::new(10.0, 20.0, 30.0), 2.0);
         assert_eq!(isl.world_origin(&t), DVec3::new(18.0, 24.0, 230.0));
         assert_eq!(isl.world_pivot(&t), DVec3::new(21.0, 25.0, 231.0));
+    }
+
+    // ---------- DT.5: fracture partitioners ----------
+
+    /// A hand-built solid box island for the partition tests.
+    fn box_island(dims: IVec3) -> Island {
+        let mut voxels = Vec::new();
+        for z in 0..dims.z {
+            for y in 0..dims.y {
+                for x in 0..dims.x {
+                    voxels.push((IVec3::new(x, y, z), STONE));
+                }
+            }
+        }
+        Island {
+            voxels,
+            bbox: (IVec3::ZERO, dims - IVec3::ONE),
+        }
+    }
+
+    /// The union of the fragments is exactly the original voxel set,
+    /// pairwise disjoint, with correct per-fragment bboxes.
+    fn assert_disjoint_cover(original: &Island, frags: &[Island]) {
+        let mut seen = std::collections::HashSet::new();
+        for f in frags {
+            let (mut lo, mut hi) = (IVec3::MAX, IVec3::MIN);
+            for &(v, _) in &f.voxels {
+                assert!(seen.insert(v), "voxel {v} appears in two fragments");
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            assert_eq!(f.bbox, (lo, hi), "fragment bbox recomputed");
+        }
+        assert_eq!(
+            seen.len(),
+            original.voxels.len(),
+            "fragments cover every original voxel"
+        );
+        for &(v, _) in &original.voxels {
+            assert!(seen.contains(&v));
+        }
+    }
+
+    /// `Chunks` yields several rounded cells forming a disjoint cover,
+    /// bit-identically for the same seed and differently-grouped for
+    /// another.
+    #[test]
+    fn chunks_split_is_disjoint_cover_and_deterministic() {
+        let isl = box_island(IVec3::new(12, 12, 6));
+        let frags = isl.split(FracturePattern::Chunks { cell: 4 }, 7);
+        assert!(frags.len() > 3, "a 12×12×6 box breaks into several cells");
+        assert_disjoint_cover(&isl, &frags);
+
+        let again = isl.split(FracturePattern::Chunks { cell: 4 }, 7);
+        assert_eq!(frags.len(), again.len());
+        for (a, b) in frags.iter().zip(&again) {
+            assert_eq!(a.voxels, b.voxels, "same seed ⇒ bit-identical split");
+        }
+    }
+
+    /// `Shards` slices into the requested number of roughly-equal
+    /// plates; each plate is thin along some direction (the slicing
+    /// normal — found here by sampling), unlike the island itself.
+    #[test]
+    fn shards_split_into_planar_plates() {
+        let isl = box_island(IVec3::new(12, 12, 12));
+        let frags = isl.split(FracturePattern::Shards { plates: 3 }, 11);
+        assert_eq!(frags.len(), 3, "three plates from a solid cube");
+        assert_disjoint_cover(&isl, &frags);
+        let total = isl.voxels.len() as f64;
+        for f in &frags {
+            let share = f.voxels.len() as f64 / total;
+            assert!(
+                (0.15..=0.55).contains(&share),
+                "roughly equal plates (share {share:.2})"
+            );
+            // Planarity metric: over sampled directions, the plate's
+            // thinnest extent is well under the cube's 12-voxel edge —
+            // a compact (non-planar) third of the cube could not be.
+            let mut best = f64::MAX;
+            let mut rng = SplitMix(99);
+            for _ in 0..256 {
+                let z = 2.0 * rng.unit() - 1.0;
+                let phi = std::f64::consts::TAU * rng.unit();
+                let r = (1.0 - z * z).max(0.0).sqrt();
+                let d = glam::DVec3::new(r * phi.cos(), r * phi.sin(), z);
+                let (mut pmin, mut pmax) = (f64::MAX, f64::MIN);
+                for &(v, _) in &f.voxels {
+                    let p = v.as_dvec3().dot(d);
+                    pmin = pmin.min(p);
+                    pmax = pmax.max(p);
+                }
+                best = best.min(pmax - pmin);
+            }
+            assert!(
+                best < 7.0,
+                "each plate is thin along the slicing normal (got {best:.2})"
+            );
+        }
+    }
+
+    /// `Whole` and degenerate inputs pass through unchanged.
+    #[test]
+    fn whole_and_degenerate_splits_pass_through() {
+        let isl = box_island(IVec3::new(3, 2, 1));
+        let whole = isl.split(FracturePattern::Whole, 1);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].voxels, isl.voxels);
+        // A cell far larger than the island ⇒ one fragment.
+        let coarse = isl.split(FracturePattern::Chunks { cell: 64 }, 1);
+        assert_eq!(coarse.len(), 1);
+        assert_disjoint_cover(&isl, &coarse);
     }
 
     /// Property test: on a randomised scene, `detect_islands` over the

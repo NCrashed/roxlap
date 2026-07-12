@@ -178,8 +178,38 @@ stage** (DT.5) after the plain crumble loop works.
   debris with a boom. Known v1 seams: debris bodies survive an
   `R`/`F` regen (they keep falling in the new world — cosmetic);
   crystal voxels in a fallen island render opaque, not glowing
-  (island models carry no material map — DT.5 territory).
-- DT.5 — per-material fracture patterns: NOT STARTED
+  (island models carry no material map — CLOSED by DT.5: mapped
+  model registration).
+- DT.5 — LANDED 2026-07-13: per-material fracture. **Engine:**
+  `FracturePattern { Whole | Chunks { cell } | Shards { plates } }`
+  + `Island::split(pattern, seed)` in `islands.rs` (pure, SplitMix64
+  from the explicit seed — deterministic): `Chunks` = jittered-
+  Voronoi sites on a `cell`-spaced grid over the bbox, nearest-site
+  assignment (ties → lower index); `Shards` = one random unit normal,
+  `plates` slabs with jittered boundaries. Disjoint-cover guaranteed;
+  a fragment may be internally disconnected (accepted, documented).
+  **DebrisSystem:** `set_fracture_patterns(colour_map, patterns)` —
+  the side table exactly as locked (decision 6); `spawn_island` now
+  extracts once, groups voxels by their material's pattern
+  (first-seen order), splits each group (seed hashed from the island
+  position), and spawns every fragment with an outward
+  `fracture_impulse` (default 2 u/s, from the parent centre); bodies
+  carry `DVec3` velocity — horizontal drift integrates WITHOUT
+  collision (v1, documented). With the colour map installed, models
+  register via `add_sprite_model_with_materials` — **a fallen
+  crystal keeps its translucent+emissive material and glows in
+  flight, closing DT.4's v1 seam**. **Demo:** rock (material 0) →
+  `Chunks { cell: 6 }`, crystal → `Shards { plates: 3 }`, same
+  colour map as the terrain pass. Tests: partition disjoint-cover +
+  bit-determinism (`Chunks`), planarity metric via sampled-direction
+  thinness (`Shards`), Whole/degenerate pass-through, and the
+  debris-side integration (mixed rock+crystal island → colour-pure
+  fragments, voxels conserved, outward drift, deterministic across
+  identical scenes, mapped model registration through the mock
+  seam). 233 scene + 88 render + 5 demo tests green, clippy + fmt
+  clean. Visual delta for the eyeball pass: rock overhangs now break
+  into several tumbling lumps that spread apart; crystals shatter
+  into glowing plates.
 - DT.6 — docs: NOT STARTED
 
 ## Goal
