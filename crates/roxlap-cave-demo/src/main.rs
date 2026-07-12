@@ -28,7 +28,13 @@
 //!   lands. By design, a detached region bigger than the detection
 //!   budget (~4096 voxels) stays put — shooting the single support out
 //!   from under a whole gallery will NOT drop the gallery.
-//!   `ROXLAP_NO_CRUMBLE=1` restores plain carves.
+//!   `ROXLAP_NO_CRUMBLE=1` restores plain carves (the `ROXLAP_GPU`
+//!   convention: unset, empty or `0` keep crumble ON; any other value
+//!   disables it). Known v1 seams: falling debris survives an `R`/`F`
+//!   regeneration (it keeps falling in the new world), and a fallen
+//!   island's crystal voxels render opaque — the island model carries
+//!   no material map, so the glow returns with DT.5's per-material
+//!   shards.
 //! - `F` → toggle blue ↔ mag cave preset (regenerates the world).
 //! - `R` → regenerate the world with the next seed (preset preserved).
 //! - `Esc` → release cursor (or exit if already released).
@@ -1520,6 +1526,57 @@ mod tests {
             tmp.voxel_solid(IVec3::new(11, 10, 100)),
             "the supported beam root stays"
         );
+    }
+
+    /// Two impacts in one batch whose detection windows both see the
+    /// same severed piece yield exactly ONE island — the
+    /// immediate-extract invariant (each island is carved out of the
+    /// worker chunk before the next impact's flood runs), which is
+    /// what prevents duplicate falling sprites when shots queue up.
+    /// Breaks silently if extraction ever moves after the detect loop.
+    #[test]
+    fn carve_worker_batch_dedups_islands() {
+        let mut g = Grid::new(GridTransform::identity());
+        // Two supported pillars bridged by a beam; the two r=4 carves
+        // at x=15 and x=26 remove x ∈ [11, 19] ∪ [22, 30], leaving the
+        // 2-voxel mid-piece x ∈ [20, 21] afloat — inside BOTH impacts'
+        // padded detection windows (±FIRE_RADIUS ± 1).
+        for x in [10, 31] {
+            g.set_rect(
+                IVec3::new(x, 10, 100),
+                IVec3::new(x, 10, 255),
+                Some(VoxColor(0x80B0_8040)),
+            );
+        }
+        g.set_rect(
+            IVec3::new(11, 10, 100),
+            IVec3::new(30, 10, 100),
+            Some(VoxColor(0x80B0_8040)),
+        );
+        let chunk = g.chunks.remove(&IVec3::ZERO).expect("chunk built");
+
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<CarveJob>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<CarveDone>();
+        thread::spawn(move || carve_worker_loop(&job_rx, &done_tx));
+        job_tx
+            .send(CarveJob {
+                chunk,
+                impacts: vec![IVec3::new(15, 10, 100), IVec3::new(26, 10, 100)],
+                epoch: 0,
+                lights: Vec::new(),
+            })
+            .expect("worker alive");
+        let done = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("worker answers");
+        drop(job_tx);
+
+        assert_eq!(
+            done.islands.len(),
+            1,
+            "one severed piece, one island — no duplicate from the second window"
+        );
+        assert_eq!(done.islands[0].voxels.len(), 2, "x ∈ [20, 21] at z=100");
     }
 
     /// `build_cave_scene` materialises chunk `(0, 0, 0)` and the spawn

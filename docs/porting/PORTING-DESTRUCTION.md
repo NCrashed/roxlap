@@ -161,9 +161,16 @@ stage** (DT.5) after the plain crumble loop works.
   `carve_worker_detects_and_extracts_islands` — a real worker thread
   gets a pillar+beam chunk, one impact severs the beam, the tip
   comes back as a 10-voxel island already extracted from the
-  returned chunk, the supported root intact. 4 demo tests green,
-  clippy 0 (default features; the `audio` feature build needs the
-  full dev shell's ALSA — pre-existing). **Owed: the user's visual
+  returned chunk, the supported root intact;
+  `carve_worker_batch_dedups_islands` (maintainer review) pins the
+  immediate-extract invariant — two impacts in one batch whose
+  padded windows both see the same severed mid-piece yield exactly
+  ONE island (breaks silently if extraction ever moves after the
+  detect loop). 5 demo tests green, clippy 0 (default features; the
+  `audio` feature build needs the full dev shell's ALSA —
+  pre-existing). The demo module doc records the
+  `ROXLAP_NO_CRUMBLE` tri-state (`ROXLAP_GPU` convention: unset /
+  empty / `0` = crumble ON) and both v1 seams. **Owed: the user's visual
   eyeball pass** — `cargo run --release -p roxlap-cave-demo` (CPU)
   and `ROXLAP_GPU=1 …` (GPU): shoot the thin rock fins/arches near
   the spawn bubble; the disconnected piece should detach as a
