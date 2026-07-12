@@ -191,28 +191,36 @@ impl Island {
     #[must_use]
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     pub fn split(&self, pattern: FracturePattern, seed: u64) -> Vec<Island> {
-        let (lo, hi) = self.bbox;
         let assign: Vec<usize> = match pattern {
             FracturePattern::Whole => return vec![self.clone()],
             FracturePattern::Chunks { cell } => {
                 let cell = i32::try_from(cell.max(2)).unwrap_or(i32::MAX);
                 let mut rng = SplitMix(seed ^ 0xC0C0);
-                // One jittered Voronoi site per cell-grid node over the
-                // bbox; every voxel joins its nearest site (ties → the
-                // lower site index, deterministic).
-                let dims = (hi - lo) / cell + IVec3::ONE;
+                // One jittered Voronoi site per **occupied** cell
+                // (keyed by the voxel's cell coordinate, first-seen
+                // order — deterministic): cost scales with the island,
+                // O(voxels × occupied cells), never with its bbox
+                // volume — a long sparse island (a shot-off diagonal
+                // vein) has a huge bbox but few occupied cells, and a
+                // bbox-grid of sites would OOM on it (maintainer
+                // review). Every voxel joins its nearest site (ties →
+                // the lower site index).
+                let mut cell_site: HashMap<IVec3, usize> = HashMap::new();
                 let mut sites: Vec<IVec3> = Vec::new();
-                for gz in 0..dims.z {
-                    for gy in 0..dims.y {
-                        for gx in 0..dims.x {
-                            let base = lo + IVec3::new(gx, gy, gz) * cell;
-                            let jitter = IVec3::new(
-                                rng.below(cell as u32),
-                                rng.below(cell as u32),
-                                rng.below(cell as u32),
-                            );
-                            sites.push(base + jitter);
-                        }
+                for &(v, _) in &self.voxels {
+                    let cc = IVec3::new(
+                        v.x.div_euclid(cell),
+                        v.y.div_euclid(cell),
+                        v.z.div_euclid(cell),
+                    );
+                    if let std::collections::hash_map::Entry::Vacant(e) = cell_site.entry(cc) {
+                        let jitter = IVec3::new(
+                            rng.below(cell as u32),
+                            rng.below(cell as u32),
+                            rng.below(cell as u32),
+                        );
+                        e.insert(sites.len());
+                        sites.push(cc * cell + jitter);
                     }
                 }
                 self.voxels
@@ -1018,6 +1026,25 @@ mod tests {
                 "each plate is thin along the slicing normal (got {best:.2})"
             );
         }
+    }
+
+    /// A long sparse diagonal island (huge bbox, few voxels) splits
+    /// in time and memory proportional to the ISLAND, not its bbox —
+    /// the bbox-grid site placement this replaces would have built
+    /// millions of sites here (maintainer review, DT.5).
+    #[test]
+    fn chunks_split_scales_with_island_not_bbox() {
+        let n = 200;
+        let voxels: Vec<(IVec3, VoxColor)> = (0..n)
+            .map(|i| (IVec3::new(i, i, i.rem_euclid(256)), STONE))
+            .collect();
+        let isl = Island {
+            bbox: (IVec3::ZERO, IVec3::new(n - 1, n - 1, 199)),
+            voxels,
+        };
+        let frags = isl.split(FracturePattern::Chunks { cell: 2 }, 3);
+        assert!(frags.len() > 10, "a diagonal snake breaks into many bits");
+        assert_disjoint_cover(&isl, &frags);
     }
 
     /// `Whole` and degenerate inputs pass through unchanged.

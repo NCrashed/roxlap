@@ -209,7 +209,20 @@ stage** (DT.5) after the plain crumble loop works.
   seam). 233 scene + 88 render + 5 demo tests green, clippy + fmt
   clean. Visual delta for the eyeball pass: rock overhangs now break
   into several tumbling lumps that spread apart; crystals shatter
-  into glowing plates.
+  into glowing plates. Maintainer-review fixes (2026-07-13):
+  **`Chunks` sites are per-occupied-cell**, not per-bbox-grid-node —
+  the bbox-volume placement would OOM on a long sparse island (a
+  4096-voxel diagonal vein has a ~10³-per-axis bbox); cost is now
+  O(voxels × occupied cells), pinned by a diagonal-snake test.
+  **Upward fracture kicks integrate** (ballistic, collision-free,
+  like the x/y drift) instead of stalling the body until gravity
+  flips the sign; pinned. **Drift-into-wall = mid-air shatter** is
+  documented on `update` as the same accepted degenerate-search
+  mechanism as spawn-inside-geometry. Grouping-by-pattern (two
+  materials sharing a pattern split as one group, fragments may mix
+  colours) documented as intentional on `fracture`. Demo:
+  `CRYSTAL_RADIUS` 2 → 3 so a crystal has enough voxels for its
+  `Shards` structure to read (user's visual-pass note).
 - DT.6 — docs: NOT STARTED
 
 ## Goal

@@ -178,7 +178,10 @@ const CRYSTAL_MATERIAL_ID: u8 = 1;
 /// Crystal clusters planted per world (re)build.
 const CRYSTAL_COUNT: usize = 16;
 /// Crystal blob radius in voxels ([`roxlap_scene::Grid::set_sphere`]).
-const CRYSTAL_RADIUS: u32 = 2;
+/// DT.5 bumped 2 → 3 (~33 → ~123 voxels): a `Shards { plates: 3 }`
+/// split needs enough voxels per plate for the fracture structure to
+/// read when a crystal crumbles (visual-pass note).
+const CRYSTAL_RADIUS: u32 = 3;
 /// Hard cutoff of a crystal's baked glow pool, voxels.
 const CRYSTAL_LIGHT_RADIUS: f32 = 32.0;
 /// Voxlap brightness scale of a crystal's glow (byte gain ≈

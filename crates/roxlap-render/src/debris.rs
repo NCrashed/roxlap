@@ -253,10 +253,13 @@ impl DebrisSystem {
     }
 
     /// DT.5 — split an island per the fracture tables: voxels group by
-    /// their material's pattern (first-seen order — deterministic),
-    /// each group splits with its pattern, seeded from the island's
-    /// position (stateless; replays bit-identical). Empty tables or
-    /// all-`Whole` materials return the island unsplit.
+    /// their material's **pattern** (first-seen order — deterministic;
+    /// two materials sharing a pattern split as ONE group, so their
+    /// fragments may mix colours — intentional: the pattern describes
+    /// how matter breaks, not what it looks like), each group splits
+    /// with its pattern, seeded from the island's position (stateless;
+    /// replays bit-identical). Empty tables or all-`Whole` materials
+    /// return the island unsplit.
     fn fracture(&self, island: Island) -> Vec<Island> {
         if self.patterns.is_empty() {
             return vec![island];
@@ -309,6 +312,12 @@ impl DebrisSystem {
     /// included). A blocked substep is binary-searched to flush
     /// contact; the body retires as a [`DebrisImpact`]. Pure
     /// simulation — no facade calls (see [`Self::sync`]).
+    ///
+    /// A body whose horizontal drift carries it into a wall finds
+    /// every vertical probe blocked: the contact search degenerates to
+    /// its current position and it **shatters mid-air against the
+    /// wall** — the same accepted mechanism as the
+    /// spawn-inside-geometry policy on [`Self::spawn_island`].
     #[allow(clippy::cast_possible_truncation)]
     pub fn update(&mut self, scene: &Scene, dt: f64) {
         let dtf = dt as f32;
@@ -326,6 +335,16 @@ impl DebrisSystem {
             // endpoint tests cannot straddle the thinnest obstacle.
             let stride = b.half.z + 0.5 * f64::from(b.scale);
             let mut remaining = b.vel.z * dt;
+            // An upward fracture kick (a fragment above the parent's
+            // centre) integrates ballistically, collision-free —
+            // mirroring the x/y drift; gravity flips it within a
+            // beat. Without this the body would hang mid-air until
+            // the sign change (maintainer review).
+            if remaining < 0.0 {
+                b.pos.z += remaining;
+                i += 1;
+                continue;
+            }
             let mut blocked_at = None;
             while remaining > 0.0 {
                 let step = remaining.min(stride);
@@ -940,6 +959,27 @@ mod tests {
             "every fragment model registers with the colour→material map"
         );
         assert!(f.mapped_adds.iter().all(|&n| n == 1), "the map rode along");
+    }
+
+    /// An upward fracture kick integrates (ballistic, collision-free)
+    /// instead of hanging the body until gravity flips the sign: z
+    /// decreases while the kick lasts, then falling resumes.
+    #[test]
+    fn upward_kick_rises_then_falls() {
+        let (mut scene, grid, island) = scene_with_island();
+        let mut sys = DebrisSystem::new();
+        assert!(sys.spawn_island(&mut scene, grid, island, BakeMode::Directional));
+        let start = sys.bodies[0].pos.z;
+        sys.bodies[0].vel.z = -10.0; // upward (z-down world)
+        sys.update(&scene, 1.0 / 60.0);
+        assert!(
+            sys.bodies[0].pos.z < start,
+            "an upward kick moves the body up, not into a stall"
+        );
+        for _ in 0..120 {
+            sys.update(&scene, 1.0 / 60.0);
+        }
+        assert!(sys.bodies[0].pos.z > start, "gravity wins and it falls");
     }
 
     /// DT.3 — the shatter path end-to-end: a two-colour island falls,
