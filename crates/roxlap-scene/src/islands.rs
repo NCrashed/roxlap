@@ -7,10 +7,13 @@
 //! BFS node (chunk-format-native, no dense decode), 6-connected,
 //! seeded from every run touching the carved bbox (±1 pad). A
 //! component that reaches a **bedrock-anchored** run (the final run of
-//! a column in a chunk with no chunk below it — the `.vxl` format
-//! extends it to the column bottom) or grows past `budget` voxels is
-//! supported and abandoned early; only components that exhaust under
-//! budget without finding support come back as [`Island`]s.
+//! any materialised chunk's column: the `.vxl` format extends it to
+//! the column bottom, and its bottom voxel at local z=255 is
+//! uncarvable — `delslab` clamps below `MAXZDIM` — so a component
+//! containing it can never physically fall, chz stacks included) or
+//! grows past `budget` voxels is supported and abandoned early; only
+//! components that exhaust under budget without finding support come
+//! back as [`Island`]s.
 //!
 //! Cost per call ≈ O(Σ min(component size, budget)) over the distinct
 //! components touching the bbox. False negatives are by design: a
@@ -148,8 +151,12 @@ impl<'a> Flood<'a> {
     /// The arena range of grid-local column `(x, y)`, decoding it on
     /// first touch: each present chunk in the chz stack contributes
     /// its runs offset by `chz * CHUNK_SIZE_Z`; runs meeting exactly
-    /// at a chunk border merge; the final run of a chunk with **no
-    /// chunk below it** is the bedrock anchor (support). Split field
+    /// at a chunk border merge; **every** chunk's final run is a
+    /// bedrock anchor — its local z=255 voxel is format-pinned
+    /// (uncarvable), so even on chz stacks a component containing it
+    /// cannot fall. (Gating the anchor on "no chunk below" was wrong:
+    /// it let the placeholder-bedrock sheet of an upper chunk flood
+    /// into components as 128×128 phantom voxels.) Split field
     /// borrows keep the whole decode allocation-free (arena append).
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn column_range(&mut self, x: i32, y: i32) -> (u32, u32) {
@@ -170,7 +177,7 @@ impl<'a> Flood<'a> {
         let lx = x.rem_euclid(CHUNK_SIZE_XY as i32) as u32;
         let ly = y.rem_euclid(CHUNK_SIZE_XY as i32) as u32;
         let stack: &[i32] = stacks.get(&(chx, chy)).map_or(&[], Vec::as_slice);
-        for (i, &chz) in stack.iter().enumerate() {
+        for &chz in stack {
             let idx = IVec3::new(chx, chy, chz);
             let vxl = match *last_chunk {
                 Some((c, v)) if c == idx => v,
@@ -182,10 +189,9 @@ impl<'a> Flood<'a> {
             };
             let Some(vxl) = vxl else { continue };
             let base = chz * CHUNK_SIZE_Z as i32;
-            let below_present = stack.get(i + 1) == Some(&(chz + 1));
             chunk_column_runs(vxl, lx, ly, |top, bot, is_final| {
                 let (top_g, bot_g) = (base + top, base + bot);
-                let anchored = is_final && !below_present;
+                let anchored = is_final;
                 if runs.len() > start {
                     if let Some(last) = runs.last_mut() {
                         if last.bot == top_g {
@@ -454,23 +460,53 @@ mod tests {
         );
     }
 
-    /// Two separate islands from one carve come back as two islands.
+    /// Two separate islands from one carve come back as two islands:
+    /// both beams hang on a single keystone voxel atop the pillar;
+    /// carving it detaches each side independently.
     #[test]
     fn two_islands_from_one_carve() {
         let mut g = grid();
         pillar(&mut g, 5, 5, 101);
-        // Two beams off the same pillar, along +x and −x.
+        // The keystone both beams connect through, sitting on the pillar.
+        g.set_voxel(IVec3::new(5, 5, 100), Some(STONE));
+        // Two beams off the keystone, along +x and −x.
         g.set_rect(IVec3::new(6, 5, 100), IVec3::new(8, 5, 100), Some(STONE));
         g.set_rect(IVec3::new(2, 5, 100), IVec3::new(4, 5, 100), Some(STONE));
-        // The pillar top holds both; carve it out.
+
+        // With the keystone in place everything is supported.
+        assert!(detect_islands(&g, IVec3::new(5, 5, 100), IVec3::new(5, 5, 100), 4096).is_empty());
+
+        // Carve the keystone: each beam floats on its own.
         g.set_voxel(IVec3::new(5, 5, 100), None);
-        g.set_voxel(IVec3::new(5, 5, 101), None);
-        // (both beams hung on (5,5,100); with it gone each side floats)
-        let islands = detect_islands(&g, IVec3::new(5, 5, 100), IVec3::new(5, 5, 101), 4096);
+        let islands = detect_islands(&g, IVec3::new(5, 5, 100), IVec3::new(5, 5, 100), 4096);
         assert_eq!(islands.len(), 2);
         let mut sizes: Vec<usize> = islands.iter().map(|i| i.voxels.len()).collect();
         sizes.sort_unstable();
         assert_eq!(sizes, vec![3, 3]);
+    }
+
+    /// A pillar through the chz = 0/1 chunk border: every chunk's
+    /// local z=255 is format-pinned placeholder bedrock (`delslab`
+    /// clamps below `MAXZDIM`, so it is uncarvable — a component
+    /// containing it can never fall). A cut below the border must
+    /// detach exactly the segment under the cut — not report the
+    /// pinned upper segment, and not flood the upper chunk's 128×128
+    /// bedrock sheet into a phantom mega-island.
+    #[test]
+    fn stacked_chz_bedrock_is_anchored() {
+        let mut g = grid();
+        // Column (5,5), z ∈ [200, 400] — crosses the border at z=256
+        // and merges with chunk 0's pinned bedrock at z=255 on the way.
+        g.set_rect(IVec3::new(5, 5, 200), IVec3::new(5, 5, 400), Some(STONE));
+
+        g.set_voxel(IVec3::new(5, 5, 300), None);
+        let islands = detect_islands(&g, IVec3::new(5, 5, 300), IVec3::new(5, 5, 300), 100_000);
+        assert_eq!(islands.len(), 1, "only the under-cut segment falls");
+        assert_eq!(islands[0].voxels.len(), 100, "z ∈ [301, 400]");
+        assert_eq!(
+            islands[0].bbox,
+            (IVec3::new(5, 5, 301), IVec3::new(5, 5, 400))
+        );
     }
 
     /// Manual perf probe (house-style, `--ignored --nocapture`): the

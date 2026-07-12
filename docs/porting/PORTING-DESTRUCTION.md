@@ -20,18 +20,32 @@ stage** (DT.5) after the plain crumble loop works.
   (+ `DEFAULT_ISLAND_BUDGET = 4096`), re-exported at the crate root.
   Budgeted span-BFS exactly as locked (decision 2): runs decode
   straight off the slab chain (mirror of the `vxl_voxel_solid` walk),
-  chz stacks merge at chunk borders, support = final run of a chunk
-  with no chunk below. Perf shape that landed: per-call **arena**
-  (one shared `runs` + parallel `visited: Vec<u32>` keyed by
-  `(start, len)` ranges — no per-column allocations), a
-  multiply-mix column-key hasher (SipHash dominated the probe-heavy
-  plate case), and a one-entry `Grid::chunk` cache. Probe
-  (`--ignored`, release): supported-exit on a 100×100 plate
-  **294 µs** (gate < 0.5 ms), 63-voxel beam detach **14 µs**. Tests:
-  beam tip / arch both-legs / cross-chunk-border / budget-exceeded /
-  carve-in-air / two-islands-one-carve / dense-oracle property test
-  (exact agreement on a randomised scene) — 8 total, all green;
-  clippy + fmt clean.
+  chz stacks merge at chunk borders, support = **every** chunk's
+  final run, unconditionally. The first cut gated the anchor on "no
+  chunk below" — a maintainer review caught that as a phantom-island
+  bug on chz stacks: every materialised chunk's local z=255 is
+  format-pinned placeholder bedrock (`delslab` clamps below
+  `MAXZDIM`, uncarvable ⇒ a component containing it can never fall),
+  and the ungated version let an upper chunk's 128×128 bedrock sheet
+  flood into components (silent budget-suppression with the default
+  budget, an unextractable mega-island with a raised one). Pinned by
+  `stacked_chz_bedrock_is_anchored` (pillar through the chz border,
+  cut below it). Perf shape that landed: per-call **arena** (one
+  shared `runs` + parallel `visited: Vec<u32>` keyed by `(start,
+  len)` ranges — no per-column allocations), a multiply-mix
+  column-key hasher (SipHash dominated the probe-heavy plate case),
+  and a one-entry `Grid::chunk` cache. Probe (`--ignored`, release):
+  supported-exit on a 100×100 plate **~0.3 ms** (gate < 0.5 ms),
+  63-voxel beam detach **~14 µs**. Tests: beam tip / arch both-legs /
+  cross-chunk-border / stacked-chz bedrock anchor /
+  budget-exceeded / carve-in-air / two-islands-one-carve (keystone) /
+  dense-oracle property test (exact agreement on a randomised scene)
+  — 9 total, all green; clippy + fmt clean. Known-fine notes: the
+  neighbour scan is linear over a column's runs (binary search over
+  the z-sorted list is the fix if riddled cavern columns ever show up
+  in the probe), and `Flood::new` does one pass over `Grid::chunks`
+  keys (scales with world size, not carve size — microseconds at
+  current grid sizes).
 - DT.1 — island extraction → sprite: NOT STARTED
 - DT.2 — DebrisSystem (falling + collision): NOT STARTED
 - DT.3 — impact shatter + audio: NOT STARTED
@@ -107,7 +121,10 @@ Three user-visible things:
    RLE spans directly (a run is one BFS node — chunk-format-native,
    no dense decode): seeds are the solid runs 6-adjacent to the
    carved bbox; each seed component flood-fills with 6-connectivity;
-   a component that **touches a bedrock-anchored bottom run** or
+   a component that **touches a bedrock-anchored run** (the final run
+   of ANY materialised chunk's column — its local z=255 voxel is
+   format-pinned and uncarvable, so the component can never fall;
+   this holds on chz stacks too, see the DT.0 status note) or
    **exceeds `budget` voxels** is supported (abort early, cheap);
    only components that exhaust under budget without support are
    islands. Cost per carve ≈ O(Σ min(component, budget)). False
