@@ -223,7 +223,25 @@ stage** (DT.5) after the plain crumble loop works.
   colours) documented as intentional on `fracture`. Demo:
   `CRYSTAL_RADIUS` 2 → 3 so a crystal has enough voxels for its
   `Shards` structure to read (user's visual-pass note).
-- DT.6 — docs: NOT STARTED
+- DT.6 — LANDED 2026-07-13 — **STAGE COMPLETE** (DT.4 visual pass
+  passed by the user; a quick look at DT.5's visual delta — spreading
+  lumps, bigger glowing crystal plates — can ride the next session).
+  Book: new **Destruction** chapter (chapter 10, after Audio) built on
+  the windowless `book_destruction` example
+  (`roxlap-render/examples/`, anchors `scene`/`detect`/`spawn`/`tick`:
+  a stone cantilever loses its beam — detect → fracture → fall →
+  shatter, printing each stage; runs anywhere, no renderer);
+  demo-tour's cave paragraph mentions the crumble;
+  `check-anchors.sh` green — inserting the chapter renumbered five
+  cross-references (demo-tour ×3, sprites ×2), all caught by the
+  gate and fixed. CHANGELOG: the DT stage under [Unreleased]
+  (islands + DebrisSystem + voxel_debris + cave-demo crumble).
+  Suites at close: 234 scene + 89 render + 5 demo, clippy 0.
+  Maintainer-review follow-up (2026-07-13): the demo-tour env-var
+  table's own "re-verify at stage closes" checklist executed —
+  `ROXLAP_NO_CRUMBLE` row added (the full `ROXLAP_*` grep found no
+  other gaps: `ROXLAP_SAVE_VXL` is a doc-comment-only oracle-test
+  knob, not a demo variable).
 
 ## Goal
 

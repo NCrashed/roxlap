@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: voxel destruction — floating-island crumble (DT stage)
+
+- The signature voxlap feature: carve away an overhang's support and
+  the disconnected rock **crumbles** — it detaches, falls, and bursts
+  into colour-true debris where it lands. Three engine pieces:
+  - **`roxlap_scene::islands`** — `detect_islands(grid, carve_lo,
+    carve_hi, budget)` finds the voxel regions a carve disconnected
+    from support: a budgeted breadth-first flood over the chunk
+    format's RLE **runs** (one run = one search node, no dense
+    decode), 6-connected, cross-chunk and chz-stack aware. Support =
+    a bedrock-anchored column bottom (format-pinned, uncarvable);
+    regions past the budget stay put by design. Worst-case
+    supported-exit on a 100×100 plate ≈ 0.3 ms. `Island` carries the
+    voxels + colours; `extract` removes it from the grid (coalesced
+    span carves + one incremental re-bake; re-mip stays the caller's
+    obligation like any edit), `to_kv6`/`world_pivot` turn it into a
+    sprite model posed exactly over the voxels it replaced, and
+    `split(pattern, seed)` fractures it — `Chunks { cell }` into
+    rounded jittered-Voronoi lumps, `Shards { plates }` into sharp
+    near-parallel plates — deterministically, cost scaling with the
+    island, not its bounding box.
+  - **`roxlap_render::DebrisSystem`** — the crumble loop, shaped like
+    `ParticleSystem` (pure `spawn_island`/`update` over the `Scene`,
+    batched `sync` into dynamic sprite instances, `tick` per frame).
+    Gravity + terminal clamp, a deterministic cosmetic spin, and
+    tunnel-proof collision (the descent marches in half-window
+    substeps, then binary-searches flush contact — a fast body cannot
+    skip a one-voxel shelf on a slow frame). `set_fracture_patterns`
+    installs the per-material side table; fragments spawn with an
+    outward drift, and with the colour→material map installed the
+    fragment models register with materials — a fallen crystal keeps
+    its translucent+emissive look and **glows on the way down**.
+    `drain_impacts()` reports each landing with its world-space
+    `burst_sites()` for the shatter.
+  - **`ParticleSystem::voxel_debris`** — the burst half of
+    `carve_debris`, factored out (bit-compatibly — same-seed spawn
+    sequences are identical) so a landed island's own voxels shatter
+    into the same colour-true debris a bullet crater throws.
+- The **cave demo** crumbles end-to-end: island detection and
+  extraction run on the existing background carve worker (covered by
+  the same incremental re-mip), the main thread spawns the falling
+  sprites, shatters landings into particles, and routes every impact
+  through the same occlusion-shaded boom as a bullet hit. Rock breaks
+  into lumps (`Chunks`), crystals into glowing plates (`Shards`);
+  `ROXLAP_NO_CRUMBLE=1` restores plain carves.
+- Documented in the book's new **Destruction** chapter (a runnable
+  windowless `book_destruction` example walks a cantilevered beam
+  through detect → fracture → fall → shatter and prints each stage).
+
 ### Added: sprite emissive + headless GPU emissive gate (EV owed items)
 
 - **Sprite emissive**: a sprite/clip voxel whose material glows now
