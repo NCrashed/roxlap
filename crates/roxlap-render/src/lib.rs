@@ -52,6 +52,9 @@ mod cpu_egui;
 /// QE-C6 — the one place `ROXLAP_*` env overrides are read (once, at
 /// construction). The user-facing variable table is on
 /// [`RenderOptions`].
+/// Falling voxel islands over dynamic sprite instances (stage DT) —
+/// see `docs/porting/PORTING-DESTRUCTION.md`.
+mod debris;
 mod env_config;
 mod gpu;
 /// Dynamic lighting types (stages DL + SL) — runtime sun, point and
@@ -72,6 +75,7 @@ use roxlap_formats::material::MaterialTable;
 use roxlap_formats::voxel_clip::{duration_prefix_sums, frame_at_prefix};
 use roxlap_scene::Scene;
 
+pub use debris::{DebrisImpact, DebrisSystem};
 pub use light::{DirectionalLight, LightRig, PointLight, SpotLight};
 pub use particles::{
     CollisionMode, ConeDef, EmitterId, EmitterShape, Particle, ParticleEmitterDef, ParticleSystem,

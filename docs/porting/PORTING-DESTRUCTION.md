@@ -69,7 +69,45 @@ stage** (DT.5) after the plain crumble loop works.
   Known-fine: a horizontal plate extracts as N single-voxel
   `set_rect`s (µs at budget sizes; batch `set_spans` (S4.1) is the
   fix if DT.2 profiling ever shows it).
-- DT.2 — DebrisSystem (falling + collision): NOT STARTED
+- DT.2 — LANDED 2026-07-12: `roxlap-render/src/debris.rs` —
+  `DebrisSystem` (+ `DebrisImpact`), re-exported at the crate root.
+  Shaped exactly like `ParticleSystem`: `spawn_island(scene, grid,
+  island, bake)` + `update(scene, dt)` are pure simulation
+  (spawn extracts via `Island::extract` — **mips stay the caller's
+  obligation**, hazard 3b — and registers the body at
+  `world_pivot`); `sync(renderer)` mirrors bodies through a
+  `DebrisFacade` seam (the `ParticleFacade` pattern grown by the
+  model half): pre-posed spawn (no first-frame flash), one batched
+  transform write per frame, despawn + model removal on impact;
+  `tick` = update + sync; `drain_impacts()` hands DT.3 each landed
+  island's voxels + world pos + speed. Physics as locked: gravity
+  22 u/s² (+z, particle-matched), terminal clamp 60 u/s, cosmetic
+  yaw hashed from the island position (stateless — replays
+  bit-identical); collision = unrotated AABB (grid-vws-scaled, shrunk
+  by an anti-flush epsilon so resting/flush contact never re-fires)
+  via `box_overlaps_solid`, contact binary-searched to the voxel
+  plane. Sprite pose uses the particle scaled-basis convention
+  (yaw about world-z × vws — chirality preserved); grid rotation is
+  NOT applied to the falling pose (v1, axis-aligned grids; noted in
+  the module doc). Tests (5): monotonic fall + terminal clamp;
+  lands flush on a z=140 plate (bottom within 5e-3) + exactly one
+  impact + island voxels ride along; spawn extracts from the grid;
+  empty/stale spawns refused; full mock-facade lifecycle (model +
+  pre-posed spawn at pivot → per-frame batches → despawn + model
+  removal, nothing leaked). Maintainer-review fixes (2026-07-12):
+  **(a) tunneling** — collision was endpoint-only, so a frame's
+  displacement past the overlap window (stock tuning at 30 FPS sits
+  exactly on it; hitches/raised terminal blow past it) skipped
+  one-voxel shelves; `update` now marches the displacement in
+  substeps of half the window (`half.z + vws/2`) — pinned by a
+  deterministic 8-units-per-frame vs 2-unit-window test. **(b) spawn
+  inside geometry** (island bbox wraps a surviving support) is now an
+  explicit policy — immediate zero-speed impact, never a body — not
+  a degenerate-search accident; pinned + documented on
+  `spawn_island`. **(c)** two-body test covers the mid-iteration
+  `swap_remove` path (batches 2 → 1 → 0); binary search 32 → 16
+  iterations; per-sync move batch reuses a scratch buffer. 84 render
+  lib tests green, clippy + fmt clean.
 - DT.3 — impact shatter + audio: NOT STARTED
 - DT.4 — cave-demo crumble: NOT STARTED
 - DT.5 — per-material fracture patterns: NOT STARTED
