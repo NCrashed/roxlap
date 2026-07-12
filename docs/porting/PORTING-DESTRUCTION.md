@@ -46,7 +46,29 @@ stage** (DT.5) after the plain crumble loop works.
   in the probe), and `Flood::new` does one pass over `Grid::chunks`
   keys (scales with world size, not carve size — microseconds at
   current grid sizes).
-- DT.1 — island extraction → sprite: NOT STARTED
+- DT.1 — LANDED 2026-07-12: three `Island` methods in `islands.rs`.
+  `extract(grid, bake)` — one `set_rect(None)` per contiguous column
+  segment (the voxel list is run-major, coalescing is a single pass)
+  + one `bake_bbox` over the island bbox; edits + bake bump chunk
+  versions. `to_kv6()` — `Kv6::from_fn` over the bbox-relative voxel
+  set, colours normalised to full-bright `0x80RRGGBB` (sprite paths
+  light the model themselves; a baked byte would double-darken);
+  pivot = bbox centre per `from_fn`. `world_origin(&GridTransform)` /
+  `world_pivot(...)` — bbox-min corner / bbox centre through
+  `grid_local_to_world` (`voxel_world_size` honoured, SC) —
+  `world_pivot` is the spawn pose that puts the model exactly over
+  the voxels it replaced. Tests (4): extract leaves air + support
+  stays + re-detect finds nothing + version bumped; vertical-run
+  extraction across the chz border; KV6 dims/count/colours for a
+  thin beam; world anchors under `at_scale(…, 2.0)`. 229 scene lib
+  tests green, clippy + fmt clean. Maintainer-review follow-ups
+  (2026-07-12): extract's doc states the no-remip contract explicitly
+  (see hazard 3b — DT.4 obligation); empty-`Island` extract is an
+  early-return no-op; the brightness-normalisation branch of
+  `to_kv6` is pinned by a dim-byte (0x40) voxel in the colour test.
+  Known-fine: a horizontal plate extracts as N single-voxel
+  `set_rect`s (µs at budget sizes; batch `set_spans` (S4.1) is the
+  fix if DT.2 profiling ever shows it).
 - DT.2 — DebrisSystem (falling + collision): NOT STARTED
 - DT.3 — impact shatter + audio: NOT STARTED
 - DT.4 — cave-demo crumble: NOT STARTED
@@ -237,6 +259,15 @@ Three user-visible things:
 3. **GPU re-upload spikes.** Island extraction is a second edit right
    after the carve — keep both inside the same dirty bbox where
    possible so the partial-refresh path (PF.12) uploads once.
+3b. **Stale mips after extraction (maintainer review, DT.1).**
+   `Island::extract` does NOT remip — the workspace-wide edit
+   contract (`bake_bbox` documents the same; there is no Grid-level
+   remip primitive). Beyond `mip_scan_dist` (default 64) both
+   renderers keep drawing the extracted island from mip-N while its
+   sprite twin falls next to it — and up close everything looks
+   correct, so an eyeball pass won't catch it. **DT.4 must fold the
+   extraction bbox into the carve worker's existing `remip_bbox`
+   call** (cave-demo main.rs, the same one its carves use).
 4. **Sprite model/instance leaks.** Every island is a model; shatter
    must remove both handles, and `compact_sprite_models` must run
    periodically (models are tombstoned, not freed). The 100-cycle

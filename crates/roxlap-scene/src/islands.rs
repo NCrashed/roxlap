@@ -22,11 +22,12 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use glam::IVec3;
+use glam::{DVec3, IVec3, Vec3};
 use roxlap_formats::color::VoxColor;
+use roxlap_formats::kv6::Kv6;
 use roxlap_formats::vxl::Vxl;
 
-use crate::{Grid, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
+use crate::{grid_local_to_world, BakeMode, Grid, GridTransform, CHUNK_SIZE_XY, CHUNK_SIZE_Z};
 
 /// Default flood budget in voxels: a component that grows past this is
 /// declared supported (early exit). Tuned for carve-sized overhangs;
@@ -43,6 +44,91 @@ pub struct Island {
     pub voxels: Vec<(IVec3, VoxColor)>,
     /// Inclusive grid-local bounds of `voxels`.
     pub bbox: (IVec3, IVec3),
+}
+
+impl Island {
+    /// DT.1 — carve this island's voxels out of `grid`, then re-bake
+    /// the touched region so lighting on the newly exposed faces is
+    /// correct: one [`Grid::set_rect`] carve per contiguous column
+    /// segment (the voxel list is stored run-major, so coalescing is a
+    /// single pass) and one [`Grid::bake_bbox`] over the island bbox
+    /// (its internal padding relights the surroundings; the edits and
+    /// the bake bump the touched chunk versions). After extraction, a
+    /// re-run of [`detect_islands`] over the same region finds
+    /// nothing.
+    ///
+    /// **Mip ladders are NOT regenerated** — the same contract as
+    /// every edit primitive ([`Grid::bake_bbox`] documents it too): a
+    /// caller rendering distant chunks must remip the touched columns
+    /// (`Vxl::remip_bbox`) exactly as it already does for its carves,
+    /// or mip-N keeps drawing the extracted island beyond
+    /// `mip_scan_dist` while its sprite twin falls next to it.
+    pub fn extract(&self, grid: &mut Grid, bake: BakeMode) {
+        if self.voxels.is_empty() {
+            return;
+        }
+        let mut pending: Option<(IVec3, IVec3)> = None;
+        for &(v, _) in &self.voxels {
+            if let Some((lo, hi)) = pending {
+                if v.x == hi.x && v.y == hi.y && v.z == hi.z + 1 {
+                    pending = Some((lo, v));
+                    continue;
+                }
+                grid.set_rect(lo, hi, None);
+            }
+            pending = Some((v, v));
+        }
+        if let Some((lo, hi)) = pending {
+            grid.set_rect(lo, hi, None);
+        }
+        let (lo, hi) = self.bbox;
+        grid.bake_bbox(lo, hi, bake);
+    }
+
+    /// DT.1 — build the island's KV6 sprite model: dims are the
+    /// inclusive bbox extent, voxels sit at bbox-relative positions,
+    /// and colours are the detected ones with the high byte normalised
+    /// to `0x80` (full-bright — the sprite paths do their own
+    /// lighting, and a baked brightness byte would double-darken).
+    /// Surface-only ([`Kv6::from_fn`]): the interior is invisible in
+    /// flight, and a shatter samples [`Self::voxels`], not the model.
+    /// The model pivot is the bbox centre (`from_fn`'s convention) —
+    /// pose it with [`Self::world_pivot`].
+    #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn to_kv6(&self) -> Kv6 {
+        let (lo, hi) = self.bbox;
+        let dims = (hi - lo + IVec3::ONE).as_uvec3();
+        let map: HashMap<IVec3, u32> = self
+            .voxels
+            .iter()
+            .map(|&(v, c)| (v - lo, (c.0 & 0x00ff_ffff) | 0x8000_0000))
+            .collect();
+        Kv6::from_fn(dims.x, dims.y, dims.z, |x, y, z| {
+            map.get(&IVec3::new(x as i32, y as i32, z as i32))
+                .map(|&c| VoxColor(c))
+        })
+    }
+
+    /// DT.1 — the world-space position of the island's **minimum
+    /// corner** (`bbox.0`, voxel corner), through the grid transform
+    /// with `voxel_world_size` honoured (SC).
+    #[must_use]
+    pub fn world_origin(&self, transform: &GridTransform) -> DVec3 {
+        let (chunk, in_chunk) = crate::voxel_split(self.bbox.0);
+        grid_local_to_world(chunk, in_chunk, Vec3::ZERO, transform)
+    }
+
+    /// DT.1 — the world-space position of the island's **bbox centre**
+    /// — where [`Self::to_kv6`]'s pivot sits, i.e. the position a
+    /// debris system spawns the sprite instance at so the model lands
+    /// exactly over the voxels it replaced.
+    #[must_use]
+    pub fn world_pivot(&self, transform: &GridTransform) -> DVec3 {
+        let (chunk, in_chunk) = crate::voxel_split(self.bbox.0);
+        let dims = (self.bbox.1 - self.bbox.0 + IVec3::ONE).as_vec3();
+        grid_local_to_world(chunk, in_chunk, dims * 0.5, transform)
+    }
 }
 
 /// One solid z-run of a column in **grid-local** z (chz stacking
@@ -551,6 +637,126 @@ mod tests {
 
         eprintln!("supported-exit (budget {DEFAULT_ISLAND_BUDGET}): {supported_exit:?}");
         eprintln!("63-voxel beam detach: {detach:?}");
+    }
+
+    // ---------- DT.1: extraction → sprite ----------
+
+    /// Extraction carves exactly the island's voxels (support stays),
+    /// bumps the chunk version, and a re-run of detection over the
+    /// same carve region finds nothing.
+    #[test]
+    fn extract_leaves_air_and_detection_clean() {
+        let mut g = grid();
+        pillar(&mut g, 2, 2, 100);
+        g.set_rect(IVec3::new(3, 2, 100), IVec3::new(6, 2, 100), Some(STONE));
+        g.set_voxel(IVec3::new(3, 2, 100), None);
+        let cut = (IVec3::new(3, 2, 100), IVec3::new(3, 2, 100));
+        let islands = detect_islands(&g, cut.0, cut.1, 4096);
+        let isl = islands[0].clone();
+
+        let v_before = g.chunk_version(IVec3::ZERO);
+        isl.extract(&mut g, BakeMode::Directional);
+
+        for &(v, _) in &isl.voxels {
+            assert!(!g.voxel_solid(v), "extracted voxel {v} must be air");
+        }
+        assert!(
+            g.voxel_solid(IVec3::new(2, 2, 100)),
+            "the supported pillar stays"
+        );
+        assert!(
+            detect_islands(&g, cut.0, cut.1, 4096).is_empty(),
+            "nothing left to detach"
+        );
+        assert!(
+            g.chunk_version(IVec3::ZERO) > v_before,
+            "renderers must see the extraction"
+        );
+    }
+
+    /// Extraction of a vertical run (one column, many voxels)
+    /// coalesces into span carves and clears the whole segment —
+    /// the stacked-chz island from `stacked_chz_bedrock_is_anchored`.
+    #[test]
+    fn extract_vertical_run_across_chz() {
+        let mut g = grid();
+        g.set_rect(IVec3::new(5, 5, 200), IVec3::new(5, 5, 400), Some(STONE));
+        g.set_voxel(IVec3::new(5, 5, 300), None);
+        let islands = detect_islands(&g, IVec3::new(5, 5, 300), IVec3::new(5, 5, 300), 100_000);
+        islands[0].extract(&mut g, BakeMode::Directional);
+        for z in 301..=400 {
+            assert!(!g.voxel_solid(IVec3::new(5, 5, z)), "z={z} must be air");
+        }
+        assert!(
+            g.voxel_solid(IVec3::new(5, 5, 299)),
+            "the pinned upper segment stays"
+        );
+    }
+
+    /// The KV6 model matches the island: dims = bbox extent, one
+    /// (surface) voxel per island voxel for a thin beam, colours
+    /// normalised to full-bright `0x80RRGGBB` — including a voxel
+    /// whose grid colour carries a dim baked brightness byte.
+    #[test]
+    fn to_kv6_matches_bbox_and_colours() {
+        const DIM_STONE: VoxColor = VoxColor(0x40B0_8040); // baked-dark byte
+        let mut g = grid();
+        pillar(&mut g, 2, 2, 100);
+        // Per-voxel inserts into air (an insert over an existing solid
+        // voxel does not repaint): x=5 carries the dim brightness byte.
+        for x in [3, 4, 6] {
+            g.set_voxel(IVec3::new(x, 2, 100), Some(STONE));
+        }
+        g.set_voxel(IVec3::new(5, 2, 100), Some(DIM_STONE));
+        g.set_voxel(IVec3::new(3, 2, 100), None);
+        let islands = detect_islands(&g, IVec3::new(3, 2, 100), IVec3::new(3, 2, 100), 4096);
+        let isl = &islands[0];
+        assert!(
+            isl.voxels
+                .iter()
+                .any(|&(v, c)| v == IVec3::new(5, 2, 100) && c == DIM_STONE),
+            "the island records the raw (dim) grid colour"
+        );
+        let kv6 = isl.to_kv6();
+        assert_eq!((kv6.xsiz, kv6.ysiz, kv6.zsiz), (3, 1, 1));
+        assert_eq!(kv6.voxels.len(), 3, "thin beam: every voxel is surface");
+        assert!(
+            kv6.voxels.iter().all(|v| v.col == STONE.0),
+            "the model normalises every brightness byte to 0x80"
+        );
+    }
+
+    /// A hand-constructed empty island (detection never yields one)
+    /// is a no-op: no edits, no bake over the degenerate default bbox.
+    #[test]
+    fn extract_empty_island_is_noop() {
+        let mut g = grid();
+        pillar(&mut g, 2, 2, 100);
+        let v = g.chunk_version(IVec3::ZERO);
+        Island {
+            voxels: Vec::new(),
+            bbox: (IVec3::MAX, IVec3::MIN),
+        }
+        .extract(&mut g, BakeMode::Directional);
+        assert_eq!(
+            g.chunk_version(IVec3::ZERO),
+            v,
+            "no-op leaves versions alone"
+        );
+    }
+
+    /// World anchors honour the grid transform including
+    /// `voxel_world_size` (SC): the origin is the bbox-min corner, the
+    /// pivot the bbox centre (where `to_kv6`'s pivot sits).
+    #[test]
+    fn world_anchors_honour_scale() {
+        let isl = Island {
+            voxels: Vec::new(),
+            bbox: (IVec3::new(4, 2, 100), IVec3::new(6, 2, 100)),
+        };
+        let t = GridTransform::at_scale(DVec3::new(10.0, 20.0, 30.0), 2.0);
+        assert_eq!(isl.world_origin(&t), DVec3::new(18.0, 24.0, 230.0));
+        assert_eq!(isl.world_pivot(&t), DVec3::new(21.0, 25.0, 231.0));
     }
 
     /// Property test: on a randomised scene, `detect_islands` over the
