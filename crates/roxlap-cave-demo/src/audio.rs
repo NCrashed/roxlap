@@ -16,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use glam::{DMat3, DQuat, DVec3, IVec3};
 use roxlap_audio::{
-    source_acoustics, synth, AcousticsConfig, AudioOut, CavityConfig, CavityEstimator, KiraAudio,
-    SoundKey, SourceId,
+    doppler_factor, source_acoustics, synth, AcousticsConfig, AudioOut, CavityConfig,
+    CavityEstimator, KiraAudio, SoundKey, SourceId, DEFAULT_SPEED_OF_SOUND,
 };
 use roxlap_core::Camera;
 use roxlap_scene::{GridId, Scene};
@@ -63,6 +63,9 @@ pub struct DemoAudio {
     cavity_timer: f64,
     hum_timer: f64,
     near_timer: f64,
+    /// AU2.2 — last tick's listener position, for the Doppler velocity
+    /// estimate (`None` right after construction / [`Self::reset`]).
+    prev_listener: Option<DVec3>,
 }
 
 impl DemoAudio {
@@ -90,6 +93,7 @@ impl DemoAudio {
             cavity_timer: 0.0,
             hum_timer: 0.0,
             near_timer: 0.0,
+            prev_listener: None,
         })
     }
 
@@ -123,6 +127,9 @@ impl DemoAudio {
         self.cavity_timer = 0.0;
         self.hum_timer = 0.0;
         self.near_timer = 0.0;
+        // AU2.2 — a regen teleports the camera; forget the old position
+        // so the first post-reset tick reads as at-rest, not warp-speed.
+        self.prev_listener = None;
     }
 
     /// Per-frame update: listener pose (every frame), reverb environment
@@ -199,6 +206,41 @@ impl DemoAudio {
                 let a = source_acoustics(scene, pos, listener, &self.acfg);
                 self.audio.apply_source(id, &a);
             }
+        }
+
+        // AU2.2 — Doppler on the hums, every frame (pure math over a
+        // handful of sources; kira's ~120 ms tween smooths the ramp):
+        // crystals are static, so only the listener's velocity bends
+        // the pitch — fly past a crystal and its hum bends down.
+        // Per-frame is deliberate (positions already update per frame;
+        // ≤ MAX_HUMS playback-rate commands/frame) — if the kira
+        // command queue ever shows in a profile, throttle HERE first.
+        let vel = self.listener_velocity(listener, dt);
+        for (&i, &id) in &self.hums {
+            let pos = grid.bake_lights[i].pos.as_dvec3();
+            let f = doppler_factor(pos, DVec3::ZERO, listener, vel, DEFAULT_SPEED_OF_SOUND);
+            self.audio.set_source_pitch(id, f);
+        }
+    }
+
+    /// AU2.2 — the listener's velocity from consecutive tick positions.
+    /// Teleport-guarded: a jump reading over 200 u/s (regen, spawn
+    /// warp) is treated as rest rather than a one-frame pitch spike.
+    /// The threshold sits well above the demo's fast-fly (~4× walk);
+    /// a future movement mode faster than 200 u/s would silently mute
+    /// its own Doppler — raise the guard alongside it.
+    fn listener_velocity(&mut self, listener: DVec3, dt: f64) -> DVec3 {
+        let prev = self.prev_listener.replace(listener);
+        match prev {
+            Some(p) if dt > 1e-4 => {
+                let v = (listener - p) / dt;
+                if v.length() > 200.0 {
+                    DVec3::ZERO
+                } else {
+                    v
+                }
+            }
+            _ => DVec3::ZERO,
         }
     }
 }

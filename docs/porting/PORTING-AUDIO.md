@@ -339,7 +339,26 @@ class — minor per house policy (maintainer review).
   `boxed_room` from six painted slabs instead (the same reason the
   cave demo's crater walls needed an explicit colfunc). 28 audio
   tests, clippy 0.
-- AU2.2 — Doppler: NOT STARTED
+- AU2.2 — LANDED 2026-07-13: pure `doppler_factor(source_pos,
+  source_vel, listener_pos, listener_vel, c)` +
+  `DEFAULT_SPEED_OF_SOUND = 90.0` (game-tuned knob, doc says why not
+  343). The two-sided formula made monotone at the edges: numerator
+  floors at 0, denominator at `0.05·c` (a supersonic approach clamps
+  to the ceiling instead of flipping sign), result clamps to
+  `[0.5, 2.0]`; rest is `c/c` — exactly `1.0`. `AudioOut` grew
+  **default-no-op** `set_source_pitch(id, factor)` (existing
+  backends compile untouched); `KiraAudio` maps it to
+  `set_playback_rate` with the FAST (~120 ms) tween. Cave demo: the
+  crystal hums get per-frame Doppler from the **listener's velocity**
+  (position delta per tick, teleport-guarded at 200 u/s and reset on
+  regen — a warp reads as rest, not a pitch spike); crystals are
+  static so `source_vel = 0`. Tests (2): signs + exact-rest +
+  perpendicular-neutral; clamps + degenerate inputs. Env note: this
+  shell CAN build the `audio` feature after all —
+  `PKG_CONFIG_PATH=<nix-store alsa-lib dev>/lib/pkgconfig` (the
+  earlier "needs full dev shell" claim was a missing search path,
+  not a missing library); demo clippy + tests green WITH audio.
+  30 audio tests, clippy 0.
 - AU2.3 — scene-demo Audio tab: NOT STARTED
 - AU2.4 — docs: NOT STARTED
 

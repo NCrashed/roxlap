@@ -146,6 +146,49 @@ impl SourceAcoustics {
     }
 }
 
+/// AU2.2 — default speed of sound for [`doppler_factor`], world
+/// units/second. Deliberately game-tuned, not physical: at the real
+/// 343 m/s a 60 u/s bullet would bend pitch by ~1.5 semitones; at 90
+/// the demo's speeds read clearly. Hosts pass their own value to
+/// retune.
+pub const DEFAULT_SPEED_OF_SOUND: f64 = 90.0;
+
+/// AU2.2 — the Doppler playback-rate factor for a moving
+/// source/listener pair: `> 1` approaching (pitch up), `< 1` receding,
+/// exactly `1.0` at rest. The classic two-sided formula
+/// `(c − v_l·n̂) / (c − v_s·n̂)` with `n̂` the source→listener
+/// direction, made monotone and finite at the edges: the denominator
+/// floors at `0.05·c` (a supersonic approach clamps instead of
+/// flipping sign) and the result clamps to `[0.5, 2.0]` — an octave
+/// down/up, past which game audio reads as a glitch.
+///
+/// Pure math over positions/velocities — no scene query. Feed the
+/// result to [`AudioOut::set_source_pitch`] (backends tween it).
+/// Pitch-bending a **one-shot** mid-envelope sounds like a defect, not
+/// physics: apply Doppler to loops and long tails (a hum, an engine),
+/// driven by whatever velocity the host tracks (a camera delta is
+/// fine).
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn doppler_factor(
+    source_pos: DVec3,
+    source_vel: DVec3,
+    listener_pos: DVec3,
+    listener_vel: DVec3,
+    speed_of_sound: f64,
+) -> f32 {
+    let seg = listener_pos - source_pos;
+    let dist = seg.length();
+    if dist < 1e-9 || speed_of_sound <= 1e-9 {
+        return 1.0;
+    }
+    let n = seg / dist;
+    // `c/c == 1.0` exactly at rest (both dot products are 0.0).
+    let numer = (speed_of_sound - listener_vel.dot(n)).max(0.0);
+    let denom = (speed_of_sound - source_vel.dot(n)).max(speed_of_sound * 0.05);
+    ((numer / denom) as f32).clamp(0.5, 2.0)
+}
+
 /// Total **solid path length** (world/voxel units) the straight segment
 /// `a → b` crosses, summed over every grid in the scene. This is the
 /// thickness building block under [`source_acoustics`]: exact per-cell
@@ -731,6 +774,59 @@ mod tests {
         cfg.absorption = vec![(GLASS_ID + 1, 0.3)];
         let unmapped = source_acoustics(&scene, src, dst, &cfg);
         assert_eq!(unmapped.transmission, base.transmission);
+    }
+
+    // ---------- AU2.2: Doppler ----------
+
+    /// Approaching pitches up, receding down, rest is exactly neutral,
+    /// perpendicular motion is (numerically) neutral too.
+    #[test]
+    fn doppler_signs_and_rest() {
+        let c = DEFAULT_SPEED_OF_SOUND;
+        let s = DVec3::new(0.0, 0.0, 0.0);
+        let l = DVec3::new(50.0, 0.0, 0.0);
+        let at_rest = doppler_factor(s, DVec3::ZERO, l, DVec3::ZERO, c);
+        assert_eq!(at_rest.to_bits(), 1.0f32.to_bits(), "rest is exactly 1");
+
+        // Source flying toward the listener (+x) pitches up; away, down.
+        let up = doppler_factor(s, DVec3::new(30.0, 0.0, 0.0), l, DVec3::ZERO, c);
+        let down = doppler_factor(s, DVec3::new(-30.0, 0.0, 0.0), l, DVec3::ZERO, c);
+        assert!(up > 1.0 && down < 1.0, "source motion: {up} / {down}");
+
+        // Listener closing on the source pitches up symmetrically.
+        let l_up = doppler_factor(s, DVec3::ZERO, l, DVec3::new(-30.0, 0.0, 0.0), c);
+        let l_down = doppler_factor(s, DVec3::ZERO, l, DVec3::new(30.0, 0.0, 0.0), c);
+        assert!(
+            l_up > 1.0 && l_down < 1.0,
+            "listener motion: {l_up} / {l_down}"
+        );
+
+        // Perpendicular motion has no radial component.
+        let perp = doppler_factor(s, DVec3::new(0.0, 30.0, 0.0), l, DVec3::ZERO, c);
+        assert!((perp - 1.0).abs() < 1e-6, "perpendicular ≈ neutral: {perp}");
+    }
+
+    /// Extreme speeds clamp to the octave bounds instead of flipping
+    /// sign or diverging; degenerate inputs are neutral.
+    #[test]
+    fn doppler_clamps_and_degenerates() {
+        let c = DEFAULT_SPEED_OF_SOUND;
+        let s = DVec3::ZERO;
+        let l = DVec3::new(50.0, 0.0, 0.0);
+        // Supersonic approach: clamps at 2.0, never negative.
+        let mach2 = doppler_factor(s, DVec3::new(2.0 * c, 0.0, 0.0), l, DVec3::ZERO, c);
+        assert_eq!(mach2, 2.0);
+        // Supersonic retreat: floor at 0.5.
+        let away = doppler_factor(s, DVec3::new(-3.0 * c, 0.0, 0.0), l, DVec3::ZERO, c);
+        assert_eq!(away, 0.5);
+        // Listener fleeing faster than sound: silence would be right,
+        // pitch-wise we floor at 0.5 (the backend's distance
+        // attenuation owns the rest).
+        let flee = doppler_factor(s, DVec3::ZERO, l, DVec3::new(2.0 * c, 0.0, 0.0), c);
+        assert_eq!(flee, 0.5);
+        // Coincident points / zero speed of sound: neutral.
+        assert_eq!(doppler_factor(s, DVec3::X, s, DVec3::ZERO, c), 1.0);
+        assert_eq!(doppler_factor(s, DVec3::X, l, DVec3::ZERO, 0.0), 1.0);
     }
 
     /// A ray descending through a tall run: only the run's surface

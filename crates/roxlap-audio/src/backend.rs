@@ -71,6 +71,17 @@ pub trait AudioOut {
 
     /// Apply the listener's reverb environment (~1 s tween).
     fn apply_listener(&mut self, acoustics: &ListenerAcoustics);
+
+    /// AU2.2 — Doppler pitch for a live source: a playback-rate factor
+    /// from [`crate::doppler_factor`] (`1.0` = neutral, `> 1`
+    /// approaching). Backends without pitch control may ignore it —
+    /// the default is a no-op — and implementations should tween
+    /// (~120 ms) like the other per-source parameters. Meant for
+    /// loops and long tails; bending a one-shot mid-envelope reads as
+    /// a glitch. Stale ids are ignored.
+    fn set_source_pitch(&mut self, id: SourceId, factor: f32) {
+        let _ = (id, factor);
+    }
 }
 
 /// How a pooled slot is currently used.

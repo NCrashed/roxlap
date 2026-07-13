@@ -307,6 +307,17 @@ impl AudioOut for KiraAudio {
             .set_send(self.send_id, Decibels(acoustics.reverb_send_db), t);
     }
 
+    fn set_source_pitch(&mut self, id: SourceId, factor: f32) {
+        let Some(idx) = self.pool.slot_of(id) else {
+            return;
+        };
+        // AU2.2 — Doppler: the playback rate IS the pitch factor; the
+        // fast tween keeps a flyby from zippering.
+        if let Some(sound) = self.tracks[idx].sound.as_mut() {
+            sound.set_playback_rate(f64::from(factor), tween(FAST_TWEEN_MS));
+        }
+    }
+
     fn apply_listener(&mut self, acoustics: &ListenerAcoustics) {
         let t = tween(ENV_TWEEN_MS);
         // Reverb CHARACTER (decay/damping) tweens on the effect; room
