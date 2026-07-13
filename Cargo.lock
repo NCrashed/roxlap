@@ -2548,6 +2548,7 @@ dependencies = [
  "glam 0.30.10",
  "kira",
  "mint",
+ "roxlap-formats",
  "roxlap-scene",
 ]
 

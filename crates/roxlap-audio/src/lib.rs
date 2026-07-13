@@ -22,7 +22,8 @@
 //! it from any thread.
 
 use glam::{DVec3, IVec3};
-use roxlap_scene::Scene;
+use roxlap_formats::material::material_for_color;
+use roxlap_scene::{Rgb, Scene, VoxColor};
 
 mod backend;
 mod cavity;
@@ -73,6 +74,27 @@ pub struct AcousticsConfig {
     /// backend's job, and a far-away source in open air must NOT come
     /// back muffled. Bounds the DDA cost.
     pub max_distance: f64,
+    /// AU2.0 — the host's colour→material terrain map (the SAME map the
+    /// renderer's `set_terrain_materials` and the debris system's
+    /// fracture tables take), classifying the voxels a thickness ray
+    /// crosses. Only consulted when [`absorption`](Self::absorption) is
+    /// non-empty.
+    pub material_map: Vec<(Rgb, u8)>,
+    /// AU2.0 — material id → **effective-thickness multiplier**: a ray
+    /// crossing one voxel of a `0.35` material accumulates 0.35 voxels
+    /// of muffling (glass/crystal), a `1.0` material the full voxel
+    /// (stone — also the default for unmapped materials). **Empty
+    /// (the default) keeps the exact legacy arithmetic** — bit-identical
+    /// to pre-AU2 output. Interior cells carry no colour in the `.vxl`
+    /// format; a ray reuses the last surface colour it crossed (1.0
+    /// until the first) — in practice deep interiors are rock, so the
+    /// default reads correctly.
+    ///
+    /// Note the engine-wide convention: colours absent from
+    /// [`material_map`](Self::material_map) classify as material `0`,
+    /// so an entry for id `0` here re-weights **every unmapped
+    /// voxel** — a deliberate global-default knob, not an accident.
+    pub absorption: Vec<(u8, f32)>,
 }
 
 impl Default for AcousticsConfig {
@@ -86,6 +108,8 @@ impl Default for AcousticsConfig {
             max_occlusion_db: -24.0,
             send_occlusion_frac: 0.5,
             max_distance: 128.0,
+            material_map: Vec::new(),
+            absorption: Vec::new(),
         }
     }
 }
@@ -138,6 +162,45 @@ impl SourceAcoustics {
 /// optimisation).
 #[must_use]
 pub fn path_thickness(scene: &Scene, a: DVec3, b: DVec3) -> f64 {
+    path_thickness_impl(scene, a, b, None)
+}
+
+/// AU2.0 — [`path_thickness`] with **per-material weighting**: each
+/// solid cell's segment length is multiplied by its material's
+/// absorption factor (`material_map` classifies the cell's colour the
+/// way the renderer's terrain map does; `absorption` maps material id
+/// → multiplier, unmapped = `1.0`). One voxel of `0.35` glass muffles
+/// like 0.35 voxels of stone. The `.vxl` format stores surface colours
+/// only, so an interior cell reuses the last surface colour the ray
+/// crossed in that grid (weight `1.0` before the first — deep
+/// interiors read as rock, which is what they are).
+///
+/// With an empty `absorption` table this is exactly
+/// [`path_thickness`] (same arithmetic, bit-identical).
+#[must_use]
+pub fn path_thickness_weighted(
+    scene: &Scene,
+    a: DVec3,
+    b: DVec3,
+    material_map: &[(Rgb, u8)],
+    absorption: &[(u8, f32)],
+) -> f64 {
+    if absorption.is_empty() {
+        return path_thickness_impl(scene, a, b, None);
+    }
+    path_thickness_impl(
+        scene,
+        a,
+        b,
+        Some(&Weights {
+            map: material_map,
+            table: absorption,
+        }),
+    )
+}
+
+/// Shared walk under [`path_thickness`] / [`path_thickness_weighted`].
+fn path_thickness_impl(scene: &Scene, a: DVec3, b: DVec3, weights: Option<&Weights<'_>>) -> f64 {
     let mut total = 0.0;
     for (_, grid) in scene.grids() {
         // SC — rebase into the grid's VOXEL frame: un-rotate, un-translate,
@@ -150,9 +213,26 @@ pub fn path_thickness(scene: &Scene, a: DVec3, b: DVec3) -> f64 {
         let inv = grid.transform.rotation.inverse();
         let la = (inv * (a - grid.transform.origin)) / vws;
         let lb = (inv * (b - grid.transform.origin)) / vws;
-        total += grid_thickness(grid, la, lb) * vws;
+        total += grid_thickness(grid, la, lb, weights) * vws;
     }
     total
+}
+
+/// AU2.0 — the per-material weighting tables, resolved once per query.
+struct Weights<'a> {
+    map: &'a [(Rgb, u8)],
+    table: &'a [(u8, f32)],
+}
+
+impl Weights<'_> {
+    /// The effective-thickness multiplier of a voxel colour.
+    fn resolve(&self, c: VoxColor) -> f64 {
+        let id = material_for_color(self.map, c.0);
+        self.table
+            .iter()
+            .find(|&&(m, _)| m == id)
+            .map_or(1.0, |&(_, w)| f64::from(w))
+    }
 }
 
 /// Solid path length of the grid-local segment `a → b` through one
@@ -165,13 +245,22 @@ pub fn path_thickness(scene: &Scene, a: DVec3, b: DVec3) -> f64 {
 /// otherwise-empty chunks) reads as solid, so a segment grazing the
 /// world bottom accumulates it as real thickness. Keep acoustic
 /// endpoints above the bedrock plane (every demo does).
-fn grid_thickness(grid: &roxlap_scene::Grid, a: DVec3, b: DVec3) -> f64 {
+fn grid_thickness(
+    grid: &roxlap_scene::Grid,
+    a: DVec3,
+    b: DVec3,
+    weights: Option<&Weights<'_>>,
+) -> f64 {
     let seg = b - a;
     let len = seg.length();
     if len < 1e-9 {
         return 0.0;
     }
     let dir = seg / len;
+    // AU2.0 — carry-forward material weight along the ray: interior
+    // cells have no colour in the `.vxl` format, so they inherit the
+    // last surface colour crossed in THIS grid (1.0 before the first).
+    let mut last_weight = 1.0f64;
 
     #[allow(clippy::cast_possible_truncation)]
     let mut cell = IVec3::new(a.x.floor() as i32, a.y.floor() as i32, a.z.floor() as i32);
@@ -215,7 +304,20 @@ fn grid_thickness(grid: &roxlap_scene::Grid, a: DVec3, b: DVec3) -> f64 {
         let solid =
             cached_chunk.is_some_and(|vxl| roxlap_scene::Grid::chunk_voxel_solid(vxl, in_chunk));
         if solid {
-            thickness += t_next - t_prev;
+            // `w == 1.0` on the unweighted path: `x * 1.0` is exact, so
+            // pre-AU2 output stays bit-identical (pinned tests).
+            let w = match weights {
+                None => 1.0,
+                Some(ws) => {
+                    if let Some(c) = cached_chunk
+                        .and_then(|vxl| vxl.voxel_color(in_chunk.x, in_chunk.y, in_chunk.z))
+                    {
+                        last_weight = ws.resolve(c);
+                    }
+                    last_weight
+                }
+            };
+            thickness += (t_next - t_prev) * w;
         }
         if t_max[ax] >= len {
             break;
@@ -284,7 +386,11 @@ pub fn source_acoustics(
             let ang = std::f64::consts::TAU * f64::from(i - 1) / f64::from(rays - 1);
             source + (u * ang.cos() + v * ang.sin()) * cfg.jitter_radius
         };
-        let t = path_thickness(scene, origin, listener);
+        // AU2.0 — per-material weighting when the config carries
+        // tables; the empty-table default routes through the exact
+        // legacy arithmetic (bit-identical, pinned tests).
+        let t =
+            path_thickness_weighted(scene, origin, listener, &cfg.material_map, &cfg.absorption);
         energy += (-cfg.absorption_per_voxel * t).exp();
     }
     #[allow(clippy::cast_possible_truncation)]
@@ -545,5 +651,119 @@ mod tests {
         let a = source_acoustics(&scene, src, dst, &cfg);
         let b = source_acoustics(&scene, src, dst, &cfg);
         assert_eq!(a, b);
+    }
+
+    // ---------- AU2.0: per-material absorption ----------
+
+    const GLASS: VoxColor = VoxColor(0x80_40_C0_E0);
+    const GLASS_ID: u8 = 7;
+
+    /// A thin (1-voxel-tall) wall at the ray height, `thick` voxels
+    /// along x — every cell is a surface cell, so every crossing
+    /// samples a colour (no carry-forward in play).
+    fn thin_wall(grid: &mut roxlap_scene::Grid, x0: i32, thick: i32, c: VoxColor) {
+        grid.set_rect(
+            IVec3::new(x0, 0, 140),
+            IVec3::new(x0 + thick - 1, 127, 140),
+            Some(c),
+        );
+    }
+
+    /// Empty tables route through the exact legacy arithmetic:
+    /// `path_thickness_weighted` equals `path_thickness` bit-for-bit,
+    /// and a config with a map but no absorption is byte-identical to
+    /// the default.
+    #[test]
+    fn empty_tables_are_bit_identical() {
+        let scene = scene_with(|g| wall(g, 30, 3));
+        let src = DVec3::new(10.0, 64.0, 140.5);
+        let dst = DVec3::new(60.0, 64.0, 140.5);
+        let plain = path_thickness(&scene, src, dst);
+        let weighted =
+            path_thickness_weighted(&scene, src, dst, &[(GLASS.rgb_part(), GLASS_ID)], &[]);
+        assert_eq!(
+            plain.to_bits(),
+            weighted.to_bits(),
+            "empty absorption = legacy path"
+        );
+
+        let cfg = AcousticsConfig {
+            material_map: vec![(GLASS.rgb_part(), GLASS_ID)],
+            ..AcousticsConfig::default()
+        };
+        let a = source_acoustics(&scene, src, dst, &AcousticsConfig::default());
+        let b = source_acoustics(&scene, src, dst, &cfg);
+        assert_eq!(a, b, "map without absorption changes nothing");
+    }
+
+    /// A glass wall muffles less than the same wall in stone: the
+    /// weighted thickness scales by the absorption factor (all cells
+    /// are surface cells here), and the transmission rises with it.
+    #[test]
+    fn glass_wall_transmits_more_than_stone() {
+        let scene = scene_with(|g| thin_wall(g, 30, 4, GLASS));
+        let src = DVec3::new(10.0, 64.0, 140.5);
+        let dst = DVec3::new(60.0, 64.0, 140.5);
+        let map = [(GLASS.rgb_part(), GLASS_ID)];
+        let table = [(GLASS_ID, 0.3f32)];
+
+        let plain = path_thickness(&scene, src, dst);
+        let weighted = path_thickness_weighted(&scene, src, dst, &map, &table);
+        assert!((plain - 4.0).abs() < 1e-6, "4 voxels of wall: {plain}");
+        assert!(
+            (weighted - plain * 0.3).abs() < 1e-6,
+            "glass counts at 0.3×: {weighted} vs {plain}"
+        );
+
+        let mut cfg = AcousticsConfig::default();
+        let base = source_acoustics(&scene, src, dst, &cfg);
+        cfg.material_map = map.to_vec();
+        cfg.absorption = table.to_vec();
+        let glass = source_acoustics(&scene, src, dst, &cfg);
+        assert!(
+            glass.transmission > base.transmission,
+            "glass passes more sound: {} vs {}",
+            glass.transmission,
+            base.transmission
+        );
+        // An unmapped material keeps stone weight: same wall colour but
+        // an absorption table for a DIFFERENT id changes nothing.
+        cfg.absorption = vec![(GLASS_ID + 1, 0.3)];
+        let unmapped = source_acoustics(&scene, src, dst, &cfg);
+        assert_eq!(unmapped.transmission, base.transmission);
+    }
+
+    /// A ray descending through a tall run: only the run's surface
+    /// cells carry colour (`.vxl` stores surface lists); the interior
+    /// inherits the last surface colour crossed — a glass monolith
+    /// stays glass all the way down.
+    #[test]
+    fn interior_inherits_surface_colour() {
+        let scene = scene_with(|g| {
+            g.set_rect(
+                IVec3::new(40, 60, 100),
+                IVec3::new(44, 68, 180),
+                Some(GLASS),
+            );
+        });
+        // Precondition: mid-run cells really are colour-less interior.
+        let g = scene.grids().next().expect("one grid").1;
+        assert_eq!(
+            g.voxel_color(IVec3::new(42, 64, 140)),
+            None,
+            "test premise: interior cells carry no colour"
+        );
+
+        let src = DVec3::new(42.5, 64.5, 90.0); // above the monolith
+        let dst = DVec3::new(42.5, 64.5, 140.0); // buried inside it
+        let map = [(GLASS.rgb_part(), GLASS_ID)];
+        let table = [(GLASS_ID, 0.3f32)];
+        let plain = path_thickness(&scene, src, dst);
+        let weighted = path_thickness_weighted(&scene, src, dst, &map, &table);
+        assert!((plain - 40.0).abs() < 1e-6, "40 buried voxels: {plain}");
+        assert!(
+            (weighted - plain * 0.3).abs() < 1e-6,
+            "interior inherited the glass surface weight: {weighted}"
+        );
     }
 }

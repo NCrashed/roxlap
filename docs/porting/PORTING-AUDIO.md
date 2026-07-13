@@ -15,7 +15,9 @@ demo showcase (`--features audio`), book Audio chapter. User listening
 pass passed ("работает отлично"). Purely additive to the workspace
 (new crate + a demo feature + a book chapter) ⇒ folds into the next
 minor cut. Owed beyond the stage: wasm audio, Doppler, HRTF,
-per-material acoustics (all noted as deferred below).
+per-material acoustics (all noted as deferred below). **2026-07-13:
+macro-stage AU2 (per-material + Doppler + gallery tab; wasm still
+deferred) — entry doc at the END of this file.**
 
 - AU.0 — LANDED 2026-07-07: `roxlap-audio` crate (workspace member,
   cavegen-style metadata); `AcousticsConfig` / `SourceAcoustics`;
@@ -284,3 +286,123 @@ Sound that *knows about the voxels*:
    demo (retro engine, retro bleeps), but keep the asset path open:
    `StaticSoundData::from_cursor` loads ogg/wav if the maintainer
    drops real files in later.
+
+---
+
+# Macro-stage AU2 — per-material acoustics, reverb character, Doppler, gallery tab
+
+Entry written 2026-07-13, right after the 0.27.0 cut. Scoped with the
+user: the **deep** per-material form (absorption AND reverb
+character), the deferred scene-demo audio tab, and a DIY Doppler.
+**wasm audio stays deferred** (explicitly excluded from this wave);
+HRTF stays rejected (AU decision — Fyrox infra drag).
+
+## Status
+
+- AU2.0 — LANDED 2026-07-13: `AcousticsConfig` grew `material_map` +
+  `absorption` (plain data, defaults empty); new
+  `path_thickness_weighted` (public) shares one walk with
+  `path_thickness` — per solid cell, `Vxl::voxel_color` → material →
+  multiplier, interior cells carry the last surface colour forward
+  (1.0 before the first); `source_acoustics` routes through it.
+  Activation gate = non-empty `absorption` (a map alone changes
+  nothing); the empty-table path multiplies by an exact `1.0`, so all
+  22 pre-AU2 pinned tests pass untouched. New tests (3): bit-identity
+  (`to_bits` on the walk + config equality), glass wall = exactly
+  0.3× thickness + higher transmission + unmapped-id no-op, and the
+  interior carry-forward on a glass monolith (with a precondition
+  assert that mid-run cells really are colour-less). roxlap-audio
+  grew a `roxlap-formats` dep (`material_for_color`). 25 tests,
+  clippy 0.
+- AU2.1 — reverb character (per-material damping): NOT STARTED
+- AU2.2 — Doppler: NOT STARTED
+- AU2.3 — scene-demo Audio tab: NOT STARTED
+- AU2.4 — docs: NOT STARTED
+
+## Locked design decisions
+
+1. **Material tables are plain data on the configs**, the DT
+   side-table pattern (`DebrisSystem::set_fracture_patterns`):
+   `AcousticsConfig` grows `material_map: Vec<(Rgb, u8)>` — the SAME
+   colour→material terrain map the renderer and the debris system
+   already take — plus `absorption: Vec<(u8, f32)>`, a material →
+   effective-thickness multiplier (stone 1.0, glass/crystal ~0.35;
+   unmapped = 1.0). **Empty tables must stay bit-identical to today**
+   — the AU tests pin exact values and must pass untouched.
+2. **Weighted thickness** (AU2.0): `grid_thickness` samples the voxel
+   colour of each SOLID cell it crosses (colour → material → weight;
+   effective thickness = Σ segment × weight). The `.vxl` format
+   stores surface colours only, so interior cells inherit the last
+   colour seen along the ray (the same carry-forward
+   `Island::build`/`voxel_color` convention); before any coloured
+   cell the weight is 1.0. Keep the one-entry chunk borrow; only
+   sample colour for solid cells.
+3. **Reverb character** (AU2.1): `probe_cavity` already receives
+   `RayHit.color` per wall hit — classify each hit through the same
+   map; `CavityConfig` grows `material_map` + `damping_override:
+   Vec<(u8, f32)>`. The probe's effective damping = mean over hit
+   rays of the per-material damping (unmapped/no-colour hits use
+   `cfg.damping`); rides the existing `(3·old + new)/4` smoothing
+   into `ListenerAcoustics.reverb_damping`. A glass cavern rings
+   brighter than a stone one.
+4. **Doppler is core-computed, backend-applied** (AU2.2): pure
+   `doppler_factor(source_pos, source_vel, listener_pos,
+   listener_vel, speed_of_sound) -> f32`, clamped to `[0.5, 2.0]`;
+   `AudioOut` grows a **default-no-op** `set_source_pitch(id,
+   factor)` (existing backends keep compiling); `KiraAudio` maps it
+   to `set_playback_rate` with the house ~120 ms tween. Speed of
+   sound is a knob (default 90 u/s — audible against 60 u/s
+   bullets). Pitch-bending a one-shot mid-boom sounds wrong — hosts
+   should apply Doppler to loops and long tails (demo: crystal hums
+   vs a moving listener).
+5. **Gallery tab** (AU2.3): scene-demo grows an optional `audio`
+   feature mirroring the cave demo's, plus an Audio scene: sealed
+   room + doorway + open field + cavern, one looping synth source per
+   zone, HUD readout of transmission / openness / damping — the
+   `book_audio` numbers made walkable.
+
+## Substages
+
+- **AU2.0 — weighted thickness (roxlap-audio).** Tables on
+  `AcousticsConfig`; colour sampler + carry-forward in
+  `grid_thickness`; `source_acoustics` unchanged on empty tables.
+  Tests: empty tables bit-identical (existing pinned tests
+  untouched); a glass wall vs a stone wall of equal thickness →
+  higher transmission; interior carry-forward pinned (thick wall,
+  surface colour rules the interior).
+- **AU2.1 — reverb character (roxlap-audio).** Tables on
+  `CavityConfig`; per-hit classification in `probe_cavity` (returns
+  effective damping in `CavityProbe`); estimator smooths it. Tests:
+  glass box vs stone box damping; empty tables identical; mixed-wall
+  box averages.
+- **AU2.2 — Doppler.** `doppler_factor` + `AudioOut::set_source_pitch`
+  (default no-op) + `KiraAudio` impl; cave demo: the listener's own
+  velocity vs the crystal hums (fly past a crystal — the hum bends).
+  Tests: approaching > 1 > receding; symmetric at equal speeds;
+  clamps; zero velocity = 1 exactly.
+- **AU2.3 — scene-demo Audio tab** (behind `audio`): the walkable
+  scene above; F1 HUD lines for the live numbers.
+- **AU2.4 — docs.** Book Audio chapter grows "Materials & Doppler"
+  (extend `book_audio` — still device-free); CHANGELOG; this status;
+  memory note.
+
+## Hazards
+
+1. **Pinned-value tests.** The AU test suite pins exact floats;
+   AU2.0/2.1 must route empty-table paths through the EXACT same
+   arithmetic (no reordering of float ops).
+2. **Colour lookups cost more than solid tests.** `voxel_color` walks
+   the slab chain per cell; keep it gated on solid cells only and
+   behind the chunk borrow. Audio rays are short and ~4 Hz per
+   source — fine — but re-profile the demo tick with ACTIVE tables.
+   **OWED at AU2.3** (maintainer review): AU2.0 landed core-only, no
+   demo wires the tables yet — the profile is honest only once the
+   gallery tab (or the cave demo) runs weighted queries per tick.
+3. **Interior cells have no colour** — the carry-forward starts
+   empty; a segment entering solid mid-wall (buried source) weights
+   1.0 until the first coloured cell. Accepted; document on the
+   config.
+4. **Doppler on one-shots** reads as a glitch, not physics — the API
+   is per-source, the guidance (docs + demo) applies it to loops.
+5. **kira playback-rate units** — factor is a ratio (1.0 = neutral);
+   tween it like the other params or fast flybys zipper.
