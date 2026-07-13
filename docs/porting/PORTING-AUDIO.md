@@ -297,6 +297,12 @@ character), the deferred scene-demo audio tab, and a DIY Doppler.
 **wasm audio stays deferred** (explicitly excluded from this wave);
 HRTF stays rejected (AU decision — Fyrox infra drag).
 
+**Semver: this wave's cut is 0.28.0 (minor), never a patch** —
+AU2.0/2.1 grew public config structs and added a `pub` field to
+`CavityProbe` (Copy + PartialEq: exhaustive destructuring downstream
+breaks). Source-level breaking only, the EV `Material.emissive`
+class — minor per house policy (maintainer review).
+
 ## Status
 
 - AU2.0 — LANDED 2026-07-13: `AcousticsConfig` grew `material_map` +
@@ -314,7 +320,25 @@ HRTF stays rejected (AU decision — Fyrox infra drag).
   assert that mid-run cells really are colour-less). roxlap-audio
   grew a `roxlap-formats` dep (`material_for_color`). 25 tests,
   clippy 0.
-- AU2.1 — reverb character (per-material damping): NOT STARTED
+- AU2.1 — LANDED 2026-07-13: `CavityConfig` grew `material_map` +
+  `damping_override` (activation gate = non-empty override; the
+  `damping` field is now "the default material's damping" + the
+  fallback for unmapped/colour-less hits). `CavityProbe` grew
+  `damping`: mean per-material damping over hit rays
+  (`RayHit.color` → `material_for_color` → override entry); the
+  estimator smooths it like the other probe fields — EXCEPT the
+  empty-table case, which passes the config constant through
+  untouched (blending a constant with itself can drift a ULP; the
+  legacy contract is exact, pinned via `to_bits` through TWO updates
+  so the blend branch is exercised). `ListenerAcoustics
+  .reverb_damping` = the smoothed probe value. Tests (3): legacy
+  bit-exactness; glass box (0.1) vs stone box (default) + the value
+  reaching listener params; mixed-wall averaging. Test-infra note:
+  the AU-era `room()` helper CARVES its interior — carved faces are
+  zero-RGB (colour-less) and unclassifiable, so AU2.1 tests build a
+  `boxed_room` from six painted slabs instead (the same reason the
+  cave demo's crater walls needed an explicit colfunc). 28 audio
+  tests, clippy 0.
 - AU2.2 — Doppler: NOT STARTED
 - AU2.3 — scene-demo Audio tab: NOT STARTED
 - AU2.4 — docs: NOT STARTED

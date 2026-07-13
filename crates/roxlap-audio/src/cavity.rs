@@ -15,7 +15,8 @@
 //! per *update*, so a faster cadence converges faster.
 
 use glam::DVec3;
-use roxlap_scene::Scene;
+use roxlap_formats::material::material_for_color;
+use roxlap_scene::{Rgb, Scene};
 
 /// Tuning knobs for the cavity probe + the reverb mapping.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,9 +45,30 @@ pub struct CavityConfig {
     /// threshold makes that read as *fully dry* instead of half-wet.
     /// Default `0.5`; a sealed cavern (openness `0`) is unaffected.
     pub outdoor_openness: f32,
-    /// Reverb damping (high-frequency loss), passed through to the
-    /// backend unmodified. Per-material damping is future work.
+    /// Reverb damping (high-frequency loss) of the **default**
+    /// material — used verbatim when
+    /// [`damping_override`](Self::damping_override) is empty, and as
+    /// the fallback for unmapped materials / colour-less wall hits
+    /// when it is not (AU2.1).
     pub damping: f32,
+    /// AU2.1 — the host's colour→material terrain map (the SAME map
+    /// [`crate::AcousticsConfig::material_map`] and the renderer
+    /// take), classifying the wall cells the probe rays hit. Only
+    /// consulted when [`damping_override`](Self::damping_override) is
+    /// non-empty.
+    pub material_map: Vec<(Rgb, u8)>,
+    /// AU2.1 — material id → reverb damping for walls of that
+    /// material: the probe's effective damping is the **mean over hit
+    /// rays** (a glass cavern at `0.1` rings brighter than stone at
+    /// the default). Unmapped materials and colour-less hits (carved
+    /// faces, bedrock) fall back to [`damping`](Self::damping).
+    /// **Empty (the default) keeps the exact legacy behaviour** —
+    /// `reverb_damping` passes [`damping`](Self::damping) through
+    /// bit-identically, no classification runs. Colours absent from
+    /// the map classify as material `0`, so an entry for id `0` here
+    /// re-damps every unmapped-but-coloured wall (the engine-wide
+    /// "0 = default material" convention).
+    pub damping_override: Vec<(u8, f32)>,
     /// Fraction of the OLD smoothed value kept per
     /// [`CavityEstimator::update`] — `0.75` is the prior art's
     /// `(3·old + new) / 4`. `0` disables smoothing.
@@ -63,6 +85,8 @@ impl Default for CavityConfig {
             max_wet: 0.5,
             outdoor_openness: 0.5,
             damping: 0.4,
+            material_map: Vec::new(),
+            damping_override: Vec::new(),
             smoothing: 0.75,
         }
     }
@@ -86,6 +110,12 @@ pub struct CavityProbe {
     /// Fraction of rays that escaped the probe radius, `0..=1` —
     /// `0` = sealed cavern, `~0.5` = standing on open ground.
     pub openness: f32,
+    /// AU2.1 — effective reverb damping of the surrounding walls: the
+    /// mean per-material damping over hit rays (see
+    /// [`CavityConfig::damping_override`]). Exactly
+    /// [`CavityConfig::damping`] when the override table is empty or
+    /// no ray hit anything.
+    pub damping: f32,
 }
 
 /// Smoothed reverb parameters for the listener's surroundings,
@@ -99,7 +129,9 @@ pub struct ListenerAcoustics {
     pub openness: f32,
     /// Reverb feedback (decay): bigger enclosed space ⇒ longer tail.
     pub reverb_feedback: f32,
-    /// Reverb damping, straight from [`CavityConfig::damping`].
+    /// Reverb damping — AU2.1: the smoothed per-material wall damping
+    /// (see [`CavityConfig::damping_override`]); exactly
+    /// [`CavityConfig::damping`] when no override table is set.
     pub reverb_damping: f32,
     /// Reverb wet mix, `0..=1`: scaled down by openness so outdoor
     /// sound stays dry.
@@ -122,8 +154,13 @@ pub struct ListenerAcoustics {
 #[must_use]
 pub fn probe_cavity(scene: &Scene, listener: DVec3, cfg: &CavityConfig) -> CavityProbe {
     let rays = cfg.rays.max(4);
+    // AU2.1 — wall-material classification only runs with a non-empty
+    // override table; the empty default skips it entirely (legacy
+    // behaviour, `damping` passed through bit-identically).
+    let classify = !cfg.damping_override.is_empty();
     let mut path_sum = 0.0f64;
     let mut hit_sum = 0.0f64;
+    let mut damp_sum = 0.0f64;
     let mut escaped = 0u32;
     for k in 0..rays {
         let dir = golden_spiral_dir(k, rays);
@@ -131,6 +168,12 @@ pub fn probe_cavity(scene: &Scene, listener: DVec3, cfg: &CavityConfig) -> Cavit
             Some(hit) => {
                 path_sum += hit.t;
                 hit_sum += hit.t;
+                if classify {
+                    // Colour-less hits (carved faces, bedrock) fall
+                    // back to the default-material damping.
+                    let d = hit.color.map_or(cfg.damping, |c| resolve_damping(cfg, c.0));
+                    damp_sum += f64::from(d);
+                }
             }
             None => {
                 path_sum += cfg.max_ray_dist;
@@ -148,7 +191,23 @@ pub fn probe_cavity(scene: &Scene, listener: DVec3, cfg: &CavityConfig) -> Cavit
             (hit_sum / f64::from(hits)) as f32
         },
         openness: escaped as f32 / rays as f32,
+        damping: if !classify || hits == 0 {
+            cfg.damping
+        } else {
+            (damp_sum / f64::from(hits)) as f32
+        },
     }
+}
+
+/// AU2.1 — the reverb damping of a wall colour: colour → material id
+/// (unmapped ⇒ `0`, the engine convention) → override entry, else the
+/// config's default damping.
+fn resolve_damping(cfg: &CavityConfig, colour: u32) -> f32 {
+    let id = material_for_color(&cfg.material_map, colour);
+    cfg.damping_override
+        .iter()
+        .find(|&&(m, _)| m == id)
+        .map_or(cfg.damping, |&(_, d)| d)
 }
 
 /// Direction `k` of an `n`-point golden-spiral sphere covering — the
@@ -208,6 +267,16 @@ impl CavityEstimator {
                 enclosed_free_path: prev.enclosed_free_path * s
                     + raw.enclosed_free_path * (1.0 - s),
                 openness: prev.openness * s + raw.openness * (1.0 - s),
+                // AU2.1 — the material damping rides the same smoothing;
+                // with an empty override table the raw value IS the
+                // config constant, passed through untouched (blending a
+                // constant with itself could drift a ULP — the legacy
+                // contract is exact).
+                damping: if self.cfg.damping_override.is_empty() {
+                    raw.damping
+                } else {
+                    prev.damping * s + raw.damping * (1.0 - s)
+                },
             },
         };
         self.smoothed = Some(sm);
@@ -233,7 +302,9 @@ impl CavityEstimator {
             openness: p.openness,
             reverb_feedback: self.cfg.min_feedback
                 + (self.cfg.max_feedback - self.cfg.min_feedback) * size_norm,
-            reverb_damping: self.cfg.damping,
+            // AU2.1 — the probe's material-classified damping (exactly
+            // `cfg.damping` when the override table is empty).
+            reverb_damping: p.damping,
             reverb_mix: self.cfg.max_wet * enclosure,
         }
     }
@@ -404,5 +475,126 @@ mod tests {
         let cfg = CavityConfig::default();
         let (scene, c) = room(16, IVec3::new(64, 64, 128));
         assert_eq!(probe_cavity(&scene, c, &cfg), probe_cavity(&scene, c, &cfg));
+    }
+
+    // ---------- AU2.1: per-material reverb character ----------
+
+    const GLASS: VoxColor = VoxColor(0x80_40_C0_E0);
+    const GLASS_ID: u8 = 7;
+
+    /// A sealed room built from six PAINTED slabs (never carved — a
+    /// carve leaves zero-RGB faces the probe couldn't classify): the
+    /// walls' surface cells keep their authored colour.
+    fn boxed_room(side: i32, c: IVec3, col: VoxColor) -> (Scene, DVec3) {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).expect("grid just added");
+        let h = side / 2;
+        let (lo, hi) = (c - IVec3::splat(h), c + IVec3::splat(h));
+        for ax in 0..3 {
+            for side in 0..2 {
+                let mut slo = lo - IVec3::splat(2);
+                let mut shi = hi + IVec3::splat(2);
+                if side == 0 {
+                    shi[ax] = lo[ax] - 1;
+                } else {
+                    slo[ax] = hi[ax] + 1;
+                }
+                g.set_rect(slo, shi, Some(col));
+            }
+        }
+        let centre = DVec3::new(
+            f64::from(c.x) + 0.5,
+            f64::from(c.y) + 0.5,
+            f64::from(c.z) + 0.5,
+        );
+        (scene, centre)
+    }
+
+    fn glassy_cfg() -> CavityConfig {
+        CavityConfig {
+            material_map: vec![(GLASS.rgb_part(), GLASS_ID)],
+            damping_override: vec![(GLASS_ID, 0.1)],
+            ..CavityConfig::default()
+        }
+    }
+
+    /// Empty override table = the exact legacy path: probe damping and
+    /// the estimator's smoothed output both pass `cfg.damping` through
+    /// bit-for-bit (a map alone changes nothing).
+    #[test]
+    fn empty_override_damping_is_legacy_exact() {
+        let (scene, c) = boxed_room(16, IVec3::new(64, 64, 128), GLASS);
+        let cfg = CavityConfig {
+            material_map: vec![(GLASS.rgb_part(), GLASS_ID)],
+            ..CavityConfig::default()
+        };
+        let p = probe_cavity(&scene, c, &cfg);
+        assert_eq!(p.damping.to_bits(), cfg.damping.to_bits());
+
+        let mut est = CavityEstimator::new(cfg.clone());
+        let a = est.update(&scene, c);
+        let b = est.update(&scene, c); // second update takes the blend branch
+        assert_eq!(a.reverb_damping.to_bits(), cfg.damping.to_bits());
+        assert_eq!(b.reverb_damping.to_bits(), cfg.damping.to_bits());
+    }
+
+    /// A glass cavern rings brighter than a stone one: the override
+    /// classifies its walls to 0.1 damping, while the stone room's
+    /// unmapped colour keeps the default.
+    #[test]
+    fn glass_cavern_rings_brighter_than_stone() {
+        let cfg = glassy_cfg();
+        let (glass, gc) = boxed_room(16, IVec3::new(64, 64, 128), GLASS);
+        let (stone, sc) = boxed_room(16, IVec3::new(64, 64, 128), STONE);
+
+        let pg = probe_cavity(&glass, gc, &cfg);
+        let ps = probe_cavity(&stone, sc, &cfg);
+        assert_eq!(pg.openness, 0.0, "sealed glass box");
+        assert!(
+            (pg.damping - 0.1).abs() < 1e-4,
+            "all-glass walls take the override: {}",
+            pg.damping
+        );
+        assert_eq!(
+            ps.damping.to_bits(),
+            cfg.damping.to_bits(),
+            "unmapped stone keeps the default"
+        );
+
+        let mut est = CavityEstimator::new(cfg);
+        let a = est.update(&glass, gc);
+        assert!(
+            a.reverb_damping < 0.15,
+            "the mapped damping reaches the listener params: {}",
+            a.reverb_damping
+        );
+    }
+
+    /// A room with mixed walls averages: half glass, half stone lands
+    /// strictly between the two pure rooms.
+    #[test]
+    fn mixed_walls_average_damping() {
+        let cfg = glassy_cfg();
+        // Glass box, then repaint one half (x > centre) in stone by
+        // overlaying stone slabs on the inside faces of that half.
+        let c = IVec3::new(64, 64, 128);
+        let (mut scene, centre) = boxed_room(16, c, GLASS);
+        {
+            let id = scene.grids().next().expect("one grid").0;
+            let g = scene.grid_mut(id).expect("grid");
+            // A stone wall replacing the +x face, inside the room.
+            g.set_rect(
+                IVec3::new(c.x + 7, c.y - 10, c.z - 10),
+                IVec3::new(c.x + 7, c.y + 10, c.z + 10),
+                Some(STONE),
+            );
+        }
+        let p = probe_cavity(&scene, centre, &cfg);
+        assert!(
+            p.damping > 0.11 && p.damping < 0.39,
+            "mixed walls land between glass (0.1) and stone (0.4): {}",
+            p.damping
+        );
     }
 }
