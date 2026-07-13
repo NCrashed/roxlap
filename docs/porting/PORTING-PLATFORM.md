@@ -112,7 +112,28 @@ top to bottom before touching code.
     workspace rustdoc -D warnings, wasm check+clippy both variants
     (only the 2 pre-existing lints). Owed: the user's manual browser
     check (press P over a wall → coordinates in the console).
-- PW.2 — CI matrix (macOS + aarch64 + wasm-audio check): NOT STARTED
+- PW.2 — LANDED 2026-07-13: CI matrix per decision 5.
+  - Two new jobs: `test-macos` (macos-latest, Apple Silicon) and
+    `test-linux-arm` (ubuntu-24.04-arm), both running the standard
+    `cargo test --workspace --release --exclude roxlap-sdl-demo`. The
+    two first-time-proofs (DDA hash portability on ARM; GPU tests
+    under Metal) are called out in the job comment with the agreed
+    responses (pin per-arch / scope mac to build-only).
+  - wasm-check UPGRADED check → clippy (`components: clippy` on the
+    pinned nightly) and split into two invocations: default-feature
+    web crates, then the audio stack
+    (`roxlap-cave-web/audio + roxlap-audio/kira` — the PW.0 gate).
+    The three wasm-only pedantic lints that had accumulated unseen
+    (check never ran clippy) are FIXED: cpu.rs `new_from_canvas`
+    takes `&canvas` (needless_pass_by_value; internal call site only
+    — the public `new_from_canvas_async` signature is unchanged), and
+    `map(...).unwrap_or(4)` → `map_or(4, ...)` in BOTH web demos'
+    `navigator_hardware_concurrency` (the roxlap-web copy was
+    invisible until the audio-stack invocation ran it).
+  - Verified locally: both clippy invocations with the exact CI
+    RUSTFLAGS pass clean under the pinned nightly; fmt + native
+    clippy green; YAML parses (11 jobs). Owed: watching the FIRST
+    mac + ARM runs on push (decision 6's experiment).
 - PW.3 — docs + close: NOT STARTED
 
 ## Audit facts the design leans on (verified 2026-07-13)

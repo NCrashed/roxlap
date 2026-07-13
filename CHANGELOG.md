@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dynamic sprite API, and — with `--features audio` —
   distance-culled crystal hums with Doppler.
 
+### CI
+
+- **Architecture matrix** (PW.2): new `test-macos` (Apple Silicon) and
+  `test-linux-arm` (ubuntu-24.04-arm) jobs run the full test suite;
+  the wasm job upgraded from `check` to `clippy` and now also gates
+  the browser audio stack (`roxlap-cave-web --features audio` +
+  `roxlap-audio --features kira` on wasm32). Three wasm-only pedantic
+  lints that had accumulated unseen are fixed.
+
 ### Fixed
 
 - `roxlap-cave-web`: the spawn "bubble" **inserted** a solid painted

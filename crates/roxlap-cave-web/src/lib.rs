@@ -808,8 +808,7 @@ fn navigator_hardware_concurrency() -> usize {
     web_sys::window()
         .as_ref()
         .map(web_sys::Window::navigator)
-        .map(|n| n.hardware_concurrency() as usize)
-        .unwrap_or(4)
+        .map_or(4, |n| n.hardware_concurrency() as usize)
         .clamp(1, 16)
 }
 

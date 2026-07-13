@@ -39,7 +39,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   wasm-check:
-    name: cargo check (wasm32 web crates)
+    name: cargo clippy (wasm32 web crates)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,32 +51,41 @@ jobs:
           targets: wasm32-unknown-unknown
           # nightly cargo honours the [unstable] build-std table in
           # .cargo/config.toml, which rebuilds std from rust-src.
-          components: rust-src
+          components: rust-src, clippy
       - uses: Swatinem/rust-cache@v2
       # CC.4 lesson: `roxlap-web` / `roxlap-cave-web` are
       # `#![cfg(target_arch = "wasm32")]` — on native targets their
       # whole body is cfg'd away, so the workspace clippy job only
       # PARSES them and type errors ship silently (the colour-newtype
       # migration missed both, and nothing noticed). This wasm32
-      # check is the type gate. It must run on the SAME pinned
-      # nightly as the web crates' rust-toolchain.toml: stable rustc
-      # applies unstable target features to codegen but does NOT
-      # reflect them in cfg(target_feature = ...), so
-      # wasm-bindgen-rayon's atomics compile_error! fires on stable
-      # no matter what RUSTFLAGS say. (Full linking/build-std still
-      # stays a local trunk concern — this job only type-checks.)
-      - run: cargo check -p roxlap-web -p roxlap-cave-web --target wasm32-unknown-unknown
+      # job is the type + lint gate (PW.2 upgraded check → clippy:
+      # two wasm-only pedantic lints had accumulated unseen). It must
+      # run on the SAME pinned nightly as the web crates'
+      # rust-toolchain.toml: stable rustc applies unstable target
+      # features to codegen but does NOT reflect them in
+      # cfg(target_feature = ...), so wasm-bindgen-rayon's atomics
+      # compile_error! fires on stable no matter what RUSTFLAGS say.
+      # (Full linking/build-std still stays a local trunk concern —
+      # this job never links.)
+      #
+      # Two invocations: the default-feature web crates, then the
+      # audio stack (PW.0 gate — cave-web with `audio` pulls
+      # roxlap-audio/kira, whose cpal switches to the wasm-bindgen
+      # WebAudio backend on this target).
+      - run: cargo clippy -p roxlap-web -p roxlap-cave-web --target wasm32-unknown-unknown
         env:
           # The workflow-global RUSTFLAGS env OVERRIDES
           # .cargo/config.toml's [target.wasm32-unknown-unknown]
           # rustflags, silently dropping the +atomics feature set
           # that wasm-bindgen-rayon compile_error!-asserts on — so
           # re-state the target features here alongside -D warnings.
-          # (Type-check only: no linking, so the config's link-args
-          # and the nightly build-std std rebuild aren't needed.
-          # rustc's "unstable feature ... atomics" note is a
-          # driver warning without a lint name; -D warnings does
-          # not promote it.)
+          # (No linking, so the config's link-args and the nightly
+          # build-std std rebuild aren't needed. rustc's "unstable
+          # feature ... atomics" note is a driver warning without a
+          # lint name; -D warnings does not promote it.)
+          RUSTFLAGS: -D warnings -C target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals
+      - run: cargo clippy -p roxlap-cave-web -p roxlap-audio --features roxlap-cave-web/audio,roxlap-audio/kira --target wasm32-unknown-unknown
+        env:
           RUSTFLAGS: -D warnings -C target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals
 
   test:
@@ -92,6 +101,34 @@ jobs:
       # (`--all-targets`), so API breakage against `roxlap-render` is
       # caught. (To link it in CI instead, `apt-get install libsdl2-dev`
       # here, or add the sdl2 `bundled` feature for a self-contained build.)
+      - run: cargo test --workspace --release --exclude roxlap-sdl-demo
+
+  # PW.2 — architecture matrix: Apple Silicon and Linux aarch64 run
+  # the same full test suite as the x86_64 `test` job. Two
+  # first-time-proofs ride on these (PORTING-PLATFORM.md decision 6):
+  # DDA hash-test bit-portability across x86/ARM (the tests are plain
+  # IEEE f32 — a red hash test here is a FINDING to pin per-arch, not
+  # a broken branch), and the GPU suite under Metal on the mac runner
+  # (GPU tests self-skip without an adapter; if Metal proves flaky in
+  # CI, scope test-macos to build-only rather than deleting it).
+  test-macos:
+    name: cargo test (macOS aarch64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Same exclusion rationale as `test`: roxlap-sdl-demo links
+      # system SDL2, absent on the runners.
+      - run: cargo test --workspace --release --exclude roxlap-sdl-demo
+
+  test-linux-arm:
+    name: cargo test (Linux aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --release --exclude roxlap-sdl-demo
 
   msrv:

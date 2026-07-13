@@ -1908,7 +1908,7 @@ impl SceneRenderer {
             }
         }
         Self::from_backend(BackendImpl::Cpu(Box::new(CpuBackend::new_from_canvas(
-            canvas, size, opts,
+            &canvas, size, opts,
         ))))
     }
 

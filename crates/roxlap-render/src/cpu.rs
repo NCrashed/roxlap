@@ -608,13 +608,13 @@ impl CpuBackend {
     /// in the browser).
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn new_from_canvas(
-        canvas: web_sys::HtmlCanvasElement,
+        canvas: &web_sys::HtmlCanvasElement,
         size: (u32, u32),
         opts: &RenderOptions,
     ) -> Self {
         let (w, h) = (size.0.max(1), size.1.max(1));
-        let blit = crate::cpu_blit::WebGlBlit::new(&canvas, w, h)
-            .expect("roxlap-render: WebGL2 blit init");
+        let blit =
+            crate::cpu_blit::WebGlBlit::new(canvas, w, h).expect("roxlap-render: WebGL2 blit init");
         Self::assemble(blit, size, opts)
     }
 
