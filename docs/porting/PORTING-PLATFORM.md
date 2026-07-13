@@ -134,7 +134,25 @@ top to bottom before touching code.
     RUSTFLAGS pass clean under the pinned nightly; fmt + native
     clippy green; YAML parses (11 jobs). Owed: watching the FIRST
     mac + ARM runs on push (decision 6's experiment).
-- PW.3 — docs + close: NOT STARTED
+- PW.3 — DONE 2026-07-13; **WAVE CLOSED**.
+  - Book: Platforms chapter grew the browser-audio section (the
+    gesture-is-the-constructor rule + the trunk debug-profile trap),
+    the picking-semantics table (CPU sync everywhere / native GPU
+    sync / wasm GPU one-frame poll) and a "What CI actually proves"
+    section (3-arch test matrix = the bit-identical claim is gated;
+    wasm clippy gate incl. audio stack). Audio chapter's "wasm is a
+    later stage" line replaced with the WebAudio reality + pointer.
+    Picking chapter points at the semantics table; its STALE
+    "roxlap has no character controller yet" section (predating CC,
+    0.23.0) rewritten to point at `CharacterBody`.
+  - CHANGELOG had the PW entries already (0b features/fixes, PW.1
+    picking, PW.2 CI); PW.3 adds the docs line.
+  - All wave-end owed items resolved: browser listening pass (PW.0),
+    parity pass (PW.0b), P-probe pick check (PW.1), first mac + ARM
+    CI runs (PW.2) — ALL PASSED/GREEN per the user. The two
+    first-time-proofs came back clean: DDA hashes ARE bit-portable
+    to ARM (no per-arch pinning needed), and the mac job holds with
+    the GPU tests as-is (no build-only scoping needed).
 
 ## Audit facts the design leans on (verified 2026-07-13)
 

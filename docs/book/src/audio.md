@@ -116,10 +116,12 @@ fixed pool allocated up front and reused — one-shots steal the oldest
 finished voice when the pool is full; loops hold their slot until
 stopped.
 
-The `kira` backend is native-only and needs an audio device (ALSA on
-Linux). It's off by default, so a plain build pulls in no audio stack
-at all; wasm support (kira runs on WebAudio) is scoped for a later
-stage.
+The `kira` backend needs an audio device (ALSA on Linux; WebAudio in
+the browser — kira runs on wasm out of the box). It's off by default,
+so a plain build pulls in no audio stack at all. The one
+browser-specific rule — construct the audio system **inside a user
+gesture** — lives in the [Platforms](platforms.md) chapter; the cave
+web demo (`trunk serve --features audio`) is the worked example.
 
 ## Materials: glass sounds thin
 

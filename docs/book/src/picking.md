@@ -45,7 +45,10 @@ backend reads an in-memory z-buffer (free), the GPU backend stages
 the depth buffer and blocks on a device poll. That makes it a
 **click-time** call, not a per-frame one — the
 `Feature::FreePickDepth` probe from [chapter 4](rendering.md) is the
-queryable form of this distinction. Two more semantics to know:
+queryable form of this distinction. On the **wasm GPU path** the
+readback cannot block at all, so the pick answers with one frame of
+latency — call it again next frame; the semantics table lives in the
+[Platforms chapter](platforms.md). Two more semantics to know:
 sprites don't occlude the pick (a cursor sprite under the pointer is
 transparent to it), and the depth belongs to the *last rendered*
 frame — pass the camera that frame used.
@@ -70,17 +73,15 @@ Both scene-level queries work headless (tools, servers, AI):
 - **`Grid::voxel_solid` / `voxel_color`** — the point queries from
   [chapter 3](scene-graph.md), for when you already know the grid.
 
-## Collision: the interim pattern
+## Collision: use the controller
 
-roxlap has no character controller yet — a dedicated stage (CC) is
-planned. Until then the demos hand-roll a serviceable pattern:
-per-axis **slide with collision** — propose a movement step, test
-each axis independently with a small-radius voxel probe
-(`voxel_solid` around the player's capsule points), and zero the
-axes that would penetrate. The reference implementation is
-[`roxlap-scene-demo/src/collision.rs`](https://github.com/NCrashed/roxlap/blob/master/crates/roxlap-scene-demo/src/collision.rs)
-(~a screenful of code) — copy it, tune the radius, and expect the CC
-stage to supersede it with a real controller.
+Movement collision is not a picking pattern anymore: the engine ships
+`CharacterBody` — a walking body with move-and-slide collision,
+gravity, jumping and step-up, covered in
+[the scene-graph chapter](scene-graph.md) (with a runnable
+`book_controller` example). Reach for the raw queries on this page
+only for non-character shapes (projectiles want `Scene::raycast`,
+area effects want the point queries).
 
 ## Further reading
 

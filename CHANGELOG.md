@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dynamic sprite API, and — with `--features audio` —
   distance-culled crystal hums with Doppler.
 
+### Docs
+
+- Book: the Platforms chapter covers browser audio (the
+  gesture-is-the-constructor rule), the per-backend picking-semantics
+  table (wasm GPU = one-frame poll), and what the CI matrix proves;
+  the Picking chapter's pre-`CharacterBody` collision advice replaced
+  with a pointer to the engine controller.
+
 ### CI
 
 - **Architecture matrix** (PW.2): new `test-macos` (Apple Silicon) and

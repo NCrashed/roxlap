@@ -32,8 +32,8 @@ The same engine runs on wasm32 — both demos are live proof:
 cd crates/roxlap-web        # engine demo (~360 KB wasm + 18 KB JS)
 trunk serve                 # → http://localhost:8080
 
-cd crates/roxlap-cave-web   # procedural caves + carving (~130 KB wasm)
-trunk serve
+cd crates/roxlap-cave-web   # caves + crystals + carving + crumble
+trunk serve --features audio   # optional: the full soundscape
 ```
 
 Construction differs (there is no raw-window-handle in a browser):
@@ -69,6 +69,59 @@ toolchain pinned in the web crates — `-Z build-std` with atomics;
 plain library consumers on stable are unaffected.) Per-host header
 recipes, mobile touch controls, and the full setup live in
 [`crates/roxlap-web/README.md`](https://github.com/NCrashed/roxlap/blob/master/crates/roxlap-web/README.md).
+
+**Audio.** The `kira` backend runs on WebAudio unchanged — same
+crate, same API as the [Audio chapter](audio.md). The one
+browser-specific rule is the **autoplay policy: the gesture is the
+constructor**. An `AudioContext` created outside a user-gesture
+handler starts suspended and, on some browsers, never recovers — so
+build the audio system *lazily inside* the first click / first touch
+handler, never during init:
+
+```rust,ignore
+// In the click handler — the FIRST user gesture:
+if state.audio.is_none() {
+    state.audio = WebAudio::new();   // constructs KiraAudio HERE
+}
+```
+
+Heavy main-thread frames can starve the browser's audio callback into
+crackling; the demos accept that. If the whole demo stutters, check
+the build profile first — `trunk serve` defaults to a *debug* build,
+and a debug-built renderer is slow enough to read as an engine
+problem (the cave demo's `Trunk.toml` sets `release = true` for this
+reason).
+
+**Picking.** `pick_depth` / `pick` read the GPU depth buffer back,
+and WebGPU has no blocking readback — so the wasm GPU path answers
+with **one frame of latency**: a call submits the readback for its
+pixel and returns the latest *completed* result. Poll it (call again
+next frame); the first call after a click usually returns `None`, and
+the value that eventually arrives may belong to the previously
+requested pixel. Everywhere else picking is synchronous:
+
+| Backend            | `pick_depth` / `pick` semantics            |
+|--------------------|--------------------------------------------|
+| CPU (all targets)  | synchronous — in-memory z-buffer, free     |
+| GPU, native        | synchronous — blocking readback, click-time cost |
+| GPU, wasm          | **one-frame latency** — submit now, poll next frame |
+
+Hosts that need a synchronous answer in the browser keep the CPU
+backend, or skip the depth buffer entirely with the depth-free
+`view_ray` + `Scene::raycast` composition from the
+[Picking chapter](picking.md) — that path is identical on every
+backend and target.
+
+## What CI actually proves
+
+Every push runs the full test suite on **x86_64 Linux, Apple Silicon
+macOS and aarch64 Linux** — the DDA renderer's hash tests are plain
+IEEE `f32` arithmetic and pass bit-identically on all three, so
+"pixel-identical across architectures" is a gated claim, not an
+aspiration. The wasm32 build is type- and lint-gated (`cargo clippy`
+on the pinned nightly, including the browser audio stack); GPU tests
+self-skip on runners without an adapter and run where one exists
+(Metal on the mac runners).
 
 ## Troubleshooting
 
