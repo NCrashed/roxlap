@@ -122,6 +122,127 @@ where
     }
 }
 
+/// Tuning for [`plant_crystals`] — extracted from the native cave demo
+/// (EV.4) so the web demo grows the same crystals from the same code.
+#[derive(Debug, Clone)]
+pub struct CrystalParams {
+    /// Crystal voxel colour (map it to a translucent+emissive material
+    /// on the renderer and to the audio/debris tables for the full
+    /// treatment).
+    pub color: crate::VoxColor,
+    /// Clusters to plant (a guaranteed one counts toward this).
+    pub count: usize,
+    /// Crystal blob radius, voxels ([`crate::Grid::set_sphere`]).
+    pub crystal_radius: u32,
+    /// Hard cutoff of a crystal's baked glow pool, voxels.
+    pub light_radius: f32,
+    /// Bake-light strength (byte gain × distance²; ~2000 = torch,
+    /// ~8000 = cavern beacon).
+    pub light_strength: f32,
+    /// Grow one guaranteed crystal downward from this air voxel (the
+    /// spawn bubble's floor — the player never spawns in the dark).
+    pub guaranteed: Option<IVec3>,
+    /// Seed salt so e.g. two colour presets place differently.
+    pub salt: u64,
+}
+
+/// EV.4 (shared home since PW.0b) — plant glowing crystal clusters on
+/// the cavity walls of a **single-chunk cave** at chunk `(0, 0, 0)`:
+/// deterministic (seed + salt) rejection sampling picks an air voxel,
+/// marches along a random axis to the nearest wall within reach, grows
+/// a crystal blob into it, and registers a [`crate::BakeLight`]
+/// floating just off the surface (so the glow pool spreads over the
+/// wall). Replaces (clears) any previous build's lights — pair with a
+/// [`crate::BakeMode::PointLights`] bake.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn plant_crystals(grid: &mut crate::Grid, seed: u64, params: &CrystalParams) {
+    grid.bake_lights.clear();
+    let side = CHUNK_SIZE_XY as i32;
+    let zmax = crate::CHUNK_SIZE_Z as i32;
+    // xorshift64* — deterministic per (seed, salt), decoupled from the
+    // generator's own noise seeding.
+    let mut state = seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(params.salt)
+        | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    // The six axis directions a crystal can grow along (into the wall).
+    const DIRS: [IVec3; 6] = [
+        IVec3::new(1, 0, 0),
+        IVec3::new(-1, 0, 0),
+        IVec3::new(0, 1, 0),
+        IVec3::new(0, -1, 0),
+        IVec3::new(0, 0, 1),
+        IVec3::new(0, 0, -1),
+    ];
+
+    let plant_at = |grid: &mut crate::Grid, air: IVec3, dir: IVec3| {
+        // March from the air voxel to the wall (≤ 14 voxels away).
+        for k in 1..=14 {
+            let p = air + dir * k;
+            if !(0..side).contains(&p.x)
+                || !(0..side).contains(&p.y)
+                || !(8..zmax - 1).contains(&p.z)
+            {
+                return false;
+            }
+            if grid.voxel_solid(p) {
+                // ANCHOR: bake_light
+                grid.set_sphere(p, params.crystal_radius, Some(params.color));
+                // The light floats in the air a few voxels off the
+                // surface so the pool spreads over the wall around it.
+                let lp = air + dir * (k - 3).max(0);
+                grid.bake_lights.push(crate::BakeLight {
+                    pos: glam::Vec3::new(lp.x as f32, lp.y as f32, lp.z as f32),
+                    radius: params.light_radius,
+                    strength: params.light_strength,
+                });
+                // ANCHOR_END: bake_light
+                return true;
+            }
+        }
+        false
+    };
+    let mut planted = 0;
+    if let Some(spawn) = params.guaranteed {
+        if plant_at(grid, spawn, IVec3::new(0, 0, 1)) {
+            planted += 1;
+        }
+    }
+
+    let mut attempts = 0;
+    while planted < params.count && attempts < 800 {
+        attempts += 1;
+        #[allow(clippy::cast_possible_wrap)]
+        let cand = IVec3::new(
+            (8 + next() % (side as u64 - 16)) as i32,
+            (8 + next() % (side as u64 - 16)) as i32,
+            (24 + next() % 200) as i32,
+        );
+        if grid.voxel_solid(cand) {
+            continue; // need an air pocket to glow into
+        }
+        // Spread the crystals out: reject candidates inside another
+        // light's pool core.
+        let too_close = grid.bake_lights.iter().any(|l| {
+            let d = glam::Vec3::new(cand.x as f32, cand.y as f32, cand.z as f32) - l.pos;
+            d.length_squared() < 24.0 * 24.0
+        });
+        if too_close {
+            continue;
+        }
+        let dir = DIRS[(next() % 6) as usize];
+        if plant_at(grid, cand, dir) {
+            planted += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

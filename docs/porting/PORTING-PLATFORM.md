@@ -50,6 +50,40 @@ top to bottom before touching code.
   crisp-retro upscale. roxlap-web (the legacy demo) has the same
   CPU-res exposure — candidate for the same two-line treatment if
   anyone still exercises it.
+- PW.0b — LANDED 2026-07-13 (user follow-up: "не хватает кристаллов,
+  их гудения и падений островов"): cave-web reaches full parity with
+  the native cave demo.
+  - **Bullets → dynamic sprite API** (prerequisite: the old per-frame
+    `set_sprites` rebuild RESETS the dynamic instance world, which
+    would have deleted debris + particles every frame).
+  - **Crystals**: `plant_crystals` extracted from the native demo into
+    `roxlap_scene::cavegen` (shared fn + `CrystalParams`; the
+    `bake_light` book anchor moved with it, `lighting.md` include
+    repointed, `check-anchors.sh` green). Same colours + salts →
+    identical caves grow identical crystals. Web gets lightmode 2 +
+    `BakeMode::PointLights`, the translucent+emissive material, and
+    `generate_mips` at regen.
+  - **Crumble**: synchronous in-frame (no carve worker on the web —
+    the 128³ cave affords it): per-hit `detect_islands` → immediate
+    `spawn_island` (extraction prevents duplicate re-finds),
+    `DebrisSystem` + landing shatter `ParticleSystem` + booms, model
+    pool compaction every 32 shatters. Carves now relight with
+    `bake_bbox(PointLights)` + `remip_bbox` over the edit extent —
+    closing TWO pre-existing web bugs: whole-chunk `Directional`
+    re-bake (would erase glow pools) and no re-mip after carves. A
+    THIRD found in review: the spawn bubble was `set_sphere(Some(…))`
+    — an INSERTED solid ball, not a carved bubble (same bug class as
+    the PW.0 crater fix).
+  - **Audio**: web `WebAudio` is now the full native `DemoAudio` —
+    crystal hums (distance-culled MAX_HUMS=8, enter 80 / exit 92 /
+    cap-hysteresis 6, occlusion at 4 Hz) + AU2 Doppler from listener
+    velocity (200 u/s teleport guard). `select_near` copied verbatim;
+    its unit tests live in the native demo (this crate is wasm-only).
+  - Verified: wasm32 check + clippy both feature variants (only the 2
+    pre-existing lints), roxlap-scene 234 lib tests, cave-demo 5
+    tests (incl. `crystals_planted_and_lit` against the delegate),
+    rustdoc -D warnings, check-anchors. Owed: the user's browser pass
+    (crystals visible + hums + islands falling).
 - PW.1 — wasm GPU depth-picking: NOT STARTED
 - PW.2 — CI matrix (macOS + aarch64 + wasm-audio check): NOT STARTED
 - PW.3 — docs + close: NOT STARTED

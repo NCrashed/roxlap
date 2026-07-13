@@ -5,18 +5,28 @@
 //! CPU DDA path presented via the facade's WebGL2 blit. The cave
 //! is generated into a single-chunk `roxlap_scene::Scene` grid;
 //! flying, per-voxel collision, and runtime carving all run against
-//! the scene. Plasma bullets are facade **sprites** (small glowing
-//! voxel spheres); on impact they carve a crater into the scene grid
-//! with a local lightmode-1 re-bake, which the facade re-uploads to
-//! the GPU via its per-chunk dirty tracking. `F` cycles the preset,
-//! `R` reseeds — both regenerate the cave in place.
+//! the scene. Plasma bullets are **dynamic sprite instances** (small
+//! glowing voxel spheres); on impact they carve a crater with a local
+//! `PointLights` re-bake, which the facade re-uploads to the GPU via
+//! its per-chunk dirty tracking. `F` cycles the preset, `R` reseeds —
+//! both regenerate the cave in place.
+//!
+//! PW.0b — full parity with the native cave demo: glowing **crystals**
+//! (the shared `roxlap_scene::cavegen::plant_crystals`, translucent +
+//! emissive material, point-light bake) and **floating-island
+//! crumble** — a carve that disconnects a region drops it as a falling
+//! debris sprite that shatters into colour-true particles on landing.
+//! Unlike the native demo there is no carve worker thread: carves,
+//! island detection and the incremental re-mip all run synchronously
+//! in the frame (the 128³ cave keeps that affordable).
 //!
 //! PW.0 — build with the `audio` feature
 //! (`trunk serve --features audio`) for the voxel-aware soundscape:
-//! shots and carve booms muffled by the rock in the way, and cavity
-//! reverb that follows the chamber around you. kira's WebAudio
+//! shots and carve booms muffled by the rock in the way, cavity
+//! reverb that follows the chamber around you, and distance-culled
+//! crystal hums with AU2 Doppler as you fly past. kira's WebAudio
 //! backend starts on the FIRST click/touch (the browser autoplay
-//! policy); no crystal hums here — the web cave has no crystals.
+//! policy).
 
 #![cfg(target_arch = "wasm32")]
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -26,17 +36,19 @@ use std::rc::Rc;
 
 use glam::{DVec3, IVec3};
 use roxlap_cavegen::{BlueCaveGenerator, CaveParams, Generator, MagCaveGenerator, MAXZDIM};
-use roxlap_core::{Camera, Engine, OpticastSettings};
+use roxlap_core::{Camera, Engine, OpticastSettings, ESTNORMRAD};
 use roxlap_formats::kv6::Kv6;
-use roxlap_formats::sprite::{Sprite, SPRITE_FLAG_NO_SHADING};
 use roxlap_formats::vxl;
 use roxlap_render::{
-    Backend, BackendPreference, FrameParams, RenderOptions, SceneRenderer, SpriteInstanceDesc,
-    SpriteSet,
+    Backend, BackendPreference, CollisionMode, DebrisSystem, DynSpriteTransform, FrameParams,
+    Material, ParticleEmitterDef, ParticleSystem, RenderOptions, SceneRenderer, SpriteInstanceId,
+    SpriteModelId,
 };
+use roxlap_scene::cavegen::CrystalParams;
+use roxlap_scene::islands::{detect_islands, FracturePattern, DEFAULT_ISLAND_BUDGET};
 use roxlap_scene::{
-    CharacterBody, CharacterDef, GridId, GridTransform, MoveMode, Rgb, Scene, Solidity, SpanOp,
-    VoxColor, WalkInput,
+    BakeMode, CharacterBody, CharacterDef, GridId, GridTransform, MoveMode, Rgb, Scene, Solidity,
+    SpanOp, VoxColor, WalkInput,
 };
 use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
@@ -70,15 +82,41 @@ const PLAYER_RADIUS: f64 = 0.3;
 const BULLET_MAX_DIST: f64 = 96.0;
 const BULLET_VEL: f64 = 60.0;
 const FIRE_RADIUS: u32 = 4;
-/// Bullet sprite half-extent in voxels (a small glowing sphere).
-const BULLET_SPRITE_RADIUS: u32 = 2;
-const BULLET_COLOR_CORE: VoxColor = VoxColor(0x00FF_4080);
+/// Bullet sphere radius in voxels (mirrors the native demo's glowing
+/// plasma ball).
+const BULLET_SPHERE_RADIUS: u32 = 3;
+const BULLET_COLOR: VoxColor = VoxColor(0x80FF_4080);
 
 const CARVE_COLOR: VoxColor = VoxColor(0x8050_3018);
 const SPAWN_BUBBLE_COLOR: VoxColor = VoxColor(0x8060_6068);
 const SPAWN_BUBBLE_RADIUS: u32 = 6;
 
-const LIGHTMODE: u32 = 1;
+// EV.4 / PW.0b — the crystal treatment, native cave demo's tuning
+// verbatim (the planting itself is the shared
+// `roxlap_scene::cavegen::plant_crystals`).
+const CRYSTAL_COLOR_BLUE: VoxColor = VoxColor(0x8040_E8FF);
+const CRYSTAL_COLOR_MAG: VoxColor = VoxColor(0x80FF_B040);
+/// Terrain material both crystal colours map to: translucent (the
+/// rock ghosts through the gem) + emissive (immune to the bake).
+const CRYSTAL_MATERIAL_ID: u8 = 1;
+const CRYSTAL_COUNT: usize = 16;
+const CRYSTAL_RADIUS: u32 = 3;
+const CRYSTAL_LIGHT_RADIUS: f32 = 32.0;
+const CRYSTAL_LIGHT_STRENGTH: f32 = 6000.0;
+
+// DT / PW.0b — floating-island crumble.
+const CRUMBLE_BUDGET: usize = DEFAULT_ISLAND_BUDGET;
+/// Compact the sprite-model pool every this many shatters (island
+/// models are tombstoned on removal).
+const CRUMBLE_COMPACT_EVERY: u32 = 32;
+/// GPU mip-ladder depth baked into the cave chunk (mirrors the native
+/// demo; the incremental `remip_bbox` after each carve keeps the
+/// renderer's re-upload on the cheap mip read-path).
+const GPU_MIP_LEVELS: u32 = 6;
+
+/// Voxlap lightmode 2 — the dim base the crystal glow pools read
+/// against.
+const LIGHTMODE: u32 = 2;
 
 const FOG_COLOR: u32 = 0x0090_98B0;
 const FOG_MAX_SCAN_DIST: i32 = 128;
@@ -94,6 +132,9 @@ struct Bullet {
     pos: [f64; 3],
     vel: [f64; 3],
     travelled: f64,
+    /// The dynamic sprite instance rendering this bullet; removed on
+    /// despawn.
+    inst: SpriteInstanceId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,9 +176,18 @@ struct State {
     grid: GridId,
     /// Unified CPU/GPU renderer over the canvas.
     renderer: SceneRenderer,
-    /// Glowing bullet sprite model, reused for every live bullet
-    /// instance via the facade's [`SpriteSet`].
-    bullet_model: Sprite,
+    /// Glowing-sphere model every bullet instances; registered once at
+    /// startup via the facade's dynamic sprite API.
+    bullet_model: SpriteModelId,
+    /// One white voxel; every shatter particle instances it, tinted
+    /// with its source voxel's colour.
+    debris_model: SpriteModelId,
+    /// PW.0b — falling detached islands (DT).
+    debris: DebrisSystem,
+    /// PW.0b — landing-shatter particles (DT.4).
+    particles: ParticleSystem,
+    /// Shatters since the last sprite-model-pool compaction.
+    shatters_since_compact: u32,
     cam_pos: [f64; 3],
     /// CC.3 — the engine controller (fly-mode PLAYER_RADIUS cube)
     /// replaces the wasm copy of the per-axis slide; `cam_pos` stays
@@ -230,40 +280,81 @@ fn spawn_centre() -> IVec3 {
 }
 
 /// (Re)generate the cave into the grid's single chunk in place, carve
-/// the spawn bubble, and bake lightmode-1. Editing in place (rather
-/// than building a fresh `Scene`) keeps the same `GridId` so the
-/// facade's GPU residency tracker re-uploads the changed chunk instead
-/// of going stale.
+/// the spawn bubble, plant the crystals, and point-light bake. Editing
+/// in place (rather than building a fresh `Scene`) keeps the same
+/// `GridId` so the facade's GPU residency tracker re-uploads the
+/// changed chunk instead of going stale.
 fn regen_cave(grid: &mut roxlap_scene::Grid, preset: Preset, seed: u64) {
     let vxl = preset.generate(seed);
     *grid.ensure_chunk(IVec3::ZERO) = vxl;
     let c = spawn_centre();
-    grid.set_sphere(c, SPAWN_BUBBLE_RADIUS, Some(SPAWN_BUBBLE_COLOR));
-    grid.bake(roxlap_scene::BakeMode::Directional);
-    // `set_sphere` bumped the version; bump once more so a re-gen with
-    // an identical spawn-bubble edit still differs from the tracker.
+    // PW.0b fix: this was `set_sphere(…, Some(SPAWN_BUBBLE_COLOR))`,
+    // which INSERTS a solid painted ball at the spawn — the player
+    // started buried. Carve the bubble like the native demo, painting
+    // the newly exposed walls.
+    grid.set_sphere_with_colfunc(c, SPAWN_BUBBLE_RADIUS, SpanOp::Carve, |_, _, _| {
+        SPAWN_BUBBLE_COLOR
+    });
+    // EV.4 — plant the glowing crystals (voxels + their bake lights)
+    // BEFORE the bake so the first bake already writes their pools.
+    // Same colours/salts as the native demo → identical caves grow
+    // identical crystals.
+    roxlap_scene::cavegen::plant_crystals(
+        grid,
+        seed,
+        &CrystalParams {
+            color: match preset {
+                Preset::Blue => CRYSTAL_COLOR_BLUE,
+                Preset::Mag => CRYSTAL_COLOR_MAG,
+            },
+            count: CRYSTAL_COUNT,
+            crystal_radius: CRYSTAL_RADIUS,
+            light_radius: CRYSTAL_LIGHT_RADIUS,
+            light_strength: CRYSTAL_LIGHT_STRENGTH,
+            guaranteed: Some(c),
+            salt: match preset {
+                Preset::Blue => 0xB1,
+                Preset::Mag => 0x4A,
+            },
+        },
+    );
+    // EV.4 — point-light bake: the dim lightmode-2 base plus a glow
+    // pool around every crystal.
+    grid.bake(BakeMode::PointLights);
+    // Build the GPU mip ladder up front so re-uploads take the cheap
+    // mip read-path; step_bullets keeps it fresh with remip_bbox.
+    if let Some(vxl) = grid.chunk_mut(IVec3::ZERO) {
+        vxl.generate_mips(GPU_MIP_LEVELS);
+    }
+    // The edits above bumped the version; bump once more so a re-gen
+    // with an identical spawn-bubble edit still differs from the
+    // tracker.
     grid.bump_chunk_version(IVec3::ZERO);
 }
 
-/// Build the bullet sprite model: a small solid glowing sphere. The
-/// `NO_SHADING` flag makes it emissive (uniform bright colour) so it
-/// reads as plasma rather than a lit rock.
-fn build_bullet_model() -> Sprite {
-    let d = BULLET_SPRITE_RADIUS * 2 + 1;
-    let r = BULLET_SPRITE_RADIUS as i32;
-    let kv6 = Kv6::from_fn(d, d, d, |x, y, z| {
-        let dx = x as i32 - r;
-        let dy = y as i32 - r;
-        let dz = z as i32 - r;
-        if dx * dx + dy * dy + dz * dz <= r * r {
-            Some(BULLET_COLOR_CORE)
-        } else {
-            None
-        }
-    });
-    let mut sprite = Sprite::axis_aligned(kv6, [0.0, 0.0, 0.0]);
-    sprite.flags = SPRITE_FLAG_NO_SHADING;
-    sprite
+/// Build the glowing voxel sphere every bullet renders as: a solid
+/// `BULLET_SPHERE_RADIUS`-radius ball of plasma-pink voxels with a
+/// centred pivot (so an instance's position places the ball's centre).
+/// Mirrors the native demo.
+fn build_bullet_kv6() -> Kv6 {
+    let n = BULLET_SPHERE_RADIUS * 2 + 1;
+    let c = n as f32 * 0.5;
+    let r = BULLET_SPHERE_RADIUS as f32 + 0.5;
+    Kv6::from_fn_shaded(n, n, n, |x, y, z| {
+        let dx = x as f32 + 0.5 - c;
+        let dy = y as f32 + 0.5 - c;
+        let dz = z as f32 + 0.5 - c;
+        (dx * dx + dy * dy + dz * dz <= r * r).then_some(BULLET_COLOR)
+    })
+}
+
+/// Identity-orientation sprite pose at world `pos`. The sphere is
+/// rotationally symmetric, so no per-bullet orientation is needed.
+fn bullet_pose(pos: [f64; 3]) -> DynSpriteTransform {
+    DynSpriteTransform {
+        pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32],
+        ..DynSpriteTransform::default()
+    }
 }
 
 // ----- Camera + collision ---------------------------------------------------
@@ -376,10 +467,17 @@ fn fire_bullet(state: &mut State) {
         cam.forward[1] * BULLET_VEL,
         cam.forward[2] * BULLET_VEL,
     ];
+    // The bullet model is registered at startup, so the spawn cannot
+    // see a stale handle.
+    let inst = state
+        .renderer
+        .add_sprite_instance_posed(state.bullet_model, bullet_pose(pos))
+        .expect("bullet model registered");
     state.bullets.push(Bullet {
         pos,
         vel,
         travelled: 0.0,
+        inst,
     });
     // PW.0 — the shot transient at the muzzle, occlusion-shaded.
     #[cfg(feature = "audio")]
@@ -388,42 +486,62 @@ fn fire_bullet(state: &mut State) {
     }
 }
 
-/// Advance bullets, carve craters on impact, and re-bake the cave's
-/// lighting once if anything was carved. Returns `true` if the grid
-/// was edited (so the caller knows the facade will re-upload).
+/// Advance bullets, carve craters on impact, drop any islands the
+/// carve disconnected (synchronous crumble — no worker thread on the
+/// web), relight + re-mip the edited region, and re-pose the surviving
+/// bullet sprites.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn step_bullets(state: &mut State, dt: f64) -> bool {
+fn step_bullets(state: &mut State, dt: f64) {
     if dt <= 0.0 {
-        return false;
+        return;
     }
-    let grid = state.scene.grid(state.grid).expect("cave grid present");
     let vsid = VSID as i32;
     let mut impacts: Vec<IVec3> = Vec::new();
-    state.bullets.retain_mut(|b| {
-        let dx = b.vel[0] * dt;
-        let dy = b.vel[1] * dt;
-        let dz = b.vel[2] * dt;
-        b.pos[0] += dx;
-        b.pos[1] += dy;
-        b.pos[2] += dz;
-        b.travelled += (dx * dx + dy * dy + dz * dz).sqrt();
-        if b.travelled > BULLET_MAX_DIST {
-            return false;
-        }
-        let vx = b.pos[0].floor() as i32;
-        let vy = b.pos[1].floor() as i32;
-        let vz = b.pos[2].floor() as i32;
-        if vx < 0 || vy < 0 || vx >= vsid || vy >= vsid || !(0..MAXZDIM).contains(&vz) {
-            return false;
-        }
-        if grid.voxel_solid(IVec3::new(vx, vy, vz)) {
-            impacts.push(IVec3::new(vx, vy, vz));
-            return false;
-        }
-        true
-    });
+    let mut despawned: Vec<SpriteInstanceId> = Vec::new();
+    {
+        let grid = state.scene.grid(state.grid).expect("cave grid present");
+        state.bullets.retain_mut(|b| {
+            let dx = b.vel[0] * dt;
+            let dy = b.vel[1] * dt;
+            let dz = b.vel[2] * dt;
+            b.pos[0] += dx;
+            b.pos[1] += dy;
+            b.pos[2] += dz;
+            b.travelled += (dx * dx + dy * dy + dz * dz).sqrt();
+            if b.travelled > BULLET_MAX_DIST {
+                despawned.push(b.inst);
+                return false;
+            }
+            let vx = b.pos[0].floor() as i32;
+            let vy = b.pos[1].floor() as i32;
+            let vz = b.pos[2].floor() as i32;
+            if vx < 0 || vy < 0 || vx >= vsid || vy >= vsid || !(0..MAXZDIM).contains(&vz) {
+                despawned.push(b.inst);
+                return false;
+            }
+            if grid.voxel_solid(IVec3::new(vx, vy, vz)) {
+                impacts.push(IVec3::new(vx, vy, vz));
+                despawned.push(b.inst);
+                return false;
+            }
+            true
+        });
+    }
+
+    // Drop the despawned sprite instances, then re-pose the survivors
+    // (one batched upload).
+    for id in despawned {
+        state.renderer.remove_sprite_instance(id);
+    }
+    let updates: Vec<(SpriteInstanceId, DynSpriteTransform)> = state
+        .bullets
+        .iter()
+        .map(|b| (b.inst, bullet_pose(b.pos)))
+        .collect();
+    state.renderer.set_sprite_instance_transforms(&updates);
+
     if impacts.is_empty() {
-        return false;
+        return;
     }
     // PW.0 — impact booms, shaded for the rock in the way (before the
     // carve mutates the grid).
@@ -431,43 +549,115 @@ fn step_bullets(state: &mut State, dt: f64) -> bool {
     if let Some(a) = state.audio.as_mut() {
         a.impacts(&impacts, &state.scene, DVec3::from(state.cam_pos));
     }
-    let grid = state.scene.grid_mut(state.grid).expect("cave grid present");
-    for hit in impacts {
-        // PW.0 drive-by fix: this used `set_sphere(…, Some(CARVE_COLOR))`,
-        // which INSERTS a solid painted ball — the opposite of the
-        // documented crater. Mirror the native demo: carve, painting
-        // the newly exposed crater walls (a plain carve leaves them
-        // black).
-        grid.set_sphere_with_colfunc(hit, FIRE_RADIUS, SpanOp::Carve, |_, _, _| CARVE_COLOR);
+
+    // The batch's edit extent: carve spheres plus the relight's
+    // internal ±ESTNORMRAD brightness writes — feeds the incremental
+    // relight + remip below.
+    let mut lo = IVec3::splat(i32::MAX);
+    let mut hi = IVec3::splat(i32::MIN);
+    {
+        let grid = state.scene.grid_mut(state.grid).expect("cave grid present");
+        for &hit in &impacts {
+            // Newly-exposed crater walls take CARVE_COLOR (a plain
+            // carve would leave them black).
+            grid.set_sphere_with_colfunc(hit, FIRE_RADIUS, SpanOp::Carve, |_, _, _| CARVE_COLOR);
+            let pad = FIRE_RADIUS as i32 + ESTNORMRAD;
+            lo = lo.min(hit - IVec3::splat(pad));
+            hi = hi.max(hit + IVec3::splat(pad));
+        }
     }
-    // Re-bake the (single) chunk's lighting once after all craters so
-    // estnorm shading follows the new cavity walls; the carve already
-    // bumped the chunk version, so the facade re-uploads this frame.
-    grid.bake(roxlap_scene::BakeMode::Directional);
-    true
+
+    // DT — floating-island crumble, synchronous (the native demo does
+    // this on its carve worker; the 128³ web cave affords it in-frame).
+    // Per-hit detect, spawn immediately: `spawn_island` extracts the
+    // island from the grid, so a later hit's flood cannot re-find
+    // (duplicate) it.
+    let r = IVec3::splat(FIRE_RADIUS as i32);
+    for &hit in &impacts {
+        let islands = {
+            let grid = state.scene.grid(state.grid).expect("cave grid present");
+            detect_islands(grid, hit - r, hit + r, CRUMBLE_BUDGET)
+        };
+        for isl in islands {
+            let pad = IVec3::splat(ESTNORMRAD);
+            lo = lo.min(isl.bbox.0 - pad);
+            hi = hi.max(isl.bbox.1 + pad);
+            state
+                .debris
+                .spawn_island(&mut state.scene, state.grid, isl, BakeMode::PointLights);
+        }
+    }
+
+    // Relight just the edited extent (the grid's bake_lights ride
+    // along, so a carve inside a crystal's pool keeps its glow), then
+    // rebuild the mip ladder over the same columns so the facade's
+    // re-upload stays on the cheap mip read-path. (The old code baked
+    // the whole chunk Directional — crystal pools would have been
+    // erased — and never re-mipped at all.)
+    let grid = state.scene.grid_mut(state.grid).expect("cave grid present");
+    grid.bake_bbox(lo, hi, BakeMode::PointLights);
+    if let Some(chunk) = grid.chunk_mut(IVec3::ZERO) {
+        chunk.remip_bbox(lo.x, lo.y, hi.x, hi.y, GPU_MIP_LEVELS);
+    }
+    grid.bump_chunk_version(IVec3::ZERO);
+}
+
+/// DT — advance the falling islands, shatter the landed ones into
+/// colour-true debris particles (each landing booms through the same
+/// occlusion-shaded path as a bullet hit), and periodically compact
+/// the sprite-model pool (island models are tombstoned on removal).
+#[allow(clippy::cast_possible_truncation)]
+fn tick_crumble(state: &mut State, dt: f64) {
+    let st = &mut *state;
+    st.debris.tick(&mut st.renderer, &st.scene, dt);
+    let mut booms: Vec<IVec3> = Vec::new();
+    for hit in st.debris.drain_impacts() {
+        let from = [hit.pos.x as f32, hit.pos.y as f32, hit.pos.z as f32];
+        // Harder landings kick the shards faster.
+        let kick = hit.speed as f32 * 0.25;
+        st.particles.voxel_debris(
+            &hit.burst_sites(),
+            from,
+            (2.0 + 0.5 * kick)..(5.0 + kick),
+            &ParticleEmitterDef {
+                lifetime: 0.6..1.4,
+                drag: 0.4,
+                collision: CollisionMode::Bounce { restitution: 0.35 },
+                fade_out_frac: 0.4,
+                scale_end: Some(0.4),
+                ..ParticleEmitterDef::new(st.debris_model)
+            },
+        );
+        // Identity grid: world == grid-local voxel coords.
+        booms.push(IVec3::new(
+            hit.pos.x.floor() as i32,
+            hit.pos.y.floor() as i32,
+            hit.pos.z.floor() as i32,
+        ));
+        st.shatters_since_compact += 1;
+    }
+    st.particles.tick_with_scene(&mut st.renderer, dt, &st.scene);
+    if st.shatters_since_compact >= CRUMBLE_COMPACT_EVERY {
+        st.renderer.compact_sprite_models();
+        st.shatters_since_compact = 0;
+    }
+    #[cfg(feature = "audio")]
+    if !booms.is_empty() {
+        if let Some(a) = st.audio.as_mut() {
+            a.impacts(&booms, &st.scene, DVec3::from(st.cam_pos));
+        }
+    }
+    #[cfg(not(feature = "audio"))]
+    let _ = booms;
 }
 
 // ----- Render ---------------------------------------------------------------
 
-/// Rebuild the per-frame sprite set from the live bullets and march +
-/// present the scene through the facade.
+/// March + present the scene through the facade. Bullets, debris and
+/// particles are dynamic sprite instances, posed where they already
+/// are — no per-frame sprite-set rebuild (which would reset the
+/// dynamic instance world).
 fn render(state: &mut State) {
-    // Bullets → facade sprite instances (all share the one model).
-    let instances: Vec<SpriteInstanceDesc> = state
-        .bullets
-        .iter()
-        .map(|b| SpriteInstanceDesc {
-            model: 0,
-            pos: [b.pos[0] as f32, b.pos[1] as f32, b.pos[2] as f32],
-        })
-        .collect();
-    let set = SpriteSet {
-        models: vec![state.bullet_model.clone()],
-        instances,
-        carve_model: None,
-    };
-    state.renderer.set_sprites(&set);
-
     // `frame` borrows `state.engine` immutably; the render call below
     // mutably borrows the disjoint `state.scene` + `state.renderer`
     // fields, so NLL lets them coexist.
@@ -506,7 +696,8 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_m
         state.input.tap_fire = false;
         fire_bullet(&mut state);
     }
-    let _carved = step_bullets(&mut state, dt);
+    step_bullets(&mut state, dt);
+    tick_crumble(&mut state, dt);
     // PW.0 — listener pose per frame + throttled reverb environment.
     #[cfg(feature = "audio")]
     {
@@ -522,6 +713,13 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_m
 // ----- Regenerate -----------------------------------------------------------
 
 fn regenerate(state: &mut State) {
+    // Remove every live bullet sprite instance, then forget them
+    // (dynamic instances survive world regen — they must be dropped
+    // explicitly).
+    for b in &state.bullets {
+        state.renderer.remove_sprite_instance(b.inst);
+    }
+    state.bullets.clear();
     let preset = state.preset;
     let seed = state.seed;
     let grid = state.scene.grid_mut(state.grid).expect("cave grid present");
@@ -531,9 +729,9 @@ fn regenerate(state: &mut State) {
         f64::from(VSID) * 0.5,
         f64::from(MAXZDIM) * 0.5,
     ];
-    state.bullets.clear();
-    // PW.0 — the cave changed wholesale under the listener: drop the
-    // smoothed reverb history so the old chamber's tail doesn't linger.
+    // PW.0 — the crystal set changed wholesale (hum indices change
+    // meaning) and the cave changed under the listener: stop the hums
+    // and drop the smoothed reverb history.
     #[cfg(feature = "audio")]
     if let Some(a) = state.audio.as_mut() {
         a.reset();
@@ -640,13 +838,49 @@ async fn start() -> Result<(), JsValue> {
         renderer.resize(res.0, res.1);
     }
 
+    // Register the dynamic sprite models once (bullets + the white
+    // debris voxel every shatter particle instances, tinted).
+    let bullet_model = renderer.add_sprite_model(&build_bullet_kv6());
+    let debris_model = renderer.add_sprite_model(&Kv6::solid_cube(1, VoxColor(0x80FF_FFFF)));
+
+    // EV.4 — the crystal material: translucent AND emissive. Both
+    // preset colours route to the same slot so an F-toggle needs no
+    // material churn.
+    renderer.define_material(
+        CRYSTAL_MATERIAL_ID,
+        Material::alpha_blend(180).with_emissive(255),
+    );
+    renderer.set_terrain_materials(&[
+        (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
+        (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
+    ]);
+
+    // DT.5 — per-material crumble: rock breaks into rounded Voronoi
+    // lumps, crystal into sharp plates that keep the emissive material
+    // and glow on the way down.
+    let mut debris = DebrisSystem::new();
+    debris.set_fracture_patterns(
+        &[
+            (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
+            (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
+        ],
+        &[
+            (0, FracturePattern::Chunks { cell: 6 }),
+            (CRYSTAL_MATERIAL_ID, FracturePattern::Shards { plates: 3 }),
+        ],
+    );
+
     let now_ms = perf.as_ref().map_or(0.0, web_sys::Performance::now);
     let state = State {
         engine,
         scene,
         grid: grid_id,
         renderer,
-        bullet_model: build_bullet_model(),
+        bullet_model,
+        debris_model,
+        debris,
+        particles: ParticleSystem::new(0xCA5E),
+        shatters_since_compact: 0,
         cam_pos: [
             f64::from(VSID) * 0.5,
             f64::from(VSID) * 0.5,

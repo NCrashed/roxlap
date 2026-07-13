@@ -1094,100 +1094,31 @@ fn install_cave_chunk(scene: &mut Scene, grid_id: GridId, preset: Preset, seed: 
 }
 
 /// EV.4 — plant [`CRYSTAL_COUNT`] glowing crystal clusters on cavity
-/// walls: deterministic (seed + preset) rejection sampling picks an air
-/// voxel, marches along a random axis to the nearest wall within reach,
-/// and grows a small crystal blob into it, registering a [`BakeLight`]
-/// floating in the air just off the surface. One extra crystal always
-/// lands on the spawn bubble's floor so the player never spawns in
-/// pitch black. Replaces (clears) any previous build's lights.
+/// walls. The planting itself lives in
+/// [`roxlap_scene::cavegen::plant_crystals`] (shared with the web
+/// demo since PW.0b); this wrapper supplies the demo's tuning: preset
+/// colour + salt, and the guaranteed crystal on the spawn bubble's
+/// floor so the player never spawns in pitch black.
 fn plant_crystals(grid: &mut Grid, preset: Preset, seed: u64) {
-    grid.bake_lights.clear();
-    let color = match preset {
-        Preset::Blue => CRYSTAL_COLOR_BLUE,
-        Preset::Mag => CRYSTAL_COLOR_MAG,
-    };
-    // xorshift64* — deterministic per (seed, preset), decoupled from the
-    // generator's own noise seeding.
-    let mut state = seed
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(match preset {
-            Preset::Blue => 0xB1,
-            Preset::Mag => 0x4A,
-        })
-        | 1;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    };
-    // The six axis directions a crystal can grow along (into the wall).
-    const DIRS: [IVec3; 6] = [
-        IVec3::new(1, 0, 0),
-        IVec3::new(-1, 0, 0),
-        IVec3::new(0, 1, 0),
-        IVec3::new(0, -1, 0),
-        IVec3::new(0, 0, 1),
-        IVec3::new(0, 0, -1),
-    ];
-
-    // One guaranteed crystal on the spawn bubble's floor.
-    let plant_at = |grid: &mut Grid, air: IVec3, dir: IVec3| {
-        // March from the air voxel to the wall (≤ 14 voxels away).
-        for k in 1..=14 {
-            let p = air + dir * k;
-            if !(0..VSID as i32).contains(&p.x)
-                || !(0..VSID as i32).contains(&p.y)
-                || !(8..MAXZDIM - 1).contains(&p.z)
-            {
-                return false;
-            }
-            if grid.voxel_solid(p) {
-                // ANCHOR: bake_light
-                grid.set_sphere(p, CRYSTAL_RADIUS, Some(color));
-                // The light floats in the air a few voxels off the
-                // surface so the pool spreads over the wall around it.
-                let lp = air + dir * (k - 3).max(0);
-                grid.bake_lights.push(BakeLight {
-                    pos: glam::Vec3::new(lp.x as f32, lp.y as f32, lp.z as f32),
-                    radius: CRYSTAL_LIGHT_RADIUS,
-                    strength: CRYSTAL_LIGHT_STRENGTH,
-                });
-                // ANCHOR_END: bake_light
-                return true;
-            }
-        }
-        false
-    };
-    plant_at(grid, spawn_centre(), IVec3::new(0, 0, 1));
-
-    let mut planted = 1; // the spawn crystal
-    let mut attempts = 0;
-    while planted < CRYSTAL_COUNT && attempts < 800 {
-        attempts += 1;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let cand = IVec3::new(
-            (8 + next() % u64::from(VSID - 16)) as i32,
-            (8 + next() % u64::from(VSID - 16)) as i32,
-            (24 + next() % 200) as i32,
-        );
-        if grid.voxel_solid(cand) {
-            continue; // need an air pocket to glow into
-        }
-        // Spread the crystals out: reject candidates inside another
-        // light's pool core.
-        let too_close = grid.bake_lights.iter().any(|l| {
-            let d = glam::Vec3::new(cand.x as f32, cand.y as f32, cand.z as f32) - l.pos;
-            d.length_squared() < 24.0 * 24.0
-        });
-        if too_close {
-            continue;
-        }
-        let dir = DIRS[(next() % 6) as usize];
-        if plant_at(grid, cand, dir) {
-            planted += 1;
-        }
-    }
+    roxlap_scene::cavegen::plant_crystals(
+        grid,
+        seed,
+        &roxlap_scene::cavegen::CrystalParams {
+            color: match preset {
+                Preset::Blue => CRYSTAL_COLOR_BLUE,
+                Preset::Mag => CRYSTAL_COLOR_MAG,
+            },
+            count: CRYSTAL_COUNT,
+            crystal_radius: CRYSTAL_RADIUS,
+            light_radius: CRYSTAL_LIGHT_RADIUS,
+            light_strength: CRYSTAL_LIGHT_STRENGTH,
+            guaranteed: Some(spawn_centre()),
+            salt: match preset {
+                Preset::Blue => 0xB1,
+                Preset::Mag => 0x4A,
+            },
+        },
+    );
 }
 
 /// A batch of bullet-impact carve centres to apply to a cloned cave

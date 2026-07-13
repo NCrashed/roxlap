@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `roxlap-scene`: `cavegen::plant_crystals` + `cavegen::CrystalParams`
+  — the cave demo's EV.4 crystal planting (wall-march, glow
+  `BakeLight`s, deterministic rejection sampling), extracted so the
+  native and web demos grow identical crystals from the same code.
+  The native demo now delegates to it.
+- `roxlap-cave-web` (unpublished demo): full parity with the native
+  cave demo — glowing crystals (translucent + emissive material,
+  point-light bake), floating-island crumble with landing shatter
+  (synchronous in-frame: no carve worker on the web), bullets moved to
+  the dynamic sprite API, and — with `--features audio` —
+  distance-culled crystal hums with Doppler.
+
+### Fixed
+
+- `roxlap-cave-web`: the spawn "bubble" **inserted** a solid painted
+  ball at world centre instead of carving one (the player started
+  buried); carves after each impact re-baked the whole chunk
+  `Directional` (which would have erased crystal glow pools) and never
+  rebuilt the mip ladder — now an incremental `bake_bbox` +
+  `remip_bbox` over the edit extent, like the native demo.
+
 ## [0.28.0] — 2026-07-13
 
 ### Added: per-material acoustics + Doppler (macro-stage AU2)

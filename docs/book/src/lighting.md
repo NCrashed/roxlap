@@ -184,7 +184,7 @@ pools reading against gloom. Baked means free at render time, on both
 backends:
 
 ```rust,noplayground
-{{#include ../../../crates/roxlap-cave-demo/src/main.rs:bake_light}}
+{{#include ../../../crates/roxlap-scene/src/cavegen.rs:bake_light}}
 ```
 
 ```rust,noplayground
