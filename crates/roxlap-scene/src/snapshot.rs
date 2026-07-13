@@ -136,6 +136,12 @@ pub struct GridSnapshot {
     /// dispatch in [`Scene::load_snapshot`]. v1 blobs restore this at `1.0`.
     #[serde(default = "one_f64")]
     pub voxel_world_size: f64,
+    /// WT.0 (v3) — the grid's [`crate::WaterVolume`]s. Same
+    /// trailing-field discipline as `voxel_world_size`: v1/v2 blobs
+    /// decode through their frozen shadow shapes and restore with no
+    /// water.
+    #[serde(default)]
+    pub water_volumes: Vec<crate::WaterVolume>,
 }
 
 /// `voxel_world_size`'s default (`1.0`) for `#[serde(default)]` on
@@ -179,12 +185,22 @@ impl From<SceneSnapshotV1> for SceneSnapshot {
     fn from(v1: SceneSnapshotV1) -> Self {
         Self {
             next_grid_id: v1.next_grid_id,
-            grids: v1.grids.into_iter().map(|(id, g)| (id, g.into())).collect(),
+            grids: v1
+                .grids
+                .into_iter()
+                // Chain through the frozen v2 shape (see the
+                // GridSnapshotV1 → GridSnapshotV2 impl).
+                .map(|(id, g)| (id, GridSnapshotV2::from(g).into()))
+                .collect(),
         }
     }
 }
 
-impl From<GridSnapshotV1> for GridSnapshot {
+impl From<GridSnapshotV1> for GridSnapshotV2 {
+    // FROZEN (WT.0): v1 → v2 adds only the persisted scale. Version
+    // bumps chain shadow shapes (V1 → V2 → … → live), so old links
+    // like this one never change again — only the final
+    // shadow-to-live impl is rewritten per bump.
     fn from(g: GridSnapshotV1) -> Self {
         Self {
             transform: g.transform,
@@ -197,6 +213,65 @@ impl From<GridSnapshotV1> for GridSnapshot {
             stream_radius: g.stream_radius,
             // v1 predates persisted scale — an unscaled grid.
             voxel_world_size: 1.0,
+        }
+    }
+}
+
+/// WT.0 — the **frozen v2** wire shape of [`SceneSnapshot`], used only to
+/// deserialize version-2 blobs (which predate water volumes). Same
+/// positional-bincode rationale as [`SceneSnapshotV1`].
+#[derive(Deserialize)]
+struct SceneSnapshotV2 {
+    next_grid_id: u32,
+    grids: Vec<(GridId, GridSnapshotV2)>,
+}
+
+/// WT.0 — the frozen v2 [`GridSnapshot`] shape (no `water_volumes`).
+/// The field list must byte-match what v2 `save_snapshot` wrote (the
+/// checked-in v2 fixture is the gate).
+#[derive(Deserialize)]
+struct GridSnapshotV2 {
+    transform: GridTransform,
+    chunks: Vec<(IVec3, Vec<u8>)>,
+    #[serde(default)]
+    chunk_versions: Vec<(IVec3, u64)>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_render_sky")]
+    render_sky: bool,
+    #[serde(default)]
+    mip_levels_override: Option<u32>,
+    #[serde(default = "LodThresholds::always_near")]
+    lod_thresholds: LodThresholds,
+    #[serde(default)]
+    stream_radius: StreamRadius,
+    #[serde(default = "one_f64")]
+    voxel_world_size: f64,
+}
+
+impl From<SceneSnapshotV2> for SceneSnapshot {
+    fn from(v2: SceneSnapshotV2) -> Self {
+        Self {
+            next_grid_id: v2.next_grid_id,
+            grids: v2.grids.into_iter().map(|(id, g)| (id, g.into())).collect(),
+        }
+    }
+}
+
+impl From<GridSnapshotV2> for GridSnapshot {
+    fn from(g: GridSnapshotV2) -> Self {
+        Self {
+            transform: g.transform,
+            chunks: g.chunks,
+            chunk_versions: g.chunk_versions,
+            name: g.name,
+            render_sky: g.render_sky,
+            mip_levels_override: g.mip_levels_override,
+            lod_thresholds: g.lod_thresholds,
+            stream_radius: g.stream_radius,
+            voxel_world_size: g.voxel_world_size,
+            // v2 predates water volumes — a dry grid.
+            water_volumes: Vec::new(),
         }
     }
 }
@@ -297,6 +372,9 @@ impl Scene {
                     // SC.snap — persist the grid's scale (transform's own wire
                     // form omits it via #[serde(skip)]).
                     voxel_world_size: grid.transform.voxel_world_size,
+                    // WT.0 (v3) — persist the water volumes verbatim
+                    // (host-authored Vec order is already deterministic).
+                    water_volumes: grid.water_volumes.clone(),
                 },
             ));
         }
@@ -366,6 +444,12 @@ impl Scene {
             grid.mip_levels_override = gsnap.mip_levels_override;
             grid.lod_thresholds = gsnap.lod_thresholds;
             grid.stream_radius = gsnap.stream_radius;
+            // WT.0 — restore the water volumes VERBATIM. No corner
+            // re-normalisation: `WaterVolume::depth_local` accepts
+            // either corner order, so normalising here would make a
+            // volume behave differently before and after a round-trip
+            // (a live scene must equal its restored self).
+            grid.water_volumes.clone_from(&gsnap.water_volumes);
             scene.grids.insert(*id, grid);
         }
         Ok(scene)
@@ -383,17 +467,17 @@ pub const SNAPSHOT_MAGIC: [u8; 4] = *b"RXSS";
 /// [`SnapshotLoadError::UnsupportedVersion`] — never a silent misparse
 /// (the pre-QE.5 failure mode of bare positional bincode).
 ///
-/// SC.snap — **v2** persists per-grid `voxel_world_size`. bincode is
-/// strictly positional, so the trailing `voxel_world_size` field on
-/// [`GridSnapshot`] would make a v1 blob short-read ("unexpected end of
-/// file") — hence the version bump. [`Scene::load_snapshot`] dispatches:
-/// v2 blobs decode [`GridSnapshot`] directly; v1 blobs decode the frozen
-/// private `GridSnapshotV1` shadow shape (which lacks the field) and restore
-/// at `voxel_world_size = 1.0`. `GridTransform`'s own wire form stays frozen
-/// (`#[serde(skip)]` on the field) in BOTH versions — the persisted scale
-/// is a sibling field on the snapshot, not inside the transform — so the
-/// forever-loadable v1 fixture keeps loading unchanged.
-pub const SNAPSHOT_VERSION: u32 = 2;
+/// WT.0 — **v3** appends per-grid `water_volumes` (v2 = SC.snap's
+/// `voxel_world_size`; v1 = the original shape). bincode is strictly
+/// positional, so every trailing-field addition bumps the version and
+/// freezes the previous shape as a private shadow struct:
+/// [`Scene::load_snapshot`] dispatches — v3 blobs decode
+/// [`GridSnapshot`] directly; v2/v1 blobs decode `GridSnapshotV2` /
+/// `GridSnapshotV1` and restore with no water (and, for v1,
+/// `voxel_world_size = 1.0`). `GridTransform`'s own wire form stays
+/// frozen (`#[serde(skip)]`) in ALL versions, so the forever-loadable
+/// v1/v2 fixtures keep loading unchanged.
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 /// Errors from [`Scene::load_snapshot`].
 #[derive(Debug)]
@@ -480,14 +564,18 @@ impl Scene {
         }
         let version = u32::from_le_bytes(version.try_into().expect("4-byte slice"));
         let payload = &bytes[8..];
-        // SC.snap — dispatch on the wire version. v1 blobs decode the frozen
-        // `SceneSnapshotV1` shadow shape (no persisted scale → 1.0); v2 blobs
-        // decode `SceneSnapshot` directly. Both funnel through `from_snapshot`.
+        // Dispatch on the wire version: older blobs decode their frozen
+        // shadow shapes (v1: no scale, no water → 1.0 + dry; v2 (SC.snap):
+        // no water → dry); v3 blobs decode `SceneSnapshot` directly. All
+        // funnel through `from_snapshot`.
         let snap: SceneSnapshot = match version {
             1 => bincode::deserialize::<SceneSnapshotV1>(payload)
                 .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?
                 .into(),
-            2 => bincode::deserialize(payload)
+            2 => bincode::deserialize::<SceneSnapshotV2>(payload)
+                .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?
+                .into(),
+            3 => bincode::deserialize(payload)
                 .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?,
             v => return Err(SnapshotLoadError::UnsupportedVersion(v)),
         };
@@ -524,7 +612,14 @@ mod tests {
             .set_voxel(IVec3::new(1, 2, 100), Some(VoxColor(0x8011_2233)));
 
         let bytes = scene.save_snapshot();
-        assert_eq!(&bytes[4..8], &2u32.to_le_bytes(), "expected v2 wire");
+        // LITERAL on purpose (WT.0 review): this is the one assert that
+        // pins the envelope version as a NUMBER. Comparing against
+        // SNAPSHOT_VERSION would be a tautology (save_snapshot writes
+        // that same constant) and an accidental bump would sail through
+        // green while old engines stop reading new saves. Bumping the
+        // version deliberately? Update this literal alongside the new
+        // shadow shape + fixture.
+        assert_eq!(&bytes[4..8], &3u32.to_le_bytes(), "expected v3 wire");
         let restored = Scene::load_snapshot(&bytes).expect("round trip");
 
         let (_, g) = restored.grids().next().expect("one grid");
@@ -558,6 +653,7 @@ mod tests {
                         lod_thresholds: LodThresholds::always_near(),
                         stream_radius: StreamRadius::default(),
                         voxel_world_size: bad,
+                        water_volumes: vec![],
                     },
                 )],
             };
@@ -583,6 +679,7 @@ mod tests {
                     lod_thresholds: LodThresholds::always_near(),
                     stream_radius: StreamRadius::default(),
                     voxel_world_size: 1000.0,
+                    water_volumes: vec![],
                 },
             )],
         };

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Water volumes** (WT.0, `PORTING-WATER.md`): `roxlap-scene` grids
+  carry `water_volumes: Vec<WaterVolume>` — grid-local voxel AABBs
+  (surface = the volume's top face, z-down) that answer
+  `Scene::water_depth_at` / `in_water` in world units under any grid
+  transform (rotation + `voxel_world_size`). This is the *physics*
+  representation of water — the colour-keyed `Solidity::passable`
+  veto can't reach slab interiors (colourless by format), so it caps
+  at ~2 voxels of depth; volumes have no such limit. Persisted in
+  snapshots: wire **v3** (v1/v2 saves keep loading — dry — via frozen
+  shadow shapes; new `snapshot_v3.rxs` fixture joins the
+  forever-loadable gate). Note: `GridSnapshot` grew a pub field —
+  exhaustive struct literals must add it (same discipline as v2's
+  `voxel_world_size`).
+
 - **wasm GPU depth-picking** (PW.1): `SceneRenderer::pick_depth` /
   `pick` now work on the browser GPU path with **one-frame latency**
   (WebGPU has no blocking readback): a call submits the readback for

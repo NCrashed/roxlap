@@ -53,6 +53,9 @@ pub mod occluder;
 pub mod render;
 pub mod snapshot;
 pub mod streaming;
+/// Water volumes (stage WT) — the physics representation of water;
+/// see `docs/porting/PORTING-WATER.md`.
+pub mod water;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -72,6 +75,7 @@ pub use lod::{select_lod, Lod, LodThresholds};
 pub use roxlap_core::AoParams;
 pub use roxlap_formats::color::{OverlayColor, Rgb, VoxColor};
 pub use streaming::{ChunkGenerator, ChunkStore, StreamRadius};
+pub use water::WaterVolume;
 
 /// XY size of one chunk in voxels. The plan locks 128 — keeps
 /// chunks compact (~2 MB worst-case dense-slab footprint inside
@@ -503,6 +507,15 @@ pub struct Grid {
     /// list after a load if you keep editing). Ignored by the other
     /// bake modes and by the dynamic `LightRig`.
     pub bake_lights: Vec<BakeLight>,
+    /// WT.0 — the grid's water volumes ([`WaterVolume`], grid-local
+    /// voxel AABBs; surface = each volume's `lo.z`, z-down). The
+    /// PHYSICS representation of water — [`Scene::water_depth_at`]
+    /// and the swim state read these; the *visual* water is ordinary
+    /// (typically volumetric-material) voxels the host fills
+    /// separately. Authoring state like [`Self::bake_lights`], but —
+    /// unlike them — persisted in snapshots (wire v3+; older saves
+    /// load with no water).
+    pub water_volumes: Vec<WaterVolume>,
     /// Per-chunk edit version counter (S7.2). Each user edit
     /// through [`Self::set_voxel`] / [`Self::set_rect`] /
     /// [`Self::set_sphere`] bumps the counter for every chunk it
@@ -590,6 +603,7 @@ impl Grid {
             store: None,
             stream_radius: StreamRadius::DISABLED,
             bake_lights: Vec::new(),
+            water_volumes: Vec::new(),
             chunk_versions: HashMap::new(),
             pending_gen: HashSet::new(),
             dda_brick_cache: roxlap_core::BrickCache::new(),
