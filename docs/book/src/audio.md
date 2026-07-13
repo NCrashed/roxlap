@@ -121,6 +121,50 @@ Linux). It's off by default, so a plain build pulls in no audio stack
 at all; wasm support (kira runs on WebAudio) is scoped for a later
 stage.
 
+## Materials: glass sounds thin
+
+By default every solid voxel muffles alike. The material tables (stage
+AU2) change that — and they take the **same colour→material map** the
+renderer's `set_terrain_materials` and the debris system's fracture
+tables use, so "this colour is crystal" is declared once and drives
+rendering, destruction and sound together. `absorption` re-weighs a
+material's *effective thickness* in the occlusion march (a `0.35`
+glass voxel muffles like a third of a stone one); `damping_override`
+re-colours the reverb of whatever walls the cavity probe hits — a
+glass chamber rings brighter than a stone one:
+
+```rust,no_run,noplayground
+{{#include ../../../crates/roxlap-audio/examples/book_audio.rs:materials}}
+```
+
+Two conventions worth knowing. Colours absent from the map classify as
+material `0`, so a table entry for id `0` re-weighs every unmapped
+voxel — a deliberate global knob. And the `.vxl` format stores
+**surface** colours only: interior cells inherit the last surface
+colour a ray crossed (rock-like `1.0` before the first), and a *carved*
+face is colour-less — paint what you want classified (the example's
+booth is built from painted slabs, not carved out). Empty tables keep
+the exact pre-AU2 arithmetic, bit for bit.
+
+## Doppler
+
+Motion bends pitch. `doppler_factor` is pure math over positions and
+velocities — clamped to `[0.5, 2.0]` (an octave each way) and exactly
+`1.0` at rest — and the backend applies it through
+`AudioOut::set_source_pitch` (the kira implementation tweens the
+playback rate, ~120 ms):
+
+```rust,no_run,noplayground
+{{#include ../../../crates/roxlap-audio/examples/book_audio.rs:doppler}}
+```
+
+The default speed of sound is a deliberately game-tuned **90 u/s** (at
+the physical 343 the demo's speeds would barely bend a semitone); pass
+your own to retune. Apply Doppler to **loops and long tails** — a hum,
+an engine — driven by whatever velocity you track (a camera position
+delta per frame is fine, with a teleport guard). Pitch-bending a
+one-shot mid-envelope reads as a glitch, not physics.
+
 ## The cave demo
 
 The cave demo is the worked example — build it with the `audio`
@@ -133,13 +177,21 @@ cargo run --release -p roxlap-cave-demo --features audio
 Every plasma shot cracks at the muzzle, each impact booms at the crater
 it carves, and every glowing crystal hums — all muffled by the rock
 between them and you, with reverb that swells as you fly into a big
-chamber and dries as you leave it. The crystal hums show the voice
+chamber and dries as you leave it, and the hums bending in pitch as
+you fly past (AU2 Doppler, driven by the camera's velocity). The crystal hums show the voice
 budget at work: only the nearest handful loop at once (with hysteresis
 so a crystal at the edge of earshot doesn't flicker), started and
 stopped as you move, so a crystal-rich cave never drowns out the shots.
 The wiring — one small `DemoAudio` struct driving the core and the kira
 backend from the demo's fire / carve / per-frame hooks — lives in
 [`crates/roxlap-cave-demo/src/audio.rs`](https://github.com/NCrashed/roxlap/blob/master/crates/roxlap-cave-demo/src/audio.rs).
+
+The scene gallery ([chapter 15](demo-tour.md)) also has an **Audio**
+tab: a walkable stone room / open field / glass cavern with every
+number this chapter derives shown live in the HUD — including the
+measured cost of the acoustics update. The numbers come from the pure
+core, so the tab works in every build; add `--features audio` to the
+scene demo to hear the three zone hums too.
 
 ## Further reading
 

@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-07-13
+
+### Added: per-material acoustics + Doppler (macro-stage AU2)
+
+- **Materials change what the rays hear.** The acoustics configs take
+  the same colour→material map the renderer and the debris system use
+  — "this colour is crystal" is declared once and drives rendering,
+  destruction and sound together:
+  - `AcousticsConfig` grew `material_map` + `absorption` (material →
+    effective-thickness multiplier): one voxel of `0.35` glass muffles
+    like a third of a voxel of stone, via the new
+    `path_thickness_weighted` (interior cells inherit the last surface
+    colour along the ray — deep interiors read as rock).
+  - `CavityConfig` grew `material_map` + `damping_override`: the
+    cavity probe classifies every wall hit and averages per-material
+    reverb damping — a glass cavern rings brighter than a stone one.
+  - Empty tables (the default) keep the exact pre-AU2 arithmetic —
+    bit-identical, pinned in tests. Cost with active tables measured
+    at +0.8% per source query (release probe).
+- **Doppler**: pure `doppler_factor` (clamped to an octave each way,
+  exactly `1.0` at rest, monotone through supersonic edge cases) +
+  `AudioOut::set_source_pitch` (default no-op; the kira backend tweens
+  the playback rate). `DEFAULT_SPEED_OF_SOUND = 90` world units/s —
+  game-tuned so demo speeds audibly bend. The cave demo's crystal hums
+  now bend as you fly past.
+- **The scene gallery grew an Audio tab**: a walkable stone room /
+  open field / glass cavern with every acoustic parameter live in the
+  HUD — occlusion per source, the reverb environment (watch the
+  damping drop inside the glass cavern), Doppler factors, and the
+  measured per-update acoustics cost. The numbers come from the pure
+  core, so the tab works in every build; the scene demo's new `audio`
+  feature adds the three zone hums.
+- Book: the Audio chapter grew **"Materials: glass sounds thin"** and
+  **"Doppler"** (the device-free `book_audio` example walks both).
+- Public config structs grew fields (`AcousticsConfig`, `CavityConfig`,
+  `CavityProbe`) — **breaking** for exhaustive struct literals /
+  destructuring (constructors and `..Default::default()` unaffected);
+  hence the minor bump.
+
+### Fixed: GPU sprite-registry offset desync after remove + growth
+
+- A `remove_sprite_model` tombstone followed by an `add_sprite_model`
+  that overflowed the shared occupancy/color-offsets buffer left every
+  live model **behind the hole** reading its volume at a stale offset:
+  the grow path rebuilt the buffer tightly (tombstoned entries
+  contribute nothing) but never rewrote the surviving entries' meta
+  offsets — permanent shifted-occupancy corruption ("black stripe"
+  planes), repaired per-model only when an `update_model` happened to
+  rewrite that model at the stale offset. Hosts calling
+  `compact_sprite_models` periodically repaired it after the fact,
+  which is why the artefact surfaced downstream only after a host
+  stopped compacting. The overflow path now rebuilds through the
+  compactor, which recomputes the offsets it uploads (and reclaiming
+  the holes can absorb the growth outright). Root-caused with a precise
+  report from the **roxlap-game-demo** author — thank you. Pinned by a
+  readback regression test (remove → grow → every live entry verified
+  at its meta offset).
+
 ## [0.27.0] — 2026-07-13
 
 ### Added: voxel destruction — floating-island crumble (DT stage)
@@ -3034,7 +3092,8 @@ Initial public release of the roxlap workspace.
 [0.1.1]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.1
 [0.1.0]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.0
 
-[Unreleased]: https://github.com/NCrashed/roxlap/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/NCrashed/roxlap/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/NCrashed/roxlap/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/NCrashed/roxlap/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/NCrashed/roxlap/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/NCrashed/roxlap/compare/v0.24.0...v0.25.0

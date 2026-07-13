@@ -382,7 +382,22 @@ class — minor per house policy (maintainer review).
   scene's HUD also shows the measured per-update acoustics cost
   live. Both feature variants compile, clippy 0; 30 audio + 18
   scene-demo tests green.
-- AU2.4 — docs: NOT STARTED
+- AU2.4 — LANDED 2026-07-13 — **MACRO-STAGE AU2 COMPLETE** (owed: the
+  user's listening pass — scene-demo Audio tab with
+  `--features audio`, and the cave demo's Doppler-bent hums; can ride
+  the next session). Book: the Audio chapter grew **"Materials:
+  glass sounds thin"** (same-map-three-consumers pitch, absorption +
+  damping through the extended device-free `book_audio` — a glass
+  pane heard both ways, 0.47 → 0.77 transmission, and a painted
+  glass booth reading damping 0.10; the material-0 convention and
+  the carve/paint caveat stated in prose) and **"Doppler"** (the
+  factor table: ×1.44 approaching / ×0.56 receding / ×1.00 still;
+  the 90 u/s game-tuning rationale; loops-only guidance); the cave
+  demo section mentions the bending hums, and a new paragraph points
+  at the gallery's Audio tab. `check-anchors` green (two new
+  anchors: `materials`, `doppler`). CHANGELOG: the AU2 wave under
+  [Unreleased], closing with the minor-bump note. Wave cut = 0.28.0
+  (the semver obligation above).
 
 ## Locked design decisions
 

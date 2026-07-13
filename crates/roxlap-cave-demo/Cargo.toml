@@ -21,18 +21,18 @@ path = "src/main.rs"
 # on stderr like the pre-QE.2 eprintln!s did (RUST_LOG adjusts
 # verbosity).
 env_logger = "0.11"
-roxlap-core = { path = "../roxlap-core", version = "0.27" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.27" }
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.27" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.27" }
-roxlap-render = { path = "../roxlap-render", version = "0.27" }
+roxlap-core = { path = "../roxlap-core", version = "0.28" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.28" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.28" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.28" }
+roxlap-render = { path = "../roxlap-render", version = "0.28" }
 glam = { workspace = true }
 winit = "0.30"
 # AU.3 — voxel-aware audio, opt-in (native, needs an audio device +
 # ALSA on Linux). Off by default so the demo builds/ships silent
 # without pulling in kira/cpal:
 #   cargo run -p roxlap-cave-demo --features audio
-roxlap-audio = { path = "../roxlap-audio", version = "0.27", features = [
+roxlap-audio = { path = "../roxlap-audio", version = "0.28", features = [
     "kira",
 ], optional = true }
 
