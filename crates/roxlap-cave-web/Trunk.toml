@@ -1,9 +1,17 @@
 # Trunk config for roxlap-cave-web. `trunk serve` from this
-# directory hosts the demo at http://localhost:8080. Production
-# bundles via `trunk build --release`.
+# directory hosts the demo at http://localhost:8080.
 
 [build]
 public_url = "/"
+
+# PW.0 follow-up: build RELEASE by default. Trunk's default is the
+# dev profile, and a debug-built DDA marcher is tens of times slower —
+# the demo reads as "the engine is slow" (and starves the WebAudio
+# callback into stutter) when it's really opt-level 0. The demo is a
+# showcase, not an inner dev loop; anyone iterating on it can
+# `trunk serve --no-release` temporarily. (This bit the maintainer:
+# the DDA migration was blamed before the profile was.)
+release = true
 
 # R10.X.2: keep wasm-opt from stripping the shared-memory +
 # atomics constructs that wasm-bindgen-rayon relies on.

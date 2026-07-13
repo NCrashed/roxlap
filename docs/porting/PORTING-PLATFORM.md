@@ -39,6 +39,17 @@ top to bottom before touching code.
   listening pass** (`trunk serve --features audio`: click → shots
   and booms muffle behind rock, reverb swells in chambers — and
   craters now actually excavate).
+  **Listening-pass follow-up (user, 2026-07-13)**: audio works, but
+  the CPU fallback's DDA can't hold 640×512 in wasm (low FPS since
+  the DDA migration). Fix: backend-conditional resolution — WebGPU
+  keeps 640×512, the CPU path drops to quarter-pixel 320×256
+  (`renderer.resize` after backend detection; input mapping follows
+  automatically since the handlers read `canvas.width()` live), with
+  a fixed 640-wide CSS size + the existing `image-rendering:
+  pixelated` so the on-screen picture stays identical in spirit —
+  crisp-retro upscale. roxlap-web (the legacy demo) has the same
+  CPU-res exposure — candidate for the same two-line treatment if
+  anyone still exercises it.
 - PW.1 — wasm GPU depth-picking: NOT STARTED
 - PW.2 — CI matrix (macOS + aarch64 + wasm-audio check): NOT STARTED
 - PW.3 — docs + close: NOT STARTED

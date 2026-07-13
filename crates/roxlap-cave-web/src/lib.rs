@@ -48,8 +48,17 @@ mod audio;
 
 // ----- World / camera tuning (mirrors roxlap-cave-demo) ----------------------
 
+/// Framebuffer resolution on the WebGPU path.
 const XRES: u32 = 640;
 const YRES: u32 = 512;
+/// PW.0 follow-up — framebuffer resolution on the **CPU fallback**:
+/// the DDA marcher in wasm can't hold 640×512 at interactive rates,
+/// so the CPU path renders quarter-pixels (320×256) and the CSS
+/// `image-rendering: pixelated` upscale keeps the on-screen size —
+/// the crisp-retro look the engine ships anyway. WebGPU keeps full
+/// res (it has headroom to spare).
+const CPU_XRES: u32 = 320;
+const CPU_YRES: u32 = 256;
 const VSID: u32 = 128;
 
 const MOVE_SPEED: f64 = 32.0;
@@ -141,6 +150,10 @@ struct State {
     pitch: f64,
     input: Input,
     last_frame_ms: f64,
+    /// PW.0 follow-up — the active framebuffer resolution: full
+    /// [`XRES`]×[`YRES`] on WebGPU, quarter-pixel
+    /// [`CPU_XRES`]×[`CPU_YRES`] on the CPU fallback.
+    res: (u32, u32),
     bullets: Vec<Bullet>,
     preset: Preset,
     seed: u64,
@@ -459,8 +472,14 @@ fn render(state: &mut State) {
     // mutably borrows the disjoint `state.scene` + `state.renderer`
     // fields, so NLL lets them coexist.
     let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
-    let mut settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
-    settings.max_scan_dist = MAXZDIM;
+    let mut settings = OpticastSettings::for_oracle_framebuffer(state.res.0, state.res.1);
+    // PW.0 follow-up — the CPU fallback stops marching at the fog
+    // wall (nothing beyond it survives compositing anyway; worst-case
+    // ray length halves); WebGPU keeps the full budget.
+    settings.max_scan_dist = match state.renderer.backend() {
+        Backend::Gpu => MAXZDIM,
+        Backend::Cpu => FOG_MAX_SCAN_DIST,
+    };
     // QE.2 — `FrameParams::new` + overrides; the GPU projection derives
     // from `settings`, so the deliberate 70° FOV is set there (for
     // both backends).
@@ -601,11 +620,25 @@ async fn start() -> Result<(), JsValue> {
         backend: BackendPreference::PreferGpu,
         ..RenderOptions::default()
     };
-    let renderer = SceneRenderer::new_from_canvas_async(canvas.clone(), (XRES, YRES), &opts).await;
+    let mut renderer =
+        SceneRenderer::new_from_canvas_async(canvas.clone(), (XRES, YRES), &opts).await;
     let backend = match renderer.backend() {
         Backend::Gpu => "WebGPU",
         Backend::Cpu => "CPU (WebGL2 present)",
     };
+    // PW.0 follow-up — the CPU DDA can't hold full res in wasm: drop
+    // the fallback path to quarter-pixels (the CSS pixelated upscale
+    // keeps the on-screen size; input handlers read canvas.width()
+    // live, so pointer/touch mapping follows automatically).
+    let res = match renderer.backend() {
+        Backend::Gpu => (XRES, YRES),
+        Backend::Cpu => (CPU_XRES, CPU_YRES),
+    };
+    if res != (XRES, YRES) {
+        canvas.set_width(res.0);
+        canvas.set_height(res.1);
+        renderer.resize(res.0, res.1);
+    }
 
     let now_ms = perf.as_ref().map_or(0.0, web_sys::Performance::now);
     let state = State {
@@ -639,6 +672,7 @@ async fn start() -> Result<(), JsValue> {
         pitch: 0.0,
         input: Input::default(),
         last_frame_ms: now_ms,
+        res,
         bullets: Vec::new(),
         preset,
         seed,
