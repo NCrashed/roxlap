@@ -1704,27 +1704,20 @@ impl SpriteRegistryResident {
             ConcatBuf::ColorOffsets => (self.coloff_used, self.coloff_cap),
         };
         if used > cap {
-            let new_cap = grow_words(used);
-            let all: Vec<u32> = registry
-                .entries
-                .iter()
-                .flat_map(|m| concat_data(m, which).iter().copied())
-                .collect();
-            let label = match which {
-                ConcatBuf::Occupancy => "roxlap-gpu sprite_reg.occupancy",
-                ConcatBuf::ColorOffsets => "roxlap-gpu sprite_reg.color_offsets",
-            };
-            let buf = storage_dst_u32_cap(device, label, &all, new_cap);
-            match which {
-                ConcatBuf::Occupancy => {
-                    self.occupancy = buf;
-                    self.occ_cap = new_cap;
-                }
-                ConcatBuf::ColorOffsets => {
-                    self.color_offsets = buf;
-                    self.coloff_cap = new_cap;
-                }
-            }
+            // The bump layout overflowed: rebuild through the COMPACTOR,
+            // which re-packs live entries tightly AND rewrites their
+            // meta offsets (`add_model` re-uploads the whole model_meta
+            // table right after this, so the recomputed offsets reach
+            // the GPU for free) — and reclaiming tombstone holes may
+            // absorb the growth outright.
+            //
+            // The previous code here rebuilt tightly but kept the STALE
+            // bump offsets in `meta`: after any `remove_model` hole,
+            // every live model behind it read its volume at a shifted
+            // offset — permanent "black stripe" corruption, repaired
+            // per-model only by an `update_model` rewrite. Root-caused
+            // by the roxlap-game-demo author (0.27.0).
+            self.compact_concat(device, registry, which);
         } else {
             let target = match which {
                 ConcatBuf::Occupancy => &self.occupancy,
@@ -3030,6 +3023,67 @@ mod tests {
                 &cols[cc..cc + m.colors.len()],
                 &m.colors[..],
                 "colors entry {e}"
+            );
+        }
+    }
+
+    /// Regression (downstream report, 0.27.0): a `remove_model` hole
+    /// followed by an occupancy-overflow `add_model` desynced every live
+    /// entry behind the hole — the grow path rebuilt the buffer tightly
+    /// (tombstoned entries contribute nothing) but kept the STALE bump
+    /// offsets in `meta`, so those models read shifted occupancy words
+    /// ("black stripe planes") until an `update_model` happened to
+    /// rewrite them at the stale offset. The overflow path now routes
+    /// through `compact_concat`, which recomputes the offsets it
+    /// uploads.
+    #[test]
+    fn growth_after_remove_keeps_offsets_in_sync() {
+        let Some(h) = headless() else { return };
+        let mut reg = SpriteModelRegistry::new();
+        // Three models; the middle one becomes the hole.
+        let a = reg.add(build_sprite_model(&kv6_unsorted()));
+        let mut res = SpriteRegistryResident::upload(&h.device, &reg, &[inst(a, [0.0; 3])]);
+        let b = reg.add(build_sprite_model(&kv6_other()));
+        res.add_model(&h.device, &h.queue, &reg, b);
+        let c = reg.add(build_sprite_model(&kv6_other()));
+        res.add_model(&h.device, &h.queue, &reg, c);
+        let _ = c;
+
+        // Tombstone the middle chain: resident hole + zero-length
+        // registry entry (exactly the facade's remove path).
+        res.remove_model(b);
+        reg.remove(b);
+
+        // Keep adding until occupancy overflows — the grow/rebuild path.
+        let cap_before = res.occ_cap;
+        let mut guard = 0;
+        while res.occ_cap == cap_before {
+            let id = reg.add(build_sprite_model(&kv6_other()));
+            res.add_model(&h.device, &h.queue, &reg, id);
+            guard += 1;
+            assert!(guard < 10_000, "growth never triggered");
+        }
+
+        // Every LIVE entry's meta offset must point at its actual data
+        // in the rebuilt buffers.
+        let occ = read_u32(&h, &res.occupancy, u64::from(res.occ_cap));
+        let coloff = read_u32(&h, &res.color_offsets, u64::from(res.coloff_cap));
+        for (e, m) in reg.entries.iter().enumerate() {
+            if res.dead[e] {
+                continue;
+            }
+            let meta = res.meta[e];
+            let oo = meta.occupancy_offset as usize;
+            assert_eq!(
+                &occ[oo..oo + m.occupancy.len()],
+                &m.occupancy[..],
+                "occ entry {e} reads at its meta offset"
+            );
+            let co = meta.color_offsets_offset as usize;
+            assert_eq!(
+                &coloff[co..co + m.color_offsets.len()],
+                &m.color_offsets[..],
+                "color_offsets entry {e}"
             );
         }
     }
