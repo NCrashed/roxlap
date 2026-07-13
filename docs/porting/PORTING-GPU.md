@@ -383,7 +383,9 @@ opticast. Landed as sub-substages GW.0..GW.4; cut in **roxlap 0.9.0**.
   that fine; the canvas constructors carry no `Send+Sync` bound.
 - **No blocking on wasm.** `pollster::block_on` and
   `device.poll(Wait)` have no WebGPU equivalent, so init is async and
-  GPU depth-picking is deferred (the CPU fallback still picks).
+  GPU depth-picking was deferred here. **[CLOSED by PW.1 (2026-07-13,
+  PORTING-PLATFORM.md): `read_depth_pixel_async` + the `PendingPick`
+  machine — one-frame-latency polling semantics.]**
 - **CPU fallback kept.** WebGPU isn't universal (Safari/Firefox lag),
   so the facade's CPU opticast path stays available on the web,
   presented via WebGL2 instead of softbuffer.
@@ -396,7 +398,8 @@ opticast. Landed as sub-substages GW.0..GW.4; cut in **roxlap 0.9.0**.
 - `!Send` wgpu resources must stay on the main thread (they do — the
   host is `Rc<RefCell>`; rayon workers only touch the CPU
   compositor's framebuffer slices).
-- GPU click-picking returns `None` on wasm (deferred); CPU picks.
+- GPU click-picking on wasm answers with one frame of latency (PW.1;
+  was `None`/deferred until 2026-07-13); CPU picks synchronously.
 
 ## GPU.13.1 — chunk-occupancy pyramid (landed 2026-07-07)
 

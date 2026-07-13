@@ -6,7 +6,7 @@ per-grid voxel-scale stage — tag **SC**. A fresh-context session should
 read it top to bottom before touching code. Recon: two very-thorough
 sweeps (CPU/scene + GPU), both 2026-07-07.
 
-## Status — OPEN (scope locked by user 2026-07-07)
+## Status — CLOSED 2026-07-13 (all substages shipped; SC.5 landed in 0.26.0, status rot fixed at the PW-wave close)
 
 - SC.0 — LANDED 2026-07-07: `GridTransform::voxel_world_size: f64`
   (default 1.0) + `at_scale()`; `addr::world_to_grid_local` (`/vws`) /
@@ -30,9 +30,14 @@ sweeps (CPU/scene + GPU), both 2026-07-07.
   ×vws). Detailed entry below.
 - SC.snap — LANDED (snapshot v2 persists vws). Detailed entry below; the
   SC.5 gate is cleared (scale now survives a save).
-- SC.5 — pending (demo + book chapter + CHANGELOG). The SC.snap gate is
-  cleared: a scaled scene persists correctly across save/load. Last
-  substage.
+- SC.5 — LANDED (shipped in 0.26.0; this status line rotted until
+  2026-07-13): the **Scale** demo scene
+  (`roxlap-scene-demo/src/scenes/scale.rs` — planet `4.0` + bobbing
+  ship `0.25`, a 16× ratio; `P` pause, `K` sun shadows), book coverage
+  in the scene-graph chapter (`voxel_world_size`, `at_scale`, snapshot
+  persistence), and the 0.26.0 CHANGELOG section. The demo-tour scene
+  table was the one true leftover — its Scale row (and the Audio
+  scene's, an AU2.3 miss) added 2026-07-13.
 (Per-substage detail — tests, gotchas, exact edits — is in the "Substages"
 section below; this list is just the at-a-glance status.)
 
