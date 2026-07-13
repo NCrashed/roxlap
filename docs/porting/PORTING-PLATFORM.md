@@ -82,9 +82,36 @@ top to bottom before touching code.
   - Verified: wasm32 check + clippy both feature variants (only the 2
     pre-existing lints), roxlap-scene 234 lib tests, cave-demo 5
     tests (incl. `crystals_planted_and_lit` against the delegate),
-    rustdoc -D warnings, check-anchors. Owed: the user's browser pass
-    (crystals visible + hums + islands falling).
-- PW.1 — wasm GPU depth-picking: NOT STARTED
+    rustdoc -D warnings, check-anchors. Browser pass PASSED
+    (2026-07-13): crystals + hums + falling islands confirmed live.
+- PW.1 — LANDED 2026-07-13: wasm GPU depth-picking per decision 4.
+  - `roxlap-gpu/src/pending_pick.rs` — `PendingPick`, the pure
+    one-in-flight state machine (request → in-flight → complete →
+    re-arm; clicks during flight coalesce away — the next call re-arms
+    with its own, newest pixel; the completed result keeps its pixel).
+    4 native unit tests.
+  - Driver `GpuRenderer::read_depth_pixel_async` (new pub API ⇒ minor):
+    harvest-if-resolved → re-arm-for-this-pixel → return latest
+    completed. Per-pick 4-byte staging buffer owned by the state (NOT
+    the shared `depth_readback`) — the copy executes at submit time,
+    so a resize/scene swap between calls can't invalidate an in-flight
+    pick, and no generation counter is needed. `map_async` result
+    rides an `Arc<Mutex>` cell (fresh per submission), so the driver
+    compiles on every target; the browser event loop resolves the map
+    between RAF frames.
+  - Facade: the wasm `pick_depth` stub (`None`) now calls the async
+    driver; `SceneRenderer::pick_depth`/`pick` docs state the
+    one-frame-latency contract (poll next frame; result may be the
+    previous pixel's). Native path byte-untouched. Stale doc claim
+    fixed en route: depth is ALWAYS written since L3.1 — picking never
+    needed sprites in the frame.
+  - cave-web probe: `P` polls `pick()` at the canvas centre (≤30
+    frames) and console.logs the world hit + voxel — works on both
+    wasm backends (CPU resolves on the first poll).
+  - Verified: gpu 52 + render 89 native lib tests, clippy clean,
+    workspace rustdoc -D warnings, wasm check+clippy both variants
+    (only the 2 pre-existing lints). Owed: the user's manual browser
+    check (press P over a wall → coordinates in the console).
 - PW.2 — CI matrix (macOS + aarch64 + wasm-audio check): NOT STARTED
 - PW.3 — docs + close: NOT STARTED
 

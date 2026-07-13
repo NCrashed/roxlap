@@ -45,6 +45,7 @@ pub mod sprite_model;
 
 mod lights;
 mod overlay;
+mod pending_pick;
 mod readback;
 mod shader_src;
 
@@ -268,6 +269,11 @@ pub struct GpuRenderer {
     /// Lazy-built on first [`Self::render_scene`] call. Holds the
     /// multi-grid pipeline + per-grid camera uniforms.
     scene_dda: Option<SceneDdaResources>,
+    /// PW.1 — async depth-pick state for the wasm GPU path (see
+    /// `pending_pick.rs`). Interior-mutable because the facade's
+    /// `pick_depth` is `&self`; native hosts use the blocking
+    /// [`Self::read_depth_pixel`] instead.
+    async_pick: std::sync::Mutex<pending_pick::AsyncPickState>,
     /// TV.6 — global voxel-material palette mirrored to the scene pass (256
     /// entries, default all-opaque), set via [`Self::set_scene_materials`].
     scene_materials: Box<[MaterialGpu; 256]>,
@@ -1260,6 +1266,7 @@ impl GpuRenderer {
             ssaa: 1,
             posterize: None,
             scene_dda: None,
+            async_pick: std::sync::Mutex::new(pending_pick::AsyncPickState::default()),
             scene_materials: Box::new(
                 [MaterialGpu {
                     alpha: 1.0,

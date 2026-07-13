@@ -22,14 +22,14 @@ impl GpuRenderer {
     /// and blocks on `device.poll(Wait)`. Cheap enough for click-time
     /// picks; do not call it every frame.
     ///
-    /// Requires the last frame to have written depth, which happens
-    /// when sprites are present (`write_depth`). The pick demo always
-    /// has a cursor sprite, so this holds.
+    /// The scene pass always writes depth (L3.1), so the last rendered
+    /// frame is pickable with or without sprites in it.
     ///
     /// Compiles on wasm, but the wasm facade never calls it: WebGPU's
     /// `device.poll` doesn't block for the GPU, so the blocking
-    /// `recv()` here would hang the single browser thread. Picking is
-    /// deferred on the wasm GPU path (the facade returns `None`).
+    /// `recv()` here would hang the single browser thread. The wasm
+    /// facade calls [`Self::read_depth_pixel_async`] instead (PW.1 —
+    /// one-frame latency).
     #[must_use]
     pub fn read_depth_pixel(&self, x: u32, y: u32) -> Option<f32> {
         let dda = self.scene_dda.as_ref()?;
@@ -70,6 +70,86 @@ impl GpuRenderer {
             return None;
         }
         Some(t)
+    }
+
+    /// PW.1 — the async counterpart of [`Self::read_depth_pixel`] for
+    /// the wasm GPU path, where `map_async` only resolves on browser
+    /// event-loop turns and blocking would hang the single thread.
+    ///
+    /// Each call: (1) **harvests** the previous readback if its map
+    /// has resolved (the browser resolves it between RAF frames), (2)
+    /// **re-arms** — submits a fresh 4-byte copy + map for THIS call's
+    /// pixel if nothing is in flight (clicks arriving while one is
+    /// mapping are coalesced away; the next call re-arms with its own,
+    /// newest pixel), and (3) returns the **latest completed** depth —
+    /// usually `None` on the first call and the value on the next
+    /// (one-frame latency; the result may correspond to the previously
+    /// requested pixel). Same `T_INF`/non-finite sky filtering as the
+    /// sync path.
+    ///
+    /// The staging buffer is created per pick (4 bytes) and owned by
+    /// the pick state, NOT the shared `depth_readback`: the copy
+    /// executes against the depth buffer at submit time, so a resize /
+    /// scene swap between calls cannot invalidate an in-flight pick.
+    ///
+    /// Compiles and works on every target (the state machine
+    /// unit-tests natively), but native hosts should call the sync
+    /// [`Self::read_depth_pixel`]: without the browser event loop the
+    /// map only resolves if something polls the device between calls.
+    #[must_use]
+    pub fn read_depth_pixel_async(&self, x: u32, y: u32) -> Option<f32> {
+        let mut st = self.async_pick.lock().expect("async-pick lock");
+
+        // (1) Harvest a resolved map: read the 4 bytes, drop the
+        // staging buffer (mapped buffers unmap on drop).
+        if st.pending.is_in_flight() {
+            let resolved = st.map_result.lock().expect("map-result lock").take();
+            if let Some(res) = resolved {
+                let staging = st.staging.take();
+                let depth = res.ok().and(staging).and_then(|buf| {
+                    let data = buf.slice(..4).get_mapped_range();
+                    let bytes: [u8; 4] = data[0..4].try_into().ok()?;
+                    let t = f32::from_le_bytes(bytes);
+                    // Reject sky / no-hit (T_INF == 1e30) + non-finite.
+                    (t.is_finite() && t < 1.0e29).then_some(t)
+                });
+                st.pending.complete(depth);
+            }
+        }
+
+        // (2) Re-arm for THIS pixel (request() refuses while in flight).
+        if let Some(dda) = self.scene_dda.as_ref() {
+            let (w, h) = dda.storage_size;
+            if x < w && y < h && st.pending.request(x, y) {
+                let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("roxlap-gpu async depth pick"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut enc = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("roxlap-gpu async depth pick"),
+                    });
+                let offset = (u64::from(y) * u64::from(w) + u64::from(x)) * 4;
+                enc.copy_buffer_to_buffer(&dda.depth_buffer, offset, &staging, 0, 4);
+                self.queue.submit(std::iter::once(enc.finish()));
+
+                // A fresh result cell per submission: a late callback
+                // from an abandoned pick writes into an orphaned cell.
+                let cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let cb = std::sync::Arc::clone(&cell);
+                staging.slice(..4).map_async(wgpu::MapMode::Read, move |r| {
+                    *cb.lock().expect("map-result lock (callback)") = Some(r);
+                });
+                st.map_result = cell;
+                st.staging = Some(staging);
+            }
+        }
+
+        // (3) The latest completed pick (sky/no-hit folds to None).
+        st.pending.latest().and_then(|(_pixel, depth)| depth)
     }
 
     /// QE.7a — read back the last rendered frame's colour at the

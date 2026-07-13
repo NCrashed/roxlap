@@ -4063,8 +4063,17 @@ impl SceneRenderer {
     ///
     /// Cost: the CPU backend reads its in-memory z-buffer (free); the
     /// GPU backend stages the depth buffer and blocks on a device poll
-    /// (cheap at click time — do not call every frame). The GPU path
-    /// only has depth when the last frame drew sprites (`write_depth`).
+    /// (cheap at click time — do not call every frame). The scene pass
+    /// always writes depth (L3.1), so the pick works with or without
+    /// sprites in the frame.
+    ///
+    /// **wasm GPU path (PW.1): one-frame latency.** WebGPU has no
+    /// blocking readback, so the call submits the readback for
+    /// `(x, y)` and returns the latest **completed** pick — usually
+    /// `None` on the first call and the value on the next; the value
+    /// may correspond to the previously requested pixel. Poll by
+    /// calling again next frame. Hosts needing synchronous picks use
+    /// the CPU backend (which is synchronous everywhere).
     #[must_use]
     pub fn pick_depth(&self, x: u32, y: u32) -> Option<f32> {
         match &self.inner {
@@ -4119,7 +4128,10 @@ impl SceneRenderer {
     /// `scene` and `camera` must be the ones the last frame rendered;
     /// the projection (size + FOV / `hx,hy,hz`) is taken from that
     /// frame. Cheap on CPU (in-memory z-buffer); on GPU it stages the
-    /// depth buffer (a click-time device poll — not per frame).
+    /// depth buffer (a click-time device poll — not per frame). On the
+    /// **wasm GPU path** the underlying [`Self::pick_depth`] has
+    /// one-frame latency — expect `None` on the first call after a
+    /// click and poll again next frame.
     #[must_use]
     pub fn pick(&self, scene: &Scene, camera: &Camera, x: u32, y: u32) -> Option<PickHit> {
         let dir = self.pixel_ray(camera, f64::from(x), f64::from(y))?;

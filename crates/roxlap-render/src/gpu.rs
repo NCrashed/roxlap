@@ -876,14 +876,16 @@ impl GpuBackend {
         self.gpu.read_depth_pixel(rx, ry)
     }
 
-    /// wasm: depth picking is deferred on the GPU path — WebGPU has no
-    /// blocking readback, so the staging-buffer map can't be awaited
-    /// synchronously here. Always `None`; the CPU fallback picks
-    /// normally from its in-memory z-buffer.
+    /// wasm (PW.1): one-frame-latency async pick — WebGPU has no
+    /// blocking readback, so this call SUBMITS the readback for
+    /// `(x, y)` and returns the latest COMPLETED pick: usually `None`
+    /// on the first call and the value on the next (which may
+    /// correspond to the previously requested pixel). Hosts poll —
+    /// call it again next frame. The CPU fallback picks synchronously.
     #[cfg(target_arch = "wasm32")]
-    #[allow(clippy::unused_self)]
-    pub(crate) fn pick_depth(&self, _x: u32, _y: u32) -> Option<f32> {
-        None
+    pub(crate) fn pick_depth(&self, x: u32, y: u32) -> Option<f32> {
+        let (rx, ry) = self.window_to_render_u(x, y);
+        self.gpu.read_depth_pixel_async(rx, ry)
     }
 
     /// World-space view ray for pixel `(x, y)` under the GPU marcher's
@@ -908,7 +910,6 @@ impl GpuBackend {
         )
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn window_to_render_u(&self, x: u32, y: u32) -> (u32, u32) {
         let (rw, rh) = self.gpu.render_dims();
         let (nw, nh) = self.gpu.surface_dims();

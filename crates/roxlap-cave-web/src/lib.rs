@@ -210,6 +210,10 @@ struct State {
     /// R10.X.4: per-frame multi-touch state. Empty on desktop;
     /// 1-2 entries while a phone player holds the canvas.
     touches: Vec<ActiveTouch>,
+    /// PW.1 — frames left on the P-key pick probe (`None` = idle).
+    /// The wasm GPU pick has one-frame latency, so the probe POLLS
+    /// the pick each frame until it resolves.
+    pick_probe: Option<u8>,
     /// PW.0 — browser audio. `None` until the FIRST user gesture
     /// constructs it (the autoplay policy: an `AudioContext` made
     /// outside a gesture handler stays suspended), and stays `None`
@@ -636,7 +640,8 @@ fn tick_crumble(state: &mut State, dt: f64) {
         ));
         st.shatters_since_compact += 1;
     }
-    st.particles.tick_with_scene(&mut st.renderer, dt, &st.scene);
+    st.particles
+        .tick_with_scene(&mut st.renderer, dt, &st.scene);
     if st.shatters_since_compact >= CRUMBLE_COMPACT_EVERY {
         st.renderer.compact_sprite_models();
         st.shatters_since_compact = 0;
@@ -708,6 +713,37 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_m
         }
     }
     render(&mut state);
+    poll_pick_probe(&mut state);
+}
+
+/// PW.1 — the P-key pick probe: polls [`SceneRenderer::pick`] at the
+/// canvas centre each frame until it resolves, then logs the world
+/// hit + owning grid + voxel to the console. On the wasm GPU path the
+/// pick has one-frame latency (the first call arms the readback), so
+/// polling — rather than a single call — is the correct consumption
+/// pattern; the CPU fallback resolves on the first poll. A probe that
+/// exhausts its frames was aimed at the sky.
+fn poll_pick_probe(state: &mut State) {
+    let Some(left) = state.pick_probe else {
+        return;
+    };
+    let (cx, cy) = (state.res.0 / 2, state.res.1 / 2);
+    let cam = cam_from_yaw_pitch(state.cam_pos, state.yaw, state.pitch);
+    if let Some(hit) = state.renderer.pick(&state.scene, &cam, cx, cy) {
+        web_sys::console::log_1(
+            &format!(
+                "roxlap-cave-web: pick @({cx},{cy}) → world ({:.1}, {:.1}, {:.1}), voxel ({}, {}, {})",
+                hit.world[0], hit.world[1], hit.world[2], hit.voxel.x, hit.voxel.y, hit.voxel.z,
+            )
+            .into(),
+        );
+        state.pick_probe = None;
+    } else if left == 0 {
+        web_sys::console::log_1(&"roxlap-cave-web: pick @centre → no hit (sky?)".into());
+        state.pick_probe = None;
+    } else {
+        state.pick_probe = Some(left - 1);
+    }
 }
 
 // ----- Regenerate -----------------------------------------------------------
@@ -911,6 +947,7 @@ async fn start() -> Result<(), JsValue> {
         preset,
         seed,
         touches: Vec::new(),
+        pick_probe: None,
         #[cfg(feature = "audio")]
         audio: None,
     };
@@ -918,7 +955,7 @@ async fn start() -> Result<(), JsValue> {
 
     web_sys::console::log_1(
         &format!(
-            "roxlap-cave-web: cave-gen + bake {:.0} ms — renderer = {backend}{} — controls: WASD move, Space/Shift up/down, Ctrl fast, click canvas to look around, click again to fire, F preset, R reseed",
+            "roxlap-cave-web: cave-gen + bake {:.0} ms — renderer = {backend}{} — controls: WASD move, Space/Shift up/down, Ctrl fast, click canvas to look around, click again to fire, F preset, R reseed, P pick probe (console)",
             t_gen_end - t_gen_start,
             state
                 .borrow()
@@ -959,6 +996,13 @@ fn install_input_handlers(
                 "KeyR" => {
                     s.seed = s.seed.wrapping_add(1);
                     regenerate(&mut s);
+                    ev.prevent_default();
+                }
+                // PW.1 — pick probe: poll the screen→world pick at the
+                // canvas centre until it resolves (one-frame latency
+                // on the wasm GPU path) and log the hit.
+                "KeyP" => {
+                    s.pick_probe = Some(30);
                     ev.prevent_default();
                 }
                 _ => {}

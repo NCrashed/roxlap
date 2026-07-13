@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **wasm GPU depth-picking** (PW.1): `SceneRenderer::pick_depth` /
+  `pick` now work on the browser GPU path with **one-frame latency**
+  (WebGPU has no blocking readback): a call submits the readback for
+  its pixel and returns the latest *completed* pick — poll again next
+  frame. Clicks arriving while a readback is mapping coalesce away
+  (the newest pixel wins). Backed by the new
+  `roxlap_gpu::GpuRenderer::read_depth_pixel_async` and a
+  unit-tested `PendingPick` state machine; the native blocking path
+  is untouched, and the CPU backend stays synchronous everywhere.
+  The cave web demo grew a `P` pick probe that logs the crosshair's
+  world voxel to the console.
+
 - `roxlap-scene`: `cavegen::plant_crystals` + `cavegen::CrystalParams`
   — the cave demo's EV.4 crystal planting (wall-march, glow
   `BakeLight`s, deterministic rejection sampling), extracted so the
