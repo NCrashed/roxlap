@@ -359,7 +359,29 @@ class — minor per house policy (maintainer review).
   earlier "needs full dev shell" claim was a missing search path,
   not a missing library); demo clippy + tests green WITH audio.
   30 audio tests, clippy 0.
-- AU2.3 — scene-demo Audio tab: NOT STARTED
+- AU2.3 — LANDED 2026-07-13: the **Audio** scene
+  (`scene-demo/src/scenes/audio.rs`, registered unconditionally).
+  Design upgrade over the plan: the acoustics core is pure, so the
+  tab exists in EVERY build showing the live numbers (`book_audio`
+  made walkable — occlusion per source, reverb environment, Doppler,
+  listener speed); the new scene-demo `audio` feature
+  (`roxlap-audio/kira`) only adds playback (three looping zone hums,
+  full parameter mirroring incl. per-frame Doppler pitch). World:
+  floor + sealed stone room (doorway on +x) + a big **glass** cavern
+  (entrance on −x) — built from PAINTED slabs with gaps assembled
+  around the doorways, never carved (the AU2.1 zero-RGB lesson); the
+  same colour map drives rendering, so the cavern renders as actual
+  alpha-blend glass AND classifies as low-damping for the reverb.
+  Tables ACTIVE: glass → absorption 0.35 + damping 0.1. **Hazard-2
+  profiling debt DISCHARGED** with numbers (release probe
+  `weighted_tables_probe`, #[ignore]d, roxlap-audio):
+  `source_acoustics` through 4 walls — 8.03 µs empty vs 8.10 µs
+  active tables (+0.8%); `probe_cavity` — 7.2 vs 6.9 µs (noise). The
+  feared per-cell `voxel_color` cost doesn't materialise: colours
+  are only sampled on solid cells, and audio rays cross few. The
+  scene's HUD also shows the measured per-update acoustics cost
+  live. Both feature variants compile, clippy 0; 30 audio + 18
+  scene-demo tests green.
 - AU2.4 — docs: NOT STARTED
 
 ## Locked design decisions

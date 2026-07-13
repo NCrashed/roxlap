@@ -7,6 +7,7 @@
 //! [`DemoScene`]: crate::scene_api::DemoScene
 
 pub mod animation;
+pub mod audio;
 pub mod doom;
 pub mod empty;
 pub mod lighting;

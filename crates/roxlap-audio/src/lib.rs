@@ -776,6 +776,62 @@ mod tests {
         assert_eq!(unmapped.transmission, base.transmission);
     }
 
+    /// Manual perf probe (release, `--ignored --nocapture`) — the AU2
+    /// profiling debt: the cost of `source_acoustics` and
+    /// `probe_cavity` with the material tables ACTIVE vs empty, on a
+    /// wall-heavy scene (the per-cell `voxel_color` slab walk is the
+    /// suspect).
+    #[test]
+    #[ignore = "manual perf probe — cargo test -p roxlap-audio --release weighted_tables_probe -- --ignored --nocapture"]
+    fn weighted_tables_probe() {
+        let scene = scene_with(|g| {
+            for x in [20, 30, 40, 50] {
+                wall(g, x, 3);
+            }
+        });
+        let src = DVec3::new(10.0, 64.0, 140.5);
+        let dst = DVec3::new(60.0, 64.0, 140.5);
+        let plain_cfg = AcousticsConfig::default();
+        let glass_cfg = AcousticsConfig {
+            material_map: vec![(GLASS.rgb_part(), GLASS_ID)],
+            absorption: vec![(GLASS_ID, 0.35)],
+            ..AcousticsConfig::default()
+        };
+        const N: u32 = 1_000;
+        let time = |cfg: &AcousticsConfig| {
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(source_acoustics(&scene, src, dst, cfg));
+            }
+            t0.elapsed() / N
+        };
+        eprintln!(
+            "source_acoustics, 4 walls, tables empty:  {:?}",
+            time(&plain_cfg)
+        );
+        eprintln!(
+            "source_acoustics, 4 walls, tables ACTIVE: {:?}",
+            time(&glass_cfg)
+        );
+
+        let cav_plain = crate::CavityConfig::default();
+        let cav_glass = crate::CavityConfig {
+            material_map: vec![(GLASS.rgb_part(), GLASS_ID)],
+            damping_override: vec![(GLASS_ID, 0.1)],
+            ..crate::CavityConfig::default()
+        };
+        let listener = DVec3::new(25.0, 64.0, 140.5);
+        let time_cav = |cfg: &crate::CavityConfig| {
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(crate::probe_cavity(&scene, listener, cfg));
+            }
+            t0.elapsed() / N
+        };
+        eprintln!("probe_cavity, tables empty:  {:?}", time_cav(&cav_plain));
+        eprintln!("probe_cavity, tables ACTIVE: {:?}", time_cav(&cav_glass));
+    }
+
     // ---------- AU2.2: Doppler ----------
 
     /// Approaching pitches up, receding down, rest is exactly neutral,

@@ -2697,6 +2697,7 @@ dependencies = [
  "gif",
  "glam 0.30.10",
  "png 0.17.16",
+ "roxlap-audio",
  "roxlap-core",
  "roxlap-formats",
  "roxlap-render",
