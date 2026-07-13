@@ -2573,6 +2573,7 @@ version = "0.28.0"
 dependencies = [
  "console_error_panic_hook",
  "glam 0.30.10",
+ "roxlap-audio",
  "roxlap-cavegen",
  "roxlap-core",
  "roxlap-formats",

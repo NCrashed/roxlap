@@ -29,6 +29,17 @@ roxlap-render = { path = "../roxlap-render", version = "0.28" }
 roxlap-scene = { path = "../roxlap-scene", version = "0.28" }
 glam = { workspace = true }
 
+# PW.0 — voxel-aware audio in the browser, opt-in (mirrors the native
+# cave demo's `audio` feature). kira 0.12 is wasm-ready out of the
+# box: its manifest switches cpal to the `wasm-bindgen` backend under
+# wasm32. Constructed lazily on the FIRST user gesture (pointer-lock
+# click / touch) — the browser autoplay policy makes an earlier
+# AudioContext permanently silent.
+#   trunk serve --features audio
+roxlap-audio = { path = "../roxlap-audio", version = "0.28", features = [
+    "kira",
+], optional = true }
+
 # wasm-bindgen / web-sys versions pinned to the same major+minor as
 # the `wasm-bindgen-cli` shipped by nixpkgs — a schema mismatch between
 # the macro-generated glue and the CLI fails the build.
@@ -65,6 +76,10 @@ features = [
     # worker count.
     "Navigator",
 ]
+
+[features]
+# PW.0 — browser audio (see the roxlap-audio dependency note above).
+audio = ["dep:roxlap-audio"]
 
 [lints]
 workspace = true

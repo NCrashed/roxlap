@@ -10,6 +10,13 @@
 //! with a local lightmode-1 re-bake, which the facade re-uploads to
 //! the GPU via its per-chunk dirty tracking. `F` cycles the preset,
 //! `R` reseeds — both regenerate the cave in place.
+//!
+//! PW.0 — build with the `audio` feature
+//! (`trunk serve --features audio`) for the voxel-aware soundscape:
+//! shots and carve booms muffled by the rock in the way, and cavity
+//! reverb that follows the chamber around you. kira's WebAudio
+//! backend starts on the FIRST click/touch (the browser autoplay
+//! policy); no crystal hums here — the web cave has no crystals.
 
 #![cfg(target_arch = "wasm32")]
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -28,11 +35,16 @@ use roxlap_render::{
     SpriteSet,
 };
 use roxlap_scene::{
-    CharacterBody, CharacterDef, GridId, GridTransform, MoveMode, Rgb, Scene, Solidity, VoxColor,
-    WalkInput,
+    CharacterBody, CharacterDef, GridId, GridTransform, MoveMode, Rgb, Scene, Solidity, SpanOp,
+    VoxColor, WalkInput,
 };
 use wasm_bindgen::prelude::*;
 use web_sys::{HtmlCanvasElement, KeyboardEvent, MouseEvent};
+
+/// PW.0 — voxel-aware audio (feature `audio`): shots + carve booms +
+/// cavity reverb, the native cave demo's soundscape in the browser.
+#[cfg(feature = "audio")]
+mod audio;
 
 // ----- World / camera tuning (mirrors roxlap-cave-demo) ----------------------
 
@@ -135,6 +147,21 @@ struct State {
     /// R10.X.4: per-frame multi-touch state. Empty on desktop;
     /// 1-2 entries while a phone player holds the canvas.
     touches: Vec<ActiveTouch>,
+    /// PW.0 — browser audio. `None` until the FIRST user gesture
+    /// constructs it (the autoplay policy: an `AudioContext` made
+    /// outside a gesture handler stays suspended), and stays `None`
+    /// when no device/context is available (silent demo).
+    #[cfg(feature = "audio")]
+    audio: Option<audio::WebAudio>,
+}
+
+/// PW.0 — construct the audio system; called ONLY from user-gesture
+/// handlers (first pointer-lock click, first touch). Idempotent.
+#[cfg(feature = "audio")]
+fn ensure_audio(state: &mut State) {
+    if state.audio.is_none() {
+        state.audio = audio::WebAudio::new();
+    }
 }
 
 /// R10.X.4: multi-touch tracking. Each entry covers one
@@ -341,6 +368,11 @@ fn fire_bullet(state: &mut State) {
         vel,
         travelled: 0.0,
     });
+    // PW.0 — the shot transient at the muzzle, occlusion-shaded.
+    #[cfg(feature = "audio")]
+    if let Some(a) = state.audio.as_mut() {
+        a.fire(pos, &state.scene, DVec3::from(state.cam_pos));
+    }
 }
 
 /// Advance bullets, carve craters on impact, and re-bake the cave's
@@ -380,9 +412,20 @@ fn step_bullets(state: &mut State, dt: f64) -> bool {
     if impacts.is_empty() {
         return false;
     }
+    // PW.0 — impact booms, shaded for the rock in the way (before the
+    // carve mutates the grid).
+    #[cfg(feature = "audio")]
+    if let Some(a) = state.audio.as_mut() {
+        a.impacts(&impacts, &state.scene, DVec3::from(state.cam_pos));
+    }
     let grid = state.scene.grid_mut(state.grid).expect("cave grid present");
     for hit in impacts {
-        grid.set_sphere(hit, FIRE_RADIUS, Some(CARVE_COLOR));
+        // PW.0 drive-by fix: this used `set_sphere(…, Some(CARVE_COLOR))`,
+        // which INSERTS a solid painted ball — the opposite of the
+        // documented crater. Mirror the native demo: carve, painting
+        // the newly exposed crater walls (a plain carve leaves them
+        // black).
+        grid.set_sphere_with_colfunc(hit, FIRE_RADIUS, SpanOp::Carve, |_, _, _| CARVE_COLOR);
     }
     // Re-bake the (single) chunk's lighting once after all craters so
     // estnorm shading follows the new cavity walls; the carve already
@@ -445,6 +488,15 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_m
         fire_bullet(&mut state);
     }
     let _carved = step_bullets(&mut state, dt);
+    // PW.0 — listener pose per frame + throttled reverb environment.
+    #[cfg(feature = "audio")]
+    {
+        let st = &mut *state;
+        if let Some(a) = st.audio.as_mut() {
+            let cam = cam_from_yaw_pitch(st.cam_pos, st.yaw, st.pitch);
+            a.tick(dt, &st.scene, st.grid, &cam);
+        }
+    }
     render(&mut state);
 }
 
@@ -461,6 +513,12 @@ fn regenerate(state: &mut State) {
         f64::from(MAXZDIM) * 0.5,
     ];
     state.bullets.clear();
+    // PW.0 — the cave changed wholesale under the listener: drop the
+    // smoothed reverb history so the old chamber's tail doesn't linger.
+    #[cfg(feature = "audio")]
+    if let Some(a) = state.audio.as_mut() {
+        a.reset();
+    }
 }
 
 // ----- Init -----------------------------------------------------------------
@@ -585,6 +643,8 @@ async fn start() -> Result<(), JsValue> {
         preset,
         seed,
         touches: Vec::new(),
+        #[cfg(feature = "audio")]
+        audio: None,
     };
     let state = Rc::new(RefCell::new(state));
 
@@ -665,6 +725,12 @@ fn install_input_handlers(
             }
         } else {
             canvas_for_click.request_pointer_lock();
+            // PW.0 — this first click IS the user gesture: the only
+            // moment the browser lets an AudioContext start audible.
+            #[cfg(feature = "audio")]
+            if let Ok(mut s) = click_state.try_borrow_mut() {
+                ensure_audio(&mut s);
+            }
         }
     });
     canvas.add_event_listener_with_callback("click", on_canvas_click.as_ref().unchecked_ref())?;
@@ -722,6 +788,9 @@ fn install_touch_handlers(
         let Ok(mut s) = state_for_start.try_borrow_mut() else {
             return;
         };
+        // PW.0 — a first touch is a user gesture too (mobile).
+        #[cfg(feature = "audio")]
+        ensure_audio(&mut s);
         let changed = ev.changed_touches();
         for i in 0..changed.length() {
             let Some(t) = changed.get(i) else { continue };
