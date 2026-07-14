@@ -266,6 +266,12 @@ pub struct GpuRenderer {
     /// RP.2 — reduced-palette post applied in the resolve pass (at logical
     /// resolution). `None` = off (`levels = [1,1,1]` ⇒ the RP.1 box-avg only).
     posterize: Option<PosterizeGpu>,
+    /// WT.2 — per-frame full-screen tint applied in the resolve pass
+    /// before the posterize quantize: packed `0x00RRGGBB` + strength
+    /// quantized to `1..=255` ([`Self::set_tint`] folds `0` to `None`
+    /// itself, so the identity fast paths never depend on caller
+    /// discipline).
+    tint: Option<(u32, u8)>,
     /// Lazy-built on first [`Self::render_scene`] call. Holds the
     /// multi-grid pipeline + per-grid camera uniforms.
     scene_dda: Option<SceneDdaResources>,
@@ -1267,6 +1273,7 @@ impl GpuRenderer {
             posterize: None,
             scene_dda: None,
             async_pick: std::sync::Mutex::new(pending_pick::AsyncPickState::default()),
+            tint: None,
             scene_materials: Box::new(
                 [MaterialGpu {
                     alpha: 1.0,
@@ -1470,6 +1477,20 @@ impl GpuRenderer {
     /// resolve uniform, so no pipeline rebuild is needed.
     pub fn set_posterize(&mut self, cfg: Option<PosterizeGpu>) {
         self.posterize = cfg;
+    }
+
+    /// WT.2 — set (or clear) this frame's full-screen tint: packed
+    /// `0x00RRGGBB` + strength quantized to `0..=255` (the blend is
+    /// integer — `(c·(255−s₈) + t·s₈ + 127)/255` per channel, the
+    /// same expression the CPU backend runs, so tinted frames are
+    /// bit-exact across backends). Applied in the resolve pass at
+    /// the logical resolution, before the posterize quantize.
+    /// `None` — and a strength of `0`, folded HERE so direct callers
+    /// can't disable it — keeps the identity-resolve fast path
+    /// (byte-identical output, no full-screen pass). Per-frame state
+    /// — the facade forwards `FrameParams::tint` on every render.
+    pub fn set_tint(&mut self, tint: Option<(u32, u8)>) {
+        self.tint = tint.filter(|&(_, s8)| s8 > 0);
     }
 
     /// RP.0 — the logical (retro) grid size the scene resolves to before the
@@ -1694,17 +1715,27 @@ impl GpuRenderer {
             16,
             bytemuck::bytes_of(&[u32::from(self.flip_x), 0u32]),
         );
-        // RP.2 — refresh the resolve pass's posterize fields each frame (offset
-        // 20, after src/dst dims + ssaa). `None` ⇒ `levels = [1,1,1]`, `dither
-        // = 0` ⇒ the resolve does box-downfilter only (RP.1).
+        // RP.2 + WT.2 — refresh the resolve pass's posterize + tint fields
+        // each frame (offset 20, after src/dst dims + ssaa). Posterize
+        // `None` ⇒ `levels = [1,1,1]`, `dither = 0` (box-downfilter only);
+        // tint `None` ⇒ `s8 = 0` (the shader's integer blend is skipped).
+        // The tint colour rides in the facade's own `0x00RRGGBB` packing —
+        // the shader extracts channels with shifts, so there is exactly ONE
+        // packing convention on this path.
         let (plevels, pdither) = match self.posterize {
             Some(p) => (p.levels, p.dither),
             None => ([1u32; 3], 0u32),
         };
+        let (tint_rgb, tint_s8) = match self.tint {
+            Some((rgb, s8)) => (rgb, u32::from(s8)),
+            None => (0u32, 0u32),
+        };
         self.queue.write_buffer(
             &dda.resolve_dims,
             20,
-            bytemuck::bytes_of(&[plevels[0], plevels[1], plevels[2], pdither]),
+            bytemuck::bytes_of(&[
+                plevels[0], plevels[1], plevels[2], pdither, tint_rgb, tint_s8,
+            ]),
         );
 
         // Pack per-grid cameras into a runtime-sized storage buffer
@@ -2052,11 +2083,13 @@ impl GpuRenderer {
         }
         // RP.1 — resolve pass: box-downfilter framebuffer(march) →
         // resolve_buf(logical). One thread per logical pixel.
-        // PF.5 (H6) — with ssaa == 1 AND posterize off the resolve is an
-        // identity copy: skip the whole full-screen pass and blit straight
-        // from the framebuffer instead (byte-identical output).
-        let identity_resolve =
-            (render_w, render_h) == (logical_w, logical_h) && self.posterize.is_none();
+        // PF.5 (H6) — with ssaa == 1, posterize off AND no WT.2 tint
+        // this frame, the resolve is an identity copy: skip the whole
+        // full-screen pass and blit straight from the framebuffer
+        // instead (byte-identical output).
+        let identity_resolve = (render_w, render_h) == (logical_w, logical_h)
+            && self.posterize.is_none()
+            && self.tint.is_none();
         if !identity_resolve {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("roxlap-gpu scene_dda resolve"),

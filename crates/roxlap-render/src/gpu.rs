@@ -1023,6 +1023,13 @@ impl GpuBackend {
         // (which carries its own sky texture + fog state).
         self.sync_sky_and_fog(frame);
 
+        // WT.2 — forward this frame's full-screen tint to the resolve
+        // pass in the quantized wire form (`Tint::quantized` folds
+        // strength-0 to None, same as the CPU backend — one fold, one
+        // place).
+        self.gpu
+            .set_tint(frame.tint.and_then(crate::Tint::quantized));
+
         // Drop a resident built for a different scene (a scene switch swaps
         // the whole grid set). Without this the previous scene's grids —
         // e.g. the World scene's ship saucer — ghost into a gridless scene,

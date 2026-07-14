@@ -969,6 +969,56 @@ pub struct FrameParams<'a> {
     /// reinterpreted as the ambient/AO channel; direct light composites
     /// on top (`albedo*ambient + Σ direct`).
     pub lights: Option<LightRig<'a>>,
+    /// WT.2 — full-screen colour tint ([`Tint`]), applied by **both**
+    /// backends in the resolve step at the logical resolution: after
+    /// the SSAA downfilter, BEFORE posterize (grade first, quantize
+    /// after — the reduced palette stays palette-shaped under the
+    /// tint). The canonical use is the underwater look — lerp toward
+    /// a deep blue-green while
+    /// [`CharacterBody::eye_in_water`](roxlap_scene::CharacterBody::eye_in_water)
+    /// — but it is a general grade hook (damage flash, night vision).
+    /// `None` (the default) is byte-identical to the pre-WT.2 output.
+    pub tint: Option<Tint>,
+}
+
+/// WT.2 — a full-screen tint: every resolved pixel lerps toward
+/// `color` by `strength`. See [`FrameParams::tint`] for where in the
+/// pipeline it applies.
+///
+/// The blend is **integer**: `strength` quantizes to 8 bits and each
+/// channel computes `(c·(255−s₈) + t·s₈ + 127) / 255` — the identical
+/// arithmetic on both backends, so tinted frames are bit-exact across
+/// CPU and GPU by construction (a float lerp + round pair provably
+/// drifts ±1 from WGSL `mix` + `pack4x8unorm` on ~2.5% of byte
+/// pairs, and driver float contraction is out of our control).
+/// Strengths below `1/510` quantize to 0 = off.
+///
+/// Known seam: overlays ([`SceneRenderer::draw_lines`] /
+/// [`SceneRenderer::draw_images`]) rasterise before the resolve on
+/// the CPU backend (they are graded with the scene) but after it on
+/// the GPU (drawn over the grade at full brightness).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tint {
+    /// Target colour, packed `0x00RRGGBB` like every facade colour.
+    pub color: Rgb,
+    /// Lerp factor, clamped to `0..=1` at use. `0.0` is an identity
+    /// (byte-identical to `None`); `1.0` paints the frame flat.
+    pub strength: f32,
+}
+
+impl Tint {
+    /// The wire form both backends consume: packed colour + strength
+    /// quantized to `0..=255`. A strength that quantizes to `0` folds
+    /// to `None`, so the identity fast paths (skip the whole resolve
+    /// pass) stay engaged — the ONE place this fold lives; both
+    /// backend adapters call it.
+    pub(crate) fn quantized(self) -> Option<(u32, u8)> {
+        // Byte quantization of the clamped strength; `as u8` after
+        // round is in range by construction.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let s8 = (self.strength.clamp(0.0, 1.0) * 255.0).round() as u8;
+        (s8 > 0).then_some((self.color.0, s8))
+    }
 }
 
 impl<'a> FrameParams<'a> {
@@ -1004,6 +1054,7 @@ impl<'a> FrameParams<'a> {
             draw_sprites: true,
             side_shades: [0; 6],
             lights: None,
+            tint: None,
         }
     }
 

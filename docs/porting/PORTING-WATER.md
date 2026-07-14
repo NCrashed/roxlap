@@ -113,7 +113,71 @@ file:line facts, not guesses).
   wading with the DEFAULT body). Scene 255 tests; workspace clippy
   (+`struct_excessive_bools` allow — 4 genuinely independent flags),
   fmt, docs, anchors, wasm clippy, book example run — all green.
-- WT.2 — underwater tint (render): NOT STARTED
+- WT.2 — LANDED 2026-07-14: full-screen tint in the resolve step.
+  - Facade: `Tint { color: Rgb, strength: f32 }` +
+    `FrameParams.tint: Option<Tint>` (per-frame, unlike the
+    renderer-level posterize; pub-field growth — in-tree all
+    construction goes through `FrameParams::new`, no literals
+    existed). Pipeline position: after the SSAA downfilter, BEFORE
+    the posterize quantize (grade first — the reduced palette stays
+    palette-shaped under the tint). Strength `0.0` folds to `None`
+    in BOTH facade paths, so the identity claim is structural.
+  - CPU: `tint_pixel` (per-channel f32 lerp + round-to-nearest) in
+    `resolve_scene` between downfilter and posterize;
+    `resolve_active()` includes the tint (a tint alone activates the
+    resolve).
+  - GPU: the `Resolve` uniform's `_pad0/_pad1` became
+    `tint_rgb`/`tint_strength` (ZERO layout change — the pads were
+    load-bearing spare room); per-frame write extends the existing
+    offset-20 posterize refresh; the colour repacks facade
+    `0x00RRGGBB` → little-endian R-low for `unpack4x8unorm`; the
+    identity-resolve fast-path gate (PF.5 H6) includes
+    `tint.is_none()`. `mix` in unorm space + `pack4x8unorm`
+    round-to-nearest = the CPU arithmetic exactly (pinned by a CPU
+    test that emulates the unorm round-trip over a sample grid).
+  - Tests: strength-0 byte-identity, strength-1 flat paint,
+    per-channel lerp + GPU-arithmetic equivalence; naga validates
+    the edited shader; full gpu suite (21 scene_render on a live
+    adapter) + render 92 + workspace clippy/fmt/docs + wasm clippy
+    green. Demo wiring (eye_in_water → tint) lands with WT.4.
+  **Review round (user, 2026-07-14) — 7 findings closed; the tint is
+  now INTEGER end-to-end:**
+  1. The f32 design was NOT bit-exact across backends: CPU
+     `round(c+(t−c)s)` vs WGSL `mix` + `pack4x8unorm` provably drift
+     ±1 on ~2.5% of byte pairs (user brute-forced 256×256×9; e.g.
+     c=7,t=2,s=0.1 → 7 vs 6) — and the "GPU emulation" test used the
+     CPU's own formula, a tautology that could never catch it.
+     REDESIGN: strength quantizes to 8 bits (`Tint::quantized`, the
+     single fold — closes the duplicated-closure finding too) and
+     both backends run the identical u32 expression
+     `(c·(255−s₈)+t·s₈+127)/255`; the GPU byte-quantizes the SSAA box
+     average first (`floor(0.5+255c)`, = pack4x8unorm semantics),
+     closing the second drift (CPU rounded the downfilter before the
+     lerp, GPU lerped the raw average). Bit-exactness is now BY
+     CONSTRUCTION — immune to driver float contraction; tests pin
+     properties (endpoint brute force, boundedness, monotonicity, the
+     reviewer's witness pair) instead of pretending to emulate.
+  2. CPU capture (QE.7a) snapshotted the raw MARCH buffer at render
+     time — a tinted/posterized frame captured without its grade
+     (pre-existing for posterize!). Moved to the present-side
+     pipeline (`capture_logical` after `resolve_scene`, in both
+     `present` and `paint_egui` — pre-UI, like the GPU) — captures
+     are now the post-resolve logical image on both backends.
+  3. GPU capture's identity-gate MIRROR in readback.rs was not
+     updated with the render-path gate — a tinted default-settings
+     frame captured from the ungraded march buffer. Fixed + a
+     drift-trap comment tying the two conditions together.
+  4. `GpuRenderer::set_tint` now enforces its own contract (folds
+     strength 0 → None) — a direct crates.io user's fade-to-zero no
+     longer parks the identity fast path permanently.
+  5. Host-side LE repack deleted: the shader extracts the facade's
+     `0x00RRGGBB` with shifts — ONE packing convention on the path.
+  6. `tint_channel` doc warns off the workspace's two other RGB
+     lerps (particles truncates, cavegen rounds via f32).
+  7. CPU resolve builds three 256-entry LUTs per frame (colour +
+     strength are frame constants) instead of per-pixel arithmetic.
+  Known seam (documented on `Tint`): CPU overlays rasterise before
+  the resolve (graded), GPU overlays draw after it (full-brightness).
 - WT.3 — underwater audio: NOT STARTED
 - WT.4 — cave-demo flood (native): NOT STARTED
 - WT.5 — web parity + docs + close: NOT STARTED

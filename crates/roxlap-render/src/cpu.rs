@@ -344,6 +344,30 @@ fn quantize_channel(c: u32, levels: u8, offset: f32) -> u32 {
     out
 }
 
+/// WT.2 — one channel of the tint blend, INTEGER on purpose:
+/// `(c·(255−s₈) + t·s₈ + 127) / 255`. The GPU resolve runs this same
+/// integer expression (`scene_resolve.wgsl`), so tinted frames are
+/// bit-exact across backends regardless of driver float contraction —
+/// an f32 lerp + round pair provably drifts ±1 from WGSL `mix` +
+/// `pack4x8unorm` on ~2.5% of byte pairs. NB the workspace has two
+/// OTHER rgb lerps with different rounding (`particles::lerp_tint`
+/// truncates, cavegen's rounds via f32) — do not substitute either.
+fn tint_channel(c: u32, t: u32, s8: u32) -> u32 {
+    (c * (255 - s8) + t * s8 + 127) / 255
+}
+
+/// WT.2 — [`tint_channel`] over a packed `0x00RRGGBB` pixel. The
+/// resolve loop uses per-channel LUTs built from the same function;
+/// this scalar form is the reference (and the test surface).
+#[cfg(test)]
+fn tint_pixel(rgb: u32, tint: u32, s8: u32) -> u32 {
+    let mut out = 0u32;
+    for shift in [16, 8, 0] {
+        out |= tint_channel((rgb >> shift) & 0xff, (tint >> shift) & 0xff, s8) << shift;
+    }
+    out
+}
+
 /// RP.2 — posterize one `0x00RRGGBB` logical pixel: per-channel quantization
 /// with a per-pixel dither threshold (so banding becomes a stable pattern).
 fn posterize_pixel(rgb: u32, x: usize, y: usize, cfg: crate::PosterizeConfig) -> u32 {
@@ -436,6 +460,11 @@ pub(crate) struct CpuBackend {
     /// RP.2 — reduced-palette post applied at logical resolution in the resolve
     /// step. `None` = off (when `ssaa == 1` the framebuffer is presented as-is).
     posterize: Option<crate::PosterizeConfig>,
+    /// WT.2 — per-frame full-screen tint in the wire form
+    /// ([`crate::Tint::quantized`]: packed `0x00RRGGBB` + non-zero
+    /// 8-bit strength), captured from [`crate::FrameParams::tint`]
+    /// each render; applied in the resolve step BEFORE posterize.
+    tint: Option<(u32, u8)>,
     /// RP.0 — native-size scratch buffer the logical scene is nearest-upscaled
     /// into before present, in the non-`Native` path. The egui overlay
     /// rasterises here (at native res) so the HUD stays crisp. Empty in the
@@ -534,6 +563,7 @@ impl CpuBackend {
             ssaa: 1,
             resolve: Vec::new(),
             posterize: None,
+            tint: None,
             output: Vec::new(),
             zbuffer,
             last_dims: (w, h),
@@ -1086,9 +1116,10 @@ impl CpuBackend {
         self.posterize = cfg;
     }
 
-    /// Whether the resolve step has work to do (SSAA downfilter or posterize).
+    /// Whether the resolve step has work to do (SSAA downfilter,
+    /// posterize, or a WT.2 tint this frame).
     fn resolve_active(&self) -> bool {
-        self.ssaa > 1 || self.posterize.is_some()
+        self.ssaa > 1 || self.posterize.is_some() || self.tint.is_some()
     }
 
     /// RP.1 — the resolution the raycaster actually marches at:
@@ -1121,6 +1152,11 @@ impl CpuBackend {
         }
         let pixel_count = (width as usize) * (height as usize);
         self.last_dims = (width, height);
+        // WT.2 — capture the frame's tint for the resolve step
+        // (per-frame state, unlike the renderer-level posterize).
+        // `quantized` folds strength-0 to `None` so the identity path
+        // stays the identity path.
+        self.tint = frame.tint.and_then(crate::Tint::quantized);
 
         // RP.0 — the host builds `OpticastSettings` for the *window*; the
         // raster extent (`xres`/`yres`) and projection must instead match the
@@ -1530,11 +1566,10 @@ impl CpuBackend {
             }
         }
 
-        if self.capture_next {
-            self.capture_next = false;
-            self.captured = Some((fb.to_vec(), width, height));
-        }
-        // No present here — the host calls `present` or `paint_egui`.
+        // No present here — the host calls `present` or `paint_egui`
+        // (WT.2 review: the QE.7a capture moved there too — it must
+        // snapshot the POST-resolve logical image, or a tinted /
+        // posterized frame captures without its grade).
     }
 
     /// Blit the composited [`Self::framebuffer`] into the softbuffer
@@ -1551,6 +1586,9 @@ impl CpuBackend {
         // RP.1 — resolve march → logical (box downfilter) when supersampling;
         // otherwise the framebuffer is already the logical image.
         let logical_src = self.resolve_scene(logical);
+        // QE.7a — capture the POST-resolve logical image (post-tint /
+        // posterize, pre-upscale — what the GPU capture returns too).
+        self.capture_logical(logical_src, logical);
         if logical == native {
             // Present the logical buffer directly (Native + ssaa==1 ⇒ pre-RP).
             self.blit_and_present_from(logical_src, native);
@@ -1559,6 +1597,29 @@ impl CpuBackend {
             self.upscale_to_output(logical_src, logical, native);
             self.blit_and_present_from(CpuSrc::Output, native);
         }
+    }
+
+    /// QE.7a (moved here by WT.2) — snapshot the post-resolve logical
+    /// image when a capture is pending. Runs in the present-side
+    /// pipeline right after [`Self::resolve_scene`], so the grabbed
+    /// pixels include the WT.2 tint and the RP.2 posterize exactly as
+    /// shown (the old render-time capture snapshotted the raw march
+    /// buffer — a tinted frame captured without its grade).
+    fn capture_logical(&mut self, src: CpuSrc, logical: (u32, u32)) {
+        if !self.capture_next {
+            return;
+        }
+        self.capture_next = false;
+        let n = (logical.0 as usize) * (logical.1 as usize);
+        let buf = match src {
+            CpuSrc::Frame => &self.framebuffer,
+            CpuSrc::Resolve => &self.resolve,
+            CpuSrc::Output => &self.output,
+        };
+        if buf.len() < n {
+            return; // nothing rendered at this size yet
+        }
+        self.captured = Some((buf[..n].to_vec(), logical.0, logical.1));
     }
 
     /// RP.1 — box-downfilter the march-resolution [`Self::framebuffer`]
@@ -1582,6 +1643,19 @@ impl CpuBackend {
             self.resolve.resize(lpc, self.clear_sky);
         }
         let post = self.posterize;
+        // WT.2 — the tint colour + strength are frame constants, so the
+        // per-channel blends collapse into three 256-entry LUTs (built
+        // from the same `tint_channel` the scalar reference uses).
+        let tint_luts = self.tint.map(|(color, s8)| {
+            let mut luts = [[0u32; 256]; 3];
+            for (i, shift) in [16u32, 8, 0].into_iter().enumerate() {
+                let t = (color >> shift) & 0xff;
+                for (c, out) in luts[i].iter_mut().enumerate() {
+                    *out = tint_channel(c as u32, t, u32::from(s8));
+                }
+            }
+            luts
+        });
         let Self {
             framebuffer,
             resolve,
@@ -1589,9 +1663,15 @@ impl CpuBackend {
         } = self;
         for ly in 0..lh {
             for lx in 0..lw {
-                // RP.1 box downfilter (1×1 = copy when ssaa==1), then RP.2
-                // posterize + dither at the logical resolution.
+                // RP.1 box downfilter (1×1 = copy when ssaa==1), then the
+                // WT.2 tint (grade), then RP.2 posterize + dither
+                // (quantize) — all at the logical resolution.
                 let mut px = downfilter_pixel(framebuffer, mw, lx, ly, s);
+                if let Some(luts) = &tint_luts {
+                    px = luts[0][(px >> 16 & 0xff) as usize] << 16
+                        | luts[1][(px >> 8 & 0xff) as usize] << 8
+                        | luts[2][(px & 0xff) as usize];
+                }
                 if let Some(cfg) = post {
                     px = posterize_pixel(px, lx, ly, cfg);
                 }
@@ -2004,6 +2084,9 @@ impl CpuBackend {
         }
         // RP.1 — resolve march → logical (box downfilter) when supersampling.
         let logical_src = self.resolve_scene(logical);
+        // QE.7a — capture BEFORE the UI rasterises over the logical
+        // buffer (the GPU capture reads resolve_buf, also pre-UI).
+        self.capture_logical(logical_src, logical);
         self.egui_raster
             .update_textures(&textures.set, &textures.free);
         if logical == native {
@@ -2082,6 +2165,64 @@ mod posterize_tests {
         let cfg = PosterizeConfig::uniform(2, DitherMode::None);
         // r=200→255, g=10→0, b=130→255.
         assert_eq!(posterize_pixel(0x00_c8_0a_82, 0, 0, cfg), 0x00_ff_00_ff);
+    }
+
+    // ---- WT.2: tint ----
+    //
+    // Cross-backend parity is STRUCTURAL, not tested: both backends run
+    // the same integer expression (`tint_channel` here; the identical
+    // u32 arithmetic in scene_resolve.wgsl), so there is no float
+    // rounding to diverge — a previous f32 version provably drifted ±1
+    // from WGSL `mix` + `pack4x8unorm` on ~2.5% of byte pairs, and its
+    // "GPU emulation" test used the CPU's own formula (a tautology).
+    // These tests pin the integer blend's PROPERTIES instead.
+
+    /// s₈ = 0 is a byte-exact identity, s₈ = 255 paints the tint
+    /// colour flat — for EVERY byte pair (brute force).
+    #[test]
+    fn tint_channel_endpoints_exact() {
+        for c in 0..=255u32 {
+            for t in 0..=255u32 {
+                assert_eq!(super::tint_channel(c, t, 0), c);
+                assert_eq!(super::tint_channel(c, t, 255), t);
+            }
+        }
+    }
+
+    /// The blend never leaves the [min(c,t), max(c,t)] interval and is
+    /// monotone in the strength (brute force over a value lattice).
+    #[test]
+    fn tint_channel_bounded_and_monotone() {
+        for &c in &[0u32, 1, 7, 100, 128, 254, 255] {
+            for &t in &[0u32, 2, 64, 127, 200, 255] {
+                let mut prev = super::tint_channel(c, t, 0);
+                for s8 in 1..=255u32 {
+                    let v = super::tint_channel(c, t, s8);
+                    assert!(v >= c.min(t) && v <= c.max(t), "c={c} t={t} s8={s8}");
+                    if t >= c {
+                        assert!(v >= prev, "not monotone up: c={c} t={t} s8={s8}");
+                    } else {
+                        assert!(v <= prev, "not monotone down: c={c} t={t} s8={s8}");
+                    }
+                    prev = v;
+                }
+            }
+        }
+    }
+
+    /// Hand-checked values + the packed per-channel form.
+    #[test]
+    fn tint_pixel_hand_checked() {
+        // s8=128: 0→255 blends to (0·127 + 255·128 + 127)/255 = 128.
+        assert_eq!(super::tint_channel(0, 255, 128), 128);
+        // The reviewer's old ±1 witness pair, now exact by definition:
+        // c=7, t=2, s8=26 (≈0.1): (7·229 + 2·26 + 127)/255 = 6.
+        assert_eq!(super::tint_channel(7, 2, 26), 6);
+        // Packed: r 200→100 s8=128 ⇒ (200·127+100·128+127)/255 = 150.
+        assert_eq!(
+            super::tint_pixel(0x00c8_0040, 0x0064_ff40, 128),
+            0x0096_8040
+        );
     }
 
     /// Dither pushes a near-boundary value across the threshold for some

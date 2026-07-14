@@ -169,10 +169,14 @@ impl GpuRenderer {
         if w == 0 || h == 0 {
             return None;
         }
-        // Mirror `render_scene`'s identity-resolve choice: with ssaa 1
-        // + posterize off the resolve pass was skipped and the march
-        // framebuffer IS the logical image.
-        let identity = dda.storage_size == dda.logical_size && self.posterize.is_none();
+        // Mirror `render_scene`'s identity-resolve choice: with ssaa 1,
+        // posterize off AND no tint last frame (WT.2), the resolve pass
+        // was skipped and the march framebuffer IS the logical image.
+        // Drift trap: these two conditions MUST stay in lockstep, or a
+        // capture returns the ungraded march buffer while the screen
+        // shows the graded resolve_buf.
+        let identity =
+            dda.storage_size == dda.logical_size && self.posterize.is_none() && self.tint.is_none();
         let src = if identity {
             &dda.framebuffer
         } else {

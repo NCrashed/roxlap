@@ -18,8 +18,13 @@ struct Resolve {
     levels_g: u32,
     levels_b: u32,
     dither: u32,
-    _pad0: u32,
-    _pad1: u32,
+    // WT.2 — full-screen tint, applied between the box downfilter and the
+    // posterize quantize (grade first, quantize after). The colour keeps
+    // the facade's 0x00RRGGBB packing (extracted with shifts below);
+    // tint_s8 is the strength quantized to 0..=255 — 0 ⇒ off (the host
+    // also skips the whole pass then, when ssaa == 1 and posterize is off).
+    tint_rgb: u32,
+    tint_s8: u32,
     _pad2: u32,
 };
 
@@ -74,6 +79,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     var color = acc / f32(s * s);
+    // WT.2 — full-screen tint (grade) before the RP.2 quantize, as an
+    // INTEGER blend: byte-quantize the box average exactly the way
+    // pack4x8unorm would (floor(0.5 + 255c)), then run the identical u32
+    // expression the CPU backend runs — (c·(255−s₈) + t·s₈ + 127) / 255 —
+    // so tinted frames are bit-exact across backends by construction
+    // (a float mix here provably drifts ±1 from the CPU on ~2.5% of
+    // byte pairs, and driver float contraction is out of our hands).
+    if r.tint_s8 > 0u {
+        let ci = vec3<u32>(floor(color * 255.0 + vec3<f32>(0.5)));
+        let t = vec3<u32>(
+            (r.tint_rgb >> 16u) & 0xffu,
+            (r.tint_rgb >> 8u) & 0xffu,
+            r.tint_rgb & 0xffu,
+        );
+        let vi = (ci * (255u - r.tint_s8) + t * r.tint_s8 + vec3<u32>(127u)) / 255u;
+        color = vec3<f32>(vi) / 255.0;
+    }
     // RP.2 — posterize + dither at the logical resolution (one quantize per
     // hard pixel). All-`1` levels ⇒ untouched (the RP.1 box-avg only).
     let off = dither_offset(r.dither, gid.x, gid.y);

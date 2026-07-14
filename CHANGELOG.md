@@ -42,6 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exhaustive literals must add `sink` (or use
   `..WalkInput::default()`). Fly modes ignore water; a dry scene's
   walk path is byte-identical to before (pinned).
+- **Full-screen tint** (WT.2): `FrameParams.tint: Option<Tint>` — a
+  per-frame colour grade (lerp toward `color` by `strength`) applied
+  by **both** backends in the resolve step at the logical resolution,
+  after the SSAA downfilter and before posterize. The blend is
+  **integer** (strength quantized to 8 bits, identical u32 arithmetic
+  in both backends), so tinted frames are bit-exact across CPU and
+  GPU by construction. The canonical use is the underwater look
+  (drive it from `CharacterBody::eye_in_water`), but it is general
+  (damage flash, night vision). `None` / strength `0.0` is
+  byte-identical to before (the identity-resolve fast path stays
+  engaged). Known seam: overlays are graded on CPU (drawn before the
+  resolve) but not on GPU (drawn after). `FrameParams` grew a pub
+  field — hosts constructing it via `FrameParams::new` (the
+  documented way) are unaffected.
 
 - **wasm GPU depth-picking** (PW.1): `SceneRenderer::pick_depth` /
   `pick` now work on the browser GPU path with **one-frame latency**
@@ -86,6 +100,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Frame capture now grades** (WT.2 review): the CPU backend's
+  `take_capture` snapshotted the raw march framebuffer at render time
+  — a posterized (and now tinted) frame captured WITHOUT its post
+  (pre-existing since RP.2). Capture moved to the present-side
+  pipeline on the CPU (post-resolve logical image, pre-UI) and the
+  GPU capture's identity-gate mirror learned about the tint — both
+  backends now capture exactly what the screen shows.
 - `roxlap-cave-web`: the spawn "bubble" **inserted** a solid painted
   ball at world centre instead of carving one (the player started
   buried); carves after each impact re-baked the whole chunk
