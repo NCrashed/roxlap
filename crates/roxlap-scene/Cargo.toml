@@ -14,9 +14,9 @@ categories = ["game-development", "graphics"]
 
 [dependencies]
 glam = { workspace = true }
-roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.28" }
-roxlap-core = { path = "../roxlap-core", version = "0.28" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.28" }
+roxlap-cavegen = { path = "../roxlap-cavegen", version = "0.29" }
+roxlap-core = { path = "../roxlap-core", version = "0.29" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.29" }
 serde = { workspace = true }
 # QE.5b — the versioned snapshot wire format
 # (`Scene::save_snapshot` / `load_snapshot`: magic + u32 version +

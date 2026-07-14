@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-07-14
+
+Two macro-stages since 0.28.0: **water + swimming** (stage WT — physics
+`WaterVolume`s, an auto-swim `CharacterBody`, a full-screen tint and a
+listener lowpass, the flooded cave demos) and the tail of the
+**platform wave** (PW — wasm GPU depth-picking, the macOS/aarch64 CI
+matrix). Additive — new APIs, no breaking changes; several structs grew
+public fields (`GridSnapshot`, `WalkInput`, `FrameParams`,
+`CharacterDef`), so exhaustive struct literals must add them (construct
+via the `::new` / `..Default::default()` paths and you're unaffected).
+
 ### Added
 
 - **Water volumes** (WT.0, `PORTING-WATER.md`): `roxlap-scene` grids
