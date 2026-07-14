@@ -310,7 +310,32 @@ file:line facts, not guesses).
   classify water from the getcube they already did (one lookup, one
   classification path); `eye_in_water` evaluates once per frame and
   feeds both tint and lowpass.
-- WT.5 — web parity + docs + close: NOT STARTED
+- WT.5 — LANDED 2026-07-14; **STAGE CLOSED** (pending the web
+  browser pass, owed below).
+  - cave-web floods with the native design verbatim: shell fill rule
+    (coloured-zone invariant) + one `WaterVolume`, batched
+    `set_spans`, body/bullet/debris water vetoes, V-toggle with
+    per-mode proportions, edge-triggered walk jump vs held swim
+    stroke, wish-z gated to fly modes, tint + lowpass from ONE
+    `eye_in_water` per frame, splash ring (Walk + real-shell gated),
+    `material_map()` feeding renderer + fracture + audio,
+    `KiraAudio::with_options` opt-in. Touch UI has no mode toggle —
+    desktop keys only (documented v1 limit). wasm clippy both CI
+    invocations + release wasm build green.
+  - Book: scene-graph grew a "Water & swimming" section (physics
+    volumes vs visual shell, the auto-swim contract, `eye_in_water`
+    as THE feel hook) with a new runnable `water` anchor in
+    `book_controller.rs` (float-to-bob + dry-camera + dive
+    assertions); the audio chapter documents the listener lowpass.
+    Deviation from the plan: no demo-tour row — the water showcase
+    is the cave demo, not a gallery scene (demo-tour covers
+    scene-demo only).
+  - CHANGELOG had the feature entries; status/memory closed.
+- **Owed at stage close**: the user's WEB pass (trunk serve
+  --features audio: V-walk, wade, dive — tint/muffle/splash/crystals
+  — and CPU-fallback perf with the shell on screen; the fog wall
+  caps rays, expected fine). PERF G8 (`exp2` volumetric rewrite)
+  stays deferred — the shell is thin, no demo pressure.
 
 ## Goal
 

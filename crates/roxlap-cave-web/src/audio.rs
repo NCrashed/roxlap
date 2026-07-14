@@ -57,6 +57,9 @@ const NEAR_HZ: f64 = 5.0;
 const HUM_ACOUSTICS_HZ: f64 = 4.0;
 /// Cap booms started in a single frame (multi-impact carve bursts).
 const MAX_BOOMS_PER_FRAME: usize = 2;
+/// WT.5 — sound through water: half a voxel of effective rock per
+/// voxel of water (rock keeps the implicit 1.0).
+const WATER_ABSORPTION: f32 = 0.5;
 
 /// The browser demo's audio system. Built lazily on the first user
 /// gesture; `None` from [`WebAudio::new`] when the device/context is
@@ -83,7 +86,10 @@ impl WebAudio {
     /// MUST be called from inside a user-gesture event handler (see
     /// the module doc).
     pub fn new() -> Option<Self> {
-        let mut audio = match KiraAudio::new() {
+        // WT.5 — opt into the WT.3 listener lowpass (a master-track
+        // filter, construction-time-only in kira): the flooded cave
+        // dunks the ear.
+        let mut audio = match KiraAudio::with_options(roxlap_audio::DEFAULT_POOL, true) {
             Ok(a) => a,
             Err(e) => {
                 web_sys::console::warn_1(&format!("roxlap-cave-web: audio disabled ({e})").into());
@@ -93,12 +99,20 @@ impl WebAudio {
         let shot = audio.register(&synth::shot(SAMPLE_RATE));
         let impact = audio.register(&synth::impact(SAMPLE_RATE));
         let hum = audio.register(&synth::hum(SAMPLE_RATE));
+        // WT.5 — water muffles less than rock (AU2 absorption); the
+        // colour map is THE shared one (crystals classify with no
+        // absorption entry = the default 1.0, a no-op).
+        let acfg = AcousticsConfig {
+            material_map: crate::material_map().to_vec(),
+            absorption: vec![(crate::WATER_MATERIAL_ID, WATER_ABSORPTION)],
+            ..AcousticsConfig::default()
+        };
         Some(Self {
             audio,
             shot,
             impact,
             hum,
-            acfg: AcousticsConfig::default(),
+            acfg,
             cavity: CavityEstimator::new(CavityConfig::default()),
             hums: HashMap::new(),
             cavity_timer: f64::MAX, // first tick estimates immediately
@@ -124,6 +138,17 @@ impl WebAudio {
             let a = source_acoustics(scene, at, listener, &self.acfg);
             self.audio.play(self.impact, at, Some(&a));
         }
+    }
+
+    /// WT.5 — the underwater ear: drive the WT.3 listener lowpass from
+    /// the submersion signal, every frame (the backend dedups an
+    /// unchanged target — no tween restart).
+    pub fn set_submerged(&mut self, under: bool) {
+        self.audio.set_listener_lowpass(if under {
+            roxlap_audio::LISTENER_LOWPASS_SUBMERGED_HZ
+        } else {
+            roxlap_audio::LISTENER_LOWPASS_OPEN_HZ
+        });
     }
 
     /// Stop every crystal hum and clear the reverb history — call on a

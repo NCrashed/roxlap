@@ -99,17 +99,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dynamic sprite API, and — with `--features audio` —
   distance-culled crystal hums with Doppler.
 
-- **The cave demo floods** (WT.4): the lower third of the cave is
-  water — a volumetric 2-voxel surface shell (grazing views go opaque,
-  looking down stays clear), one `WaterVolume` for the physics, and
-  the full underwater treatment: `V` toggles fly ⇄ walk, a wading body
-  auto-swims (Space strokes up and breaches, Shift dives), the frame
-  tints blue-green and the mix muffles while the eye is under, feet
-  crossing the surface splash, and plasma bullets pass the surface to
-  detonate on the pool floor. Some crystals glow under water — dive
-  for them. Known v1 seams: the water volume is static (a crater
-  carved below the waterline still swims) and a fully-sealed submerged
-  cavity shows no surface plane.
+- **The cave demos flood** (WT.4 native, WT.5 web — full parity): the
+  lower third of the cave is water — a volumetric ≤2-voxel surface
+  shell (grazing views go opaque, looking down stays clear; the fill
+  rule keeps every water voxel colour-classifiable), one `WaterVolume`
+  for the physics, and the full underwater treatment: `V` toggles
+  fly ⇄ walk (head-level camera on foot), a wading body auto-swims
+  (Space strokes up and breaches, Shift dives), the frame tints
+  blue-green and the mix muffles while the eye is under, feet
+  crossing the surface splash, and plasma bullets and falling debris
+  pass the surface colour-keyed to act on the pool floor. Some
+  crystals glow under water — dive for them. Known v1 seams: the
+  water volume is static (a crater carved below the waterline still
+  swims), a fully-sealed submerged cavity shows no surface plane, and
+  the web touch UI has no mode toggle.
 
 ### Docs
 

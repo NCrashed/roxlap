@@ -272,6 +272,41 @@ the encoder treats out-of-chunk neighbours as solid). The
 Transparency demo's glass/water wall is the visual version: the
 water half lets you through, the glass half does not.
 
+## Water & swimming
+
+Deep water is exactly what the colour veto *cannot* do (the 2-voxel
+limit above), so the engine splits water in two (stage WT):
+
+- **Physics** — `WaterVolume`s on the grid: grid-local voxel AABBs
+  whose top face (min z — +z is down) is the surface. `Scene::
+  water_depth_at` / `in_water` answer in world units under any grid
+  transform, and a `Walk`-mode `CharacterBody` submerged past
+  `swim_enter_frac` of its height **swims automatically**: buoyancy
+  against gravity floats it bobbing at the surface, `WalkInput::jump`
+  strokes up (and breaches into a real jump when the head is above
+  water — one-shot until released), the new `WalkInput::sink` dives.
+  The passive water forces (buoyancy + drag, scaled by submersion)
+  apply to wading walkers too — the continuity is what keeps the
+  waterline state stable for any tuning. Volumes persist in
+  snapshots (wire v3).
+- **Visuals** — ordinary voxels: a 1–2-voxel volumetric-material
+  *surface shell* where air crosses the waterline (grazing views
+  accumulate thickness and go opaque — a cheap Fresnel; a solid fill
+  would merge into the surrounding slabs and drop every submerged
+  surface's colours). The shell is itself the veto's textbook case:
+  colour-key it passable and bodies, bullets and debris cross it.
+
+```rust,noplayground
+{{#include ../../../crates/roxlap-scene/examples/book_controller.rs:water}}
+```
+
+`eye_in_water` is the hook for the underwater *feel*: drive the
+render facade's full-screen `Tint` and the audio backend's listener
+lowpass (`AudioOut::set_listener_lowpass`) from that one flag — see
+the [Lighting & materials](lighting.md) and [Audio](audio.md)
+chapters. The cave demo (native and web) is the worked example:
+`V` to walk, wade in, dive for the crystals.
+
 ## Further reading
 
 - [docs.rs/roxlap-scene](https://docs.rs/roxlap-scene) — the full API,

@@ -123,6 +123,14 @@ browser-specific rule — construct the audio system **inside a user
 gesture** — lives in the [Platforms](platforms.md) chapter; the cave
 web demo (`trunk serve --features audio`) is the worked example.
 
+One more listener-side knob (stage WT): `AudioOut::set_listener_lowpass`
+muffles the **whole mix** — every voice and the reverb tail — for the
+submerged ear. Drive it per frame from `CharacterBody::eye_in_water`
+(deliberately not part of the reverb environment: that rides a ~2 Hz
+probe cadence, and a head-dip must muffle at frame rate). On kira it
+is an opt-in master-track filter (`KiraAudio::with_options`);
+`LISTENER_LOWPASS_SUBMERGED_HZ` is the canonical underwater cutoff.
+
 ## Materials: glass sounds thin
 
 By default every solid voxel muffles alike. The material tables (stage

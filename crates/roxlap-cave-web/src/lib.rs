@@ -20,6 +20,14 @@
 //! island detection and the incremental re-mip all run synchronously
 //! in the frame (the 128³ cave keeps that affordable).
 //!
+//! WT.5 — the lower third of the cave is **flooded** (native WT.4
+//! parity): a ≤2-voxel volumetric surface shell + one `WaterVolume`
+//! for physics. `V` toggles fly ⇄ walk (with head-level camera when
+//! walking); a wading body auto-swims — `Space` strokes up/breaches,
+//! `Shift` dives; under the surface the frame tints and the mix
+//! muffles; bullets and debris pass the shell colour-keyed. Desktop
+//! keys only — the touch UI has no mode toggle (v1).
+//!
 //! PW.0 — build with the `audio` feature
 //! (`trunk serve --features audio`) for the voxel-aware soundscape:
 //! shots and carve booms muffled by the rock in the way, cavity
@@ -37,12 +45,13 @@ use std::rc::Rc;
 use glam::{DVec3, IVec3};
 use roxlap_cavegen::{BlueCaveGenerator, CaveParams, Generator, MagCaveGenerator, MAXZDIM};
 use roxlap_core::{Camera, Engine, OpticastSettings, ESTNORMRAD};
+use roxlap_formats::edit::Vspan;
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::vxl;
 use roxlap_render::{
     Backend, BackendPreference, CollisionMode, DebrisSystem, DynSpriteTransform, FrameParams,
     Material, ParticleEmitterDef, ParticleSystem, RenderOptions, SceneRenderer, SpriteInstanceId,
-    SpriteModelId,
+    SpriteModelId, Tint,
 };
 use roxlap_scene::cavegen::CrystalParams;
 use roxlap_scene::islands::{detect_islands, FracturePattern, DEFAULT_ISLAND_BUDGET};
@@ -117,6 +126,45 @@ const GPU_MIP_LEVELS: u32 = 6;
 /// Voxlap lightmode 2 — the dim base the crystal glow pools read
 /// against.
 const LIGHTMODE: u32 = 2;
+
+// ---- WT.5: the flooded lower cave, native-demo parity ----
+
+/// Water surface plane, grid-local z (+z is DOWN). Same as native.
+const WATERLINE_Z: i32 = 170;
+/// Water voxel colour — keys the render material, the audio
+/// absorption and the fracture map (the one-map discipline).
+const WATER_COLOR: VoxColor = VoxColor(0x8018_4A78);
+/// Material palette slot for water (volumetric surface shell).
+const WATER_MATERIAL_ID: u8 = 2;
+/// Per-voxel volumetric alpha of the shell.
+const WATER_ALPHA: u8 = 70;
+/// WT.2 full-screen grade while the EYE is under the surface.
+const UNDERWATER_TINT: Tint = Tint {
+    color: Rgb(0x000F_3A55),
+    strength: 0.45,
+};
+/// WT.4 follow-up — Walk-mode proportions (the fly "drone" keeps the
+/// probe cube; walking stands a human frame, camera at head level).
+const WALK_HEIGHT: f64 = 1.8;
+const WALK_EYE_HEIGHT: f64 = 1.62;
+
+/// The CC.4 colour veto for the water surface shell (≤2 voxels — the
+/// format's colour-keyed passthrough limit): the walking body and the
+/// plasma both cross it; falling debris sinks through it.
+fn water_passes(c: VoxColor) -> bool {
+    c.rgb_part() == WATER_COLOR.rgb_part()
+}
+
+/// AU2 discipline — THE colour→material map (renderer + fracture +
+/// audio all consume this one list; see the native demo's WT.4 review
+/// for how three hand-written partial lists drift).
+fn material_map() -> [(Rgb, u8); 3] {
+    [
+        (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
+        (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
+        (WATER_COLOR.rgb_part(), WATER_MATERIAL_ID),
+    ]
+}
 
 const FOG_COLOR: u32 = 0x0090_98B0;
 const FOG_MAX_SCAN_DIST: i32 = 128;
@@ -214,6 +262,11 @@ struct State {
     /// The wasm GPU pick has one-frame latency, so the probe POLLS
     /// the pick each frame until it resolves.
     pick_probe: Option<u8>,
+    /// WT.5 — the feet's water depth last frame (splash detection).
+    prev_feet_depth: f64,
+    /// WT.5 — Space held last frame: the walk jump is edge-triggered
+    /// (swimming reads the held key as a stroke).
+    up_was_down: bool,
     /// PW.0 — browser audio. `None` until the FIRST user gesture
     /// constructs it (the autoplay policy: an `AudioContext` made
     /// outside a gesture handler stays suspended), and stays `None`
@@ -322,6 +375,10 @@ fn regen_cave(grid: &mut roxlap_scene::Grid, preset: Preset, seed: u64) {
             },
         },
     );
+    // WT.5 — flood the lower cave: after the crystals (the planter
+    // must not grow on the shell), before the bake (shell voxels get
+    // their brightness like any surface).
+    flood_below_waterline(grid);
     // EV.4 — point-light bake: the dim lightmode-2 base plus a glow
     // pool around every crystal.
     grid.bake(BakeMode::PointLights);
@@ -334,6 +391,46 @@ fn regen_cave(grid: &mut roxlap_scene::Grid, preset: Preset, seed: u64) {
     // with an identical spawn-bubble edit still differs from the
     // tracker.
     grid.bump_chunk_version(IVec3::ZERO);
+}
+
+/// WT.5 — flood the lower cave, the native demo's design verbatim
+/// (see its `flood_below_waterline` + the WT.4 review): physics = ONE
+/// [`WaterVolume`] over the whole band below [`WATERLINE_Z`]; visuals
+/// = a ≤2-voxel volumetric shell where air crosses the line. The fill
+/// rule keeps every water voxel in its span's COLOURED zone (layer 1
+/// wherever air — even on rock, it's the merged span's always-coloured
+/// top; layer 2 only over MORE air — merged onto a floor it would be
+/// a colourless `UnexposedSolid` both colour vetoes are blind to).
+/// One batched `set_spans` (y-outer sort contract).
+fn flood_below_waterline(grid: &mut roxlap_scene::Grid) {
+    grid.water_volumes.clear();
+    #[allow(clippy::cast_possible_wrap)]
+    let side = VSID as i32;
+    grid.add_water_volume(
+        IVec3::new(0, 0, WATERLINE_Z),
+        IVec3::new(side - 1, side - 1, MAXZDIM - 1),
+    );
+    let mut spans: Vec<Vspan> = Vec::new();
+    for y in 0..side {
+        for x in 0..side {
+            let air = |z: i32| !grid.voxel_solid(IVec3::new(x, y, z));
+            if !air(WATERLINE_Z) {
+                continue;
+            }
+            let deep = air(WATERLINE_Z + 1) && air(WATERLINE_Z + 2);
+            #[allow(clippy::cast_sign_loss)]
+            spans.push(Vspan {
+                x: x as u32,
+                y: y as u32,
+                z0: WATERLINE_Z as u8,
+                z1: (WATERLINE_Z + i32::from(deep)) as u8,
+            });
+        }
+    }
+    if let Some(chunk) = grid.chunk_mut(IVec3::ZERO) {
+        roxlap_formats::edit::set_spans(chunk, &spans, Some(WATER_COLOR));
+    }
+    // (No per-edit bump needed: regen_cave bakes + bumps after this.)
 }
 
 /// Build the glowing voxel sphere every bullet renders as: a solid
@@ -401,10 +498,15 @@ fn integrate_input(state: &mut State, dt: f64) {
             *d -= c;
         }
     }
-    if state.input.up {
+    // WT.5 — Space/Shift feed the wish's z only in the FLY modes; in
+    // Walk they are the jump/sink flags (leaking them into the 3D
+    // normalisation taxes horizontal swim speed −29% — the native
+    // demo's WT.4 review #3).
+    let flying = state.body.mode() != MoveMode::Walk;
+    if state.input.up && flying {
         delta[2] -= 1.0;
     }
-    if state.input.down {
+    if state.input.down && flying {
         delta[2] += 1.0;
     }
     // R10.X.4: virtual-joystick deflection on the canvas's
@@ -436,12 +538,24 @@ fn integrate_input(state: &mut State, dt: f64) {
             .teleport(glam::DVec3::from(state.cam_pos) + glam::DVec3::new(0.0, 0.0, PLAYER_RADIUS));
     }
     state.body.def_mut().fly_speed = speed;
+    // WT.5 — swim strokes: HELD Space while swimming (continuous
+    // stroke; breach is engine-latched), the PRESS EDGE while walking
+    // (the engine re-buffers a held jump every frame — chain-hopping
+    // up the shore otherwise). Shift dives.
+    let up = state.input.up;
+    let jump = if state.body.is_swimming() {
+        up
+    } else {
+        up && !state.up_was_down
+    };
+    state.up_was_down = up;
     state.body.walk(
         &state.scene,
         dt,
         WalkInput {
             wish,
-            ..WalkInput::default()
+            jump,
+            sink: state.input.down,
         },
     );
 
@@ -528,8 +642,12 @@ fn step_bullets(state: &mut State, dt: f64) {
                 despawned.push(b.inst);
                 return false;
             }
-            if grid.voxel_solid(IVec3::new(vx, vy, vz)) {
-                impacts.push(IVec3::new(vx, vy, vz));
+            // WT.5 — plasma flies THROUGH the water surface shell
+            // (colour-keyed like the body's veto) and detonates on
+            // the pool floor instead.
+            let p = IVec3::new(vx, vy, vz);
+            if grid.voxel_solid(p) && !grid.voxel_color(p).is_some_and(water_passes) {
+                impacts.push(p);
                 despawned.push(b.inst);
                 return false;
             }
@@ -611,6 +729,67 @@ fn step_bullets(state: &mut State, dt: f64) {
     grid.bump_chunk_version(IVec3::ZERO);
 }
 
+/// WT.5 — splash at surface crossings (the native demo's tick_splash
+/// verbatim): Walk mode only, feet crossing with speed, and only
+/// where the surface shell actually exists in this column.
+#[allow(clippy::cast_possible_truncation)]
+fn tick_splash(state: &mut State) {
+    if state.body.mode() != MoveMode::Walk {
+        state.prev_feet_depth = 0.0;
+        return;
+    }
+    let feet = state.body.pos();
+    let depth = state
+        .scene
+        .water_depth_at(feet)
+        .map_or(0.0, |(_, d)| d.max(f64::EPSILON));
+    let was = std::mem::replace(&mut state.prev_feet_depth, depth);
+    if (was > 0.0) == (depth > 0.0) {
+        return;
+    }
+    let speed = state.body.vel().length();
+    if speed < 2.0 {
+        return;
+    }
+    let shell_here = state.scene.grid(state.grid).is_some_and(|g| {
+        (0..=1).any(|dz| {
+            g.voxel_color(IVec3::new(
+                feet.x.floor() as i32,
+                feet.y.floor() as i32,
+                WATERLINE_Z + dz,
+            ))
+            .is_some_and(water_passes)
+        })
+    });
+    if !shell_here {
+        return;
+    }
+    let at = [feet.x as f32, feet.y as f32, WATERLINE_Z as f32];
+    let sites: Vec<([f32; 3], Rgb)> = (0..12)
+        .map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            let a = i as f32 / 12.0 * std::f32::consts::TAU;
+            (
+                [at[0] + a.cos() * 0.5, at[1] + a.sin() * 0.5, at[2]],
+                WATER_COLOR.rgb_part(),
+            )
+        })
+        .collect();
+    let kick = (speed as f32 * 0.4).min(6.0);
+    state.particles.voxel_debris(
+        &sites,
+        at,
+        (1.0 + 0.3 * kick)..(2.5 + kick),
+        &ParticleEmitterDef {
+            lifetime: 0.25..0.6,
+            drag: 1.2,
+            fade_out_frac: 0.6,
+            scale_end: Some(0.3),
+            ..ParticleEmitterDef::new(state.debris_model)
+        },
+    );
+}
+
 /// DT — advance the falling islands, shatter the landed ones into
 /// colour-true debris particles (each landing booms through the same
 /// occlusion-shaded path as a bullet hit), and periodically compact
@@ -666,8 +845,9 @@ fn tick_crumble(state: &mut State, dt: f64) {
 /// March + present the scene through the facade. Bullets, debris and
 /// particles are dynamic sprite instances, posed where they already
 /// are — no per-frame sprite-set rebuild (which would reset the
-/// dynamic instance world).
-fn render(state: &mut State) {
+/// dynamic instance world). `submerged` is the frame's shared
+/// eye-under-water flag (WT.5 tint).
+fn render(state: &mut State, submerged: bool) {
     // `frame` borrows `state.engine` immutably; the render call below
     // mutably borrows the disjoint `state.scene` + `state.renderer`
     // fields, so NLL lets them coexist.
@@ -689,6 +869,11 @@ fn render(state: &mut State) {
     frame.sky = state.engine.sky();
     frame.fog_color = Rgb(state.engine.fog_color());
     frame.fog_max_scan_dist = state.engine.fog_max_scan_dist();
+    // WT.5 — the underwater grade while the eye is under a surface
+    // (`None` above water keeps the identity-resolve fast path).
+    if submerged {
+        frame.tint = Some(UNDERWATER_TINT);
+    }
     state.renderer.render(&mut state.scene, &cam, &frame);
     state.renderer.present();
 }
@@ -708,16 +893,21 @@ fn frame_tick(state_rc: &Rc<RefCell<State>>, _perf: &web_sys::Performance, now_m
     }
     step_bullets(&mut state, dt);
     tick_crumble(&mut state, dt);
+    tick_splash(&mut state);
+    // WT.5 — the frame's ONE "eye under water" evaluation drives both
+    // the tint and the listener lowpass.
+    let submerged = state.body.eye_in_water(&state.scene);
     // PW.0 — listener pose per frame + throttled reverb environment.
     #[cfg(feature = "audio")]
     {
         let st = &mut *state;
         if let Some(a) = st.audio.as_mut() {
             let cam = cam_from_yaw_pitch(st.cam_pos, st.yaw, st.pitch);
+            a.set_submerged(submerged);
             a.tick(dt, &st.scene, st.grid, &cam);
         }
     }
-    render(&mut state);
+    render(&mut state, submerged);
     poll_pick_probe(&mut state);
 }
 
@@ -761,6 +951,9 @@ fn regenerate(state: &mut State) {
         state.renderer.remove_sprite_instance(b.inst);
     }
     state.bullets.clear();
+    // WT.5 — the regen respawn teleports out of the water; forget the
+    // old depth so the first post-regen frame can't phantom-splash.
+    state.prev_feet_depth = 0.0;
     let preset = state.preset;
     let seed = state.seed;
     let grid = state.scene.grid_mut(state.grid).expect("cave grid present");
@@ -885,25 +1078,26 @@ async fn start() -> Result<(), JsValue> {
 
     // EV.4 — the crystal material: translucent AND emissive. Both
     // preset colours route to the same slot so an F-toggle needs no
-    // material churn.
+    // material churn. WT.5 — water: thickness-aware translucency on
+    // the surface shell. ONE colour→material map feeds the renderer,
+    // the fracture tables and the audio config.
     renderer.define_material(
         CRYSTAL_MATERIAL_ID,
         Material::alpha_blend(180).with_emissive(255),
     );
-    renderer.set_terrain_materials(&[
-        (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
-        (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
-    ]);
+    renderer.define_material(WATER_MATERIAL_ID, Material::volumetric(WATER_ALPHA));
+    renderer.set_terrain_materials(&material_map());
 
     // DT.5 — per-material crumble: rock breaks into rounded Voronoi
     // lumps, crystal into sharp plates that keep the emissive material
-    // and glow on the way down.
+    // and glow on the way down. WT.5 — debris shares the water veto
+    // (a detached rock sinks THROUGH the surface shell, not stands on
+    // it); water has no pattern entry → an unsplit Whole island,
+    // translucent via the mapped model.
     let mut debris = DebrisSystem::new();
+    debris.solidity.passable = Some(water_passes);
     debris.set_fracture_patterns(
-        &[
-            (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
-            (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
-        ],
+        &material_map(),
         &[
             (0, FracturePattern::Chunks { cell: 6 }),
             (CRYSTAL_MATERIAL_ID, FracturePattern::Shards { plates: 3 }),
@@ -934,7 +1128,9 @@ async fn start() -> Result<(), JsValue> {
                 fly_speed: MOVE_SPEED,
                 solidity: Solidity {
                     bedrock_blocks: true,
-                    ..Solidity::default()
+                    // WT.5 — the water surface shell is passable: the
+                    // body crosses it to swim.
+                    passable: Some(water_passes),
                 },
                 ..CharacterDef::default()
             });
@@ -952,6 +1148,8 @@ async fn start() -> Result<(), JsValue> {
         seed,
         touches: Vec::new(),
         pick_probe: None,
+        prev_feet_depth: 0.0,
+        up_was_down: false,
         #[cfg(feature = "audio")]
         audio: None,
     };
@@ -1007,6 +1205,31 @@ fn install_input_handlers(
                 // on the wasm GPU path) and log the hit.
                 "KeyP" => {
                     s.pick_probe = Some(30);
+                    ev.prevent_default();
+                }
+                // WT.5 — V toggles fly ⇄ walk (walking is how you
+                // reach the swim state) with per-mode proportions:
+                // walking stands a human frame (head-level camera),
+                // flying keeps the probe-cube drone.
+                "KeyV" => {
+                    let mode = if s.body.mode() == MoveMode::Fly {
+                        MoveMode::Walk
+                    } else {
+                        MoveMode::Fly
+                    };
+                    s.body.set_mode(mode);
+                    let def = s.body.def_mut();
+                    if mode == MoveMode::Walk {
+                        def.height = WALK_HEIGHT;
+                        def.eye_height = WALK_EYE_HEIGHT;
+                    } else {
+                        def.height = 2.0 * PLAYER_RADIUS;
+                        def.eye_height = PLAYER_RADIUS;
+                    }
+                    web_sys::console::log_1(
+                        &format!("roxlap-cave-web: movement = {mode:?} (V toggles; walk to swim)")
+                            .into(),
+                    );
                     ev.prevent_default();
                 }
                 _ => {}
