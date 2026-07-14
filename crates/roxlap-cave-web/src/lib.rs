@@ -436,9 +436,14 @@ fn integrate_input(state: &mut State, dt: f64) {
             .teleport(glam::DVec3::from(state.cam_pos) + glam::DVec3::new(0.0, 0.0, PLAYER_RADIUS));
     }
     state.body.def_mut().fly_speed = speed;
-    state
-        .body
-        .walk(&state.scene, dt, WalkInput { wish, jump: false });
+    state.body.walk(
+        &state.scene,
+        dt,
+        WalkInput {
+            wish,
+            ..WalkInput::default()
+        },
+    );
 
     // Out-of-world was SOLID in the old probe; the engine says air,
     // so the cave bounds become an explicit feet clamp (velocity

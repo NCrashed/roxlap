@@ -22,6 +22,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forever-loadable gate). Note: `GridSnapshot` grew a pub field —
   exhaustive struct literals must add it (same discipline as v2's
   `voxel_world_size`).
+- **Swimming** (WT.1): a `Walk`-mode `CharacterBody` submerged past
+  `swim_enter_frac` (default 0.6 — one voxel of water over the floor
+  stays *wadable*) enters the swim state automatically, with
+  hysteresis clamped around the buoyancy equilibrium so no tuning
+  flickers at the waterline. Buoyancy against gravity floats the body
+  bobbing at the surface; `jump` strokes up, the new `WalkInput.sink`
+  strokes down; a jump with the head above the surface breaches into
+  a real jump (one-shot — release to re-arm). The passive water
+  forces (buoyancy + drag, scaled by submersion) apply to *walking*
+  bodies too — wading is floaty, landings cushion, and the force
+  continuity is what keeps the waterline state stable. The dry
+  terminal fall cap binds under water as well. `is_swimming()`,
+  `submerged_fraction()` (body state) and `eye_in_water()` (the hook
+  for underwater tint/audio — it flips at the camera, not the feet)
+  expose the state to hosts. New `CharacterDef` fields `buoyancy`,
+  `water_drag`, `swim_speed`, `swim_accel`, `swim_enter_frac`,
+  `swim_exit_frac` (all defaulted); `WalkInput` grew a pub field —
+  exhaustive literals must add `sink` (or use
+  `..WalkInput::default()`). Fly modes ignore water; a dry scene's
+  walk path is byte-identical to before (pinned).
 
 - **wasm GPU depth-picking** (PW.1): `SceneRenderer::pick_depth` /
   `pick` now work on the browser GPU path with **one-frame latency**

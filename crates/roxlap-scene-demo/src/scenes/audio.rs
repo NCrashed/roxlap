@@ -280,8 +280,14 @@ impl DemoScene for AudioScene {
                 1.0
             };
         let wish = DVec3::from(ctx.cam.wish_dir(ctx.input));
-        self.body
-            .walk(&self.scene, dt, WalkInput { wish, jump: false });
+        self.body.walk(
+            &self.scene,
+            dt,
+            WalkInput {
+                wish,
+                ..WalkInput::default()
+            },
+        );
         ctx.cam.pos = self.body.eye_pos().into();
         self.last_eye = ctx.cam.pos;
 

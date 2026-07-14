@@ -571,8 +571,14 @@ impl App {
             );
         }
         self.body.def_mut().fly_speed = speed;
-        self.body
-            .walk(&self.scene, dt, WalkInput { wish, jump: false });
+        self.body.walk(
+            &self.scene,
+            dt,
+            WalkInput {
+                wish,
+                ..WalkInput::default()
+            },
+        );
 
         // The old probe treated out-of-world cells as SOLID so the
         // camera couldn't leave the cave volume; the engine treats

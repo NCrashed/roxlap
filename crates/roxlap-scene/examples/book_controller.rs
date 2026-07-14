@@ -88,6 +88,7 @@ fn main() {
         let input = WalkInput {
             wish: DVec3::new(1.0, 0.2, 0.0), // toward the ledge
             jump: frame == 120,              // one hop on the way
+            ..WalkInput::default()           // sink (WT.1) + future fields
         };
         body.walk(&scene, dt, input);
     }

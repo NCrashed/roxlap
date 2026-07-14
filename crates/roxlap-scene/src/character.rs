@@ -3,7 +3,12 @@
 //!
 //! A walking body over a [`Scene`]: substepped per-axis
 //! move-and-slide against the [`crate::collide`] probe, gravity,
-//! jumping, ground / head-bump detection. Not to be confused with
+//! jumping, ground / head-bump detection — and swimming (stage WT.1):
+//! a `Walk`-mode body submerged past
+//! [`CharacterDef::swim_enter_frac`] of its height in a
+//! [`crate::WaterVolume`] enters the swim state automatically
+//! (buoyancy, vertical drag, `jump` strokes up / `sink` strokes down,
+//! a jump with the head above water breaches). Not to be confused with
 //! `.rkc` characters (`roxlap-formats`' animated-model container) —
 //! this is what you *stand on the ground* with; a `.rkc` character is
 //! what you *draw* (CC.4 connects the two).
@@ -89,6 +94,35 @@ pub struct CharacterDef {
     /// how the host *renders* the world; see
     /// [`Solidity::bedrock_blocks`]).
     pub solidity: Solidity,
+    /// WT.1 — upward acceleration at FULL submersion, **positive**
+    /// (applied toward −z, fighting `gravity`). With no stroke input
+    /// the body settles where `gravity == buoyancy · fraction`; the
+    /// defaults (24 / 32) float it at 75% submerged — head above the
+    /// surface.
+    pub buoyancy: f64,
+    /// WT.1 — vertical velocity damping in water, per second
+    /// (exponential). Caps stroke/fall speeds under water and kills
+    /// the surface bob; higher = thicker water.
+    pub water_drag: f64,
+    /// WT.1 — target horizontal speed while swimming.
+    pub swim_speed: f64,
+    /// WT.1 — acceleration while swimming: the horizontal approach
+    /// rate AND the vertical stroke strength (`jump` up / `sink`
+    /// down).
+    pub swim_accel: f64,
+    /// WT.1 — the swim state ENGAGES at this submerged fraction of
+    /// the body height. The default `0.6` deliberately lets the
+    /// default 1.8-body WADE through minimal authored water (one
+    /// voxel over the floor = fraction ≈ 0.56): a decorative puddle
+    /// must not swap walking for swimming.
+    pub swim_enter_frac: f64,
+    /// …and RELEASES below this one. The gap is deliberate hysteresis:
+    /// a bobbing body at the waterline must not flicker between
+    /// swimming and walking (`enter > exit`). The EFFECTIVE release
+    /// threshold is additionally clamped below the no-stroke bobbing
+    /// equilibrium (`gravity / buoyancy`) at runtime, so a very
+    /// buoyant "cork" tuning can't limit-cycle at the waterline.
+    pub swim_exit_frac: f64,
 }
 
 impl Default for CharacterDef {
@@ -109,6 +143,12 @@ impl Default for CharacterDef {
             fly_speed: 12.0,
             fly_accel: f64::INFINITY,
             solidity: Solidity::default(),
+            buoyancy: 32.0,
+            water_drag: 3.0,
+            swim_speed: 4.0,
+            swim_accel: 20.0,
+            swim_enter_frac: 0.6,
+            swim_exit_frac: 0.35,
         }
     }
 }
@@ -138,7 +178,13 @@ pub struct WalkInput {
     /// Jump this frame. Fires when grounded or within the coyote
     /// window; otherwise it stays buffered for
     /// [`CharacterDef::jump_buffer`] seconds and fires on landing.
+    /// While swimming (WT.1) it strokes the body UP instead — and a
+    /// jump with the head already above the surface breaches into a
+    /// normal jump.
     pub jump: bool,
+    /// WT.1 — stroke DOWN while swimming (dive). Ignored on land and
+    /// in the fly modes (they steer with the full 3D `wish`).
+    pub sink: bool,
 }
 
 /// A walking body: feet-positioned collision box + velocity +
@@ -146,6 +192,9 @@ pub struct WalkInput {
 /// [`teleport`](Self::teleport), then call
 /// [`walk`](Self::walk) once per frame.
 #[derive(Debug, Clone, Copy)]
+// Four bools, all genuinely independent contact/state flags (ground,
+// head bump, swim, breach latch) — not an encoded state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct CharacterBody {
     def: CharacterDef,
     mode: MoveMode,
@@ -160,6 +209,16 @@ pub struct CharacterBody {
     since_grounded: f64,
     /// Seconds of buffered-jump validity left.
     jump_buffer_left: f64,
+    /// WT.1 — the hysteretic swim state (see
+    /// [`CharacterDef::swim_enter_frac`]). Only meaningful in
+    /// [`MoveMode::Walk`]; the fly modes clear it.
+    swimming: bool,
+    /// WT.1 — breach one-shot: set when a breach jump fires, held
+    /// until the jump input releases. Without it a HELD jump at the
+    /// surface would re-impulse to full `-jump_speed` every frame
+    /// (no ballistic decay — the body leaves any pool at jump speed
+    /// and overshoots a normal jump's apex).
+    breach_latched: bool,
 }
 
 impl CharacterBody {
@@ -176,6 +235,8 @@ impl CharacterBody {
             hit_head: false,
             since_grounded: f64::INFINITY,
             jump_buffer_left: 0.0,
+            swimming: false,
+            breach_latched: false,
         }
     }
 
@@ -189,6 +250,14 @@ impl CharacterBody {
     /// `Fly` mid-air falls with whatever speed you had.
     pub fn set_mode(&mut self, mode: MoveMode) {
         self.mode = mode;
+        // WT.1 — the fly modes ignore water. Clear the swim state
+        // HERE, not just on the next walk(): a host polling
+        // `is_swimming()` right after the switch (cutscene camera, no
+        // walk() calls) must not see a stale underwater tint/lowpass.
+        if mode != MoveMode::Walk {
+            self.swimming = false;
+            self.breach_latched = false;
+        }
     }
 
     /// The construction parameters.
@@ -244,6 +313,56 @@ impl CharacterBody {
         self.hit_head
     }
 
+    /// WT.1 — `true` while the body is in the swim state (submerged
+    /// past [`CharacterDef::swim_enter_frac`], held until it falls
+    /// below [`CharacterDef::swim_exit_frac`]). Updated by
+    /// [`walk`](Self::walk); always `false` in the fly modes.
+    #[must_use]
+    pub fn is_swimming(&self) -> bool {
+        self.swimming
+    }
+
+    /// WT.1 — fraction of the body height below a water surface,
+    /// `0.0..=1.0`: the [`Scene::water_depth_at`] point depth at the
+    /// FEET over [`CharacterDef::height`] (exact for the
+    /// world-horizontal surfaces water is authored with —
+    /// PORTING-WATER.md decision 1: there is deliberately no
+    /// box-overlap query). This is the BODY-STATE number (it drives
+    /// the swim state) — do NOT wire underwater tint/audio to it: at
+    /// the default bobbing equilibrium it reads 0.75 while the head
+    /// (and camera) are in the air. Use [`Self::eye_in_water`] for
+    /// those.
+    ///
+    /// Continuity guard: feet just below an authored volume's BOTTOM
+    /// face (a pool volume that stops short of the floor) read as
+    /// fully submerged while the head is still in water — without
+    /// this, the fraction would snap 0.55+ → 0.0 mid-dive and strobe
+    /// the swim state faster than hysteresis can absorb. (Author
+    /// volumes down to the floor anyway.)
+    #[must_use]
+    pub fn submerged_fraction(&self, scene: &Scene) -> f64 {
+        if let Some((_, depth)) = scene.water_depth_at(self.pos) {
+            return (depth / self.def.height).clamp(0.0, 1.0);
+        }
+        let head = self.pos - DVec3::new(0.0, 0.0, self.def.height);
+        if scene.in_water(head) {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// WT.1 — `true` while the EYE (the camera anchor,
+    /// [`Self::eye_pos`]) is under a water surface. THE hook for the
+    /// underwater feel — WT.2 tint, WT.3 listener lowpass: it flips
+    /// exactly when the player's view goes under, unlike
+    /// [`Self::submerged_fraction`] (feet-depth, 0.75 at the surface
+    /// bob with a dry camera).
+    #[must_use]
+    pub fn eye_in_water(&self, scene: &Scene) -> bool {
+        scene.in_water(self.eye_pos())
+    }
+
     /// Reposition the feet, KEEPING velocity and contact state — for
     /// world-bounds clamps and moving-platform style corrections.
     /// For spawns and respawns use [`teleport`](Self::teleport).
@@ -261,6 +380,8 @@ impl CharacterBody {
         self.hit_head = false;
         self.since_grounded = f64::INFINITY;
         self.jump_buffer_left = 0.0;
+        self.swimming = false;
+        self.breach_latched = false;
     }
 
     /// Advance the body by `dt` seconds against `scene`. Behaviour
@@ -295,24 +416,72 @@ impl CharacterBody {
     }
 
     fn walk_grounded(&mut self, scene: &Scene, dt: f64, input: WalkInput) {
-        // -- integrate velocity ------------------------------------
-        let wish = input.wish.truncate();
-        let wish = if wish.length_squared() > 1.0 {
-            wish.normalize()
+        // -- WT.1: hysteretic swim state ----------------------------
+        // A dry scene short-circuits in `water_depth_at` (no volumes),
+        // so the pre-WT walk path runs unperturbed.
+        let frac = self.submerged_fraction(scene);
+        // BOTH thresholds are clamped around the no-stroke bobbing
+        // equilibrium (gravity/buoyancy) so the resting point always
+        // lies INSIDE the hysteresis band and the flag keeps tracking
+        // the truth for extreme tunings: release below the
+        // equilibrium (0.9× — a cork bobbing at 0.3 must not release
+        // at swim_exit_frac = 0.35), engage no higher than just above
+        // it (1.1× — a cork's bob never reaches the default 0.6).
+        // The band alone can't prevent waterline strobing, though —
+        // that is the passive-force continuity's job (see the
+        // integration below). The default tuning (equilibrium 0.75)
+        // leaves both knobs untouched: 0.9·0.75 > 0.35 and
+        // 1.1·0.75 > 0.6.
+        let equilibrium = if self.def.buoyancy > 0.0 {
+            self.def.gravity / self.def.buoyancy
         } else {
-            wish
+            f64::INFINITY
         };
-        let target = wish * self.def.walk_speed;
+        let exit = self.def.swim_exit_frac.min(0.9 * equilibrium);
+        let enter = self
+            .def
+            .swim_enter_frac
+            .min(1.1 * equilibrium)
+            .max(exit + 0.01);
+        if self.swimming {
+            if frac < exit {
+                self.swimming = false;
+            }
+        } else if frac >= enter {
+            self.swimming = true;
+        }
+        if self.swimming {
+            self.swim(scene, dt, input, frac);
+            return;
+        }
+        self.breach_latched = false; // walking re-arms the breach
+
+        // -- integrate velocity ------------------------------------
         let accel = if self.on_ground {
             self.def.accel_ground
         } else {
             self.def.accel_air
         };
-        let horizontal = move_toward(self.vel.truncate(), target, accel * dt);
-        self.vel.x = horizontal.x;
-        self.vel.y = horizontal.y;
+        self.steer_horizontal(input.wish, self.def.walk_speed, accel, dt);
 
-        self.vel.z = (self.vel.z + self.def.gravity * dt).min(self.def.max_fall_speed);
+        // WT.1 — the PASSIVE water forces (buoyancy + drag, both
+        // scaled by the submerged fraction) apply in BOTH states; the
+        // swim flag gates only the CONTROLS (strokes, speeds, coyote).
+        // This continuity is load-bearing: if the walking body felt
+        // dry gravity inside water, the force would jump by
+        // `buoyancy · frac` at every engage/release crossing — a
+        // relay oscillator whose hysteresis loop pumps energy each
+        // cycle, so a buoyant body strobes swim → walk at the
+        // waterline forever instead of settling (drag alone cannot
+        // outrun the pump; measured before this fix). Besides
+        // stability it is also the right feel — wading is floaty,
+        // a splashing landing is cushioned. `frac == 0` reduces to
+        // exactly the pre-WT integration (bit-identical, pinned).
+        self.vel.z = (self.vel.z + (self.def.gravity - self.def.buoyancy * frac) * dt)
+            .min(self.def.max_fall_speed);
+        if frac > 0.0 {
+            self.vel.z -= self.vel.z * (self.def.water_drag * frac * dt).min(1.0);
+        }
 
         // -- jump: buffered press + coyote window ------------------
         if input.jump {
@@ -345,9 +514,80 @@ impl CharacterBody {
         }
     }
 
+    /// WT.1 — swimming: buoyancy scaled by the submerged fraction
+    /// fights gravity (equilibrium bobbing at the surface), vertical
+    /// drag caps every speed, `jump`/`sink` stroke up/down, and a
+    /// jump with the head above the surface breaches into a real
+    /// jump (one-shot — release the jump input to re-arm). Collision
+    /// is the same slide as walking — pool walls and floor still
+    /// block (step-up assists a grounded wade out).
+    fn swim(&mut self, scene: &Scene, dt: f64, input: WalkInput, frac: f64) {
+        // Horizontal: like walking, at swim speed/accel.
+        self.steer_horizontal(input.wish, self.def.swim_speed, self.def.swim_accel, dt);
+
+        // Breach FIRST (the stroke/drag it replaces would only be
+        // overwritten): a jump with the head above the surface is a
+        // real jump, not a stroke. ONE-SHOT via the latch — a held
+        // jump must not re-impulse to full `-jump_speed` every frame
+        // (the body would leave any pool at jump speed with no
+        // ballistic decay and overshoot a normal jump's apex).
+        let head = self.pos - DVec3::new(0.0, 0.0, self.def.height);
+        let breach = input.jump && !self.breach_latched && !scene.in_water(head);
+        self.breach_latched = input.jump && (self.breach_latched || breach);
+        if breach {
+            self.vel.z = -self.def.jump_speed;
+        } else {
+            // Vertical (+z is DOWN): gravity pulls down (+), buoyancy
+            // pushes up (−) in proportion to how much of the body is
+            // under; a stroke adds on top. With no stroke the body
+            // settles where gravity == buoyancy·frac — bobbing at the
+            // surface, above the enter threshold at the defaults (and
+            // the release threshold is clamped under the equilibrium
+            // for any tuning — see `walk_grounded`).
+            let stroke = f64::from(input.sink) - f64::from(input.jump);
+            self.vel.z += (self.def.gravity - self.def.buoyancy * frac) * dt;
+            self.vel.z += stroke * self.def.swim_accel * dt;
+            // Exponential drag — the water is thick.
+            self.vel.z -= self.vel.z * (self.def.water_drag * dt).min(1.0);
+            // The dry terminal cap still binds: a legal weak-drag,
+            // zero-buoyancy tuning must not sink faster than the walk
+            // path is allowed to fall.
+            self.vel.z = self.vel.z.min(self.def.max_fall_speed);
+        }
+
+        // Swimming neither grants coyote time nor buffers jumps
+        // (jump means "stroke up" here; a press near the shore must
+        // not fire a stale jump on landing).
+        self.since_grounded = f64::INFINITY;
+        self.jump_buffer_left = 0.0;
+
+        if self.slide_move(scene, dt, true) {
+            return; // stuck escape — no contact state this frame
+        }
+        self.on_ground = self.ground_probe(scene);
+    }
+
+    /// The walk/swim horizontal steer: clamp the wish's x/y to unit
+    /// length, approach `wish · speed` at `accel` (also the friction
+    /// rate — zero wish brakes).
+    fn steer_horizontal(&mut self, wish: DVec3, speed: f64, accel: f64, dt: f64) {
+        let wish = wish.truncate();
+        let wish = if wish.length_squared() > 1.0 {
+            wish.normalize()
+        } else {
+            wish
+        };
+        let horizontal = move_toward(self.vel.truncate(), wish * speed, accel * dt);
+        self.vel.x = horizontal.x;
+        self.vel.y = horizontal.y;
+    }
+
     /// `Fly` / `Noclip`: the full 3D wish steers at `fly_speed`, no
     /// gravity, no jumping; `collide` picks slide-vs-ghost.
     fn fly(&mut self, scene: &Scene, dt: f64, input: WalkInput, collide: bool) {
+        // WT.1 — the fly modes ignore water entirely.
+        self.swimming = false;
+        self.breach_latched = false;
         let wish = if input.wish.length_squared() > 1.0 {
             input.wish.normalize()
         } else {
@@ -587,6 +827,7 @@ mod tests {
         let input = WalkInput {
             wish: DVec3::new(1.0, 0.0, 0.0),
             jump: false,
+            sink: false,
         };
         for _ in 0..180 {
             body.walk(&scene, DT, input);
@@ -617,6 +858,7 @@ mod tests {
         let input = WalkInput {
             wish: DVec3::new(1.0, 1.0, 0.0),
             jump: false,
+            sink: false,
         };
         for _ in 0..240 {
             body.walk(&scene, DT, input);
@@ -647,6 +889,7 @@ mod tests {
             WalkInput {
                 wish: DVec3::ZERO,
                 jump: true,
+                sink: false,
             },
         );
         assert!(!body.on_ground(), "airborne after jump");
@@ -701,6 +944,7 @@ mod tests {
             WalkInput {
                 wish: DVec3::ZERO,
                 jump: true,
+                sink: false,
             },
         );
         let mut bumped = false;
@@ -769,6 +1013,7 @@ mod tests {
             WalkInput {
                 wish: DVec3::new(1.0, 0.0, 0.0),
                 jump: false,
+                sink: false,
             },
         );
         assert!(body.pos().z > z0, "gravity still applies while stuck");
@@ -797,6 +1042,7 @@ mod tests {
         let input = WalkInput {
             wish: DVec3::new(1.0, 0.0, 0.0),
             jump: false,
+            sink: false,
         };
         for _ in 0..240 {
             body.walk(&scene, DT, input);
@@ -817,6 +1063,7 @@ mod tests {
         let input = WalkInput {
             wish: DVec3::new(1.0, 0.0, 0.0),
             jump: false,
+            sink: false,
         };
         for _ in 0..240 {
             body.walk(&scene, DT, input);
@@ -849,6 +1096,7 @@ mod tests {
         let input = WalkInput {
             wish: DVec3::new(1.0, 0.0, 0.0),
             jump: false,
+            sink: false,
         };
         for _ in 0..240 {
             body.walk(&scene, DT, input);
@@ -875,6 +1123,7 @@ mod tests {
         let input = WalkInput {
             wish: DVec3::new(1.0, 0.0, 0.0),
             jump: false,
+            sink: false,
         };
         while body.on_ground() {
             body.walk(&scene, DT, input);
@@ -887,6 +1136,7 @@ mod tests {
             WalkInput {
                 wish: DVec3::new(1.0, 0.0, 0.0),
                 jump: true,
+                sink: false,
             },
         );
         assert!(
@@ -906,6 +1156,7 @@ mod tests {
             WalkInput {
                 wish: DVec3::ZERO,
                 jump: true,
+                sink: false,
             },
         );
         let rising = body.vel().z;
@@ -923,6 +1174,7 @@ mod tests {
             WalkInput {
                 wish: DVec3::ZERO,
                 jump: true,
+                sink: false,
             },
         );
         assert!(
@@ -946,6 +1198,7 @@ mod tests {
             WalkInput {
                 wish: DVec3::ZERO,
                 jump: true,
+                sink: false,
             },
         );
         assert!(!body.on_ground(), "still airborne at press");
@@ -984,6 +1237,7 @@ mod tests {
         let input = WalkInput {
             wish: DVec3::new(1.0, 0.0, -0.2),
             jump: false,
+            sink: false,
         };
         for _ in 0..240 {
             body.walk(&scene, DT, input);
@@ -1012,6 +1266,7 @@ mod tests {
             WalkInput {
                 wish: DVec3::new(1.0, 0.0, 0.0),
                 jump: false,
+                sink: false,
             },
         );
         assert!(
@@ -1045,6 +1300,7 @@ mod tests {
         let input = WalkInput {
             wish: DVec3::new(1.0, 0.0, 0.0),
             jump: false,
+            sink: false,
         };
         for _ in 0..240 {
             body.walk(&scene, DT, input);
@@ -1078,6 +1334,7 @@ mod tests {
         let input = WalkInput {
             wish: DVec3::new(1.0, 0.0, 0.0), // straight INTO the wall
             jump: false,
+            sink: false,
         };
 
         let mut body = body_on_ground(&scene);
@@ -1145,6 +1402,7 @@ mod tests {
                     WalkInput {
                         wish: DVec3::new(1.0, 0.3, 0.0),
                         jump: i == 90,
+                        sink: false,
                     },
                 );
                 trace.push(body.pos());
@@ -1152,5 +1410,425 @@ mod tests {
             trace
         };
         assert_eq!(run(), run(), "same input ⇒ bit-identical trajectory");
+    }
+
+    // ---- WT.1: swimming --------------------------------------------
+
+    /// A deep pool: solid basin floor at z = 120, water surface plane
+    /// at z = 100 (20 voxels of water above the floor). Physics water
+    /// only — no visual voxels needed.
+    fn pool_scene() -> Scene {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let grid = scene.grid_mut(id).expect("grid present");
+        grid.set_rect(
+            IVec3::new(60, 60, 120),
+            IVec3::new(160, 160, 130),
+            Some(VoxColor(0x80_50_90_50)),
+        );
+        grid.add_water_volume(IVec3::new(60, 60, 100), IVec3::new(160, 160, 119));
+        scene
+    }
+
+    /// The no-stroke bobbing equilibrium: gravity == buoyancy · frac.
+    fn equilibrium_frac(def: &CharacterDef) -> f64 {
+        def.gravity / def.buoyancy
+    }
+
+    #[test]
+    fn floats_to_equilibrium_and_never_flickers() {
+        let scene = pool_scene();
+        let mut body = CharacterBody::new(CharacterDef::default());
+        // Drop in deep: feet at z = 115 (fully submerged).
+        body.teleport(DVec3::new(100.0, 100.0, 115.0));
+        let mut engaged_at = None;
+        for i in 0..600 {
+            body.walk(&scene, DT, WalkInput::default());
+            if body.is_swimming() && engaged_at.is_none() {
+                engaged_at = Some(i);
+            }
+            // Hysteresis gate: once the swim state engages it must
+            // hold through the whole rise + surface bob.
+            if engaged_at.is_some() {
+                assert!(body.is_swimming(), "swim state flickered at frame {i}");
+            }
+        }
+        assert!(engaged_at.is_some(), "fully submerged body must swim");
+        // Settled: negligible vertical motion at the predicted bob.
+        assert!(body.vel().z.abs() < 0.05, "still bobbing: {}", body.vel().z);
+        let frac = body.submerged_fraction(&scene);
+        let eq = equilibrium_frac(body.def());
+        assert!(
+            (frac - eq).abs() < 0.03,
+            "equilibrium fraction {frac} != {eq}"
+        );
+        // Head above the surface at the default tuning (z-down:
+        // smaller z is higher).
+        let head_z = body.pos().z - body.def().height;
+        assert!(head_z < 100.0, "head under water at rest: {head_z}");
+        assert!(!body.on_ground(), "floating, not standing");
+    }
+
+    #[test]
+    fn sink_dives_and_jump_strokes_up() {
+        let scene = pool_scene();
+        let mut body = CharacterBody::new(CharacterDef::default());
+        body.teleport(DVec3::new(100.0, 100.0, 102.0));
+        // Settle at the surface first.
+        for _ in 0..300 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        let surface_z = body.pos().z;
+
+        // Hold sink: the body dives (+z grows).
+        let dive = WalkInput {
+            sink: true,
+            ..WalkInput::default()
+        };
+        for _ in 0..120 {
+            body.walk(&scene, DT, dive);
+        }
+        assert!(
+            body.pos().z > surface_z + 1.0,
+            "dive made no depth: {} vs {surface_z}",
+            body.pos().z
+        );
+        assert!(body.is_swimming());
+
+        // Hold jump: the body strokes back up (−z).
+        let rise = WalkInput {
+            jump: true,
+            ..WalkInput::default()
+        };
+        let deep_z = body.pos().z;
+        for _ in 0..60 {
+            body.walk(&scene, DT, rise);
+        }
+        assert!(
+            body.pos().z < deep_z - 1.0,
+            "stroke up made no height: {} vs {deep_z}",
+            body.pos().z
+        );
+    }
+
+    #[test]
+    fn breach_jump_fires_with_head_above_water() {
+        let scene = pool_scene();
+        let mut body = CharacterBody::new(CharacterDef::default());
+        body.teleport(DVec3::new(100.0, 100.0, 102.0));
+        for _ in 0..300 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        // At equilibrium the head is above the surface — a jump is a
+        // BREACH (full jump impulse), not a stroke.
+        assert!(body.is_swimming());
+        let head_z = body.pos().z - body.def().height;
+        assert!(head_z < 100.0, "test setup: head must be above water");
+        body.walk(
+            &scene,
+            DT,
+            WalkInput {
+                jump: true,
+                ..WalkInput::default()
+            },
+        );
+        assert!(
+            body.vel().z < -0.8 * body.def().jump_speed,
+            "breach impulse missing: vel.z = {}",
+            body.vel().z
+        );
+    }
+
+    #[test]
+    fn wading_below_enter_fraction_stays_walking() {
+        // The minimal authored water — ONE voxel over the walkable
+        // floor (surface z = 99 above the z = 100 plane) — must stay
+        // wadable for the DEFAULT body: 1.0 deep on a 1.8 body is a
+        // fraction of ≈ 0.56, under the 0.6 enter threshold (the
+        // threshold default was picked for exactly this: a
+        // decorative puddle must not swap walking for swimming).
+        let mut scene = ground_scene();
+        let id = scene.grids().next().expect("grid").0;
+        scene
+            .grid_mut(id)
+            .expect("grid")
+            .add_water_volume(IVec3::new(60, 60, 99), IVec3::new(160, 160, 99));
+        let mut body = body_on_ground(&scene);
+        let frac = body.submerged_fraction(&scene);
+        assert!(
+            frac > 0.5 && frac < body.def().swim_enter_frac,
+            "test setup: wading fraction {frac}"
+        );
+        for _ in 0..120 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        assert!(!body.is_swimming(), "wading must not engage the swim state");
+        assert!(body.on_ground(), "wading body stands on the floor");
+    }
+
+    #[test]
+    fn breach_is_one_shot_until_jump_releases() {
+        let scene = pool_scene();
+        let mut body = CharacterBody::new(CharacterDef::default());
+        body.teleport(DVec3::new(100.0, 100.0, 102.0));
+        for _ in 0..300 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        let held = WalkInput {
+            jump: true,
+            ..WalkInput::default()
+        };
+        // First held frame: the breach impulse, exactly.
+        body.walk(&scene, DT, held);
+        assert_eq!(body.vel().z, -body.def().jump_speed, "breach fired");
+        // Still held: NO re-impulse — the very next frame the
+        // velocity must have integrated away from the exact impulse
+        // value (the old bug pinned it to -jump_speed every frame).
+        body.walk(&scene, DT, held);
+        assert!(
+            (body.vel().z - -body.def().jump_speed).abs() > 1e-9,
+            "held jump re-impulsed: vel.z = {}",
+            body.vel().z
+        );
+        // Release: fall back into the pool and settle at the bob
+        // again (the breach launched the body clear of the water) —
+        // then a fresh press re-arms the latch and breaches again.
+        for _ in 0..300 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        assert!(body.is_swimming(), "back at the surface bob");
+        body.walk(&scene, DT, held);
+        assert_eq!(body.vel().z, -body.def().jump_speed, "re-armed breach");
+    }
+
+    #[test]
+    fn underwater_sink_respects_the_terminal_fall_cap() {
+        // A legal tuning with no buoyancy and near-zero drag must not
+        // sink faster than the dry terminal cap (gravity/drag alone
+        // would reach 240 u/s here — 4× the cap — and could launch
+        // the body out of the volume's bottom face).
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let grid = scene.grid_mut(id).expect("grid present");
+        // A very deep column of water, no floor for a while.
+        grid.add_water_volume(IVec3::new(60, 60, 100), IVec3::new(160, 160, 900));
+        let def = CharacterDef {
+            buoyancy: 0.0,
+            water_drag: 0.1,
+            ..CharacterDef::default()
+        };
+        let mut body = CharacterBody::new(def);
+        body.teleport(DVec3::new(100.0, 100.0, 110.0));
+        for _ in 0..600 {
+            body.walk(&scene, DT, WalkInput::default());
+            assert!(
+                body.vel().z <= body.def().max_fall_speed + 1e-9,
+                "sink speed {} exceeded the terminal cap",
+                body.vel().z
+            );
+        }
+        assert!(body.is_swimming(), "zero buoyancy: still under water");
+    }
+
+    #[test]
+    fn cork_tuning_does_not_limit_cycle_at_the_waterline() {
+        // buoyancy 80 / gravity 24 → equilibrium fraction 0.3, BELOW
+        // swim_exit_frac (0.35). Without the runtime clamp on the
+        // release threshold this strobes swim → walk forever.
+        let scene = pool_scene();
+        let mut body = CharacterBody::new(CharacterDef {
+            buoyancy: 80.0,
+            ..CharacterDef::default()
+        });
+        body.teleport(DVec3::new(100.0, 100.0, 115.0));
+        // The strong buoyancy legitimately POPS the cork clear of the
+        // water first (airborne = not swimming — physical, not a
+        // flicker); let the splash oscillation decay…
+        for _ in 0..600 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        // …then the settled bob must hold ONE state steadily
+        // (whichever the last threshold crossing left — the clamped
+        // band contains the equilibrium, so either flag is honest).
+        // Without continuous passive water forces this strobes every
+        // few frames: the walk path's dry gravity vs the swim path's
+        // buoyancy made a relay oscillator across the band.
+        let settled = body.is_swimming();
+        for i in 0..300 {
+            body.walk(&scene, DT, WalkInput::default());
+            assert_eq!(
+                body.is_swimming(),
+                settled,
+                "settled cork flickered at frame {i}"
+            );
+        }
+        // Floating high: equilibrium ≈ 0.3 of the body under water.
+        let frac = body.submerged_fraction(&scene);
+        assert!((frac - 0.3).abs() < 0.05, "cork equilibrium {frac}");
+    }
+
+    #[test]
+    fn fraction_survives_a_volume_that_stops_short_of_the_floor() {
+        // An authored volume whose bottom face ends ABOVE the basin
+        // floor: a diving body's feet exit through the bottom while
+        // the head is still deep in water. The fraction must read
+        // fully-submerged there, not snap to dry (the discontinuity
+        // would strobe the swim state).
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let grid = scene.grid_mut(id).expect("grid present");
+        grid.set_rect(
+            IVec3::new(60, 60, 120),
+            IVec3::new(160, 160, 130),
+            Some(VoxColor(0x80_50_90_50)),
+        );
+        // Water stops at z = 110 — ten voxels short of the floor.
+        grid.add_water_volume(IVec3::new(60, 60, 100), IVec3::new(160, 160, 109));
+        let mut body = CharacterBody::new(CharacterDef::default());
+        // Feet below the volume's bottom face, head well inside it.
+        body.teleport(DVec3::new(100.0, 100.0, 111.0));
+        assert_eq!(
+            body.submerged_fraction(&scene),
+            1.0,
+            "feet under the volume's bottom + head in water = fully submerged"
+        );
+        // Diving straight through: the guard covers the straddle band
+        // (feet out, head in), so the ONLY release happens when the
+        // whole body has passed below the volume — one clean
+        // swim→walk transition, no strobing across the bottom face.
+        let mut transitions = 0;
+        let mut was_swimming = false;
+        for _ in 0..300 {
+            body.walk(
+                &scene,
+                DT,
+                WalkInput {
+                    sink: true,
+                    ..WalkInput::default()
+                },
+            );
+            if was_swimming && !body.is_swimming() {
+                transitions += 1;
+            }
+            was_swimming = body.is_swimming();
+        }
+        assert!(transitions <= 1, "strobed across the face: {transitions}");
+        assert!(!body.is_swimming(), "fully below the volume = not in water");
+        assert!(body.on_ground(), "landed on the basin floor");
+    }
+
+    #[test]
+    fn eye_in_water_flips_at_the_camera_not_the_feet() {
+        let scene = pool_scene();
+        let mut body = CharacterBody::new(CharacterDef::default());
+        body.teleport(DVec3::new(100.0, 100.0, 102.0));
+        for _ in 0..300 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        // Bobbing at the surface: swimming, but the camera is dry —
+        // the tint/lowpass hook must be off.
+        assert!(body.is_swimming());
+        assert!(!body.eye_in_water(&scene), "surface bob: dry camera");
+        // Dive: the eye goes under.
+        for _ in 0..120 {
+            body.walk(
+                &scene,
+                DT,
+                WalkInput {
+                    sink: true,
+                    ..WalkInput::default()
+                },
+            );
+        }
+        assert!(body.eye_in_water(&scene), "diving: submerged camera");
+    }
+
+    #[test]
+    fn dry_walk_is_unaffected_by_far_away_water() {
+        // Byte-identity gate: the same input sequence over the same
+        // floor must produce the SAME trajectory whether or not the
+        // scene has water somewhere else.
+        let run = |with_water: bool| {
+            let mut scene = ground_scene();
+            if with_water {
+                let id = scene.grids().next().expect("grid").0;
+                scene
+                    .grid_mut(id)
+                    .expect("grid")
+                    .add_water_volume(IVec3::new(150, 150, 90), IVec3::new(160, 160, 99));
+            }
+            let mut body = CharacterBody::new(CharacterDef::default());
+            body.teleport(DVec3::new(100.0, 100.0, 95.0));
+            let mut trace = Vec::new();
+            for i in 0..240 {
+                body.walk(
+                    &scene,
+                    DT,
+                    WalkInput {
+                        wish: DVec3::new(-1.0, 0.4, 0.0),
+                        jump: i == 60,
+                        sink: false,
+                    },
+                );
+                trace.push(body.pos());
+            }
+            trace
+        };
+        assert_eq!(run(false), run(true), "dry path must be unperturbed");
+    }
+
+    #[test]
+    fn swims_identically_on_a_scaled_grid() {
+        // SC discipline: the same pool authored on a vws = 0.5 grid
+        // (double the voxel counts, half the size each) floats the
+        // body to the same WORLD equilibrium.
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 0.5));
+        let grid = scene.grid_mut(id).expect("grid present");
+        grid.set_rect(
+            IVec3::new(120, 120, 240),
+            IVec3::new(320, 320, 260),
+            Some(VoxColor(0x80_50_90_50)),
+        );
+        grid.add_water_volume(IVec3::new(120, 120, 200), IVec3::new(320, 320, 239));
+        let mut body = CharacterBody::new(CharacterDef::default());
+        body.teleport(DVec3::new(100.0, 100.0, 115.0));
+        for _ in 0..600 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        assert!(body.is_swimming());
+        let frac = body.submerged_fraction(&scene);
+        let eq = equilibrium_frac(body.def());
+        assert!(
+            (frac - eq).abs() < 0.03,
+            "scaled-grid equilibrium {frac} != {eq}"
+        );
+        // World surface plane: local z 200 × 0.5 = world z 100 — the
+        // same waterline as the identity pool.
+        let expect_feet = 100.0 + eq * body.def().height;
+        assert!(
+            (body.pos().z - expect_feet).abs() < 0.1,
+            "feet at {} != {expect_feet}",
+            body.pos().z
+        );
+    }
+
+    #[test]
+    fn fly_mode_ignores_water_and_clears_swim_state() {
+        let scene = pool_scene();
+        let mut body = CharacterBody::new(CharacterDef::default());
+        body.teleport(DVec3::new(100.0, 100.0, 110.0));
+        for _ in 0..120 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        assert!(body.is_swimming(), "walk mode swims in the pool");
+        body.set_mode(MoveMode::Fly);
+        body.walk(&scene, DT, WalkInput::default());
+        assert!(!body.is_swimming(), "fly cleared the swim state");
+        // Hovering: no gravity, no buoyancy — velocity stays zero.
+        for _ in 0..60 {
+            body.walk(&scene, DT, WalkInput::default());
+        }
+        assert_eq!(body.vel(), DVec3::ZERO, "fly ignores water forces");
     }
 }

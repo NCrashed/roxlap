@@ -43,7 +43,76 @@ file:line facts, not guesses).
   `in_water` short-circuits (the per-actor-per-frame query);
   decision 1 + the substage spec de-rotted (point queries only,
   fraction derives in WT.1 — no box query exists).
-- WT.1 — CharacterBody swimming: NOT STARTED
+- WT.1 — LANDED 2026-07-13: swimming in `CharacterBody`
+  (character.rs). Hysteretic swim state at the top of the Walk path:
+  `submerged_fraction` = `clamp(water_depth_at(feet) / height)`
+  (pub — hosts wire tint/audio to the same number), engage ≥
+  `swim_enter_frac` (0.5), release < `swim_exit_frac` (0.35); the
+  no-stroke equilibrium `gravity/buoyancy` (24/32 = 0.75) sits above
+  the enter threshold, so the surface bob can't flicker the state
+  (pinned by test). `swim()`: horizontal `move_toward` at
+  `swim_speed`/`swim_accel`; vertical `+= (gravity − buoyancy·frac)·dt
+  + stroke·swim_accel·dt` then exponential `water_drag` (stroke =
+  `sink` − `jump`, +z down); **breach** = `jump` with the head out of
+  the water (`!scene.in_water(head)`) → full `-jump_speed` impulse
+  (knob-free; fires-while-held matches the walk path's held-jump
+  behaviour). Swimming grants no coyote and buffers no jumps; the fly
+  modes clear the state; `teleport` resets it. New `CharacterDef`
+  fields (defaulted): `buoyancy`, `water_drag`, `swim_speed`,
+  `swim_accel`, `swim_enter_frac`, `swim_exit_frac`; new
+  `WalkInput.sink` (pub-field growth — all in-tree literal users
+  patched: 2 demos, 2 gallery scenes, cave-web, book example).
+  7 tests: float-to-equilibrium + no-flicker, dive/stroke-up, breach
+  impulse, wading below enter keeps walking, dry-walk byte-identity
+  with far-away water, scaled-grid (vws 0.5) same WORLD equilibrium,
+  fly clears + ignores.
+  **Review round (user, 2026-07-14) — 10 findings closed:**
+  1. `submerged_fraction` continuity guard: feet below an authored
+     volume's BOTTOM face with the head still in water read as fully
+     submerged (was: snap to 0.0 mid-dive → state strobe hysteresis
+     can't absorb). Diving all the way THROUGH a short volume is one
+     clean swim→walk exit (pinned).
+  2. Breach is a ONE-SHOT (`breach_latched`, re-armed on jump
+     release / walking / fly / teleport): a held jump re-impulsed to
+     full `-jump_speed` every frame — the body left any pool at jump
+     speed with no ballistic decay. Pinned: second held frame must
+     NOT read exactly `-jump_speed`; release + press re-breaches.
+  3. `eye_in_water` added — THE hook for WT.2 tint / WT.3 lowpass.
+     `submerged_fraction` is feet-depth (0.75 at the bob with a DRY
+     camera) and its doc now says so.
+  4. **The big one — waterline relay oscillator.** Clamping release
+     below the equilibrium wasn't enough: a cork (buoyancy 80) still
+     strobed, because the walk path applied DRY gravity inside water
+     — the force jumped by `buoyancy·frac` at every state crossing,
+     and the hysteresis loop pumps energy each cycle (dry-gravity
+     fall across the released band re-accelerates the body every
+     re-entry; drag can't outrun it). FIX: the passive water forces
+     (buoyancy + drag, `frac`-scaled) apply in BOTH states —
+     continuous across the boundary; the swim flag gates only
+     controls (strokes/speeds/coyote). Bonus: wading is floaty,
+     splashing landings cushion. Both thresholds also clamp around
+     the equilibrium (0.9× / 1.1×) so the band always contains the
+     resting point. Cork test: settle, then 300 frames of ONE stable
+     state (either flag is honest inside the band).
+  5. The dry terminal cap (`max_fall_speed`) binds under water too
+     (a zero-buoyancy weak-drag tuning could sink at 4× the cap).
+  6. `set_mode(Fly/Noclip)` clears the swim state immediately (a
+     host polling `is_swimming()` between set_mode and the next
+     walk() saw a stale underwater state).
+  7. Default `swim_enter_frac` 0.5 → 0.6: minimal authored water
+     (one voxel over the floor = frac ≈ 0.56 on the default body)
+     stays WADABLE — a decorative puddle must not swap walking for
+     swimming (was: needed a taller test body to wade at all).
+  8. Horizontal steer deduplicated (`steer_horizontal`, walk + swim).
+  9. Breach branches FIRST (stroke/drag on the breach frame were
+     dead computation).
+  10. All 6 external `WalkInput` literal sites use
+     `..WalkInput::default()` — the next field won't churn 6 files.
+  Tests 7 → 13 (breach one-shot/re-arm, terminal cap, cork
+  stability, short-volume continuity + clean exit, eye_in_water,
+  wading with the DEFAULT body). Scene 255 tests; workspace clippy
+  (+`struct_excessive_bools` allow — 4 genuinely independent flags),
+  fmt, docs, anchors, wasm clippy, book example run — all green.
 - WT.2 — underwater tint (render): NOT STARTED
 - WT.3 — underwater audio: NOT STARTED
 - WT.4 — cave-demo flood (native): NOT STARTED

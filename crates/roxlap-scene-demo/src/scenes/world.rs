@@ -204,6 +204,7 @@ impl DemoScene for WorldScene {
             WalkInput {
                 wish,
                 jump: ctx.input.up,
+                ..WalkInput::default()
             },
         );
         ctx.cam.pos = self.body.eye_pos().into();
