@@ -227,7 +227,89 @@ file:line facts, not guesses).
      `LISTENER_LOWPASS_SUBMERGED_HZ` (700 Hz) — the one named
      submerged default WT.4/WT.5 call sites share, so the listening
      pass retunes one line, not N demos.
-- WT.4 — cave-demo flood (native): NOT STARTED
+- WT.4 — LANDED 2026-07-14: the native cave demo floods.
+  **Design correction found by test**: the planned solid volumetric
+  FILL destroys submerged surface colours — refilling cavities merges
+  water into the rock slabs and the RLE format drops every
+  interior-boundary colour (colourless by design; the crystal test
+  caught black submerged crystals). Shipped design: a 2-voxel
+  volumetric **surface SHELL** where air crosses `WATERLINE_Z = 170`
+  (grazing looks accumulate thickness ⇒ cheap Fresnel; straight down
+  stays clear enough to spot submerged crystals), physics = ONE
+  `WaterVolume` over the whole band below, underwater look = the
+  WT.2 tint (not murky geometry). The shell is the CC.4 veto's
+  textbook case (exactly 2 voxels — the format limit): the body's
+  `Solidity.passable = water_passes` crosses it to swim; plasma
+  bullets ALSO pass it colour-keyed (they detonate on the pool floor,
+  the boom muffled by the water's absorption on the way up).
+  - Order is load-bearing: crystals plant BEFORE the flood (the
+    planter must not grow on the shell), flood before the bake.
+  - Wiring: `Material::volumetric(70)` + colour→material rows
+    (render + AU2 absorption 0.5 via `DemoAudio`'s config), V-key
+    fly ⇄ walk toggle, Space/Shift = jump-breach/sink (held keys pass
+    through `WalkInput` — the fly path never reads them),
+    `UNDERWATER_TINT` from `eye_in_water` per frame, the WT.3
+    lowpass via `KiraAudio::with_options(DEFAULT_POOL, true)` +
+    `DemoAudio::set_submerged`, splash particle ring on feet-crossing
+    with speed (entry + exit; `prev_feet_depth` reset on regen so a
+    respawn can't phantom-splash).
+  - Seams documented in the module doc + `flood_below_waterline`:
+    static volume (craters below the line still swim), fully-sealed
+    submerged cavities have no visible surface plane.
+  - 6 tests green incl. `cave_floods_below_the_waterline` (shell
+    colour + veto + wet physics + deep-air-pocket swims + dry spawn)
+    and the crystal test that caught the fill bug.
+  - **Visual + listening pass PASSED** (user, 2026-07-14) with one
+    follow-up, fixed: walking used the fly "drone" body (the
+    ±PLAYER_RADIUS probe cube, eye at its centre) — ankle-height
+    camera. Now per-mode proportions: the V-toggle stands a human
+    frame up for Walk (`WALK_HEIGHT` 1.8 / `WALK_EYE_HEIGHT` 1.62,
+    radius unchanged) and restores the drone cube for Fly; the
+    eye→feet teleport sync and the world-top z-clamp read the
+    CURRENT def instead of the old hardcoded drone numbers. Bonus:
+    the swim thresholds were tuned for a 1.8 body all along — the
+    0.6 drone swam at 0.36 depth; the human frame wades/swims at the
+    intended depths, and the bob leaves the eye just above the
+    surface.
+  **Review round (user, 2026-07-14) — 6 findings + 4 cleanups
+  closed:**
+  1. The 2-layer shell grew a colourless `UnexposedSolid` cell
+     wherever it landed on a floor 1 voxel down (air 170–171, rock
+     172: the merged span's second cell is interior — both colour
+     vetoes blind there: invisible step for the body, surface
+     detonation for plasma). New fill rule keeps every water voxel
+     in its span's COLOURED zone: layer 1 fills wherever air (even
+     on rock — it's the merged span's top, always coloured); layer 2
+     only over MORE air. Shallow shores get a 1-voxel sheet with a
+     1-voxel air slice above the floor.
+  2. Held Space bunny-hopped up the shore (the engine re-buffers a
+     held jump every frame): the demo passes the held key while
+     SWIMMING (continuous stroke; breach is engine-latched) but the
+     PRESS EDGE while walking (`up_was_down`).
+  3. Space/Shift leaked into the 3D wish in Walk mode — the
+     normalisation taxed horizontal speed −29% while stroking. The z
+     components now feed the wish only in the fly modes.
+  4. `DebrisSystem` didn't know the water veto — detached rock stood
+     ON the 2-voxel sheet like concrete. `debris.solidity.passable`
+     now shares `water_passes`. (Accepted cosmetic seam: shatter
+     PARTICLES' `Bounce` still treats the sheet as solid —
+     `ParticleSystem` has no solidity plumbing; they fade in ≤1.4 s.)
+  5. Splash gating: Walk mode only (the fly START mode crossed
+     z = 170 and rang phantom rings) and only where the shell
+     actually exists in the feet's column (a carved crater / sealed
+     pocket has no visible surface for a ring).
+  6. The WT.4 test had been inserted MID-doc-comment of the EV.4
+     crystal test (its contract text was orphaned) — both docs
+     reattached.
+  Cleanups: ONE `material_map()` feeds renderer + fracture + audio
+  (the three hand-written lists had already drifted — water missing
+  from the fracture map dropped shot-out shell pieces as opaque
+  rock; crystals in the audio map are a no-op, unmapped ids absorb
+  at 1.0); the flood uses ONE batched `set_spans` (y-outer contract)
+  instead of ≤16 384 per-column `set_rect` ScumCtx builds; bullets
+  classify water from the getcube they already did (one lookup, one
+  classification path); `eye_in_water` evaluates once per frame and
+  feeds both tint and lowpass.
 - WT.5 — web parity + docs + close: NOT STARTED
 
 ## Goal

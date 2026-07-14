@@ -47,6 +47,9 @@ const HUM_ACOUSTICS_HZ: f64 = 4.0;
 /// Cap booms started in a single frame so a shotgun-into-a-wall burst
 /// of impacts doesn't machine-gun the voice pool.
 const MAX_BOOMS_PER_FRAME: usize = 2;
+/// WT.4 — sound through water: half a voxel of effective rock per
+/// voxel of water — muffled but audible (rock keeps the implicit 1.0).
+const WATER_ABSORPTION: f32 = 0.5;
 
 /// The demo's audio system. `None`-friendly: [`DemoAudio::new`] returns
 /// `None` when no audio device is available (headless CI, no ALSA), and
@@ -72,7 +75,10 @@ impl DemoAudio {
     /// Open the audio device and register the synthesized sounds, or
     /// `None` if no device is available (the demo then runs silent).
     pub fn new() -> Option<Self> {
-        let mut audio = match KiraAudio::new() {
+        // WT.4 — opt into the WT.3 listener lowpass (a master-track
+        // filter, construction-time-only in kira): the flooded cave
+        // dunks the ear.
+        let mut audio = match KiraAudio::with_options(roxlap_audio::DEFAULT_POOL, true) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("roxlap-cave-demo: audio disabled ({e})");
@@ -82,12 +88,22 @@ impl DemoAudio {
         let shot = audio.register(&synth::shot(SAMPLE_RATE));
         let impact = audio.register(&synth::impact(SAMPLE_RATE));
         let hum = audio.register(&synth::hum(SAMPLE_RATE));
+        // WT.4 — water muffles less than rock: a boom heard through
+        // the pool reads distant, not sealed away (AU2 per-material
+        // absorption; rock keeps the implicit 1.0). The colour map is
+        // THE shared one (crystals riding along classify as material
+        // 1 with no absorption entry = the default 1.0 — a no-op).
+        let acfg = AcousticsConfig {
+            material_map: crate::material_map().to_vec(),
+            absorption: vec![(crate::WATER_MATERIAL_ID, WATER_ABSORPTION)],
+            ..AcousticsConfig::default()
+        };
         Some(Self {
             audio,
             shot,
             impact,
             hum,
-            acfg: AcousticsConfig::default(),
+            acfg,
             cavity: CavityEstimator::new(CavityConfig::default()),
             hums: HashMap::new(),
             cavity_timer: 0.0,
@@ -115,6 +131,17 @@ impl DemoAudio {
             let a = source_acoustics(scene, at, listener, &self.acfg);
             self.audio.play(self.impact, at, Some(&a));
         }
+    }
+
+    /// WT.4 — the underwater ear: drive the WT.3 listener lowpass from
+    /// the submersion signal, every frame. Cheap above water — the
+    /// kira backend dedups an unchanged target (no tween restart).
+    pub fn set_submerged(&mut self, under: bool) {
+        self.audio.set_listener_lowpass(if under {
+            roxlap_audio::LISTENER_LOWPASS_SUBMERGED_HZ
+        } else {
+            roxlap_audio::LISTENER_LOWPASS_OPEN_HZ
+        });
     }
 
     /// Stop every crystal hum and clear the reverb history — call on a

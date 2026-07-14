@@ -20,6 +20,15 @@
 //! - `W`/`A`/`S`/`D` → forward / strafe-left / back / strafe-right.
 //! - `Space` → up (world `-z`); `LShift` → down (world `+z`).
 //! - Hold `LCtrl` for fast-fly (≈4× speed).
+//! - `V` → toggle fly ⇄ walk (WT.4). Walking stands a human frame up
+//!   (the camera rises to head height; flying keeps the small probe
+//!   "drone"). The cave's lower third is flooded: a WALKING body that
+//!   wades past chest depth swims automatically — `Space` strokes up
+//!   (and breaches at the surface), `LShift` dives. Under the surface
+//!   the frame tints blue-green and the mix muffles; some crystals
+//!   glow down there.
+//!   Known v1 seam: carving below the waterline leaves an air pocket
+//!   that LOOKS dry but still swims (the water volume is static).
 //! - `LMB` (while grabbed) → fire a plasma bullet (a glowing voxel
 //!   sphere sprite) that flies along camera-forward and carves a sphere
 //!   into the world on impact. DT.4 — rock the carve disconnects from
@@ -61,13 +70,13 @@ use roxlap_core::Camera;
 use roxlap_core::Engine;
 use roxlap_core::LightSrc;
 use roxlap_core::OpticastSettings;
-use roxlap_formats::edit::set_sphere_with_colfunc;
+use roxlap_formats::edit::{set_sphere_with_colfunc, Vspan};
 use roxlap_formats::kv6::Kv6;
 use roxlap_formats::vxl::Vxl;
 use roxlap_render::{
     BackendPreference, CollisionMode, DebrisSystem, DynSpriteTransform, FrameParams, Material,
     ParticleEmitterDef, ParticleSystem, RenderOptions, SceneRenderer, SpriteInstanceId,
-    SpriteModelId,
+    SpriteModelId, Tint,
 };
 use roxlap_scene::cavegen::CaveChunkGenerator;
 use roxlap_scene::islands::{detect_islands, FracturePattern, Island, DEFAULT_ISLAND_BUDGET};
@@ -189,6 +198,31 @@ const CRYSTAL_LIGHT_RADIUS: f32 = 32.0;
 /// ~20 voxels; see [`BakeLight::strength`]).
 const CRYSTAL_LIGHT_STRENGTH: f32 = 6000.0;
 
+// ---- WT.4: the flooded lower cave (PORTING-WATER.md) ----
+
+/// Water surface plane, grid-local z (+z is DOWN: everything from here
+/// to the floor is flooded — roughly the cave's bottom third). The
+/// crystal planter's z range (24..224) reaches well below it, so some
+/// crystals glow under water: the dive incentive.
+const WATERLINE_Z: i32 = 170;
+/// Water voxel colour — the visual fill's surface AND interior (the
+/// same colour keys the render material, the audio absorption and the
+/// physics-irrelevant fracture map, the one-map discipline).
+const WATER_COLOR: VoxColor = VoxColor(0x8018_4A78);
+/// Material palette slot for water: Beer–Lambert volumetric
+/// (thickness-aware) on the 2-voxel surface shell — looking straight
+/// down crosses ~2 voxels (clear enough to spot submerged crystals),
+/// a grazing look accumulates many (the surface reads solid at the
+/// horizon, the cheap Fresnel).
+const WATER_MATERIAL_ID: u8 = 2;
+/// Per-voxel volumetric alpha (~0.27/voxel ⇒ ~0.47 straight down
+/// through the 2-voxel shell).
+const WATER_ALPHA: u8 = 70;
+/// WT.2 full-screen grade while the EYE is under the surface.
+const UNDERWATER_TINT: Tint = Tint {
+    color: Rgb(0x000F_3A55),
+    strength: 0.45,
+};
 /// Fog colour (RGB low-24-bit). The renderer blends each pixel toward
 /// this colour by `depth / fog_max_dist`.
 const FOG_COLOR: u32 = 0x0090_98B0;
@@ -217,6 +251,17 @@ const GPU_MIP_LEVELS: u32 = 6;
 /// that the camera fits through the `SPAWN_BUBBLE_RADIUS = 6` carved
 /// bubble + bullet-impact craters.
 const PLAYER_RADIUS: f64 = 0.3;
+
+/// WT.4 follow-up (visual pass: "walking put the camera at ankle
+/// height") — WALK-mode proportions. The fly body stays the
+/// historical ±[`PLAYER_RADIUS`] probe cube (eye at its centre — a
+/// drone, it fits crevices); toggling to Walk swaps in a human frame:
+/// feet-positioned height with the eye up at head level. The xy
+/// radius stays [`PLAYER_RADIUS`] in both modes.
+const WALK_HEIGHT: f64 = 1.8;
+/// Feet → eye distance while walking (head level, just under the
+/// crown — the stock [`CharacterDef`] proportions).
+const WALK_EYE_HEIGHT: f64 = 1.62;
 
 /// In-flight plasma bullet. Travels in a straight line until it hits a
 /// solid voxel (carved into a sphere) or exits the world / max-flight
@@ -343,6 +388,12 @@ struct App {
     debris_model: Option<SpriteModelId>,
     /// Shatters since the last sprite-model-pool compaction.
     shatters_since_compact: u32,
+    /// WT.4 — the feet's water depth last frame; a sign change with
+    /// speed behind it is a surface crossing = splash.
+    prev_feet_depth: f64,
+    /// WT.4 review #2 — Space held last frame, for the walk jump's
+    /// edge trigger (swimming reads the held key instead).
+    up_was_down: bool,
     /// AU.3 — voxel-aware audio (feature `audio`). `None` when no audio
     /// device is available; the demo then runs silent.
     #[cfg(feature = "audio")]
@@ -378,7 +429,9 @@ impl App {
             fly_speed: MOVE_SPEED,
             solidity: Solidity {
                 bedrock_blocks: true,
-                ..Solidity::default()
+                // WT.4 — the water surface shell is passable: the body
+                // crosses it to swim (see `water_passes`).
+                passable: Some(water_passes),
             },
             ..CharacterDef::default()
         });
@@ -403,10 +456,21 @@ impl App {
             seed,
             bullets: Vec::new(),
             carve: CarveWorker::new(),
-            debris: DebrisSystem::new(),
+            debris: {
+                // WT.4 review #4 — the falling islands honour the
+                // same water veto as the body and the bullets: a
+                // detached rock must sink THROUGH the surface shell
+                // and shatter on the pool floor, not stand on the
+                // 2-voxel sheet like concrete.
+                let mut d = DebrisSystem::new();
+                d.solidity.passable = Some(water_passes);
+                d
+            },
             particles: ParticleSystem::new(0xCA5E),
             debris_model: None,
             shatters_since_compact: 0,
+            prev_feet_depth: 0.0,
+            up_was_down: false,
             #[cfg(feature = "audio")]
             audio: audio::DemoAudio::new(),
         }
@@ -427,8 +491,12 @@ impl App {
             audio.impacts(hits, &self.scene, glam::DVec3::from(self.cam_pos));
         }
     }
+    /// `submerged` is the frame's ONE eye-under-water evaluation
+    /// (WT.4 review — a second call site is a place for a future
+    /// hysteresis/deadband to be applied in one spot and forgotten in
+    /// the other: blue screen, dry sound).
     #[cfg(feature = "audio")]
-    fn audio_tick(&mut self, dt: f64) {
+    fn audio_tick(&mut self, dt: f64, submerged: bool) {
         if self.audio.is_none() {
             return; // silent: skip the per-frame camera/quat build
         }
@@ -436,6 +504,7 @@ impl App {
         let listener = glam::DVec3::from(self.cam_pos);
         let grid_id = self.grid_id;
         if let Some(audio) = self.audio.as_mut() {
+            audio.set_submerged(submerged);
             audio.tick(dt, &self.scene, grid_id, listener, orientation);
         }
     }
@@ -454,7 +523,7 @@ impl App {
     fn audio_impacts(&mut self, _hits: &[IVec3]) {}
     #[cfg(not(feature = "audio"))]
     #[allow(clippy::unused_self)]
-    fn audio_tick(&mut self, _dt: f64) {}
+    fn audio_tick(&mut self, _dt: f64, _submerged: bool) {}
     #[cfg(not(feature = "audio"))]
     #[allow(clippy::unused_self)]
     fn audio_reset(&mut self) {}
@@ -484,6 +553,9 @@ impl App {
             }
         }
         self.bullets.clear();
+        // WT.4 — the regen respawn teleports out of the water; forget
+        // the old depth so the first post-regen frame can't phantom-splash.
+        self.prev_feet_depth = 0.0;
 
         // Drop any in-flight background carve so its result (carved into
         // the OLD world) can't clobber the fresh chunk.
@@ -543,11 +615,17 @@ impl App {
                 delta[i] -= cam.right[i];
             }
         }
-        if self.keys.has(KeyState::UP) {
+        // WT.4 review #3 — Space/Shift feed the wish's z only in the
+        // FLY modes. In Walk they are the jump/sink FLAGS instead; if
+        // they also leaked into `delta`, the 3D normalisation would
+        // shrink the xy part (W+Space = 0.707·forward — a −29%
+        // horizontal speed tax on every stroking swimmer).
+        let flying = self.body.mode() != MoveMode::Walk;
+        if self.keys.has(KeyState::UP) && flying {
             // `-z` is up in voxlap convention.
             delta[2] -= 1.0;
         }
-        if self.keys.has(KeyState::DOWN) {
+        if self.keys.has(KeyState::DOWN) && flying {
             delta[2] += 1.0;
         }
         // Normalise diagonal motion so two-key combos don't move √2×
@@ -564,19 +642,38 @@ impl App {
 
         // CC.3: the engine controller slides the cube body; regen or
         // spawn moves `cam_pos` behind our back, so re-teleport when
-        // it no longer matches our last sync.
+        // it no longer matches our last sync. Eye → feet uses the
+        // CURRENT mode's eye height (WT.4 follow-up: walk stands a
+        // taller body than the fly drone).
         if self.cam_pos != self.last_eye {
             self.body.teleport(
-                glam::DVec3::from(self.cam_pos) + glam::DVec3::new(0.0, 0.0, PLAYER_RADIUS),
+                glam::DVec3::from(self.cam_pos)
+                    + glam::DVec3::new(0.0, 0.0, self.body.def().eye_height),
             );
         }
         self.body.def_mut().fly_speed = speed;
+        // WT.4 — Space/Shift double as the swim strokes in Walk mode
+        // (jump = up + breach at the surface, sink = dive); the fly
+        // path never reads the flags. Review #2: swimming wants the
+        // HELD key (a continuous stroke; the engine's breach latch is
+        // already one-shot), but the WALK jump is edge-triggered here
+        // — the engine re-buffers a held jump every frame, so wading
+        // out of the pool with Space still down would chain-hop up
+        // the shore.
+        let up = self.keys.has(KeyState::UP);
+        let jump = if self.body.is_swimming() {
+            up
+        } else {
+            up && !self.up_was_down
+        };
+        self.up_was_down = up;
         self.body.walk(
             &self.scene,
             dt,
             WalkInput {
                 wish,
-                ..WalkInput::default()
+                jump,
+                sink: self.keys.has(KeyState::DOWN),
             },
         );
 
@@ -590,7 +687,9 @@ impl App {
         let hi_z = f64::from(MAXZDIM) - 1e-3;
         feet.x = feet.x.clamp(PLAYER_RADIUS, hi_xy);
         feet.y = feet.y.clamp(PLAYER_RADIUS, hi_xy);
-        feet.z = feet.z.clamp(2.0 * PLAYER_RADIUS, hi_z);
+        // The head (feet − height) must stay inside the world top —
+        // the lower bound follows the CURRENT mode's body height.
+        feet.z = feet.z.clamp(self.body.def().height, hi_z);
         if feet != self.body.pos() {
             self.body.set_pos(feet);
         }
@@ -678,19 +777,25 @@ impl App {
                     despawned.push(b.inst);
                     return false;
                 }
-                // Solid hit?
-                let solid = chunk.is_some_and(|c| {
-                    !matches!(
-                        getcube(&c.data, &c.column_offset, c.vsid, vx, vy, vz),
-                        Cube::Air
-                    )
+                // Solid hit? WT.4 — plasma flies THROUGH the water
+                // surface shell (colour-keyed like the body's veto):
+                // it detonates on the pool floor instead, with the
+                // boom muffled by the water on the way back up. ONE
+                // getcube classifies both (review: a second
+                // voxel_color read is a wasted lookup and a second
+                // classification path to drift).
+                let hit = chunk.map_or(Cube::Air, |c| {
+                    getcube(&c.data, &c.column_offset, c.vsid, vx, vy, vz)
                 });
-                if solid {
-                    impacts.push(IVec3::new(vx, vy, vz));
-                    despawned.push(b.inst);
-                    return false;
+                match hit {
+                    Cube::Air => true,
+                    Cube::Color(c) if water_passes(VoxColor(c)) => true,
+                    Cube::Color(_) | Cube::UnexposedSolid => {
+                        impacts.push(IVec3::new(vx, vy, vz));
+                        despawned.push(b.inst);
+                        false
+                    }
                 }
-                true
             });
         }
 
@@ -804,6 +909,76 @@ impl App {
         }
     }
 
+    /// WT.4 — splash: when the FEET cross a water surface with some
+    /// speed behind them, burst a ring of water-coloured particles at
+    /// the crossing point. Entry and exit both splash; a slow wade
+    /// doesn't. Review #5 gates: Walk mode only (fly ignores water —
+    /// a flythrough of z = 170 must not ring), and only where the
+    /// surface SHELL actually exists in this column (the physics
+    /// volume covers the whole band, but a carved crater or a sealed
+    /// pocket has no visible surface for a ring to sit on).
+    #[allow(clippy::cast_possible_truncation)]
+    fn tick_splash(&mut self) {
+        if self.body.mode() != MoveMode::Walk {
+            self.prev_feet_depth = 0.0;
+            return;
+        }
+        let feet = self.body.pos();
+        let depth = self
+            .scene
+            .water_depth_at(feet)
+            .map_or(0.0, |(_, d)| d.max(f64::EPSILON));
+        let was = std::mem::replace(&mut self.prev_feet_depth, depth);
+        if (was > 0.0) == (depth > 0.0) {
+            return; // no surface crossing this frame
+        }
+        let speed = self.body.vel().length();
+        if speed < 2.0 {
+            return; // gentle wade — no splash
+        }
+        let shell_here = self.scene.grid(self.grid_id).is_some_and(|g| {
+            (0..=1).any(|dz| {
+                g.voxel_color(IVec3::new(
+                    feet.x.floor() as i32,
+                    feet.y.floor() as i32,
+                    WATERLINE_Z + dz,
+                ))
+                .is_some_and(water_passes)
+            })
+        });
+        if !shell_here {
+            return; // dry-looking crater / sealed pocket
+        }
+        let Some(model) = self.debris_model else {
+            return;
+        };
+        // The crossing point sits on the waterline plane under the body.
+        let at = [feet.x as f32, feet.y as f32, WATERLINE_Z as f32];
+        let sites: Vec<([f32; 3], Rgb)> = (0..12)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let a = i as f32 / 12.0 * std::f32::consts::TAU;
+                (
+                    [at[0] + a.cos() * 0.5, at[1] + a.sin() * 0.5, at[2]],
+                    WATER_COLOR.rgb_part(),
+                )
+            })
+            .collect();
+        let kick = (speed as f32 * 0.4).min(6.0);
+        self.particles.voxel_debris(
+            &sites,
+            at,
+            (1.0 + 0.3 * kick)..(2.5 + kick),
+            &ParticleEmitterDef {
+                lifetime: 0.25..0.6,
+                drag: 1.2,
+                fade_out_frac: 0.6,
+                scale_end: Some(0.3),
+                ..ParticleEmitterDef::new(model)
+            },
+        );
+    }
+
     fn redraw(&mut self) {
         let Some(window) = self.window.as_ref() else {
             return;
@@ -824,7 +999,13 @@ impl App {
         self.step_bullets(dt);
         self.pump_carves();
         self.tick_crumble(dt);
-        self.audio_tick(dt);
+        self.tick_splash();
+        // WT.4 — the frame's ONE "eye under water" evaluation drives
+        // BOTH the tint and the listener lowpass (review: two call
+        // sites is how a future hysteresis gets applied to one and
+        // forgotten on the other — blue screen, dry sound).
+        let submerged = self.body.eye_in_water(&self.scene);
+        self.audio_tick(dt, submerged);
 
         let cam = self.camera();
         let settings = OpticastSettings::for_oracle_framebuffer(size.width, size.height);
@@ -837,6 +1018,12 @@ impl App {
         frame.fog_color = Rgb(self.engine.fog_color());
         frame.fog_max_scan_dist = self.engine.fog_max_scan_dist();
         frame.side_shades = self.engine.side_shades();
+        // WT.4 — the underwater grade: while the EYE is under a water
+        // surface the frame lerps toward deep blue-green (WT.2 tint;
+        // `None` above water keeps the identity-resolve fast path).
+        if submerged {
+            frame.tint = Some(UNDERWATER_TINT);
+        }
 
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -909,20 +1096,21 @@ impl ApplicationHandler for App {
             CRYSTAL_MATERIAL_ID,
             Material::alpha_blend(180).with_emissive(255),
         );
-        renderer.set_terrain_materials(&[
-            (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
-            (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
-        ]);
+        // WT.4 — water: thickness-aware translucency (Beer–Lambert).
+        renderer.define_material(WATER_MATERIAL_ID, Material::volumetric(WATER_ALPHA));
+        renderer.set_terrain_materials(&material_map());
         // DT.5 — per-material crumble: rock (material 0) breaks into
         // rounded Voronoi lumps, crystal into sharp plates. The same
         // colour map switches island models to material-mapped
         // registration, so a falling crystal shard keeps its
         // translucent+emissive material and glows on the way down.
+        // The SAME map as the renderer + audio (WT.4 review — three
+        // hand-written partial lists had already drifted: water was
+        // missing here, so shot-out shell pieces fell as opaque
+        // material-0 rock). Water has no pattern entry → an unsplit
+        // `Whole` island, translucent via the mapped model.
         self.debris.set_fracture_patterns(
-            &[
-                (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
-                (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
-            ],
+            &material_map(),
             &[
                 (0, FracturePattern::Chunks { cell: 6 }),
                 (CRYSTAL_MATERIAL_ID, FracturePattern::Shards { plates: 3 }),
@@ -998,6 +1186,33 @@ impl ApplicationHandler for App {
                             self.seed
                         );
                         self.regenerate();
+                    }
+                    // WT.4 — V toggles fly ⇄ walk: walking is how you
+                    // reach the swim state (a flying body ignores
+                    // water). Space = jump / swim up, Shift = swim
+                    // down while in the water.
+                    KeyCode::KeyV if pressed => {
+                        let mode = if self.body.mode() == MoveMode::Fly {
+                            MoveMode::Walk
+                        } else {
+                            MoveMode::Fly
+                        };
+                        self.body.set_mode(mode);
+                        // Per-mode proportions: the fly drone keeps
+                        // the probe cube; walking stands a human
+                        // frame up (camera at head height — the
+                        // ankle-cam visual-pass note). Growing into
+                        // a low ceiling overlaps solid for a frame;
+                        // the stuck-escape rule recovers it.
+                        let def = self.body.def_mut();
+                        if mode == MoveMode::Walk {
+                            def.height = WALK_HEIGHT;
+                            def.eye_height = WALK_EYE_HEIGHT;
+                        } else {
+                            def.height = 2.0 * PLAYER_RADIUS;
+                            def.eye_height = PLAYER_RADIUS;
+                        }
+                        eprintln!("cave-demo: movement = {mode:?} (V toggles; walk to swim)");
                     }
                     _ => {}
                 }
@@ -1080,6 +1295,10 @@ fn install_cave_chunk(scene: &mut Scene, grid_id: GridId, preset: Preset, seed: 
     // BEFORE the bake so the first bake already writes their pools.
     plant_crystals(grid, preset, seed);
 
+    // WT.4 — flood the lower cave: after the crystals, before the
+    // bake (see the fn doc for why the order is load-bearing).
+    flood_below_waterline(grid);
+
     // EV.4 — point-light bake: the dim voxlap lightmode-2 base plus a
     // glow pool around every crystal. The gloom is deliberate — the
     // cave now reads by crystal light.
@@ -1097,6 +1316,119 @@ fn install_cave_chunk(scene: &mut Scene, grid_id: GridId, preset: Preset, seed: 
     // Final version bump so the renderer re-uploads the baked brightness
     // + fresh mips.
     grid.bump_chunk_version(IVec3::ZERO);
+}
+
+/// WT.4 — the CC.4 colour veto for the water surface shell: the
+/// walking body passes THROUGH it to swim (the physics water is the
+/// [`roxlap_scene::WaterVolume`]; the shell is visuals). The veto is
+/// exact here — the shell is ≤2 voxels thick, within the format's
+/// colour-keyed passthrough limit (thicker grows a colourless
+/// `UnexposedSolid` core no veto can classify).
+fn water_passes(c: VoxColor) -> bool {
+    c.rgb_part() == WATER_COLOR.rgb_part()
+}
+
+/// AU2 discipline (WT.4 review) — THE colour→material map, declared
+/// once and consumed by all three systems: the renderer
+/// (`set_terrain_materials` — translucency/emissive), the fracture
+/// tables (`set_fracture_patterns` — a mapped island model keeps its
+/// material, so a shot-out shell piece stays water-translucent
+/// instead of falling as an opaque rock), and the audio config
+/// (absorption classification). Hand-writing three partial lists is
+/// how they drift — this diff's own review caught water missing from
+/// the fracture map. Audio note: crystals classifying as material 1
+/// with no absorption entry is a no-op — an unmapped material id
+/// absorbs at the default 1.0, same as before.
+fn material_map() -> [(Rgb, u8); 3] {
+    [
+        (CRYSTAL_COLOR_BLUE.rgb_part(), CRYSTAL_MATERIAL_ID),
+        (CRYSTAL_COLOR_MAG.rgb_part(), CRYSTAL_MATERIAL_ID),
+        (WATER_COLOR.rgb_part(), WATER_MATERIAL_ID),
+    ]
+}
+
+/// WT.4 — flood the lower cave. TWO representations, split on
+/// purpose (PORTING-WATER.md decision 1):
+///
+/// - **Physics**: ONE [`roxlap_scene::WaterVolume`] covering the whole
+///   band below [`WATERLINE_Z`] — every air pocket down there swims,
+///   tints and muffles. Rock inside the box is unreachable for a
+///   collided body, so the conservative AABB is exact in practice.
+/// - **Visuals**: a 2-voxel [`WATER_COLOR`] SHELL where air crosses
+///   the waterline — the visible surface plane, volumetric so a
+///   grazing look goes opaque while looking straight down stays
+///   clear enough to spot the submerged crystals. The shell is
+///   deliberately NOT a solid fill: refilling whole cavities merges
+///   the water into the rock slabs and the RLE format then DROPS the
+///   colours of every submerged surface (interiors are colourless by
+///   design — the crystal test caught black submerged crystals).
+///   Below the shell the cave stays air-with-water-physics; the
+///   underwater look is the WT.2 tint, not murky geometry.
+///
+/// Order is load-bearing (see the call site): AFTER the crystals —
+/// the planter marches through air and must not grow crystals ON the
+/// shell — and BEFORE the bake, so shell voxels get their brightness
+/// like any surface.
+///
+/// Known v1 seams (PORTING-WATER.md hazard 4): the volume is static —
+/// a crater carved below the waterline still swims; a cavity sealed
+/// entirely below the shell has no visible surface plane (it reads as
+/// a dark air pocket that swims).
+fn flood_below_waterline(grid: &mut Grid) {
+    grid.water_volumes.clear();
+    #[allow(clippy::cast_possible_wrap)]
+    let side = VSID as i32;
+    grid.add_water_volume(
+        IVec3::new(0, 0, WATERLINE_Z),
+        IVec3::new(side - 1, side - 1, MAXZDIM - 1),
+    );
+
+    // Pass 1 (read-only): the shell cells. The rule keeps every water
+    // voxel in the COLOURED zone of whatever span it lands in
+    // (WT.4 review #1): the top layer fills wherever it is air — even
+    // sitting directly on rock it becomes the merged span's TOP cell,
+    // which the format always colours. The second layer fills ONLY
+    // over more air: a second cell touching a floor immediately below
+    // would merge into the rock span as a colourless interior cell —
+    // an invisible UnexposedSolid no colour veto (body OR bullet) can
+    // classify. Shallow shores therefore get a 1-voxel sheet with a
+    // 1-voxel air slice above the floor, which swims and shoots
+    // through exactly like the deep parts.
+    //
+    // Spans are collected y-outer/x-inner, ascending — the
+    // `set_spans` sort contract — and applied with ONE ScumCtx: the
+    // per-call `set_rect` variant built and dropped a ~400 KB context
+    // per column (review perf note).
+    let mut spans: Vec<Vspan> = Vec::new();
+    if let Some(chunk) = grid.chunk(IVec3::ZERO) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        for y in 0..side {
+            for x in 0..side {
+                let air = |z: i32| {
+                    matches!(
+                        getcube(&chunk.data, &chunk.column_offset, chunk.vsid, x, y, z),
+                        Cube::Air
+                    )
+                };
+                if !air(WATERLINE_Z) {
+                    continue;
+                }
+                let deep = air(WATERLINE_Z + 1) && air(WATERLINE_Z + 2);
+                spans.push(Vspan {
+                    x: x as u32,
+                    y: y as u32,
+                    z0: WATERLINE_Z as u8,
+                    z1: (WATERLINE_Z + i32::from(deep)) as u8,
+                });
+            }
+        }
+    }
+    // Pass 2: fill the shell in one batched edit.
+    if let Some(chunk) = grid.chunk_mut(IVec3::ZERO) {
+        roxlap_formats::edit::set_spans(chunk, &spans, Some(WATER_COLOR));
+    }
+    // (No per-edit version bump needed: install_cave_chunk bakes and
+    // bumps after this, covering the upload.)
 }
 
 /// EV.4 — plant [`CRYSTAL_COUNT`] glowing crystal clusters on cavity
@@ -1553,6 +1885,81 @@ mod tests {
         );
         // The chunk is the single-chunk lateral size.
         assert_eq!(chunk.vsid, VSID);
+    }
+
+    /// WT.4 — the built cave is flooded: one WaterVolume covers the
+    /// band below the waterline (the physics — a point down there
+    /// reads wet), a water SHELL marks the visible surface where air
+    /// crosses the line, the shell is passable under the body's veto,
+    /// and — the regression the solid-fill design failed on —
+    /// submerged surfaces KEEP their colours (interiors go colourless
+    /// when solids merge; the shell never touches them).
+    #[test]
+    fn cave_floods_below_the_waterline() {
+        let (scene, grid_id) = build_cave_scene(Preset::Blue, 1234);
+        let grid = scene.grid(grid_id).expect("grid");
+        assert_eq!(grid.water_volumes.len(), 1, "one flooded slab");
+
+        // Find a shell cell (air crossed the waterline somewhere) and
+        // check all three facts at it: colour, passability, wet physics.
+        let mut checked = false;
+        for x in 0..VSID as i32 {
+            for y in 0..VSID as i32 {
+                let p = IVec3::new(x, y, WATERLINE_Z);
+                let is_water = grid.voxel_color(p).map(roxlap_scene::VoxColor::rgb_part)
+                    == Some(WATER_COLOR.rgb_part());
+                if !is_water {
+                    continue;
+                }
+                assert!(
+                    grid.voxel_color(p).is_some_and(water_passes),
+                    "shell must satisfy the body veto"
+                );
+                let centre = glam::DVec3::new(
+                    f64::from(x) + 0.5,
+                    f64::from(y) + 0.5,
+                    f64::from(WATERLINE_Z) + 0.5,
+                );
+                assert!(
+                    scene.water_depth_at(centre).is_some_and(|(_, d)| d > 0.0),
+                    "shell cell must read wet"
+                );
+                checked = true;
+                break;
+            }
+            if checked {
+                break;
+            }
+        }
+        assert!(checked, "no water shell found at the waterline");
+
+        // Physics water is the whole band: an AIR pocket well below
+        // the shell still reads wet (dive space), while the spawn —
+        // above the line — is dry.
+        let mut deep_air_checked = false;
+        'deep: for x in (8..120).step_by(4) {
+            for y in (8..120).step_by(4) {
+                for z in (WATERLINE_Z + 8)..(MAXZDIM - 8) {
+                    let p = IVec3::new(x, y, z);
+                    if !grid.voxel_solid(p) {
+                        let centre = p.as_dvec3() + glam::DVec3::splat(0.5);
+                        assert!(
+                            scene.water_depth_at(centre).is_some_and(|(_, d)| d > 0.0),
+                            "air pocket below the waterline must swim"
+                        );
+                        deep_air_checked = true;
+                        break 'deep;
+                    }
+                }
+            }
+        }
+        assert!(deep_air_checked, "no cavity below the waterline");
+        assert!(
+            scene
+                .water_depth_at(spawn_centre().as_dvec3() + glam::DVec3::splat(0.5))
+                .is_none(),
+            "spawn must be above the waterline"
+        );
     }
 
     /// EV.4 — crystals are planted with their bake lights: every light
