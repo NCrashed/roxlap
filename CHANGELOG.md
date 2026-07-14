@@ -56,6 +56,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolve) but not on GPU (drawn after). `FrameParams` grew a pub
   field — hosts constructing it via `FrameParams::new` (the
   documented way) are unaffected.
+- **Underwater listener muffle** (WT.3):
+  `AudioOut::set_listener_lowpass(cutoff_hz)` — a listener-side
+  lowpass over the whole mix (every voice and the reverb tail), for
+  the submerged ear. Default no-op. The kira backend implements it as
+  one filter on the master track — **opt-in** via the new
+  `KiraAudio::with_options(pool, listener_lowpass)` (a master biquad
+  is not an identity even fully open; waterless hosts keep the exact
+  old master path). Fast ~120 ms tween, target-deduped (per-frame
+  calls with an unchanged value don't restart the tween), non-finite
+  cutoffs rejected (one NaN would silence the mix permanently).
+  Drive it per frame from `CharacterBody::eye_in_water` —
+  deliberately NOT part of `ListenerAcoustics` (the reverb
+  environment's ~2 Hz cadence would lag a head-dip by up to a
+  second). New constants: `OPEN_CUTOFF_HZ` (the ONE definition of
+  "fully open" shared by the config default, the per-source filters
+  and `LISTENER_LOWPASS_OPEN_HZ`), `LISTENER_LOWPASS_SUBMERGED_HZ`
+  (700 Hz, the canonical underwater value), and `DEFAULT_POOL` went
+  public.
 
 - **wasm GPU depth-picking** (PW.1): `SceneRenderer::pick_depth` /
   `pick` now work on the browser GPU path with **one-frame latency**

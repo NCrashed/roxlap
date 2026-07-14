@@ -32,12 +32,15 @@ pub mod synth;
 #[cfg(feature = "kira")]
 mod kira_out;
 
-pub use backend::{AudioOut, SoundKey, SourceId, SourcePool};
+pub use backend::{
+    AudioOut, SoundKey, SourceId, SourcePool, LISTENER_LOWPASS_OPEN_HZ,
+    LISTENER_LOWPASS_SUBMERGED_HZ,
+};
 pub use cavity::{probe_cavity, CavityConfig, CavityEstimator, CavityProbe, ListenerAcoustics};
 pub use synth::SoundBuffer;
 
 #[cfg(feature = "kira")]
-pub use kira_out::KiraAudio;
+pub use kira_out::{KiraAudio, DEFAULT_POOL};
 
 /// Tuning knobs for [`source_acoustics`]. The defaults are the cave-demo
 /// tuning; every field is plain data so hosts can persist or lerp them.
@@ -97,13 +100,21 @@ pub struct AcousticsConfig {
     pub absorption: Vec<(u8, f32)>,
 }
 
+/// The ONE definition of a fully-open (no muffle) lowpass cutoff,
+/// shared by every path that needs "not occluded / not submerged":
+/// [`AcousticsConfig::default`]'s `open_cutoff_hz`, the listener
+/// lowpass ([`LISTENER_LOWPASS_OPEN_HZ`] is this constant), and the
+/// kira backend's per-source filter rest position. One constant so
+/// the three can't drift apart silently.
+pub const OPEN_CUTOFF_HZ: f32 = 20_000.0;
+
 impl Default for AcousticsConfig {
     fn default() -> Self {
         Self {
             rays: 9,
             jitter_radius: 1.5,
             absorption_per_voxel: 0.25,
-            open_cutoff_hz: 20_000.0,
+            open_cutoff_hz: OPEN_CUTOFF_HZ,
             occluded_cutoff_hz: 800.0,
             max_occlusion_db: -24.0,
             send_occlusion_frac: 0.5,

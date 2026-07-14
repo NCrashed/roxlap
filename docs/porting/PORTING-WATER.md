@@ -178,7 +178,55 @@ file:line facts, not guesses).
      strength are frame constants) instead of per-pixel arithmetic.
   Known seam (documented on `Tint`): CPU overlays rasterise before
   the resolve (graded), GPU overlays draw after it (full-brightness).
-- WT.3 — underwater audio: NOT STARTED
+- WT.3 — LANDED 2026-07-14: the underwater listener muffle.
+  **Deliberate deviation from decision 3**: NOT a `ListenerAcoustics`
+  field but a trait method — `AudioOut::set_listener_lowpass(cutoff_hz)`
+  (default no-op, the `set_source_pitch` precedent). Rationale: the
+  reverb environment rides a ~2 Hz probe cadence with ~1 s tweens; a
+  muffle wired through it would lag a head-dip by up to a second. The
+  dunk is a FRAME-rate signal (`CharacterBody::eye_in_water`) —
+  hosts call the method per frame.
+  - `LISTENER_LOWPASS_OPEN_HZ` (20 kHz) = "not submerged"; pinned
+    equal to `AcousticsConfig::default().open_cutoff_hz` — one
+    definition of "open" across the per-source and listener paths.
+  - kira: one `FilterBuilder` on `AudioManagerSettings`'s
+    `main_track_builder` — the MASTER path, so every spatial voice
+    AND the reverb send dull together; FAST (~120 ms) tween (a dip
+    is an event, a slow ramp smears it); cutoff floored at 40 Hz.
+  - Tests: default-no-op inheritance via the mock + the open-constant
+    coherence pin; audio 31 tests both feature variants; kira-on-wasm
+    clippy green (the cave-web audio stack invocation). Demo wiring
+    (eye_in_water → cutoff + the water material's absorption entry)
+    lands with WT.4; listening pass owed there.
+  **Review round (user, 2026-07-14) — 6 findings closed:**
+  1. NaN passed THROUGH the clamp (`f32::clamp` keeps NaN) and one
+     NaN cutoff NaN-poisons the SVF integrators — the whole mix goes
+     silent PERMANENTLY (no later valid call recovers). Non-finite
+     input now rejected before the clamp ("hold the current muffle").
+  2. Per-frame drive RESTARTED the 120 ms tween every frame (kira
+     `Parameter::set` semantics) — the dunk smeared to ~3×, exactly
+     the lag the per-frame method exists to avoid. The backend now
+     stores the last clamped target and only a CHANGED value tweens.
+  3. The master biquad was unconditional — every KiraAudio host
+     (waterless games, wasm) paid attenuation + phase shift near the
+     top octave + per-sample DSP with no opt-out. Now OPT-IN:
+     `KiraAudio::with_options(pool, listener_lowpass)` (the filter
+     can only be built at construction in kira); `new`/
+     `with_capacity` keep the exact pre-WT.3 master path and inherit
+     the trait no-op. `DEFAULT_POOL` went pub so opting in doesn't
+     restate the magic pool size.
+  4. THREE unsynced "open = 20 kHz" definitions (constant, config
+     default, per-source builder literal) → ONE `crate::OPEN_CUTOFF_HZ`;
+     `LISTENER_LOWPASS_OPEN_HZ` is defined AS it and the pin test
+     died (coherence by construction).
+  5. The magic 40.0 floor became `LISTENER_LOWPASS_FLOOR_HZ` beside
+     the file's other named knobs, doc'd with the NaN story.
+  6. The no-op test now asserts the MOCK'S STATE is untouched
+     (voices, applies, stops, registrations) — not merely that two
+     calls don't panic; it feeds NaN too. Plus
+     `LISTENER_LOWPASS_SUBMERGED_HZ` (700 Hz) — the one named
+     submerged default WT.4/WT.5 call sites share, so the listening
+     pass retunes one line, not N demos.
 - WT.4 — cave-demo flood (native): NOT STARTED
 - WT.5 — web parity + docs + close: NOT STARTED
 

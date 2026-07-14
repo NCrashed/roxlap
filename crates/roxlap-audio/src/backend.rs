@@ -82,7 +82,43 @@ pub trait AudioOut {
     fn set_source_pitch(&mut self, id: SourceId, factor: f32) {
         let _ = (id, factor);
     }
+
+    /// WT.3 — a LISTENER-side lowpass over the whole mix (the master
+    /// path): the underwater muffle. A cutoff at or above
+    /// [`LISTENER_LOWPASS_OPEN_HZ`] is neutral; a few hundred Hz is
+    /// the canonical submerged value. Unlike the per-source occlusion
+    /// lowpass this dulls EVERYTHING — every voice and the reverb
+    /// tail alike.
+    ///
+    /// Drive it per frame from the submersion signal
+    /// (`CharacterBody::eye_in_water` in roxlap-scene): the dunk must
+    /// track the camera crossing the surface at FRAME rate, which is
+    /// why this is its own method and not a [`ListenerAcoustics`]
+    /// field — the reverb environment rides a ~2 Hz probe cadence
+    /// with ~1 s tweens, and a muffle quantized to that would lag a
+    /// head-dip by up to a second. Implementations tween fast
+    /// (~120 ms). Default: no-op (a backend without a master filter
+    /// simply stays clear — the [`set_source_pitch`](Self::set_source_pitch)
+    /// contract).
+    fn set_listener_lowpass(&mut self, cutoff_hz: f32) {
+        let _ = cutoff_hz;
+    }
 }
+
+/// WT.3 — the neutral (fully open) listener-lowpass cutoff: passing
+/// this (or anything above) to [`AudioOut::set_listener_lowpass`]
+/// means "not submerged". Defined AS [`crate::OPEN_CUTOFF_HZ`] —
+/// "open" means the same thing on the per-source and listener paths
+/// by construction, not by a pin test.
+pub const LISTENER_LOWPASS_OPEN_HZ: f32 = crate::OPEN_CUTOFF_HZ;
+
+/// WT.3 — the canonical SUBMERGED listener-lowpass cutoff: the value
+/// the demos (and any host without its own tuning) pass while the
+/// eye is under water. One named default so every call site muffles
+/// identically and a listening-pass retune is a one-line change.
+/// Tuned dark enough to read as "under the surface" while speech-band
+/// content stays intelligible.
+pub const LISTENER_LOWPASS_SUBMERGED_HZ: f32 = 700.0;
 
 /// How a pooled slot is currently used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,5 +347,31 @@ mod tests {
 
         assert_eq!(out.stopped, vec![a]);
         assert_eq!(out.applied, vec![a, b], "stale apply on `a` was dropped");
+    }
+
+    /// WT.3 — the listener-lowpass default is a REAL no-op: a backend
+    /// that never implements it (the mock) inherits a method that
+    /// leaves every bit of its state untouched — not merely "doesn't
+    /// panic". ("Open == per-source open" needs no pin anymore:
+    /// [`LISTENER_LOWPASS_OPEN_HZ`] is DEFINED as
+    /// [`crate::OPEN_CUTOFF_HZ`], the same constant the config
+    /// default uses.)
+    #[test]
+    fn listener_lowpass_default_is_a_no_op() {
+        let mut out = MockOut::default();
+        let s = out.register(&SoundBuffer {
+            samples: vec![0.0],
+            sample_rate: 44_100,
+        });
+        let id = out.play(s, glam::DVec3::ZERO, None).expect("voice");
+        out.set_listener_lowpass(400.0);
+        out.set_listener_lowpass(f32::NAN);
+        out.set_listener_lowpass(super::LISTENER_LOWPASS_OPEN_HZ);
+        // Nothing observable moved: no stops, no applies, the pool
+        // still owns the voice, no extra sounds registered.
+        assert!(out.stopped.is_empty());
+        assert!(out.applied.is_empty());
+        assert_eq!(out.sounds, 1);
+        assert!(out.pool.as_ref().is_some_and(|p| p.slot_of(id).is_some()));
     }
 }

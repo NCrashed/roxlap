@@ -43,9 +43,18 @@ const ENV_TWEEN_MS: u64 = 1000;
 /// Very short fade when a playing voice is stolen, so the cut doesn't
 /// click.
 const STEAL_TWEEN_MS: u64 = 15;
-/// Default spatial-track pool size. Sources beyond this steal the
-/// oldest finished/one-shot slot.
-const DEFAULT_POOL: usize = 24;
+/// Default spatial-track pool size ([`KiraAudio::new`]). Sources
+/// beyond this steal the oldest finished/one-shot slot. Public so a
+/// host opting into [`KiraAudio::with_options`] extras can keep the
+/// default pool without restating a magic number.
+pub const DEFAULT_POOL: usize = 24;
+/// WT.3 — the listener-lowpass cutoff floor: keeps a legal (finite)
+/// but absurd host value from pushing the master filter into the
+/// subsonic. NaN/±inf are rejected before the clamp — `f32::clamp`
+/// passes NaN through, and one NaN cutoff makes the SVF integrators
+/// NaN which silences the whole mix PERMANENTLY (every later sample
+/// is NaN; no later valid call recovers it).
+const LISTENER_LOWPASS_FLOOR_HZ: f32 = 40.0;
 
 fn tween(ms: u64) -> Tween {
     Tween {
@@ -98,6 +107,22 @@ pub struct KiraAudio {
     listener: kira::listener::ListenerHandle,
     send_id: kira::track::SendTrackId,
     reverb: ReverbHandle,
+    /// WT.3 — the listener lowpass on the MAIN track: dulls the whole
+    /// mix (every voice AND the reverb tail — both route through the
+    /// master) when the listener submerges. OPT-IN
+    /// ([`Self::with_options`]) — a biquad on the master is not an
+    /// identity even "fully open" (attenuation + phase shift near the
+    /// cutoff, DSP work per sample), so waterless hosts must not pay
+    /// for it; `None` makes [`AudioOut::set_listener_lowpass`] a
+    /// no-op (the trait's documented fallback).
+    listener_filter: Option<FilterHandle>,
+    /// WT.3 — the last cutoff actually sent to the filter. Guards the
+    /// per-frame drive pattern: re-sending an unchanged target every
+    /// frame would RESTART the 120 ms tween each time (kira's
+    /// `Parameter::set` semantics), stretching the dunk into an
+    /// asymptotic ~3× smear — exactly the lag the per-frame method
+    /// exists to avoid.
+    listener_cutoff: f32,
     tracks: Vec<PoolTrack>,
     pool: SourcePool,
     sounds: Vec<StaticSoundData>,
@@ -120,7 +145,34 @@ impl KiraAudio {
     /// # Errors
     /// As [`KiraAudio::new`].
     pub fn with_capacity(pool: usize) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())?;
+        Self::with_options(pool, false)
+    }
+
+    /// [`KiraAudio::with_capacity`] plus the WT.3 **listener lowpass**
+    /// opt-in. With `listener_lowpass = true` one filter is built into
+    /// the MAIN track (it can only be added at construction in kira),
+    /// so [`AudioOut::set_listener_lowpass`] dulls everything
+    /// downstream — the spatial voice pool AND the reverb send both
+    /// mix into the master. Opt-in because a master biquad is not an
+    /// identity even fully open (attenuation + phase shift near the
+    /// cutoff, per-sample DSP): hosts without water keep the exact
+    /// pre-WT.3 master path and inherit the trait's no-op.
+    ///
+    /// # Errors
+    /// As [`KiraAudio::new`].
+    pub fn with_options(
+        pool: usize,
+        listener_lowpass: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut settings = AudioManagerSettings::<DefaultBackend>::default();
+        let listener_filter = listener_lowpass.then(|| {
+            settings.main_track_builder.add_effect(
+                FilterBuilder::new()
+                    .mode(FilterMode::LowPass)
+                    .cutoff(f64::from(crate::LISTENER_LOWPASS_OPEN_HZ)),
+            )
+        });
+        let mut manager = AudioManager::<DefaultBackend>::new(settings)?;
         let listener = manager.add_listener(
             mint_pos(DVec3::ZERO),
             mint::Quaternion::from([0.0, 0.0, 0.0, 1.0]),
@@ -160,7 +212,7 @@ impl KiraAudio {
             let filter = builder.add_effect(
                 FilterBuilder::new()
                     .mode(FilterMode::LowPass)
-                    .cutoff(20_000.0),
+                    .cutoff(f64::from(crate::OPEN_CUTOFF_HZ)),
             );
             let track = manager.add_spatial_sub_track(&listener, mint_pos(DVec3::ZERO), builder)?;
             tracks.push(PoolTrack {
@@ -177,6 +229,8 @@ impl KiraAudio {
             listener,
             send_id,
             reverb,
+            listener_filter,
+            listener_cutoff: crate::LISTENER_LOWPASS_OPEN_HZ,
             tracks,
             pool: SourcePool::new(pool_len),
             sounds: Vec::new(),
@@ -316,6 +370,32 @@ impl AudioOut for KiraAudio {
         if let Some(sound) = self.tracks[idx].sound.as_mut() {
             sound.set_playback_rate(f64::from(factor), tween(FAST_TWEEN_MS));
         }
+    }
+
+    fn set_listener_lowpass(&mut self, cutoff_hz: f32) {
+        // NaN/±inf would pass THROUGH clamp (f32::clamp keeps NaN) and
+        // a single NaN cutoff silences the whole mix permanently (see
+        // LISTENER_LOWPASS_FLOOR_HZ). Reject, don't repair — garbage
+        // in means "hold the current muffle".
+        if !cutoff_hz.is_finite() {
+            return;
+        }
+        let Some(filter) = self.listener_filter.as_mut() else {
+            return; // built without the master filter — the trait no-op
+        };
+        let cutoff = cutoff_hz.clamp(LISTENER_LOWPASS_FLOOR_HZ, crate::LISTENER_LOWPASS_OPEN_HZ);
+        // Per-frame drive dedup: re-sending an unchanged target
+        // RESTARTS the 120 ms tween every frame (~14% of the remaining
+        // gap per frame at 60 fps ⇒ the dunk smears to ~3×). Only a
+        // CHANGED target starts a tween. Exact f32 compare on purpose:
+        // both sides went through the same clamp.
+        if cutoff == self.listener_cutoff {
+            return;
+        }
+        self.listener_cutoff = cutoff;
+        // The FAST tween on purpose: a head-dip is an event, and a
+        // slow ramp smears it.
+        filter.set_cutoff(f64::from(cutoff), tween(FAST_TWEEN_MS));
     }
 
     fn apply_listener(&mut self, acoustics: &ListenerAcoustics) {
