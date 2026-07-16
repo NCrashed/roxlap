@@ -45,6 +45,42 @@ This is the **entry doc** for the cutaway-rendering stage — tag **CA**.
 Hazard 4 (occupancy not clip-aware — wasted steps through hidden
 decks) accepted for v1, not measured as a blocker in CA.5.
 
+### Post-landing review fixes (user code review, same day)
+
+1. `sprite_terrain_shadow.wgsl` (the spliced sprite-receives-terrain
+   shadow marcher) gained the same clip gate — sprites on an exposed
+   deck are no longer shadowed by the cut-away hull on the GPU.
+2. Far-tier billboards: `BillboardCache::build` renders with the
+   grid's clip, records `built_z_clip`; the Far dispatch rebuilds on
+   mismatch (self-heals direct `z_clip` writes) and `set_grid_z_clip`
+   drops the cache eagerly. Test pins clipped/unclipped snapshots.
+3. GPU sprite footprint now comes from the HOST scene's materialised
+   chunks (`GridWorldTransform.cutaway_footprint`, fed from
+   `Grid::cutaway_volume`) — not the GPU-resident slot AABB, which is
+   a moving subset on streaming grids (backend disagreement).
+4. The per-grid camera clip lane is a REAL `i32` (both WGSL mirrors)
+   — the old f32 bit-carrier made every clip in `1..=0x7fffff` a
+   subnormal, which WGSL permits drivers to flush to zero on load
+   (silent value-dependent GPU-only "clip off").
+5. Decks demo: flood water placed before the crates so the bilge
+   crate survives as a submerged solid.
+6. Decks demo: `saved_mip_scan` is an `Option` — `0.0` (LOD off) is a
+   legal value to restore on exit.
+7. CHANGELOG names the full literal-breaking surface (`DdaEnv.z_clip`,
+   `GridWorldTransform.z_clip`/`.cutaway_footprint`,
+   `BillboardCache.built_z_clip`).
+8. CPU sprite pass hoists `Grid::cutaway_volume` once per frame (no
+   chunk-map walk / rotation inverse per sprite); `CutawayVolume` is
+   public for host-side culls.
+9. `CullKey` is `Copy` again — the clip set folds to an FNV-1a `u64`
+   fingerprint instead of a per-frame `Vec`.
+10. `opticast_settings_fov` deleted in favour of the existing
+    `OpticastSettings::with_fov_y`.
+
+NOT separately gated: the GPU sprite-shadow clip (fix 1) has no
+headless test — the sprite-shadow splice needs a 22-storage-buffer
+device; covered by the Decks visual pass instead.
+
 ## Goal
 
 Per-grid horizontal clip plane for isometric "deck view" rendering (SS13 /

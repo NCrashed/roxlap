@@ -173,6 +173,48 @@ fn grid_voxel_aabb_f64(grid: &Grid) -> Option<(DVec3, DVec3)> {
     Some((v(min, 0), v(max, 1)))
 }
 
+/// CA.4 — a grid's cutaway volume, precomputed for the **footprint
+/// rule**: the grid's world→local transform + its materialised XY
+/// chunk footprint + the clip plane, hoisted out of the per-point test
+/// so one frame can test many points (sprites, particles, lights)
+/// cheaply. Build via [`Grid::cutaway_volume`]; the one-shot
+/// convenience is [`Grid::cutaway_hides_point`]. Both renderers hide
+/// sprite instances by exactly this volume, so host-side culls (the
+/// deck-light pattern) stay in perfect agreement with the render.
+#[derive(Clone, Copy, Debug)]
+pub struct CutawayVolume {
+    origin: DVec3,
+    rot_inv: DQuat,
+    inv_vws: f64,
+    xy_lo: [f64; 2],
+    xy_hi: [f64; 2],
+    z_clip: f64,
+}
+
+impl CutawayVolume {
+    /// Whether the footprint rule hides the world-space point: mapped
+    /// into the grid's local voxel frame, it lands inside the XY
+    /// footprint with `z < z_clip` (z-down).
+    #[must_use]
+    pub fn hides_point(&self, world: DVec3) -> bool {
+        let local = (self.rot_inv * (world - self.origin)) * self.inv_vws;
+        local.x >= self.xy_lo[0]
+            && local.x < self.xy_hi[0]
+            && local.y >= self.xy_lo[1]
+            && local.y < self.xy_hi[1]
+            && local.z < self.z_clip
+    }
+
+    /// The materialised XY chunk footprint `[lo, hi)` in grid-local
+    /// voxel coords — what the GPU facade forwards to the sprite cull
+    /// so both backends test the SAME footprint (the scene's
+    /// materialised chunks, not the GPU-resident subset).
+    #[must_use]
+    pub fn footprint_xy(&self) -> ([f64; 2], [f64; 2]) {
+        (self.xy_lo, self.xy_hi)
+    }
+}
+
 /// Voxel DDA (Amanatides-Woo) in a grid's local space. `lo` / `ld` are
 /// the ray origin + unit direction already transformed into grid-local
 /// coords. Returns the first [`Grid::voxel_solid`] cell and its world-
@@ -675,6 +717,26 @@ impl Grid {
         mip
     }
 
+    /// CA.4 — this grid's precomputed [`CutawayVolume`], or `None`
+    /// when no [`Self::z_clip`] is set or the grid is empty. The
+    /// hoisted form of [`Self::cutaway_hides_point`]: build once per
+    /// frame, then test many points (sprites, particles, lights)
+    /// without re-walking the chunk map or re-inverting the rotation
+    /// per point. Both renderers' sprite passes use exactly this.
+    #[must_use]
+    pub fn cutaway_volume(&self) -> Option<CutawayVolume> {
+        let zc = self.z_clip?;
+        let (blo, bhi) = grid_voxel_aabb_f64(self)?;
+        Some(CutawayVolume {
+            origin: self.transform.origin,
+            rot_inv: self.transform.rotation.inverse(),
+            inv_vws: 1.0 / self.transform.voxel_world_size,
+            xy_lo: [blo.x, blo.y],
+            xy_hi: [bhi.x, bhi.y],
+            z_clip: f64::from(zc),
+        })
+    }
+
     /// CA.4 — the cutaway **footprint rule** for world-positioned
     /// objects (sprite instances, actors, particles): `true` iff this
     /// grid's [`Self::z_clip`] hides the world-space point — the
@@ -684,23 +746,11 @@ impl Grid {
     /// (clipping the ship's upper decks must not hide a character
     /// standing on the ground beside the ship, even when they share a
     /// world height). `false` when no clip is set or the grid is
-    /// empty. Both renderers hide sprite instances by this rule, so
-    /// hosts can reuse it for their own overlays/effects.
+    /// empty. Testing many points per frame? Hoist the volume once via
+    /// [`Self::cutaway_volume`].
     #[must_use]
     pub fn cutaway_hides_point(&self, world: DVec3) -> bool {
-        let Some(zc) = self.z_clip else {
-            return false;
-        };
-        let Some((blo, bhi)) = grid_voxel_aabb_f64(self) else {
-            return false;
-        };
-        let local = (self.transform.rotation.inverse() * (world - self.transform.origin))
-            / self.transform.voxel_world_size;
-        local.x >= blo.x
-            && local.x < bhi.x
-            && local.y >= blo.y
-            && local.y < bhi.y
-            && local.z < f64::from(zc)
+        self.cutaway_volume().is_some_and(|v| v.hides_point(world))
     }
 
     /// Current per-chunk edit version (S7.2). Returns `0` for any
@@ -1022,6 +1072,14 @@ impl Scene {
     pub fn set_grid_z_clip(&mut self, id: GridId, z_clip: Option<i32>) -> bool {
         match self.grids.get_mut(&id) {
             Some(g) => {
+                // CA — Far-tier impostors bake the clip into their
+                // snapshots; drop a cache built under a different one
+                // (the Far dispatch also self-heals via
+                // `BillboardCache::built_z_clip` for direct field
+                // writes — this just frees the memory sooner).
+                if g.z_clip != z_clip {
+                    g.billboards = None;
+                }
                 g.z_clip = z_clip;
                 true
             }

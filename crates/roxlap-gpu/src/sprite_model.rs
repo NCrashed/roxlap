@@ -815,7 +815,7 @@ impl SpriteCutawayClip {
         dot3(self.inv_rows[2], rel) * self.inv_vws < self.z_clip
     }
 
-    /// Bitwise fingerprint for the [`CullKey`] frame cache.
+    /// Bitwise field dump feeding the [`CullKey`] clip fingerprint.
     fn key_bits(&self) -> [u32; 18] {
         let b = |v: f32| v.to_bits();
         [
@@ -841,19 +841,38 @@ impl SpriteCutawayClip {
     }
 }
 
+/// CA.4 — FNV-1a fold of the frame's clip volumes for the [`CullKey`]:
+/// keeps the key `Copy` and allocation-free on the PF.10 skip path (a
+/// per-frame `Vec` of bit dumps would allocate just to compare-and-die
+/// on the very path whose purpose is skipping work). Seeded per-clip
+/// with the count so `[]` vs `[identity-ish]` can't alias trivially; a
+/// 64-bit collision mis-SKIPS one cull for one frame at worst.
+fn clips_fingerprint(clips: &[SpriteCutawayClip]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET ^ clips.len() as u64;
+    for c in clips {
+        for w in c.key_bits() {
+            h = (h ^ u64::from(w)).wrapping_mul(FNV_PRIME);
+        }
+    }
+    h
+}
+
 /// PF.10 — everything `cull_bin_upload`'s result depends on besides the
 /// registry contents (float fields compared bitwise). Paired with the
 /// "registry changed" invalidation (`last_cull = None` in every mutating
 /// method): when the key matches the previous frame's, the cull, the
 /// binning, and all four buffer uploads are skipped — the buffers already
 /// hold exactly this frame's data. CA.4 adds the cutaway-clip volumes
-/// (bitwise) — moving a clip plane changes the visible set, so it must
-/// invalidate the cache like a camera move.
-#[derive(Clone, PartialEq)]
+/// (as an FNV-1a fingerprint — see [`clips_fingerprint`]) — moving a
+/// clip plane changes the visible set, so it must invalidate the cache
+/// like a camera move.
+#[derive(Clone, Copy, PartialEq)]
 struct CullKey {
     frustum: [u32; 15],
     screen: [u32; 4],
-    clips: Vec<[u32; 18]>,
+    clips_fp: u64,
 }
 
 impl CullKey {
@@ -885,7 +904,7 @@ impl CullKey {
                 b(f.far),
             ],
             screen: [screen_w, screen_h, tile_size, lod_px.to_bits()],
-            clips: clips.iter().map(SpriteCutawayClip::key_bits).collect(),
+            clips_fp: clips_fingerprint(clips),
         }
     }
 }
@@ -1966,9 +1985,9 @@ impl SpriteRegistryResident {
         // state, same view, same screen): the four buffers already hold
         // exactly this frame's data — skip the whole cull/bin/upload.
         let key = CullKey::new(f, screen_w, screen_h, tile_size, lod_px, clips);
-        if let Some((k, res)) = &self.last_cull {
-            if *k == key {
-                return *res;
+        if let Some((k, res)) = self.last_cull {
+            if k == key {
+                return res;
             }
         }
 

@@ -146,6 +146,13 @@ pub struct BillboardCache {
     /// [`canonical_viewpoints`]. Empty (`Vec::new`) iff this cache
     /// is uninitialised.
     pub snapshots: Vec<BillboardSnapshot>,
+    /// CA — the [`Grid::z_clip`] the snapshots were rendered with.
+    /// The Far-tier dispatch compares this against the grid's LIVE
+    /// clip and rebuilds on mismatch, so a moved cut plane can't blit
+    /// a stale (unclipped) impostor — the clip must hold at every LOD
+    /// tier ("world as if removed" applies to primary rays, and the
+    /// impostor IS the Far tier's primary render).
+    pub built_z_clip: Option<i32>,
 }
 
 impl BillboardCache {
@@ -157,6 +164,7 @@ impl BillboardCache {
         Self {
             resolution,
             snapshots: Vec::new(),
+            built_z_clip: None,
         }
     }
 
@@ -228,18 +236,25 @@ impl BillboardCache {
                 };
                 let grid_view = roxlap_core::GridView::from_chunk_grid(&cg, CHUNK_SIZE_XY);
                 let settings = snapshot_settings(resolution, d, r, max_scan_dist);
-                // DDA render: no textured sky (`DdaEnv::default`), so a
-                // miss leaves the `SKY_SENTINEL` prefill untouched — the
-                // blit detects impostor sky by that sentinel. Impostors
-                // are unfogged. `render_dda` builds its own per-call brick
-                // cache covering all populated chunks.
+                // DDA render: no textured sky, so a miss leaves the
+                // `SKY_SENTINEL` prefill untouched — the blit detects
+                // impostor sky by that sentinel. Impostors are unfogged.
+                // CA — the grid's cutaway clip applies to the snapshots
+                // too (the impostor IS the Far tier's primary render;
+                // `built_z_clip` below pins what it was built with).
+                // `render_dda` builds its own per-call brick cache
+                // covering all populated chunks.
+                let env = DdaEnv {
+                    z_clip: grid.z_clip,
+                    ..DdaEnv::default()
+                };
                 let mut sink = RasterSink::new(&mut color, &mut depth);
                 render_dda(
                     &camera,
                     &settings,
                     grid_view,
                     resolution as usize,
-                    &DdaEnv::default(),
+                    &env,
                     0,
                     &mut sink,
                 );
@@ -268,6 +283,7 @@ impl BillboardCache {
         Self {
             resolution,
             snapshots,
+            built_z_clip: grid.z_clip,
         }
     }
 

@@ -864,11 +864,12 @@ struct SceneDdaPerGridCamera {
     forward: [f32; 3],
     /// CA.0 — the grid's cutaway clip (grid-local absolute voxel z,
     /// z-down; hide `z < z_clip`), riding the old `_pad3` lane as a
-    /// bitcast `i32` because every vec3 pad is spoken for elsewhere
-    /// and the struct layout is frozen against the WGSL mirror.
-    /// [`Z_CLIP_DISABLED_BITS`] (`i32::MIN`) ⇒ no clip. Re-uploaded
-    /// per frame with the rest of the per-grid cameras.
-    z_clip_bits: f32,
+    /// REAL `i32`. (An f32 bit-carrier would make every clip in
+    /// `1..=0x7fffff` a subnormal, which the WGSL spec permits a
+    /// driver to flush to zero on load — a silent, GPU-only,
+    /// value-dependent "clip off".) [`Z_CLIP_DISABLED`] (`i32::MIN`)
+    /// ⇒ no clip. Re-uploaded per frame with the per-grid cameras.
+    z_clip: i32,
     /// DL — unit direction TO the sun in this grid's local frame (xyz; w
     /// unused). Packed here rather than a separate per-grid storage buffer
     /// because the device's `max_storage_buffers_per_shader_stage` (16) is
@@ -885,12 +886,12 @@ struct SceneDdaPerGridCamera {
     rot2: [f32; 4],
 }
 
-/// CA.0 — sentinel bit pattern for "no cutaway clip" in
-/// [`SceneDdaPerGridCamera::z_clip_bits`] (and its WGSL mirror):
-/// `i32::MIN` can never be a real clip (grid-local voxel z is bounded
-/// by the chunk stack), so the shader reads `bitcast<i32>` and
-/// compares against this directly.
-const Z_CLIP_DISABLED_BITS: u32 = i32::MIN as u32;
+/// CA.0 — sentinel for "no cutaway clip" in
+/// [`SceneDdaPerGridCamera::z_clip`] (and its WGSL mirror): `i32::MIN`
+/// can never be a real clip (grid-local voxel z is bounded by the
+/// chunk stack) and it stays below any real cell even after the
+/// shader's per-chunk `>> mip`.
+const Z_CLIP_DISABLED: i32 = i32::MIN;
 
 impl SceneDdaPerGridCamera {
     fn from_camera(c: &Camera) -> Self {
@@ -904,7 +905,7 @@ impl SceneDdaPerGridCamera {
             forward: c.forward,
             // CA.0 — default "no clip"; the per-grid build
             // (`set_world_transform`) stamps the real value.
-            z_clip_bits: f32::from_bits(Z_CLIP_DISABLED_BITS),
+            z_clip: Z_CLIP_DISABLED,
             sun_dir: [0.0; 4],
             // Identity world transform by default; the per-grid build
             // (`grid_cameras`) overwrites it with the grid's real transform.
@@ -928,44 +929,38 @@ impl SceneDdaPerGridCamera {
         self.rot0 = [t.rot_cols[0][0], t.rot_cols[0][1], t.rot_cols[0][2], 0.0];
         self.rot1 = [t.rot_cols[1][0], t.rot_cols[1][1], t.rot_cols[1][2], 0.0];
         self.rot2 = [t.rot_cols[2][0], t.rot_cols[2][1], t.rot_cols[2][2], 0.0];
-        // CA.0 — cutaway clip rides the old `_pad3` lane (bitcast i32;
-        // `i32::MIN` = disabled). Unread by the shader until CA.3.
-        #[allow(clippy::cast_sign_loss)]
-        {
-            self.z_clip_bits = f32::from_bits(t.z_clip.map_or(Z_CLIP_DISABLED_BITS, |z| z as u32));
-        }
+        // CA.0 — cutaway clip rides the old `_pad3` lane (a real i32;
+        // `i32::MIN` = disabled).
+        self.z_clip = t.z_clip.unwrap_or(Z_CLIP_DISABLED);
     }
 }
 
 /// CA.4 — the frame's cutaway volumes for the sprite cull: one
 /// [`sprite_model::SpriteCutawayClip`] per clipped grid, from its world
-/// transform (origin / rotation / scale / clip) + its resident chunk
-/// AABB (the XY footprint). Grids without a clip, empty grids (the
-/// inverted-AABB sentinel) and identity-default transforms contribute
+/// transform (origin / rotation / scale / clip / **host-supplied XY
+/// footprint**). The footprint deliberately comes from the host's
+/// scene — the grid's MATERIALISED chunk extent, the same set the CPU
+/// footprint rule (`Grid::cutaway_hides_point`) tests — NOT from the
+/// GPU-resident slot AABB: on a streaming grid the resident set is a
+/// moving subset, so a slot-derived footprint would hide/show
+/// edge-of-hull sprites differently per backend as chunks stream.
+/// Grids without a clip or without a footprint (empty) contribute
 /// nothing, so the result is empty — and the cull unchanged — until a
 /// host actually sets `Grid::z_clip`.
 #[allow(clippy::cast_precision_loss)]
-fn sprite_cutaway_clips(
-    grid_world: &[GridWorldTransform],
-    metas: &[scene::GridStaticMeta],
-) -> Vec<sprite_model::SpriteCutawayClip> {
+fn sprite_cutaway_clips(grid_world: &[GridWorldTransform]) -> Vec<sprite_model::SpriteCutawayClip> {
     let mut out = Vec::new();
-    for (t, m) in grid_world.iter().zip(metas.iter()) {
-        let Some(zc) = t.z_clip else { continue };
-        if m.aabb_min[0] > m.aabb_max[0] || m.aabb_min[1] > m.aabb_max[1] {
+    for t in grid_world {
+        let (Some(zc), Some((lo, hi))) = (t.z_clip, t.cutaway_footprint) else {
             continue;
-        }
-        let vsid = m.vsid as f32;
+        };
         out.push(sprite_model::SpriteCutawayClip {
             origin: t.origin,
             // World→local rows = the local→world rotation's columns.
             inv_rows: t.rot_cols,
             inv_vws: 1.0 / t.voxel_world_size,
-            xy_lo: [m.aabb_min[0] as f32 * vsid, m.aabb_min[1] as f32 * vsid],
-            xy_hi: [
-                (m.aabb_max[0] + 1) as f32 * vsid,
-                (m.aabb_max[1] + 1) as f32 * vsid,
-            ],
+            xy_lo: lo,
+            xy_hi: hi,
             z_clip: zc as f32,
         });
     }
@@ -994,6 +989,14 @@ pub struct GridWorldTransform {
     /// the grid renders as air. `None` (the default) = no clip,
     /// byte-identical to pre-CA renders.
     pub z_clip: Option<i32>,
+    /// CA.4 — the grid's materialised XY chunk footprint `[lo, hi)` in
+    /// grid-local voxel coords, for the sprite footprint rule. Must
+    /// come from the HOST's scene (all materialised chunks — what
+    /// `Grid::cutaway_hides_point` tests), not the GPU-resident slot
+    /// subset, so both backends hide the same sprites on streaming
+    /// grids. Only consulted when [`Self::z_clip`] is set; `None` ⇒
+    /// the clip hides no sprites (an empty grid).
+    pub cutaway_footprint: Option<([f32; 2], [f32; 2])>,
 }
 
 impl Default for GridWorldTransform {
@@ -1003,6 +1006,7 @@ impl Default for GridWorldTransform {
             rot_cols: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             voxel_world_size: 1.0,
             z_clip: None,
+            cutaway_footprint: None,
         }
     }
 }
@@ -1734,7 +1738,7 @@ impl GpuRenderer {
         // CA.4 — build the frame's cutaway volumes for the sprite cull:
         // one per clipped grid, from its world transform + resident
         // chunk AABB. Empty (the common case) ⇒ pre-CA cull behaviour.
-        let cutaway_clips = sprite_cutaway_clips(grid_world, &scene.static_meta);
+        let cutaway_clips = sprite_cutaway_clips(grid_world);
         let sprite_pass: Option<(u32, u32)> = if let Some(reg) = self.sprite_registry.as_mut() {
             if reg.instance_capacity > 0 {
                 // World camera — sprite positions/transforms are world-

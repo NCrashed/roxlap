@@ -1345,24 +1345,31 @@ impl CpuBackend {
         // CA.4 — cutaway footprint rule: an instance whose origin lands
         // inside a clipped grid's XY footprint above the plane is hidden
         // this frame — not drawn AND not casting ("world as if
-        // removed"). Precomputed per list so the flags outlive the
-        // terrain render's `&mut Scene` borrow below; all-empty (and
-        // O(1) per lookup) when no grid has a clip set.
-        let cutaway_on = frame.draw_sprites && scene.grids().any(|(_, g)| g.z_clip.is_some());
+        // removed"). The volumes (transform + footprint + plane) are
+        // hoisted ONCE per frame via `Grid::cutaway_volume`, so the
+        // per-sprite test is a few compares — no chunk-map walk or
+        // rotation inverse per sprite. Flags are precomputed per list
+        // so they outlive the terrain render's `&mut Scene` borrow
+        // below; all-empty (and O(1) per lookup) when no grid clips.
+        let cutaway_volumes: Vec<roxlap_scene::CutawayVolume> = if frame.draw_sprites {
+            scene
+                .grids()
+                .filter_map(|(_, g)| g.cutaway_volume())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let cutaway_flags = |sprites: &mut dyn Iterator<Item = &Sprite>| -> Vec<bool> {
-            if cutaway_on {
-                sprites
-                    .map(|s| {
-                        scene.cutaway_hides_point(glam::DVec3::new(
-                            f64::from(s.p[0]),
-                            f64::from(s.p[1]),
-                            f64::from(s.p[2]),
-                        ))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
+            if cutaway_volumes.is_empty() {
+                return Vec::new();
             }
+            sprites
+                .map(|s| {
+                    let p =
+                        glam::DVec3::new(f64::from(s.p[0]), f64::from(s.p[1]), f64::from(s.p[2]));
+                    cutaway_volumes.iter().any(|v| v.hides_point(p))
+                })
+                .collect()
         };
         let hidden_static = cutaway_flags(&mut self.sprites.iter());
         let hidden_limbs = cutaway_flags(&mut self.kfa_limbs.iter());

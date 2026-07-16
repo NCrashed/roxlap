@@ -184,18 +184,6 @@ impl CameraRig {
     }
 }
 
-/// CA.5 — [`opticast_settings`] with an explicit vertical FOV (radians):
-/// the focal length `hz` is derived so `FrameParams::fov_y_rad()` lands
-/// exactly on `fov_y` at any window size. Both backends project from
-/// these settings, so the narrow tele-iso view matches CPU/GPU.
-#[must_use]
-#[allow(clippy::cast_precision_loss)]
-pub fn opticast_settings_fov(size: (u32, u32), scan_dist: i32, fov_y: f32) -> OpticastSettings {
-    let mut s = opticast_settings(size, scan_dist);
-    s.hz = (size.1 as f32 * 0.5) / (fov_y * 0.5).tan();
-    s
-}
-
 /// The camera pose a scene starts at (set by the host on `enter`).
 #[derive(Clone, Copy, Debug)]
 pub struct CameraPose {

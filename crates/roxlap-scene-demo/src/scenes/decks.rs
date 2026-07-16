@@ -26,7 +26,7 @@ use winit::keyboard::KeyCode;
 
 use crate::build_sprites;
 use crate::scene_api::{
-    frame_params, opticast_settings_fov, CameraPose, CameraRig, DemoScene, SceneCtx, SceneInput,
+    frame_params, opticast_settings, CameraPose, CameraRig, DemoScene, SceneCtx, SceneInput,
 };
 
 // ---- ship geometry (ship-grid-local, z-down) -------------------------
@@ -96,7 +96,9 @@ pub struct DecksScene {
     /// The GPU LOD scan distance to restore on `exit` (the tele camera
     /// sits ~1150 voxels out — distance LOD would coarsen the whole
     /// ship to deep mips, so `enter` raises it past the working range).
-    saved_mip_scan: f32,
+    /// `Option` because `0.0` ("LOD off", e.g.
+    /// `ROXLAP_GPU_MIP_SCAN_DIST=0`) is a legal value to restore.
+    saved_mip_scan: Option<f32>,
 }
 
 impl DecksScene {
@@ -148,17 +150,12 @@ impl DecksScene {
                     Some(FLOOR_RGB[d]),
                 );
             }
-            // A crate per deck so the interiors read as rooms.
-            for &ft in &FLOOR_TOPS {
-                g.set_rect(
-                    IVec3::new(70, 58, ft - 8),
-                    IVec3::new(77, 65, ft - 1),
-                    Some(VoxColor(0x80_7A_5A_30)),
-                );
-            }
             // Hazard 6 — flood the bottom deck: ordinary water voxels in
             // the slabs (they clip with everything else) + the physics
-            // volume for completeness.
+            // volume for completeness. Placed BEFORE the crates so the
+            // bilge crate overwrites its water cells and reads as a
+            // submerged solid through the Beer–Lambert surface, not a
+            // washed-away hole.
             g.set_rect(
                 IVec3::new(x0 + 2, y0 + 2, FLOOR_TOPS[2] - 8),
                 IVec3::new(x1 - 2, y1 - 2, FLOOR_TOPS[2] - 1),
@@ -168,6 +165,17 @@ impl DecksScene {
                 IVec3::new(x0 + 2, y0 + 2, FLOOR_TOPS[2] - 8),
                 IVec3::new(x1 - 2, y1 - 2, FLOOR_TOPS[2] - 1),
             );
+            // A crate per deck so the interiors read as rooms. 12
+            // voxels tall — 4 above the 8-deep flood, so the bilge one
+            // pokes out of the water while its base reads through the
+            // Beer–Lambert surface (it overwrote its water cells).
+            for &ft in &FLOOR_TOPS {
+                g.set_rect(
+                    IVec3::new(70, 58, ft - 12),
+                    IVec3::new(77, 65, ft - 1),
+                    Some(VoxColor(0x80_7A_5A_30)),
+                );
+            }
         }
 
         // World-space actor spots: one per deck (standing on its floor,
@@ -214,7 +222,7 @@ impl DecksScene {
             actor_model: None,
             cabin_lights,
             lit_points: Vec::new(),
-            saved_mip_scan: 0.0,
+            saved_mip_scan: None,
         };
         if deck != 0 {
             this.set_deck(deck);
@@ -264,7 +272,7 @@ impl DemoScene for DecksScene {
     fn enter(&mut self, ctx: &mut SceneCtx) {
         // GPU distance LOD would march the whole ship at deep mips from
         // the tele distance; hold mip 0 out past the orbit range.
-        self.saved_mip_scan = ctx.renderer.gpu_mip_scan_dist();
+        self.saved_mip_scan = Some(ctx.renderer.gpu_mip_scan_dist());
         #[allow(clippy::cast_possible_truncation)]
         ctx.renderer
             .set_gpu_mip_scan_dist((TELE_DIST + 512.0) as f32);
@@ -386,7 +394,9 @@ impl DemoScene for DecksScene {
     }
 
     fn render(&mut self, ctx: &mut SceneCtx) {
-        let settings = opticast_settings_fov(ctx.size, TELE_SCAN_DIST, TELE_FOV_Y);
+        // Narrow tele FOV via the core helper (both backends derive
+        // their projection from these settings).
+        let settings = opticast_settings(ctx.size, TELE_SCAN_DIST).with_fov_y(TELE_FOV_Y);
         let mut frame = frame_params(ctx.engine, &settings, TELE_SCAN_DIST);
         // A shadowing sun proves CA.2/CA.3 live: with the roof cut
         // away the interior is sun-lit, not shadowed by hidden decks.
@@ -411,10 +421,11 @@ impl DemoScene for DecksScene {
     }
 
     fn exit(&mut self, ctx: &mut SceneCtx) {
-        // Restore the construction-time GPU LOD distance for the other
-        // scenes (their cameras sit inside the world).
-        if self.saved_mip_scan > 0.0 {
-            ctx.renderer.set_gpu_mip_scan_dist(self.saved_mip_scan);
+        // Restore the entry-time GPU LOD distance for the other scenes
+        // (their cameras sit inside the world). `0.0` = "LOD off" is a
+        // legal saved value, hence the Option, not a magic zero.
+        if let Some(d) = self.saved_mip_scan.take() {
+            ctx.renderer.set_gpu_mip_scan_dist(d);
         }
     }
 

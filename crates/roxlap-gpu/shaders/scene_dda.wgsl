@@ -31,10 +31,11 @@ struct PerGridCamera {
     _pad2: f32,
     forward: vec3<f32>,
     // CA.0 — the grid's cutaway clip riding the old `_pad3` lane:
-    // grid-local absolute voxel z as a bitcast i32 (`bitcast<i32>` to
-    // read); i32::MIN (0x80000000) = disabled. Hide cells with
-    // `z < z_clip`. Unread until CA.3.
-    z_clip_bits: f32,
+    // grid-local absolute voxel z, a REAL i32 lane (an f32 bit-carrier
+    // would be a subnormal for any clip in 1..=0x7fffff, which the
+    // WGSL spec permits implementations to flush to zero on load).
+    // i32::MIN = disabled. Hide cells with `z < z_clip`.
+    z_clip: i32,
     // DL — unit direction TO the sun in this grid's local frame (xyz; w
     // unused). Packed here instead of a separate per-grid storage buffer
     // (the 16 storage-buffer limit is already saturated). Zero ⇒ no sun
@@ -493,7 +494,7 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
     // removed"), each grid applying its OWN clip — mirrors the CPU
     // SceneOccluder. Sentinel i32::MIN survives the `>> mip` below
     // any real cell, so no enable flag.
-    let z_clip = bitcast<i32>(grid_cameras[g].z_clip_bits);
+    let z_clip = grid_cameras[g].z_clip;
 
     var p_chunk = vec3<i32>(floor(origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(dir));
@@ -869,7 +870,7 @@ fn march_grid(
     // with `z < z_clip` read as air). The disabled sentinel (i32::MIN)
     // stays below any real cell even after the per-chunk `>> mip`, so
     // no separate enable flag is needed.
-    let z_clip = bitcast<i32>(grid_cameras[g].z_clip_bits);
+    let z_clip = grid_cameras[g].z_clip;
 
     var p_chunk = vec3<i32>(floor(ray_origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(ray_dir));

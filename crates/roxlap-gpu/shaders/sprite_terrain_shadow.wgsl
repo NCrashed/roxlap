@@ -15,7 +15,9 @@ struct PerGridCamera {
     pos: vec3<f32>, _pc0: f32,
     right: vec3<f32>, _pc1: f32,
     down: vec3<f32>, _pc2: f32,
-    forward: vec3<f32>, _pc3: f32,
+    forward: vec3<f32>,
+    // CA — the grid's cutaway clip (see scene_dda.wgsl); i32::MIN = off.
+    z_clip: i32,
     sun_dir: vec4<f32>,
     world_origin: vec4<f32>,
     rot0: vec4<f32>,
@@ -118,6 +120,9 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> boo
     let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z)) * vws;
     let vsid_i = i32(vsid);
     let cz_i = i32(CHUNK_Z);
+    // CA.3 — cutaway: clipped-away cells never occlude sprites either
+    // (mip-0 march, so the plane needs no `>> mip`). i32::MIN = off.
+    let z_clip = grid_cameras[g].z_clip;
     var p_chunk = vec3<i32>(floor(origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(dir));
     let t_delta_chunk = abs(chunk_dim / dir);
@@ -162,7 +167,8 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> boo
                     occ_idx_cached = widx;
                     occ_word_cached = occ_word(widx);
                 }
-                if ((occ_word_cached & (1u << (z_u & 31u))) != 0u) { return true; }
+                if ((p_chunk.z * cz_i + p_voxel.z >= z_clip)
+                    && (occ_word_cached & (1u << (z_u & 31u))) != 0u) { return true; }
                 steps = steps + 1u;
                 if (steps >= u.shadow_max_steps) { return false; }
                 if (t_max_voxel.x < t_max_voxel.y && t_max_voxel.x < t_max_voxel.z) {

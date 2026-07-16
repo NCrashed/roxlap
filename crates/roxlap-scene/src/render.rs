@@ -880,7 +880,14 @@ fn render_scene_composed_scissored(
     for (id, grid) in scene.grids_mut() {
         let lod = grid.select_lod(cam_world);
         if lod == Lod::Far {
-            if !grid.chunks.is_empty() && grid.billboards.is_none() {
+            // CA — a cache built under a different cutaway clip is
+            // stale: rebuilding here (not only in `set_grid_z_clip`)
+            // also catches hosts that write `grid.z_clip` directly.
+            let stale_clip = grid
+                .billboards
+                .as_ref()
+                .is_some_and(|c| c.built_z_clip != grid.z_clip);
+            if !grid.chunks.is_empty() && (grid.billboards.is_none() || stale_clip) {
                 let cache = BillboardCache::build(grid, BILLBOARD_RESOLUTION);
                 grid.billboards = Some(cache);
             }
@@ -2687,6 +2694,91 @@ mod tests {
             None,
         );
         assert!(scene.grid(id).unwrap().billboards.is_some());
+    }
+
+    /// CA — the cutaway clip reaches the Far tier: impostor snapshots
+    /// render WITH the grid's clip ("world as if removed" holds at
+    /// every LOD), a clip change rebuilds the cache — via the facade
+    /// setter (drops it eagerly) or a direct `z_clip` field write (the
+    /// Far dispatch self-heals on `built_z_clip` mismatch) — and the
+    /// rebuilt impostor actually loses the clipped voxels.
+    #[test]
+    fn cutaway_clip_rebuilds_and_clips_far_billboards() {
+        let (mut scene, id) = build_one_grid_scene(DVec3::new(0.0, 200.0, 0.0));
+        scene.grid_mut(id).unwrap().lod_thresholds = crate::LodThresholds {
+            r_near: 0.0,
+            r_mid: 0.0,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
+        };
+        let camera = camera_at([64.0, 0.0, 100.0]);
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let render = |scene: &mut Scene| {
+            let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+            let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+            let _ = render_scene_composed(
+                &mut fb,
+                &mut zb,
+                XRES as usize,
+                XRES,
+                YRES,
+                fog,
+                scene,
+                &camera,
+                &settings,
+                sky_color,
+                None,
+            );
+        };
+        // Impostor solid coverage = finite-depth pixels of snapshot 0.
+        let solid_px = |scene: &Scene| {
+            let c = scene.grid(id).unwrap().billboards.as_ref().unwrap();
+            c.snapshots[0]
+                .depth
+                .iter()
+                .filter(|d| d.is_finite())
+                .count()
+        };
+
+        // Unclipped Far render: cache built with no clip, solid pixels.
+        render(&mut scene);
+        let unclipped = solid_px(&scene);
+        assert!(unclipped > 0, "unclipped impostor must have solid pixels");
+        assert_eq!(
+            scene
+                .grid(id)
+                .unwrap()
+                .billboards
+                .as_ref()
+                .unwrap()
+                .built_z_clip,
+            None
+        );
+
+        // Facade setter: hides the WHOLE grid → cache dropped eagerly,
+        // the next Far render rebuilds all-sky snapshots.
+        assert!(scene.set_grid_z_clip(id, Some(256)));
+        assert!(
+            scene.grid(id).unwrap().billboards.is_none(),
+            "set_grid_z_clip must drop a cache built under another clip"
+        );
+        render(&mut scene);
+        let cache = scene.grid(id).unwrap().billboards.as_ref().unwrap();
+        assert_eq!(cache.built_z_clip, Some(256));
+        assert_eq!(
+            solid_px(&scene),
+            0,
+            "a fully clipped grid's impostor must be all sky"
+        );
+
+        // Direct field write bypasses the setter — the Far dispatch
+        // must self-heal on the built_z_clip mismatch.
+        scene.grid_mut(id).unwrap().z_clip = None;
+        render(&mut scene);
+        let cache = scene.grid(id).unwrap().billboards.as_ref().unwrap();
+        assert_eq!(cache.built_z_clip, None, "stale-clip cache must rebuild");
+        assert_eq!(solid_px(&scene), unclipped, "unclipped impostor restored");
     }
 
     /// Hybrid scene: one Near grid + one Far grid. Both must render

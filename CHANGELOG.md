@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Stage **CA — cutaway deck rendering** (`PORTING-CUTAWAY.md`): per-grid
 horizontal clip planes for isometric "deck view" rendering (SS13-style
-ship interiors). Additive — new APIs and one new public struct field
-(`roxlap-gpu`'s `GridWorldTransform.z_clip`; exhaustive literals must
-add it, `..Default::default()` users are unaffected).
+ship interiors). Additive APIs, but three public structs grew required
+fields, so **exhaustive struct literals must add them**
+(`..Default::default()` / constructor users are unaffected):
+`roxlap-core`'s `DdaEnv.z_clip`, `roxlap-gpu`'s
+`GridWorldTransform.z_clip` + `.cutaway_footprint`, and
+`roxlap-scene`'s `BillboardCache.built_z_clip` (plus `Grid.z_clip`,
+which only `Grid::new` constructs — no literal breakage there).
 
 ### Added
 

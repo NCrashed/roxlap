@@ -1684,8 +1684,16 @@ impl GpuBackend {
                 rot_cols: [col(DVec3::X), col(DVec3::Y), col(DVec3::Z)],
                 // SC.4 — the shader marcher scales chunk/voxel dims by this.
                 voxel_world_size: grid.transform.voxel_world_size as f32,
-                // CA.0 — per-grid cutaway clip (shader-unread until CA.3).
+                // CA — per-grid cutaway clip for the marcher/shadow
+                // paths, plus the SCENE-side materialised-chunk XY
+                // footprint for the sprite cull (the same set the CPU
+                // footprint rule tests — never the GPU-resident slot
+                // subset, which drifts on streaming grids).
                 z_clip: grid.z_clip,
+                cutaway_footprint: grid.cutaway_volume().map(|v| {
+                    let (lo, hi) = v.footprint_xy();
+                    ([lo[0] as f32, lo[1] as f32], [hi[0] as f32, hi[1] as f32])
+                }),
             });
         }
         out
