@@ -260,8 +260,20 @@ pub struct GridStaticMeta {
     /// GPU.13.1 — pyramid levels stored above L0 (0 = no pyramid,
     /// the single-chunk-pool degenerate case).
     pub chunk_occ_levels: u32,
+    /// CA perf — grid-local SOLID voxel z-extent (inclusive) over all
+    /// resident chunks: the marchers clamp their entry fast-forward
+    /// box and ray caps to it, so a grid whose content occupies a
+    /// slice of its chunk stack (a ship spanning a chz boundary sits
+    /// in a 512-voxel-tall chunk AABB but is ~70 voxels of hull) is
+    /// entered AT the content and abandoned right past it. Inverted
+    /// sentinel (`lo = i32::MAX`, `hi = i32::MIN`) when the grid holds
+    /// no solid voxels. Maintained live alongside the chunk AABB
+    /// ([`GpuSceneResident::refresh_chunk`] / `evict_chunk`).
+    pub vox_z_lo: i32,
+    /// See [`Self::vox_z_lo`]; inclusive.
+    pub vox_z_hi: i32,
     /// std430 padding; always 0.
-    pub _pad4: [u32; 3],
+    pub _pad4: u32,
 }
 
 /// Sentinel chunk_idx written into empty slot_chunk_idx entries.
@@ -348,6 +360,12 @@ pub struct GpuSceneResident {
     /// change reflows the packed colour block and forces the full-path
     /// fallback. ~87 KB per 128² chunk; dropped on evict.
     pub(crate) color_offsets_shadow: Vec<std::collections::HashMap<usize, Vec<u32>>>,
+    /// CA perf — CPU mirror of each slot's IN-CHUNK solid z-extent
+    /// (`[lo, hi]` inclusive; `[i32::MAX, i32::MIN]` for empty slots).
+    /// Combined with the slot's chunk-z on every refresh/evict to
+    /// recompute the grid's [`GridStaticMeta::vox_z_lo`]/`vox_z_hi`
+    /// marcher clamp (same maintenance path as the chunk AABB).
+    pub(crate) slot_z_ext_shadow: Vec<Vec<[i32; 2]>>,
 }
 
 impl GpuSceneResident {
@@ -369,6 +387,7 @@ impl GpuSceneResident {
         let mut chunk_occupancy_shadow: Vec<Vec<u32>> = Vec::with_capacity(info.grids.len());
         let mut chunk_occ_pyramid_shadow: Vec<Vec<Vec<u32>>> = Vec::with_capacity(info.grids.len());
         let mut slot_chunk_idx_shadow: Vec<Vec<[i32; 4]>> = Vec::with_capacity(info.grids.len());
+        let mut slot_z_ext_shadow: Vec<Vec<[i32; 2]>> = Vec::with_capacity(info.grids.len());
         let mut color_offsets_shadow: Vec<std::collections::HashMap<usize, Vec<u32>>> =
             Vec::with_capacity(info.grids.len());
         // Per-grid colour stride (words/slot) — adaptive to the grid's
@@ -442,6 +461,8 @@ impl GpuSceneResident {
                     0,
                 ]);
             }
+            // CA perf — per-slot in-chunk solid z-extent (marcher clamp).
+            let mut grid_slot_z_ext: Vec<[i32; 2]> = vec![[i32::MAX, i32::MIN]; total_slots];
 
             let mask_x = (grid.pool_dims[0] - 1) as i32;
             let mask_y = (grid.pool_dims[1] - 1) as i32;
@@ -496,6 +517,12 @@ impl GpuSceneResident {
                     grid_chunk_occupancy[slot_idx >> 5] |= 1u32 << (slot_idx & 31);
                 }
                 grid_slot_chunk_idx[slot_idx] = [chunk_idx[0], chunk_idx[1], chunk_idx[2], 0];
+                // CA perf — the slot's in-chunk solid z-extent.
+                grid_slot_z_ext[slot_idx] = match crate::decompress::solid_z_extent(&chunk.mips[0])
+                {
+                    Some((lo, hi)) => [lo as i32, hi as i32],
+                    None => [i32::MAX, i32::MIN],
+                };
                 // PF.12.c — mirror the slot's color_offsets window.
                 grid_offsets_shadow.insert(
                     slot_idx,
@@ -508,6 +535,8 @@ impl GpuSceneResident {
             let slot_chunk_idx_offset = u32::try_from(all_slot_chunk_idx.len()).expect("fits");
             // GPU.13.0 — occupied chunk-AABB for the outer-DDA early-out.
             let (aabb_min, aabb_max) = aabb_of_slots(&grid_slot_chunk_idx);
+            // CA perf — grid-local solid voxel z-extent (marcher clamp).
+            let (vox_z_lo, vox_z_hi) = vox_z_of_slots(&grid_slot_chunk_idx, &grid_slot_z_ext);
             // GPU.13.1 — chunk-occupancy pyramid: levels 1.. appended
             // right after this grid's L0 words, offsets recorded per
             // level (word offsets are into `all_chunk_occupancy`).
@@ -544,12 +573,15 @@ impl GpuSceneResident {
                 _pad3: 0,
                 chunk_occ_mip_off,
                 chunk_occ_levels: u32::try_from(pyramid.len()).expect("small"),
-                _pad4: [0; 3],
+                vox_z_lo,
+                vox_z_hi,
+                _pad4: 0,
             };
 
             chunk_occupancy_shadow.push(grid_chunk_occupancy.clone());
             chunk_occ_pyramid_shadow.push(pyramid.clone());
             slot_chunk_idx_shadow.push(grid_slot_chunk_idx.clone());
+            slot_z_ext_shadow.push(grid_slot_z_ext);
             color_offsets_shadow.push(grid_offsets_shadow);
 
             all_occupancy.extend_from_slice(&grid_occupancy);
@@ -672,6 +704,7 @@ impl GpuSceneResident {
             slot_chunk_idx_shadow,
             color_offsets_shadow,
             colors_stride_shadow: grid_colors_strides,
+            slot_z_ext_shadow,
         }
     }
 
@@ -799,6 +832,14 @@ impl GpuSceneResident {
         }
         self.color_offsets_shadow[scene_idx].insert(slot_idx, window);
 
+        // CA perf — the slot's in-chunk solid z-extent (the grid clamp
+        // recomputes inside sync_aabb below).
+        self.slot_z_ext_shadow[scene_idx][slot_idx] =
+            match crate::decompress::solid_z_extent(&chunk.mips[0]) {
+                Some((lo, hi)) => [lo as i32, hi as i32],
+                None => [i32::MAX, i32::MIN],
+            };
+
         // ---- GPU.13.0 grid-AABB early-out box ----
         self.sync_aabb(queue, scene_idx);
 
@@ -876,6 +917,11 @@ impl GpuSceneResident {
             colors: Vec<u32>,
         }
         let mut runs: Vec<RowRun> = Vec::new();
+        // CA perf — mip-0 solid z-extent of the re-derived columns, to
+        // WIDEN the slot's clamp below (widen-only is safe: an edit
+        // that removed the extremes leaves the clamp conservatively
+        // large; the next full refresh re-tightens it).
+        let mut dirty_z = [i32::MAX, i32::MIN];
         for m in 0..layout.mip_count {
             let vsid_m = (meta.vsid >> m).max(1) as i32;
             let cz_m = crate::decompress::CHUNK_Z >> m;
@@ -915,6 +961,17 @@ impl GpuSceneResident {
                         as usize;
                     if colors.len() - before != old_count {
                         return false; // reflow → full path
+                    }
+                    // CA perf — fold this column's mip-0 solid extent.
+                    if m == 0 {
+                        for (k, &w) in solid[i * wpc..(i + 1) * wpc].iter().enumerate() {
+                            if w == 0 {
+                                continue;
+                            }
+                            let zb = (k as i32) * 32;
+                            dirty_z[0] = dirty_z[0].min(zb + w.trailing_zeros() as i32);
+                            dirty_z[1] = dirty_z[1].max(zb + 31 - w.leading_zeros() as i32);
+                        }
                     }
                 }
                 let color_word = offs_shadow[coff_base + row_col0] as usize;
@@ -961,6 +1018,17 @@ impl GpuSceneResident {
         }
         // Counts unchanged ⇒ offsets, chunk-occupancy bit, AABB and the
         // mirrors all stay valid untouched.
+        // CA perf — widen the slot's solid z-extent by the re-derived
+        // columns (never narrows; see `dirty_z`'s comment).
+        if dirty_z[0] <= dirty_z[1] {
+            let e = &mut self.slot_z_ext_shadow[scene_idx][slot_idx];
+            let widened = dirty_z[0] < e[0] || dirty_z[1] > e[1];
+            e[0] = e[0].min(dirty_z[0]);
+            e[1] = e[1].max(dirty_z[1]);
+            if widened {
+                self.sync_aabb(queue, scene_idx);
+            }
+        }
         true
     }
 
@@ -997,6 +1065,8 @@ impl GpuSceneResident {
         self.set_slot_chunk_idx(queue, scene_idx, &meta, slot_idx, SLOT_EMPTY_SENTINEL);
         // PF.12.c — drop the evicted slot's offsets mirror.
         self.color_offsets_shadow[scene_idx].remove(&slot_idx);
+        // CA perf — the slot no longer contributes to the z-extent.
+        self.slot_z_ext_shadow[scene_idx][slot_idx] = [i32::MAX, i32::MIN];
         // GPU.13.0 — eviction may shrink the occupied box; recompute.
         self.sync_aabb(queue, scene_idx);
         true
@@ -1108,15 +1178,45 @@ impl GpuSceneResident {
     /// tight, always-conservative early-out box.
     fn sync_aabb(&mut self, queue: &wgpu::Queue, scene_idx: usize) {
         let (aabb_min, aabb_max) = aabb_of_slots(&self.slot_chunk_idx_shadow[scene_idx]);
+        // CA perf — the voxel z-extent clamp travels with the AABB.
+        let (vox_z_lo, vox_z_hi) = vox_z_of_slots(
+            &self.slot_chunk_idx_shadow[scene_idx],
+            &self.slot_z_ext_shadow[scene_idx],
+        );
         let meta = &mut self.static_meta[scene_idx];
-        if meta.aabb_min == aabb_min && meta.aabb_max == aabb_max {
+        if meta.aabb_min == aabb_min
+            && meta.aabb_max == aabb_max
+            && meta.vox_z_lo == vox_z_lo
+            && meta.vox_z_hi == vox_z_hi
+        {
             return;
         }
         meta.aabb_min = aabb_min;
         meta.aabb_max = aabb_max;
+        meta.vox_z_lo = vox_z_lo;
+        meta.vox_z_hi = vox_z_hi;
         let off = (scene_idx * std::mem::size_of::<GridStaticMeta>()) as u64;
         queue.write_buffer(&self.grid_static_meta, off, bytemuck::bytes_of(meta));
     }
+}
+
+/// CA perf — inclusive grid-local SOLID voxel z-extent over a grid's
+/// occupied slots: each slot contributes `chunk_z · CHUNK_Z + its
+/// in-chunk extent`. Inverted sentinel when nothing is solid — the
+/// marcher's entry slab test then rejects every ray, matching the
+/// empty chunk-AABB behaviour.
+fn vox_z_of_slots(slots: &[[i32; 4]], exts: &[[i32; 2]]) -> (i32, i32) {
+    let mut lo = i32::MAX;
+    let mut hi = i32::MIN;
+    for (s, e) in slots.iter().zip(exts.iter()) {
+        if s[..3] == SLOT_EMPTY_SENTINEL[..3] || e[0] > e[1] {
+            continue;
+        }
+        let base = s[2] * crate::decompress::CHUNK_Z as i32;
+        lo = lo.min(base + e[0]);
+        hi = hi.max(base + e[1]);
+    }
+    (lo, hi)
 }
 
 /// GPU.13.0 — inclusive chunk-AABB over a grid's `slot_chunk_idx`
@@ -1333,9 +1433,24 @@ mod tests {
         // Concretely: 8 u32 (32) + vec3+pad (16) + 4 u32 (16) +
         // 2*[u32;6] (48) = 112, then GPU.13.0 adds two vec3<i32>+pad
         // (aabb_min, aabb_max) = 32 → 144, and GPU.13.1 adds
-        // [u32;4] pyramid offsets + levels + [u32;3] pad = 32 → 176.
+        // [u32;4] pyramid offsets + levels = 20; CA perf appends
+        // vox_z_lo/hi + pad = 12 → 176.
         assert_eq!(std::mem::size_of::<GridStaticMeta>(), 176);
         assert_eq!(std::mem::align_of::<GridStaticMeta>(), 4);
+        // The size matching is NECESSARY but not sufficient: WGSL
+        // packs a bare `vec3<i32>` as 12 bytes and the next member
+        // lands at ITS OWN alignment, so without the shaders'
+        // `@size(16)` on aabb_min/aabb_max every tail field reads 4
+        // bytes early while the total stride still agrees (this
+        // silently disabled the GPU.13.1 pyramid — its level count
+        // read `mip_off[3]`). Pin the host-side tail offsets the
+        // annotated WGSL mirrors are written against.
+        assert_eq!(std::mem::offset_of!(GridStaticMeta, aabb_min), 112);
+        assert_eq!(std::mem::offset_of!(GridStaticMeta, aabb_max), 128);
+        assert_eq!(std::mem::offset_of!(GridStaticMeta, chunk_occ_mip_off), 144);
+        assert_eq!(std::mem::offset_of!(GridStaticMeta, chunk_occ_levels), 160);
+        assert_eq!(std::mem::offset_of!(GridStaticMeta, vox_z_lo), 164);
+        assert_eq!(std::mem::offset_of!(GridStaticMeta, vox_z_hi), 168);
     }
 
     /// GPU.13.1 — the pyramid built from an L0 bitmap must equal a

@@ -420,10 +420,10 @@ impl DemoScene for DecksScene {
             ambient: [0.4, 0.42, 0.48],
             shadow_strength: 0.8,
             shadow_bias_voxels: 1.5,
-            // Just enough ray to cover the hull's self-shadow and its
-            // ground shadow (~180 world units along the sun) — every
-            // extra unit is marched per lit pixel on the GPU.
-            shadow_max_dist: 200.0,
+            // Just enough ray to cover the hull: the farthest real
+            // occluder (ground-tip → roof edge along the sun) is ~90
+            // world units out — every extra unit is marched per lit pixel.
+            shadow_max_dist: 110.0,
             bands: 0,
             shadow_tint: [0.0; 3],
         });

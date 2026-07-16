@@ -128,6 +128,30 @@ pub fn occ_words_per_column_for_mip(mip: u32) -> u32 {
     (CHUNK_Z >> mip).div_ceil(32).max(1)
 }
 
+/// CA perf — a chunk's SOLID voxel z-extent (inclusive, in-chunk
+/// `0..CHUNK_Z`) from its mip-0 solid bitmap, or `None` for an
+/// all-air chunk. Feeds the per-grid `vox_z_lo/hi` marcher clamp in
+/// [`crate::scene::GridStaticMeta`]. One pass over the bitmap words
+/// (columns are z-major, so a word's z window is
+/// `(word % words_per_col) * 32`).
+#[must_use]
+pub fn solid_z_extent(mip0: &MipUpload) -> Option<(u32, u32)> {
+    let wpc = mip0.occ_words_per_col;
+    let mut lo = u32::MAX;
+    let mut hi = 0u32;
+    let mut any = false;
+    for (i, &w) in mip0.solid_occupancy.iter().enumerate() {
+        if w == 0 {
+            continue;
+        }
+        any = true;
+        let zbase = (i as u32 % wpc) * 32;
+        lo = lo.min(zbase + w.trailing_zeros());
+        hi = hi.max(zbase + 31 - w.leading_zeros());
+    }
+    any.then_some((lo, hi))
+}
+
 /// GPU.11 — one mip level of a chunk in the GPU upload shape. Mip-N
 /// has `(vsid >> mip)²` columns spanning z = 0..`CHUNK_Z >> mip`.
 ///

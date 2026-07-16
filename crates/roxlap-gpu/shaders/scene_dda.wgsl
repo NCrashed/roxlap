@@ -73,19 +73,27 @@ struct GridStaticMeta {
     mip_occ_rel: array<u32, MAX_GPU_MIPS>,
     mip_coff_rel: array<u32, MAX_GPU_MIPS>,
     // GPU.13.0 — occupied chunk-AABB (inclusive) in chunk-index space.
-    // `vec3<i32>` aligns to 16 here (mip_coff_rel ends 16-aligned), so
-    // these mirror the host's `[i32;3] + pad` pair exactly (112→144).
-    aabb_min: vec3<i32>,
-    aabb_max: vec3<i32>,
+    // `@size(16)` is REQUIRED, not cosmetic: a bare `vec3<i32>` is 12
+    // bytes and WGSL places the next member at its own alignment (4
+    // for the u32 array below) — offset 140, while the host's
+    // explicit `[i32;3] + pad` pairs put it at 144: every tail field
+    // after the first bare vec3 read 4 bytes early (the GPU.13.1
+    // pyramid silently read `mip_off[3]` as its level count — 0 in
+    // small pools, i.e. the pyramid never fired). 112→144 padded.
+    @size(16) aabb_min: vec3<i32>,
+    @size(16) aabb_max: vec3<i32>,
     // GPU.13.1 — chunk-occupancy pyramid: word offsets of levels 1..=4
     // in `all_chunk_occupancy` (entry l-1 = level l) + the level count
     // above L0. Mirrors the host's [u32;4] + u32 + [u32;3] pad
     // (144→176).
     chunk_occ_mip_off: array<u32, 4>,
     chunk_occ_levels: u32,
-    _pad4a: u32,
-    _pad4b: u32,
-    _pad4c: u32,
+    // CA perf — grid-local SOLID voxel z-extent (inclusive): clamps
+    // the marchers' entry fast-forward box + ray caps to the real
+    // content slice of the chunk stack. Inverted sentinel when empty.
+    vox_z_lo: i32,
+    vox_z_hi: i32,
+    _pad4: u32,
 };
 
 struct Uniforms {
@@ -496,7 +504,45 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
     // any real cell, so no enable flag.
     let z_clip = grid_cameras[g].z_clip;
 
-    var p_chunk = vec3<i32>(floor(origin / chunk_dim));
+    // CA follow-up — fast-forward to the content box (see march_grid;
+    // voxel-granular in Z, cutaway-clipped): a cross-grid shadow ray
+    // from another grid's surface skips the approach void in one slab
+    // test; a ray that never reaches this grid's box within `max_t`
+    // rejects without loading anything else; and the ray CAP tightens
+    // to the box exit — nothing past it can occlude, so up-rays stop
+    // at the hull top instead of marching to the chunk-stack edge.
+    var t_ff: f32 = 0.0;
+    var t_cap = max_t;
+    {
+        let box_lo = vec3<f32>(
+            f32(aabb_mn.x) * chunk_dim.x,
+            f32(aabb_mn.y) * chunk_dim.y,
+            f32(max(grid_static_meta[g].vox_z_lo, z_clip)) * vws,
+        );
+        let box_hi = vec3<f32>(
+            f32(aabb_mx.x + 1) * chunk_dim.x,
+            f32(aabb_mx.y + 1) * chunk_dim.y,
+            f32(grid_static_meta[g].vox_z_hi + 1) * vws,
+        );
+        let t_a = (box_lo - origin) / dir;
+        let t_b = (box_hi - origin) / dir;
+        let t_lo = min(t_a, t_b);
+        let t_hi = max(t_a, t_b);
+        let t_in = max(max(t_lo.x, t_lo.y), t_lo.z);
+        let t_out = min(min(t_hi.x, t_hi.y), t_hi.z);
+        if (t_out < max(t_in, 0.0) || t_in > max_t) {
+            return false;
+        }
+        if (t_out < 1e29) {
+            t_cap = min(max_t, t_out + 1.0);
+        }
+        let ff = t_in - 1.0;
+        if (ff > 1.0 && ff < 1e30) {
+            t_ff = ff;
+        }
+    }
+
+    var p_chunk = vec3<i32>(floor((origin + dir * t_ff) / chunk_dim));
     let step_chunk = vec3<i32>(sign(dir));
     let t_delta_chunk = abs(chunk_dim / dir);
     let next_boundary_chunk = vec3<f32>(
@@ -505,11 +551,11 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
         select(f32(p_chunk.z), f32(p_chunk.z + 1), step_chunk.z > 0) * chunk_dim.z,
     );
     var t_max_chunk = shield_parallel((next_boundary_chunk - origin) / dir, dir);
-    var t_enter: f32 = 0.0;
+    var t_enter: f32 = t_ff;
     var steps: u32 = 0u;
 
     for (var oc: u32 = 0u; oc < u.max_outer_steps; oc = oc + 1u) {
-        if (t_enter > max_t) { return false; }
+        if (t_enter > t_cap) { return false; }
         // Left the occupied chunk-AABB along the ray ⇒ nothing ahead.
         if (aabb_passed(aabb_mn, aabb_mx, p_chunk, step_chunk)) { return false; }
         let slot_id = slot_idx_of(pool_dims, p_chunk);
@@ -524,18 +570,22 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
             let cz_mip = i32(CHUNK_Z >> mip);
             // CA.3 — same floor formula as march_grid / the CPU sampler.
             let z_clip_mip = z_clip >> mip;
-            // CA follow-up — empty-block skip: the SOLID bitmap of a
-            // coarser mip level doubles as a brick map (a clear bit
+            // CA follow-up — empty-block skip: the SOLID bitmaps of
+            // coarser mip levels double as brick maps (a clear bit
             // proves every descendant cell empty — gated by the
             // `solid_mips_are_child_supersets` test). Marching mip m,
-            // test the mip-(m+gap) block containing the cell; empty ⇒
-            // jump the whole 2^gap-cell box. This is what keeps long
-            // shadow rays affordable at fine mips (the CPU march has
-            // the same skip via its brick cache).
+            // test the block containing the cell, coarsest tier first
+            // (32³ then 8³ at mip 0, like the CPU super/brick pair);
+            // empty ⇒ jump the whole box. This is what keeps long
+            // shadow rays affordable at fine mips.
             var skip_gap = 0u;
             var skip_vsid = 0u;
             var skip_wpc = 0u;
             var skip_col_base = 0u;
+            var sup_gap = 0u;
+            var sup_vsid = 0u;
+            var sup_wpc = 0u;
+            var sup_col_base = 0u;
             if (mip + 2u < mip_count) {
                 let l = min(mip + 3u, mip_count - 1u);
                 skip_gap = l - mip;
@@ -545,6 +595,16 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
                     + slot_id * occ_words_slot
                     + grid_static_meta[g].mip_occ_rel[l]
                     + skip_vsid * skip_vsid * skip_wpc;
+                let l2 = mip_count - 1u;
+                if (l2 > l) {
+                    sup_gap = l2 - mip;
+                    sup_vsid = vsid >> l2;
+                    sup_wpc = occ_words_per_col_for_mip(l2);
+                    sup_col_base = occ_off
+                        + slot_id * occ_words_slot
+                        + grid_static_meta[g].mip_occ_rel[l2]
+                        + sup_vsid * sup_vsid * sup_wpc;
+                }
             }
             // PF.1 — solid word base for this (slot, mip), hoisted out of
             // the inner loop, plus a last-word cache.
@@ -584,16 +644,30 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
             loop {
                 // CA follow-up — empty-block skip (see the hoist above):
                 // if the containing coarse block is solid-free, jump to
-                // its exit. Axis advances use exact crossing COUNTS from
-                // t-differences (mirrors the CPU landing).
+                // its exit, coarsest tier first. Axis advances use exact
+                // crossing COUNTS from t-differences (mirrors the CPU
+                // landing).
                 if (skip_gap > 0u) {
-                    let b = vec3<u32>(p_voxel) >> vec3<u32>(skip_gap);
-                    let bw = skip_col_base + (b.x + b.y * skip_vsid) * skip_wpc + (b.z >> 5u);
-                    if ((occ_word(bw) & (1u << (b.z & 31u))) == 0u) {
+                    var gap = 0u;
+                    if (sup_gap > 0u) {
+                        let bs = vec3<u32>(p_voxel) >> vec3<u32>(sup_gap);
+                        let bws = sup_col_base + (bs.x + bs.y * sup_vsid) * sup_wpc + (bs.z >> 5u);
+                        if ((occ_word(bws) & (1u << (bs.z & 31u))) == 0u) {
+                            gap = sup_gap;
+                        }
+                    }
+                    if (gap == 0u) {
+                        let b = vec3<u32>(p_voxel) >> vec3<u32>(skip_gap);
+                        let bw = skip_col_base + (b.x + b.y * skip_vsid) * skip_wpc + (b.z >> 5u);
+                        if ((occ_word(bw) & (1u << (b.z & 31u))) == 0u) {
+                            gap = skip_gap;
+                        }
+                    }
+                    if (gap > 0u) {
                         // The block was empty, so the (unsampled) origin
                         // cell was air — nothing left to suppress.
                         skip_origin_cell = false;
-                        let bmask = vec3<i32>(i32((1u << skip_gap) - 1u));
+                        let bmask = vec3<i32>(i32((1u << gap) - 1u));
                         // Cells to the block edge along the travel
                         // direction, then the per-axis block-exit t.
                         let to_edge = select(
@@ -604,7 +678,7 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
                         let t_exit_raw = t_max_voxel + vec3<f32>(to_edge) * t_delta_voxel;
                         let t_exit = select(t_exit_raw, vec3<f32>(1e30), step_chunk == vec3<i32>(0));
                         let t_box = min(t_exit.x, min(t_exit.y, t_exit.z));
-                        if (t_box > max_t) { return false; }
+                        if (t_box > t_cap) { return false; }
                         // Crossings of each axis at t ≤ t_box (`max(…, 0)`
                         // keeps the parallel-axis lanes NaN-free).
                         let num = max(vec3<f32>(t_box) - t_max_voxel, vec3<f32>(0.0));
@@ -647,17 +721,17 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
                 steps = steps + 1u;
                 if (steps >= u.shadow_max_steps) { return false; }
                 if (t_max_voxel.x < t_max_voxel.y && t_max_voxel.x < t_max_voxel.z) {
-                    if (t_max_voxel.x > max_t) { return false; }
+                    if (t_max_voxel.x > t_cap) { return false; }
                     p_voxel.x = p_voxel.x + step_chunk.x;
                     t_max_voxel.x = t_max_voxel.x + t_delta_voxel.x;
                     if (p_voxel.x < 0 || p_voxel.x >= vsid_mip) { break; }
                 } else if (t_max_voxel.y < t_max_voxel.z) {
-                    if (t_max_voxel.y > max_t) { return false; }
+                    if (t_max_voxel.y > t_cap) { return false; }
                     p_voxel.y = p_voxel.y + step_chunk.y;
                     t_max_voxel.y = t_max_voxel.y + t_delta_voxel.y;
                     if (p_voxel.y < 0 || p_voxel.y >= vsid_mip) { break; }
                 } else {
-                    if (t_max_voxel.z > max_t) { return false; }
+                    if (t_max_voxel.z > t_cap) { return false; }
                     p_voxel.z = p_voxel.z + step_chunk.z;
                     t_max_voxel.z = t_max_voxel.z + t_delta_voxel.z;
                     if (p_voxel.z < 0 || p_voxel.z >= cz_mip) { break; }
@@ -691,7 +765,7 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
             }
             if (skip_lvl == 0u) { break; }
             if (any((p_chunk >> vec3<u32>(skip_lvl)) != block_id)) { break; }
-            if (t_enter > max_t) { break; }
+            if (t_enter > t_cap) { break; }
         }
     }
     return false;
@@ -940,7 +1014,60 @@ fn march_grid(
     // no separate enable flag is needed.
     let z_clip = grid_cameras[g].z_clip;
 
-    var p_chunk = vec3<i32>(floor(ray_origin / chunk_dim));
+    // CA follow-up — fast-forward to the grid's chunk AABB: a distant
+    // eye (the tele-iso deck camera sits ~1000+ world units out)
+    // otherwise walks EVERY pixel's ray chunk-by-chunk through the
+    // void just to reach the scene, per grid. One slab test either
+    // rejects the ray outright (sky) or advances it to ~1 world unit
+    // before the box (the backoff swallows the f32 cancellation noise
+    // of a large-t position reconstruction, so the DDA still enters
+    // through a true outside chunk). The empty-grid AABB sentinel
+    // (min > max) rejects here too. NaN lanes (origin exactly on a
+    // face of a parallel axis) fail the compares → conservative
+    // fall-through to the plain from-origin march.
+    var t_ff: f32 = 0.0;
+    // Ray t past which nothing of this grid can be hit (the box exit,
+    // +1 world unit of the same backoff slack) — checked in the outer
+    // loop so up-rays leave a tall-but-thin grid at its content top
+    // instead of chunk-stepping to the chunk-AABB edge.
+    var t_gone: f32 = 1e30;
+    {
+        // Voxel-granular in Z (vox_z_lo/hi: the grid's real solid
+        // slice — a chz-spanning ship is ~70 voxels of hull inside a
+        // 512-voxel chunk stack), chunk-granular in XY. The cutaway
+        // clip narrows the top for free (`z < z_clip` renders as air;
+        // the i32::MIN sentinel never wins the max).
+        let box_lo = vec3<f32>(
+            f32(aabb_mn.x) * chunk_dim.x,
+            f32(aabb_mn.y) * chunk_dim.y,
+            f32(max(grid_static_meta[g].vox_z_lo, z_clip)) * vws,
+        );
+        let box_hi = vec3<f32>(
+            f32(aabb_mx.x + 1) * chunk_dim.x,
+            f32(aabb_mx.y + 1) * chunk_dim.y,
+            f32(grid_static_meta[g].vox_z_hi + 1) * vws,
+        );
+        let t_a = (box_lo - ray_origin) / ray_dir;
+        let t_b = (box_hi - ray_origin) / ray_dir;
+        let t_lo = min(t_a, t_b);
+        let t_hi = max(t_a, t_b);
+        let t_in = max(max(t_lo.x, t_lo.y), t_lo.z);
+        let t_out = min(min(t_hi.x, t_hi.y), t_hi.z);
+        if (t_out < max(t_in, 0.0)) {
+            // Nothing of this grid on the ray — pristine sky (the
+            // translucent accumulator hasn't started yet).
+            return finalize_sky_grid(false, vec3<f32>(0.0), 1.0, ray_dir);
+        }
+        if (t_out < 1e29) {
+            t_gone = t_out + 1.0;
+        }
+        let ff = t_in - 1.0;
+        if (ff > 1.0 && ff < 1e30) {
+            t_ff = ff;
+        }
+    }
+
+    var p_chunk = vec3<i32>(floor((ray_origin + ray_dir * t_ff) / chunk_dim));
     let step_chunk = vec3<i32>(sign(ray_dir));
     let t_delta_chunk = abs(chunk_dim / ray_dir);
     let next_boundary_chunk = vec3<f32>(
@@ -953,7 +1080,7 @@ fn march_grid(
         ray_dir,
     );
 
-    var t_enter: f32 = 0.0;
+    var t_enter: f32 = t_ff;
     // Axis crossed to enter the current chunk (= the face normal of a
     // voxel that is already solid at the chunk-entry point). Seeds
     // `hit_axis` for the `iv==0` case so a surface flush with the chunk
@@ -976,7 +1103,7 @@ fn march_grid(
     var prev_mat = 0u;
 
     for (var step: u32 = 0u; step < u.max_outer_steps; step = step + 1u) {
-        if (t_enter > best_t) {
+        if (t_enter > best_t || t_enter > t_gone) {
             return finalize_sky_grid(touched, accum, trans, ray_dir);
         }
         // GPU.13.0 — once the ray has left the occupied chunk-AABB
@@ -1008,14 +1135,20 @@ fn march_grid(
             // `z_clip >> mip` (the CA.3 parity gate pins the pair).
             let z_clip_mip = z_clip >> mip;
             // CA follow-up — empty-block skip (see shadow_occluded):
-            // the coarse SOLID mip doubles as a brick map, so rays
+            // the coarse SOLID mips double as brick maps, so rays
             // cross in-chunk air in 2^gap-cell jumps instead of
-            // per-voxel steps. Skipping solid-free boxes can't change
-            // any hit (mip-superset gate) — pure traversal speed.
+            // per-voxel steps. TWO tiers, like the CPU's brick/super
+            // pair: the coarsest level (32³ at mip 0) is tried first,
+            // then the mip+3 level (8³). Skipping solid-free boxes
+            // can't change any hit (mip-superset gate) — pure speed.
             var skip_gap = 0u;
             var skip_vsid = 0u;
             var skip_wpc = 0u;
             var skip_col_base = 0u;
+            var sup_gap = 0u;
+            var sup_vsid = 0u;
+            var sup_wpc = 0u;
+            var sup_col_base = 0u;
             if (mip + 2u < mip_count) {
                 let l = min(mip + 3u, mip_count - 1u);
                 skip_gap = l - mip;
@@ -1025,6 +1158,16 @@ fn march_grid(
                     + slot_id * occ_words_slot
                     + grid_static_meta[g].mip_occ_rel[l]
                     + skip_vsid * skip_vsid * skip_wpc;
+                let l2 = mip_count - 1u;
+                if (l2 > l) {
+                    sup_gap = l2 - mip;
+                    sup_vsid = vsid >> l2;
+                    sup_wpc = occ_words_per_col_for_mip(l2);
+                    sup_col_base = occ_off
+                        + slot_id * occ_words_slot
+                        + grid_static_meta[g].mip_occ_rel[l2]
+                        + sup_vsid * sup_vsid * sup_wpc;
+                }
             }
             // PF.1 — solid-occupancy word base for this (slot, mip), hoisted
             // out of the inner loop (textured block first, solid after it),
@@ -1072,15 +1215,29 @@ fn march_grid(
 
             for (var iv: u32 = 0u; iv < MAX_INNER_STEPS; iv = iv + 1u) {
                 // CA follow-up — empty-block skip (mirror of the shadow
-                // march): jump solid-free coarse blocks. The landing
-                // cell is entered at `t_box` through the exit axis, so
-                // `t_hit`/`hit_axis` update exactly as a dense step
-                // would; skipped air resets the translucent run.
+                // march): jump solid-free coarse blocks, coarsest tier
+                // first. The landing cell is entered at `t_box` through
+                // the exit axis, so `t_hit`/`hit_axis` update exactly
+                // as a dense step would; skipped air resets the
+                // translucent run.
                 if (skip_gap > 0u) {
-                    let b = vec3<u32>(p_voxel) >> vec3<u32>(skip_gap);
-                    let bw = skip_col_base + (b.x + b.y * skip_vsid) * skip_wpc + (b.z >> 5u);
-                    if ((occ_word(bw) & (1u << (b.z & 31u))) == 0u) {
-                        let bmask = vec3<i32>(i32((1u << skip_gap) - 1u));
+                    var gap = 0u;
+                    if (sup_gap > 0u) {
+                        let bs = vec3<u32>(p_voxel) >> vec3<u32>(sup_gap);
+                        let bws = sup_col_base + (bs.x + bs.y * sup_vsid) * sup_wpc + (bs.z >> 5u);
+                        if ((occ_word(bws) & (1u << (bs.z & 31u))) == 0u) {
+                            gap = sup_gap;
+                        }
+                    }
+                    if (gap == 0u) {
+                        let b = vec3<u32>(p_voxel) >> vec3<u32>(skip_gap);
+                        let bw = skip_col_base + (b.x + b.y * skip_vsid) * skip_wpc + (b.z >> 5u);
+                        if ((occ_word(bw) & (1u << (b.z & 31u))) == 0u) {
+                            gap = skip_gap;
+                        }
+                    }
+                    if (gap > 0u) {
+                        let bmask = vec3<i32>(i32((1u << gap) - 1u));
                         let to_edge = select(
                             p_voxel & bmask,
                             bmask - (p_voxel & bmask),

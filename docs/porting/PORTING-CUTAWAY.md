@@ -116,6 +116,33 @@ the first to surface:
    `scene_dda_cross_grid_shadow_survives_tele_distance`). CPU and GPU
    shadow masks now agree exactly on the Decks fixture.
 
+### GPU perf round (user target: 80 FPS; landed at ~127)
+
+Breakdown-driven (A/B FPS at 860×520 NVK: no-lights 81 → shadows were
+~20 ms of the 34 ms frame):
+
+1. **Two-tier block skip** — the 8³ skip alone left 25-57 iterations
+   per shadow ray crossing chunk air; the coarsest solid mip (32³ at
+   mip 0) joins as a super tier, CPU brick/super style. 29 → 46 FPS.
+2. **Content-box fast-forward** (march_grid + shadow_occluded +
+   sprite_terrain_shadow) — one slab test rejects or advances every
+   ray to the grid's content box instead of chunk-stepping the ~1150
+   world units of approach void per grid per pixel. 46 → 61 FPS.
+3. **Voxel-granular Z bounds** — new `GridStaticMeta.vox_z_lo/hi`
+   (solid-bitmap extents, live on refresh/evict/partial-refresh; the
+   cutaway clip narrows the top for free) shrink the box from the
+   512-voxel chunk stack to the ~74-voxel hull and CAP rays at the box
+   exit. 61 → **~127 FPS**; World scene ~366 FPS. Demo knob:
+   `shadow_max_dist` 200 → 110 (real occluder reach ≈ 90).
+4. **Root-caused a THIRD silent layout bug** while wiring `vox_z`: WGSL
+   packs bare `vec3<i32>` members 12-byte-tight, so every
+   `GridStaticMeta` tail field was read 4 bytes early (stride still
+   matched) — the GPU.13.1 occupancy pyramid's level count read
+   `mip_off[3]` = 0 and the pyramid NEVER FIRED. Fixed with
+   `@size(16)` on the aabb pair + an offset-pinning test; the sprite
+   terrain-shadow mirror was additionally a truncated 144-byte struct
+   (garbage meta for g ≥ 1) — full tail now declared.
+
 ## Goal
 
 Per-grid horizontal clip plane for isometric "deck view" rendering (SS13 /

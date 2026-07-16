@@ -66,12 +66,22 @@ which only `Grid::new` constructs — no literal breakage there).
   (API, semantics, the footprint rule, the light-cull pattern,
   tele-iso); the demo tour lists the Decks tab.
 - **GPU empty-block skip** (CA visual-pass follow-up): the primary,
-  sun-shadow and sprite-shadow WGSL marches jump solid-free 8³-cell
-  boxes via the coarse SOLID mip levels already resident per slot —
-  the GPU analogue of the CPU brick skip. Safe by construction (a new
-  `solid_mips_are_child_supersets` gate pins that every mip level is a
-  superset of its children); measured 12 → ~30 FPS on the Decks tele
-  view (NVK, 860×520) with all shadow geometry intact.
+  sun-shadow and sprite-shadow WGSL marches jump solid-free boxes via
+  the coarse SOLID mip levels already resident per slot — two tiers
+  (8³ + 32³ at mip 0), the GPU analogue of the CPU brick/super pair.
+  Safe by construction (a new `solid_mips_are_child_supersets` gate
+  pins that every mip level is a superset of its children).
+- **GPU content-box fast-forward + caps**: every march slab-tests the
+  grid's content box up front — chunk-granular in XY, **voxel-granular
+  in Z** (new live-maintained `GridStaticMeta.vox_z_lo/hi`, computed
+  from the solid bitmaps at upload/refresh/evict; the cutaway clip
+  narrows the top for free) — rejecting non-intersecting rays in one
+  test, entering at the content instead of chunk-stepping the approach
+  void (a tele camera sits 1000+ units out), and capping the ray at
+  the box exit so up-rays leave a chz-spanning hull at its roof, not
+  at the 512-voxel chunk-stack edge. Together with the block skip:
+  Decks tele view 12 → ~127 FPS, World scene ~366 FPS (NVK, 860×520),
+  identical images.
 
 ### Fixed
 
@@ -84,6 +94,17 @@ which only `Grid::new` constructs — no literal breakage there).
   (well-conditioned at any distance); same fix in the shadow-march and
   scene-occluder mirrors. One stability hash re-frozen (the structural
   no-seam + skip-vs-dense gates pin correctness).
+- **WGSL `GridStaticMeta` tail misalignment (GPU)**: a bare
+  `vec3<i32>` is 12 bytes in WGSL and the next member packs at its own
+  alignment, while the host struct pads to 16 — every field after
+  `aabb_min`/`aabb_max` was read 4 bytes early (the total stride still
+  agreed, so nothing failed loudly). Concretely the GPU.13.1
+  chunk-occupancy pyramid read `mip_off[3]` as its level count —
+  usually 0, silently never firing. Fixed with explicit `@size(16)`
+  annotations; a new offset-pinning test guards the layout. Also: the
+  sprite terrain-shadow WGSL declared a TRUNCATED 144-byte mirror of
+  the 176-byte struct, mis-indexing all meta for grids past the first
+  — now the full tail is declared.
 - **Phantom shadows from placeholder bedrock (CPU)**: the cross-grid
   shadow occluder counted the invisible zero-RGB bedrock placeholder
   (the bottom voxel of never-written columns in materialised chunks)
