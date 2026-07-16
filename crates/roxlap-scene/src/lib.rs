@@ -187,8 +187,12 @@ fn grid_voxel_aabb_f64(grid: &Grid) -> Option<(DVec3, DVec3)> {
 ///   the slab chain in place (no per-step allocation);
 /// - a voxel in an absent (all-air) chunk fast-forwards the march to
 ///   that chunk's exit face instead of stepping its up-to-128 voxels.
+///
+/// CA.4 — `z_clip` in grid-local absolute voxel z: cells with
+/// `z < z_clip` read as air (the cutaway rule). `i32::MIN` = disabled
+/// (no real cell lies below it — the same sentinel the renderers use).
 #[allow(clippy::cast_possible_truncation)]
-fn voxel_dda(grid: &Grid, lo: DVec3, ld: DVec3, max_t: f64) -> Option<(IVec3, f64)> {
+fn voxel_dda(grid: &Grid, lo: DVec3, ld: DVec3, max_t: f64, z_clip: i32) -> Option<(IVec3, f64)> {
     // Clip to the populated chunk AABB: everything outside is air.
     let (blo, bhi) = grid_voxel_aabb_f64(grid)?;
     let (t0, t1) = ray_box(lo, ld, blo, bhi)?;
@@ -252,7 +256,8 @@ fn voxel_dda(grid: &Grid, lo: DVec3, ld: DVec3, max_t: f64) -> Option<(IVec3, f6
     for _ in 0..max_steps {
         let (chunk_idx, in_chunk) = voxel_split(p);
         if let Some(vxl) = sampler.chunk_at(chunk_idx) {
-            if chunks::vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z) {
+            // CA.4 — clipped-away cells (z < z_clip) read as air.
+            if p.z >= z_clip && chunks::vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z) {
                 return Some((p, t_curr));
             }
             // Advance across the nearest voxel boundary.
@@ -446,6 +451,22 @@ pub struct Grid {
     /// artifact when near-axis-aligned rays hit the rotated grid.
     /// `Some(1)` = mip-0 only, byte-stable to single-mip.
     pub mip_levels_override: Option<u32>,
+    /// CA.0 — cutaway deck clip: grid-local **absolute** voxel z
+    /// (z-down, spanning stacked chz chunks — the same space
+    /// [`Self::set_voxel`] addresses). `Some(z)` makes both renderers
+    /// treat every voxel with `z < z_clip` as air, exposing the
+    /// interior for an isometric "deck view" (SS13-style); `z_clip`
+    /// itself is the first visible layer and its top face renders as
+    /// the cut surface. Stays glued to a rotated/moving grid (the clip
+    /// is grid-local). **Render-only**: simulation, collision, audio
+    /// occlusion and pathing still see the full grid — a hidden deck
+    /// keeps blocking sound and movement. Point lights are NOT
+    /// filtered by the engine; cull lights on hidden decks game-side
+    /// when setting the clip. Persisted in snapshots (wire v4+; older
+    /// saves load with `None`). `None` (the default) = no clipping,
+    /// byte-identical to pre-CA renders. Set directly or via
+    /// [`Scene::set_grid_z_clip`].
+    pub z_clip: Option<i32>,
     /// World-distance thresholds for per-grid LOD tier selection
     /// (S6.0). Defaults to [`LodThresholds::always_near`], so a
     /// freshly-constructed grid always renders at full voxel (the
@@ -596,6 +617,7 @@ impl Grid {
             chunks: HashMap::new(),
             render_sky: true,
             mip_levels_override: None,
+            z_clip: None,
             lod_thresholds: LodThresholds::always_near(),
             billboards: None,
             generator: None,
@@ -651,6 +673,34 @@ impl Grid {
         dda_brick_cache.retain_chunks(|c| chunks.contains_key(&IVec3::new(c[0], c[1], c[2])));
         self.last_bricks = Some((mutations, requested_mip, mip));
         mip
+    }
+
+    /// CA.4 — the cutaway **footprint rule** for world-positioned
+    /// objects (sprite instances, actors, particles): `true` iff this
+    /// grid's [`Self::z_clip`] hides the world-space point — the
+    /// point, mapped into the grid's local frame, lands inside the
+    /// grid's materialised **XY chunk footprint** with local voxel
+    /// `z < z_clip`. Points outside the footprint are NEVER affected
+    /// (clipping the ship's upper decks must not hide a character
+    /// standing on the ground beside the ship, even when they share a
+    /// world height). `false` when no clip is set or the grid is
+    /// empty. Both renderers hide sprite instances by this rule, so
+    /// hosts can reuse it for their own overlays/effects.
+    #[must_use]
+    pub fn cutaway_hides_point(&self, world: DVec3) -> bool {
+        let Some(zc) = self.z_clip else {
+            return false;
+        };
+        let Some((blo, bhi)) = grid_voxel_aabb_f64(self) else {
+            return false;
+        };
+        let local = (self.transform.rotation.inverse() * (world - self.transform.origin))
+            / self.transform.voxel_world_size;
+        local.x >= blo.x
+            && local.x < bhi.x
+            && local.y >= blo.y
+            && local.y < bhi.y
+            && local.z < f64::from(zc)
     }
 
     /// Current per-chunk edit version (S7.2). Returns `0` for any
@@ -963,6 +1013,31 @@ impl Scene {
         self.grids.get_mut(&id)
     }
 
+    /// CA.0 — set (or clear, with `None`) a grid's cutaway clip
+    /// ([`Grid::z_clip`]): both renderers treat voxels with
+    /// `z < z_clip` (grid-local absolute voxel z, z-down) as air,
+    /// exposing the interior below for an isometric "deck view".
+    /// Render-only — collision, audio and simulation still see the
+    /// full grid. Returns `false` if `id` is not a registered grid.
+    pub fn set_grid_z_clip(&mut self, id: GridId, z_clip: Option<i32>) -> bool {
+        match self.grids.get_mut(&id) {
+            Some(g) => {
+                g.z_clip = z_clip;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// CA.4 — whether ANY grid's cutaway clip hides the world-space
+    /// point under the footprint rule ([`Grid::cutaway_hides_point`]).
+    /// The per-instance test both renderers apply to sprites; cheap
+    /// when no grid has a clip set (each unclipped grid early-outs).
+    #[must_use]
+    pub fn cutaway_hides_point(&self, world: DVec3) -> bool {
+        self.grids.values().any(|g| g.cutaway_hides_point(world))
+    }
+
     /// Iterator over all `(id, grid)` pairs in registration order
     /// is **not** guaranteed — the underlying map is a `HashMap`.
     /// Callers that need a stable order must sort by [`GridId`].
@@ -1020,6 +1095,28 @@ impl Scene {
     /// optimisation if hot.
     #[must_use]
     pub fn raycast(&self, origin: DVec3, dir: DVec3, max_dist: f64) -> Option<RayHit> {
+        self.raycast_impl(origin, dir, max_dist, false)
+    }
+
+    /// CA.4 — clip-aware [`Self::raycast`] variant for click-to-select
+    /// on decks: voxels each grid's [`Grid::z_clip`] hides read as air,
+    /// so the ray lands on what the CUT render shows (the exposed
+    /// interior) instead of the hidden hull above it. Grids without a
+    /// clip behave exactly as in `raycast`. Use the plain `raycast`
+    /// for gameplay traces — hidden decks still block projectiles and
+    /// line-of-sight (the clip is render/picking-only).
+    #[must_use]
+    pub fn raycast_clipped(&self, origin: DVec3, dir: DVec3, max_dist: f64) -> Option<RayHit> {
+        self.raycast_impl(origin, dir, max_dist, true)
+    }
+
+    fn raycast_impl(
+        &self,
+        origin: DVec3,
+        dir: DVec3,
+        max_dist: f64,
+        apply_clip: bool,
+    ) -> Option<RayHit> {
         let len = dir.length();
         if len < 1e-12 || max_dist <= 0.0 {
             return None;
@@ -1040,7 +1137,13 @@ impl Scene {
             let vws = grid.transform.voxel_world_size;
             let lo = (inv * (origin - grid.transform.origin)) / vws;
             let ld = inv * dn;
-            if let Some((voxel, t_local)) = voxel_dda(grid, lo, ld, max_dist / vws) {
+            // CA.4 — the clipped variant applies each grid's OWN clip.
+            let z_clip = if apply_clip {
+                grid.z_clip.unwrap_or(i32::MIN)
+            } else {
+                i32::MIN
+            };
+            if let Some((voxel, t_local)) = voxel_dda(grid, lo, ld, max_dist / vws, z_clip) {
                 let t = t_local * vws;
                 if best.as_ref().is_none_or(|b| t < b.t) {
                     best = Some(RayHit {
@@ -1491,6 +1594,71 @@ mod tests {
         assert_eq!(hit.voxel, IVec3::new(5, 5, 10), "grid-local voxel");
         assert!((hit.world.x - 105.5).abs() < 1e-6, "world x preserved");
         assert!((hit.t - 10.0).abs() < 1e-6, "t≈10, got {}", hit.t);
+    }
+
+    /// CA.4 — the footprint rule: a clipped grid hides world points
+    /// that map inside its materialised XY chunk footprint with local
+    /// `z < z_clip`; points below the plane or outside the footprint
+    /// are never affected, and an unclipped grid hides nothing.
+    #[test]
+    fn cutaway_footprint_rule_hides_points() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at(DVec3::new(100.0, 0.0, 0.0)));
+        // Materialise chunk (0,0,0) → XY footprint [0, 128)².
+        scene
+            .grid_mut(id)
+            .unwrap()
+            .set_voxel(IVec3::new(5, 5, 200), Some(VoxColor(0x80_10_20_30)));
+        // No clip yet: nothing is hidden.
+        assert!(!scene.cutaway_hides_point(DVec3::new(116.0, 16.0, 50.0)));
+
+        assert!(scene.set_grid_z_clip(id, Some(120)));
+        // Inside the footprint, above the plane (local z 50 < 120).
+        assert!(scene.cutaway_hides_point(DVec3::new(116.0, 16.0, 50.0)));
+        // Below the plane stays.
+        assert!(!scene.cutaway_hides_point(DVec3::new(116.0, 16.0, 200.0)));
+        // Above the plane but OUTSIDE the XY footprint (local x = 300):
+        // a character beside the ship keeps rendering.
+        assert!(!scene.cutaway_hides_point(DVec3::new(400.0, 16.0, 50.0)));
+        // Behind the grid origin (local x < 0) is outside too.
+        assert!(!scene.cutaway_hides_point(DVec3::new(50.0, 16.0, 50.0)));
+    }
+
+    /// CA.4 — `raycast_clipped` lands on what the cut render shows (the
+    /// exposed interior), while the plain `raycast` keeps hitting the
+    /// hidden hull — gameplay traces ignore the render-only clip.
+    #[test]
+    fn raycast_clipped_lands_on_exposed_interior() {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        {
+            let g = scene.grid_mut(id).unwrap();
+            // Roof plate at z=40 over a floor plate at z=100.
+            g.set_rect(
+                IVec3::new(0, 0, 40),
+                IVec3::new(31, 31, 40),
+                Some(VoxColor(0x80_aa_00_00)),
+            );
+            g.set_rect(
+                IVec3::new(0, 0, 100),
+                IVec3::new(31, 31, 100),
+                Some(VoxColor(0x80_00_aa_00)),
+            );
+            g.z_clip = Some(80);
+        }
+        let (o, d) = (DVec3::new(10.5, 10.5, 0.0), DVec3::new(0.0, 0.0, 1.0));
+        // Plain raycast: the roof still blocks (clip is render-only).
+        let solid = scene.raycast(o, d, 256.0).expect("roof blocks");
+        assert_eq!(solid.voxel, IVec3::new(10, 10, 40));
+        // Clipped raycast: the roof reads as air; the click lands on
+        // the exposed floor — exactly what the cut render shows.
+        let cut = scene.raycast_clipped(o, d, 256.0).expect("floor visible");
+        assert_eq!(cut.voxel, IVec3::new(10, 10, 100));
+        assert!((cut.t - 100.0).abs() < 1e-6, "t≈100, got {}", cut.t);
+        // With the clip removed both variants agree again.
+        scene.set_grid_z_clip(id, None);
+        let back = scene.raycast_clipped(o, d, 256.0).expect("roof again");
+        assert_eq!(back.voxel, IVec3::new(10, 10, 40));
     }
 
     #[test]

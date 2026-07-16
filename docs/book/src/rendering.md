@@ -141,6 +141,80 @@ For textured quads (world-fixed or billboarded) there is the
 `upload_image` / `draw_images` pair — same slot in the protocol, see
 the [docs.rs](https://docs.rs/roxlap-render) entries.
 
+## Cutaway deck views
+
+For ship-interior ("deck view") rendering, every grid carries an
+optional horizontal clip plane — set `Grid::z_clip` directly or via
+the scene facade:
+
+```rust,noplayground
+// Hide everything above grid-local voxel z = 290 (z-down): the upper
+// decks vanish, z = 290 is the first visible layer and its top face
+// renders as the cut surface. `None` restores the full grid.
+scene.set_grid_z_clip(ship, Some(290));
+```
+
+Semantics, on both backends identically:
+
+- **Grid-local, absolute voxel z.** The plane lives in the grid's own
+  frame (the same coordinates `set_voxel` uses, spanning stacked
+  chunks), so it stays glued to a rotated or moving ship. Voxels with
+  `z < z_clip` render as air; `z_clip` itself stays visible.
+- **"World as if removed."** Primary rays, sun and point-light shadow
+  rays (including cross-grid ones — each grid applies its *own*
+  clip), sprite visibility and picking all agree. A cut-away deck
+  neither renders *nor* casts shadows onto what's exposed below.
+- **The cut face** reuses the run-top colour fallback — voxlap RLE
+  stores no interior colours, so a cut through a solid region shows
+  the run's stored surface colour with the normal top-face shading.
+  No new material in v1.
+- **Render-only.** Simulation, collision, audio occlusion and
+  `Scene::raycast` still see the full grid: a hidden deck keeps
+  blocking sound, movement and gameplay traces. Persisted in
+  snapshots (wire v4; older saves load unclipped).
+
+**Sprites — the footprint rule.** A sprite instance is hidden while
+its origin, mapped into a clipped grid's frame, lands inside that
+grid's materialised XY chunk footprint with local `z < z_clip`.
+Instances outside the footprint are never affected — clipping the
+ship's upper decks hides the crew *on* those decks, not a character
+standing on the ground beside the hull. The same test is exposed as
+`Scene::cutaway_hides_point(world)` for your own overlays and
+effects.
+
+**Lights are game-managed.** The engine deliberately does *not*
+filter point lights above the plane — a lamp on a hidden deck would
+keep lighting the exposed interior. Cull them yourself with the same
+footprint rule when the cut moves:
+
+```rust,noplayground
+// The light-cull pattern (see the demo's Decks scene): keep only the
+// lights the cut doesn't hide.
+lit.clear();
+lit.extend(
+    cabin_lights
+        .iter()
+        .filter(|l| !scene.cutaway_hides_point(l.position.into()))
+        .copied(),
+);
+frame.lights = Some(LightRig { points: &lit, ..rig });
+```
+
+**Picking on the cut.** GPU depth picks are clip-aware for free (they
+read the clipped render's depth). For a CPU-side trace that lands on
+what the cut *shows* — click-to-select on decks — use
+`Scene::raycast_clipped`; keep the plain `raycast` for gameplay
+line-of-sight, which must ignore the render-only clip.
+
+**The iso look** is just a camera: a distant eye with a narrow FOV
+("tele-iso", ≈ 0.15 rad) flattens perspective without any
+orthographic projection. On the GPU backend raise
+`set_gpu_mip_scan_dist` past the orbit distance while such a view is
+active, or distance LOD will coarsen the whole scene. The scene demo
+ships the full pattern as the **Decks** tab
+(`ROXLAP_SCENE=Decks cargo run -p roxlap-scene-demo`, `PgUp`/`PgDn`
+slides the cut).
+
 ## Where next
 
 - [The render pipeline](render-pipeline.md) — the fixed-resolution /

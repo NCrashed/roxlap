@@ -771,20 +771,100 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// CA.4 — one clipped grid's cutaway volume for the sprite cull: the
+/// **footprint rule**. An instance whose origin, mapped into the grid's
+/// local voxel frame, lands inside the grid's XY chunk footprint with
+/// `z < z_clip` is hidden this frame — dropped from the visible set,
+/// which also stops it casting sprite shadows (the shadow pass marches
+/// the culled visible set). Instances outside the footprint are never
+/// affected. Built per frame by `SceneRenderer::render_scene` from the
+/// per-grid world transforms + the resident chunk AABBs.
+#[derive(Clone, Copy, PartialEq)]
+pub struct SpriteCutawayClip {
+    /// Grid world origin.
+    pub origin: [f32; 3],
+    /// World→local rotation rows: `local[i] = dot(inv_rows[i], w - origin)`
+    /// (= the grid's local→world rotation columns, reused as rows).
+    pub inv_rows: [[f32; 3]; 3],
+    /// `1 / voxel_world_size` — world offsets → voxel coords.
+    pub inv_vws: f32,
+    /// XY footprint `[lo, hi)` of the grid's resident chunks, voxel coords.
+    pub xy_lo: [f32; 2],
+    /// See [`Self::xy_lo`].
+    pub xy_hi: [f32; 2],
+    /// The clip plane ([`crate::GridWorldTransform::z_clip`]), voxel z.
+    pub z_clip: f32,
+}
+
+impl SpriteCutawayClip {
+    /// Whether the footprint rule hides a world-space point.
+    fn hides(&self, p: [f32; 3]) -> bool {
+        let rel = [
+            p[0] - self.origin[0],
+            p[1] - self.origin[1],
+            p[2] - self.origin[2],
+        ];
+        let x = dot3(self.inv_rows[0], rel) * self.inv_vws;
+        if x < self.xy_lo[0] || x >= self.xy_hi[0] {
+            return false;
+        }
+        let y = dot3(self.inv_rows[1], rel) * self.inv_vws;
+        if y < self.xy_lo[1] || y >= self.xy_hi[1] {
+            return false;
+        }
+        dot3(self.inv_rows[2], rel) * self.inv_vws < self.z_clip
+    }
+
+    /// Bitwise fingerprint for the [`CullKey`] frame cache.
+    fn key_bits(&self) -> [u32; 18] {
+        let b = |v: f32| v.to_bits();
+        [
+            b(self.origin[0]),
+            b(self.origin[1]),
+            b(self.origin[2]),
+            b(self.inv_rows[0][0]),
+            b(self.inv_rows[0][1]),
+            b(self.inv_rows[0][2]),
+            b(self.inv_rows[1][0]),
+            b(self.inv_rows[1][1]),
+            b(self.inv_rows[1][2]),
+            b(self.inv_rows[2][0]),
+            b(self.inv_rows[2][1]),
+            b(self.inv_rows[2][2]),
+            b(self.inv_vws),
+            b(self.xy_lo[0]),
+            b(self.xy_lo[1]),
+            b(self.xy_hi[0]),
+            b(self.xy_hi[1]),
+            b(self.z_clip),
+        ]
+    }
+}
+
 /// PF.10 — everything `cull_bin_upload`'s result depends on besides the
 /// registry contents (float fields compared bitwise). Paired with the
 /// "registry changed" invalidation (`last_cull = None` in every mutating
 /// method): when the key matches the previous frame's, the cull, the
 /// binning, and all four buffer uploads are skipped — the buffers already
-/// hold exactly this frame's data.
-#[derive(Clone, Copy, PartialEq)]
+/// hold exactly this frame's data. CA.4 adds the cutaway-clip volumes
+/// (bitwise) — moving a clip plane changes the visible set, so it must
+/// invalidate the cache like a camera move.
+#[derive(Clone, PartialEq)]
 struct CullKey {
     frustum: [u32; 15],
     screen: [u32; 4],
+    clips: Vec<[u32; 18]>,
 }
 
 impl CullKey {
-    fn new(f: &ViewFrustum, screen_w: u32, screen_h: u32, tile_size: u32, lod_px: f32) -> Self {
+    fn new(
+        f: &ViewFrustum,
+        screen_w: u32,
+        screen_h: u32,
+        tile_size: u32,
+        lod_px: f32,
+        clips: &[SpriteCutawayClip],
+    ) -> Self {
         let b = |v: f32| v.to_bits();
         Self {
             frustum: [
@@ -805,6 +885,7 @@ impl CullKey {
                 b(f.far),
             ],
             screen: [screen_w, screen_h, tile_size, lod_px.to_bits()],
+            clips: clips.iter().map(SpriteCutawayClip::key_bits).collect(),
         }
     }
 }
@@ -1873,6 +1954,9 @@ impl SpriteRegistryResident {
         screen_h: u32,
         tile_size: u32,
         lod_px: f32,
+        // CA.4 — per-frame cutaway volumes; an instance inside any of
+        // them is hidden (footprint rule). Empty ⇒ pre-CA behaviour.
+        clips: &[SpriteCutawayClip],
     ) -> (u32, u32, u32) {
         let tiles_x = screen_w.div_ceil(tile_size).max(1);
         let tiles_y = screen_h.div_ceil(tile_size).max(1);
@@ -1881,10 +1965,10 @@ impl SpriteRegistryResident {
         // PF.10 — nothing changed since the last cull (same registry
         // state, same view, same screen): the four buffers already hold
         // exactly this frame's data — skip the whole cull/bin/upload.
-        let key = CullKey::new(f, screen_w, screen_h, tile_size, lod_px);
-        if let Some((k, res)) = self.last_cull {
-            if k == key {
-                return res;
+        let key = CullKey::new(f, screen_w, screen_h, tile_size, lod_px, clips);
+        if let Some((k, res)) = &self.last_cull {
+            if *k == key {
+                return *res;
             }
         }
 
@@ -1922,6 +2006,11 @@ impl SpriteRegistryResident {
             // linger in `cull` until the caller drops them, but draw as
             // nothing.
             if self.chains[ci.chain_id as usize].is_empty() {
+                continue;
+            }
+            // CA.4 — cutaway footprint rule: hidden instances drop out
+            // of the visible set (and with it, sprite shadow casting).
+            if clips.iter().any(|c| c.hides(ci.center)) {
                 continue;
             }
             let rel = [
@@ -2394,6 +2483,49 @@ fn storage_pod<T: Pod + Zeroable>(device: &wgpu::Device, label: &str, data: &[T]
 mod tests {
     use super::*;
     use roxlap_formats::kv6::{Kv6, Voxel};
+
+    /// CA.4 — the footprint rule's point test: inside-footprint +
+    /// above-plane hides; below the plane or outside the XY footprint
+    /// never does; rotated / scaled grids test in THEIR voxel frame.
+    #[test]
+    fn cutaway_clip_footprint_rule() {
+        let clip = SpriteCutawayClip {
+            origin: [10.0, 0.0, 0.0],
+            inv_rows: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            inv_vws: 1.0,
+            xy_lo: [0.0, 0.0],
+            xy_hi: [128.0, 128.0],
+            z_clip: 120.0,
+        };
+        assert!(clip.hides([20.0, 5.0, 50.0]), "inside + above plane");
+        assert!(!clip.hides([20.0, 5.0, 150.0]), "below the plane");
+        assert!(!clip.hides([20.0, 5.0, 120.0]), "on the plane = visible");
+        assert!(!clip.hides([300.0, 5.0, 50.0]), "outside the footprint");
+        assert!(!clip.hides([5.0, 5.0, 50.0]), "x < origin: outside");
+
+        // 90°-about-z grid (local x = world y, local y = −world x): the
+        // footprint follows the ROTATED frame, not the world axes.
+        let rot = SpriteCutawayClip {
+            inv_rows: [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            ..clip
+        };
+        assert!(
+            rot.hides([-20.0, 40.0, 50.0]),
+            "local (40, 30): inside the rotated footprint"
+        );
+        assert!(
+            !rot.hides([20.0, 40.0, 50.0]),
+            "local (40, -10): outside the rotated footprint"
+        );
+        // A scaled grid (vws = 0.5 ⇒ inv_vws = 2): world offsets double
+        // in voxel coords, so world x = 74 → voxel x = 128 (outside).
+        let scaled = SpriteCutawayClip {
+            inv_vws: 2.0,
+            ..clip
+        };
+        assert!(scaled.hides([40.0, 5.0, 50.0]), "voxel (60, 10, 100) < 120");
+        assert!(!scaled.hides([74.0, 5.0, 50.0]), "voxel x = 128: outside");
+    }
 
     /// 2×1 kv6: column (0,0) has voxels at z=5 (red) and z=1 (green)
     /// stored OUT of z-order; column (1,0) has one voxel at z=3.
@@ -3233,7 +3365,7 @@ mod tests {
         // The next cull packs the new chain into the GPU instance buffer
         // (visible, no panic).
         let f = test_frustum();
-        let (visible, _, _) = res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0);
+        let (visible, _, _) = res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0, &[]);
         assert_eq!(visible, 1);
 
         // …and back to frame 0.
@@ -3298,7 +3430,7 @@ mod tests {
 
         // The lingering instance of removed B is skipped without panic.
         let f = test_frustum();
-        let _ = res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0);
+        let _ = res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0, &[]);
     }
 
     #[test]

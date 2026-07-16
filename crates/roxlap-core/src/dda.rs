@@ -82,6 +82,16 @@ pub struct DdaEnv<'a> {
     /// local→world transform, instead of the single-grid `SamplerShadow`.
     /// `None` ⇒ single-grid shadows (the direct `render_dda` path / tests).
     pub world_shadow: Option<WorldShadowCtx<'a>>,
+    /// CA.0 — per-grid cutaway clip (stage CA), grid-local **absolute**
+    /// voxel z (the same space as [`GridView::voxel_bounds`], spanning
+    /// stacked chz chunks; z-down). `Some(z)` makes the renderer treat
+    /// every cell with `z < z_clip` as air — the isometric "deck view"
+    /// cut; `z_clip` itself is the first visible layer, whose top face
+    /// renders as the cut surface (colour = the existing
+    /// [`GridView::surface_color_mip`] run-top fallback). Render-only:
+    /// simulation / collision / audio are untouched. `None` (the
+    /// default) disables clipping — byte-identical to pre-CA renders.
+    pub z_clip: Option<i32>,
 }
 
 /// CPU.1 — one point light in a grid's local frame for the CPU renderer.
@@ -165,6 +175,7 @@ impl Default for DdaEnv<'_> {
             terrain_materials: &[],
             lights: CpuLights::default(),
             world_shadow: None,
+            z_clip: None,
         }
     }
 }
@@ -1149,6 +1160,12 @@ struct Sampler<'a> {
     xy_mask: i32,
     z_shift: u32,
     z_mask: i32,
+    /// CA.1 — cutaway clip plane in **mip-cells** (`z_clip >> mip`;
+    /// arithmetic shift = floor, matching the GPU formula). Cells with
+    /// `c[2] < z_clip_mip` read as air. `i32::MIN` = disabled: no real
+    /// cell index is ever below it, so the gate is branch-cheap with
+    /// no `Option` unwrap per cell.
+    z_clip_mip: i32,
     cur_ch: [i32; 3],
     cur_view: Option<GridView<'a>>,
     cur_brick: Option<&'a BrickMap>,
@@ -1156,7 +1173,7 @@ struct Sampler<'a> {
 }
 
 impl<'a> Sampler<'a> {
-    fn new(grid: GridView<'a>, bricks: &'a BrickCache, mip: u32) -> Self {
+    fn new(grid: GridView<'a>, bricks: &'a BrickCache, mip: u32, z_clip: Option<i32>) -> Self {
         let cs_xy = (grid.chunk_size_xy >> mip).max(1);
         let cs_z = (crate::grid_view::CHUNK_SIZE_Z >> mip).max(1);
         debug_assert!(
@@ -1172,6 +1189,11 @@ impl<'a> Sampler<'a> {
             xy_mask: cs_xy as i32 - 1,
             z_shift: cs_z.trailing_zeros(),
             z_mask: cs_z as i32 - 1,
+            // CA.1 — mip-0 voxel z → mip-cells. Arithmetic `>>` floors
+            // toward -∞ (clip planes can be negative on stacked-chz
+            // grids), the same formula the GPU marcher uses — CA.3's
+            // parity gate depends on the two staying identical.
+            z_clip_mip: z_clip.map_or(i32::MIN, |z| z >> mip),
             cur_ch: [0; 3],
             cur_view: None,
             cur_brick: None,
@@ -1216,6 +1238,15 @@ impl<'a> Sampler<'a> {
     fn hit(&mut self, c: [i32; 3]) -> Option<u32> {
         #[cfg(test)]
         prof::SURF.with(|x| x.set(x.get() + 1));
+        // CA.1 — cutaway: cells above the clip plane (z-down, so
+        // `z < z_clip`) read as air. `c[2]` is the grid-local ABSOLUTE
+        // mip-cell z (spanning stacked chz chunks) — testing the
+        // in-chunk `loc[2]` alone would pass on 1-chunk fixtures and
+        // break on multi-deck ships. Shadow marches share this gate
+        // via [`SamplerShadow`], so hidden decks stop casting too.
+        if c[2] < self.z_clip_mip {
+            return None;
+        }
         let (ch, loc) = self.locate(c);
         self.select_chunk(ch);
         let occupied = self.cur_brick.is_some_and(|bm| {
@@ -1865,7 +1896,7 @@ pub fn render_dda(
     // Sequential path builds a throwaway per-call cache (tests / single
     // grid). The parallel path takes a persistent cross-frame cache.
     let (cache, mip) = local_cache(&grid, mip);
-    let mut sampler = Sampler::new(grid, &cache, mip);
+    let mut sampler = Sampler::new(grid, &cache, mip, env.z_clip);
 
     for py in settings.y_start..settings.y_end {
         let row = py as usize * pitch_pixels;
@@ -1952,7 +1983,7 @@ pub fn render_dda_parallel(
         .collect();
 
     bands.par_iter().for_each(|&(by0, by1)| {
-        let mut sampler = Sampler::new(grid, cache, mip);
+        let mut sampler = Sampler::new(grid, cache, mip, env.z_clip);
         for py in by0..by1 {
             let row = py as usize * pitch_pixels;
             for px in settings.x_start..settings.x_end {
@@ -2281,6 +2312,72 @@ mod tests {
             (lit_sum - sh_sum) * 50 > lit_sum,
             "shadow should remove >2% of total luminance: lit={lit_sum} shadow={sh_sum}",
         );
+    }
+
+    /// CA.2 — "world as if removed": a clipped-away deck neither
+    /// renders NOR casts sun shadows. The render of a roofed fixture
+    /// with the roof clipped must be byte-identical to a fixture with
+    /// no roof at all (same camera, same shadowing sun) — primary rays
+    /// (CA.1) and the [`SamplerShadow`] march (this substage) both see
+    /// air above the plane, even though the roof's bricks are still
+    /// occupancy-occupied.
+    #[test]
+    fn cutaway_hidden_deck_neither_renders_nor_shadows() {
+        const ROOF: VoxColor = VoxColor(0x80_A0_50_20);
+        const FLOOR: VoxColor = VoxColor(0x80_80_80_80);
+        let roofed = roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| {
+            if z == 20 {
+                Some(ROOF)
+            } else if z >= 60 {
+                Some(FLOOR)
+            } else {
+                None
+            }
+        });
+        let roofless =
+            roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| (z >= 60).then_some(FLOOR));
+        let g_roofed = GridView::from_single_vxl(&roofed);
+        let g_roofless = GridView::from_single_vxl(&roofless);
+        let cam = Camera {
+            pos: [32.0, 32.0, 6.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let inv = 1.0f32 / 2.0f32.sqrt();
+        let lights = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_dir: [inv, 0.0, -inv],
+            sun_color: [1.0; 3],
+            sun_intensity: 1.0,
+            sun_casts_shadow: true,
+            ambient: [0.25; 3],
+            shadow_strength: 0.8,
+            shadow_bias: 1.5,
+            shadow_max_dist: 128.0,
+            ..CpuLights::default()
+        };
+        let (w, h) = (64u32, 64u32);
+        let env_clipped = DdaEnv {
+            lights,
+            z_clip: Some(40),
+            ..DdaEnv::default()
+        };
+        let env_plain = DdaEnv {
+            lights,
+            ..DdaEnv::default()
+        };
+        let (fb_clip, zb_clip) = render_brickmap_env(g_roofed, &cam, w, h, &env_clipped);
+        let (fb_ref, zb_ref) = render_brickmap_env(g_roofless, &cam, w, h, &env_plain);
+        assert_eq!(
+            fb_clip, fb_ref,
+            "clipped roof must render AND shadow exactly like no roof"
+        );
+        assert_eq!(zb_clip, zb_ref);
+        // Negative control: unclipped, the camera sees the roof instead.
+        let (fb_roof, _) = render_brickmap_env(g_roofed, &cam, w, h, &env_plain);
+        assert_ne!(fb_roof, fb_ref, "unclipped roof must be visible");
     }
 
     /// Recording sink: collects `(idx, color, dist)` puts for tests.
@@ -2809,6 +2906,7 @@ mod tests {
             terrain_materials: &[],
             lights: CpuLights::default(),
             world_shadow: None,
+            z_clip: None,
         };
         let (w, h) = (64u32, 64u32);
         let (fog, _) = render_brickmap_env(grid, &cam, w, h, &env);
@@ -2849,6 +2947,7 @@ mod tests {
             terrain_materials: &[],
             lights: CpuLights::default(),
             world_shadow: None,
+            z_clip: None,
         };
         let cam = Camera::from_yaw_pitch([16.0, 16.0, 128.0], 0.3, -0.4);
         let (w, h) = (48u32, 48u32);
@@ -2938,6 +3037,7 @@ mod tests {
             terrain_materials: &[],
             lights: CpuLights::default(),
             world_shadow: None,
+            z_clip: None,
         };
         let (shaded, _) = render_brickmap_env(grid, &cam, 32, 32, &env);
         let lum = |c: u32| (c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff);
@@ -3083,6 +3183,225 @@ mod tests {
             "look-down depth {} not ≈ {expected}",
             zb[centre]
         );
+    }
+
+    /// CA.1 — render with only a cutaway clip set (rest of the env
+    /// default).
+    fn render_clip(
+        grid: GridView<'_>,
+        camera: &Camera,
+        w: u32,
+        h: u32,
+        z_clip: Option<i32>,
+    ) -> (Vec<u32>, Vec<f32>) {
+        let env = DdaEnv {
+            z_clip,
+            ..DdaEnv::default()
+        };
+        render_brickmap_env(grid, camera, w, h, &env)
+    }
+
+    /// CA.1 golden — a 3-deck fixture: the clip hides whole decks and
+    /// the look-down ray lands on the first floor at-or-below the
+    /// plane, with exact colour + depth.
+    #[test]
+    fn cutaway_clip_reveals_lower_decks() {
+        const DECK_A: VoxColor = VoxColor(0x80_C0_30_30); // z = 60
+        const DECK_B: VoxColor = VoxColor(0x80_30_C0_30); // z = 120
+        const DECK_C: VoxColor = VoxColor(0x80_30_30_C0); // z = 180
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| match z {
+            60 => Some(DECK_A),
+            120 => Some(DECK_B),
+            180 => Some(DECK_C),
+            _ => None,
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [16.0, 16.0, 10.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (w, h) = (32u32, 32u32);
+        let centre = (h / 2 * w + w / 2) as usize;
+        // (clip, expected floor colour, expected floor z)
+        let cases = [
+            (None, DECK_A, 60.0),
+            (Some(100), DECK_B, 120.0), // deck boundary: A hidden
+            (Some(120), DECK_B, 120.0), // z_clip itself stays visible
+            (Some(121), DECK_C, 180.0), // one past → B hidden too
+        ];
+        for (clip, col, z) in cases {
+            let (fb, zb) = render_clip(grid, &cam, w, h, clip);
+            assert_eq!(
+                fb[centre], col.0,
+                "clip {clip:?}: expected {:08x}, got {:08x}",
+                col.0, fb[centre]
+            );
+            let expected = z - 10.0;
+            assert!(
+                (zb[centre] - expected).abs() < 1.0,
+                "clip {clip:?}: depth {} not ≈ {expected}",
+                zb[centre]
+            );
+        }
+    }
+
+    /// CA.1 — cutting through a SOLID run: the cut face renders with
+    /// the run's top-surface colour (the [`GridView::surface_color_mip`]
+    /// interior fallback — decision 3 of the CA entry doc), not black
+    /// and not the colour of some other voxel.
+    #[test]
+    fn cutaway_cut_face_uses_run_top_colour() {
+        // Solid from z=100 down; every voxel gets a z-derived colour,
+        // but RLE only STORES surface colours — the run top is z=100.
+        let col_at = |z: u32| VoxColor(0x8000_0000 | (0x40 + z));
+        let vxl =
+            roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| (z >= 100).then_some(col_at(z)));
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [16.0, 16.0, 10.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (w, h) = (32u32, 32u32);
+        let centre = (h / 2 * w + w / 2) as usize;
+        // Unclipped: the real top face at z=100, its own colour.
+        let (fb, zb) = render_clip(grid, &cam, w, h, None);
+        assert_eq!(fb[centre], col_at(100).0);
+        assert!((zb[centre] - 90.0).abs() < 1.0);
+        // Clipped mid-run: the cut face at z=150 falls back to the run
+        // top's colour (interior voxels are colourless in voxlap RLE).
+        let (fb, zb) = render_clip(grid, &cam, w, h, Some(150));
+        assert_eq!(
+            fb[centre],
+            col_at(100).0,
+            "cut face must reuse the run-top colour, got {:08x}",
+            fb[centre]
+        );
+        assert!(
+            (zb[centre] - 140.0).abs() < 1.0,
+            "cut face depth {} not ≈ 140",
+            zb[centre]
+        );
+    }
+
+    /// CA.1 — the clip compares the grid-local ABSOLUTE voxel z, not
+    /// the in-chunk local z: on a stacked-chz grid a plane inside chz=1
+    /// (`z_clip > 255`) must hide the chz=0 deck yet keep the deeper
+    /// chz=1 floor. An in-chunk-z bug (`loc[2] < clip`, always true for
+    /// clip > 255) would render all-sky here.
+    #[test]
+    fn cutaway_clip_is_absolute_z_on_stacked_chunks() {
+        const UPPER_COL: VoxColor = VoxColor(0x80_C0_C0_30); // abs z = 40
+        const LOWER_COL: VoxColor = VoxColor(0x80_30_C0_C0); // abs z = 296
+        let upper =
+            roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| (z == 40).then_some(UPPER_COL));
+        let lower =
+            roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| (z >= 40).then_some(LOWER_COL));
+        let v_up = GridView::from_single_vxl(&upper);
+        let v_lo = GridView::from_single_vxl(&lower);
+        let chunks = [Some(v_up), Some(v_lo)];
+        let cg = crate::ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            origin_chunk_z: 0,
+            chunks_x: 1,
+            chunks_y: 1,
+            chunks_z: 2,
+        };
+        let grid = GridView::from_chunk_grid(&cg, 32);
+        let cam = Camera {
+            pos: [16.0, 16.0, 10.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (w, h) = (32u32, 32u32);
+        let centre = (h / 2 * w + w / 2) as usize;
+        // Unclipped: the chz=0 deck at abs z=40.
+        let (fb, zb) = render_clip(grid, &cam, w, h, None);
+        assert_eq!(fb[centre], UPPER_COL.0);
+        assert!((zb[centre] - 30.0).abs() < 1.0);
+        // Clip inside chz=1: the chz=0 deck vanishes, the chz=1 floor
+        // (abs z = 256 + 40 = 296 ≥ 290) stays.
+        let (fb, zb) = render_clip(grid, &cam, w, h, Some(290));
+        assert_eq!(
+            fb[centre], LOWER_COL.0,
+            "expected the chz=1 floor, got {:08x}",
+            fb[centre]
+        );
+        assert!(
+            (zb[centre] - 286.0).abs() < 1.0,
+            "depth {} not ≈ 286",
+            zb[centre]
+        );
+    }
+
+    /// CA.1 — pins the mip formula `z_clip >> mip` (floor). At mip 1
+    /// with `z_clip = 101` the plane rounds DOWN to mip-cell 50 (voxels
+    /// 100..102), so the surface at z=100 stays visible — the accepted
+    /// coarse-mip bleed. A round-up formula would hide that cell and
+    /// the depth would jump to 102. CPU and GPU must share this exact
+    /// formula (CA.3 parity gate).
+    #[test]
+    fn cutaway_clip_mip_formula_floors() {
+        let mut vxl = roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| {
+            (z >= 100).then_some(VoxColor(0x80_80_80_80))
+        });
+        vxl.generate_mips(2);
+        assert!(vxl.mip_count() >= 2, "need mip 1 built");
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [32.0, 32.0, 10.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (w, h) = (32u32, 32u32);
+        let n = (w as usize) * (h as usize);
+        let centre = (h / 2 * w + w / 2) as usize;
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let settings = OpticastSettings::for_oracle_framebuffer(w, h);
+        let env = DdaEnv {
+            z_clip: Some(101),
+            ..DdaEnv::default()
+        };
+        {
+            let mut sink = RasterSink::new(&mut fb, &mut zb);
+            render_dda(&cam, &settings, grid, w as usize, &env, 1, &mut sink);
+        }
+        assert_ne!(fb[centre], 0, "mip-1 clipped surface must still hit");
+        assert!(
+            (zb[centre] - 90.0).abs() < 1.5,
+            "mip-cell 50 (voxel z=100) must be the first visible layer \
+             (floor formula); depth {} not ≈ 90",
+            zb[centre]
+        );
+    }
+
+    /// CA.1 standing gate — `z_clip = None` and a no-op clip (nothing
+    /// above the plane) are byte-identical to the unclipped render.
+    #[test]
+    fn cutaway_clip_disabled_is_byte_identical() {
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
+            let surf = 28 + ((x / 4 + y / 6) % 13);
+            (z >= surf).then_some(VoxColor(0x80_40_60_80 + (x ^ y) % 0x30))
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera::orbit(0.8, 0.55, 100.0, [32.0, 32.0, 40.0]);
+        let (w, h) = (96u32, 96u32);
+        let (fb_base, zb_base) = render_brickmap(grid, &cam, w, h);
+        let (fb_none, zb_none) = render_clip(grid, &cam, w, h, None);
+        assert_eq!(fb_base, fb_none, "z_clip=None must not change a pixel");
+        assert_eq!(zb_base, zb_none);
+        // `z < 0` hides nothing on a chz≥0 grid — still byte-identical
+        // (pins the strict `<` comparison).
+        let (fb_zero, zb_zero) = render_clip(grid, &cam, w, h, Some(0));
+        assert_eq!(fb_base, fb_zero, "no-op clip must not change a pixel");
+        assert_eq!(zb_base, zb_zero);
     }
 
     /// DDA.4: a floor spanning two side-by-side chunks (chunks_x=2)
@@ -3306,6 +3625,7 @@ mod tests {
             terrain_materials: &[],
             lights: CpuLights::default(),
             world_shadow: None,
+            z_clip: None,
         };
 
         let (seq_fb, seq_zb) = render_brickmap_env(grid, &cam, w, h, &env);

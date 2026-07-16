@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Stage **CA — cutaway deck rendering** (`PORTING-CUTAWAY.md`): per-grid
+horizontal clip planes for isometric "deck view" rendering (SS13-style
+ship interiors). Additive — new APIs and one new public struct field
+(`roxlap-gpu`'s `GridWorldTransform.z_clip`; exhaustive literals must
+add it, `..Default::default()` users are unaffected).
+
+### Added
+
+- **Per-grid cutaway clip** (CA.0/CA.1): `Grid::z_clip: Option<i32>` +
+  `Scene::set_grid_z_clip` — grid-local **absolute** voxel z (z-down,
+  spanning stacked chz chunks); both renderers treat voxels with
+  `z < z_clip` as air, exposing the interior below. The plane is
+  grid-local so it stays glued to a rotated/moving ship. The cut
+  cross-section renders via the existing run-top colour fallback
+  (voxlap RLE stores no interior colours) with normal top-face
+  shading. **Render-only**: simulation, collision, audio occlusion and
+  `Scene::raycast` still see the full grid. `None` (the default) is
+  byte-identical to pre-CA renders — the standing stage gate.
+- **Shadows follow the cut** (CA.2/CA.3): sun and dynamic-light shadow
+  rays apply the same per-grid clip on both backends, including the
+  cross-grid path (each *target* grid applies its own clip) — a hidden
+  deck neither renders nor casts, so the exposed interior is sun-lit.
+  At mip `m` the plane rounds as `z_clip >> m` (floor) on CPU and GPU
+  identically, pinned by a headless parity gate
+  (`roxlap-gpu/tests/scene_render.rs`) with exact cut-face colours.
+- **Sprite footprint rule + picking** (CA.4): a sprite instance is
+  hidden while its origin, mapped into a clipped grid's frame, lands
+  inside that grid's materialised XY chunk footprint with local
+  `z < z_clip` — crew on hidden decks vanish, a character on the
+  ground beside the hull never does. Applied in the CPU sprite pass
+  and the GPU cull (which also stops hidden sprites casting sprite
+  shadows). Exposed as `Grid::cutaway_hides_point` /
+  `Scene::cutaway_hides_point` for host-side overlays and the
+  light-cull pattern. `Scene::raycast_clipped` is the clip-aware
+  raycast for click-to-select on decks (GPU depth picks are clip-aware
+  for free); plain `raycast` deliberately ignores the clip.
+- **Snapshot wire v4** (CA.0): `z_clip` persists per grid; v1–v3
+  fixtures stay loadable forever (new frozen v3 shadow shape), old
+  saves restore unclipped.
+- **Decks demo tab + tele-iso preset** (CA.5): a 3-deck shiplet
+  (stacked chz chunks) on a ground plate — `PgUp`/`PgDn` slides the
+  cut, per-deck actors and cabin lights hide with their deck (the
+  game-side light-cull pattern, locked decision: the engine does not
+  filter lights), the bilge deck is flooded (WT water clips with the
+  slabs). `CameraRig::tele_iso` + `opticast_settings_fov` give the
+  isometric look (narrow-FOV distant orbit, no orthographic
+  projection); `ROXLAP_DECK=0..=3` starts on a cut view for captures.
+- **`SceneRenderer::set_gpu_mip_scan_dist` / `gpu_mip_scan_dist`**
+  (CA.5): runtime override of the GPU distance-LOD scan range —
+  required by tele/iso cameras, whose distance would otherwise coarsen
+  the whole scene to deep mips. No-op on the CPU backend.
+- **Book**: the Rendering chapter gains a *Cutaway deck views* section
+  (API, semantics, the footprint rule, the light-cull pattern,
+  tele-iso); the demo tour lists the Decks tab.
+
 ## [0.29.0] — 2026-07-14
 
 Two macro-stages since 0.28.0: **water + swimming** (stage WT — physics

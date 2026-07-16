@@ -20,8 +20,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::scene_api::{CameraPose, CameraRig, DemoScene, InputState, SceneCtx, SceneInput};
 use crate::scenes::{
-    animation::AnimationScene, audio::AudioScene, doom::DoomScene, empty::EmptyScene,
-    lighting::LightingScene, particles::ParticlesScene, picking::PickingScene,
+    animation::AnimationScene, audio::AudioScene, decks::DecksScene, doom::DoomScene,
+    empty::EmptyScene, lighting::LightingScene, particles::ParticlesScene, picking::PickingScene,
     primitives::PrimitivesScene, scale::ScaleScene, spotlight::SpotlightScene,
     sprites::SpritesScene, transparency::TransparencyScene, world::WorldScene,
 };
@@ -237,6 +237,7 @@ impl Host {
             Box::new(ParticlesScene::new()),
             Box::new(AudioScene::new()),
             Box::new(DoomScene::new()),
+            Box::new(DecksScene::new()),
             Box::new(PickingScene::new()),
             Box::new(PrimitivesScene::new()),
             Box::new(EmptyScene::new()),

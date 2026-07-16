@@ -1872,3 +1872,291 @@ fn scene_dda_emissive_ignores_lighting() {
         "empty material map must re-render byte-identically"
     );
 }
+
+/// CA.3 — z-graded [`block_chunk`]: solid over `z ∈ [top, bot]`, each
+/// voxel's stored BLUE byte = its z (R=0xff, G=0x00, brightness 0x80 →
+/// exact colour passthrough), so a render pins EXACTLY which voxel
+/// layer produced a pixel.
+fn graded_block_chunk(vsid: u32, top: u8, bot: u8) -> Vxl {
+    let n_cols = (vsid as usize) * (vsid as usize);
+    let n_vox = (bot - top + 1) as usize;
+    let mut data: Vec<u8> = Vec::with_capacity(n_cols * (4 + n_vox * 4));
+    let mut column_offset: Vec<u32> = Vec::with_capacity(n_cols + 1);
+    for _ in 0..n_cols {
+        column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+        data.extend_from_slice(&[0, top, bot, 0]);
+        for z in top..=bot {
+            data.extend_from_slice(&[z, 0x00, 0xff, 0x80]); // BGRA, B = z
+        }
+    }
+    column_offset.push(u32::try_from(data.len()).expect("offset fits"));
+    Vxl {
+        vsid,
+        ipo: [0.0; 3],
+        ist: [1.0, 0.0, 0.0],
+        ihe: [0.0, 0.0, 1.0],
+        ifo: [0.0, 1.0, 0.0],
+        data: data.into_boxed_slice(),
+        column_offset: column_offset.into_boxed_slice(),
+        mip_base_offsets: Box::new([0, n_cols + 1]),
+        vbit: Box::new([]),
+        vbiti: 0,
+    }
+}
+
+/// CA.3 — cutaway parity gate, primary rays: the per-grid clip lane
+/// hides `z < z_clip` through the real `scene_dda.wgsl` pipeline, the
+/// cut face shows EXACTLY the voxel layer at the plane (matching the
+/// CPU sampler's stored-colour/run-top rule — the fixture stores a
+/// z-graded colour per voxel, so any off-by-one or wrong-layer fetch
+/// changes the byte), a fully-clipped grid is all sky, and a `None`
+/// clip re-renders byte-identically to the unclipped baseline.
+#[test]
+fn scene_dda_cutaway_clips_and_pins_cut_face_colour() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    // Solid block z ∈ [100, 140], blue byte = z.
+    let chunk = decompress_chunk(&graded_block_chunk(vsid, 100, 140));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let render = |r: &mut HeadlessSceneRenderer, clip: Option<i32>| {
+        r.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            &[GridWorldTransform {
+                z_clip: clip,
+                ..GridWorldTransform::default()
+            }],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )
+    };
+    // Readback is 0xAABBGGRR — R low byte, B bits 16..23.
+    let rgb = |p: u32| (p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff);
+
+    // Unclipped: the top surface at z=100 (blue byte 100).
+    let base = render(&mut renderer, None);
+    assert_eq!(
+        rgb(base[centre]),
+        (255, 0, 100),
+        "unclipped top face must be the z=100 layer: {:#010x}",
+        base[centre]
+    );
+    // Clip mid-run: the cut face is EXACTLY the z=120 layer.
+    let cut = render(&mut renderer, Some(120));
+    assert_eq!(
+        rgb(cut[centre]),
+        (255, 0, 120),
+        "cut face must be the z=120 layer: {:#010x}",
+        cut[centre]
+    );
+    // Pixel classification: clipping only REMOVES geometry, so every
+    // block pixel of the cut render must be a block pixel of the base
+    // render too (edge rays that grazed the block's side above the
+    // plane legitimately become sky — the reverse never happens).
+    for (i, (&b, &c)) in base.iter().zip(cut.iter()).enumerate() {
+        assert!(
+            (b & 0xff) > 180 || (c & 0xff) <= 180,
+            "pixel {i} was sky and became block: base={b:#010x} cut={c:#010x}"
+        );
+    }
+    // Clip just past the block's bottom: voxlap columns are BEDROCK
+    // below the last slab, so the cut face is the (colourless) bedrock
+    // layer at z=141 — the colour fetch falls back to the nearest
+    // stored colour, the run's z=140 byte. Pins the interior-fallback
+    // rule the CPU sampler uses (`surface_color_mip` run-top/bottom).
+    let bedrock = render(&mut renderer, Some(141));
+    assert_eq!(
+        rgb(bedrock[centre]),
+        (255, 0, 140),
+        "bedrock cut face must fall back to the run's stored colour: {:#010x}",
+        bedrock[centre]
+    );
+    // Clip past the chunk's full depth: nothing left — all sky.
+    let gone = render(&mut renderer, Some(256));
+    assert!(
+        gone.iter().all(|&p| (p & 0xff) <= 180),
+        "clip=256 must hide the entire chunk"
+    );
+    // Standing gate: clip=None is byte-identical to the baseline.
+    let none_again = render(&mut renderer, None);
+    assert_eq!(
+        none_again, base,
+        "z_clip=None must re-render byte-identically"
+    );
+}
+
+/// CA.3 — the GPU clip uses the CPU's exact `z_clip >> mip` FLOOR
+/// formula. Two 1-voxel plates with real air between them (P at z=100,
+/// Q at z=140) and `z_clip = 101`: at mip 0 plate P (z=100 < 101) is
+/// hidden and the ray reaches Q; at any coarse mip the odd plane
+/// floors onto P's cell (`100 >> m == 101 >> m` for m ≥ 1) so P pokes
+/// through — the accepted coarse-mip bleed. A round-up formula would
+/// show Q at BOTH mips; no `>> mip` at all would hide P at mip 0 too.
+/// The plates' blue bytes (100 vs 140) name the winning layer exactly.
+#[test]
+fn scene_dda_cutaway_mip_formula_floors() {
+    use roxlap_formats::color::VoxColor;
+
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    // B = z for each plate (BGRA upload order is handled by from_dense).
+    let vxl = Vxl::from_dense(vsid, |_, _, z| match z {
+        100 => Some(VoxColor(0x80ff_0064)), // P: R=0xff, B=100
+        140 => Some(VoxColor(0x80ff_008c)), // Q: R=0xff, B=140
+        _ => None,
+    });
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], decompress_chunk(&vxl))],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let centre = (h / 2 * w + w / 2) as usize;
+    let xf = GridWorldTransform {
+        z_clip: Some(101),
+        ..GridWorldTransform::default()
+    };
+    // Camera OUTSIDE the chunk (z = -200), so the chunk is entered at
+    // t ≈ 200 and `mip_scan_dist` alone dictates the marched mip.
+    let cam = Camera {
+        position: [16.0, 16.0, -200.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 20f32.to_radians(),
+    };
+    let render_at = |mip_scan_dist: f32| {
+        renderer.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            &[xf],
+            cam.fov_y_rad,
+            64,
+            mip_scan_dist,
+        )[centre]
+    };
+    let blue = |p: u32| (p >> 16) & 0xff;
+    // LOD off → mip 0 → P hidden, the ray lands on Q (blue 140).
+    let p_mip0 = render_at(0.0);
+    assert_eq!(
+        blue(p_mip0),
+        140,
+        "mip 0: clip=101 must hide plate P and hit Q: {p_mip0:#010x}"
+    );
+    // mip ≥ 1 (t_enter ≈ 200 ≥ 2·mip_scan_dist): the floored plane
+    // exposes P's cell — blue must come from P's layer, far below Q's.
+    let p_coarse = render_at(100.0);
+    assert!(
+        blue(p_coarse) < 120,
+        "coarse mip: floor formula must expose plate P: {p_coarse:#010x}"
+    );
+}
+
+/// CA.3 — cutaway shadow parity: a clipped-away wall stops casting sun
+/// shadow on the floor next to it (the shadow march applies the same
+/// per-grid clip as the primary rays — "world as if removed").
+#[test]
+fn scene_dda_cutaway_hidden_wall_stops_shadowing() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    // Floor at z=100 + wall x ∈ [16,18) rising z ∈ [90, 100].
+    let chunk = decompress_chunk(&floor_with_wall_chunk(vsid, 16, 18, 90));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [14.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let render = |r: &mut HeadlessSceneRenderer, clip: Option<i32>| {
+        r.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            &[GridWorldTransform {
+                z_clip: clip,
+                ..GridWorldTransform::default()
+            }],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
+    };
+    // Sun toward +x and up: the wall at x ∈ [16,18) occludes the floor
+    // point (14,16,100) — the to-sun ray crosses it at z ≈ 96..94.
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    renderer.set_scene_lights(SceneLights {
+        enabled: true,
+        grid_sun_dirs: vec![[s, 0.0, -s]],
+        sun_color: [1.0; 3],
+        sun_intensity: 3.0,
+        sun_casts_shadow: true,
+        ambient: [0.5; 3],
+        shadow_strength: 1.0,
+        shadow_bias: 1.5,
+        shadow_max_dist: 512.0,
+        shadow_max_steps: 256,
+        ..SceneLights::default()
+    });
+    let shadowed = render(&mut renderer, None);
+    // Clip at z=100: the wall body (z 90..99) vanishes, the floor layer
+    // itself (z=100) stays visible AND sun-lit.
+    let unshadowed = render(&mut renderer, Some(100));
+    let blue = |p: u32| (p >> 16) & 0xff;
+    assert!(
+        blue(shadowed) < 70 && blue(unshadowed) < 70,
+        "both renders must show the floor, not sky: {shadowed:#010x} / {unshadowed:#010x}"
+    );
+    assert!(
+        lum(unshadowed) > lum(shadowed),
+        "a clipped-away wall must stop shadowing: shadowed {shadowed:#010x} -> clipped {unshadowed:#010x}",
+    );
+}

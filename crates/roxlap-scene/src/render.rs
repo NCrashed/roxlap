@@ -452,6 +452,8 @@ pub fn render_scene(
             // path); keep it on the baked-byte shade.
             lights: CpuLights::default(),
             world_shadow: None,
+            // CA.0 — per-grid cutaway clip (unread until CA.1).
+            z_clip: grid.z_clip,
         };
         // Scan-cutoff copy (identity at vws == 1.0 → same &settings).
         let grid_settings;
@@ -1236,6 +1238,8 @@ fn render_scene_composed_scissored(
             terrain_materials,
             lights: local_lights,
             world_shadow,
+            // CA.0 — per-grid cutaway clip (unread until CA.1).
+            z_clip: grid.z_clip,
         };
         // Effective render mip + brick cache were prepared above
         // (DDA.6 uniform per-grid mip, DDA.7 cross-frame cache).

@@ -570,6 +570,8 @@ impl App {
             terrain_materials: &[],
             lights: roxlap_core::CpuLights::default(),
             world_shadow: None,
+            // CA.0 — the host's single-chunk world has no deck clip.
+            z_clip: None,
         };
 
         // The world is one chunk; its brick occupancy is independent of

@@ -161,6 +161,39 @@ impl CameraRig {
         let d = self.fly_delta(input, dt);
         self.pos = [self.pos[0] + d[0], self.pos[1] + d[1], self.pos[2] + d[2]];
     }
+
+    /// CA.5 — the **tele-iso** orbit preset: place the rig `dist` back
+    /// from `focus` along the (yaw, pitch) view direction, so `focus`
+    /// sits dead-centre. Pair with a narrow FOV
+    /// ([`opticast_settings_fov`], ≈ 0.15 rad) for the isometric deck
+    /// look: a distant tele camera flattens perspective convergence
+    /// without any orthographic ray generation. Re-derive every frame
+    /// from the CURRENT yaw/pitch to orbit `focus` under mouse-look.
+    #[must_use]
+    pub fn tele_iso(focus: [f64; 3], yaw: f64, pitch: f64, dist: f64) -> Self {
+        let f = crate::scene::camera_for_yaw_pitch([0.0; 3], yaw, pitch).forward;
+        Self {
+            pos: [
+                focus[0] - f[0] * dist,
+                focus[1] - f[1] * dist,
+                focus[2] - f[2] * dist,
+            ],
+            yaw,
+            pitch,
+        }
+    }
+}
+
+/// CA.5 — [`opticast_settings`] with an explicit vertical FOV (radians):
+/// the focal length `hz` is derived so `FrameParams::fov_y_rad()` lands
+/// exactly on `fov_y` at any window size. Both backends project from
+/// these settings, so the narrow tele-iso view matches CPU/GPU.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn opticast_settings_fov(size: (u32, u32), scan_dist: i32, fov_y: f32) -> OpticastSettings {
+    let mut s = opticast_settings(size, scan_dist);
+    s.hz = (size.1 as f32 * 0.5) / (fov_y * 0.5).tan();
+    s
 }
 
 /// The camera pose a scene starts at (set by the host on `enter`).

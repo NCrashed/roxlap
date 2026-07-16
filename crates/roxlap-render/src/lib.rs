@@ -2026,6 +2026,32 @@ impl SceneRenderer {
         }
     }
 
+    /// CA.5 — runtime override of the GPU scene-LOD scan distance
+    /// ([`RenderOptions::gpu_mip_scan_dist`]): a chunk entered at
+    /// world-t `t` marches at mip `floor(log2(max(t, d) / d))`. A
+    /// distant tele/iso camera (the cutaway "deck view") otherwise
+    /// coarsens the whole scene by camera distance — raise this to
+    /// keep it at mip 0 out to the working range, and restore the
+    /// previous value ([`Self::gpu_mip_scan_dist`]) when leaving the
+    /// view. No-op on the CPU backend (its per-grid LOD is driven by
+    /// [`roxlap_scene::LodThresholds`] instead).
+    pub fn set_gpu_mip_scan_dist(&mut self, dist: f32) {
+        if let BackendImpl::Gpu(g) = &mut self.inner {
+            g.set_mip_scan_dist(dist);
+        }
+    }
+
+    /// CA.5 — the current GPU scene-LOD scan distance (see
+    /// [`Self::set_gpu_mip_scan_dist`]); the construction-time value
+    /// until overridden. `0.0` on the CPU backend.
+    #[must_use]
+    pub fn gpu_mip_scan_dist(&self) -> f32 {
+        match &self.inner {
+            BackendImpl::Gpu(g) => g.mip_scan_dist(),
+            BackendImpl::Cpu(_) => 0.0,
+        }
+    }
+
     /// Follow a window resize. CPU resizes its framebuffer lazily, so
     /// this only matters to the GPU swapchain — but it's safe to call
     /// for both.

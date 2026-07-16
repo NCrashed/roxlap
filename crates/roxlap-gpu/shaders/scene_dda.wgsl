@@ -30,7 +30,11 @@ struct PerGridCamera {
     down: vec3<f32>,
     _pad2: f32,
     forward: vec3<f32>,
-    _pad3: f32,
+    // CA.0 — the grid's cutaway clip riding the old `_pad3` lane:
+    // grid-local absolute voxel z as a bitcast i32 (`bitcast<i32>` to
+    // read); i32::MIN (0x80000000) = disabled. Hide cells with
+    // `z < z_clip`. Unread until CA.3.
+    z_clip_bits: f32,
     // DL — unit direction TO the sun in this grid's local frame (xyz; w
     // unused). Packed here instead of a separate per-grid storage buffer
     // (the 16 storage-buffer limit is already saturated). Zero ⇒ no sun
@@ -485,6 +489,11 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
     // at its true world footprint and `shadow_max_dist` stays world-uniform.
     let vws = grid_cameras[g].world_origin.w;
     let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z)) * vws;
+    // CA.3 — cutaway: hidden cells occlude nothing ("world as if
+    // removed"), each grid applying its OWN clip — mirrors the CPU
+    // SceneOccluder. Sentinel i32::MIN survives the `>> mip` below
+    // any real cell, so no enable flag.
+    let z_clip = bitcast<i32>(grid_cameras[g].z_clip_bits);
 
     var p_chunk = vec3<i32>(floor(origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(dir));
@@ -512,6 +521,8 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
             let vsid_mip_u = vsid >> mip;
             let vsid_mip = i32(vsid_mip_u);
             let cz_mip = i32(CHUNK_Z >> mip);
+            // CA.3 — same floor formula as march_grid / the CPU sampler.
+            let z_clip_mip = z_clip >> mip;
             // PF.1 — solid word base for this (slot, mip), hoisted out of
             // the inner loop, plus a last-word cache.
             let wpc = occ_words_per_col_for_mip(mip);
@@ -558,7 +569,11 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
                     occ_idx_cached = widx;
                     occ_word_cached = occ_word(widx);
                 }
-                if (!skip_origin_cell && (occ_word_cached & (1u << (z_u & 31u))) != 0u) { return true; }
+                // CA.3 — clipped-away cells (abs mip-z above the cut,
+                // i.e. < z_clip_mip) never occlude.
+                if (!skip_origin_cell
+                    && (p_chunk.z * cz_mip + p_voxel.z >= z_clip_mip)
+                    && (occ_word_cached & (1u << (z_u & 31u))) != 0u) { return true; }
                 skip_origin_cell = false;
                 steps = steps + 1u;
                 if (steps >= u.shadow_max_steps) { return false; }
@@ -850,6 +865,11 @@ fn march_grid(
     // volumetric seg_len (t_span / vsize) stays a voxel count. 1.0 ⇒ identity.
     let vws = grid_cameras[g].world_origin.w;
     let chunk_dim = vec3<f32>(f32(vsid), f32(vsid), f32(CHUNK_Z)) * vws;
+    // CA.3 — per-grid cutaway clip (grid-local absolute voxel z; cells
+    // with `z < z_clip` read as air). The disabled sentinel (i32::MIN)
+    // stays below any real cell even after the per-chunk `>> mip`, so
+    // no separate enable flag is needed.
+    let z_clip = bitcast<i32>(grid_cameras[g].z_clip_bits);
 
     var p_chunk = vec3<i32>(floor(ray_origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(ray_dir));
@@ -914,6 +934,10 @@ fn march_grid(
             let vsid_mip_u = vsid >> mip;
             let vsid_mip = i32(vsid_mip_u);
             let cz_mip = i32(CHUNK_Z >> mip);
+            // CA.3 — clip plane in mip-cells. Arithmetic `>>` floors
+            // toward -∞ — the IDENTICAL formula to the CPU sampler's
+            // `z_clip >> mip` (the CA.3 parity gate pins the pair).
+            let z_clip_mip = z_clip >> mip;
             // PF.1 — solid-occupancy word base for this (slot, mip), hoisted
             // out of the inner loop (textured block first, solid after it),
             // plus a last-word cache: consecutive z-steps land in the same
@@ -967,7 +991,12 @@ fn march_grid(
                     occ_idx_cached = widx;
                     occ_word_cached = occ_word(widx);
                 }
-                if ((occ_word_cached & (1u << (z_u & 31u))) != 0u) {
+                // CA.3 — cells above the cutaway plane (grid-local
+                // absolute mip-z < z_clip_mip) read as air, resetting
+                // `prev_solid` like real air so translucent runs
+                // restart at the cut exactly as on the CPU.
+                if ((p_chunk.z * cz_mip + p_voxel.z >= z_clip_mip)
+                    && (occ_word_cached & (1u << (z_u & 31u))) != 0u) {
                     if (t_hit >= best_t) {
                         return finalize_sky_grid(touched, accum, trans, ray_dir);
                     }

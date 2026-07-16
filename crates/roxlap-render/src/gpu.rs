@@ -977,6 +977,18 @@ impl GpuBackend {
         self.host_sky_set = true;
     }
 
+    /// CA.5 — runtime scene-LOD scan-distance override (the render
+    /// path re-pushes `mip_scan_dist` to the device every frame, so
+    /// this takes effect on the next render).
+    pub(crate) fn set_mip_scan_dist(&mut self, dist: f32) {
+        self.mip_scan_dist = dist;
+    }
+
+    /// CA.5 — the current scene-LOD scan distance.
+    pub(crate) fn mip_scan_dist(&self) -> f32 {
+        self.mip_scan_dist
+    }
+
     /// Mirror the CPU path's flat sky + distance fog onto the GPU from
     /// the per-frame [`FrameParams`]. The GPU marcher samples its own
     /// sky *texture* (default grey) and carries its own fog state, so
@@ -1672,6 +1684,8 @@ impl GpuBackend {
                 rot_cols: [col(DVec3::X), col(DVec3::Y), col(DVec3::Z)],
                 // SC.4 — the shader marcher scales chunk/voxel dims by this.
                 voxel_world_size: grid.transform.voxel_world_size as f32,
+                // CA.0 — per-grid cutaway clip (shader-unread until CA.3).
+                z_clip: grid.z_clip,
             });
         }
         out

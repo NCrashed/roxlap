@@ -1342,21 +1342,47 @@ impl CpuBackend {
         // XS.4 — a sprite contributes to the occluder (casts a shadow) unless
         // it's invisible or flagged `NO_SHADOW_CAST`.
         let invis = roxlap_formats::sprite::SPRITE_FLAG_INVISIBLE;
+        // CA.4 — cutaway footprint rule: an instance whose origin lands
+        // inside a clipped grid's XY footprint above the plane is hidden
+        // this frame — not drawn AND not casting ("world as if
+        // removed"). Precomputed per list so the flags outlive the
+        // terrain render's `&mut Scene` borrow below; all-empty (and
+        // O(1) per lookup) when no grid has a clip set.
+        let cutaway_on = frame.draw_sprites && scene.grids().any(|(_, g)| g.z_clip.is_some());
+        let cutaway_flags = |sprites: &mut dyn Iterator<Item = &Sprite>| -> Vec<bool> {
+            if cutaway_on {
+                sprites
+                    .map(|s| {
+                        scene.cutaway_hides_point(glam::DVec3::new(
+                            f64::from(s.p[0]),
+                            f64::from(s.p[1]),
+                            f64::from(s.p[2]),
+                        ))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        let hidden_static = cutaway_flags(&mut self.sprites.iter());
+        let hidden_limbs = cutaway_flags(&mut self.kfa_limbs.iter());
+        let hidden_dyn = cutaway_flags(&mut self.dyn_sprites.iter());
+        let hid = |flags: &[bool], i: usize| flags.get(i).copied().unwrap_or(false);
         let casts = |s: &Sprite| s.flags & invis == 0 && s.casts_shadow();
         let sprite_occ = if shadows_active && frame.draw_sprites {
             let mut so = SpriteOccluder::new();
-            for (s, &m) in self.sprites.iter().zip(&self.sprite_models) {
-                if casts(s) {
+            for (i, (s, &m)) in self.sprites.iter().zip(&self.sprite_models).enumerate() {
+                if casts(s) && !hid(&hidden_static, i) {
                     so.push(dense_or_decode(&self.model_dense, m, s), s.p, s.s, s.h, s.f);
                 }
             }
             for (i, s) in self.kfa_limbs.iter().enumerate() {
-                if casts(s) {
+                if casts(s) && !hid(&hidden_limbs, i) {
                     so.push(dense_or_decode(&self.limb_dense, i, s), s.p, s.s, s.h, s.f);
                 }
             }
             for (i, s) in self.dyn_sprites.iter().enumerate() {
-                if !casts(s) {
+                if !casts(s) || hid(&hidden_dyn, i) {
                     continue;
                 }
                 if let Some((book, fr)) = shared.dyn_clip[i] {
@@ -1472,8 +1498,8 @@ impl CpuBackend {
             // z-test against the shared buffer so order doesn't matter.
             // PF.8 — draw from the cached per-model/per-limb dense decode
             // (was: `draw_sprite_dda_shaded` re-densified per call).
-            for (sprite, &m) in self.sprites.iter().zip(&self.sprite_models) {
-                if sprite.flags & invis != 0 {
+            for (i, (sprite, &m)) in self.sprites.iter().zip(&self.sprite_models).enumerate() {
+                if sprite.flags & invis != 0 || hid(&hidden_static, i) {
                     continue;
                 }
                 let dense = dense_or_decode(&self.model_dense, m, sprite);
@@ -1495,7 +1521,7 @@ impl CpuBackend {
                 );
             }
             for (i, sprite) in self.kfa_limbs.iter().enumerate() {
-                if sprite.flags & invis != 0 {
+                if sprite.flags & invis != 0 || hid(&hidden_limbs, i) {
                     continue;
                 }
                 let dense = dense_or_decode(&self.limb_dense, i, sprite);
@@ -1520,6 +1546,9 @@ impl CpuBackend {
             // association — the selected frame of an animated voxel clip
             // (VCL.4). The `dyn_sprites` entry is the pose carrier either way.
             for (i, sprite) in self.dyn_sprites.iter().enumerate() {
+                if hid(&hidden_dyn, i) {
+                    continue;
+                }
                 let zb = &mut self.zbuffer[..pixel_count];
                 let shade = shade_of(sprite);
                 if let Some((book, fr)) = shared.dyn_clip[i] {

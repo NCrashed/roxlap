@@ -72,7 +72,7 @@ fn cull_cache_and_identity_colmul() {
         half_h: 0.6,
         far: 1.0e9,
     };
-    let r1 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0);
+    let r1 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
     assert_eq!(r1.0, 2, "two of three instances are in view");
 
     // PF.10 — identity colmul fast path: the buffer must hold the
@@ -86,14 +86,14 @@ fn cull_cache_and_identity_colmul() {
     }
 
     // Same key ⇒ cached result, no re-cull.
-    let r2 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0);
+    let r2 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
     assert_eq!(r1, r2, "same-key call must return the cached result");
 
     // A transform update must invalidate: move instance 1 out of view.
     let mut moved = instances.clone();
     moved[1] = axis_instance(model, [-10_000.0, 30.0, 0.0]);
     reg.update_transforms(&moved);
-    let r3 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0);
+    let r3 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
     assert_eq!(r3.0, 1, "moved instance must drop out of the visible set");
 
     // A real (non-identity) table leaves the fast path: the packed
@@ -102,7 +102,7 @@ fn cull_cache_and_identity_colmul() {
     custom[0] = 0x0042_0042_0042_0042;
     let tables: Vec<[u64; 256]> = vec![custom, [w; 256], [w; 256]];
     reg.set_instance_colmul(&tables);
-    let r4 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0);
+    let r4 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
     assert_eq!(r4.0, 1);
     let packed = read_u32(&gpu, &reg.colmul, 2);
     assert_eq!(
@@ -110,4 +110,74 @@ fn cull_cache_and_identity_colmul() {
         (0x0042_0042u32, 0x0042_0042u32),
         "custom table must be packed for the visible instance",
     );
+}
+
+/// CA.4 — the cutaway footprint rule in the live cull: an instance
+/// whose origin lies inside a clipped grid's XY footprint above the
+/// plane drops out of the visible set; instances below the plane or
+/// outside the footprint stay; and passing a different clip set
+/// invalidates the PF.10 frame cache like a camera move would.
+#[test]
+fn cull_applies_cutaway_footprint_rule() {
+    use roxlap_gpu::sprite_model::SpriteCutawayClip;
+
+    let Ok(gpu) = HeadlessGpu::new_blocking(GpuRendererSettings::default()) else {
+        eprintln!("[skip] no GPU adapter reachable");
+        return;
+    };
+
+    let mut registry = SpriteModelRegistry::new();
+    let model = registry.add(build_sprite_model(&Kv6::solid_cube(
+        8,
+        VoxColor(0x80_ff_80_40),
+    )));
+    // All three in view (ahead of the camera): one above the clip plane
+    // inside the footprint (hidden), one below the plane (kept), one
+    // above the plane but OUTSIDE the XY footprint (kept).
+    let instances = vec![
+        axis_instance(model, [10.0, 30.0, 50.0]),
+        axis_instance(model, [10.0, 30.0, 200.0]),
+        axis_instance(model, [300.0, 60.0, 50.0]),
+    ];
+    let mut reg = SpriteRegistryResident::upload(&gpu.device, &registry, &instances);
+
+    let f = ViewFrustum {
+        pos: [0.0, 0.0, 0.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+        half_w: 8.0,
+        half_h: 8.0,
+        far: 1.0e9,
+    };
+    let no_clip = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
+    assert_eq!(no_clip.0, 3, "all three instances are in view unclipped");
+
+    // Identity grid at the origin, footprint x,y ∈ [0, 128), plane 120.
+    let clip = SpriteCutawayClip {
+        origin: [0.0; 3],
+        inv_rows: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        inv_vws: 1.0,
+        xy_lo: [0.0, 0.0],
+        xy_hi: [128.0, 128.0],
+        z_clip: 120.0,
+    };
+    let clipped = reg.cull_bin_upload(
+        &gpu.device,
+        &gpu.queue,
+        &f,
+        640,
+        360,
+        16,
+        4.0,
+        std::slice::from_ref(&clip),
+    );
+    assert_eq!(
+        clipped.0, 2,
+        "only the in-footprint above-plane instance must hide"
+    );
+    // Dropping the clip again re-culls (cache keyed on the clip set)
+    // and restores the full visible set.
+    let restored = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
+    assert_eq!(restored.0, 3, "clearing the clip must restore visibility");
 }

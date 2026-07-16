@@ -1,6 +1,6 @@
 //! QE.5b — snapshot **wire-format** compatibility gate.
 //!
-//! `tests/fixtures/snapshot_v{1,2,3}.rxs` are checked-in
+//! `tests/fixtures/snapshot_v{1,2,3,4}.rxs` are checked-in
 //! [`Scene::save_snapshot`] blobs (magic + version + bincode payload)
 //! frozen at each wire version. The `v*_fixture_loads` tests must keep
 //! passing on every future engine version — that is the
@@ -8,12 +8,13 @@
 //! shape ever has to change, bump `roxlap_scene::snapshot::SNAPSHOT_VERSION`,
 //! add a version-N shadow shape to `load_snapshot`, and leave the older
 //! fixtures untouched (SC.snap did this for v1→v2 + `voxel_world_size`;
-//! WT.0 for v2→v3 + `water_volumes`).
+//! WT.0 for v2→v3 + `water_volumes`; CA.0 for v3→v4 + `z_clip`).
 //!
-//! To regenerate the **v3** fixture after deliberately changing its
+//! To regenerate the **v4** fixture after deliberately changing its
 //! reference scene (NOT after a wire-format change — see above):
-//! `cargo test -p roxlap-scene --test snapshot_wire -- --ignored`. The v1/v2
-//! fixtures are intentionally frozen (current `save_snapshot` emits v3).
+//! `cargo test -p roxlap-scene --test snapshot_wire -- --ignored`. The
+//! v1/v2/v3 fixtures are intentionally frozen (current `save_snapshot`
+//! emits v4).
 
 use glam::{DVec3, IVec3};
 use roxlap_scene::snapshot::SnapshotLoadError;
@@ -21,10 +22,12 @@ use roxlap_scene::VoxColor;
 use roxlap_scene::{GridTransform, LodThresholds, Scene, StreamRadius, WaterVolume};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/snapshot_v1.rxs");
-/// SC.snap — a v2 blob with a scaled grid (see [`build_scaled_scene`]).
+/// SC.snap — a v2 blob with a scaled grid (see [`assert_scaled_scene`]).
 const FIXTURE_V2: &[u8] = include_bytes!("fixtures/snapshot_v2.rxs");
-/// WT.0 — a v3 blob with water volumes (see [`build_water_scene`]).
+/// WT.0 — a v3 blob with water volumes (see [`assert_water_scene`]).
 const FIXTURE_V3: &[u8] = include_bytes!("fixtures/snapshot_v3.rxs");
+/// CA.0 — a v4 blob with a cutaway clip (see [`build_clipped_scene`]).
+const FIXTURE_V4: &[u8] = include_bytes!("fixtures/snapshot_v4.rxs");
 
 /// The scene the fixture encodes: two grids — a fully-configured
 /// named "terrain" grid with edits (versions non-zero) spanning a
@@ -150,24 +153,11 @@ fn v2_fixture_loads() {
     assert!(g.water_volumes.is_empty(), "v2 predates water volumes");
 }
 
-/// WT.0 — the v3 reference scene: a scaled grid with water volumes (the
-/// capability v3 adds), so the v3 fixture proves persisted water survives
-/// alongside the persisted scale. Deliberately CHUNK-FREE: one voxel edit
-/// would drag a full serialized chunk (~130 KB) into a forever-frozen
-/// fixture, and chunk decoding is already gated by the v1/v2 fixtures —
-/// v3 gates only what v3 added (~200 bytes).
-fn build_water_scene() -> Scene {
-    let mut scene = Scene::new();
-    let id = scene.add_grid(GridTransform::at_scale(DVec3::new(1.0, 2.0, 0.0), 0.5));
-    let g = scene.grid_mut(id).expect("grid just added");
-    g.name = Some("flooded".to_owned());
-    g.add_water_volume(IVec3::new(0, 0, 100), IVec3::new(31, 31, 127));
-    g.add_water_volume(IVec3::new(40, 40, 110), IVec3::new(50, 50, 115));
-    scene
-}
-
-/// Assert `scene` matches [`build_water_scene`] — the persisted water is
-/// the point.
+/// Assert `scene` matches the frozen v3 fixture's reference scene — a
+/// scaled grid named "flooded" with two water volumes (the capability
+/// v3 added). The builder that generated the fixture was removed when
+/// v4 froze v3 (a frozen fixture needs no regeneration path); the
+/// persisted water is the point.
 fn assert_water_scene(scene: &Scene) {
     let (_, g) = scene.grids().next().expect("one grid");
     assert_eq!(g.transform.voxel_world_size, 0.5);
@@ -189,32 +179,76 @@ fn v3_fixture_loads() {
     let scene =
         Scene::load_snapshot(FIXTURE_V3).expect("checked-in v3 fixture must stay loadable forever");
     assert_water_scene(&scene);
+    // CA.0 — a pre-cutaway save restores unclipped.
+    let (_, g) = scene.grids().next().expect("one grid");
+    assert_eq!(g.z_clip, None, "v3 predates the cutaway clip");
 }
 
-/// WT.0 — water volumes round-trip through the CURRENT wire format
+/// CA.0 — the v4 reference scene: a grid with water volumes AND a
+/// cutaway clip (the capability v4 adds), so the v4 fixture proves the
+/// persisted clip survives alongside the v3-era fields. Deliberately
+/// CHUNK-FREE, same rationale as the frozen v3 fixture (chunk decoding
+/// is already gated by v1/v2; v4 gates only what v4 added).
+fn build_clipped_scene() -> Scene {
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at_scale(DVec3::new(1.0, 2.0, 0.0), 0.5));
+    let g = scene.grid_mut(id).expect("grid just added");
+    g.name = Some("shiplet".to_owned());
+    g.add_water_volume(IVec3::new(0, 0, 100), IVec3::new(31, 31, 127));
+    g.z_clip = Some(-96);
+    scene
+}
+
+/// Assert `scene` matches [`build_clipped_scene`] — the persisted clip is
+/// the point (a NEGATIVE value on purpose: stacked-chz grids clip above
+/// chz 0, and a sign bug would slip through a positive-only fixture).
+fn assert_clipped_scene(scene: &Scene) {
+    let (_, g) = scene.grids().next().expect("one grid");
+    assert_eq!(g.name.as_deref(), Some("shiplet"));
+    assert_eq!(g.z_clip, Some(-96), "v4 must persist the cutaway clip");
+    assert_eq!(
+        g.water_volumes,
+        vec![WaterVolume::new(
+            IVec3::new(0, 0, 100),
+            IVec3::new(31, 31, 127)
+        )],
+        "v3-era fields must survive the v4 shape"
+    );
+}
+
+/// CA.0 — a v4 blob (with a cutaway clip) stays loadable, the same
+/// forever-promise as the v1/v2/v3 fixtures.
+#[test]
+fn v4_fixture_loads() {
+    let scene =
+        Scene::load_snapshot(FIXTURE_V4).expect("checked-in v4 fixture must stay loadable forever");
+    assert_clipped_scene(&scene);
+}
+
+/// CA.0 — the cutaway clip round-trips through the CURRENT wire format
 /// (independent of the fixture, so a green run proves both directions).
 #[test]
-fn water_volumes_round_trip() {
-    let bytes = build_water_scene().save_snapshot();
+fn z_clip_round_trip() {
+    let bytes = build_clipped_scene().save_snapshot();
     let scene = Scene::load_snapshot(&bytes).expect("round trip");
-    assert_water_scene(&scene);
+    assert_clipped_scene(&scene);
 }
 
-/// Regenerate the checked-in **v3** fixture. Only run deliberately after a
+/// Regenerate the checked-in **v4** fixture. Only run deliberately after a
 /// deliberate reference-scene change (NOT after a wire-format change — bump
 /// SNAPSHOT_VERSION and add a shadow shape instead):
 /// `cargo test -p roxlap-scene --test snapshot_wire -- --ignored`
 ///
-/// The v1/v2 fixtures are intentionally NOT regenerable here: current
-/// `save_snapshot` emits v3, so the frozen `snapshot_v1.rxs` /
-/// `snapshot_v2.rxs` (the backward-compat gates) are left untouched by
-/// design.
+/// The v1/v2/v3 fixtures are intentionally NOT regenerable here: current
+/// `save_snapshot` emits v4, so the frozen `snapshot_v1.rxs` /
+/// `snapshot_v2.rxs` / `snapshot_v3.rxs` (the backward-compat gates) are
+/// left untouched by design.
 #[test]
-#[ignore = "writes tests/fixtures/snapshot_v3.rxs; run manually"]
-fn regenerate_v3_fixture() {
+#[ignore = "writes tests/fixtures/snapshot_v4.rxs; run manually"]
+fn regenerate_v4_fixture() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/snapshot_v3.rxs"
+        "/tests/fixtures/snapshot_v4.rxs"
     );
-    std::fs::write(path, build_water_scene().save_snapshot()).expect("write fixture");
+    std::fs::write(path, build_clipped_scene().save_snapshot()).expect("write fixture");
 }

@@ -56,7 +56,23 @@ impl<'a> SceneOccluder<'a> {
     pub fn build(scene: &'a Scene) -> Self {
         let mut grids = Vec::new();
         for (_id, grid) in scene.grids() {
-            if let Some((lo, hi)) = grid_voxel_aabb(grid) {
+            if let Some((mut lo, hi)) = grid_voxel_aabb(grid) {
+                // CA.2 — cutaway: everything above the clip plane
+                // (`z < z_clip`, z-down) is air to the renderer, so
+                // shadow rays must not be blocked by it either
+                // ("world as if removed"). Raising the occluder box
+                // floor to the plane makes the march skip the hidden
+                // band entirely; each grid applies its OWN clip, so a
+                // clipped ship stops casting onto the ground while the
+                // unclipped ground keeps shadowing normally. A fully
+                // hidden grid stops casting altogether.
+                #[allow(clippy::cast_precision_loss)]
+                if let Some(zc) = grid.z_clip {
+                    lo[2] = lo[2].max(zc as f32);
+                    if lo[2] >= hi[2] {
+                        continue;
+                    }
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 grids.push(GridOcc {
                     grid,
@@ -508,5 +524,50 @@ mod tests {
         let hits_with_maps = run(&scene);
         assert_eq!(hits_no_maps, hits_with_maps, "map presence changed results");
         assert!(hits_with_maps > 200, "sweep should hit terrain often");
+    }
+
+    /// CA.2 — cross-grid shadow rays apply each TARGET grid's own
+    /// cutaway clip: a clipped-away slab stops occluding while another
+    /// grid's (unclipped) slab keeps blocking the same ray, and a clip
+    /// that hides a whole grid drops it from the occluder outright.
+    #[test]
+    fn cutaway_clip_applies_per_grid() {
+        let mut scene = Scene::new();
+        // Two overlapping identity grids: slab A at z 100..110,
+        // slab B at z 180..190.
+        let ga = scene.add_grid(GridTransform::identity());
+        scene.grid_mut(ga).unwrap().set_rect(
+            IVec3::new(0, 0, 100),
+            IVec3::new(127, 127, 110),
+            Some(VoxColor(0x80_55_66_77)),
+        );
+        let gb = scene.add_grid(GridTransform::identity());
+        scene.grid_mut(gb).unwrap().set_rect(
+            IVec3::new(0, 0, 180),
+            IVec3::new(127, 127, 190),
+            Some(VoxColor(0x80_77_66_55)),
+        );
+        // A "sun ray" from below both slabs, straight up (z-down: -z).
+        let occluded = |scene: &Scene| {
+            use roxlap_core::WorldOccluder;
+            SceneOccluder::build(scene).occluded_world([50.0, 50.0, 250.0], [0.0, 0.0, -1.0], 512.0)
+        };
+        assert!(occluded(&scene), "both slabs visible: blocked");
+        // Hide slab A only — slab B (its own clip unset) still blocks.
+        scene.grid_mut(ga).unwrap().z_clip = Some(150);
+        assert!(occluded(&scene), "B is unclipped and must keep blocking");
+        // Hide slab B too (plane below it) — the ray reaches the sun.
+        scene.grid_mut(gb).unwrap().z_clip = Some(195);
+        assert!(
+            !occluded(&scene),
+            "both slabs hidden: hidden geometry must not shadow"
+        );
+        // Per-grid independence the other way round: only B clipped.
+        scene.grid_mut(ga).unwrap().z_clip = None;
+        assert!(occluded(&scene), "A is unclipped and must keep blocking");
+        // A clip below the whole grid box drops the grid from the
+        // occluder entirely (the `lo >= hi` early-continue).
+        scene.grid_mut(ga).unwrap().z_clip = Some(300);
+        assert!(!occluded(&scene), "fully hidden grids never occlude");
     }
 }
