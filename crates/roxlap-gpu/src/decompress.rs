@@ -682,4 +682,73 @@ mod tests {
             chunk.colors.len()
         );
     }
+
+    /// CA follow-up — the GPU shadow march's empty-block skip jumps 8³
+    /// cell boxes whose mip-(m+3) SOLID bit is clear, so every solid
+    /// mip level must be a **superset** of its children: a clear
+    /// parent bit must imply all 8 child bits clear, or the skip could
+    /// jump over a real occluder. Adjacent-level supersets compose to
+    /// any span. Checked over fixtures with terrain, thin plates with
+    /// real air gaps, carved caves and isolated pillars.
+    #[test]
+    fn solid_mips_are_child_supersets() {
+        use roxlap_formats::color::VoxColor;
+        let c = VoxColor(0x80_60_60_60);
+        let fixtures: Vec<(&str, Vxl)> = vec![
+            (
+                "hilly terrain",
+                Vxl::from_dense(64, |x, y, z| {
+                    let surf = 20 + ((x / 3 + y / 5) % 17);
+                    (z >= surf).then_some(c)
+                }),
+            ),
+            (
+                "plates with air gaps",
+                Vxl::from_dense(64, |_, _, z| matches!(z, 33 | 100 | 101 | 200).then_some(c)),
+            ),
+            (
+                "carved + pillars",
+                Vxl::from_dense(64, |x, y, z| {
+                    let solid = z >= 40;
+                    let cave = {
+                        let (dx, dy, dz) = (x as i32 - 32, y as i32 - 32, z as i32 - 60);
+                        dx * dx + dy * dy + dz * dz <= 15 * 15
+                    };
+                    let pillar = x % 23 == 1 && y % 19 == 2 && z >= 10;
+                    ((solid && !cave) || pillar).then_some(c)
+                }),
+            ),
+        ];
+        let bit = |m: &MipUpload, x: u32, y: u32, z: u32| -> bool {
+            let w = (x + y * m.vsid) * m.occ_words_per_col + (z >> 5);
+            (m.solid_occupancy[w as usize] >> (z & 31)) & 1 != 0
+        };
+        for (name, vxl) in &fixtures {
+            let up = decompress_chunk(vxl);
+            for l in 0..up.mips.len() - 1 {
+                let (fine, coarse) = (&up.mips[l], &up.mips[l + 1]);
+                for y in 0..coarse.vsid {
+                    for x in 0..coarse.vsid {
+                        for z in 0..coarse.cz {
+                            if bit(coarse, x, y, z) {
+                                continue;
+                            }
+                            for d in 0..8u32 {
+                                let (fx, fy, fz) =
+                                    (2 * x + (d & 1), 2 * y + ((d >> 1) & 1), 2 * z + (d >> 2));
+                                if fx < fine.vsid && fy < fine.vsid && fz < fine.cz {
+                                    assert!(
+                                        !bit(fine, fx, fy, fz),
+                                        "{name}: mip {} clear at ({x},{y},{z}) but child \
+                                         ({fx},{fy},{fz}) solid at mip {l}",
+                                        l + 1,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -2160,3 +2160,132 @@ fn scene_dda_cutaway_hidden_wall_stops_shadowing() {
         "a clipped-away wall must stop shadowing: shadowed {shadowed:#010x} -> clipped {unshadowed:#010x}",
     );
 }
+
+/// CA follow-up — cross-grid sun shadow under a TELE camera (the deck
+/// view): a hull grid must darken the ground grid beside it even when
+/// the receiver sits ~1150 world units from the eye. Regression for
+/// the Decks report "GPU shows no hull shadow" — the CPU backend
+/// renders it, so a miss here is a backend divergence.
+#[test]
+fn scene_dda_cross_grid_shadow_survives_tele_distance() {
+    use roxlap_formats::color::VoxColor;
+
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 128u32;
+    // Ground grid: plate z ∈ [420, 440] (deep in chunk z=1 → the
+    // upload uses chunk (0,0,1) like the demo).
+    let ground_vxl = Vxl::from_dense(vsid, |_, _, z| {
+        (164..=184).contains(&z).then_some(VoxColor(0x80_4A_5E_3C))
+    });
+    // The demo's ground plate lives at z 420..440 = chunk 1, local 164..184.
+    let ground = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [2, 1, 2],
+        pool_dims: [2, 1, 2],
+        chunks: vec![
+            ([0, 0, 1], decompress_chunk(&ground_vxl)),
+            ([1, 0, 1], decompress_chunk(&ground_vxl)),
+        ],
+    };
+    // Hull grid: a HOLLOW box (roof plate + perimeter walls + deck
+    // floors, like the demo shiplet) x 24..104, y 32..96, z 240..313,
+    // split over stacked chunks (0,0,0) + (0,0,1), world origin z=106.
+    let hull_at = |x: u32, y: u32, z: i32| -> bool {
+        let inside = (24..104).contains(&x) && (32..96).contains(&y) && (240..=313).contains(&z);
+        if !inside {
+            return false;
+        }
+        let roof = z <= 241;
+        let wall = x <= 25 || x >= 102 || y <= 33 || y >= 94;
+        let floor = matches!(z, 259..=262 | 283..=286 | 307..=310 | 311..=313);
+        roof || wall || floor
+    };
+    let hull_c0 = Vxl::from_dense(vsid, |x, y, z| {
+        hull_at(x, y, i32::try_from(z).unwrap()).then_some(VoxColor(0x80_62_66_70))
+    });
+    let hull_c1 = Vxl::from_dense(vsid, |x, y, z| {
+        hull_at(x, y, i32::try_from(z).unwrap() + 256).then_some(VoxColor(0x80_62_66_70))
+    });
+    let ship = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 2],
+        pool_dims: [1, 1, 2],
+        chunks: vec![
+            ([0, 0, 0], decompress_chunk(&hull_c0)),
+            ([0, 0, 1], decompress_chunk(&hull_c1)),
+        ],
+    };
+    let scene = GpuSceneResident::upload(
+        &gpu.device,
+        &SceneUpload {
+            grids: vec![ground, ship],
+        },
+    );
+
+    let (w, h) = (128u32, 128u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // Tele camera: straight down from ~1150 world units, framing the
+    // shadow band EAST of the hull (sun travel [0.45, 0.35, 0.82] ⇒
+    // the hull's shadow falls on its +x/+y side, extending ~40 voxels
+    // past the wall from the 74-voxel drop to the ground).
+    let cam = Camera {
+        position: [120.0, 70.0, 420.0 - 1150.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 0.15,
+    };
+    let cam_ship = Camera {
+        position: [cam.position[0], cam.position[1], cam.position[2] - 106.0],
+        ..cam
+    };
+    let xf_ground = GridWorldTransform::default();
+    let xf_ship = GridWorldTransform {
+        origin: [0.0, 0.0, 106.0],
+        ..GridWorldTransform::default()
+    };
+    let mut r = renderer;
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam, cam_ship],
+            &[xf_ground, xf_ship],
+            cam.fov_y_rad,
+            64,
+            640.0, // the demo's tele LOD override
+        )
+    };
+    let s = |casts: bool| SceneLights {
+        enabled: true,
+        grid_sun_dirs: vec![[-0.45, -0.35, -0.82], [-0.45, -0.35, -0.82]],
+        sun_color: [1.0, 0.95, 0.85],
+        sun_intensity: 1.1,
+        sun_casts_shadow: casts,
+        ambient: [0.4, 0.42, 0.48],
+        shadow_strength: 0.8,
+        shadow_bias: 1.5,
+        shadow_max_dist: 200.0,
+        shadow_max_steps: 768,
+        ..SceneLights::default()
+    };
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let sum = |fb: &[u32]| fb.iter().map(|&p| u64::from(lum(p))).sum::<u64>();
+    r.set_scene_lights(s(false));
+    let lit = render(&mut r);
+    r.set_scene_lights(s(true));
+    let shadowed = render(&mut r);
+    // Compare total luminance over the frame: with the hull shadow
+    // present a visible patch of ground darkens.
+    let (l0, l1) = (sum(&lit), sum(&shadowed));
+    assert!(
+        l1 < l0 && (l0 - l1) * 100 > l0,
+        "hull must cast a visible cross-grid shadow at tele distance: \
+         lit {l0} shadowed {l1}"
+    );
+}

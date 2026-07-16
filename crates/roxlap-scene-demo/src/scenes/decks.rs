@@ -70,8 +70,18 @@ const TELE_FOV_Y: f32 = 0.15;
 /// Orbit distance: at 0.15 rad the frame spans ≈ `0.15 × dist` voxels
 /// vertically, so 1150 shows the whole shiplet with margin.
 const TELE_DIST: f64 = 1150.0;
-/// Ray-march far enough to cover the tele distance plus the scene.
-const TELE_SCAN_DIST: i32 = 4096;
+/// Ray-march far enough to cover the tele distance plus the scene
+/// (camera ≈ 1150 out + ~400 of world + orbit slack) — the GPU outer
+/// step budget derives from this, so keep it tight.
+const TELE_SCAN_DIST: i32 = 2048;
+/// GPU LOD scan-distance override while the scene is active: chosen so
+/// the PRIMARY rays still march mip 0 at the tele distance
+/// (`1150 / 640 < 2` ⇒ level 0) while the sun-shadow marches — whose
+/// mip is picked from `t_base + travel` (PF.2) — degrade to mip 1 a
+/// short way from the receiver instead of walking hundreds of mip-0
+/// voxels per lit pixel (the GPU shadow march has no brick-level
+/// empty-space skip; measured 12 → 30+ FPS on NVK at 860×520).
+const TELE_MIP_SCAN: f32 = 640.0;
 const START_YAW: f64 = 0.7;
 const START_PITCH: f64 = 0.85;
 /// Focus pans at this speed (voxels/sec) under WASD.
@@ -273,9 +283,7 @@ impl DemoScene for DecksScene {
         // GPU distance LOD would march the whole ship at deep mips from
         // the tele distance; hold mip 0 out past the orbit range.
         self.saved_mip_scan = Some(ctx.renderer.gpu_mip_scan_dist());
-        #[allow(clippy::cast_possible_truncation)]
-        ctx.renderer
-            .set_gpu_mip_scan_dist((TELE_DIST + 512.0) as f32);
+        ctx.renderer.set_gpu_mip_scan_dist(TELE_MIP_SCAN);
 
         // The flood water is a Beer–Lambert volumetric material (WT
         // pattern) so the submerged bilge reads through the surface.
@@ -412,7 +420,10 @@ impl DemoScene for DecksScene {
             ambient: [0.4, 0.42, 0.48],
             shadow_strength: 0.8,
             shadow_bias_voxels: 1.5,
-            shadow_max_dist: 512.0,
+            // Just enough ray to cover the hull's self-shadow and its
+            // ground shadow (~180 world units along the sun) — every
+            // extra unit is marched per lit pixel on the GPU.
+            shadow_max_dist: 200.0,
             bands: 0,
             shadow_tint: [0.0; 3],
         });

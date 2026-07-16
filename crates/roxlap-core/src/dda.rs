@@ -1421,21 +1421,26 @@ impl ShadowTester for SamplerShadow<'_, '_> {
                 if best_axis == 3 {
                     return false;
                 }
-                let pb = [
-                    origin[0] + dir[0] * (best_t + 1e-4),
-                    origin[1] + dir[1] * (best_t + 1e-4),
-                    origin[2] + dir[2] * (best_t + 1e-4),
-                ];
-                let mut nc = [
-                    (pb[0] / cs).floor() as i32,
-                    (pb[1] / cs).floor() as i32,
-                    (pb[2] / cs).floor() as i32,
-                ];
+                // Landing mirrors `cell_walk_skip`: exit axis pinned to
+                // the boundary cell, other axes advanced by exact
+                // crossing counts from t-differences (position
+                // reconstruction is ill-conditioned at large t).
+                let mut nc = cellc;
+                for a in 0..3 {
+                    if a == best_axis || step[a] == 0 || t_max[a] > best_t {
+                        continue;
+                    }
+                    #[allow(clippy::cast_possible_truncation)]
+                    let k = ((best_t - t_max[a]) / t_delta[a]) as i32 + 1;
+                    nc[a] += k * step[a];
+                    t_max[a] += k as f32 * t_delta[a];
+                }
                 nc[best_axis] = if step[best_axis] > 0 {
                     plane[best_axis]
                 } else {
                     plane[best_axis] - 1
                 };
+                t_max[best_axis] = best_t + t_delta[best_axis];
                 // Budget: the dense walk would have spent one step per
                 // cell (Manhattan distance). If it runs out inside the
                 // empty box the dense walk would have returned `false`
@@ -1447,13 +1452,6 @@ impl ShadowTester for SamplerShadow<'_, '_> {
                 }
                 used += crossed;
                 cellc = nc;
-                for a in 0..3 {
-                    if step[a] > 0 {
-                        t_max[a] = ((cellc[a] + 1) as f32 * cs - origin[a]) * inv[a];
-                    } else if step[a] < 0 {
-                        t_max[a] = (cellc[a] as f32 * cs - origin[a]) * inv[a];
-                    }
-                }
                 t_curr = best_t.max(t_curr);
                 continue;
             }
@@ -1629,25 +1627,34 @@ fn cell_walk_skip(
             if best_axis == 3 {
                 return finalize_exit(touched, accum, trans, env, dir, max_dist);
             }
-            // Land just across the boundary; pin the exit axis to the
-            // integer boundary cell so float error can't skip the next
-            // box's entry cell. Other axes haven't crossed their box
-            // boundary (best_t is the min), so the point's floor is safe.
-            let pb = [
-                origin[0] + dir[0] * (best_t + 1e-4),
-                origin[1] + dir[1] * (best_t + 1e-4),
-                origin[2] + dir[2] * (best_t + 1e-4),
-            ];
-            let mut nc = [
-                (pb[0] / cell_size).floor() as i32,
-                (pb[1] / cell_size).floor() as i32,
-                (pb[2] / cell_size).floor() as i32,
-            ];
+            // Land just across the boundary. The exit axis is pinned to
+            // the integer boundary cell; the OTHER axes advance by their
+            // exact crossing COUNT, derived from t-DIFFERENCES (t_max vs
+            // best_t) — well-conditioned at any camera distance. (The
+            // old landing re-floored an absolute position `origin +
+            // dir·(best_t + 1e-4)`: at tele-camera distances (t ≈
+            // 1000+) the reconstruction's cancellation noise ≈ 2·ulp(t)
+            // exceeds the fixed nudge, landing rays one cell off
+            // sideways — dark seam lines / sky pinholes along brick
+            // boundaries on distant mip-0 geometry, the CA.5 report.)
+            let mut nc = cellc;
+            for a in 0..3 {
+                if a == best_axis || step[a] == 0 || t_max[a] > best_t {
+                    continue;
+                }
+                // Crossings of axis `a` at t ≤ best_t: t_max[a] is the
+                // next one, spaced t_delta[a] apart.
+                #[allow(clippy::cast_possible_truncation)]
+                let k = ((best_t - t_max[a]) / t_delta[a]) as i32 + 1;
+                nc[a] += k * step[a];
+                t_max[a] += k as f32 * t_delta[a];
+            }
             nc[best_axis] = if step[best_axis] > 0 {
                 plane[best_axis]
             } else {
                 plane[best_axis] - 1
             };
+            t_max[best_axis] = best_t + t_delta[best_axis];
             // The skip crossed a box boundary; if that takes the ray out
             // of the grid box it has exited (sky) — return rather than
             // clamping back in-bounds, which would spin at the edge.
@@ -1661,15 +1668,10 @@ fn cell_walk_skip(
                 return finalize_exit(touched, accum, trans, env, dir, max_dist);
             }
             cellc = nc;
-            // Refresh t_max for the new cell (dir unchanged → t_delta and
-            // step constant; axes with step==0 keep their +∞).
-            for a in 0..3 {
-                if step[a] > 0 {
-                    t_max[a] = ((cellc[a] + 1) as f32 * cell_size - origin[a]) * inv[a];
-                } else if step[a] < 0 {
-                    t_max[a] = (cellc[a] as f32 * cell_size - origin[a]) * inv[a];
-                }
-            }
+            // t_max was advanced per axis above (crossing counts), so
+            // it is already consistent with the landing cell — no
+            // position-based refresh (that reconstruction is exactly
+            // the noise source this landing avoids).
             t_curr = best_t.max(t_curr);
             last_axis = best_axis;
             prev_solid = false; // skipped empty space → next hit starts a run

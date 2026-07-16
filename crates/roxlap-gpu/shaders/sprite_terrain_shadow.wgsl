@@ -123,6 +123,21 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> boo
     // CA.3 — cutaway: clipped-away cells never occlude sprites either
     // (mip-0 march, so the plane needs no `>> mip`). i32::MIN = off.
     let z_clip = grid_cameras[g].z_clip;
+    // CA follow-up — empty-block skip via the coarse SOLID mip (see
+    // scene_dda.wgsl's shadow_occluded; the gap is fixed for this
+    // mip-0 march). Safe by the mip-superset gate.
+    let mip_count = grid_static_meta[g].mip_count;
+    var skip_gap = 0u;
+    var skip_vsid = 0u;
+    var skip_wpc = 0u;
+    var skip_rel = 0u;
+    if (mip_count > 2u) {
+        let l = min(3u, mip_count - 1u);
+        skip_gap = l;
+        skip_vsid = vsid >> l;
+        skip_wpc = max((CHUNK_Z >> l) >> 5u, 1u);
+        skip_rel = grid_static_meta[g].mip_occ_rel[l] + skip_vsid * skip_vsid * skip_wpc;
+    }
     var p_chunk = vec3<i32>(floor(origin / chunk_dim));
     let step_chunk = vec3<i32>(sign(dir));
     let t_delta_chunk = abs(chunk_dim / dir);
@@ -158,7 +173,45 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32) -> boo
             );
             var t_max_voxel = shield_parallel((next_voxel_world - origin) / dir, dir);
             let t_delta_voxel = abs(vec3<f32>(vws) / dir); // SC.4 — world voxel size
+            let skip_col_base = occ_off + slot_id * occ_words_slot + skip_rel;
             loop {
+                // CA follow-up — empty-block skip (mirror of
+                // scene_dda.wgsl's shadow_occluded).
+                if (skip_gap > 0u) {
+                    let b = vec3<u32>(p_voxel) >> vec3<u32>(skip_gap);
+                    let bw = skip_col_base + (b.x + b.y * skip_vsid) * skip_wpc + (b.z >> 5u);
+                    if ((occ_word(bw) & (1u << (b.z & 31u))) == 0u) {
+                        let bmask = vec3<i32>(i32((1u << skip_gap) - 1u));
+                        let to_edge = select(
+                            p_voxel & bmask,
+                            bmask - (p_voxel & bmask),
+                            step_chunk > vec3<i32>(0),
+                        );
+                        let t_exit_raw = t_max_voxel + vec3<f32>(to_edge) * t_delta_voxel;
+                        let t_exit = select(t_exit_raw, vec3<f32>(1e30), step_chunk == vec3<i32>(0));
+                        let t_box = min(t_exit.x, min(t_exit.y, t_exit.z));
+                        if (t_box > max_t) { return false; }
+                        let num = max(vec3<f32>(t_box) - t_max_voxel, vec3<f32>(0.0));
+                        let crossed = t_max_voxel <= vec3<f32>(t_box);
+                        let k = select(
+                            vec3<i32>(0),
+                            vec3<i32>(num / t_delta_voxel) + vec3<i32>(1),
+                            crossed,
+                        );
+                        p_voxel = p_voxel + k * step_chunk;
+                        t_max_voxel = select(
+                            t_max_voxel + vec3<f32>(k) * t_delta_voxel,
+                            t_max_voxel,
+                            k == vec3<i32>(0),
+                        );
+                        steps = steps + 1u;
+                        if (steps >= u.shadow_max_steps) { return false; }
+                        if (p_voxel.x < 0 || p_voxel.x >= vsid_i
+                            || p_voxel.y < 0 || p_voxel.y >= vsid_i
+                            || p_voxel.z < 0 || p_voxel.z >= cz_i) { break; }
+                        continue;
+                    }
+                }
                 let z_u = u32(p_voxel.z);
                 let widx = solid_col0
                     + (u32(p_voxel.x) + u32(p_voxel.y) * vsid) * OCC_WORDS_PER_COLUMN_S

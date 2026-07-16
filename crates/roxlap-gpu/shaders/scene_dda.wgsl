@@ -524,6 +524,28 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
             let cz_mip = i32(CHUNK_Z >> mip);
             // CA.3 — same floor formula as march_grid / the CPU sampler.
             let z_clip_mip = z_clip >> mip;
+            // CA follow-up — empty-block skip: the SOLID bitmap of a
+            // coarser mip level doubles as a brick map (a clear bit
+            // proves every descendant cell empty — gated by the
+            // `solid_mips_are_child_supersets` test). Marching mip m,
+            // test the mip-(m+gap) block containing the cell; empty ⇒
+            // jump the whole 2^gap-cell box. This is what keeps long
+            // shadow rays affordable at fine mips (the CPU march has
+            // the same skip via its brick cache).
+            var skip_gap = 0u;
+            var skip_vsid = 0u;
+            var skip_wpc = 0u;
+            var skip_col_base = 0u;
+            if (mip + 2u < mip_count) {
+                let l = min(mip + 3u, mip_count - 1u);
+                skip_gap = l - mip;
+                skip_vsid = vsid >> l;
+                skip_wpc = occ_words_per_col_for_mip(l);
+                skip_col_base = occ_off
+                    + slot_id * occ_words_slot
+                    + grid_static_meta[g].mip_occ_rel[l]
+                    + skip_vsid * skip_vsid * skip_wpc;
+            }
             // PF.1 — solid word base for this (slot, mip), hoisted out of
             // the inner loop, plus a last-word cache.
             let wpc = occ_words_per_col_for_mip(mip);
@@ -560,6 +582,52 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
             // there's no overshoot, and mip 0 stays byte-identical.
             var skip_origin_cell = (t_enter == 0.0) && (mip > 0u);
             loop {
+                // CA follow-up — empty-block skip (see the hoist above):
+                // if the containing coarse block is solid-free, jump to
+                // its exit. Axis advances use exact crossing COUNTS from
+                // t-differences (mirrors the CPU landing).
+                if (skip_gap > 0u) {
+                    let b = vec3<u32>(p_voxel) >> vec3<u32>(skip_gap);
+                    let bw = skip_col_base + (b.x + b.y * skip_vsid) * skip_wpc + (b.z >> 5u);
+                    if ((occ_word(bw) & (1u << (b.z & 31u))) == 0u) {
+                        // The block was empty, so the (unsampled) origin
+                        // cell was air — nothing left to suppress.
+                        skip_origin_cell = false;
+                        let bmask = vec3<i32>(i32((1u << skip_gap) - 1u));
+                        // Cells to the block edge along the travel
+                        // direction, then the per-axis block-exit t.
+                        let to_edge = select(
+                            p_voxel & bmask,
+                            bmask - (p_voxel & bmask),
+                            step_chunk > vec3<i32>(0),
+                        );
+                        let t_exit_raw = t_max_voxel + vec3<f32>(to_edge) * t_delta_voxel;
+                        let t_exit = select(t_exit_raw, vec3<f32>(1e30), step_chunk == vec3<i32>(0));
+                        let t_box = min(t_exit.x, min(t_exit.y, t_exit.z));
+                        if (t_box > max_t) { return false; }
+                        // Crossings of each axis at t ≤ t_box (`max(…, 0)`
+                        // keeps the parallel-axis lanes NaN-free).
+                        let num = max(vec3<f32>(t_box) - t_max_voxel, vec3<f32>(0.0));
+                        let crossed = t_max_voxel <= vec3<f32>(t_box);
+                        let k = select(
+                            vec3<i32>(0),
+                            vec3<i32>(num / t_delta_voxel) + vec3<i32>(1),
+                            crossed,
+                        );
+                        p_voxel = p_voxel + k * step_chunk;
+                        t_max_voxel = select(
+                            t_max_voxel + vec3<f32>(k) * t_delta_voxel,
+                            t_max_voxel,
+                            k == vec3<i32>(0),
+                        );
+                        steps = steps + 1u;
+                        if (steps >= u.shadow_max_steps) { return false; }
+                        if (p_voxel.x < 0 || p_voxel.x >= vsid_mip
+                            || p_voxel.y < 0 || p_voxel.y >= vsid_mip
+                            || p_voxel.z < 0 || p_voxel.z >= cz_mip) { break; }
+                        continue;
+                    }
+                }
                 // Solid-bit test with a last-word cache: consecutive
                 // z-steps land in the same 32-voxel word up to 32 times.
                 let z_u = u32(p_voxel.z);
@@ -939,6 +1007,25 @@ fn march_grid(
             // toward -∞ — the IDENTICAL formula to the CPU sampler's
             // `z_clip >> mip` (the CA.3 parity gate pins the pair).
             let z_clip_mip = z_clip >> mip;
+            // CA follow-up — empty-block skip (see shadow_occluded):
+            // the coarse SOLID mip doubles as a brick map, so rays
+            // cross in-chunk air in 2^gap-cell jumps instead of
+            // per-voxel steps. Skipping solid-free boxes can't change
+            // any hit (mip-superset gate) — pure traversal speed.
+            var skip_gap = 0u;
+            var skip_vsid = 0u;
+            var skip_wpc = 0u;
+            var skip_col_base = 0u;
+            if (mip + 2u < mip_count) {
+                let l = min(mip + 3u, mip_count - 1u);
+                skip_gap = l - mip;
+                skip_vsid = vsid >> l;
+                skip_wpc = occ_words_per_col_for_mip(l);
+                skip_col_base = occ_off
+                    + slot_id * occ_words_slot
+                    + grid_static_meta[g].mip_occ_rel[l]
+                    + skip_vsid * skip_vsid * skip_wpc;
+            }
             // PF.1 — solid-occupancy word base for this (slot, mip), hoisted
             // out of the inner loop (textured block first, solid after it),
             // plus a last-word cache: consecutive z-steps land in the same
@@ -984,6 +1071,55 @@ fn march_grid(
             var hit_axis: i32 = entry_axis;
 
             for (var iv: u32 = 0u; iv < MAX_INNER_STEPS; iv = iv + 1u) {
+                // CA follow-up — empty-block skip (mirror of the shadow
+                // march): jump solid-free coarse blocks. The landing
+                // cell is entered at `t_box` through the exit axis, so
+                // `t_hit`/`hit_axis` update exactly as a dense step
+                // would; skipped air resets the translucent run.
+                if (skip_gap > 0u) {
+                    let b = vec3<u32>(p_voxel) >> vec3<u32>(skip_gap);
+                    let bw = skip_col_base + (b.x + b.y * skip_vsid) * skip_wpc + (b.z >> 5u);
+                    if ((occ_word(bw) & (1u << (b.z & 31u))) == 0u) {
+                        let bmask = vec3<i32>(i32((1u << skip_gap) - 1u));
+                        let to_edge = select(
+                            p_voxel & bmask,
+                            bmask - (p_voxel & bmask),
+                            step_chunk > vec3<i32>(0),
+                        );
+                        let t_exit_raw = t_max_voxel + vec3<f32>(to_edge) * t_delta_voxel;
+                        let t_exit = select(t_exit_raw, vec3<f32>(1e30), step_chunk == vec3<i32>(0));
+                        let t_box = min(t_exit.x, min(t_exit.y, t_exit.z));
+                        if (t_box >= best_t) {
+                            return finalize_sky_grid(touched, accum, trans, ray_dir);
+                        }
+                        let num = max(vec3<f32>(t_box) - t_max_voxel, vec3<f32>(0.0));
+                        let crossed = t_max_voxel <= vec3<f32>(t_box);
+                        let k = select(
+                            vec3<i32>(0),
+                            vec3<i32>(num / t_delta_voxel) + vec3<i32>(1),
+                            crossed,
+                        );
+                        p_voxel = p_voxel + k * step_chunk;
+                        t_max_voxel = select(
+                            t_max_voxel + vec3<f32>(k) * t_delta_voxel,
+                            t_max_voxel,
+                            k == vec3<i32>(0),
+                        );
+                        t_hit = t_box;
+                        if (t_exit.x <= t_exit.y && t_exit.x <= t_exit.z) {
+                            hit_axis = 0;
+                        } else if (t_exit.y <= t_exit.z) {
+                            hit_axis = 1;
+                        } else {
+                            hit_axis = 2;
+                        }
+                        prev_solid = false;
+                        if (p_voxel.x < 0 || p_voxel.x >= vsid_mip
+                            || p_voxel.y < 0 || p_voxel.y >= vsid_mip
+                            || p_voxel.z < 0 || p_voxel.z >= cz_mip) { break; }
+                        continue;
+                    }
+                }
                 let z_u = u32(p_voxel.z);
                 let widx = solid_col_base
                     + (u32(p_voxel.x) + u32(p_voxel.y) * vsid_mip_u) * wpc

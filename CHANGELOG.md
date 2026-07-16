@@ -65,6 +65,35 @@ which only `Grid::new` constructs — no literal breakage there).
 - **Book**: the Rendering chapter gains a *Cutaway deck views* section
   (API, semantics, the footprint rule, the light-cull pattern,
   tele-iso); the demo tour lists the Decks tab.
+- **GPU empty-block skip** (CA visual-pass follow-up): the primary,
+  sun-shadow and sprite-shadow WGSL marches jump solid-free 8³-cell
+  boxes via the coarse SOLID mip levels already resident per slot —
+  the GPU analogue of the CPU brick skip. Safe by construction (a new
+  `solid_mips_are_child_supersets` gate pins that every mip level is a
+  superset of its children); measured 12 → ~30 FPS on the Decks tele
+  view (NVK, 860×520) with all shadow geometry intact.
+
+### Fixed
+
+- **Distant-camera seam lines (CPU)**: the DDA empty-space skip landed
+  rays by re-flooring an absolute position (`origin + dir·t`), whose
+  f32 cancellation noise at tele-camera distances (t ≈ 1000+) exceeds
+  any fixed epsilon — one-cell sideways landings drew dark grid-lines
+  and sky pinholes along brick boundaries. Landings now advance each
+  axis by its exact crossing COUNT from t-differences
+  (well-conditioned at any distance); same fix in the shadow-march and
+  scene-occluder mirrors. One stability hash re-frozen (the structural
+  no-seam + skip-vs-dense gates pin correctness).
+- **Phantom shadows from placeholder bedrock (CPU)**: the cross-grid
+  shadow occluder counted the invisible zero-RGB bedrock placeholder
+  (the bottom voxel of never-written columns in materialised chunks)
+  as solid, so a stacked-chunk grid cast a chunk-wide phantom shadow
+  plate the GPU (whose decompressor drops placeholders) correctly
+  didn't — the first CPU/GPU shadow divergence surfaced by the Decks
+  scene. The occluder now uses the renderer's own solidity rule
+  (`surface_color_mip`); real bedrock under coloured surfaces still
+  occludes. New regression tests on both backends, including a
+  cross-grid-shadow-at-tele-distance GPU gate.
 
 ## [0.29.0] — 2026-07-14
 

@@ -81,6 +81,41 @@ NOT separately gated: the GPU sprite-shadow clip (fix 1) has no
 headless test — the sprite-shadow splice needs a 22-storage-buffer
 device; covered by the Decks visual pass instead.
 
+### Visual-pass round 2 (user report: CPU seams + GPU 11-18 FPS)
+
+Both engine-level, both pre-existing issues the tele-iso deck view was
+the first to surface:
+
+1. **CPU seam grid on distant mip-0 geometry** — the DDA empty-space
+   skip landed rays by re-flooring `origin + dir·t`; at t ≈ 1150 the
+   f32 cancellation noise (≈ 2·ulp(t) ≈ 2.4e-4) exceeds the fixed 1e-4
+   nudge → one-cell sideways landings → dark seam lines + sky pinholes
+   on brick boundaries. Fix: landings advance each axis by its exact
+   crossing COUNT from t-differences (`cell_walk_skip`, the
+   `SamplerShadow` mirror, and `occluder.rs`). One stability hash
+   re-frozen; no-seam + skip-vs-dense structural gates green.
+2. **GPU FPS** — root cause: at tele t_base the whole frame marches
+   mip 0 (primary AND shadows; the shadow origin-chunk mip is
+   `pick_mip(t_base + 0)`, so no demo-side mip_scan tuning can coarsen
+   it), and the GPU marches had NO brick-level empty-space skip —
+   hundreds of per-voxel air steps per pixel/shadow-ray. Fix: an
+   **empty-block skip** in `march_grid` + `shadow_occluded` +
+   `sprite_terrain_shadow` using the coarse SOLID mips already
+   resident per slot as brick maps; safety pinned by
+   `solid_mips_are_child_supersets` (a clear parent bit ⇒ all children
+   clear). Decks GPU: 12 → ~30 FPS (NVK, 860×520), shadows intact.
+   Demo also trimmed: `TELE_SCAN_DIST` 4096→2048, `shadow_max_dist`
+   512→200, `TELE_MIP_SCAN` = 640.
+3. **Bonus find while comparing backends** — the CPU cross-grid
+   occluder counted the invisible zero-RGB bedrock PLACEHOLDER (bottom
+   voxel of never-written columns) as solid: a stacked-chunk grid cast
+   a chunk-wide phantom shadow plate (CPU only; the GPU decompressor
+   drops placeholders). Fixed by making the occluder render-solid
+   (`surface_color_mip` rule); regression tests both backends
+   (`placeholder_bedrock_does_not_occlude`,
+   `scene_dda_cross_grid_shadow_survives_tele_distance`). CPU and GPU
+   shadow masks now agree exactly on the Decks fixture.
+
 ## Goal
 
 Per-grid horizontal clip plane for isometric "deck view" rendering (SS13 /

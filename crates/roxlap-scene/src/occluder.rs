@@ -264,21 +264,25 @@ fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
             if best_axis == 3 {
                 return false;
             }
-            let pb = [
-                o[0] + d[0] * (best_t + 1e-4),
-                o[1] + d[1] * (best_t + 1e-4),
-                o[2] + d[2] * (best_t + 1e-4),
-            ];
-            let mut nc = [
-                pb[0].floor() as i32,
-                pb[1].floor() as i32,
-                pb[2].floor() as i32,
-            ];
+            // Landing mirrors `cell_walk_skip`: exit axis pinned to the
+            // boundary cell, other axes advanced by exact crossing
+            // counts from t-differences (an absolute-position re-floor
+            // is ill-conditioned when the ray origin is far away).
+            let mut nc = cell;
+            for a in 0..3 {
+                if a == best_axis || step[a] == 0 || t_max[a] > best_t {
+                    continue;
+                }
+                let k = ((best_t - t_max[a]) / t_delta[a]) as i32 + 1;
+                nc[a] += k * step[a];
+                t_max[a] += k as f32 * t_delta[a];
+            }
             nc[best_axis] = if step[best_axis] > 0 {
                 plane[best_axis]
             } else {
                 plane[best_axis] - 1
             };
+            t_max[best_axis] = best_t + t_delta[best_axis];
             // Budget: the dense walk would have spent one step per crossed
             // cell; if it runs out inside the empty box it would have
             // returned `false` there (nothing solid inside to find).
@@ -289,20 +293,28 @@ fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
             }
             used += crossed;
             cell = nc;
-            for a in 0..3 {
-                if step[a] > 0 {
-                    t_max[a] = ((cell[a] + 1) as f32 - o[a]) * inv[a];
-                } else if step[a] < 0 {
-                    t_max[a] = (cell[a] as f32 - o[a]) * inv[a];
-                }
-            }
             t_curr = best_t.max(t_curr);
             continue;
         }
         // Occupied brick (or no cached map): dense per-voxel test through
-        // the already-probed chunk.
+        // the already-probed chunk. A cell occludes iff it is
+        // **render-solid** — the same `surface_color_mip` rule the
+        // primary rays use — NOT the collision-level `vxl_voxel_solid`:
+        // the voxlap zero-RGB bedrock placeholder (the single voxel at
+        // the bottom of every never-written column of a materialised
+        // chunk) is invisible to the renderer, and counting it as an
+        // occluder makes a stacked-chunk grid's WHOLE 128×128 chunk
+        // footprint cast a phantom shadow plate (the Decks report: the
+        // CPU over-shadowed a full-width band the GPU — whose
+        // decompressor drops placeholders — correctly didn't).
+        // `vxl_voxel_solid` stays as the cheap first gate; the colour
+        // walk runs only on solid cells (at most a handful per ray).
         if let Some(vxl) = vxl {
-            if crate::chunks::vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z) {
+            if crate::chunks::vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z)
+                && roxlap_core::GridView::from_single_vxl(vxl)
+                    .surface_color_mip(in_chunk.x, in_chunk.y, in_chunk.z, 0)
+                    .is_some()
+            {
                 return true;
             }
         }
@@ -426,8 +438,17 @@ mod tests {
             {
                 return false;
             }
-            if g.grid.voxel_solid(IVec3::new(cell[0], cell[1], cell[2])) {
-                return true;
+            // Render-solid, like the production march (the zero-RGB
+            // bedrock placeholder must not occlude — see there).
+            let (chunk_idx, in_chunk) = crate::voxel_split(IVec3::new(cell[0], cell[1], cell[2]));
+            if let Some(vxl) = g.grid.chunks.get(&chunk_idx) {
+                if crate::chunks::vxl_voxel_solid(vxl, in_chunk.x, in_chunk.y, in_chunk.z)
+                    && roxlap_core::GridView::from_single_vxl(vxl)
+                        .surface_color_mip(in_chunk.x, in_chunk.y, in_chunk.z, 0)
+                        .is_some()
+                {
+                    return true;
+                }
             }
             let a = min_axis(t_max);
             t_curr = t_max[a];
@@ -524,6 +545,55 @@ mod tests {
         let hits_with_maps = run(&scene);
         assert_eq!(hits_no_maps, hits_with_maps, "map presence changed results");
         assert!(hits_with_maps > 200, "sweep should hit terrain often");
+    }
+
+    /// CA follow-up (Decks report) — the occluder must be
+    /// **render-solid**: the zero-RGB bedrock placeholder at the bottom
+    /// of never-written columns is invisible to the renderer, so it
+    /// must not occlude either. Pre-fix, a stacked-chunk grid (the
+    /// shiplet) cast a phantom 128×128 shadow plate from its chz=0
+    /// chunk's placeholder floor. Real bedrock BELOW a coloured surface
+    /// keeps occluding (the render draws its faces via the run-top
+    /// fallback).
+    #[test]
+    fn placeholder_bedrock_does_not_occlude() {
+        use roxlap_core::WorldOccluder;
+        let mut scene = Scene::new();
+        let ground = scene.add_grid(GridTransform::identity());
+        scene.grid_mut(ground).unwrap().set_rect(
+            IVec3::new(0, 0, 420),
+            IVec3::new(255, 127, 440),
+            Some(VoxColor(0x80_4A_5E_3C)),
+        );
+        // A ship-like grid above the ground: one small roof plate high
+        // in chunk (0,0,0) — the REST of that chunk's columns keep the
+        // invisible placeholder voxel at local z=255 (world 361).
+        let ship = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, 106.0)));
+        scene.grid_mut(ship).unwrap().set_rect(
+            IVec3::new(24, 32, 240),
+            IVec3::new(103, 95, 241),
+            Some(VoxColor(0x80_62_66_70)),
+        );
+        let occ = SceneOccluder::build(&scene);
+        let to_sun = [-0.4506, -0.3505, -0.8211];
+        // Under the plate's true shadow: occluded.
+        assert!(
+            occ.occluded_world([120.0, 75.0, 418.5], to_sun, 200.0),
+            "the real roof plate must occlude"
+        );
+        // A ray that only crosses PLACEHOLDER columns of the ship's
+        // chunk (misses the plate): must NOT occlude — pre-fix this
+        // reported the phantom plate at world z=361.
+        assert!(
+            !occ.occluded_world([141.6, 26.7, 418.5], to_sun, 200.0),
+            "the invisible bedrock placeholder must not occlude"
+        );
+        // Real bedrock below a coloured surface still occludes: aim a
+        // shallow ray through the ground plate's own interior.
+        assert!(
+            occ.occluded_world([130.0, 60.0, 435.0], [1.0, 0.0, 0.0], 64.0),
+            "coloured-surface bedrock interiors keep occluding"
+        );
     }
 
     /// CA.2 — cross-grid shadow rays apply each TARGET grid's own

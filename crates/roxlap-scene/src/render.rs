@@ -3164,7 +3164,13 @@ mod tests {
         // Frozen 2026-05-10 at S4.0 landing on x86_64.
         // DDA.9: re-frozen to the DDA renderer's output (was the
         // voxlap-opticast golden 0x215e_d66d_7359_4725).
-        const GOLDEN: u64 = 0x492e_c4bb_718f_d7e5;
+        // CA follow-up: re-frozen for the well-conditioned skip landing
+        // (crossing counts from t-differences instead of re-flooring an
+        // absolute position — fixes distant-camera seam lines; was
+        // 0x492e_c4bb_718f_d7e5). The structural gates (no-seam +
+        // skip-vs-dense equivalence) pin correctness; this hash only
+        // pins stability.
+        const GOLDEN: u64 = 0x4867_4db5_5738_7065;
         // Same scene shape as `render_scene_two_chunk_x_grid_no_seam`
         // — kept distinct so the hash assertion doesn't share its
         // setup with the structural seam check.
