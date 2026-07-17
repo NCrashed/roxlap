@@ -1361,8 +1361,16 @@ impl CpuBackend {
         } else {
             Vec::new()
         };
-        let cutaway_flags = |sprites: &mut dyn Iterator<Item = &Sprite>| -> Vec<bool> {
-            if cutaway_volumes.is_empty() {
+        // FW.4 — fog-of-war sprite hide (decision 8): a sprite whose
+        // world position maps to a Memory / Unseen / off-deck cell of the
+        // fog grid is hidden, the per-sprite mirror of the cutaway cull.
+        // Resolved once (the grid transform is copied out, so no lingering
+        // scene borrow into the closure).
+        let fow_hide: Option<(&roxlap_scene::FogOfWar, roxlap_scene::GridTransform)> = frame
+            .fow
+            .and_then(|(gid, fow)| scene.grid(gid).map(|g| (fow, g.transform)));
+        let hidden_flags = |sprites: &mut dyn Iterator<Item = &Sprite>| -> Vec<bool> {
+            if cutaway_volumes.is_empty() && fow_hide.is_none() {
                 return Vec::new();
             }
             sprites
@@ -1370,12 +1378,13 @@ impl CpuBackend {
                     let p =
                         glam::DVec3::new(f64::from(s.p[0]), f64::from(s.p[1]), f64::from(s.p[2]));
                     cutaway_volumes.iter().any(|v| v.hides_point(p))
+                        || fow_hide.is_some_and(|(fow, t)| fow.hides_sprite(&t, p))
                 })
                 .collect()
         };
-        let hidden_static = cutaway_flags(&mut self.sprites.iter());
-        let hidden_limbs = cutaway_flags(&mut self.kfa_limbs.iter());
-        let hidden_dyn = cutaway_flags(&mut self.dyn_sprites.iter());
+        let hidden_static = hidden_flags(&mut self.sprites.iter());
+        let hidden_limbs = hidden_flags(&mut self.kfa_limbs.iter());
+        let hidden_dyn = hidden_flags(&mut self.dyn_sprites.iter());
         let hid = |flags: &[bool], i: usize| flags.get(i).copied().unwrap_or(false);
         let casts = |s: &Sprite| s.flags & invis == 0 && s.casts_shadow();
         // OC.0 — derive the frame's view cutout: the keyhole's pixel

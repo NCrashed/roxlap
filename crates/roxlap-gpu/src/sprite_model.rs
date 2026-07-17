@@ -873,6 +873,10 @@ struct CullKey {
     frustum: [u32; 15],
     screen: [u32; 4],
     clips_fp: u64,
+    /// FW.4 — the fog-of-war mask version. Bumps when the mask changes,
+    /// so a sprite whose cell crossed the visible/hidden boundary re-culls
+    /// (the fog hide test below reads the current mask).
+    fog_version: u64,
 }
 
 impl CullKey {
@@ -883,9 +887,11 @@ impl CullKey {
         tile_size: u32,
         lod_px: f32,
         clips: &[SpriteCutawayClip],
+        fog_version: u64,
     ) -> Self {
         let b = |v: f32| v.to_bits();
         Self {
+            fog_version,
             frustum: [
                 b(f.pos[0]),
                 b(f.pos[1]),
@@ -1976,6 +1982,12 @@ impl SpriteRegistryResident {
         // CA.4 — per-frame cutaway volumes; an instance inside any of
         // them is hidden (footprint rule). Empty ⇒ pre-CA behaviour.
         clips: &[SpriteCutawayClip],
+        // FW.4 — fog-of-war hide test on an instance's world centre
+        // (decision 8): `Some(f)` where `f(center)` is true hides the
+        // sprite (Memory / Unseen cell). `None` ⇒ no fog. `fog_version`
+        // keys the cull skip cache so a mask change re-culls.
+        fog_hidden: Option<&dyn Fn([f32; 3]) -> bool>,
+        fog_version: u64,
     ) -> (u32, u32, u32) {
         let tiles_x = screen_w.div_ceil(tile_size).max(1);
         let tiles_y = screen_h.div_ceil(tile_size).max(1);
@@ -1984,7 +1996,7 @@ impl SpriteRegistryResident {
         // PF.10 — nothing changed since the last cull (same registry
         // state, same view, same screen): the four buffers already hold
         // exactly this frame's data — skip the whole cull/bin/upload.
-        let key = CullKey::new(f, screen_w, screen_h, tile_size, lod_px, clips);
+        let key = CullKey::new(f, screen_w, screen_h, tile_size, lod_px, clips, fog_version);
         if let Some((k, res)) = self.last_cull {
             if k == key {
                 return res;
@@ -2030,6 +2042,12 @@ impl SpriteRegistryResident {
             // CA.4 — cutaway footprint rule: hidden instances drop out
             // of the visible set (and with it, sprite shadow casting).
             if clips.iter().any(|c| c.hides(ci.center)) {
+                continue;
+            }
+            // FW.4 — fog-of-war hide: a sprite over a Memory / Unseen cell
+            // of the fog grid is not currently known to be there, so it
+            // drops out of the visible set too (decision 8).
+            if fog_hidden.is_some_and(|f| f(ci.center)) {
                 continue;
             }
             let rel = [
@@ -3384,7 +3402,8 @@ mod tests {
         // The next cull packs the new chain into the GPU instance buffer
         // (visible, no panic).
         let f = test_frustum();
-        let (visible, _, _) = res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0, &[]);
+        let (visible, _, _) =
+            res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0, &[], None, 0);
         assert_eq!(visible, 1);
 
         // …and back to frame 0.
@@ -3449,7 +3468,7 @@ mod tests {
 
         // The lingering instance of removed B is skipped without panic.
         let f = test_frustum();
-        let _ = res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0, &[]);
+        let _ = res.cull_bin_upload(&h.device, &h.queue, &f, 64, 64, 16, 1.0, &[], None, 0);
     }
 
     #[test]

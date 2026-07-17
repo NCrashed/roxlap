@@ -3,7 +3,7 @@
 Entry doc written 2026-07-17 at workspace 0.29.0 + uncommitted OC tail.
 This is the **entry doc** for the fog-of-war stage — tag **FW**.
 
-## Status — FW.0 + FW.1 + FW.2 + FW.3 LANDED (2026-07-18); FW.4..5 not started
+## Status — FW.0 + FW.1 + FW.2 + FW.3 + FW.4 LANDED (2026-07-18); FW.5 not started
 
 - **FW.0** — `roxlap-scene/src/fow.rs`: `FogOfWar` + `VisionConfig` +
   `DeckBand` + `LightGate` + `FowObserver` (+ `CellState`, all
@@ -258,6 +258,28 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   both call it (the hand-rolled test header is gone). New gates:
   `roxlap_gpu::fow` header-layout + deck-truncation; `roxlap-gpu` gains a
   direct `log` dep for the warn.
+- **FW.4** — sprites + audio reveal.
+  *Sprites (decision 8)*: `FogOfWar::hides_sprite(transform, world)` —
+  world → grid-local cell + deck → true for Memory / Unseen / off-deck
+  (shown only in Visible / Heard), the per-sprite mirror of
+  `cutaway_hides_point`. **Binary hide** on both backends (no alpha fade
+  in v1 — kept backend-symmetric; the fade + live-sprite ghost are
+  follow-ups). CPU: OR'd into the `hidden_flags` closure in `cpu.rs`
+  (was `cutaway_flags`) using `frame.fow` + the fog grid's transform. GPU:
+  a `fog_hidden: Option<&dyn Fn([f32;3])->bool>` + `fog_version` threaded
+  `render_scene → cull_bin_upload` (the `CullKey`/PF.10 skip cache folds
+  in `fog_version`), tested against each instance's world `center` beside
+  the cutaway clips; `roxlap-render` builds the closure over `frame.fow`
+  (grid transform copied out — no scene borrow). Both drop the sprite
+  from the visible set (and its shadow), exactly like the CA cull.
+  *Audio (decision 6)*: `FogOfWar::hear_world(transform, world, loudness)`
+  maps a world source to its cell/deck and stamps a heard blob;
+  `roxlap_audio::hear_source(scene, fow, transform, source, listener,
+  base_loudness, cfg)` folds in `source_acoustics` transmission
+  (`loudness = base × transmission`) so a walled source reveals a smaller
+  pocket, a buried one nothing. Gates: `hides_sprite` state mapping,
+  `hear_world` map+off-deck, GPU `cull_applies_fog_hide` (headless),
+  `hear_source` transmission-scaled reveal (audio).
 
 ## Goal
 

@@ -72,7 +72,7 @@ fn cull_cache_and_identity_colmul() {
         half_h: 0.6,
         far: 1.0e9,
     };
-    let r1 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
+    let r1 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[], None, 0);
     assert_eq!(r1.0, 2, "two of three instances are in view");
 
     // PF.10 — identity colmul fast path: the buffer must hold the
@@ -86,14 +86,14 @@ fn cull_cache_and_identity_colmul() {
     }
 
     // Same key ⇒ cached result, no re-cull.
-    let r2 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
+    let r2 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[], None, 0);
     assert_eq!(r1, r2, "same-key call must return the cached result");
 
     // A transform update must invalidate: move instance 1 out of view.
     let mut moved = instances.clone();
     moved[1] = axis_instance(model, [-10_000.0, 30.0, 0.0]);
     reg.update_transforms(&moved);
-    let r3 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
+    let r3 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[], None, 0);
     assert_eq!(r3.0, 1, "moved instance must drop out of the visible set");
 
     // A real (non-identity) table leaves the fast path: the packed
@@ -102,7 +102,7 @@ fn cull_cache_and_identity_colmul() {
     custom[0] = 0x0042_0042_0042_0042;
     let tables: Vec<[u64; 256]> = vec![custom, [w; 256], [w; 256]];
     reg.set_instance_colmul(&tables);
-    let r4 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
+    let r4 = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[], None, 0);
     assert_eq!(r4.0, 1);
     let packed = read_u32(&gpu, &reg.colmul, 2);
     assert_eq!(
@@ -150,7 +150,7 @@ fn cull_applies_cutaway_footprint_rule() {
         half_h: 8.0,
         far: 1.0e9,
     };
-    let no_clip = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
+    let no_clip = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[], None, 0);
     assert_eq!(no_clip.0, 3, "all three instances are in view unclipped");
 
     // Identity grid at the origin, footprint x,y ∈ [0, 128), plane 120.
@@ -171,6 +171,8 @@ fn cull_applies_cutaway_footprint_rule() {
         16,
         4.0,
         std::slice::from_ref(&clip),
+        None,
+        0,
     );
     assert_eq!(
         clipped.0, 2,
@@ -178,6 +180,63 @@ fn cull_applies_cutaway_footprint_rule() {
     );
     // Dropping the clip again re-culls (cache keyed on the clip set)
     // and restores the full visible set.
-    let restored = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[]);
+    let restored =
+        reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[], None, 0);
     assert_eq!(restored.0, 3, "clearing the clip must restore visibility");
+}
+
+/// FW.4 — the fog-of-war hide test in the live cull: a sprite whose
+/// world centre the fog reports as Memory/Unseen drops out of the
+/// visible set; a mask-version change re-culls; clearing the fog
+/// restores it.
+#[test]
+fn cull_applies_fog_hide() {
+    let Ok(gpu) = HeadlessGpu::new_blocking(GpuRendererSettings::default()) else {
+        eprintln!("[skip] no GPU adapter reachable");
+        return;
+    };
+    let mut registry = SpriteModelRegistry::new();
+    let model = registry.add(build_sprite_model(&Kv6::solid_cube(
+        8,
+        VoxColor(0x80_ff_80_40),
+    )));
+    // Three instances in view; the fog will hide the first by position.
+    let hidden = [10.0, 30.0, 50.0];
+    let instances = vec![
+        axis_instance(model, hidden),
+        axis_instance(model, [12.0, 30.0, 50.0]),
+        axis_instance(model, [14.0, 30.0, 50.0]),
+    ];
+    let mut reg = SpriteRegistryResident::upload(&gpu.device, &registry, &instances);
+    let f = ViewFrustum {
+        pos: [0.0, 0.0, 0.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+        half_w: 8.0,
+        half_h: 8.0,
+        far: 1.0e9,
+    };
+    let all = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[], None, 0);
+    assert_eq!(all.0, 3, "all three in view without fog");
+
+    // Fog hides the sprite at `hidden` (Memory/Unseen cell).
+    let fog = |c: [f32; 3]| c == hidden;
+    let fogged = reg.cull_bin_upload(
+        &gpu.device,
+        &gpu.queue,
+        &f,
+        640,
+        360,
+        16,
+        4.0,
+        &[],
+        Some(&fog),
+        1,
+    );
+    assert_eq!(fogged.0, 2, "the fog-hidden sprite drops out");
+
+    // Clearing the fog (version 0) re-culls and restores it.
+    let cleared = reg.cull_bin_upload(&gpu.device, &gpu.queue, &f, 640, 360, 16, 4.0, &[], None, 0);
+    assert_eq!(cleared.0, 3, "clearing the fog restores visibility");
 }

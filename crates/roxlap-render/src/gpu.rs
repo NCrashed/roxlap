@@ -1248,6 +1248,25 @@ impl GpuBackend {
         // one scan budget, no per-backend desync.
         let fov_y = frame.fov_y_rad();
         let outer_steps = frame.gpu_outer_steps();
+        // FW.4 — fog-of-war sprite hide: a per-instance test the GPU cull
+        // applies to each sprite's world centre (decision 8), mirroring
+        // the CPU path. The grid transform is copied out, so the closure
+        // borrows only `frame`'s `FogOfWar`, not the scene. `fog_version`
+        // keys the cull skip cache to the mask.
+        let fog_ctx = frame
+            .fow
+            .and_then(|(gid, fow)| scene.grid(gid).map(|g| (fow, g.transform)));
+        let fog_version = fog_ctx.map_or(0, |(fow, _)| fow.mask_version());
+        let fog_fn = fog_ctx.map(|(fow, t)| {
+            move |c: [f32; 3]| {
+                fow.hides_sprite(
+                    &t,
+                    DVec3::new(f64::from(c[0]), f64::from(c[1]), f64::from(c[2])),
+                )
+            }
+        });
+        let fog_dyn: Option<&dyn Fn([f32; 3]) -> bool> =
+            fog_fn.as_ref().map(|f| f as &dyn Fn([f32; 3]) -> bool);
         if let Some(resident) = &self.resident {
             self.gpu.render_scene(
                 resident,
@@ -1256,6 +1275,8 @@ impl GpuBackend {
                 &sprite_camera,
                 fov_y,
                 outer_steps,
+                fog_dyn,
+                fog_version,
             );
         } else if !self.sprite_instances.is_empty() {
             // Sprite-only scene (no voxel grids — e.g. an asset/model
@@ -1269,8 +1290,9 @@ impl GpuBackend {
                 self.empty_resident = Some(GpuSceneResident::upload(self.gpu.device(), &info));
             }
             let empty = self.empty_resident.as_ref().expect("just built");
+            // A sprite-only scene has no voxel fog grid → no fog test.
             self.gpu
-                .render_scene(empty, &[], &[], &sprite_camera, fov_y, outer_steps);
+                .render_scene(empty, &[], &[], &sprite_camera, fov_y, outer_steps, None, 0);
         } else {
             // Truly empty (no grids, no sprites) — clear to colour
             // (deferred, so a HUD can still be painted over it).

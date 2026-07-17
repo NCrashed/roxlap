@@ -1828,6 +1828,11 @@ impl GpuRenderer {
         sprite_camera: &Camera,
         fov_y_rad: f32,
         max_outer_steps: u32,
+        // FW.4 — fog-of-war sprite hide (decision 8): `Some(f)` where
+        // `f(world_center)` is true drops the sprite from the visible set
+        // (Memory / Unseen cell). `fog_version` keys the cull skip cache.
+        fog_sprite_hidden: Option<&dyn Fn([f32; 3]) -> bool>,
+        fog_version: u64,
     ) {
         assert_eq!(
             cameras.len(),
@@ -1924,6 +1929,8 @@ impl GpuRenderer {
                     SPRITE_TILE_SIZE,
                     self.sprite_lod_px,
                     &cutaway_clips,
+                    fog_sprite_hidden,
+                    fog_version,
                 );
                 (visible > 0).then_some((visible, tiles_x))
             } else {

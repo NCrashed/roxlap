@@ -23,7 +23,7 @@
 
 use glam::{DVec3, IVec3};
 use roxlap_formats::material::material_for_color;
-use roxlap_scene::{Rgb, Scene, VoxColor};
+use roxlap_scene::{FogOfWar, GridTransform, Rgb, Scene, VoxColor};
 
 mod backend;
 mod cavity;
@@ -251,6 +251,41 @@ pub fn path_thickness_weighted(
             table: absorption,
         }),
     )
+}
+
+/// FW.4 — reveal a heard sound source in the fog of war (decision 6):
+/// hearing something behind the back or through a wall lights a temporary
+/// "heard" pocket around it. Runs [`source_acoustics`] to measure how
+/// much of the source reaches the listener through the geometry, scales
+/// `base_loudness` by that transmission, and stamps a heard blob at the
+/// source's fog cell via [`FogOfWar::hear_world`].
+///
+/// - `transform` — the fog grid's placement (the grid the mask is
+///   grid-local to: the real / twin grid, which share coordinates).
+/// - `base_loudness` — the source's intrinsic loudness: the heard-blob
+///   radius a FULLY-audible source (`transmission == 1`) reveals, in the
+///   [`FogOfWar`]'s `heard_radius` units.
+/// - Returns the effective loudness stamped (`0.0` when the source is
+///   inaudible — buried, or its z falls on no configured deck).
+///
+/// A muffled source (thick wall between) reveals a smaller pocket; a
+/// buried one reveals nothing. Distance attenuation is the host's job
+/// (fold it into `base_loudness`); this uses occlusion transmission only.
+pub fn hear_source(
+    scene: &Scene,
+    fow: &mut FogOfWar,
+    transform: &GridTransform,
+    source: DVec3,
+    listener: DVec3,
+    base_loudness: f32,
+    cfg: &AcousticsConfig,
+) -> f32 {
+    let ac = source_acoustics(scene, source, listener, cfg);
+    let loudness = base_loudness * ac.transmission;
+    if loudness > 0.0 {
+        fow.hear_world(transform, source, loudness);
+    }
+    loudness
 }
 
 /// Shared walk under [`path_thickness`] / [`path_thickness_weighted`].
@@ -501,6 +536,54 @@ mod tests {
             &cfg,
         );
         assert_eq!(a, SourceAcoustics::clear(&cfg));
+    }
+
+    /// FW.4 — `hear_source` reveals a heard pocket scaled by transmission:
+    /// an open-air source is fully audible; a wall between it and the
+    /// listener muffles the reveal; a fully buried source reveals nothing.
+    #[test]
+    fn hear_source_scales_reveal_by_transmission() {
+        use roxlap_scene::{DeckBand, FogOfWar, VisionConfig};
+        let deck = DeckBand {
+            z_top: 90,
+            z_bottom: 200,
+            eye_top: 100,
+            eye_bottom: 105,
+        };
+        let mk_fow = || FogOfWar::new(VisionConfig::for_decks(vec![deck]));
+        let transform = GridTransform::identity();
+        let cfg = AcousticsConfig::default();
+        let src = DVec3::new(20.5, 5.5, 140.5);
+        let listener = DVec3::new(60.0, 5.0, 140.0);
+
+        // Open air → full transmission → full loudness, cell revealed.
+        let open = scene_with(|_| {});
+        let mut fow = mk_fow();
+        let loud = hear_source(&open, &mut fow, &transform, src, listener, 1.0, &cfg);
+        assert!(loud > 0.0, "open-air source is audible ({loud})");
+        // One tick turns the stamped blob into a Heard cell. Observer
+        // faces AWAY so (20,5) is not Visible — the heard reveal wins.
+        let grid = open.grids().next().expect("one grid").1;
+        fow.update(
+            grid,
+            &roxlap_scene::FowObserver {
+                cell: glam::IVec2::new(0, 0),
+                facing: -glam::Vec2::X,
+                deck: 0,
+            },
+            0.1,
+        );
+        assert_eq!(
+            fow.state(0, glam::IVec2::new(20, 5)).0,
+            roxlap_scene::CellState::Heard,
+            "the heard source lights its cell"
+        );
+
+        // A wall between source and listener muffles the reveal.
+        let walled = scene_with(|g| wall(g, 30, 8));
+        let mut fow2 = mk_fow();
+        let loud2 = hear_source(&walled, &mut fow2, &transform, src, listener, 1.0, &cfg);
+        assert!(loud2 < loud, "walled source is muffled: {loud2} vs {loud}");
     }
 
     #[test]
