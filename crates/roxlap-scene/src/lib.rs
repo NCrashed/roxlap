@@ -996,6 +996,32 @@ impl Grid {
         true
     }
 
+    /// FW.4 — the grid's XY FOOTPRINT as grid-local cell (mip-0 voxel)
+    /// bounds `[lo, hi)`: the whole ship's extent, so a fog point can be
+    /// classified as "over the grid" vs "open space" (review #1, hazard
+    /// 3). Prefers [`Self::gpu_residency_hint`] (a fog twin's full-ship
+    /// bbox — bigger than its copy-on-seen chunk subset); falls back to
+    /// the materialised chunk XY bbox. `None` for an empty grid with no
+    /// hint.
+    #[must_use]
+    pub fn footprint_cells(&self) -> Option<(glam::IVec2, glam::IVec2)> {
+        let cs = CHUNK_SIZE_XY as i32;
+        if let Some((oc, dims)) = self.gpu_residency_hint {
+            let lo = glam::IVec2::new(oc[0] * cs, oc[1] * cs);
+            let hi = glam::IVec2::new((oc[0] + dims[0] as i32) * cs, (oc[1] + dims[1] as i32) * cs);
+            return Some((lo, hi));
+        }
+        if self.chunks.is_empty() {
+            return None;
+        }
+        let (mut min, mut max) = (glam::IVec2::splat(i32::MAX), glam::IVec2::splat(i32::MIN));
+        for idx in self.chunks.keys() {
+            min = min.min(idx.truncate());
+            max = max.max(idx.truncate());
+        }
+        Some((min * cs, (max + glam::IVec2::ONE) * cs))
+    }
+
     /// Bounding-sphere radius of the populated chunk set in
     /// **world** space (SC.3 — the voxel half-extent is scaled by
     /// `voxel_world_size`, so it pairs directly with the world-distance

@@ -487,6 +487,13 @@ pub struct FogOfWar {
     /// rounding).
     transitions: HashMap<(usize, i32, i32), f32>,
     mask_version: u64,
+    /// FW.4 — bumps ONLY when the set of Visible cells changes (a cell
+    /// enters or leaves the facing cone / peripheral). Sprite visibility
+    /// (decision 8) depends on nothing else — Memory/Unseen/Heard all
+    /// hide — so the GPU sprite-cull skip cache keys on this, NOT on
+    /// `mask_version` (which bumps on every intensity fade). Review perf
+    /// #1: without it every fade frame re-culls an identical sprite set.
+    sprite_epoch: u64,
 }
 
 impl FogOfWar {
@@ -506,6 +513,7 @@ impl FogOfWar {
             heard_cells: HashMap::new(),
             transitions: HashMap::new(),
             mask_version: 0,
+            sprite_epoch: 0,
         }
     }
 
@@ -538,6 +546,16 @@ impl FogOfWar {
         self.mask_version
     }
 
+    /// FW.4 — bumped ONLY when the Visible-cell set changes (see the
+    /// field docs). Sprite visibility depends on nothing else, so the
+    /// GPU sprite-cull skip cache keys on this instead of `mask_version`
+    /// — an intensity fade re-uploads the mask but does not re-cull the
+    /// sprites (review perf #1).
+    #[must_use]
+    pub fn sprite_epoch(&self) -> u64 {
+        self.sprite_epoch
+    }
+
     /// The deck the last [`Self::update`] ran LOS on.
     #[must_use]
     pub fn visible_deck(&self) -> usize {
@@ -559,10 +577,12 @@ impl FogOfWar {
     /// `loudness` (feed it `source_acoustics` transmission×gain, or
     /// any game-side loudness): stamps a live Heard blob of radius
     /// `heard_radius × loudness` for `heard_duration` seconds.
-    /// Hearing goes through walls by design — no LOS test.
-    pub fn hear(&mut self, deck: usize, cell: IVec2, loudness: f32) {
+    /// Hearing goes through walls by design — no LOS test. Returns
+    /// whether a blob was actually stamped (a sub-cell radius — a
+    /// too-faint source — stamps nothing).
+    pub fn hear(&mut self, deck: usize, cell: IVec2, loudness: f32) -> bool {
         if deck >= self.config.decks.len() || loudness <= 0.0 {
-            return;
+            return false;
         }
         let r = self.config.heard_radius * loudness;
         let ri = r.ceil() as i32;
@@ -578,7 +598,7 @@ impl FogOfWar {
             }
         }
         if cells.is_empty() {
-            return;
+            return false;
         }
         self.heard.push(HeardBlob {
             deck,
@@ -586,44 +606,74 @@ impl FogOfWar {
             ttl: self.config.heard_duration,
         });
         self.heard_dirty = true;
+        true
+    }
+
+    /// FW.4 — map a WORLD point to `(deck, grid-local cell)`, or `None`
+    /// if it lies OUTSIDE the fog grid's `footprint` (grid-local cell
+    /// bounds `[lo, hi)`, from [`crate::Grid::footprint_cells`]). Off the
+    /// footprint = open space the fog knows nothing about (hazard 3 —
+    /// actors on the water / in space are never touched). A z between
+    /// decks (a stair, a jump, the hull) falls back to the observer's
+    /// active deck, so an actor mid-transit over a visible XY does not
+    /// pop out (review #6).
+    fn resolve_world(
+        &self,
+        transform: &GridTransform,
+        footprint: (IVec2, IVec2),
+        world: DVec3,
+    ) -> Option<(usize, IVec2)> {
+        let glp = crate::addr::world_to_grid_local(world, transform);
+        let v = crate::addr::voxel_global(glp.chunk, glp.voxel);
+        let (lo, hi) = footprint;
+        if v.x < lo.x || v.x >= hi.x || v.y < lo.y || v.y >= hi.y {
+            return None; // outside the grid footprint — open space
+        }
+        let deck = self
+            .config
+            .deck_for_z(v.z)
+            .unwrap_or_else(|| self.visible_deck());
+        Some((deck, IVec2::new(v.x, v.y)))
     }
 
     /// FW.4 — [`Self::hear`] for a WORLD-space source: maps `world`
-    /// through the fog grid's `transform` to its grid-local cell + deck,
-    /// then stamps a heard blob. `transform` is the grid the mask is
-    /// grid-local to (the real / twin grid — they share coordinates).
-    /// No-op if the source's z falls on no configured deck. `loudness`
-    /// is the game-side or [`crate`]-computed audibility (see
-    /// `roxlap-audio`'s `hear_source`, which folds in `source_acoustics`
-    /// transmission).
-    pub fn hear_world(&mut self, transform: &GridTransform, world: DVec3, loudness: f32) {
-        let glp = crate::addr::world_to_grid_local(world, transform);
-        let v = crate::addr::voxel_global(glp.chunk, glp.voxel);
-        let Some(deck) = self.config.deck_for_z(v.z) else {
-            return;
-        };
-        self.hear(deck, IVec2::new(v.x, v.y), loudness);
+    /// through the fog grid's `transform` (+ its `footprint`) to a cell +
+    /// deck and stamps a heard blob. Returns whether a blob was stamped —
+    /// `false` when the source is OUTSIDE the footprint (a passing ship's
+    /// noise must not stamp this grid's mask — review #2) or too faint to
+    /// cover a cell. `transform`/`footprint` come from the fog grid.
+    pub fn hear_world(
+        &mut self,
+        transform: &GridTransform,
+        footprint: (IVec2, IVec2),
+        world: DVec3,
+        loudness: f32,
+    ) -> bool {
+        match self.resolve_world(transform, footprint, world) {
+            Some((deck, cell)) => self.hear(deck, cell, loudness),
+            None => false,
+        }
     }
 
     /// FW.4 — decision 8: should a sprite at world position `world` be
-    /// HIDDEN by the fog? A sprite is shown only where the observer
-    /// currently knows there's an actor — a Visible or Heard cell;
-    /// Memory / Unseen / off-every-deck cells hide it (you don't see
-    /// actors in a remembered or unknown room, only the frozen geometry).
-    /// `transform` is the fog grid's placement. The per-sprite mirror of
-    /// [`crate::Grid::cutaway_hides_point`]; binary (no alpha fade in
-    /// v1). No live sprite ghosts (that's an explicit follow-up).
+    /// HIDDEN by the fog? Shown ONLY where the observer currently SEES
+    /// it — a Visible cell. Memory / Unseen cells hide it (you see the
+    /// frozen geometry of a remembered room, not the actors in it); a
+    /// Heard cell also hides the sprite in v1 (hearing reveals the
+    /// GEOMETRY pocket, not a precise live actor — a dimmed heard-sprite
+    /// is a follow-up, review #5). A point OUTSIDE the grid `footprint`
+    /// is open space and is NEVER hidden (hazard 3 — review #1).
+    /// `transform`/`footprint` come from the fog grid. Binary (no alpha
+    /// fade in v1).
     #[must_use]
-    pub fn hides_sprite(&self, transform: &GridTransform, world: DVec3) -> bool {
-        let glp = crate::addr::world_to_grid_local(world, transform);
-        let v = crate::addr::voxel_global(glp.chunk, glp.voxel);
-        let Some(deck) = self.config.deck_for_z(v.z) else {
-            return true; // off every deck → untracked → hidden
-        };
-        matches!(
-            self.state(deck, IVec2::new(v.x, v.y)).0,
-            CellState::Unseen | CellState::Memory
-        )
+    pub fn hides_sprite(
+        &self,
+        transform: &GridTransform,
+        footprint: (IVec2, IVec2),
+        world: DVec3,
+    ) -> bool {
+        self.resolve_world(transform, footprint, world)
+            .is_some_and(|(deck, cell)| self.state(deck, cell).0 != CellState::Visible)
     }
 
     /// Every live cell — Visible and Heard — with its state. FW.1's
@@ -725,6 +775,7 @@ impl FogOfWar {
                 changed |= self.demote_to_memory(deck, IVec2::new(cell.0, cell.1));
             }
             self.los_key = None;
+            self.sprite_epoch = self.sprite_epoch.wrapping_add(1); // visible set emptied
         }
         self.visible_deck = observer.deck;
 
@@ -754,6 +805,7 @@ impl FogOfWar {
                     IVec2::new(cell.0, cell.1),
                 );
             }
+            self.sprite_epoch = self.sprite_epoch.wrapping_add(1); // visible set emptied
         }
 
         changed |= self.update_heard(dt);
@@ -788,16 +840,25 @@ impl FogOfWar {
         }
 
         let mut changed = false;
+        // FW.4 — the VISIBLE set is exactly what gates sprite visibility;
+        // bump `sprite_epoch` iff its membership changed (a demotion or a
+        // new cell), so the GPU sprite cull re-runs then — and NOT on the
+        // intensity fades that follow (which leave membership untouched).
+        let mut membership_changed = false;
         // Demotions: previously visible, no longer.
         let old = std::mem::take(&mut self.visible);
         for &cell in old.keys() {
             if !new_visible.contains_key(&cell) {
                 changed |= self.demote_to_memory(deck, IVec2::new(cell.0, cell.1));
+                membership_changed = true;
             }
         }
         // Stamps: state bits flip to Visible immediately; intensity
         // fades via the transition map.
         for (&(x, y), &target) in &new_visible {
+            if !old.contains_key(&(x, y)) {
+                membership_changed = true;
+            }
             let cell = IVec2::new(x, y);
             let cur = self.layers[deck].byte(cell);
             let intensity = cur & INTENSITY_MAX;
@@ -810,6 +871,9 @@ impl FogOfWar {
             }
         }
         self.visible = new_visible;
+        if membership_changed {
+            self.sprite_epoch = self.sprite_epoch.wrapping_add(1);
+        }
         changed
     }
 
@@ -2465,47 +2529,80 @@ mod tests {
         }
     }
 
-    /// FW.4 — `hides_sprite` shows sprites in Visible/Heard cells and
-    /// hides them in Memory / Unseen / off-deck cells.
+    /// FW.4 — `hides_sprite` shows sprites over Visible cells, hides over
+    /// Memory/Unseen, never touches off-footprint points (open space,
+    /// review #1), and uses the observer deck for off-deck z (review #6).
     #[test]
     fn hides_sprite_by_cell_state() {
         use glam::DVec3;
         let g = open_room();
         let mut fow = seeing_fow();
         let t = GridTransform::identity();
+        let fp = (IVec2::new(-128, -128), IVec2::new(128, 128));
         fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
         let at = |x: f64, y: f64| DVec3::new(x, y, (FLOOR_Z - 1) as f64 + 0.5);
         // Seen cell ahead → shown.
-        assert!(!fow.hides_sprite(&t, at(20.5, 0.5)));
-        // Never-seen cell behind → hidden.
-        assert!(fow.hides_sprite(&t, at(-30.5, 0.5)));
-        // Off every deck (z far below) → hidden.
-        assert!(fow.hides_sprite(&t, DVec3::new(20.5, 0.5, 300.5)));
+        assert!(!fow.hides_sprite(&t, fp, at(20.5, 0.5)));
+        // Never-seen cell behind (over the footprint) → hidden.
+        assert!(fow.hides_sprite(&t, fp, at(-30.5, 0.5)));
+        // OUTSIDE the footprint (open space) → NEVER hidden (review #1).
+        assert!(!fow.hides_sprite(&t, fp, at(500.5, 0.5)));
+        // Off-deck z over a Visible XY → observer-deck fallback → shown
+        // (review #6, no pop-out mid-transit).
+        assert!(!fow.hides_sprite(&t, fp, DVec3::new(20.5, 0.5, 300.5)));
 
         // Turn away: the seen cell becomes Memory → now hidden.
         fow.update(&g, &observer(IVec2::new(0, 0), -Vec2::X), 0.5);
         assert_eq!(fow.state(0, IVec2::new(20, 0)).0, CellState::Memory);
-        assert!(fow.hides_sprite(&t, at(20.5, 0.5)), "memory hides sprites");
+        assert!(
+            fow.hides_sprite(&t, fp, at(20.5, 0.5)),
+            "memory hides sprites"
+        );
     }
 
-    /// FW.4 — `hear_world` maps a world source point through the grid
-    /// transform to its cell + deck and stamps a heard blob there.
+    /// FW.4 perf #1 — `sprite_epoch` bumps when the Visible set changes
+    /// (a turn) but NOT on an intensity fade (a static settle), so the
+    /// GPU sprite cull isn't re-run every fade frame.
+    #[test]
+    fn sprite_epoch_tracks_visible_set_only() {
+        let g = open_room();
+        let mut fow = seeing_fow();
+        // First sight populates the visible set → epoch moves.
+        let e0 = fow.sprite_epoch();
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), 0.01);
+        let e1 = fow.sprite_epoch();
+        assert!(e1 > e0, "seeing new cells bumps sprite_epoch");
+        // Same pose, another tick (intensities still fading) → the
+        // Visible set is unchanged, so the epoch holds even though the
+        // mask version keeps moving.
+        let mv = fow.mask_version();
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), 0.01);
+        assert_eq!(fow.sprite_epoch(), e1, "a fade must not bump sprite_epoch");
+        assert!(
+            fow.mask_version() >= mv,
+            "mask_version still tracks the fade"
+        );
+        // Turning brings new cells into view → epoch moves again.
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::Y), SETTLE);
+        assert!(fow.sprite_epoch() > e1, "a turn bumps sprite_epoch");
+    }
+
+    /// FW.4 — `hear_world` stamps a heard blob for an in-footprint
+    /// source, and NOTHING for one outside the footprint (review #2).
     #[test]
     fn hear_world_maps_and_stamps() {
         use glam::DVec3;
         let g = open_room();
         let mut fow = seeing_fow();
-        let transform = GridTransform::identity();
+        let t = GridTransform::identity();
+        let fp = (IVec2::new(-128, -128), IVec2::new(128, 128));
         // A noise at grid-local voxel (20, 0, 99) — in band()'s deck.
-        fow.hear_world(&transform, DVec3::new(20.5, 0.5, 99.5), 1.0);
+        assert!(fow.hear_world(&t, fp, DVec3::new(20.5, 0.5, 99.5), 1.0));
         // Observer facing away → (20,0) not Visible; the heard blob wins.
         fow.update(&g, &observer(IVec2::new(0, 0), -Vec2::X), 0.1);
         assert_eq!(fow.state(0, IVec2::new(20, 0)).0, CellState::Heard);
-        // A source below every deck (z=300, off every band) at a far
-        // cell stamps nothing — deck_for_z rejects it.
-        fow.hear_world(&transform, DVec3::new(50.5, 50.5, 300.5), 1.0);
-        fow.update(&g, &observer(IVec2::new(0, 0), -Vec2::X), 0.01);
-        assert_eq!(fow.state(0, IVec2::new(50, 50)).0, CellState::Unseen);
+        // A source OUTSIDE the footprint (a passing ship) stamps nothing.
+        assert!(!fow.hear_world(&t, fp, DVec3::new(500.5, 500.5, 99.5), 1.0));
     }
 
     /// FW.3 — `gpu_mask` flattens the sparse per-deck tiles into a dense

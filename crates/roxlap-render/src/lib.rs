@@ -56,6 +56,7 @@ mod cpu_egui;
 /// see `docs/porting/PORTING-DESTRUCTION.md`.
 mod debris;
 mod env_config;
+mod fow_cull;
 mod gpu;
 /// Dynamic lighting types (stages DL + SL) — runtime sun, point and
 /// spot lights, on both backends.

@@ -1248,25 +1248,21 @@ impl GpuBackend {
         // one scan budget, no per-backend desync.
         let fov_y = frame.fov_y_rad();
         let outer_steps = frame.gpu_outer_steps();
-        // FW.4 — fog-of-war sprite hide: a per-instance test the GPU cull
-        // applies to each sprite's world centre (decision 8), mirroring
-        // the CPU path. The grid transform is copied out, so the closure
-        // borrows only `frame`'s `FogOfWar`, not the scene. `fog_version`
-        // keys the cull skip cache to the mask.
-        let fog_ctx = frame
-            .fow
-            .and_then(|(gid, fow)| scene.grid(gid).map(|g| (fow, g.transform)));
-        let fog_version = fog_ctx.map_or(0, |(fow, _)| fow.mask_version());
-        let fog_fn = fog_ctx.map(|(fow, t)| {
-            move |c: [f32; 3]| {
-                fow.hides_sprite(
-                    &t,
-                    DVec3::new(f64::from(c[0]), f64::from(c[1]), f64::from(c[2])),
-                )
-            }
-        });
+        // FW.4 — fog-of-war sprite hide: the SHARED `FogSpriteCull`
+        // (same rule as the CPU path — review perf #2) gives the GPU cull
+        // a per-instance world-centre test. `cull_key` folds in the
+        // Visible-set `sprite_epoch` (NOT the fade-bumped `mask_version`
+        // — review perf #1) + the fog grid's transform (review #4), and
+        // is never 0 (reserved for "no fog" — review #3).
+        let fow_cull = crate::fow_cull::FogSpriteCull::resolve(scene, frame.fow);
+        let fog_version = fow_cull
+            .as_ref()
+            .map_or(0, crate::fow_cull::FogSpriteCull::cull_key);
+        let fog_closure = fow_cull
+            .as_ref()
+            .map(|c| move |center: [f32; 3]| c.hides(center));
         let fog_dyn: Option<&dyn Fn([f32; 3]) -> bool> =
-            fog_fn.as_ref().map(|f| f as &dyn Fn([f32; 3]) -> bool);
+            fog_closure.as_ref().map(|f| f as &dyn Fn([f32; 3]) -> bool);
         if let Some(resident) = &self.resident {
             self.gpu.render_scene(
                 resident,

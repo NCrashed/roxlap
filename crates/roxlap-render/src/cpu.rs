@@ -507,6 +507,11 @@ pub(crate) struct CpuBackend {
     /// refreshed by [`Self::update_kfa_poses`] and drawn after the
     /// static sprites each frame via `draw_sprite`.
     kfa_limbs: Vec<Sprite>,
+    /// FW.4 review #7 — per `kfa_limbs` entry, its ACTOR's world root
+    /// anchor (`KfaSprite.p`). The fog / cutaway cull tests THIS (one
+    /// verdict per actor) so a body straddling a cell boundary is not
+    /// dismembered. Parallel to [`kfa_limbs`](Self::kfa_limbs).
+    kfa_limb_root: Vec<[f32; 3]>,
     /// PF.5 — the shadow-caster demotion count last warned about, so the
     /// over-cap `eprintln` fires once per change instead of every frame.
     shadow_demote_warned: usize,
@@ -576,6 +581,7 @@ impl CpuBackend {
             dyn_models: Vec::new(),
             clip_books: Vec::new(),
             kfa_limbs: Vec::new(),
+            kfa_limb_root: Vec::new(),
             shadow_demote_warned: 0,
             scene_scratch: SceneRenderScratch::default(),
             model_dense: Vec::new(),
@@ -1015,9 +1021,15 @@ impl CpuBackend {
     pub(crate) fn set_kfa_sprites(&mut self, kfas: &mut [KfaSprite]) {
         self.kfa_limbs.clear();
         self.limb_dense.clear();
+        // FW.4 review #7 — one fog/cutaway verdict per ACTOR, not per
+        // limb: record each limb's actor-root anchor (`kfa.p`) so a body
+        // straddling a Visible/Memory cell boundary isn't dismembered.
+        self.kfa_limb_root.clear();
         for kfa in kfas.iter_mut() {
             solve_kfa_limbs(kfa);
             self.kfa_limbs.extend(kfa.limbs.iter().cloned());
+            self.kfa_limb_root
+                .extend(std::iter::repeat_n(kfa.p, kfa.limbs.len()));
         }
     }
 
@@ -1037,6 +1049,7 @@ impl CpuBackend {
         for kfa in kfas.iter_mut() {
             solve_kfa_limbs(kfa);
             for limb in &kfa.limbs {
+                self.kfa_limb_root[i] = kfa.p; // FW.4 #7 — per-actor root
                 let dst = &mut self.kfa_limbs[i];
                 dst.p = limb.p;
                 dst.s = limb.s;
@@ -1361,16 +1374,13 @@ impl CpuBackend {
         } else {
             Vec::new()
         };
-        // FW.4 — fog-of-war sprite hide (decision 8): a sprite whose
-        // world position maps to a Memory / Unseen / off-deck cell of the
-        // fog grid is hidden, the per-sprite mirror of the cutaway cull.
-        // Resolved once (the grid transform is copied out, so no lingering
-        // scene borrow into the closure).
-        let fow_hide: Option<(&roxlap_scene::FogOfWar, roxlap_scene::GridTransform)> = frame
-            .fow
-            .and_then(|(gid, fow)| scene.grid(gid).map(|g| (fow, g.transform)));
+        // FW.4 — fog-of-war sprite hide (decision 8): the SHARED
+        // `FogSpriteCull` (same footprint + Visible-only rule both
+        // backends use — review perf #2) hides a sprite whose world
+        // centre maps to a Memory/Unseen/Heard cell OVER the fog grid.
+        let fow_cull = crate::fow_cull::FogSpriteCull::resolve(scene, frame.fow);
         let hidden_flags = |sprites: &mut dyn Iterator<Item = &Sprite>| -> Vec<bool> {
-            if cutaway_volumes.is_empty() && fow_hide.is_none() {
+            if cutaway_volumes.is_empty() && fow_cull.is_none() {
                 return Vec::new();
             }
             sprites
@@ -1378,12 +1388,30 @@ impl CpuBackend {
                     let p =
                         glam::DVec3::new(f64::from(s.p[0]), f64::from(s.p[1]), f64::from(s.p[2]));
                     cutaway_volumes.iter().any(|v| v.hides_point(p))
-                        || fow_hide.is_some_and(|(fow, t)| fow.hides_sprite(&t, p))
+                        || fow_cull.as_ref().is_some_and(|c| c.hides(s.p))
                 })
                 .collect()
         };
         let hidden_static = hidden_flags(&mut self.sprites.iter());
-        let hidden_limbs = hidden_flags(&mut self.kfa_limbs.iter());
+        // FW.4 review #7 — KFA limbs are culled by their ACTOR root, not
+        // each limb pivot, so a body across a Visible/Memory boundary is
+        // whole-or-hidden, never dismembered.
+        let hidden_limbs: Vec<bool> = if cutaway_volumes.is_empty() && fow_cull.is_none() {
+            Vec::new()
+        } else {
+            self.kfa_limb_root
+                .iter()
+                .map(|root| {
+                    let p = glam::DVec3::new(
+                        f64::from(root[0]),
+                        f64::from(root[1]),
+                        f64::from(root[2]),
+                    );
+                    cutaway_volumes.iter().any(|v| v.hides_point(p))
+                        || fow_cull.as_ref().is_some_and(|c| c.hides(*root))
+                })
+                .collect()
+        };
         let hidden_dyn = hidden_flags(&mut self.dyn_sprites.iter());
         let hid = |flags: &[bool], i: usize| flags.get(i).copied().unwrap_or(false);
         let casts = |s: &Sprite| s.flags & invis == 0 && s.casts_shadow();

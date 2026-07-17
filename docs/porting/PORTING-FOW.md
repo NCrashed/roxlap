@@ -280,6 +280,43 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   pocket, a buried one nothing. Gates: `hides_sprite` state mapping,
   `hear_world` map+off-deck, GPU `cull_applies_fog_hide` (headless),
   `hear_source` transmission-scaled reveal (audio).
+- **FW.4 review round (2026-07-18)** — 8 correctness + 2 perf, all
+  landed (GPU KFA-under-fog deferred — see below).
+  Cluster A (no footprint check): (1) `hides_sprite` hid EVERY off-grid
+  sprite (actors on the water / in space) — now takes the fog grid's
+  `footprint` (new `Grid::footprint_cells`, prefers the residency hint =
+  full ship) and returns "shown" outside it (hazard 3). (2) `hear_world`
+  stamped a blob for ANY source whose z hit a band — now footprint-gated
+  (a passing ship's noise no longer reveals this grid) and returns
+  `bool`.
+  Cluster B (GPU cull key): (3) `fog_version=0` meant BOTH "no fog" and a
+  fresh mask → a no-fog frame's cache masked a fog frame. (4) the fog
+  grid's transform wasn't in the key → a rotating ship kept stale sprite
+  verdicts. Both fixed by the shared `FogSpriteCull::cull_key` (top bit
+  set ⇒ never 0; folds in the transform).
+  Audio/boundary: (5) epsilon-loudness revealed a crisp live actor —
+  sprites are now shown ONLY in Visible cells (Heard reveals GEOMETRY,
+  not a precise actor; dimmed-heard-sprite deferred with the alpha
+  fade), and `hear_source` returns the truly-stamped loudness. (6)
+  off-deck z (stair / jump / hull) fell back to the observer's active
+  deck instead of `deck_for_z = None → hidden` — no pop-out mid-transit.
+  (7) KFA dismemberment: the CPU now culls each actor's limbs by ONE
+  ACTOR-ROOT verdict (`kfa_limb_root`, from `KfaSprite.p`), not per-limb.
+  (8) `hear_source` now honours its "returns 0 when no reveal" contract.
+  Perf: (perf#1) new `FogOfWar::sprite_epoch` bumps ONLY when the Visible
+  set changes (not on the fade-bumped `mask_version`), so a fade no
+  longer re-culls an identical sprite set every frame — the GPU cull key
+  is `sprite_epoch`, not `mask_version`. (perf#2) the fog resolve +
+  per-sprite verdict live in ONE shared `roxlap-render::fow_cull::
+  FogSpriteCull` both backends call (no CPU/GPU-drift copy).
+  Gates: footprint hide/show + off-footprint + off-deck fallback,
+  in/out-of-footprint hear, off-footprint hear=0, `sprite_epoch`
+  fade-vs-turn.
+  **Owed tail**: GPU KFA-under-fog still culls per-limb-instance centre
+  (the CPU fix doesn't reach the GPU registry cull, which has no
+  per-instance actor-root); a fine-grained fog boundary can dismember a
+  GPU-rendered KFA actor. Needs per-instance root threaded through
+  `cull_bin_upload` — follow-up.
 
 ## Goal
 
