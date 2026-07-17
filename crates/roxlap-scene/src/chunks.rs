@@ -389,6 +389,13 @@ impl Grid {
                     &lights,
                     ao,
                 );
+                // PF.12 — a full bake rewrites every brightness byte;
+                // bump the version (whole-chunk extent) so version-keyed
+                // consumers (the GPU dirty-chunk poller, the FW opacity /
+                // light cache) re-read. `bake_bbox` already does this;
+                // the full bake omitting it left a re-bake invisible to
+                // those caches (FW light-gate rooms stayed dark).
+                self.bump_chunk_version(chunk_idx);
             }
         }
     }

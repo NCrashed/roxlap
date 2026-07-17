@@ -3,7 +3,63 @@
 Entry doc written 2026-07-17 at workspace 0.29.0 + uncommitted OC tail.
 This is the **entry doc** for the fog-of-war stage — tag **FW**.
 
-## Status — entry doc; FW.0..5 not started
+## Status — FW.0 LANDED (2026-07-17); FW.1..5 not started
+
+- **FW.0** — `roxlap-scene/src/fow.rs`: `FogOfWar` + `VisionConfig` +
+  `DeckBand` + `LightGate` + `FowObserver` (+ `CellState`, all
+  re-exported); per-deck sparse 128×128 mask tiles (byte = 2-bit state
+  + 6-bit intensity), classic 8-octant recursive shadowcast,
+  lazy per-cell opacity/light tiles keyed by an FNV mix of
+  `chunk_version`s + config generation, LOS recompute keyed on
+  (cell, quantized facing, deck, `mutation_counter`, config gen),
+  fade/decay state machine with float-truth transitions (byte is the
+  rounding — no dt-quantization stall), heard blobs with TTL +
+  Visible-priority, `mask_version` for the FW.3 upload gate,
+  `for_each_live_cell` for the FW.1 twin sync. 10 unit gates: cone /
+  peripheral / occlusion / cache invalidation on edit / gradual fade /
+  decay-to-floor + re-see reset / light gate incl. emissive key /
+  deck independence / heard reveal + fade / mask-version quiescence.
+  Fixture note: inserting over an already-solid voxel keeps the OLD
+  colour (`set_cube` is a geometric no-op there) — light-gate fixtures
+  must author lit/dark regions disjoint.
+- **FW.0 review round (2026-07-17)** — 6 correctness + 4 perf, all
+  landed (+7 regression gates, 17 total):
+  1. **Light gate read the ceiling, not the floor** — `sample_cell`
+     took the first solid from `min(z_top, eye_top)`, so a `DeckBand`
+     whose `z_top` includes the ceiling plate sampled the dark
+     underside of the deck above → fully-lit rooms stayed Unseen
+     forever. Floor surface is now the first solid at `z >= eye_top`.
+  2. **Full `Grid::bake` was invisible to version-keyed caches** —
+     `bake_u32` rewrote brightness bytes without bumping chunk
+     versions (unlike `bake_bbox`). Fixed in `chunks.rs` (helps the
+     GPU dirty-chunk poller too, not just FW). Turn the ship's lights
+     on + re-bake → rooms now re-light.
+  3. **Stream-in seen through fresh walls** — a generated chunk keeps
+     `chunk_version == 0` (absent value), so opacity tiles cached
+     while absent survived materialisation. Tile/edit keys now fold in
+     chunk PRESENCE (`chunk(idx).is_some()`), flipping on
+     absent→present at v0.
+  4. **Ceiling emissive became a wall** — the emissive early-return
+     marked the cell blocked when the lamp sat above the eye band,
+     carving Unseen wedges. Emissive now sets a lit-override flag and
+     never blocks; blocked stays eye-band-only.
+  5. **Heard stomped just-set Visible** — `update_heard` ran after
+     `recompute_los` and demoted fallen-out heard cells unconditionally;
+     turning toward a noise flipped the cell Visible then instantly
+     back to Memory. Demotion + stamp now skip cells the active deck
+     sees.
+  6. **`quantize_facing` sentinel collision** — `-1` was both "no
+     facing" and a legit ~-0.18° bucket. Sentinel moved to `i32::MIN`;
+     buckets `rem_euclid(2048)` (also folds the ±π wrap).
+  Perf: (1) LOS key hangs on a bounded `local_edit_key` over the view
+  radius's chunks, not the grid-wide `mutation_counter` (far-side
+  debris/streaming no longer forces a radius-96 shadowcast); (2)
+  `sample_cell` borrows the chunk once per `chz` instead of a per-voxel
+  `voxel_split`+HashMap probe (~340k on a first-fill tile); (3) tile
+  key memoised per tile-transition in `LosScan`, not rehashed per
+  visited cell; (4) heard blobs precompute their cells once at `hear()`
+  and the per-tick union rebuilds only on blob add/expiry (no per-tick
+  `sqrt` fan-out).
 
 ## Goal
 

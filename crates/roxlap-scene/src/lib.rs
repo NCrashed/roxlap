@@ -47,6 +47,9 @@ pub mod chunks;
 /// scene; see `docs/porting/PORTING-CONTROLLER.md`.
 pub mod collide;
 pub mod edit;
+/// Fog-of-war mask core (stage FW) — SS13-style knowledge visibility;
+/// see `docs/porting/PORTING-FOW.md`.
+pub mod fow;
 pub mod islands;
 pub mod lod;
 pub mod occluder;
@@ -70,6 +73,7 @@ pub use character::{CharacterBody, CharacterDef, MoveMode, WalkInput};
 pub use chunks::{BakeLight, BakeMode};
 pub use collide::{box_overlaps_solid, grid_box_overlaps_solid, point_overlaps_solid, Solidity};
 pub use edit::SpanOp;
+pub use fow::{CellState, DeckBand, FogOfWar, FowObserver, LightGate, VisionConfig};
 pub use islands::{detect_islands, FracturePattern, Island, DEFAULT_ISLAND_BUDGET};
 pub use lod::{select_lod, Lod, LodThresholds};
 pub use roxlap_core::AoParams;
