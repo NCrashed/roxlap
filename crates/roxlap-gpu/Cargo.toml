@@ -21,6 +21,8 @@ readme.workspace = true
 wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { workspace = true }
+# FW.3 — one-time warn when a fog mask exceeds the shader's deck cap.
+log = { workspace = true }
 # GPU.2: source of `Vxl` chunks for the CPU-side decompressor.
 roxlap-formats = { path = "../roxlap-formats", version = "0.29" }
 # The renderer is decoupled from any specific windowing library: it

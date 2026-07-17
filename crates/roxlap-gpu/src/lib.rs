@@ -34,6 +34,7 @@
 
 pub mod camera;
 pub mod decompress;
+pub mod fow;
 pub mod grid;
 // Headless rendering is a native-only test/bench aid: it blocks on
 // `pollster` + `device.poll(Wait)`, neither of which exists on wasm.
@@ -280,6 +281,11 @@ pub struct GpuRenderer {
     /// Lazy-built on first [`Self::render_scene`] call. Holds the
     /// multi-grid pipeline + per-grid camera uniforms.
     scene_dda: Option<SceneDdaResources>,
+    /// FW.3 — bumped each time `scene_dda` (and its `fog_mask` buffer) is
+    /// rebuilt (resize/SSAA), so the facade's fog-mask version gate
+    /// re-uploads instead of trusting a stale key. See
+    /// [`Self::scene_dda_generation`].
+    scene_dda_gen: u64,
     /// PW.1 — async depth-pick state for the wasm GPU path (see
     /// `pending_pick.rs`). Interior-mutable because the facade's
     /// `pick_depth` is `&self`; native hosts use the blocking
@@ -471,6 +477,12 @@ struct SceneDdaResources {
     /// sprites). `sprite_cast_count == 0` keeps the shader from indexing it.
     /// `None` on non-capable devices (those bindings aren't in the BGL).
     sprite_cast_dummy: Option<wgpu::Buffer>,
+    /// FW.3 — fog-of-war mask (binding 22): a self-describing header +
+    /// packed per-cell bytes (see `scene_dda.wgsl` `fog_mask`). Starts as
+    /// a 1-word dummy (`FOG_ENABLED == 0`), so a scene with no fog reads
+    /// one word and skips. Rewritten by [`GpuRenderer::set_fog_mask`],
+    /// version-gated on `FogOfWar::mask_version`.
+    fog_mask_buf: wgpu::Buffer,
 }
 
 /// QE.8c — the renderer's cross-frame validity/dirty flags, grouped so
@@ -1430,6 +1442,7 @@ impl GpuRenderer {
             view_cutout: None,
             posterize: None,
             scene_dda: None,
+            scene_dda_gen: 0,
             async_pick: std::sync::Mutex::new(pending_pick::AsyncPickState::default()),
             tint: None,
             scene_materials: Box::new(
@@ -1659,6 +1672,46 @@ impl GpuRenderer {
         self.view_cutout = cutout;
     }
 
+    /// FW.3 — upload the fog-of-war mask (header + packed cells; see
+    /// `scene_dda.wgsl` `fog_mask`). Empty ⇒ a disabled dummy. When the
+    /// new mask fits the existing buffer (the common case — an intensity
+    /// fade re-uploads the same geometry every frame), it is written IN
+    /// PLACE via `write_buffer`, so the cached scene bind group stays
+    /// valid (no rebuild, no alloc); only a size GROWTH recreates the
+    /// buffer (review perf #1). No-op before the scene pass exists.
+    pub fn set_fog_mask(&mut self, words: &[u32]) {
+        use wgpu::util::DeviceExt;
+        let contents: Vec<u32> = if words.is_empty() {
+            crate::fow::disabled_fog_mask()
+        } else {
+            words.to_vec()
+        };
+        let Some(dda) = &mut self.scene_dda else {
+            return;
+        };
+        let bytes: &[u8] = bytemuck::cast_slice(&contents);
+        if (bytes.len() as u64) <= dda.fog_mask_buf.size() {
+            self.queue.write_buffer(&dda.fog_mask_buf, 0, bytes);
+        } else {
+            dda.fog_mask_buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("roxlap-gpu scene_dda.fog_mask"),
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                });
+        }
+    }
+
+    /// FW.3 — a counter bumped every time the scene-DDA pipeline (and its
+    /// `fog_mask` buffer) is rebuilt — a resize/SSAA change resets the
+    /// mask to the disabled dummy, so the facade must re-upload. The
+    /// facade folds this into its version-gate key so it can't miss it.
+    #[must_use]
+    pub fn scene_dda_generation(&self) -> u64 {
+        self.scene_dda_gen
+    }
+
     /// RP.0 — the logical (retro) grid size the scene resolves to before the
     /// upscale, resolved against the swapchain size. `logical_dims ==
     /// surface_dims` under [`RenderResolution::Native`].
@@ -1814,6 +1867,10 @@ impl GpuRenderer {
             None => true,
         };
         if needs_build {
+            // FW.3 — a fresh scene_dda has a disabled dummy fog mask; bump
+            // the generation so the facade re-uploads (else a resize
+            // silently drops the fog while `last_fog` still says loaded).
+            self.scene_dda_gen = self.scene_dda_gen.wrapping_add(1);
             self.scene_dda = Some(self.build_scene_dda(
                 render_w,
                 render_h,
@@ -2072,6 +2129,8 @@ impl GpuRenderer {
             dda_bufs.push((20, models.clone()));
             dda_bufs.push((21, occ.clone()));
         }
+        // FW.3 — fog-of-war mask (binding 22, always).
+        dda_bufs.push((22, dda.fog_mask_buf.clone()));
         let dda_bg = cached_bind_group(
             &mut fp.dda_bg,
             &self.device,
@@ -2592,6 +2651,9 @@ impl GpuRenderer {
             dda_entries.push(bgl_storage_entry(20, true)); // sprite_models
             dda_entries.push(bgl_storage_entry(21, true)); // sprite_occupancy
         }
+        // FW.3 — fog-of-war mask (22, always present; clears the
+        // conditional sprite-cast slots).
+        dda_entries.push(bgl_storage_entry(22, true));
         let bgl_dda = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2832,6 +2894,18 @@ impl GpuRenderer {
                     mapped_at_creation: false,
                 })
             }),
+            // FW.3 — 4-word dummy fog mask (header word 0 = FOG_ENABLED =
+            // 0 → the shader skips). Grown by `set_fog_mask` when a fog
+            // grid is active.
+            fog_mask_buf: {
+                use wgpu::util::DeviceExt;
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("roxlap-gpu scene_dda.fog_mask"),
+                        contents: bytemuck::cast_slice(&[0u32; 4]),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    })
+            },
         }
     }
 
@@ -3272,6 +3346,11 @@ pub struct HeadlessSceneRenderer {
     /// **render** pixels verbatim. Set via [`Self::set_view_cutout`];
     /// lets the OC.2 gates exercise the keyhole path against the CPU.
     view_cutout: Option<GpuViewCutout>,
+    /// FW.3 — fog-of-war mask words (header + packed cells; see
+    /// `scene_dda.wgsl` `fog_mask`). Default `[0; 4]` = disabled. Set via
+    /// [`Self::set_fog_mask`]; lets the FW.3 gates diff the GPU fog path
+    /// against the CPU.
+    fog_mask_words: Vec<u32>,
 }
 
 impl HeadlessSceneRenderer {
@@ -3385,6 +3464,8 @@ impl HeadlessSceneRenderer {
                 // DL — per-grid point lights (18). Sun dir rides in
                 // PerGridCamera (binding 15).
                 bgl_storage_entry(18, true),
+                // FW.3 — fog-of-war mask (22).
+                bgl_storage_entry(22, true),
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -3442,7 +3523,19 @@ impl HeadlessSceneRenderer {
             terrain_map: Vec::new(),
             terrain_translucent: false,
             view_cutout: None,
+            fog_mask_words: vec![0u32; 4],
         }
+    }
+
+    /// FW.3 — set the fog-of-war mask (header + packed cells; see
+    /// `scene_dda.wgsl` `fog_mask`) for subsequent renders. Empty ⇒ a
+    /// disabled dummy. The headless mirror of [`GpuRenderer::set_fog_mask`].
+    pub fn set_fog_mask(&mut self, words: &[u32]) {
+        self.fog_mask_words = if words.is_empty() {
+            vec![0u32; 4]
+        } else {
+            words.to_vec()
+        };
     }
 
     /// EV — set the terrain material palette + colour→material map for
@@ -3646,6 +3739,16 @@ impl HeadlessSceneRenderer {
         let (packed_lights, sun_flags, point_count) =
             pack_scene_lights(&dl, scene.grid_count as usize);
         let dummy_point_lights = upload_grid_point_lights(device, &packed_lights);
+        // FW.3 — headless path binds the fog mask supplied via
+        // `self.fog_mask_words` (a 1-word disabled dummy by default).
+        let fog_mask_buf = {
+            use wgpu::util::DeviceExt;
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("roxlap-gpu headless.fog_mask"),
+                contents: bytemuck::cast_slice(&self.fog_mask_words),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        };
         let grid_cameras = upload_grid_cameras(device, &cam_vec);
         let uniform = SceneDdaUniform {
             fov_y_rad,
@@ -3791,6 +3894,11 @@ impl HeadlessSceneRenderer {
                 wgpu::BindGroupEntry {
                     binding: 18,
                     resource: dummy_point_lights.as_entire_binding(),
+                },
+                // FW.3 — fog-of-war mask (22).
+                wgpu::BindGroupEntry {
+                    binding: 22,
+                    resource: fog_mask_buf.as_entire_binding(),
                 },
             ],
         });

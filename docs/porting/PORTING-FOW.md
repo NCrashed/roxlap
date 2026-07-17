@@ -3,7 +3,7 @@
 Entry doc written 2026-07-17 at workspace 0.29.0 + uncommitted OC tail.
 This is the **entry doc** for the fog-of-war stage — tag **FW**.
 
-## Status — FW.0 + FW.1 + FW.2 LANDED (2026-07-17); FW.3..5 not started
+## Status — FW.0 + FW.1 + FW.2 + FW.3 LANDED (2026-07-18); FW.4..5 not started
 
 - **FW.0** — `roxlap-scene/src/fow.rs`: `FogOfWar` + `VisionConfig` +
   `DeckBand` + `LightGate` + `FowObserver` (+ `CellState`, all
@@ -193,6 +193,71 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   faster hash, not a mutable cache) instead of SipHash. Gates: shadow no
   longer leaks (Δlum), out-of-band Hide, seam no-pop, emissive kept,
   composed hides-unseen-shows-seen.
+- **FW.3** — GPU parity. One `fog_mask` storage buffer (binding 22 —
+  19..21 are the conditional sprite-cast slots) with a self-describing
+  17-word header (`FOG_*` word offsets: enabled / grid index / deck
+  count / origin cell / width / height / memory dim+desaturate / up to 4
+  `(z_top, z_bottom)` deck bands) then the deck-major row-major mask
+  bytes packed 4/u32. Header + single buffer ⇒ NO change to the
+  intricate `Uniforms` layout. WGSL `fow_lookup(g, cxm, cym, czm, mip)`
+  (mirrors `FowRender`: LIVE unless enabled & `g == FOG_GRID`; mip-cell →
+  mip-0 CENTRE `<< mip + half`; deck_for_z, out-of-band/Unseen → Hide;
+  unified `dim`/`desat` taper; `dynamic = state==Visible`) + `fow_apply_
+  style`. Applied in `scene_dda.wgsl`'s hit branch (`!fow.hidden` in the
+  gate, emissive-wins + `dynamic`-gated rig + `fow_apply_style` before
+  fog) AND in `shadow_occluded` (a Hide cell occludes nothing — the CPU
+  `SceneOccluder` fix, review #1, on GPU). Disabled (word 0 == 0, a
+  1-word dummy) reads one word ⇒ byte-identical (all 30 existing headless
+  gates green). Host: `roxlap_scene::GpuFowMask` + `FogOfWar::gpu_mask
+  (origin_cell, w, h)` flattens the sparse tiles over the twin's
+  residency-hint bbox; `roxlap-render` `pack_fog_mask` builds the words +
+  `GpuBackend::sync_fog_mask` uploads them via `GpuRenderer::set_fog_mask`
+  (recreates the buffer → invalidates the cached bind group),
+  version-gated on `(fog grid, mask_version)` and cleared when
+  `FrameParams::fow` goes away. Bindings added to BOTH scene_dda BGLs +
+  bind groups (main + headless) and `HeadlessSceneRenderer::set_fog_mask`.
+  The FW.2 GPU `debug_assert` is gone. Gates: 2 headless (Hide→sky /
+  Visible→floor / disabled byte-identical; Memory dims) + `pack_fog_mask`
+  header pin + `gpu_mask` flatten. Traps: bindings 19–21 are the
+  conditional sprite-cast slots (use 22); `<< mip` (not `>> mip`) for
+  mip-0 coords; std140 fields dodged entirely via the storage-buffer
+  header.
+- **FW.3 review round (2026-07-18)** — 7 correctness (GPU mask state) +
+  3 perf/hygiene, all landed. Root cause of #1/#2/#7: the version-gate
+  key `(grid, mask_version)` under-specified the uploaded bytes AND
+  `sync_fog_mask` ran BEFORE `upload_scene` (stale `grid_ids`).
+  1. **Resize/SSAA silently disabled fog** — rebuilding the scene-DDA
+     pipeline resets `fog_mask_buf` to the disabled dummy, but the key
+     said "loaded". Added `GpuRenderer::scene_dda_generation()` (bumped
+     per pipeline build) to the key.
+  2. **Stale positional `FOG_GRID`** — the header bakes the twin's
+     resident SLOT index, which shifts on a scene switch / grid add. The
+     slot is now in the key AND `sync_fog_mask` runs AFTER `upload_scene`
+     (current `grid_ids`).
+  3. **`hint == None` ⇒ whole grid Hidden** — the `(w=0, h=0)` fallback
+     still uploaded `FOG_ENABLED=1`, so every cell failed `lx < 0` → all
+     Hidden (a direct-`FogOfWar` grid vanished on GPU). Now falls back to
+     a DISABLED mask (LIVE).
+  4. **Silent >4-deck truncate** — `pack_fog_mask` warns once when the
+     deck count exceeds the shader's `FOG_MAX_DECKS`.
+  5/6. **Fog-target switch / lost twin didn't clear + no guard** — a
+     non-resident or hint-less fog grid now clears any resident mask
+     (`clear_fog_mask`) and warns once (`warn_fog_grid_not_resident`,
+     the replacement for the removed FW.2 guard), instead of leaving the
+     old ship fogged / the new one unstyled.
+  7. **One-frame full reveal on enable** — fixed by #2's move after
+     `upload_scene`: the twin's first fogged frame has a live slot, so
+     the mask uploads before the dispatch that draws it.
+  Perf: (perf#1) `set_fog_mask` writes IN PLACE via `write_buffer` when
+  the mask fits the buffer (an intensity fade re-uploads the same
+  geometry every frame) — no bind-group rebuild / alloc; only a size
+  growth recreates. (perf#2) the WGSL `fow_lookup` runs only AFTER the
+  cheap `z_clip_mip`/`cut_hidden` gates. (perf#3) the header packer +
+  `FOG_*` layout live in ONE place — `roxlap_gpu::fow::pack_fog_mask`
+  (owner of the WGSL constants); `roxlap-render` and the headless test
+  both call it (the hand-rolled test header is gone). New gates:
+  `roxlap_gpu::fow` header-layout + deck-truncation; `roxlap-gpu` gains a
+  direct `log` dep for the warn.
 
 ## Goal
 

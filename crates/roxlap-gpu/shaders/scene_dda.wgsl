@@ -252,6 +252,86 @@ struct PointLight {
 // direction rides in `grid_cameras[g].sun_dir`, binding 15.)
 @group(0) @binding(18) var<storage, read> grid_point_lights: array<PointLight>;
 
+// FW.3 — fog-of-war mask. A single self-describing storage buffer: a
+// small header (word offsets below), then the deck-major, row-major
+// mask bytes packed 4 cells / u32. Word 0 == 0 disables the whole thing
+// (a 1-word dummy is bound when no fog grid is active), so a scene with
+// no fog reads one word and skips — byte-identical to pre-FW. Mirrors
+// `roxlap_scene::GpuFowMask`; the header layout must stay in lockstep
+// with `roxlap-render`'s packer. Binding 22 — 19..21 are the
+// conditional sprite-cast slots, so 22 is always free.
+@group(0) @binding(22) var<storage, read> fog_mask: array<u32>;
+const FOG_ENABLED: u32 = 0u;    // 0 = off
+const FOG_GRID: u32 = 1u;       // scene-grid index the mask applies to
+const FOG_DECKS_N: u32 = 2u;    // number of decks
+const FOG_ORIGIN_X: u32 = 3u;   // grid-local cell of buffer (0,0), i32
+const FOG_ORIGIN_Y: u32 = 4u;
+const FOG_WIDTH: u32 = 5u;      // cells
+const FOG_HEIGHT: u32 = 6u;
+const FOG_MEM_DIM: u32 = 7u;    // f32 bits
+const FOG_MEM_DESAT: u32 = 8u;  // f32 bits
+const FOG_DECK_BASE: u32 = 9u;  // (z_top, z_bottom) i32 pairs per deck
+const FOG_MAX_DECKS: u32 = 4u;
+const FOG_CELLS_BASE: u32 = 17u; // = FOG_DECK_BASE + 2*FOG_MAX_DECKS
+
+// FW.3 — the per-cell verdict, mirroring `roxlap_scene::FowRender`.
+// `hidden` ⇒ treat the cell as air (marcher/shadow continues);
+// otherwise `dim`/`desat` style the surface and `dynamic` gates the
+// light rig (0 = memory, baked only). `LIVE` default = shown, full.
+struct FowV { hidden: bool, dim: f32, desat: f32, dynamic: bool };
+
+// Look up the verdict for a hit in grid `g` at mip-cell `(cxm, cym,
+// czm)` (grid-local; `czm` is the absolute mip-z). Returns LIVE when
+// the fog is off or `g` is not the fog grid (caller need not pre-check).
+fn fow_lookup(g: u32, cxm: i32, cym: i32, czm: i32, mip: u32) -> FowV {
+    var v = FowV(false, 1.0, 0.0, true);
+    if (fog_mask[FOG_ENABLED] == 0u || g != fog_mask[FOG_GRID]) {
+        return v;
+    }
+    // mip-cell → mip-0 grid-local voxel at the coarse cell's CENTRE
+    // (review #2 — low-corner sampling leaked / popped at mip ≥ 1).
+    let half = (i32(1) << mip) >> 1u;
+    let m0x = (cxm << mip) + half;
+    let m0y = (cym << mip) + half;
+    let m0z = (czm << mip) + half;
+    // deck_for_z; a z in no band is untracked → hidden (review #4).
+    let dc = i32(fog_mask[FOG_DECKS_N]);
+    var deck: i32 = -1;
+    for (var d: i32 = 0; d < dc; d = d + 1) {
+        let zt = bitcast<i32>(fog_mask[FOG_DECK_BASE + u32(d) * 2u]);
+        let zb = bitcast<i32>(fog_mask[FOG_DECK_BASE + u32(d) * 2u + 1u]);
+        if (m0z >= zt && m0z <= zb) { deck = d; break; }
+    }
+    if (deck < 0) { v.hidden = true; return v; }
+    let ox = bitcast<i32>(fog_mask[FOG_ORIGIN_X]);
+    let oy = bitcast<i32>(fog_mask[FOG_ORIGIN_Y]);
+    let w = i32(fog_mask[FOG_WIDTH]);
+    let h = i32(fog_mask[FOG_HEIGHT]);
+    let lx = m0x - ox;
+    let ly = m0y - oy;
+    if (lx < 0 || lx >= w || ly < 0 || ly >= h) { v.hidden = true; return v; }
+    let idx = u32(deck) * u32(w) * u32(h) + u32(ly) * u32(w) + u32(lx);
+    let word = fog_mask[FOG_CELLS_BASE + (idx >> 2u)];
+    let mbyte = (word >> ((idx & 3u) * 8u)) & 0xffu;
+    let state = mbyte >> 6u;
+    if (state == 0u) { v.hidden = true; return v; } // Unseen
+    let inten = f32(mbyte & 63u) * (1.0 / 63.0);
+    let mdim = bitcast<f32>(fog_mask[FOG_MEM_DIM]);
+    let mdesat = bitcast<f32>(fog_mask[FOG_MEM_DESAT]);
+    // Unified Visible/Memory taper (review #5); only `dynamic` differs.
+    v.dim = mdim + (1.0 - mdim) * inten;
+    v.desat = mdesat * (1.0 - inten);
+    v.dynamic = (state == 2u); // Visible
+    return v;
+}
+
+// FW.3 — apply a verdict's dim + desaturate to a linear-RGB surface
+// colour (matches the CPU `fow_style`; identity at dim=1, desat=0).
+fn fow_apply_style(c: vec3<f32>, dim: f32, desat: f32) -> vec3<f32> {
+    let luma = dot(c, vec3<f32>(0.299, 0.587, 0.114));
+    return (c + (luma - c) * desat) * dim;
+}
+
 // TV.6 — material id for a terrain voxel colour (linear scan of the small
 // map); 0 (opaque) when unmapped or the map is empty.
 fn terrain_material_id(packed: u32) -> u32 {
@@ -734,9 +814,19 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
                 }
                 // CA.3 — clipped-away cells (abs mip-z above the cut,
                 // i.e. < z_clip_mip) never occlude.
+                // FW.3 review #1 — nor does a fog-Hidden cell: an unseen
+                // wall must cast no shadow, or its silhouette leaks onto
+                // visible floor (the CPU `SceneOccluder` fix, on GPU).
                 if (!skip_origin_cell
                     && (p_chunk.z * cz_mip + p_voxel.z >= z_clip_mip)
-                    && (occ_word_cached & (1u << (z_u & 31u))) != 0u) { return true; }
+                    && (occ_word_cached & (1u << (z_u & 31u))) != 0u
+                    && !fow_lookup(
+                        g,
+                        p_chunk.x * i32(vsid_mip_u) + p_voxel.x,
+                        p_chunk.y * i32(vsid_mip_u) + p_voxel.y,
+                        p_chunk.z * cz_mip + p_voxel.z,
+                        mip,
+                    ).hidden) { return true; }
                 skip_origin_cell = false;
                 steps = steps + 1u;
                 if (steps >= u.shadow_max_steps) { return false; }
@@ -1381,9 +1471,22 @@ fn march_grid(
                             < max(ref_dist - u.cutout_a.x, 0.0) * s;
                     }
                 }
+                // FW.3 — fog-of-war verdict, priced only AFTER the cheap
+                // clip/cutout gates (review perf #2): a cell the cutaway
+                // or keyhole already discards never pays the deck scan +
+                // mask reads. `Hide` cells read as air, so the marcher
+                // continues past unseen geometry (same as a clipped cell);
+                // `Show` carries dim/desaturate/dynamic into the shade.
+                var fow = FowV(false, 1.0, 0.0, true);
+                if (cell_occupied && cell_z_abs >= z_clip_mip && !cut_hidden) {
+                    let cell_x_mip = p_chunk.x * i32(vsid_mip_u) + p_voxel.x;
+                    let cell_y_mip = p_chunk.y * i32(vsid_mip_u) + p_voxel.y;
+                    fow = fow_lookup(g, cell_x_mip, cell_y_mip, cell_z_abs, mip);
+                }
                 if (cell_z_abs >= z_clip_mip
                     && cell_occupied
-                    && !cut_hidden) {
+                    && !cut_hidden
+                    && !fow.hidden) {
                     if (t_hit >= best_t) {
                         return finalize_sky_grid(touched, accum, trans, ray_dir);
                     }
@@ -1410,13 +1513,19 @@ fn march_grid(
                     // albedo, no face shade, no baked byte, no rig.
                     var base_color: vec3<f32>;
                     if (mm.emissive > 0.0) {
+                        // FW.3 review #6 — emissive is intrinsic and wins
+                        // even in memory (a remembered glowing crystal
+                        // stays lit, dimmed below), never dark rock.
                         let albedo = vec3<f32>(
                             f32((packed >> 16u) & 0xffu),
                             f32((packed >> 8u) & 0xffu),
                             f32(packed & 0xffu),
                         ) * (1.0 / 255.0);
                         base_color = min(albedo * mm.emissive, vec3<f32>(1.0));
-                    } else if ((u.sun_flags & 4u) != 0u) {
+                    } else if ((u.sun_flags & 4u) != 0u && fow.dynamic) {
+                        // FW.3 — memory (`dynamic == false`) suppresses the
+                        // dynamic rig: a live light never relights a
+                        // remembered room.
                         let hit_pos = ray_origin + t_hit * ray_dir;
                         // Voxel centre (grid-local) for flat per-voxel stylized
                         // lighting; ignored by the smooth path.
@@ -1426,6 +1535,9 @@ fn march_grid(
                     } else {
                         base_color = voxel_color_in(packed, shade);
                     }
+                    // FW.3 — the memory / FOV-edge taper on the surface,
+                    // before distance fog (identity for a full-visible cell).
+                    base_color = fow_apply_style(base_color, fow.dim, fow.desat);
                     let lit = apply_fog(base_color, t_hit);
                     if (u.terrain_has_translucent == 0u) {
                         // Opaque fast-path: unchanged first hit.

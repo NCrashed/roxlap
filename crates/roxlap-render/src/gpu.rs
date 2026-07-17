@@ -23,6 +23,11 @@ use crate::{
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{HasDisplayHandle, HasWindowHandle};
 use glam::{DVec3, IVec3};
+
+/// FW.3 — chunk XY size as `i32`, for converting a chunk-index origin to
+/// a grid-local cell origin.
+#[allow(clippy::cast_possible_wrap)]
+const CS_XY_I: i32 = roxlap_scene::CHUNK_SIZE_XY as i32;
 use roxlap_core::kfa_draw::solve_kfa_limbs;
 use roxlap_core::Camera;
 
@@ -59,6 +64,11 @@ pub(crate) struct GpuBackend {
     empty_resident: Option<GpuSceneResident>,
     /// Grid ids in upload order — index = per-grid camera slot.
     grid_ids: Vec<GridId>,
+    /// FW.3 — `(fog grid, mask version, resident slot, scene_dda gen)`
+    /// last uploaded, so the mask is re-packed + re-uploaded only when
+    /// one of those changes (and cleared when `FrameParams::fow` goes
+    /// away / the grid isn't resident). `None` = no fog mask resident.
+    last_fog: Option<(GridId, u64, usize, u64)>,
     /// Sorted raw grid ids of the scene the [`resident`](Self::resident)
     /// was last built for. A scene switch swaps the whole grid set; when
     /// this no longer matches the incoming scene the resident is stale and
@@ -193,6 +203,7 @@ impl GpuBackend {
             resident: None,
             empty_resident: None,
             grid_ids: Vec::new(),
+            last_fog: None,
             resident_scene_grids: Vec::new(),
             sync: Vec::new(),
             sprite_registry: None,
@@ -989,6 +1000,92 @@ impl GpuBackend {
         self.mip_scan_dist
     }
 
+    /// FW.3 — pack + upload the fog-of-war mask for the twin grid named
+    /// by `FrameParams::fow` (or clear it), version-gated. The gate key is
+    /// `(grid, mask_version, slot_index, scene_dda_generation)` — every
+    /// input the packed bytes depend on:
+    /// - `mask_version` — the mask contents (fades bump it);
+    /// - `slot_index` — the twin's per-grid camera slot (baked into
+    ///   `FOG_GRID`; shifts on a scene switch / grid add-remove);
+    /// - `scene_dda_generation` — a resize/SSAA rebuilds the pipeline and
+    ///   resets the mask buffer to the disabled dummy, so a stale key
+    ///   would leave the fog silently off.
+    ///
+    /// Falls back to a DISABLED mask (LIVE — every cell shown) rather
+    /// than an all-Hidden one when the twin has no residency hint or is
+    /// not resident: a fog grid the GPU can't place must render normally,
+    /// not vanish. A previously-uploaded mask is cleared in both cases,
+    /// and a lost twin warns once.
+    fn sync_fog_mask(&mut self, scene: &Scene, frame: &FrameParams) {
+        let Some((gid, fow)) = frame.fow else {
+            self.clear_fog_mask();
+            return;
+        };
+        let slot = self.grid_ids.iter().position(|g| *g == gid);
+        let hint = scene.grid(gid).and_then(|g| g.gpu_residency_hint);
+        // The mask needs both a resident slot AND a placement bbox; without
+        // either the GPU can't apply it → show the grid LIVE (clear).
+        let (Some(slot), Some((oc, dims))) = (slot, hint) else {
+            if slot.is_none() {
+                Self::warn_fog_grid_not_resident();
+            }
+            self.clear_fog_mask();
+            return;
+        };
+        let key = (
+            gid,
+            fow.mask_version(),
+            slot,
+            self.gpu.scene_dda_generation(),
+        );
+        if self.last_fog == Some(key) {
+            return;
+        }
+        let (origin_cell, w, h) = (
+            glam::IVec2::new(oc[0] * CS_XY_I, oc[1] * CS_XY_I),
+            dims[0] * roxlap_scene::CHUNK_SIZE_XY,
+            dims[1] * roxlap_scene::CHUNK_SIZE_XY,
+        );
+        let mask = fow.gpu_mask(origin_cell, w, h);
+        let words = roxlap_gpu::fow::pack_fog_mask(
+            u32::try_from(slot).unwrap_or(0),
+            mask.origin_cell,
+            mask.width,
+            mask.height,
+            &mask.decks,
+            mask.memory_dim,
+            mask.memory_desaturate,
+            &mask.cells,
+        );
+        self.gpu.set_fog_mask(&words);
+        self.last_fog = Some(key);
+    }
+
+    /// FW.3 — upload the disabled dummy mask if one is currently resident,
+    /// clearing the version gate. Idempotent.
+    fn clear_fog_mask(&mut self) {
+        if self.last_fog.take().is_some() {
+            self.gpu.set_fog_mask(&[]);
+        }
+    }
+
+    /// FW.3 — the replacement for the removed FW.2 "GPU ignores fow"
+    /// guard: `FrameParams::fow` names a grid that is not in the GPU
+    /// resident set (wrong `GridId`, or the twin was filtered out of the
+    /// upload), so its fog won't render. Warn once instead of silently
+    /// dropping it.
+    fn warn_fog_grid_not_resident() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "FrameParams::fow names a grid that is not GPU-resident — its \
+                 fog-of-war will not render (the grid renders LIVE). Check the \
+                 GridId, or that the twin is not render-excluded from the upload."
+            );
+        }
+    }
+
     /// Mirror the CPU path's flat sky + distance fog onto the GPU from
     /// the per-frame [`FrameParams`]. The GPU marcher samples its own
     /// sky *texture* (default grey) and carries its own fog state, so
@@ -1031,28 +1128,6 @@ impl GpuBackend {
         frame: &FrameParams,
         shared: &crate::SceneState,
     ) {
-        // FW.2 — fog-of-war styling is CPU-only until FW.3 wires the GPU
-        // kernel. Setting `FrameParams::fow` and running on the GPU
-        // backend would SILENTLY drop the fog (the whole known+unseen
-        // world drawn fully visible), so warn once rather than leak
-        // quietly. Debug builds hard-assert to catch it in tests.
-        if frame.fow.is_some() {
-            debug_assert!(
-                false,
-                "FrameParams::fow is set but the GPU backend does not apply \
-                 fog-of-war yet (FW.3); fog will not render. Use the CPU \
-                 backend, or drop `fow` for the GPU path."
-            );
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log::warn!(
-                    "FrameParams::fow set on the GPU backend — fog-of-war is \
-                     CPU-only until FW.3; the fog will not render this run."
-                );
-            }
-        }
-
         // CPU/GPU parity: mirror the frame's flat sky + fog onto the GPU
         // (which carries its own sky texture + fog state).
         self.sync_sky_and_fog(frame);
@@ -1111,6 +1186,12 @@ impl GpuBackend {
         } else {
             self.refresh_dirty(scene);
         }
+
+        // FW.3 — upload the fog-of-war mask for the twin grid (or clear
+        // it). AFTER `upload_scene` so `self.grid_ids` is current — the
+        // header bakes the twin's per-grid SLOT index, which shifts on a
+        // scene switch / grid add-remove.
+        self.sync_fog_mask(scene, frame);
 
         // Flush any dynamic-instance pose changes accumulated this frame
         // via `set_dyn_instance_transform` in a single device upload (the

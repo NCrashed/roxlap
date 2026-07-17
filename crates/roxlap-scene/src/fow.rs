@@ -227,6 +227,33 @@ impl VisionConfig {
     }
 }
 
+/// FW.3 — the fog mask flattened for GPU upload (see
+/// [`FogOfWar::gpu_mask`]). Backend-neutral: `roxlap-render` packs
+/// `cells` into a storage buffer and writes the scalars as uniforms; the
+/// WGSL kernel reproduces [`FowRender`]'s verdict from the same bytes +
+/// bands + styling, so the two backends agree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuFowMask {
+    /// Grid-local cell coordinate of the buffer's `(0, 0)`.
+    pub origin_cell: [i32; 2],
+    /// Buffer width in cells.
+    pub width: u32,
+    /// Buffer height in cells.
+    pub height: u32,
+    /// Per-deck `(z_top, z_bottom)` inclusive bands (deck order matches
+    /// the `deck` axis of `cells`).
+    pub decks: Vec<[i32; 2]>,
+    /// Deck-major, row-major mask bytes (state in bits 6–7, intensity in
+    /// bits 0–5); `d*width*height + y*width + x`.
+    pub cells: Vec<u8>,
+    /// [`VisionConfig::memory_dim`].
+    pub memory_dim: f32,
+    /// [`VisionConfig::memory_desaturate`].
+    pub memory_desaturate: f32,
+    /// [`FogOfWar::mask_version`] this snapshot was taken at (upload gate).
+    pub version: u64,
+}
+
 /// Who is looking: grid-local cell, facing, and active deck index.
 /// The caller converts from world space ([`crate::world_to_grid_local`])
 /// — keeping the mask grid-local makes ship rotation/movement free.
@@ -585,6 +612,64 @@ impl FogOfWar {
                 .iter()
                 .map(|(&(tx, ty), t)| (IVec2::new(tx, ty), &t.bytes[..]))
         })
+    }
+
+    /// FW.3 — flatten the whole mask into a dense deck-major, row-major
+    /// byte buffer over the grid-local cell rectangle
+    /// `[origin_cell, origin_cell + (width, height))`, for GPU upload.
+    /// Cell `(x, y)` on deck `d` lives at
+    /// `d*width*height + (y - origin_y)*width + (x - origin_x)`; cells
+    /// outside a materialised tile stay `0` (Unseen ⇒ the shader hides
+    /// them). The caller sizes the rectangle to the twin's
+    /// [`Grid::gpu_residency_hint`] (`origin_chunk * 128`,
+    /// `chunks_dims * 128`) so it covers the whole ship. Also returns the
+    /// per-deck `(z_top, z_bottom)` bands and styling the shader needs to
+    /// reproduce [`FowRender`]'s verdict. Gate uploads on
+    /// [`Self::mask_version`].
+    #[must_use]
+    pub fn gpu_mask(&self, origin_cell: IVec2, width: u32, height: u32) -> GpuFowMask {
+        let (w, h) = (width as usize, height as usize);
+        let deck_count = self.config.decks.len();
+        let mut cells = vec![0u8; deck_count * w * h];
+        let tile = TILE;
+        for (deck, layer) in self.layers.iter().enumerate() {
+            let base = deck * w * h;
+            for (&(tx, ty), t) in &layer.mask {
+                // Tile's grid-local cell origin, relative to the buffer.
+                let tile_x0 = tx * tile - origin_cell.x;
+                let tile_y0 = ty * tile - origin_cell.y;
+                for iy in 0..tile {
+                    let by = tile_y0 + iy;
+                    if by < 0 || by >= height as i32 {
+                        continue;
+                    }
+                    for ix in 0..tile {
+                        let bx = tile_x0 + ix;
+                        if bx < 0 || bx >= width as i32 {
+                            continue;
+                        }
+                        let src = (iy * tile + ix) as usize;
+                        let dst = base + (by as usize) * w + bx as usize;
+                        cells[dst] = t.bytes[src];
+                    }
+                }
+            }
+        }
+        GpuFowMask {
+            origin_cell: [origin_cell.x, origin_cell.y],
+            width,
+            height,
+            decks: self
+                .config
+                .decks
+                .iter()
+                .map(|d| [d.z_top, d.z_bottom])
+                .collect(),
+            cells,
+            memory_dim: self.config.memory_dim,
+            memory_desaturate: self.config.memory_desaturate,
+            version: self.mask_version,
+        }
     }
 
     /// Advance the fog one tick: recompute LOS if the observer moved /
@@ -2340,6 +2425,26 @@ mod tests {
             }
             FowVerdict::Hide => panic!("expected Show(memory), got Hide"),
         }
+    }
+
+    /// FW.3 — `gpu_mask` flattens the sparse per-deck tiles into a dense
+    /// deck-major, row-major buffer over the requested rectangle; a seen
+    /// cell lands at the right offset, the rest stay Unseen (0).
+    #[test]
+    fn gpu_mask_flattens_seen_cells() {
+        let g = open_room();
+        let mut fow = seeing_fow();
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
+        // A window covering cells [0,32)² on the single deck.
+        let mask = fow.gpu_mask(IVec2::ZERO, 32, 32);
+        assert_eq!(mask.decks.len(), 1);
+        assert_eq!(mask.decks[0], [80, FLOOR_Z]); // band()'s z_top/z_bottom
+        assert_eq!(mask.cells.len(), 32 * 32);
+        // Cell (20,0) was seen (Visible) → state bits 6-7 == 2.
+        // Index = deck 0 base + y*width + x = 0 + 0*32 + 20.
+        assert_eq!(mask.cells[20] >> 6, 2, "seen cell is Visible");
+        // Cell (5, 20) far off the +X cone → Unseen (0).
+        assert_eq!(mask.cells[20 * 32 + 5], 0, "unseen cell is 0");
     }
 
     /// Review #4 — a hit at a z OUTSIDE every deck band (untracked

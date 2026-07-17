@@ -482,6 +482,133 @@ fn scene_dda_side_shades_darken_floor() {
     );
 }
 
+/// FW.3 — a `fog_mask` for one 1-deck grid (slot 0, band z∈[0,255]) over
+/// cells `[0, vsid)²` at origin `(0, 0)`, every cell set to `state` (2 =
+/// Visible, 1 = Memory, 0 = Unseen) at `intensity` (0..=63), styled by
+/// `memory_dim`. Built via the SHARED `roxlap_gpu::fow::pack_fog_mask`
+/// (one header owner — the same packer the production path uses).
+fn fog_mask_uniform(vsid: u32, state: u8, intensity: u8, memory_dim: f32) -> Vec<u32> {
+    let byte = (state << 6) | (intensity & 63);
+    let cells = vec![byte; (vsid * vsid) as usize];
+    roxlap_gpu::fow::pack_fog_mask(0, [0, 0], vsid, vsid, &[[0, 255]], memory_dim, 0.0, &cells)
+}
+
+/// FW.3 — the GPU fog mask hides Unseen cells (renders sky) and shows
+/// Visible cells (renders the floor, dim=1), mirroring the CPU verdict.
+#[test]
+fn scene_dda_fog_mask_hides_unseen_shows_visible() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&floor_chunk(vsid)); // floor voxel at z=100
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
+    };
+
+    // No fog → the floor draws.
+    let base = render(&mut renderer);
+    assert!(is_block_color(base), "baseline floor, got {base:#08x}");
+
+    // All-Visible fog at full intensity → still the floor (dim=1 identity).
+    renderer.set_fog_mask(&fog_mask_uniform(vsid, 2, 63, 1.0));
+    let visible = render(&mut renderer);
+    assert!(is_block_color(visible), "visible floor, got {visible:#08x}");
+
+    // All-Unseen fog → the floor is Hidden (treated as air) → sky.
+    renderer.set_fog_mask(&fog_mask_uniform(vsid, 0, 0, 1.0));
+    let unseen = render(&mut renderer);
+    assert!(
+        !is_block_color(unseen),
+        "unseen cell must render as sky, got {unseen:#08x}"
+    );
+
+    // Clearing the mask restores the floor (byte-identical to baseline).
+    renderer.set_fog_mask(&[]);
+    let cleared = render(&mut renderer);
+    assert_eq!(cleared, base, "disabled fog is byte-identical");
+}
+
+/// FW.3 — a Memory cell at low intensity renders dimmer than the live
+/// floor (the `memory_dim` taper), mirroring the CPU `fow_style`.
+#[test]
+fn scene_dda_fog_memory_dims_floor() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&floor_chunk(vsid));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
+    };
+
+    // Visible at full intensity (dim 1).
+    renderer.set_fog_mask(&fog_mask_uniform(vsid, 2, 63, 0.4));
+    let visible = render(&mut renderer);
+    // Memory at intensity 0 → dim = memory_dim = 0.4.
+    renderer.set_fog_mask(&fog_mask_uniform(vsid, 1, 0, 0.4));
+    let memory = render(&mut renderer);
+    assert!(is_block_color(visible), "visible floor, got {visible:#08x}");
+    assert!(
+        lum(memory) < lum(visible),
+        "memory floor must be dimmer: {visible:#08x} -> {memory:#08x}"
+    );
+    assert_ne!(memory & 0x00ff_ffff, 0, "dimmed memory is not black");
+}
+
 /// DL.1 — the directional sun (N·L diffuse) lights a grid face by its
 /// facing. Camera looks straight down a floor (hit via +z step ⇒ top-face
 /// normal = -z = up). A sun coming from above (to-sun = up = -z) gives

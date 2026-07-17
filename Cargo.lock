@@ -2630,6 +2630,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "glam 0.30.10",
+ "log",
  "naga",
  "pollster",
  "raw-window-handle",
