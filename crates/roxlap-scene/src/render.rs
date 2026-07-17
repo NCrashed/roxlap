@@ -373,6 +373,12 @@ pub struct ComposedFrameParams<'a> {
     pub sprite_occluder: Option<&'a dyn WorldOccluder>,
     /// OC — the frame's view cutout (keyhole).
     pub view_cutout: Option<&'a SceneViewCutout>,
+    /// FW.2 — fog-of-war styling for ONE grid (the twin): its
+    /// [`GridId`] plus the mask/config to style it with. Only that grid
+    /// gets the per-hit dim / desaturate / hide; every other grid
+    /// renders normally. `None` (the default) = no fog styling,
+    /// byte-identical.
+    pub fow: Option<(crate::GridId, &'a crate::FogOfWar)>,
 }
 
 impl<'a> ComposedFrameParams<'a> {
@@ -390,6 +396,7 @@ impl<'a> ComposedFrameParams<'a> {
             lights: CpuLights::default(),
             sprite_occluder: None,
             view_cutout: None,
+            fow: None,
         }
     }
 }
@@ -584,6 +591,7 @@ pub fn render_scene(
             // (per-frame facade state, like lights); the direct path
             // renders uncut.
             cutout: None,
+            fow: None,
         };
         // Scan-cutoff copy (identity at vws == 1.0 → same &settings).
         let grid_settings;
@@ -981,6 +989,7 @@ fn render_scene_composed_scissored(
         lights,
         sprite_occluder,
         view_cutout,
+        fow,
     } = params;
     debug_assert_eq!(fb.len(), zb.len());
     let pixel_count = (width as usize) * (height as usize);
@@ -1043,7 +1052,7 @@ fn render_scene_composed_scissored(
         && lights.shadow_strength > 0.0
         && (lights.sun_casts_shadow || lights.points.iter().any(|p| p.casts_shadow));
     let grid_occ = shadows_on
-        .then(|| SceneOccluder::build(scene))
+        .then(|| SceneOccluder::build(scene, fow))
         .filter(|o| !o.is_empty());
     // XS.2 — combine the grid occluder with the sprite occluder (sprites cast
     // onto terrain). `composite_store` backs the borrow when both are present.
@@ -1358,6 +1367,14 @@ fn render_scene_composed_scissored(
                 voxel_world_size: grid.transform.voxel_world_size as f32,
             }
         });
+        // FW.2 — fog-of-war styling for the twin grid only. Built as a
+        // loop-local so `DdaEnv` can borrow it as `&dyn FowStyler`; every
+        // other grid gets `None` (byte-identical). The mask is grid-local
+        // and the twin shares the real grid's voxel coordinates, so the
+        // hit's grid-local voxel indexes it directly.
+        let fow_styler = fow
+            .filter(|(fid, _)| *fid == grid_id)
+            .map(|(_, f)| crate::fow::FowRender::new(f));
         #[allow(clippy::cast_precision_loss)]
         let env = DdaEnv {
             sky: if owns_sky { sky } else { None },
@@ -1401,6 +1418,9 @@ fn render_scene_composed_scissored(
                     focus_z,
                 }
             }),
+            fow: fow_styler
+                .as_ref()
+                .map(|s| s as &dyn roxlap_core::dda::FowStyler),
         };
         // Effective render mip + brick cache were prepared above
         // (DDA.6 uniform per-grid mip, DDA.7 cross-frame cache).

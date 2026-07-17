@@ -33,6 +33,7 @@
 //! [`FogOfWar::for_each_live_cell`].
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use glam::{IVec2, IVec3, UVec3, Vec2};
 use roxlap_formats::color::Rgb;
@@ -282,12 +283,48 @@ impl OpacityTile {
     }
 }
 
+/// FW.2 review perf #1 — the render styler calls `FogOfWar::state` once
+/// per SOLID hit (hundreds of thousands per frame at Boarding scale, and
+/// once per internal cell of a Hide volume the marcher walks through).
+/// The default `HashMap` SipHash on the `(i32, i32)` tile key dominates
+/// that path; this Fx-style integer hasher (the same
+/// `rotate_left(5) ^ v * K` multiply rustc uses) cuts each lookup to a
+/// few instructions. Deterministic, zero-dependency, and `Sync` (the
+/// styler is shared read-only across the per-tile rayon workers, so a
+/// mutable last-tile cache is not an option — a faster hash is).
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    #[inline]
+    fn write_i32(&mut self, i: i32) {
+        self.write_u64(u64::from(i as u32));
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(K);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
 /// Per-deck layers: sparse mask + opacity tiles keyed by chunk XY
-/// index.
+/// index. Fx-hashed (perf #1).
 #[derive(Default)]
 struct DeckLayer {
-    mask: HashMap<(i32, i32), MaskTile>,
-    opacity: HashMap<(i32, i32), OpacityTile>,
+    mask: FastMap<(i32, i32), MaskTile>,
+    opacity: FastMap<(i32, i32), OpacityTile>,
 }
 
 fn split_cell(cell: IVec2) -> ((i32, i32), usize) {
@@ -857,7 +894,17 @@ impl TwinMirror {
         g.transform = self.transform;
         g.render_sky = self.render_sky;
         g.mip_levels_override = self.mip_levels_override;
-        g.lod_thresholds = self.lod_thresholds;
+        // FW.2 review #3 — the twin keeps the real grid's Near→Mid
+        // behaviour (Mid mip is coarse but still marched through the
+        // fog-aware DDA), but NEVER reaches the Far tier: Far blits a
+        // `BillboardCache` impostor built from the raw twin with no
+        // per-cell fog styling, so at Far distance the whole known+unseen
+        // ship would flash fully visible — exactly the range where
+        // concealment matters most. `r_mid = INFINITY` extends Mid to
+        // any distance.
+        let mut lod = self.lod_thresholds;
+        lod.r_mid = f64::INFINITY;
+        g.lod_thresholds = lod;
         g.z_clip = self.z_clip;
     }
 }
@@ -1065,6 +1112,72 @@ impl FowTwin {
             twin.billboards = None;
         }
         true
+    }
+}
+
+/// FW.2 — the render-time fog-of-war classifier: wraps a [`FogOfWar`]
+/// and answers the [`roxlap_core::dda::FowStyler`] verdict per hit. The
+/// scene renderer builds one for the twin grid each frame and hands it
+/// to the CPU DDA (`DdaEnv::fow`).
+///
+/// State → verdict:
+/// - **Unseen** ⇒ `Hide` (the marcher treats the cell as air).
+/// - **Visible** ⇒ `Show { dynamic: true }`, dimmed toward the memory
+///   look at the cone edge (intensity `< max`) so the FOV boundary is a
+///   smooth taper, full at the cone centre.
+/// - **Memory / Heard** ⇒ `Show { dynamic: false }` (frozen baked look),
+///   dimmed by [`VisionConfig::memory_dim`] scaled by the decaying
+///   intensity and desaturated by [`VisionConfig::memory_desaturate`].
+pub struct FowRender<'a> {
+    fow: &'a FogOfWar,
+}
+
+impl<'a> FowRender<'a> {
+    /// Wrap `fow` for a render pass.
+    #[must_use]
+    pub fn new(fow: &'a FogOfWar) -> Self {
+        Self { fow }
+    }
+}
+
+impl roxlap_core::dda::FowStyler for FowRender<'_> {
+    fn verdict(&self, x: i32, y: i32, z: i32) -> roxlap_core::dda::FowVerdict {
+        use roxlap_core::dda::FowVerdict;
+        let cfg = self.fow.config();
+        // FW.2 review #4 — a z outside EVERY deck band is untracked
+        // geometry: the inter-deck hull, sub-floor machinery, ceiling
+        // voids a chunk-granular twin copy dragged in for a neighbour
+        // cell. The fog knows nothing about it, so HIDE it — the old
+        // `LIVE` default rendered whole never-seen chunk strata at full
+        // brightness through floor gaps and under the cutaway clip.
+        let Some(deck) = cfg.deck_for_z(z) else {
+            return FowVerdict::Hide;
+        };
+        let (state, intensity) = self.fow.state(deck, IVec2::new(x, y));
+        let t = f32::from(intensity) / f32::from(INTENSITY_MAX);
+        // FW.2 review #5 — Visible and Memory share ONE dim/desaturate
+        // curve keyed on intensity, so the Visible→Memory handoff (the
+        // state flips in one frame while the intensity is still high,
+        // then decays via fade_out) is a smooth taper, NOT a
+        // 1.0→memory_dim jump on the back edge of the FOV every turn.
+        // Cone-edge cells (lower intensity) sit further down the same
+        // ramp; the centre (t == 1) is exactly full. Only the dynamic
+        // rig differs between the two states (memory is never relit).
+        let dim = cfg.memory_dim + (1.0 - cfg.memory_dim) * t;
+        let desaturate = cfg.memory_desaturate * (1.0 - t);
+        match state {
+            CellState::Unseen => FowVerdict::Hide,
+            CellState::Visible => FowVerdict::Show {
+                dynamic: true,
+                dim,
+                desaturate,
+            },
+            CellState::Memory | CellState::Heard => FowVerdict::Show {
+                dynamic: false,
+                dim,
+                desaturate,
+            },
+        }
     }
 }
 
@@ -2175,5 +2288,178 @@ mod tests {
         assert!(scene.grid(real).unwrap().queryable());
         assert!(scene.grid(twin.twin()).unwrap().renderable());
         assert!(!scene.grid(twin.twin()).unwrap().queryable());
+    }
+
+    // ---- FW.2: render-time styling verdicts ----
+
+    #[test]
+    fn fow_render_verdict_maps_states() {
+        use roxlap_core::dda::{FowStyler, FowVerdict};
+        let g = open_room();
+        let mut fow = seeing_fow();
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
+        let styler = FowRender::new(&fow);
+        let zc = FLOOR_Z - 1; // inside the deck band, above the floor
+
+        // Seen ahead → Show, dynamic on, full (t == 1 at cone centre).
+        match styler.verdict(20, 0, zc) {
+            FowVerdict::Show {
+                dynamic,
+                dim,
+                desaturate,
+            } => {
+                assert!(dynamic);
+                assert!((dim - 1.0).abs() < 1e-6, "cone-centre dim {dim}");
+                assert!(desaturate.abs() < 1e-6);
+            }
+            FowVerdict::Hide => panic!("expected Show at the cone centre, got Hide"),
+        }
+        // Never seen behind → Hide.
+        assert_eq!(styler.verdict(-30, 0, zc), FowVerdict::Hide);
+    }
+
+    #[test]
+    fn fow_render_memory_is_baked_and_dim() {
+        use roxlap_core::dda::{FowStyler, FowVerdict};
+        let g = open_room();
+        let mut fow = seeing_fow();
+        let zc = FLOOR_Z - 1;
+        // See cell (20,0), then turn away so it becomes Memory.
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
+        fow.update(&g, &observer(IVec2::new(0, 0), -Vec2::X), 0.5);
+        let styler = FowRender::new(&fow);
+        match styler.verdict(20, 0, zc) {
+            FowVerdict::Show {
+                dynamic,
+                dim,
+                desaturate,
+            } => {
+                assert!(!dynamic, "memory must skip the dynamic rig");
+                assert!(dim < 1.0, "memory must be dimmed, got {dim}");
+                assert!(desaturate > 0.0, "memory desaturated");
+            }
+            FowVerdict::Hide => panic!("expected Show(memory), got Hide"),
+        }
+    }
+
+    /// Review #4 — a hit at a z OUTSIDE every deck band (untracked
+    /// inter-deck / sub-floor geometry a chunk-granular copy dragged in)
+    /// is Hidden, not shown at full brightness.
+    #[test]
+    fn fow_render_out_of_band_z_is_hidden() {
+        use roxlap_core::dda::{FowStyler, FowVerdict};
+        let g = open_room();
+        let mut fow = seeing_fow();
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
+        let styler = FowRender::new(&fow);
+        // band() spans z 80..=100; z = 200 is below every deck → Hide,
+        // even at an (x, y) the observer sees.
+        assert_eq!(styler.verdict(20, 0, 200), FowVerdict::Hide);
+        assert_eq!(styler.verdict(20, 0, 0), FowVerdict::Hide);
+    }
+
+    /// Review #5 — the Visible→Memory seam is continuous: a cell at full
+    /// brightness that just left the cone (state flips to Memory while
+    /// intensity is still high) must NOT jump straight to `memory_dim` —
+    /// its dim stays near 1.0 and only decays as intensity fades.
+    #[test]
+    fn fow_render_memory_seam_no_pop() {
+        use roxlap_core::dda::{FowStyler, FowVerdict};
+        let g = open_room();
+        let mut fow = seeing_fow();
+        let zc = FLOOR_Z - 1;
+        let cell = (20, 0);
+        // Fully seen (cone centre, intensity == max).
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
+        let dim_visible = match FowRender::new(&fow).verdict(cell.0, cell.1, zc) {
+            FowVerdict::Show { dim, .. } => dim,
+            FowVerdict::Hide => panic!("seen cell hidden"),
+        };
+        assert!((dim_visible - 1.0).abs() < 1e-6);
+
+        // Turn away ONE tiny frame: the cell flips to Memory, intensity
+        // still high → dim must be ~continuous with the Visible value,
+        // not collapsed to memory_dim.
+        fow.update(&g, &observer(IVec2::new(0, 0), -Vec2::X), 0.01);
+        assert_eq!(
+            fow.state(0, IVec2::new(cell.0, cell.1)).0,
+            CellState::Memory
+        );
+        let dim_memory = match FowRender::new(&fow).verdict(cell.0, cell.1, zc) {
+            FowVerdict::Show { dim, dynamic, .. } => {
+                assert!(!dynamic, "memory skips the rig");
+                dim
+            }
+            FowVerdict::Hide => panic!("just-seen memory hidden"),
+        };
+        let memory_dim = fow.config().memory_dim;
+        assert!(
+            dim_memory > 0.5 * (1.0 + memory_dim),
+            "seam pop: dim dropped to {dim_memory} (memory_dim {memory_dim})"
+        );
+    }
+
+    /// FW.2 review #8 — the composed `fow = Some` wiring must actually
+    /// style the twin: an all-Unseen fog HIDES the rendered twin (sky),
+    /// a fog that saw the room SHOWS it. (The old test compared two
+    /// identical `fow = None` renders and could never fail.)
+    #[test]
+    fn composed_render_fow_some_hides_unseen_shows_seen() {
+        use crate::render::{render_scene_composed_frame, ComposedFrameParams, SceneRenderScratch};
+        use roxlap_core::{Camera, OpticastSettings};
+
+        // Real room + twin; sync so the twin actually holds the floor.
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut seen = seeing_fow();
+        seen.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &seen));
+        let twin_id = twin.twin();
+
+        // Top-down camera over the seen floor cells (~x in 5..30).
+        let camera = Camera {
+            pos: [18.0, 0.0, 60.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (w, h) = (48u32, 48u32);
+        let settings = OpticastSettings::for_oracle_framebuffer(w, h);
+        let render = |fow: Option<(GridId, &FogOfWar)>, scene: &mut Scene| {
+            let mut fb = vec![0u32; (w * h) as usize];
+            let mut zb = vec![f32::INFINITY; (w * h) as usize];
+            let mut scratch = SceneRenderScratch::default();
+            let mut params = ComposedFrameParams::new(&camera, &settings);
+            params.fow = fow;
+            let _ = render_scene_composed_frame(
+                &mut fb,
+                &mut zb,
+                w as usize,
+                w,
+                h,
+                scene,
+                &params,
+                &mut scratch,
+            );
+            fb
+        };
+        let non_sky = |fb: &[u32]| fb.iter().filter(|&&p| p != 0).count();
+
+        // No fog → the twin's floor draws.
+        let base = render(None, &mut scene);
+        assert!(non_sky(&base) > 0, "the twin floor must render without fog");
+
+        // Fog that saw this area → still drawn (Visible cells).
+        let shown = render(Some((twin_id, &seen)), &mut scene);
+        assert!(non_sky(&shown) > 0, "seen cells must stay visible");
+
+        // A fresh, never-updated fog → every cell Unseen → Hide → sky.
+        let blank = FogOfWar::new(seeing_fow().config().clone());
+        let hidden = render(Some((twin_id, &blank)), &mut scene);
+        assert_eq!(non_sky(&hidden), 0, "unseen cells must be hidden (sky)");
     }
 }

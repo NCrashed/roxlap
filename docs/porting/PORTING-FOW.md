@@ -3,7 +3,7 @@
 Entry doc written 2026-07-17 at workspace 0.29.0 + uncommitted OC tail.
 This is the **entry doc** for the fog-of-war stage — tag **FW**.
 
-## Status — FW.0 + FW.1 LANDED (2026-07-17); FW.2..5 not started
+## Status — FW.0 + FW.1 + FW.2 LANDED (2026-07-17); FW.3..5 not started
 
 - **FW.0** — `roxlap-scene/src/fow.rs`: `FogOfWar` + `VisionConfig` +
   `DeckBand` + `LightGate` + `FowObserver` (+ `CellState`, all
@@ -130,6 +130,69 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   now drives `pump_streaming_sync`; snapshot routes through
   `query_grids`. Full-chunk CPU clone on copy stays per decision 2 (the
   column-wise copy is the deferred follow-up).
+- **FW.2** — CPU styling. New in `roxlap-core::dda`: `FowStyler` trait
+  (`Send + Sync`, one `verdict(x,y,z)` per hit) + `FowVerdict`
+  (`Hide` | `Show { dynamic, dim, desaturate }`, `LIVE` const) +
+  `fow_style` (dim×desaturate colour op, identity at `{1,0}`) +
+  `DdaEnv::fow`. In `cell_walk_skip`'s hit branch the verdict is
+  evaluated once per SOLID hit inside the occupancy `.filter` (the
+  cutout's "price the rule on real hits only" pattern): `Hide` reads as
+  air (marcher continues — hides within-chunk unseen geometry the twin
+  copied for a neighbour); `Show { dynamic:false }` forces the baked
+  `shade` path (memory/heard never relit by a live rig) then
+  `fow_style` dims+desaturates before fog. `roxlap-scene::FowRender`
+  implements the trait over a `FogOfWar`: Unseen→Hide, Visible→Show
+  (dynamic, dim toward memory at the cone edge by intensity so the FOV
+  boundary is a smooth taper — NO dither), Memory/Heard→Show (baked,
+  dim×decay + desaturate). Wired per-grid via `ComposedFrameParams::fow`
+  / `FrameParams::fow` (`(GridId, &FogOfWar)`) — set only for the twin
+  grid; every other grid and `None` are byte-identical. mip-N hits shift
+  `cellc << mip` to the mip-0 lookup. Gates: 5 core (fow_style unit,
+  Hide-vanish, dim/desaturate matches helper, memory-skips-dynamic-rig,
+  LIVE byte-identity) + 3 scene (verdict state mapping, memory
+  baked+dim, composed `fow=None` byte-identity).
+- **FW.2 review round (2026-07-18)** — 8 correctness (info-leak cluster
+  + visual) + 2 perf, all landed (+6 gates):
+  1. **Hidden walls cast shadows** — the Hide verdict was primary-ray
+     only; shadow marches (single-grid `SamplerShadow` AND the cross-grid
+     `SceneOccluder`/WorldShadow used by composed renders) blocked light
+     on unseen geometry → the shadow silhouette leaked. Both are now
+     fog-filtered: a `Hide` cell occludes nothing. `SceneOccluder::build`
+     takes `Option<(GridId, &FogOfWar)>`, threaded from `render.rs`
+     (terrain) and `cpu.rs` (sprite-receive).
+  2. **mip-N low-corner leak** — a coarse cell was classified by its low
+     corner (straddling a deck ceiling → out-of-band → leak; a Visible
+     corner → pop). Now sampled at the coarse cell's CENTRE
+     (`(cellc << mip) + half`), primary + shadow.
+  3. **Far-LOD impostor bypassed fog** — the twin mirrored the real
+     grid's `lod_thresholds` incl. Far, and Far blits a raw impostor. The
+     twin mirror now forces `r_mid = INFINITY` (never Far — stays on the
+     fog-aware Near/Mid DDA at any distance).
+  4. **Out-of-band z rendered LIVE** — a z in NO deck band (inter-deck
+     hull, sub-floor a chunk-granular copy dragged in) defaulted to
+     `LIVE`. Now `Hide` (untracked = unknown = hidden).
+  5. **Visible→Memory seam pop** — Memory used a different dim curve, so
+     a cone-centre cell (dim 1) jumped to `memory_dim` the frame it
+     flipped to Memory. Visible and Memory now share ONE
+     `memory_dim + (1-memory_dim)·t` dim + `memory_desaturate·(1-t)`
+     curve keyed on intensity; only `dynamic` differs → continuous, the
+     fade_out taper carries it down.
+  6. **Memory lost emissive** — `dynamic:false` had replaced the emissive
+     branch with baked `shade` → a remembered crystal went dark while its
+     baked halo stayed. Emissive is intrinsic and now ALWAYS wins;
+     `dynamic:false` gates only the dynamic rig.
+  7. **GPU silently dropped `fow`** — the GPU backend now `debug_assert`s
+     + warns once when `FrameParams::fow` is set (CPU-only until FW.3).
+  8. **Vacuous composed gate** — the byte-identity test compared two
+     `fow=None` renders. Replaced with a real one: an all-Unseen fog
+     HIDES the rendered twin (sky), a seen fog SHOWS it.
+  Perf: (perf#2) the cheap keyhole `cut_z_mip` gate now runs BEFORE the
+  fog verdict, so a hit the keyhole discards pays no classification;
+  (perf#1) the per-deck mask/opacity maps use a zero-dep Fx-style integer
+  hasher (Sync-safe — the styler is shared across rayon workers, so a
+  faster hash, not a mutable cache) instead of SipHash. Gates: shadow no
+  longer leaks (Δlum), out-of-band Hide, seam no-pop, emissive kept,
+  composed hides-unseen-shows-seen.
 
 ## Goal
 

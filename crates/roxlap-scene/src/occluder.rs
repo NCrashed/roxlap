@@ -41,6 +41,11 @@ struct GridOcc<'a> {
     /// materialised chunk; the shadow march is clipped to it.
     lo: [f32; 3],
     hi: [f32; 3],
+    /// FW.2 review #1 — this grid's fog-of-war styler, if it is the
+    /// twin. A solid cell the observer never saw (`Hide`) must not block
+    /// a shadow ray, or its silhouette leaks as a shadow shape on visible
+    /// geometry. `None` = ordinary grid, every solid cell occludes.
+    fow: Option<crate::fow::FowRender<'a>>,
 }
 
 /// World-space scene occlusion oracle (see module docs).
@@ -53,13 +58,13 @@ impl<'a> SceneOccluder<'a> {
     /// per grid it walks the chunk keys once for the AABB (the same cost the
     /// render loop's `grid_bounds` early-out already pays).
     #[must_use]
-    pub fn build(scene: &'a Scene) -> Self {
+    pub fn build(scene: &'a Scene, fow: Option<(crate::GridId, &'a crate::FogOfWar)>) -> Self {
         let mut grids = Vec::new();
         // FW.1 — same filter as the primary render: the real fog-of-war
         // grid (`render_excluded`) casts no shadow (a shadow from unseen
         // geometry is an information leak); its known twin, being drawn,
         // casts normally.
-        for (_id, grid) in scene.render_grids() {
+        for (id, grid) in scene.render_grids() {
             if let Some((mut lo, hi)) = grid_voxel_aabb(grid) {
                 // CA.2 — cutaway: everything above the clip plane
                 // (`z < z_clip`, z-down) is air to the renderer, so
@@ -77,6 +82,13 @@ impl<'a> SceneOccluder<'a> {
                         continue;
                     }
                 }
+                // FW.2 review #1 — the twin's shadow occlusion is
+                // fog-filtered: only geometry the observer knows blocks
+                // light (Hidden cells the chunk-granular copy dragged in
+                // stay invisible, shadow included).
+                let fow = fow
+                    .filter(|(fid, _)| *fid == id)
+                    .map(|(_, f)| crate::fow::FowRender::new(f));
                 #[allow(clippy::cast_possible_truncation)]
                 grids.push(GridOcc {
                     grid,
@@ -85,6 +97,7 @@ impl<'a> SceneOccluder<'a> {
                     vws: grid.transform.voxel_world_size as f32,
                     lo,
                     hi,
+                    fow,
                 });
             }
         }
@@ -318,6 +331,15 @@ fn occluded_in_grid(g: &GridOcc<'_>, ow: DVec3, dw: DVec3, max_t: f32) -> bool {
                 && roxlap_core::GridView::from_single_vxl(vxl)
                     .surface_color_mip(in_chunk.x, in_chunk.y, in_chunk.z, 0)
                     .is_some()
+                // FW.2 review #1 — a fog-Hidden cell (unseen geometry a
+                // chunk-granular copy dragged in) blocks nothing: its
+                // shadow would leak the silhouette onto visible floor. The
+                // occluder marches mip-0, so the verdict takes the voxel
+                // coord directly.
+                && !g.fow.as_ref().is_some_and(|fr| {
+                    use roxlap_core::dda::{FowStyler, FowVerdict};
+                    matches!(fr.verdict(cell[0], cell[1], cell[2]), FowVerdict::Hide)
+                })
             {
                 return true;
             }
@@ -500,7 +522,7 @@ mod tests {
         // Phase 1: no brick maps yet → every present chunk takes the
         // dense fallback; absent-chunk jumps still fire.
         let run = |scene: &Scene| {
-            let occ = SceneOccluder::build(scene);
+            let occ = SceneOccluder::build(scene, None);
             let g = &occ.grids[0];
             // Deterministic LCG ray sweep: origins above/inside the
             // terrain band, directions over the sphere (incl. near-axis).
@@ -578,7 +600,7 @@ mod tests {
             IVec3::new(103, 95, 241),
             Some(VoxColor(0x80_62_66_70)),
         );
-        let occ = SceneOccluder::build(&scene);
+        let occ = SceneOccluder::build(&scene, None);
         let to_sun = [-0.4506, -0.3505, -0.8211];
         // Under the plate's true shadow: occluded.
         assert!(
@@ -624,7 +646,11 @@ mod tests {
         // A "sun ray" from below both slabs, straight up (z-down: -z).
         let occluded = |scene: &Scene| {
             use roxlap_core::WorldOccluder;
-            SceneOccluder::build(scene).occluded_world([50.0, 50.0, 250.0], [0.0, 0.0, -1.0], 512.0)
+            SceneOccluder::build(scene, None).occluded_world(
+                [50.0, 50.0, 250.0],
+                [0.0, 0.0, -1.0],
+                512.0,
+            )
         };
         assert!(occluded(&scene), "both slabs visible: blocked");
         // Hide slab A only — slab B (its own clip unset) still blocks.

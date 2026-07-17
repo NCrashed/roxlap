@@ -992,6 +992,14 @@ pub struct FrameParams<'a> {
     /// with the deck clip. `None` (the default) is byte-identical to
     /// the pre-OC output.
     pub view_cutout: Option<ViewCutout>,
+    /// FW.2 — fog-of-war styling for one grid (the known twin): its
+    /// [`GridId`](roxlap_scene::GridId) plus the [`FogOfWar`]
+    /// (roxlap_scene::FogOfWar) mask to style it with. Only that grid's
+    /// hits are dimmed / desaturated / hidden by the observer's
+    /// knowledge; every other grid renders normally. CPU path (stage
+    /// FW.2); the GPU path lands in FW.3. `None` (the default) is
+    /// byte-identical.
+    pub fow: Option<(roxlap_scene::GridId, &'a roxlap_scene::FogOfWar)>,
 }
 
 /// OC.0 — a camera-relative "keyhole" through front geometry (stage
@@ -1152,6 +1160,7 @@ impl<'a> FrameParams<'a> {
             lights: None,
             tint: None,
             view_cutout: None,
+            fow: None,
         }
     }
 

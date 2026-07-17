@@ -574,6 +574,7 @@ impl App {
             z_clip: None,
             // OC.0 — nor a view cutout (first-person oracle host).
             cutout: None,
+            fow: None,
         };
 
         // The world is one chunk; its brick occupancy is independent of

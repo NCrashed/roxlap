@@ -1031,6 +1031,28 @@ impl GpuBackend {
         frame: &FrameParams,
         shared: &crate::SceneState,
     ) {
+        // FW.2 — fog-of-war styling is CPU-only until FW.3 wires the GPU
+        // kernel. Setting `FrameParams::fow` and running on the GPU
+        // backend would SILENTLY drop the fog (the whole known+unseen
+        // world drawn fully visible), so warn once rather than leak
+        // quietly. Debug builds hard-assert to catch it in tests.
+        if frame.fow.is_some() {
+            debug_assert!(
+                false,
+                "FrameParams::fow is set but the GPU backend does not apply \
+                 fog-of-war yet (FW.3); fog will not render. Use the CPU \
+                 backend, or drop `fow` for the GPU path."
+            );
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "FrameParams::fow set on the GPU backend — fog-of-war is \
+                     CPU-only until FW.3; the fog will not render this run."
+                );
+            }
+        }
+
         // CPU/GPU parity: mirror the frame's flat sky + fog onto the GPU
         // (which carries its own sky texture + fog state).
         self.sync_sky_and_fog(frame);

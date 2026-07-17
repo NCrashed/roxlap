@@ -1457,6 +1457,8 @@ impl CpuBackend {
         composed.sprite_occluder = sprite_occ.as_ref().map(|o| o as &dyn WorldOccluder);
         // OC.0 — the frame's keyhole (None ⇒ byte-identical).
         composed.view_cutout = view_cutout.as_ref();
+        // FW.2 — fog-of-war styling for the twin grid (None ⇒ byte-identical).
+        composed.fow = frame.fow;
         let _ = render_scene_composed_frame(
             fb,
             &mut self.zbuffer[..pixel_count],
@@ -1510,7 +1512,9 @@ impl CpuBackend {
             // (built now that the terrain render released the `&mut Scene`) +
             // the sprite volumes. `composite_store` backs the borrow.
             let grid_occ = shadows_active
-                .then(|| SceneOccluder::build(scene))
+                // FW.2 — the twin's unseen geometry must not shadow
+                // sprites either (same silhouette leak).
+                .then(|| SceneOccluder::build(scene, frame.fow))
                 .filter(|o| !o.is_empty());
             let composite_store;
             let recv_occ: Option<&dyn WorldOccluder> =

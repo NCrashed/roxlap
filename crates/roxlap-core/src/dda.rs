@@ -99,6 +99,78 @@ pub struct DdaEnv<'a> {
     /// marches, occluders, collision and gameplay raycasts never see
     /// it. `None` (the default) is byte-identical to pre-OC renders.
     pub cutout: Option<CpuCutout>,
+    /// FW.2 — per-hit fog-of-war styling (stage FW). When set, each
+    /// solid hit is classified by grid-local voxel into a
+    /// [`FowVerdict`]: `Hide` cells read as air (the observer never saw
+    /// them — the marcher continues, like [`Self::cutout`]); `Show`
+    /// cells are dimmed / desaturated and may suppress the dynamic-light
+    /// rig (memory renders the frozen BAKED look). Applied to the
+    /// fog-of-war *twin* grid only (the scene renderer sets it per grid).
+    /// `None` (the default) is byte-identical to pre-FW renders. See
+    /// [`FowStyler`].
+    pub fow: Option<&'a dyn FowStyler>,
+}
+
+/// FW.2 — how one hit cell is shown, from its fog-of-war state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FowVerdict {
+    /// The observer never saw this cell — treat it as air (the marcher
+    /// continues past it, so within-chunk unseen geometry the twin
+    /// copied for a neighbour cell stays hidden).
+    Hide,
+    /// The observer knows this cell — shade and show it.
+    Show {
+        /// Whether the dynamic-light rig runs. `false` = the frozen
+        /// BAKED look only (memory / heard: a live torch must not
+        /// relight a remembered room).
+        dynamic: bool,
+        /// Brightness multiplier `0..=1` (the smooth FOV-edge / memory
+        /// taper). `1.0` = full.
+        dim: f32,
+        /// Desaturation `0..=1`, lerp of RGB toward luma (cold memory).
+        /// `0.0` = full colour.
+        desaturate: f32,
+    },
+}
+
+impl FowVerdict {
+    /// `Show { dynamic: true, dim: 1, desaturate: 0 }` — a fully-visible
+    /// cell rendered exactly as with no fog (the byte-identity anchor).
+    pub const LIVE: Self = Self::Show {
+        dynamic: true,
+        dim: 1.0,
+        desaturate: 0.0,
+    };
+}
+
+/// FW.2 — per-cell fog-of-war classifier the DDA consults at each hit.
+/// Implemented in `roxlap-scene` over a `FogOfWar` mask + the render
+/// styling; kept as a trait here so `roxlap-core` needs no dependency
+/// on the scene graph (mirrors how [`CpuLights`] borrows scene-built
+/// data). Called once per resolved hit (mip-0 grid-local voxel coords).
+///
+/// `Send + Sync`: the per-tile DDA render fans out over rayon, so the
+/// borrowed styler is shared across worker threads (read-only).
+pub trait FowStyler: Send + Sync {
+    /// Verdict for a hit at grid-local **mip-0** voxel `(x, y, z)`.
+    fn verdict(&self, x: i32, y: i32, z: i32) -> FowVerdict;
+}
+
+/// FW.2 — apply a [`FowVerdict::Show`]'s dim + desaturate to a shaded
+/// ARGB colour (high byte preserved). Identity when `dim == 1` and
+/// `desaturate == 0`, so a fully-visible cell is bit-exact.
+#[must_use]
+pub fn fow_style(color: u32, dim: f32, desaturate: f32) -> u32 {
+    if dim == 1.0 && desaturate == 0.0 {
+        return color;
+    }
+    let hi = color & 0xff00_0000;
+    let r = ((color >> 16) & 0xff) as f32;
+    let g = ((color >> 8) & 0xff) as f32;
+    let b = (color & 0xff) as f32;
+    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+    let mix = |c: f32| ((c + (luma - c) * desaturate) * dim).clamp(0.0, 255.0) as u32;
+    hi | (mix(r) << 16) | (mix(g) << 8) | mix(b)
 }
 
 /// OC.0 — the view cutout as one grid's render pass consumes it, fully
@@ -239,6 +311,7 @@ impl Default for DdaEnv<'_> {
             world_shadow: None,
             z_clip: None,
             cutout: None,
+            fow: None,
         }
     }
 }
@@ -1395,14 +1468,19 @@ const SHADOW_MAX_STEPS: u32 = 1024;
 /// blocked by the same surfaces the camera sees) and the same `[lo_c, hi_c)`
 /// voxel-box bounds, stepping a standard 3D-DDA until it hits a solid cell
 /// (occluded), leaves the box / exceeds `max_t` (lit), or hits the step cap.
-struct SamplerShadow<'s, 'a> {
+struct SamplerShadow<'s, 'a, 'f> {
     sampler: &'s mut Sampler<'a>,
     cell_size: f32,
     lo_c: [i32; 3],
     hi_c: [i32; 3],
+    /// FW.2 review #1 — the fog-of-war styler (if any): a solid cell the
+    /// observer never saw (`Hide`) must NOT block a shadow ray, or its
+    /// silhouette leaks as a shadow shape on visible geometry. Same
+    /// classifier the primary ray uses, so shadows and vision agree.
+    fow: Option<&'f dyn FowStyler>,
 }
 
-impl ShadowTester for SamplerShadow<'_, '_> {
+impl ShadowTester for SamplerShadow<'_, '_, '_> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn occluded(&mut self, origin: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
         let cs = self.cell_size;
@@ -1518,8 +1596,8 @@ impl ShadowTester for SamplerShadow<'_, '_> {
                 t_curr = best_t.max(t_curr);
                 continue;
             }
-            if self.sampler.hit(cellc).is_some() {
-                return true; // a surface blocks the ray
+            if self.sampler.hit(cellc).is_some() && !self.fow_hidden(cellc) {
+                return true; // a surface (that the observer knows) blocks the ray
             }
             let axis = min_axis(t_max);
             t_curr = t_max[axis];
@@ -1528,6 +1606,29 @@ impl ShadowTester for SamplerShadow<'_, '_> {
             used += 1;
         }
         false
+    }
+}
+
+impl SamplerShadow<'_, '_, '_> {
+    /// FW.2 review #1 — is `cellc` (mip-cell index) a fog-Hidden cell?
+    /// A Hidden solid casts no shadow (unseen geometry stays invisible,
+    /// including its shadow silhouette). Sampled at the coarse cell's
+    /// centre, matching the primary ray's lookup.
+    #[inline]
+    fn fow_hidden(&self, cellc: [i32; 3]) -> bool {
+        let Some(styler) = self.fow else {
+            return false;
+        };
+        let mip = self.sampler.mip;
+        let half = (1i32 << mip) >> 1;
+        matches!(
+            styler.verdict(
+                (cellc[0] << mip) + half,
+                (cellc[1] << mip) + half,
+                (cellc[2] << mip) + half,
+            ),
+            FowVerdict::Hide
+        )
     }
 }
 
@@ -1578,6 +1679,14 @@ fn cell_walk_skip(
     // real cell index is ever below it, mirroring `z_clip_mip` — the
     // whole per-cell cone test below stays behind this one compare.
     let cut_z_mip = env.cutout.map_or(i32::MIN, |c| c.focus_z >> sampler.mip);
+    // FW.2 — mip shift + half-cell offset to turn a hit's mip-cell index
+    // into the mip-0 grid-local voxel at the coarse cell's CENTRE for the
+    // fog-of-war lookup (review #2: sampling the low corner let a coarse
+    // cell straddling a deck ceiling classify as out-of-band → leak, and
+    // a Visible cell with an Unseen corner pop). Copied out so the
+    // per-hit `.filter` closure captures the values, not `sampler`.
+    let fow_mip_shift = sampler.mip;
+    let fow_mip_half = (1i32 << fow_mip_shift) >> 1;
     // OC.1 — the keyhole cone axis: eye → focus, unit, grid-local.
     // Ray-invariant (`origin` is the camera for every primary ray),
     // computed once per ray for free. A focus at the eye degenerates
@@ -1779,8 +1888,18 @@ fn cell_walk_skip(
         // never the far more numerous marched air cells above the
         // plane; and inside the filter the z compare leads, never-true
         // when the cutout is off (`cut_z_mip == i32::MIN`).
+        // OC keyhole hide + FW.2 fog verdict, both evaluated only on a
+        // solid hit (inside the `.filter`, after the occupancy test — the
+        // "price the rule on real hits only" pattern). Review perf #2 —
+        // the KEYHOLE is checked first: its cheap `cut_z_mip` gate
+        // short-circuits (never-true when the cutout is off), so a hit
+        // the keyhole discards never pays the fog verdict's dyn-call +
+        // band scan + tile lookup. The fog verdict runs only for cells
+        // the keyhole keeps, and carries into the shade branch via
+        // `fow_verdict`.
+        let mut fow_verdict = FowVerdict::LIVE;
         let cell_hit = sampler.hit(cellc).filter(|_| {
-            !(cellc[2] < cut_z_mip
+            let keyhole_hides = cellc[2] < cut_z_mip
                 && env.cutout.is_some_and(|c| {
                     #[allow(clippy::cast_precision_loss)]
                     let pc = [
@@ -1817,7 +1936,22 @@ fn cell_walk_skip(
                     ];
                     let ref_dist = (dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2]).sqrt();
                     d2.sqrt() < (ref_dist - c.margin).max(0.0) * s
-                }))
+                });
+            if keyhole_hides {
+                return false;
+            }
+            if let Some(styler) = env.fow {
+                let v = styler.verdict(
+                    (cellc[0] << fow_mip_shift) + fow_mip_half,
+                    (cellc[1] << fow_mip_shift) + fow_mip_half,
+                    (cellc[2] << fow_mip_shift) + fow_mip_half,
+                );
+                fow_verdict = v;
+                if matches!(v, FowVerdict::Hide) {
+                    return false;
+                }
+            }
+            true
         });
         if let Some(color) = cell_hit {
             let bright_sub = side_shade_sub(env, last_axis, step);
@@ -1840,9 +1974,21 @@ fn cell_walk_skip(
             // the no-shadow rig stays march-free. EV.1 — an emissive
             // material outranks both: full-bright albedo, no face shade,
             // no rig, no shadow march.
+            // FW.2 — memory / heard cells suppress only the DYNAMIC rig
+            // (a live torch never relights a remembered room), then dim +
+            // desaturate below. Emissive is INTRINSIC to the material and
+            // survives (a crystal the player saw glowing is remembered
+            // glowing — dimmed — not as dark rock, and its baked halo on
+            // the surrounding walls stays consistent: FW.2 review #6).
+            // `Show { dynamic: true }` (visible, and the no-fow default
+            // `LIVE`) keeps the full path bit-identical.
+            let fow_dynamic = match fow_verdict {
+                FowVerdict::Show { dynamic, .. } => dynamic,
+                FowVerdict::Hide => true, // unreachable: Hide was filtered out
+            };
             let shaded = if m.emissive > 0 {
                 emissive_shade(color, m.emissive)
-            } else if env.lights.enabled {
+            } else if fow_dynamic && env.lights.enabled {
                 let casts = shadow_casts;
                 // Pick the shadow oracle: the scene-wide one (cross-grid +
                 // sprites, XS.1) when present, else the single-grid Sampler;
@@ -1862,6 +2008,7 @@ fn cell_walk_skip(
                         cell_size,
                         lo_c,
                         hi_c,
+                        fow: env.fow,
                     };
                     Some(&mut sampler_sh)
                 };
@@ -1878,7 +2025,16 @@ fn cell_walk_skip(
             } else {
                 shade(color, bright_sub)
             };
-            let lit = apply_fog(shaded, depth.max(0.0), env);
+            // FW.2 — the memory / FOV-edge taper on the surface colour,
+            // BEFORE distance fog (fog is atmospheric, applied to the
+            // styled surface). Identity for a full-visible cell.
+            let styled = match fow_verdict {
+                FowVerdict::Show {
+                    dim, desaturate, ..
+                } => fow_style(shaded, dim, desaturate),
+                FowVerdict::Hide => shaded,
+            };
+            let lit = apply_fog(styled, depth.max(0.0), env);
             if m.is_opaque() {
                 // Opaque surface: the background. Return the first hit verbatim
                 // when nothing translucent preceded it (bit-identical), else
@@ -3050,6 +3206,7 @@ mod tests {
             world_shadow: None,
             z_clip: None,
             cutout: None,
+            fow: None,
         };
         let (w, h) = (64u32, 64u32);
         let (fog, _) = render_brickmap_env(grid, &cam, w, h, &env);
@@ -3092,6 +3249,7 @@ mod tests {
             world_shadow: None,
             z_clip: None,
             cutout: None,
+            fow: None,
         };
         let cam = Camera::from_yaw_pitch([16.0, 16.0, 128.0], 0.3, -0.4);
         let (w, h) = (48u32, 48u32);
@@ -3183,6 +3341,7 @@ mod tests {
             world_shadow: None,
             z_clip: None,
             cutout: None,
+            fow: None,
         };
         let (shaded, _) = render_brickmap_env(grid, &cam, 32, 32, &env);
         let lum = |c: u32| (c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff);
@@ -4206,6 +4365,7 @@ mod tests {
             world_shadow: None,
             z_clip: None,
             cutout: None,
+            fow: None,
         };
 
         let (seq_fb, seq_zb) = render_brickmap_env(grid, &cam, w, h, &env);
@@ -4311,5 +4471,301 @@ mod tests {
             cols_have_no_holes(&mask, w, h),
             "column-interior gap in single-voxel silhouette (notch)"
         );
+    }
+
+    // ---- FW.2: fog-of-war styling ----
+
+    struct FixedStyler(FowVerdict);
+    impl FowStyler for FixedStyler {
+        fn verdict(&self, _x: i32, _y: i32, _z: i32) -> FowVerdict {
+            self.0
+        }
+    }
+
+    #[test]
+    fn fow_style_dims_and_desaturates() {
+        // Identity when dim=1, desat=0.
+        assert_eq!(fow_style(0x80_40_80_C0, 1.0, 0.0), 0x80_40_80_C0);
+        // Half dim halves each channel, high byte preserved.
+        assert_eq!(fow_style(0x80_40_80_C0, 0.5, 0.0), 0x80_20_40_60);
+        // Full desaturate → all channels equal the luma.
+        let g = fow_style(0x80_40_80_C0, 1.0, 1.0);
+        assert_eq!((g >> 16) & 0xff, g & 0xff);
+        assert_eq!((g >> 8) & 0xff, g & 0xff);
+        assert_eq!(g & 0xff00_0000, 0x8000_0000);
+    }
+
+    /// A flat floor; camera looking down. The three stylers exercise the
+    /// hit path.
+    fn floor_scene() -> (roxlap_formats::vxl::Vxl, Camera, u32, u32) {
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| {
+            (z >= 20).then_some(VoxColor(0x80_40_80_C0))
+        });
+        let cam = Camera {
+            pos: [16.0, 16.0, 5.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        (vxl, cam, 48, 48)
+    }
+
+    #[test]
+    fn fow_hide_makes_geometry_vanish() {
+        let (vxl, cam, w, h) = floor_scene();
+        let grid = GridView::from_single_vxl(&vxl);
+        let (base, _) = render_brickmap(grid, &cam, w, h);
+        assert!(base.iter().any(|&p| p != 0), "baseline must draw the floor");
+
+        let styler = FixedStyler(FowVerdict::Hide);
+        let env = DdaEnv {
+            fow: Some(&styler),
+            ..DdaEnv::default()
+        };
+        let (hidden, _) = render_brickmap_env(grid, &cam, w, h, &env);
+        assert!(
+            hidden.iter().all(|&p| p == 0),
+            "every Hide cell must read as air (sky)"
+        );
+    }
+
+    #[test]
+    fn fow_dim_desaturate_matches_helper() {
+        let (vxl, cam, w, h) = floor_scene();
+        let grid = GridView::from_single_vxl(&vxl);
+        let (base, _) = render_brickmap(grid, &cam, w, h);
+
+        let styler = FixedStyler(FowVerdict::Show {
+            dynamic: true,
+            dim: 0.5,
+            desaturate: 0.4,
+        });
+        let env = DdaEnv {
+            fow: Some(&styler),
+            ..DdaEnv::default()
+        };
+        let (styled, _) = render_brickmap_env(grid, &cam, w, h, &env);
+        for k in 0..(w * h) as usize {
+            if base[k] != 0 {
+                assert_eq!(styled[k], fow_style(base[k], 0.5, 0.4), "pixel {k}");
+            }
+        }
+    }
+
+    /// A `dynamic: false` verdict (memory) must render the BAKED look
+    /// even with a dynamic sun in the rig — a live light never relights
+    /// a remembered room.
+    #[test]
+    fn fow_memory_skips_dynamic_lights() {
+        let (vxl, cam, w, h) = floor_scene();
+        let grid = GridView::from_single_vxl(&vxl);
+        // A red point light just above the floor → an obvious red tint
+        // the baked look does not have.
+        let pt = [CpuPointLight {
+            pos: [16.0, 16.0, 18.0],
+            color: [1.0, 0.0, 0.0],
+            intensity: 5.0,
+            radius: 40.0,
+            casts_shadow: false,
+            spot_dir: [0.0, 0.0, 0.0],
+            cos_inner: -1.0,
+            cos_outer: -1.0,
+        }];
+        let lights = CpuLights {
+            enabled: true,
+            points: &pt,
+            ..CpuLights::default()
+        };
+        // Baked (no rig) reference.
+        let (baked, _) = render_brickmap(grid, &cam, w, h);
+        // Lit reference — the rig changes the floor colour.
+        let lit_env = DdaEnv {
+            lights,
+            ..DdaEnv::default()
+        };
+        let (lit, _) = render_brickmap_env(grid, &cam, w, h, &lit_env);
+        assert_ne!(lit, baked, "the sun rig must change the floor");
+
+        // Memory styler + the same rig → the baked look, not the lit one.
+        let styler = FixedStyler(FowVerdict::Show {
+            dynamic: false,
+            dim: 1.0,
+            desaturate: 0.0,
+        });
+        let mem_env = DdaEnv {
+            lights,
+            fow: Some(&styler),
+            ..DdaEnv::default()
+        };
+        let (mem, _) = render_brickmap_env(grid, &cam, w, h, &mem_env);
+        assert_eq!(mem, baked, "memory must skip the dynamic rig (baked look)");
+    }
+
+    /// Styler that hides one column `(x)` (an "unseen wall") and shows
+    /// everything else — for the shadow-leak test.
+    struct HideColumnStyler {
+        wall_x: i32,
+    }
+    impl FowStyler for HideColumnStyler {
+        fn verdict(&self, x: i32, _y: i32, _z: i32) -> FowVerdict {
+            if x == self.wall_x {
+                FowVerdict::Hide
+            } else {
+                FowVerdict::LIVE
+            }
+        }
+    }
+
+    /// Review #1 — an unseen (Hide) wall must cast NO shadow. With a
+    /// sun rig the wall shadows a strip of floor; hiding the wall via the
+    /// fog must both remove the wall AND its shadow (else the silhouette
+    /// leaks).
+    #[test]
+    fn fow_hidden_wall_casts_no_shadow() {
+        const FLOOR: VoxColor = VoxColor(0x80_80_80_80);
+        const WALL: VoxColor = VoxColor(0x80_40_40_40);
+        let wall_x = 16;
+        // Floor at z=30; a tall wall column standing up from the floor.
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(32, |x, y, z| {
+            if z >= 30 {
+                Some(FLOOR)
+            } else if x as i32 == wall_x && y == 16 && (18..30).contains(&z) {
+                Some(WALL)
+            } else {
+                None
+            }
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [16.0, 16.0, 4.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        // Sun slanted along +x so the wall shadows floor at x > wall_x.
+        let lights = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_dir: [-0.7, 0.0, -0.7],
+            sun_color: [1.0, 1.0, 1.0],
+            sun_intensity: 1.0,
+            sun_casts_shadow: true,
+            shadow_strength: 1.0,
+            shadow_bias: 1.5,
+            shadow_max_dist: 64.0,
+            ..CpuLights::default()
+        };
+        let (w, h) = (48u32, 48u32);
+        // A: wall present, all-LIVE (its shadow lands on the floor).
+        let live = HideColumnStyler { wall_x: -999 };
+        let env_a = DdaEnv {
+            lights,
+            fow: Some(&live),
+            ..DdaEnv::default()
+        };
+        let (fb_a, _) = render_brickmap_env(grid, &cam, w, h, &env_a);
+        // B: the wall is Hidden by fog → gone, and casts no shadow.
+        let hide = HideColumnStyler { wall_x };
+        let env_b = DdaEnv {
+            lights,
+            fow: Some(&hide),
+            ..DdaEnv::default()
+        };
+        let (fb_b, _) = render_brickmap_env(grid, &cam, w, h, &env_b);
+
+        let lum = |c: u32| ((c >> 16) & 0xff) + ((c >> 8) & 0xff) + (c & 0xff);
+        let total: u64 = (0..(w * h) as usize)
+            .map(|k| u64::from(lum(fb_b[k])).saturating_sub(u64::from(lum(fb_a[k]))))
+            .sum();
+        // Hiding the wall removes its shadow → the floor is strictly
+        // brighter overall in B than A.
+        assert!(
+            total > 0,
+            "hiding the wall must lift its shadow off the floor (Δlum {total})"
+        );
+    }
+
+    /// Review #6 — an emissive material is INTRINSIC and survives in
+    /// memory: a remembered glowing crystal renders glowing (dimmed),
+    /// not as dark baked rock. `dynamic: false` (memory) only suppresses
+    /// the dynamic light rig, never the emissive full-bright.
+    #[test]
+    fn fow_memory_keeps_emissive() {
+        const GLOW: VoxColor = VoxColor(0x80_20_FF_80);
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(32, |_, _, z| (z >= 20).then_some(GLOW));
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [16.0, 16.0, 5.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let mut table = MaterialTable::new();
+        table.set(1, roxlap_formats::material::Material::glow(255));
+        let terrain = [(GLOW.rgb_part(), 1u8)];
+        let (w, h) = (48u32, 48u32);
+
+        // Live (visible) emissive.
+        let live = FixedStyler(FowVerdict::LIVE);
+        let env_live = DdaEnv {
+            materials: Some(&table),
+            terrain_materials: &terrain,
+            fow: Some(&live),
+            ..DdaEnv::default()
+        };
+        let (fb_live, _) = render_brickmap_env(grid, &cam, w, h, &env_live);
+        // Memory (dynamic off, dim 1, desat 0) — must ALSO glow.
+        let mem = FixedStyler(FowVerdict::Show {
+            dynamic: false,
+            dim: 1.0,
+            desaturate: 0.0,
+        });
+        let env_mem = DdaEnv {
+            materials: Some(&table),
+            terrain_materials: &terrain,
+            fow: Some(&mem),
+            ..DdaEnv::default()
+        };
+        let (fb_mem, _) = render_brickmap_env(grid, &cam, w, h, &env_mem);
+        assert_eq!(
+            fb_mem, fb_live,
+            "memory must keep the emissive glow (dim 1 == the live emissive look)"
+        );
+        // And that glow is brighter than the plain baked look (emissive
+        // actually did something).
+        let baked = FixedStyler(FowVerdict::Show {
+            dynamic: false,
+            dim: 1.0,
+            desaturate: 0.0,
+        });
+        let env_baked = DdaEnv {
+            fow: Some(&baked),
+            ..DdaEnv::default()
+        };
+        let (fb_baked, _) = render_brickmap_env(grid, &cam, w, h, &env_baked);
+        let lum = |c: u32| ((c >> 16) & 0xff) + ((c >> 8) & 0xff) + (c & 0xff);
+        let centre = (24 * 48 + 24) as usize;
+        assert!(
+            lum(fb_mem[centre]) > lum(fb_baked[centre]),
+            "emissive memory ({:08x}) must be brighter than baked ({:08x})",
+            fb_mem[centre],
+            fb_baked[centre]
+        );
+    }
+
+    /// `fow = None` is byte-identical to the pre-FW render.
+    #[test]
+    fn fow_disabled_byte_identical() {
+        let (vxl, cam, w, h) = floor_scene();
+        let grid = GridView::from_single_vxl(&vxl);
+        let (base, _) = render_brickmap(grid, &cam, w, h);
+        // A LIVE styler (dim=1, desat=0, dynamic) also reproduces base.
+        let styler = FixedStyler(FowVerdict::LIVE);
+        let env = DdaEnv {
+            fow: Some(&styler),
+            ..DdaEnv::default()
+        };
+        let (live, _) = render_brickmap_env(grid, &cam, w, h, &env);
+        assert_eq!(live, base, "a fully-visible cell must be bit-identical");
     }
 }
