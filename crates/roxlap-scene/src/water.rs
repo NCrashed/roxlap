@@ -119,7 +119,7 @@ impl Scene {
     /// id).
     #[must_use]
     pub fn water_depth_at(&self, world: DVec3) -> Option<(GridId, f64)> {
-        self.grids()
+        self.query_grids()
             .filter(|(_, grid)| !grid.water_volumes.is_empty())
             .filter_map(|(id, grid)| {
                 let local = crate::streaming::world_to_grid_local_pos(world, &grid.transform);
@@ -135,7 +135,7 @@ impl Scene {
     /// [`Self::water_depth_at`] only when the depth is needed.
     #[must_use]
     pub fn in_water(&self, world: DVec3) -> bool {
-        self.grids()
+        self.query_grids()
             .filter(|(_, grid)| !grid.water_volumes.is_empty())
             .any(|(_, grid)| {
                 let local = crate::streaming::world_to_grid_local_pos(world, &grid.transform);

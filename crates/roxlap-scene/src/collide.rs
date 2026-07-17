@@ -91,7 +91,7 @@ impl Solidity {
 #[must_use]
 pub fn box_overlaps_solid(scene: &Scene, min: DVec3, max: DVec3, solidity: Solidity) -> bool {
     scene
-        .grids()
+        .query_grids()
         .any(|(_id, grid)| grid_box_overlaps_solid(grid, min, max, solidity))
 }
 

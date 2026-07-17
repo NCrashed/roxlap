@@ -1338,7 +1338,10 @@ impl GpuBackend {
     /// `scene`'s grid set (sorted raw ids). A mismatch ⇒ a scene switch or
     /// grid add/remove invalidated it.
     fn resident_matches_scene(&self, scene: &Scene) -> bool {
-        let mut ids: Vec<u32> = scene.grids().map(|(g, _)| g.raw()).collect();
+        // FW.1 — only rendered grids are resident (the real fog-of-war
+        // grid, `render_excluded`, never uploads; its twin does). Must
+        // use the same filter as `upload_scene` or the set never matches.
+        let mut ids: Vec<u32> = scene.render_grids().map(|(g, _)| g.raw()).collect();
         ids.sort_unstable();
         ids == self.resident_scene_grids
     }
@@ -1348,12 +1351,15 @@ impl GpuBackend {
         // (see `resident_matches_scene`). Recorded even when no grids are
         // uploadable yet — the empty set still has to match next frame.
         self.resident_scene_grids = {
-            let mut ids: Vec<u32> = scene.grids().map(|(g, _)| g.raw()).collect();
+            let mut ids: Vec<u32> = scene.render_grids().map(|(g, _)| g.raw()).collect();
             ids.sort_unstable();
             ids
         };
 
-        let mut grids_by_id: Vec<_> = scene.grids().collect();
+        // FW.1 — upload only rendered grids: the real fog-of-war grid is
+        // excluded (shown via its twin), so its live geometry — and any
+        // GPU shadow it would cast in-shader — never reaches the frame.
+        let mut grids_by_id: Vec<_> = scene.render_grids().collect();
         grids_by_id.sort_by_key(|(gid, _)| gid.raw());
 
         let mut scene_grids: Vec<roxlap_gpu::GridUpload> = Vec::new();
@@ -1361,31 +1367,41 @@ impl GpuBackend {
         let mut total_chunks = 0usize;
         for (gid, grid) in grids_by_id {
             let is_streaming = grid.generator.is_some();
-            // Skip truly-static empty grids (they'll never gain
-            // chunks). A STREAMING grid is registered even when empty
-            // so it lands in `grid_ids` — otherwise its chunks, which
-            // arrive over later frames via the background generator,
-            // would never be installed by `refresh_dirty` (the
-            // streaming "no hills" regression).
-            if grid.chunks.is_empty() && !is_streaming {
+            // FW.1 — a fog-of-war twin (`gpu_residency_hint`) also gains
+            // chunks over later frames (as the observer explores), so it
+            // is "dynamic" exactly like a streaming grid: registered even
+            // when empty, or `refresh_dirty` would never install the
+            // chunks that arrive after the first upload (the twin never
+            // renders → the whole fogged world stays invisible on GPU).
+            let is_dynamic = is_streaming || grid.gpu_residency_hint.is_some();
+            if grid.chunks.is_empty() && !is_dynamic {
                 continue;
             }
             let chunk_idxs: Vec<[i32; 3]> = grid.chunks.keys().map(|i| [i.x, i.y, i.z]).collect();
-            // Empty streaming grid → placeholder bbox; the modular pool
-            // ignores the bbox for slot assignment anyway.
-            let (origin_chunk, chunks_dims) =
+            // FW.1 — a hinted grid (twin) sizes its chunk-space region +
+            // pool from the REAL grid's FULL bbox, not its own currently-
+            // seen subset: a later-explored chunk outside the initial box
+            // would otherwise be unaddressable (marcher skips it) or
+            // alias an occupied modular slot (rooms flicker). Empty
+            // streaming grid → placeholder bbox; the modular pool ignores
+            // the bbox for slot assignment anyway.
+            let (origin_chunk, chunks_dims) = grid.gpu_residency_hint.unwrap_or_else(|| {
                 roxlap_gpu::bounding_box_of(chunk_idxs.iter().copied())
-                    .unwrap_or(([0, 0, 0], [1, 1, 1]));
+                    .unwrap_or(([0, 0, 0], [1, 1, 1]))
+            });
             let chunks: Vec<([i32; 3], roxlap_gpu::ChunkUpload)> = grid
                 .chunks
                 .iter()
                 .map(|(idx, vxl)| ([idx.x, idx.y, idx.z], roxlap_gpu::decompress_chunk(vxl)))
                 .collect();
             total_chunks += chunks.len();
-            // Streaming grids get a generous modular pool so chunks
-            // arriving at new indices never collide; static grids fit
+            // A hinted twin's pool covers its full (real-grid) region so
+            // every explored chunk gets a collision-free slot. Streaming
+            // grids get a generous modular pool; plain static grids fit
             // their bbox exactly.
-            let pool_dims = if is_streaming {
+            let pool_dims = if grid.gpu_residency_hint.is_some() {
+                roxlap_gpu::GridUpload::default_pool_dims(chunks_dims)
+            } else if is_streaming {
                 [8, 8, 4]
             } else {
                 roxlap_gpu::GridUpload::default_pool_dims(chunks_dims)

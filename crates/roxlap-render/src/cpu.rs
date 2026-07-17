@@ -1352,8 +1352,10 @@ impl CpuBackend {
         // so they outlive the terrain render's `&mut Scene` borrow
         // below; all-empty (and O(1) per lookup) when no grid clips.
         let cutaway_volumes: Vec<roxlap_scene::CutawayVolume> = if frame.draw_sprites {
+            // FW.1 — cutaway culling follows what is DRAWN: the rendered
+            // grids (twin, not the excluded real fog-of-war grid).
             scene
-                .grids()
+                .render_grids()
                 .filter_map(|(_, g)| g.cutaway_volume())
                 .collect()
         } else {

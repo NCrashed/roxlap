@@ -38,7 +38,7 @@ use glam::{IVec2, IVec3, UVec3, Vec2};
 use roxlap_formats::color::Rgb;
 use roxlap_formats::vxl::Vxl;
 
-use crate::{Grid, CHUNK_SIZE_XY};
+use crate::{DirtyExtent, Grid, GridId, GridTransform, LodThresholds, Scene, CHUNK_SIZE_XY};
 
 /// Maximum cell intensity (6 bits of the mask byte).
 pub const INTENSITY_MAX: u8 = 63;
@@ -797,6 +797,277 @@ impl FogOfWar {
     }
 }
 
+/// (edit version, materialised?) of a real chunk — the twin's
+/// copy-freshness key. Either changing means the twin's copy is stale.
+fn chunk_sig_pair(grid: &Grid, idx: IVec3) -> (u64, bool) {
+    (grid.chunk_version(idx), grid.chunk(idx).is_some())
+}
+
+/// One pending twin copy: (chunk idx, cloned real chunk or `None` if
+/// absent, real `(version, present)` signature, first-seen flag).
+type TwinCopy = (IVec3, Option<Vxl>, (u64, bool), bool);
+
+/// Full chunk bounding box `(origin_chunk, chunks_dims)` of a grid, for
+/// the twin's GPU residency hint — sized to the WHOLE real grid so the
+/// twin's pool never aliases as exploration adds chunks. `None` for an
+/// empty grid.
+fn grid_chunk_bbox(grid: &Grid) -> Option<([i32; 3], [u32; 3])> {
+    let mut it = grid.chunks.keys();
+    let first = it.next()?;
+    let (mut lo, mut hi) = (*first, *first);
+    for k in it {
+        lo = lo.min(*k);
+        hi = hi.max(*k);
+    }
+    Some((
+        [lo.x, lo.y, lo.z],
+        [
+            (hi.x - lo.x + 1) as u32,
+            (hi.y - lo.y + 1) as u32,
+            (hi.z - lo.z + 1) as u32,
+        ],
+    ))
+}
+
+/// FW.1 render-config the twin mirrors from the real grid each sync, so
+/// the drawn twin looks exactly like the real grid would have (a moving
+/// ship, a CA deck clip, LOD / mip overrides). NOT mirrored: the flags
+/// (`presentation_only` stays on the twin), streaming, water, bake
+/// lights — those are authoring / sim state the twin must never carry.
+struct TwinMirror {
+    transform: GridTransform,
+    render_sky: bool,
+    mip_levels_override: Option<u32>,
+    lod_thresholds: LodThresholds,
+    z_clip: Option<i32>,
+}
+
+impl TwinMirror {
+    fn read(g: &Grid) -> Self {
+        Self {
+            transform: g.transform,
+            render_sky: g.render_sky,
+            mip_levels_override: g.mip_levels_override,
+            lod_thresholds: g.lod_thresholds,
+            z_clip: g.z_clip,
+        }
+    }
+
+    fn apply(&self, g: &mut Grid) {
+        g.transform = self.transform;
+        g.render_sky = self.render_sky;
+        g.mip_levels_override = self.mip_levels_override;
+        g.lod_thresholds = self.lod_thresholds;
+        g.z_clip = self.z_clip;
+    }
+}
+
+/// FW.1 — the known-twin binding for one fog-of-war grid (entry-doc
+/// decision 1): a second grid registered in the [`Scene`] that holds
+/// the *last-seen* copy of the real grid and is what actually renders.
+/// The real grid is flagged [`Grid::render_excluded`] (simulated, never
+/// drawn); the twin is flagged [`Grid::presentation_only`] (drawn,
+/// never queried). [`Self::sync`] copies chunks from real → twin ONLY
+/// under currently Visible / Heard cells, so geometry (and its baked
+/// light) outside the observer's knowledge stays frozen at what they
+/// last saw — "memory" is simply the twin not being updated there.
+///
+/// v1 sync is **chunk-granular** (entry-doc decision 2): a chunk under
+/// any live cell re-copies whenever its real edit version changed, so
+/// an edit in the *unseen* part of a partially-seen chunk becomes
+/// visible early (bounded by one chunk). The per-column refinement is a
+/// deliberate follow-up.
+pub struct FowTwin {
+    real: GridId,
+    twin: GridId,
+    /// Per real-chunk `(version, present)` last copied into the twin.
+    /// A live chunk re-copies only when this differs.
+    copied: HashMap<IVec3, (u64, bool)>,
+    /// Quiet-frame gate: `(mask_version, real mutation_counter)` of the
+    /// last [`Self::sync`] that ran. Unchanged ⇒ nothing to copy, skip
+    /// the whole live-cell rescan.
+    last_synced: Option<(u64, u64)>,
+}
+
+impl FowTwin {
+    /// Register a known twin for `real`: adds a grid mirroring `real`'s
+    /// transform, flags `real` [`Grid::render_excluded`] and the twin
+    /// [`Grid::presentation_only`], and sizes the twin's GPU residency
+    /// hint to the real grid's full chunk bbox (so its slot pool covers
+    /// the whole ship from the first upload — no aliasing as rooms are
+    /// explored). The twin starts empty (all Unseen); the first
+    /// [`Self::sync`] copies what the observer can see.
+    ///
+    /// # Panics
+    /// If `real` is not a registered grid.
+    pub fn attach(scene: &mut Scene, real: GridId) -> Self {
+        let (transform, hint) = {
+            let g = scene
+                .grid(real)
+                .expect("FowTwin::attach: real grid must be registered");
+            (g.transform, grid_chunk_bbox(g))
+        };
+        let twin = scene.add_grid(transform);
+        scene
+            .grid_mut(real)
+            .expect("real grid just checked")
+            .render_excluded = true;
+        let t = scene.grid_mut(twin).expect("twin just added");
+        t.presentation_only = true;
+        t.gpu_residency_hint = hint;
+        Self {
+            real,
+            twin,
+            copied: HashMap::new(),
+            last_synced: None,
+        }
+    }
+
+    /// The simulated grid (flagged `render_excluded`).
+    #[must_use]
+    pub fn real(&self) -> GridId {
+        self.real
+    }
+
+    /// The rendered twin grid (flagged `presentation_only`).
+    #[must_use]
+    pub fn twin(&self) -> GridId {
+        self.twin
+    }
+
+    /// Undo [`Self::attach`]: clear `real`'s `render_excluded` (it
+    /// renders normally again) and remove the twin grid. Call before
+    /// dropping the fog-of-war for this grid.
+    pub fn detach(self, scene: &mut Scene) {
+        if let Some(r) = scene.grid_mut(self.real) {
+            r.render_excluded = false;
+        }
+        scene.remove_grid(self.twin);
+    }
+
+    /// Advance the twin for the current fog state: mirror the real
+    /// grid's render config, then copy-on-first-seen / re-sync every
+    /// chunk under a Visible or Heard cell whose real version changed.
+    ///
+    /// Returns `false` — and does nothing — when either grid is missing
+    /// (e.g. after a snapshot load or lockstep rollback: the twin was
+    /// derived state and is gone, the real grid loaded with fog off).
+    /// A host **must** treat `false` as "re-arm fog-of-war": drop this
+    /// binding and [`Self::attach`] a fresh one. `#[must_use]` so the
+    /// signal can't be silently dropped.
+    ///
+    /// Cheap on quiet frames: if neither the mask nor the real grid
+    /// changed since the last run it early-outs before the live-cell
+    /// rescan.
+    #[must_use]
+    pub fn sync(&mut self, scene: &mut Scene, fow: &FogOfWar) -> bool {
+        // Both grids must still exist — a lost twin means the host has
+        // not re-armed after a load/rollback.
+        let Some(real_mut) = scene.grid(self.real).map(Grid::mutation_counter) else {
+            return false;
+        };
+        if scene.grid(self.twin).is_none() {
+            return false;
+        }
+
+        // Quiet-frame early-out: the mask version moves on any
+        // visibility/fade change, the mutation counter on any real edit
+        // or chunk install/evict — nothing else can change what to copy.
+        let key = (fow.mask_version(), real_mut);
+        if self.last_synced == Some(key) {
+            return true;
+        }
+        self.last_synced = Some(key);
+
+        // Phase 1 — read the real grid: mirror, hint, and the copies due
+        // (with a first-seen flag: first copy bumps the whole chunk, a
+        // re-sync bumps only the edited bbox).
+        let (mirror, hint, copies) = {
+            let real = scene.grid(self.real).expect("checked above");
+            let mirror = TwinMirror::read(real);
+            let hint = grid_chunk_bbox(real);
+            // Every chunk under a live cell, deduped, with its real sig.
+            let mut want: HashMap<IVec3, (u64, bool)> = HashMap::new();
+            let decks = &fow.config().decks;
+            fow.for_each_live_cell(|deck, cell, _state| {
+                let Some(band) = decks.get(deck) else {
+                    return;
+                };
+                let (chz_lo, chz_hi) = band_chz_range(band);
+                let chx = cell.x.div_euclid(TILE);
+                let chy = cell.y.div_euclid(TILE);
+                for chz in chz_lo..=chz_hi {
+                    let idx = IVec3::new(chx, chy, chz);
+                    want.entry(idx).or_insert_with(|| chunk_sig_pair(real, idx));
+                }
+            });
+            let mut copies: Vec<TwinCopy> = Vec::new();
+            for (idx, sig) in want {
+                if self.copied.get(&idx) != Some(&sig) {
+                    let first_seen = !self.copied.contains_key(&idx);
+                    copies.push((idx, real.chunk(idx).cloned(), sig, first_seen));
+                }
+            }
+            (mirror, hint, copies)
+        };
+
+        // Phase 1b — drain each copied chunk's accumulated dirty extent
+        // from the REAL grid. The real grid never renders, so nothing
+        // else consumes its `chunk_dirty` — draining here both feeds the
+        // twin's incremental GPU re-upload (edited bbox, not whole
+        // chunk) and stops that orphaned map from leaking.
+        let extents: Vec<Option<DirtyExtent>> = {
+            let real = scene.grid_mut(self.real).expect("checked above");
+            copies
+                .iter()
+                .map(|(idx, _, _, _)| real.take_chunk_dirty(*idx))
+                .collect()
+        };
+
+        // Phase 2 — write the twin (disjoint borrow).
+        let twin = scene.grid_mut(self.twin).expect("checked above");
+        mirror.apply(twin);
+        twin.gpu_residency_hint = hint;
+        let mut any_change = false;
+        for ((idx, chunk, sig, first_seen), extent) in copies.into_iter().zip(extents) {
+            match chunk {
+                Some(vxl) => {
+                    twin.chunks.insert(idx, vxl);
+                    // First copy = whole chunk is new to the twin (Full);
+                    // a re-sync only touched the real edit's bbox.
+                    match (first_seen, extent) {
+                        (false, Some(DirtyExtent::Bbox(lo, hi))) => {
+                            twin.bump_chunk_version_bbox(idx, lo, hi);
+                        }
+                        _ => twin.bump_chunk_version(idx),
+                    }
+                    self.copied.insert(idx, sig);
+                    any_change = true;
+                }
+                None => {
+                    // Absent in the real grid (evicted, or open space):
+                    // KEEP the twin's last-seen copy as MEMORY — never
+                    // remove it (that would drop geometry the observer is
+                    // looking at) and never bump a phantom version for a
+                    // chunk that exists nowhere. Record the sig only if
+                    // we actually hold a memory copy, so a genuinely-
+                    // empty cell doesn't re-clone every frame.
+                    if twin.chunks.contains_key(&idx) {
+                        self.copied.insert(idx, sig);
+                    }
+                }
+            }
+        }
+        if any_change {
+            // Invalidate the Far-tier impostor cache like every other
+            // chunk-set path (S7.4) — else the twin renders a frozen
+            // first-look impostor at distance.
+            twin.billboards = None;
+        }
+        true
+    }
+}
+
 fn normalize_facing(f: Vec2) -> Option<Vec2> {
     let len = f.length();
     if len < 1e-6 {
@@ -1481,5 +1752,428 @@ mod tests {
         g.set_voxel(IVec3::new(600, 600, FLOOR_Z), Some(VoxColor::rgb(1, 2, 3)));
         fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), 0.0);
         assert_eq!(fow.mask_version(), v, "far edit should not recompute LOS");
+    }
+
+    // ---- FW.1: known-twin grid ----
+
+    use crate::Scene;
+    use glam::DVec3;
+
+    /// Register a real room grid in a fresh scene; return (scene, id).
+    fn scene_with_room() -> (Scene, GridId) {
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::identity());
+        let g = scene.grid_mut(id).unwrap();
+        g.set_rect(
+            IVec3::new(-64, -64, FLOOR_Z),
+            IVec3::new(63, 63, FLOOR_Z),
+            Some(VoxColor::rgb(120, 120, 120)),
+        );
+        (scene, id)
+    }
+
+    /// `attach` must flag the real grid render-excluded and the twin
+    /// presentation-only, so render/query iterators split them.
+    #[test]
+    fn attach_splits_render_and_query_grids() {
+        let (mut scene, real) = scene_with_room();
+        let twin = FowTwin::attach(&mut scene, real);
+        assert!(scene.grid(real).unwrap().render_excluded);
+        assert!(scene.grid(twin.twin()).unwrap().presentation_only);
+
+        // Render sees the twin, not the real grid.
+        let rendered: Vec<GridId> = scene.render_grids().map(|(id, _)| id).collect();
+        assert!(rendered.contains(&twin.twin()));
+        assert!(!rendered.contains(&real));
+
+        // Queries see the real grid, not the twin.
+        let queried: Vec<GridId> = scene.query_grids().map(|(id, _)| id).collect();
+        assert!(queried.contains(&real));
+        assert!(!queried.contains(&twin.twin()));
+    }
+
+    /// The real grid stays fully solid to raycasts even while excluded
+    /// from rendering (sim truth is unchanged).
+    #[test]
+    fn excluded_real_grid_still_raycasts() {
+        let (mut scene, real) = scene_with_room();
+        let _twin = FowTwin::attach(&mut scene, real);
+        let hit = scene.raycast(
+            DVec3::new(0.5, 0.5, FLOOR_Z as f64 - 5.0),
+            DVec3::new(0.0, 0.0, 1.0),
+            32.0,
+        );
+        assert!(hit.is_some(), "real grid must still answer raycasts");
+    }
+
+    fn fow_deck() -> DeckBand {
+        band()
+    }
+
+    /// Copy-on-first-seen: a chunk under a Visible cell is copied into
+    /// the twin; a never-seen chunk is not.
+    #[test]
+    fn sync_copies_only_seen_chunks() {
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut fow = FogOfWar::new({
+            let mut c = VisionConfig::for_decks(vec![fow_deck()]);
+            c.range = 40.0;
+            c.peripheral_range = 12.0;
+            c
+        });
+        // Observer at origin (chunk 0,0,0) facing +X.
+        let real_grid = scene.grid(real).unwrap();
+        fow.update(real_grid, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
+        assert!(twin.sync(&mut scene, &fow));
+
+        let twin_grid = scene.grid(twin.twin()).unwrap();
+        // Seen chunk (0,0,0) copied → floor voxel present.
+        assert!(twin_grid.voxel_solid(IVec3::new(20, 0, FLOOR_Z)));
+        // A far chunk never in view was never copied.
+        assert!(twin_grid.chunk(IVec3::new(4, 4, 0)).is_none());
+    }
+
+    /// Edit behind a wall (unseen chunk) must NOT reach the twin until
+    /// the observer walks over it.
+    #[test]
+    fn edit_behind_wall_invisible_until_seen() {
+        let (mut scene, real) = scene_with_room();
+        // Extend the floor into chunk (1,0,0) so there's geometry to see.
+        scene.grid_mut(real).unwrap().set_rect(
+            IVec3::new(128, -8, FLOOR_Z),
+            IVec3::new(200, 8, FLOOR_Z),
+            Some(VoxColor::rgb(120, 120, 120)),
+        );
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut fow = FogOfWar::new({
+            let mut c = VisionConfig::for_decks(vec![fow_deck()]);
+            c.range = 40.0;
+            c
+        });
+        // See only chunk 0.
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        assert!(scene
+            .grid(twin.twin())
+            .unwrap()
+            .chunk(IVec3::new(1, 0, 0))
+            .is_none());
+
+        // Edit the far (unseen) chunk. Still not in view → twin unchanged.
+        scene.grid_mut(real).unwrap().set_voxel(
+            IVec3::new(150, 0, FLOOR_Z - 1),
+            Some(VoxColor::rgb(255, 0, 0)),
+        );
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        assert!(
+            scene
+                .grid(twin.twin())
+                .unwrap()
+                .chunk(IVec3::new(1, 0, 0))
+                .is_none(),
+            "unseen edit must not reach the twin"
+        );
+
+        // Walk over so the far chunk is in view → now it copies.
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(150, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        let tg = scene.grid(twin.twin()).unwrap();
+        assert!(
+            tg.voxel_solid(IVec3::new(150, 0, FLOOR_Z - 1)),
+            "walked-over edit now seen"
+        );
+    }
+
+    /// Re-baking / editing a chunk the observer no longer sees must stay
+    /// frozen in the twin (memory holds the last-seen look).
+    #[test]
+    fn memory_chunk_frozen_after_observer_leaves() {
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut fow = FogOfWar::new({
+            let mut c = VisionConfig::for_decks(vec![fow_deck()]);
+            c.range = 40.0;
+            c.peripheral_range = 4.0;
+            c
+        });
+        let cell = IVec3::new(20, 0, FLOOR_Z);
+        // See it, copy it.
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        let seen_color = scene.grid(twin.twin()).unwrap().voxel_color(cell);
+        assert!(seen_color.is_some());
+
+        // Turn away (cell → Memory), then repaint the real voxel.
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), -Vec2::X),
+            0.05,
+        );
+        scene
+            .grid_mut(real)
+            .unwrap()
+            .set_voxel(cell, Some(VoxColor::rgb(9, 9, 9)));
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), -Vec2::X),
+            0.05,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+
+        // Twin still holds the ORIGINAL colour — the edit is unseen.
+        assert_eq!(
+            scene.grid(twin.twin()).unwrap().voxel_color(cell),
+            seen_color,
+            "memory geometry must stay frozen"
+        );
+    }
+
+    /// Documents the accepted v1 leak (entry-doc decision 2): an edit in
+    /// the UNSEEN part of a partially-visible chunk reaches the twin,
+    /// because sync is chunk-granular.
+    #[test]
+    fn chunk_granular_sync_leaks_within_a_seen_chunk() {
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut fow = FogOfWar::new({
+            let mut c = VisionConfig::for_decks(vec![fow_deck()]);
+            c.range = 20.0; // sees only part of chunk (0,0,0)
+            c.peripheral_range = 4.0;
+            c
+        });
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+
+        // Edit a cell in the SAME chunk but outside the 20-cell view.
+        let unseen = IVec3::new(60, 60, FLOOR_Z - 1);
+        assert_eq!(fow.state(0, IVec2::new(60, 60)).0, CellState::Unseen);
+        scene
+            .grid_mut(real)
+            .unwrap()
+            .set_voxel(unseen, Some(VoxColor::rgb(255, 0, 0)));
+        // The chunk is still under visible cells → whole-chunk re-copy.
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        assert!(
+            scene.grid(twin.twin()).unwrap().voxel_solid(unseen),
+            "v1 chunk-granular sync copies the whole chunk (accepted leak)"
+        );
+    }
+
+    /// `detach` restores the real grid and removes the twin.
+    #[test]
+    fn detach_restores_real_and_removes_twin() {
+        let (mut scene, real) = scene_with_room();
+        let twin = FowTwin::attach(&mut scene, real);
+        let twin_id = twin.twin();
+        twin.detach(&mut scene);
+        assert!(!scene.grid(real).unwrap().render_excluded);
+        assert!(scene.grid(twin_id).is_none());
+    }
+
+    /// The twin is derived state — excluded from snapshots (no wire
+    /// change); the real grid persists.
+    #[test]
+    fn twin_excluded_from_snapshot() {
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut fow = FogOfWar::new({
+            let mut c = VisionConfig::for_decks(vec![fow_deck()]);
+            c.range = 40.0;
+            c
+        });
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        let snap = scene.to_snapshot();
+        // Only the real grid is in the snapshot.
+        assert_eq!(snap.grids.len(), 1);
+        assert_eq!(snap.grids[0].0, real);
+    }
+
+    // ---- FW.1 review round ----
+
+    fn seeing_fow() -> FogOfWar {
+        let mut c = VisionConfig::for_decks(vec![fow_deck()]);
+        c.range = 40.0;
+        c.peripheral_range = 12.0;
+        FogOfWar::new(c)
+    }
+
+    /// Bug #1/#2 — `attach` sizes the twin's GPU residency hint to the
+    /// REAL grid's full chunk bbox (so the pool covers the whole ship,
+    /// and the twin registers even while empty).
+    #[test]
+    fn attach_sets_gpu_residency_hint_to_real_bbox() {
+        let (mut scene, real) = scene_with_room();
+        // Add a chunk on a higher deck so the bbox spans chz 0..1.
+        scene
+            .grid_mut(real)
+            .unwrap()
+            .set_voxel(IVec3::new(10, 10, 260), Some(VoxColor::rgb(1, 2, 3)));
+        let twin = FowTwin::attach(&mut scene, real);
+        let hint = scene.grid(twin.twin()).unwrap().gpu_residency_hint;
+        // The room `[-64, 63]²` spans chunks (-1,-1)..(0,0); the extra
+        // voxel at z=260 adds chunk (0,0,1). Bbox origin (-1,-1,0),
+        // dims (2,2,2).
+        assert_eq!(hint, Some(([-1, -1, 0], [2, 2, 2])));
+    }
+
+    /// Bug #3/#7 — evicting a real chunk under a live cell must NOT drop
+    /// it from the twin (memory holds the last-seen copy).
+    #[test]
+    fn real_eviction_keeps_twin_memory() {
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut fow = seeing_fow();
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        assert!(scene
+            .grid(twin.twin())
+            .unwrap()
+            .voxel_solid(IVec3::new(20, 0, FLOOR_Z)));
+
+        // Evict the real chunk (streaming does exactly this: remove +
+        // bump the mutation counter) while it's still in view.
+        {
+            let g = scene.grid_mut(real).unwrap();
+            g.chunks.remove(&IVec3::new(0, 0, 0));
+            g.note_chunk_set_changed();
+        }
+        assert!(twin.sync(&mut scene, &fow));
+        assert!(
+            scene
+                .grid(twin.twin())
+                .unwrap()
+                .voxel_solid(IVec3::new(20, 0, FLOOR_Z)),
+            "twin must keep the last-seen copy after real eviction"
+        );
+    }
+
+    /// Bug #5 — a lost twin (post snapshot-load / rollback) makes sync
+    /// return `false` so the host knows to re-arm, instead of silently
+    /// no-op'ing.
+    #[test]
+    fn sync_signals_lost_twin() {
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let fow = seeing_fow();
+        assert!(twin.sync(&mut scene, &fow));
+        // Drop the twin grid (what to_snapshot + load does).
+        scene.remove_grid(twin.twin());
+        assert!(!twin.sync(&mut scene, &fow), "lost twin must signal re-arm");
+    }
+
+    /// Perf P2 — a quiet frame (no mask or real-grid change) does no
+    /// work: the twin is not re-bumped.
+    #[test]
+    fn quiet_frame_skips_resync() {
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut fow = seeing_fow();
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        let after_first = scene.grid(twin.twin()).unwrap().mutation_counter();
+        // Same settled pose → mask_version stable, no real edit.
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            1.0,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        assert_eq!(
+            scene.grid(twin.twin()).unwrap().mutation_counter(),
+            after_first,
+            "quiet frame must not re-bump the twin"
+        );
+    }
+
+    /// Perf P1 — re-syncing an edited in-view chunk bumps the twin with
+    /// the edit's BBOX (incremental GPU upload), not a whole-chunk
+    /// `Full`.
+    #[test]
+    fn resync_bumps_twin_with_bbox_not_full() {
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut fow = seeing_fow();
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        // Clear the first-seen (Full) extent.
+        let _ = scene
+            .grid_mut(twin.twin())
+            .unwrap()
+            .take_chunk_dirty(IVec3::new(0, 0, 0));
+
+        // A single-voxel edit in the seen chunk.
+        scene.grid_mut(real).unwrap().set_voxel(
+            IVec3::new(15, 3, FLOOR_Z - 1),
+            Some(VoxColor::rgb(255, 0, 0)),
+        );
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+        let extent = scene
+            .grid_mut(twin.twin())
+            .unwrap()
+            .take_chunk_dirty(IVec3::new(0, 0, 0));
+        assert!(
+            matches!(extent, Some(crate::DirtyExtent::Bbox(_, _))),
+            "re-sync should bump a bbox extent, got {extent:?}"
+        );
+    }
+
+    /// P3 — the exclusion predicates are single-sourced on `Grid`.
+    #[test]
+    fn exclusion_predicates() {
+        let (mut scene, real) = scene_with_room();
+        let twin = FowTwin::attach(&mut scene, real);
+        assert!(!scene.grid(real).unwrap().renderable());
+        assert!(scene.grid(real).unwrap().queryable());
+        assert!(scene.grid(twin.twin()).unwrap().renderable());
+        assert!(!scene.grid(twin.twin()).unwrap().queryable());
     }
 }

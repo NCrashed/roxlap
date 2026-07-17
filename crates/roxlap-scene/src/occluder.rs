@@ -55,7 +55,11 @@ impl<'a> SceneOccluder<'a> {
     #[must_use]
     pub fn build(scene: &'a Scene) -> Self {
         let mut grids = Vec::new();
-        for (_id, grid) in scene.grids() {
+        // FW.1 — same filter as the primary render: the real fog-of-war
+        // grid (`render_excluded`) casts no shadow (a shadow from unseen
+        // geometry is an information leak); its known twin, being drawn,
+        // casts normally.
+        for (_id, grid) in scene.render_grids() {
             if let Some((mut lo, hi)) = grid_voxel_aabb(grid) {
                 // CA.2 — cutaway: everything above the clip plane
                 // (`z < z_clip`, z-down) is air to the renderer, so

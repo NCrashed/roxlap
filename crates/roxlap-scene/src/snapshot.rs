@@ -406,7 +406,16 @@ impl Scene {
     /// would be non-deterministic).
     #[must_use]
     pub fn to_snapshot(&self) -> SceneSnapshot {
-        let mut grid_ids: Vec<GridId> = self.grids.keys().copied().collect();
+        // FW.1 — a presentation-only twin is DERIVED visual state
+        // (rebuilt from the real grid + a `FogOfWar`), not authoritative
+        // scene content: exclude it (`query_grids` shares the predicate
+        // with the rest of the crate). This keeps the wire format
+        // unchanged (no new fields) — after a load the host re-arms
+        // fog-of-war, which re-creates the twin. The real grid's
+        // `render_excluded` flag is likewise transient and defaults off
+        // on load (fog is off until re-armed — [`crate::FowTwin::sync`]
+        // signals a lost twin so a host can detect the re-arm).
+        let mut grid_ids: Vec<GridId> = self.query_grids().map(|(id, _)| id).collect();
         grid_ids.sort_unstable();
 
         let mut grids = Vec::with_capacity(grid_ids.len());

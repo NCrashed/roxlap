@@ -256,7 +256,10 @@ pub fn path_thickness_weighted(
 /// Shared walk under [`path_thickness`] / [`path_thickness_weighted`].
 fn path_thickness_impl(scene: &Scene, a: DVec3, b: DVec3, weights: Option<&Weights<'_>>) -> f64 {
     let mut total = 0.0;
-    for (_, grid) in scene.grids() {
+    // FW.1 — audio occlusion hears the REAL world: skip presentation-only
+    // fog-of-war twins (`query_grids`), whose copy-on-seen geometry would
+    // otherwise double-count solid thickness.
+    for (_, grid) in scene.query_grids() {
         // SC — rebase into the grid's VOXEL frame: un-rotate, un-translate,
         // then divide by `voxel_world_size` (the DDA below marches voxels).
         // `grid_thickness` returns the solid length in voxel units, so scale

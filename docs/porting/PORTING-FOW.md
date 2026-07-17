@@ -3,7 +3,7 @@
 Entry doc written 2026-07-17 at workspace 0.29.0 + uncommitted OC tail.
 This is the **entry doc** for the fog-of-war stage — tag **FW**.
 
-## Status — FW.0 LANDED (2026-07-17); FW.1..5 not started
+## Status — FW.0 + FW.1 LANDED (2026-07-17); FW.2..5 not started
 
 - **FW.0** — `roxlap-scene/src/fow.rs`: `FogOfWar` + `VisionConfig` +
   `DeckBand` + `LightGate` + `FowObserver` (+ `CellState`, all
@@ -60,6 +60,76 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   visited cell; (4) heard blobs precompute their cells once at `hear()`
   and the per-tick union rebuilds only on blob add/expiry (no per-tick
   `sqrt` fan-out).
+- **FW.1** — known-twin grid (`fow.rs` `FowTwin` + two `Grid` flags).
+  `Grid::render_excluded` (real grid: simulated, never drawn — skipped
+  by BOTH the primary render and the shadow occluder, so unseen
+  geometry casts no shadow) and `Grid::presentation_only` (twin: drawn,
+  never queried). Two centralised `Scene` iterators enforce the split:
+  `render_grids[_mut]` (`!render_excluded`) drive CPU render / Phase-A
+  caches / occluder / GPU residency / CPU sprite-cutaway; `query_grids
+  [_mut]` (`!presentation_only`) drive raycast / resolve_voxel /
+  cutaway_hides_point / collision / water / audio thickness / streaming.
+  With no FW grids both yield every grid ⇒ byte-identical. `FowTwin::
+  attach` registers the twin + sets the flags; `sync(scene, fow)`
+  mirrors the real grid's render config (transform / render_sky / mip
+  override / lod / z_clip) then copy-on-first-seen / re-syncs (whole
+  `Vxl` clone) every chunk under a live cell whose `(version, present)`
+  signature changed; `detach` restores. Twin excluded from snapshots
+  (derived state — NO wire change; host re-arms fog after load, real
+  grid's `render_excluded` defaults off). 8 gates: render/query split,
+  excluded-real-still-raycasts, copy-on-first-seen, edit-behind-wall
+  invisible-until-seen, memory-frozen-after-leaving, chunk-granular leak
+  (documents the accepted v1 bound), detach, snapshot-excludes-twin.
+  Audit: 28 grid-iteration sites swept (found one the entry doc missed —
+  `cpu.rs` sprite-cutaway — routed through `render_grids`).
+- **FW.1 review round (2026-07-17)** — 7 correctness/lifecycle + 3 perf,
+  all landed (+6 regression gates, 31 fow total):
+  1. **Empty twin fell out of GPU residency forever** — `upload_scene`
+     skipped a chunkless static grid from `grid_ids` yet still recorded
+     its id as resident, so `resident_matches_scene` kept matching and
+     `refresh_dirty` never installed the twin's later chunks (whole
+     fogged world invisible on GPU). Twin now counts as "dynamic"
+     (`gpu_residency_hint.is_some()`), registered even when empty — the
+     streaming-grid pattern.
+  2. **Twin GPU pool didn't grow with exploration** — a static grid
+     sizes its chunk-space region AND modular slot pool from the
+     chunks resident at first upload; later-explored chunks (a tall
+     ship spans many `chz`) fell outside → unaddressable or aliased
+     occupied slots (rooms flicker), CPU/GPU divergence. New
+     `Grid::gpu_residency_hint (origin_chunk, chunks_dims)` set by
+     `FowTwin` to the REAL grid's full chunk bbox; `upload_scene` sizes
+     region + `default_pool_dims` from it. (colors_stride truncation
+     for denser-later chunks is inherited from the streaming path — a
+     shared pre-existing limitation, noted not newly introduced.)
+  3/7. **Real-grid eviction wiped twin memory / phantom versions** —
+     sync keyed copies on `(version, present)`; an evicted real chunk
+     flipped present→false and the old sync REMOVED it from the twin
+     (geometry in view vanished) and bumped a version for a chunk that
+     exists nowhere (unbounded `chunk_versions`/`chunk_dirty` growth +
+     defeated PF.13 quiet-skip). Sync now NEVER removes for an absent
+     real chunk — the last-seen copy stays as memory — and only records
+     the sig when a memory copy exists.
+  4. **Cutaway footprint divergence** — `cutaway_hides_point` was on
+     `query_grids` (real, full footprint) while the sprite cull reads
+     `render_grids` (twin, seen chunks); CA.4 requires one rule.
+     `cutaway_hides_point` moved to `render_grids` (both = the drawn
+     twin). Byte-identical with no FW.
+  5. **Snapshot silently killed fog** — `sync` now returns `#[must_use]
+     bool`: `false` when either grid is gone (post-load / rollback),
+     the explicit "host must re-arm" signal the API lacked.
+  6. **sync didn't clear twin.billboards** — a copying sync now nulls
+     the Far impostor cache (the S7.4 contract every other chunk-set
+     path honours), else a frozen first-look impostor at distance.
+  Perf: (P1) re-sync bumps the twin with the real edit's drained bbox
+  (`take_chunk_dirty` on the never-rendered real grid — also stops that
+  orphaned map leaking) instead of `Full`, so the GPU re-uploads only
+  the delta; first-seen still `Full`. (P2) quiet-frame early-out keyed
+  on `(mask_version, real mutation_counter)` skips the ~πr² live-cell
+  rescan when nothing changed. (P3) the exclusion rule is single-sourced
+  in `Grid::renderable` / `Grid::queryable`; `query_grids_mut` (was dead)
+  now drives `pump_streaming_sync`; snapshot routes through
+  `query_grids`. Full-chunk CPU clone on copy stays per decision 2 (the
+  column-wise copy is the deferred follow-up).
 
 ## Goal
 

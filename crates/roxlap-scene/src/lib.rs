@@ -73,7 +73,7 @@ pub use character::{CharacterBody, CharacterDef, MoveMode, WalkInput};
 pub use chunks::{BakeLight, BakeMode};
 pub use collide::{box_overlaps_solid, grid_box_overlaps_solid, point_overlaps_solid, Solidity};
 pub use edit::SpanOp;
-pub use fow::{CellState, DeckBand, FogOfWar, FowObserver, LightGate, VisionConfig};
+pub use fow::{CellState, DeckBand, FogOfWar, FowObserver, FowTwin, LightGate, VisionConfig};
 pub use islands::{detect_islands, FracturePattern, Island, DEFAULT_ISLAND_BUDGET};
 pub use lod::{select_lod, Lod, LodThresholds};
 pub use roxlap_core::AoParams;
@@ -640,6 +640,36 @@ pub struct Grid {
     /// of the last [`Self::ensure_dda_bricks`] sweep; a matching pair
     /// skips the whole per-chunk ensure + retain pass.
     last_bricks: Option<(u64, u32, u32)>,
+    /// FW.1 — fog-of-war exclusion. `render_excluded` marks the *real*
+    /// simulated grid whose visuals are shown through a known twin
+    /// instead: every render path (primary AND shadow) skips it, so its
+    /// live geometry — and any shadow it would cast — never reaches the
+    /// screen (a shadow from unseen geometry is an information leak).
+    /// It is still fully present to simulation, collision, audio and
+    /// pathing. `false` (the default) = normal grid, byte-identical to
+    /// pre-FW renders. See [`crate::fow`].
+    pub render_excluded: bool,
+    /// FW.1 — fog-of-war exclusion. `presentation_only` marks the known
+    /// *twin* grid: it is drawn like any other grid but excluded from
+    /// EVERY gameplay query — raycasts, collision, `resolve_voxel`,
+    /// cutaway hit-tests, audio occlusion, streaming and LOD
+    /// bookkeeping — and from snapshots (it is derived state rebuilt
+    /// from the real grid). `false` (the default) = normal grid. See
+    /// [`crate::fow`].
+    pub presentation_only: bool,
+    /// FW.1 — GPU residency sizing hint `(origin_chunk, chunks_dims)`
+    /// in chunk coordinates. A fog-of-war twin gains chunks over its
+    /// lifetime as the observer explores; without a hint the GPU
+    /// backend sizes the twin's chunk-space region AND its modular slot
+    /// pool from whatever chunks were resident at the first upload, so a
+    /// later-explored chunk outside that box is unaddressable (the
+    /// marcher never looks there) or aliases an occupied slot (rooms
+    /// flicker). [`crate::FowTwin`] sets this to the REAL grid's full
+    /// chunk bounding box, so the twin's region + pool cover the whole
+    /// ship from the first frame. `None` (the default) = size from the
+    /// grid's own chunks, the pre-FW behaviour. Not serialised
+    /// (transient render state).
+    pub gpu_residency_hint: Option<([i32; 3], [u32; 3])>,
 }
 
 /// PF.12 — how much of a chunk changed since a consumer last synced it.
@@ -678,7 +708,28 @@ impl Grid {
             chunk_dirty: HashMap::new(),
             mutations: 0,
             last_bricks: None,
+            render_excluded: false,
+            presentation_only: false,
+            gpu_residency_hint: None,
         }
+    }
+
+    /// FW.1 — the render predicate behind [`Scene::render_grids`]: a
+    /// grid is drawn (primary + shadow) unless it is the
+    /// [`Self::render_excluded`] real fog-of-war grid. Single source of
+    /// the rule so it can't drift across the render sites.
+    #[must_use]
+    pub fn renderable(&self) -> bool {
+        !self.render_excluded
+    }
+
+    /// FW.1 — the query predicate behind [`Scene::query_grids`]: a grid
+    /// answers gameplay queries (raycast, collision, audio, streaming,
+    /// snapshot) unless it is a [`Self::presentation_only`] twin.
+    /// Single source of the rule.
+    #[must_use]
+    pub fn queryable(&self) -> bool {
+        !self.presentation_only
     }
 
     /// Ensure the DDA brick cache holds current mip-`requested_mip`
@@ -1097,7 +1148,13 @@ impl Scene {
     /// when no grid has a clip set (each unclipped grid early-outs).
     #[must_use]
     pub fn cutaway_hides_point(&self, world: DVec3) -> bool {
-        self.grids.values().any(|g| g.cutaway_hides_point(world))
+        // FW.1 — CA.4 is a RENDER rule: it must iterate the SAME grid
+        // set the sprite cull collects cutaway volumes from
+        // (`render_grids` — the drawn twin, not the excluded real grid),
+        // or a lamp culled by the host would sit under a still-drawn
+        // sprite where fog is active. Both sites use `render_grids`.
+        self.render_grids()
+            .any(|(_, g)| g.cutaway_hides_point(world))
     }
 
     /// Iterator over all `(id, grid)` pairs in registration order
@@ -1111,6 +1168,49 @@ impl Scene {
     /// is not guaranteed (HashMap-backed).
     pub fn grids_mut(&mut self) -> impl Iterator<Item = (GridId, &mut Grid)> {
         self.grids.iter_mut().map(|(id, g)| (*id, g))
+    }
+
+    /// FW.1 — grids the renderers draw: every grid EXCEPT one flagged
+    /// [`Grid::render_excluded`] (the real fog-of-war grid, shown via
+    /// its known twin instead). Both render passes — primary AND the
+    /// shadow occluder — iterate this, so unseen live geometry casts no
+    /// shadow either. With no FW grids this yields every grid, so
+    /// renders stay byte-identical.
+    pub fn render_grids(&self) -> impl Iterator<Item = (GridId, &Grid)> {
+        self.grids
+            .iter()
+            .filter(|(_, g)| g.renderable())
+            .map(|(id, g)| (*id, g))
+    }
+
+    /// FW.1 — mutable [`Self::render_grids`] (the render caches / LOD
+    /// bookkeeping phase).
+    pub fn render_grids_mut(&mut self) -> impl Iterator<Item = (GridId, &mut Grid)> {
+        self.grids
+            .iter_mut()
+            .filter(|(_, g)| g.renderable())
+            .map(|(id, g)| (*id, g))
+    }
+
+    /// FW.1 — grids visible to gameplay: every grid EXCEPT one flagged
+    /// [`Grid::presentation_only`] (a fog-of-war twin — derived visual
+    /// state that must never answer a query). Raycasts, `resolve_voxel`,
+    /// collision, cutaway hit-tests, water, audio occlusion and
+    /// streaming iterate this, never [`Self::grids`]. With no FW grids
+    /// it yields every grid, so query results are unchanged.
+    pub fn query_grids(&self) -> impl Iterator<Item = (GridId, &Grid)> {
+        self.grids
+            .iter()
+            .filter(|(_, g)| g.queryable())
+            .map(|(id, g)| (*id, g))
+    }
+
+    /// FW.1 — mutable [`Self::query_grids`] (streaming / eviction).
+    pub fn query_grids_mut(&mut self) -> impl Iterator<Item = (GridId, &mut Grid)> {
+        self.grids
+            .iter_mut()
+            .filter(|(_, g)| g.queryable())
+            .map(|(id, g)| (*id, g))
     }
 
     /// Resolve a world-space surface hit to the owning grid + its
@@ -1132,7 +1232,7 @@ impl Scene {
             return None;
         }
         let inside = world + ray_dir * (0.5 / len); // half a voxel inward
-        for (id, grid) in self.grids() {
+        for (id, grid) in self.query_grids() {
             let glp = addr::world_to_grid_local(inside, &grid.transform);
             let v = addr::voxel_global(glp.chunk, glp.voxel);
             if grid.voxel_solid(v) {
@@ -1185,7 +1285,7 @@ impl Scene {
         }
         let dn = dir / len; // unit world direction → t is world distance
         let mut best: Option<RayHit> = None;
-        for (id, grid) in self.grids() {
+        for (id, grid) in self.query_grids() {
             // World ray → grid-local voxel space. `ld = inv * dn` stays
             // UNIT (rotation preserves length), so `voxel_dda` marches
             // in voxel units and returns a voxel-distance `t`. SC — the
@@ -1345,7 +1445,12 @@ impl Scene {
         // grids via `&mut self.grids`. Hold both at once.
         let pool: &rayon::ThreadPool = self.streaming.pool.as_ref().expect("ensure_pool just ran");
         let tx_template = &self.streaming.tx;
-        for (grid_id, grid) in &mut self.grids {
+        // FW.1 — never stream a presentation-only twin (derived state).
+        // Inline here (not `query_grids_mut`) because the streaming
+        // pool/tx borrow of `self.streaming.*` must coexist with the
+        // `&mut self.grids` borrow; the predicate is shared via
+        // `Grid::queryable` so the rule stays single-sourced.
+        for (grid_id, grid) in self.grids.iter_mut().filter(|(_, g)| g.queryable()) {
             evict_grid_chunks(grid, camera_world_pos);
             dispatch_grid_async(*grid_id, grid, camera_world_pos, pool, tx_template);
         }
@@ -1374,7 +1479,8 @@ impl Scene {
     /// Callers that want the async variant in S7.0/S7.1 stages
     /// should keep `r_active` small.
     pub fn pump_streaming_sync(&mut self, camera_world_pos: DVec3) {
-        for grid in self.grids.values_mut() {
+        // FW.1 — skip presentation-only twins (derived state).
+        for (_, grid) in self.query_grids_mut() {
             pump_grid_streaming_sync(grid, camera_world_pos);
         }
     }

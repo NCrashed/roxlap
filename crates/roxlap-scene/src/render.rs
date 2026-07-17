@@ -518,7 +518,7 @@ pub fn render_scene(
     debug_assert_eq!(fb.len(), pixel_count);
 
     let mut grids_drawn = 0usize;
-    for (_id, grid) in scene.grids_mut() {
+    for (_id, grid) in scene.render_grids_mut() {
         // S4B.2.e: Approach B render path. World → grid-local
         // camera transform doesn't need a voxel-offset adjustment
         // anymore — Approach B's chunks live at their signed
@@ -1006,7 +1006,7 @@ fn render_scene_composed_scissored(
     let cam_world = DVec3::from_array(camera.pos);
     let eff_mips = &mut scratch.eff_mips;
     eff_mips.clear();
-    for (id, grid) in scene.grids_mut() {
+    for (id, grid) in scene.render_grids_mut() {
         let lod = grid.select_lod(cam_world);
         if lod == Lod::Far {
             // CA — a cache built under a different cutaway clip is
@@ -1062,7 +1062,7 @@ fn render_scene_composed_scissored(
         None
     };
 
-    for (grid_id, grid) in scene.grids() {
+    for (grid_id, grid) in scene.render_grids() {
         // S6.0/S6.1: per-grid LOD tier dispatch. The picker keys
         // off the grid's `lod_thresholds` and the world-space
         // camera. Default thresholds are `always_near` so every
