@@ -92,6 +92,68 @@ pub struct DdaEnv<'a> {
     /// simulation / collision / audio are untouched. `None` (the
     /// default) disables clipping — byte-identical to pre-CA renders.
     pub z_clip: Option<i32>,
+    /// OC.0 — per-grid derived view cutout (stage OC): the screen-space
+    /// "keyhole" through front walls for third-person play. Unlike
+    /// [`Self::z_clip`] (grid state, "world as if removed") this is
+    /// transient per-frame VIEW state: primary rays only — shadow
+    /// marches, occluders, collision and gameplay raycasts never see
+    /// it. `None` (the default) is byte-identical to pre-OC renders.
+    pub cutout: Option<CpuCutout>,
+}
+
+/// OC.0 — the view cutout as one grid's render pass consumes it, fully
+/// derived by the facade each frame (stage OC; see
+/// `FrameParams::view_cutout` in `roxlap-render`). A cell is hidden
+/// iff ALL of: its CENTRE lies inside the view cone around the
+/// eye→focus axis (the cone tapers across the feather band), its
+/// eye distance is under the nearest character-column point's minus
+/// [`margin`](Self::margin), and its grid-local z is above the focus
+/// plane (`z < focus_z`, z-down) — walls between the camera and the
+/// focus cut, the floor in front of the focus stays.
+///
+/// **Per-CELL, not per-pixel** (the OC.3 visual-pass round-2
+/// redesign): the original rule gated each RAY by a screen-space
+/// window, so a cell straddling the window edge rendered for the
+/// outside pixels only — sub-cell fragments that read as ragged teeth
+/// wherever the boundary crossed a floor or wall at a shallow angle.
+/// Classifying whole cells by their centres makes the cut edge
+/// cube-granular and spatially coherent, exactly like the CA clip's
+/// edges.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CpuCutout {
+    /// The focus point in this grid's local frame, **voxel units**
+    /// (the same space the ray origin lives in).
+    pub focus_local: [f32; 3],
+    /// Tangent of the cone's OUTER half-angle (nothing is cut outside
+    /// it). The facade derives it from the keyhole's pixel radius and
+    /// the frame's focal length (`radius_px / hz`), so it still means
+    /// "a screen circle of ~radius_px around the projected focus".
+    pub tan_outer: f32,
+    /// Tangent of the full-reveal INNER half-angle
+    /// (`(radius − feather)/hz`): between the two the reveal distance
+    /// tapers linearly to zero, closing the keyhole into a smooth
+    /// funnel. `== tan_outer` gives a hard edge.
+    pub tan_inner: f32,
+    /// How far short of the character COLUMN the reveal stops, in this
+    /// grid's **voxel units** (world units `/vws`). The reveal surface
+    /// hugs the column — the vertical segment at the focus xy between
+    /// the focus plane ([`Self::focus_z`], the feet) and its mirror
+    /// above the focus (the head): a cell is hidden while its eye
+    /// distance is under the eye distance of the NEAREST column point
+    /// at the cell's own height, minus this margin. A fixed
+    /// eye-distance sphere through the focus (the previous rule) kept
+    /// waist-down stumps of any obstacle the character stood right
+    /// behind — below-chest cells in front sit FARTHER from an
+    /// elevated eye than the chest itself.
+    pub margin: f32,
+    /// Grid-local **absolute** voxel z of the focus plane (mip-0,
+    /// z-down, spanning stacked chz chunks — the same space as
+    /// [`Self::z_clip`](DdaEnv::z_clip)); cells with `z < focus_z`
+    /// qualify for hiding. At mip N the compare uses `focus_z >> mip`
+    /// (arithmetic shift = floor), the CA.1 formula. This is the
+    /// FIRST, cheap gate in the hit branch: `i32::MIN`-like sentinels
+    /// keep the disabled cost at one never-true compare.
+    pub focus_z: i32,
 }
 
 /// CPU.1 — one point light in a grid's local frame for the CPU renderer.
@@ -176,6 +238,7 @@ impl Default for DdaEnv<'_> {
             lights: CpuLights::default(),
             world_shadow: None,
             z_clip: None,
+            cutout: None,
         }
     }
 }
@@ -1509,6 +1572,29 @@ fn cell_walk_skip(
 ) -> Option<Hit> {
     let has_super = sampler.cells_per_chunk_xy() >= SUPER && sampler.cells_per_chunk_z() >= SUPER;
     let has_brick = sampler.cells_per_chunk_xy() >= BRICK && sampler.cells_per_chunk_z() >= BRICK;
+    // OC.1 — the cutout's focus plane in mip-cells (arithmetic `>> mip`
+    // floors — CA.1's exact formula; the OC.2 parity gate pins this
+    // against the GPU kernel's pair). `i32::MIN` when no cutout: no
+    // real cell index is ever below it, mirroring `z_clip_mip` — the
+    // whole per-cell cone test below stays behind this one compare.
+    let cut_z_mip = env.cutout.map_or(i32::MIN, |c| c.focus_z >> sampler.mip);
+    // OC.1 — the keyhole cone axis: eye → focus, unit, grid-local.
+    // Ray-invariant (`origin` is the camera for every primary ray),
+    // computed once per ray for free. A focus at the eye degenerates
+    // to "cut nothing" (the facade's margin fold prevents it anyway).
+    let cut_axis = env.cutout.map_or([0.0; 3], |c| {
+        let d = [
+            c.focus_local[0] - origin[0],
+            c.focus_local[1] - origin[1],
+            c.focus_local[2] - origin[2],
+        ];
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if len > 1e-6 {
+            [d[0] / len, d[1] / len, d[2] / len]
+        } else {
+            [0.0; 3]
+        }
+    });
 
     let start = t_enter + 1e-4;
     let p = [
@@ -1681,7 +1767,59 @@ fn cell_walk_skip(
         // Occupied brick: dense per-cell surface test.
         #[cfg(test)]
         prof::CELLS.with(|x| x.set(x.get() + 1));
-        if let Some(color) = sampler.hit(cellc) {
+        // OC.1 — keyhole hide rule (view cutout), decided per CELL by
+        // its centre (whole cubes in or out — no sub-cell fragments;
+        // see [`CpuCutout`]): a HIT cell above the focus plane whose
+        // centre lies inside the tapered eye→focus cone closer than
+        // the character column reads as air for this PRIMARY ray only
+        // (`SamplerShadow` shares `sampler.hit`, so shadows still see
+        // the wall — a view aid, not CA's "world as if removed").
+        // Order matters twice: the occupancy/surface test runs FIRST,
+        // so the cone math (two sqrt) prices only actual solid hits —
+        // never the far more numerous marched air cells above the
+        // plane; and inside the filter the z compare leads, never-true
+        // when the cutout is off (`cut_z_mip == i32::MIN`).
+        let cell_hit = sampler.hit(cellc).filter(|_| {
+            !(cellc[2] < cut_z_mip
+                && env.cutout.is_some_and(|c| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let pc = [
+                        (cellc[0] as f32 + 0.5) * cell_size,
+                        (cellc[1] as f32 + 0.5) * cell_size,
+                        (cellc[2] as f32 + 0.5) * cell_size,
+                    ];
+                    let d = [pc[0] - origin[0], pc[1] - origin[1], pc[2] - origin[2]];
+                    let along = d[0] * cut_axis[0] + d[1] * cut_axis[1] + d[2] * cut_axis[2];
+                    if along <= 0.0 {
+                        return false; // behind the eye
+                    }
+                    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                    let tan_c = ((d2 - along * along).max(0.0)).sqrt() / along;
+                    // Radial taper: full reveal inside the inner cone,
+                    // linear to zero at the outer cone (a hard edge when
+                    // the two coincide — the subnormal-free max keeps the
+                    // degenerate division finite).
+                    let s = ((c.tan_outer - tan_c)
+                        / (c.tan_outer - c.tan_inner).max(f32::MIN_POSITIVE))
+                    .clamp(0.0, 1.0);
+                    // Column-hugging reveal (see [`CpuCutout::margin`]):
+                    // reference = the nearest character-column point at
+                    // the cell's own height — the plane z (feet) mirrored
+                    // around the focus gives the column top (head).
+                    #[allow(clippy::cast_precision_loss)]
+                    let plane = c.focus_z as f32;
+                    let top = 2.0 * c.focus_local[2] - plane;
+                    let rz = pc[2].clamp(top.min(plane), top.max(plane));
+                    let dr = [
+                        c.focus_local[0] - origin[0],
+                        c.focus_local[1] - origin[1],
+                        rz - origin[2],
+                    ];
+                    let ref_dist = (dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2]).sqrt();
+                    d2.sqrt() < (ref_dist - c.margin).max(0.0) * s
+                }))
+        });
+        if let Some(color) = cell_hit {
             let bright_sub = side_shade_sub(env, last_axis, step);
             // PF.7 (C4) — one colour→material scan per hit: resolve the id
             // and the material together. EV.1 hoisted this above the shade
@@ -1913,7 +2051,9 @@ pub fn render_dda(
 /// Resolve one pixel: a shaded + fogged hit colour, a sampled textured
 /// sky on a miss, or `None` (miss with no textured sky → caller's
 /// pre-fill stands). Shared by the sequential ([`render_dda`]) and
-/// parallel ([`render_dda_parallel`]) drivers.
+/// parallel ([`render_dda_parallel`]) drivers. The OC keyhole needs no
+/// per-pixel work here: the hide rule classifies whole CELLS in the
+/// hit branch (see [`CpuCutout`]).
 #[inline]
 fn pixel_result(
     cs: &CameraState,
@@ -2909,6 +3049,7 @@ mod tests {
             lights: CpuLights::default(),
             world_shadow: None,
             z_clip: None,
+            cutout: None,
         };
         let (w, h) = (64u32, 64u32);
         let (fog, _) = render_brickmap_env(grid, &cam, w, h, &env);
@@ -2950,6 +3091,7 @@ mod tests {
             lights: CpuLights::default(),
             world_shadow: None,
             z_clip: None,
+            cutout: None,
         };
         let cam = Camera::from_yaw_pitch([16.0, 16.0, 128.0], 0.3, -0.4);
         let (w, h) = (48u32, 48u32);
@@ -3040,6 +3182,7 @@ mod tests {
             lights: CpuLights::default(),
             world_shadow: None,
             z_clip: None,
+            cutout: None,
         };
         let (shaded, _) = render_brickmap_env(grid, &cam, 32, 32, &env);
         let lum = |c: u32| (c & 0xff) + ((c >> 8) & 0xff) + ((c >> 16) & 0xff);
@@ -3406,6 +3549,440 @@ mod tests {
         assert_eq!(zb_base, zb_zero);
     }
 
+    /// OC.1 — render with only a view cutout set (rest of the env
+    /// default).
+    fn render_cutout(
+        grid: GridView<'_>,
+        camera: &Camera,
+        w: u32,
+        h: u32,
+        cutout: Option<CpuCutout>,
+    ) -> (Vec<u32>, Vec<f32>) {
+        let env = DdaEnv {
+            cutout,
+            ..DdaEnv::default()
+        };
+        render_brickmap_env(grid, camera, w, h, &env)
+    }
+
+    /// OC.1 — the wall-between-camera-and-focus fixture: a front wall
+    /// at y=20 and a room back wall at y=48, camera at y=4 looking +y.
+    const CUT_WALL: VoxColor = VoxColor(0x80_C0_40_40);
+    const CUT_BACK: VoxColor = VoxColor(0x80_40_C0_40);
+    fn keyhole_fixture() -> roxlap_formats::vxl::Vxl {
+        roxlap_formats::vxl::Vxl::from_dense(64, |_, y, _| match y {
+            20 => Some(CUT_WALL),
+            48 => Some(CUT_BACK),
+            _ => None,
+        })
+    }
+    fn keyhole_camera() -> Camera {
+        Camera {
+            pos: [32.0, 4.0, 128.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        }
+    }
+
+    /// OC.1 golden — the keyhole reveals the room behind the front
+    /// wall for cells inside the view cone; outside the cone the wall
+    /// column is intact; cells at/below the focus plane stay even
+    /// inside the cone (the floor rule).
+    #[test]
+    fn cutout_reveals_wall_inside_window_only() {
+        let vxl = keyhole_fixture();
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = keyhole_camera();
+        let (w, h) = (32u32, 32u32);
+        let centre = (h / 2 * w + w / 2) as usize;
+        // Cone straight down the +y view axis (focus ahead of the
+        // wall), hard edge, reveal past the wall (dist ≈ 16.5) but
+        // short of the back wall (≈ 44.5); focus plane below the
+        // whole wall span the centre ray crosses (z ≈ 128).
+        let cut = CpuCutout {
+            focus_local: [32.0, 30.0, 128.0],
+            tan_outer: 0.25,
+            tan_inner: 0.25,
+            margin: 2.0,
+            focus_z: 200,
+        };
+        let (fb, zb) = render_cutout(grid, &cam, w, h, Some(cut));
+        assert_eq!(
+            fb[centre], CUT_BACK.0,
+            "cone centre must see through the wall, got {:08x}",
+            fb[centre]
+        );
+        assert!(
+            (zb[centre] - 44.0).abs() < 1.0,
+            "revealed depth {} not ≈ 44 (the back wall)",
+            zb[centre]
+        );
+        // Outside the cone (pixel (2,16) hits wall cells ~14 voxels
+        // off-axis: tan ≈ 0.85 > 0.25): the wall is untouched.
+        let outside = (h / 2 * w + 2) as usize;
+        assert_eq!(
+            fb[outside], CUT_WALL.0,
+            "outside the cone the wall must stay, got {:08x}",
+            fb[outside]
+        );
+        assert!((zb[outside] - 16.0).abs() < 1.0);
+        // Focus plane above the centre ray's z (128 ≮ 100): the wall
+        // stays even inside the cone — the floor-in-front rule.
+        let below = CpuCutout {
+            focus_z: 100,
+            ..cut
+        };
+        let (fb, zb) = render_cutout(grid, &cam, w, h, Some(below));
+        assert_eq!(
+            fb[centre], CUT_WALL.0,
+            "cells at/below the focus plane must stay, got {:08x}",
+            fb[centre]
+        );
+        assert!((zb[centre] - 16.0).abs() < 1.0);
+    }
+
+    /// OC.1 — the feather tapers the REVEAL DISTANCE across the cone
+    /// band (visual-pass redesign — no dither): the cut edge is
+    /// spatially COHERENT (per screen row, the revealed pixels form
+    /// one contiguous run — no teeth), deterministic frame-to-frame,
+    /// and strictly narrower than the same cone with a hard edge
+    /// (pinning that the taper really scales the reveal down).
+    #[test]
+    fn cutout_feather_tapers_reveal_radially() {
+        let vxl = keyhole_fixture();
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = keyhole_camera();
+        let (w, h) = (64u32, 64u32);
+        let tapered = CpuCutout {
+            focus_local: [32.0, 30.0, 128.0],
+            tan_outer: 0.9,
+            tan_inner: 0.3,
+            margin: 2.0,
+            focus_z: 200,
+        };
+        let (fb, _) = render_cutout(grid, &cam, w, h, Some(tapered));
+        let (fb2, _) = render_cutout(grid, &cam, w, h, Some(tapered));
+        assert_eq!(fb, fb2, "the feather taper must be deterministic");
+        // Per-row coherence on the axis row: BACK pixels form ONE
+        // contiguous run (whole-cell classification — the ragged
+        // per-pixel teeth the redesign removed would break this).
+        let row = (h / 2) as usize * w as usize;
+        let flags: Vec<bool> = (0..w as usize)
+            .map(|px| fb[row + px] == CUT_BACK.0)
+            .collect();
+        let first = flags.iter().position(|&b| b);
+        let last = flags.iter().rposition(|&b| b);
+        let (Some(first), Some(last)) = (first, last) else {
+            panic!("axis row must contain revealed pixels");
+        };
+        assert!(
+            flags[first..=last].iter().all(|&b| b),
+            "revealed run must be contiguous (no teeth): {flags:?}"
+        );
+        assert!(
+            flags.iter().any(|&b| !b),
+            "the taper must keep wall pixels on the axis row"
+        );
+        // The taper cuts a strictly SMALLER hole than a hard edge at
+        // the same outer cone.
+        let hard = CpuCutout {
+            tan_inner: 0.9,
+            ..tapered
+        };
+        let (fb_hard, _) = render_cutout(grid, &cam, w, h, Some(hard));
+        let count = |fb: &[u32]| fb.iter().filter(|&&p| p == CUT_BACK.0).count();
+        let (n_taper, n_hard) = (count(&fb), count(&fb_hard));
+        assert!(
+            0 < n_taper && n_taper < n_hard,
+            "taper must shrink the hole: tapered {n_taper} vs hard {n_hard}"
+        );
+    }
+
+    /// OC.1 — the reveal surface hugs the character COLUMN (the
+    /// visual-pass round-4 rule): a full-height pillar the character
+    /// stands right behind is cut in its ENTIRETY, boots to head — a
+    /// fixed eye-distance sphere through the chest (the previous rule)
+    /// kept the pillar's below-chest cells, which sit FARTHER from the
+    /// elevated eye than the chest itself, leaving a waist-high stump
+    /// hiding the character.
+    #[test]
+    fn cutout_pillar_in_front_cuts_down_to_the_feet() {
+        const PILLAR: VoxColor = VoxColor(0x80_C0_C0_20);
+        const FLOOR: VoxColor = VoxColor(0x80_60_60_60);
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
+            if z >= 132 {
+                Some(FLOOR)
+            } else if (31..=33).contains(&x) && (24..=25).contains(&y) && (120..130).contains(&z) {
+                // A body-height pillar right in front of the focus (one
+                // voxel OFF the floor: resting on it would merge the
+                // runs, and the cut face under the footprint would
+                // legitimately show the run-top = pillar colour).
+                Some(PILLAR)
+            } else {
+                None
+            }
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+        // Elevated shoulder eye behind; the character column ahead at
+        // (32, 30), feet on the floor (plane 132), head at 120.
+        let cam = Camera {
+            pos: [32.0, 4.0, 112.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let cut = CpuCutout {
+            focus_local: [32.0, 30.0, 126.0],
+            tan_outer: 1.0,
+            tan_inner: 1.0,
+            margin: 2.0,
+            focus_z: 132,
+        };
+        let (w, h) = (64u32, 64u32);
+        let count = |fb: &[u32], c: VoxColor| fb.iter().filter(|&&p| p == c.0).count();
+        // Uncut: the pillar is visible.
+        let (fb, _) = render_cutout(grid, &cam, w, h, None);
+        assert!(count(&fb, PILLAR) > 0, "uncut pillar must be visible");
+        // Cut: the WHOLE pillar melts (no waist-high stump), while the
+        // floor at/below the plane stays.
+        let (fb, _) = render_cutout(grid, &cam, w, h, Some(cut));
+        assert_eq!(
+            count(&fb, PILLAR),
+            0,
+            "the pillar must cut down to the feet, not stop at the chest"
+        );
+        assert!(count(&fb, FLOOR) > 0, "the floor must survive the cut");
+    }
+
+    /// OC.1 — the focus plane compares the grid-local ABSOLUTE voxel z
+    /// on stacked-chz grids (the CA.1 absolute-z pin, cutout edition):
+    /// a focus plane inside chz=1 hides the wall span above it there.
+    #[test]
+    fn cutout_focus_plane_is_absolute_z_on_stacked_chunks() {
+        // chz=0 empty; chz=1 carries the wall pair (abs z 256..512).
+        let upper = roxlap_formats::vxl::Vxl::from_dense(32, |_, _, _| None);
+        let lower = roxlap_formats::vxl::Vxl::from_dense(32, |_, y, _| match y {
+            20 => Some(CUT_WALL),
+            28 => Some(CUT_BACK),
+            _ => None,
+        });
+        let v_up = GridView::from_single_vxl(&upper);
+        let v_lo = GridView::from_single_vxl(&lower);
+        let chunks = [Some(v_up), Some(v_lo)];
+        let cg = crate::ChunkGrid {
+            chunks: &chunks,
+            origin_chunk_xy: [0, 0],
+            origin_chunk_z: 0,
+            chunks_x: 1,
+            chunks_y: 1,
+            chunks_z: 2,
+        };
+        let grid = GridView::from_chunk_grid(&cg, 32);
+        let cam = Camera {
+            pos: [16.0, 4.0, 300.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 0.0, 1.0],
+            forward: [0.0, 1.0, 0.0],
+        };
+        let (w, h) = (32u32, 32u32);
+        let centre = (h / 2 * w + w / 2) as usize;
+        let cut = CpuCutout {
+            focus_local: [16.0, 25.0, 300.0],
+            tan_outer: 1.0,
+            tan_inner: 1.0,
+            margin: 2.0,
+            focus_z: 320, // abs voxel z inside chz=1
+        };
+        let (fb, zb) = render_cutout(grid, &cam, w, h, Some(cut));
+        assert_eq!(
+            fb[centre], CUT_BACK.0,
+            "abs-z focus plane must hide the chz=1 wall, got {:08x}",
+            fb[centre]
+        );
+        assert!((zb[centre] - 24.0).abs() < 1.0);
+        // Plane above the ray's abs z (300 ≮ 280): nothing hides. An
+        // in-chunk-z bug (300 & 255 = 44 < 280) would still cut here.
+        let above = CpuCutout {
+            focus_z: 280,
+            ..cut
+        };
+        let (fb, _) = render_cutout(grid, &cam, w, h, Some(above));
+        assert_eq!(
+            fb[centre], CUT_WALL.0,
+            "focus plane above the ray must keep the wall, got {:08x}",
+            fb[centre]
+        );
+    }
+
+    /// OC.1 — pins the mip formula `focus_z >> mip` (floor), the CA.1
+    /// formula verbatim: at mip 1 with `focus_z = 101` the plane
+    /// rounds DOWN to mip-cell 50 (voxels 100..102), so the surface at
+    /// z=100 stays visible — the accepted coarse-mip bleed. CPU and
+    /// GPU must share this exact formula (the OC.2 parity gate).
+    #[test]
+    fn cutout_focus_plane_mip_formula_floors() {
+        let mut vxl = roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| {
+            (z >= 100).then_some(VoxColor(0x80_80_80_80))
+        });
+        vxl.generate_mips(2);
+        assert!(vxl.mip_count() >= 2, "need mip 1 built");
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera {
+            pos: [32.0, 32.0, 10.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let (w, h) = (32u32, 32u32);
+        let n = (w as usize) * (h as usize);
+        let centre = (h / 2 * w + w / 2) as usize;
+        let mut fb = vec![0u32; n];
+        let mut zb = vec![f32::INFINITY; n];
+        let settings = OpticastSettings::for_oracle_framebuffer(w, h);
+        let env = DdaEnv {
+            cutout: Some(CpuCutout {
+                focus_local: [32.0, 32.0, 120.0],
+                tan_outer: 4.0, // whole frustum inside the cone
+                tan_inner: 4.0,
+                margin: 0.0,
+                focus_z: 101,
+            }),
+            ..DdaEnv::default()
+        };
+        {
+            let mut sink = RasterSink::new(&mut fb, &mut zb);
+            render_dda(&cam, &settings, grid, w as usize, &env, 1, &mut sink);
+        }
+        assert_ne!(fb[centre], 0, "mip-1 cut surface must still hit");
+        assert!(
+            (zb[centre] - 90.0).abs() < 1.5,
+            "mip-cell 50 (voxel z=100) must stay visible (floor \
+             formula); depth {} not ≈ 90",
+            zb[centre]
+        );
+    }
+
+    /// OC.1 standing gate — `cutout = None`, a zero-radius window and
+    /// a zero-reveal cutout are all byte-identical to the plain render
+    /// (decision 8: disabled ⇒ byte-identical; pins both "off" folds).
+    #[test]
+    fn cutout_disabled_is_byte_identical() {
+        let vxl = roxlap_formats::vxl::Vxl::from_dense(64, |x, y, z| {
+            let surf = 28 + ((x / 4 + y / 6) % 13);
+            (z >= surf).then_some(VoxColor(0x80_40_60_80 + (x ^ y) % 0x30))
+        });
+        let grid = GridView::from_single_vxl(&vxl);
+        let cam = Camera::orbit(0.8, 0.55, 100.0, [32.0, 32.0, 40.0]);
+        let (w, h) = (96u32, 96u32);
+        let (fb_base, zb_base) = render_brickmap(grid, &cam, w, h);
+        let (fb_none, zb_none) = render_cutout(grid, &cam, w, h, None);
+        assert_eq!(fb_base, fb_none, "cutout=None must not change a pixel");
+        assert_eq!(zb_base, zb_none);
+        // Zero-width cone: no cell centre is ever inside it.
+        let no_cone = CpuCutout {
+            focus_local: [32.0, 32.0, 40.0],
+            tan_outer: 0.0,
+            tan_inner: 0.0,
+            margin: 0.0,
+            focus_z: i32::MAX,
+        };
+        let (fb, zb) = render_cutout(grid, &cam, w, h, Some(no_cone));
+        assert_eq!(fb_base, fb, "a zero cone must not change a pixel");
+        assert_eq!(zb_base, zb);
+        // Zero reveal (the facade's behind-camera fold): cell
+        // distances are non-negative, so nothing hides.
+        let no_reveal = CpuCutout {
+            focus_local: [32.0, 32.0, 40.0],
+            tan_outer: 10.0,
+            tan_inner: 10.0,
+            margin: 1.0e6,
+            focus_z: i32::MAX,
+        };
+        let (fb, zb) = render_cutout(grid, &cam, w, h, Some(no_reveal));
+        assert_eq!(fb_base, fb, "zero reveal must not change a pixel");
+        assert_eq!(zb_base, zb);
+    }
+
+    /// OC.1 — the cutout is a VIEW aid, not world removal (non-goal in
+    /// the entry doc): a roof hidden by the keyhole still casts its
+    /// sun shadow onto the floor below — the exact opposite of the CA
+    /// clip's "world as if removed" gate above.
+    #[test]
+    fn cutout_hidden_roof_still_casts_shadows() {
+        const ROOF: VoxColor = VoxColor(0x80_A0_50_20);
+        const FLOOR: VoxColor = VoxColor(0x80_80_80_80);
+        let roofed = roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| {
+            if z == 20 {
+                Some(ROOF)
+            } else if z >= 60 {
+                Some(FLOOR)
+            } else {
+                None
+            }
+        });
+        let roofless =
+            roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| (z >= 60).then_some(FLOOR));
+        let g_roofed = GridView::from_single_vxl(&roofed);
+        let g_roofless = GridView::from_single_vxl(&roofless);
+        let cam = Camera {
+            pos: [32.0, 32.0, 6.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let inv = 1.0f32 / 2.0f32.sqrt();
+        let lights = CpuLights {
+            enabled: true,
+            sun: true,
+            sun_dir: [inv, 0.0, -inv],
+            sun_color: [1.0; 3],
+            sun_intensity: 1.0,
+            sun_casts_shadow: true,
+            ambient: [0.25; 3],
+            shadow_strength: 0.8,
+            shadow_bias: 1.5,
+            shadow_max_dist: 128.0,
+            ..CpuLights::default()
+        };
+        let (w, h) = (64u32, 64u32);
+        // Cone over the whole frustum; reveal past the farthest roof
+        // cell (corner distance ≈ 47) but short of the floor's z-gate
+        // anyway (floor z=60 ≥ plane 50 keeps it); plane between them.
+        let cut = CpuCutout {
+            focus_local: [32.0, 32.0, 46.0],
+            tan_outer: 10.0,
+            tan_inner: 10.0,
+            margin: 1.0,
+            focus_z: 50,
+        };
+        let env_cut = DdaEnv {
+            lights,
+            cutout: Some(cut),
+            ..DdaEnv::default()
+        };
+        let env_plain = DdaEnv {
+            lights,
+            ..DdaEnv::default()
+        };
+        let (fb_cut, zb_cut) = render_brickmap_env(g_roofed, &cam, w, h, &env_cut);
+        let (fb_ref, zb_ref) = render_brickmap_env(g_roofless, &cam, w, h, &env_plain);
+        // Same geometry visible (the floor)…
+        assert_eq!(zb_cut, zb_ref, "the cutout must reveal the same floor");
+        // …but the hidden roof still shadows it: the cut render is
+        // strictly darker than the roofless reference.
+        let sum: fn(&[u32]) -> u64 = |fb| {
+            fb.iter()
+                .map(|&p| u64::from((p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff)))
+                .sum()
+        };
+        let (dark, light) = (sum(&fb_cut), sum(&fb_ref));
+        assert!(
+            dark < light,
+            "hidden roof must keep shadowing the floor: cut={dark} roofless={light}"
+        );
+    }
+
     /// DDA.4: a floor spanning two side-by-side chunks (chunks_x=2)
     /// renders continuously across the chunk-XY seam — hits on both
     /// sides, no gap column.
@@ -3628,6 +4205,7 @@ mod tests {
             lights: CpuLights::default(),
             world_shadow: None,
             z_clip: None,
+            cutout: None,
         };
 
         let (seq_fb, seq_zb) = render_brickmap_env(grid, &cam, w, h, &env);

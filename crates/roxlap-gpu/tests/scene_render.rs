@@ -26,7 +26,8 @@ use std::sync::Mutex;
 use roxlap_formats::vxl::Vxl;
 use roxlap_gpu::{
     decompress_chunk, Camera, GpuInitError, GpuLight, GpuRendererSettings, GpuSceneResident,
-    GridUpload, GridWorldTransform, HeadlessGpu, HeadlessSceneRenderer, SceneLights, SceneUpload,
+    GpuViewCutout, GridUpload, GridWorldTransform, HeadlessGpu, HeadlessSceneRenderer, SceneLights,
+    SceneUpload,
 };
 
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -2287,5 +2288,451 @@ fn scene_dda_cross_grid_shadow_survives_tele_distance() {
         l1 < l0 && (l0 - l1) * 100 > l0,
         "hull must cast a visible cross-grid shadow at tele distance: \
          lit {l0} shadowed {l1}"
+    );
+}
+
+/// OC.2 — keyhole parity gate, primary rays: the uniform cone +
+/// per-grid focus-plane lane cut the front wall through the real
+/// `scene_dda.wgsl` pipeline exactly like the CPU keyhole — cone
+/// centre revealed, outside-cone column intact, cells at/below the
+/// focus plane intact — and both "off" encodings re-render
+/// byte-identically.
+#[test]
+fn scene_dda_cutout_reveals_wall_inside_window_only() {
+    use roxlap_formats::color::VoxColor;
+
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    // Front wall at y=8, room back wall at y=24, both spanning x/z.
+    const WALL: (u32, u32, u32) = (0xC0, 0x40, 0x40);
+    const BACK: (u32, u32, u32) = (0x40, 0xC0, 0x40);
+    let vxl = Vxl::from_dense(vsid, |_, y, _| match y {
+        8 => Some(VoxColor(0x80_C0_40_40)),
+        24 => Some(VoxColor(0x80_40_C0_40)),
+        _ => None,
+    });
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], decompress_chunk(&vxl))],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // Camera at y=2 looking +y (right × down == forward): wall at
+    // world-t ≈ 6, back wall at ≈ 22, centre ray at grid z = 16.
+    let cam = Camera {
+        position: [16.0, 2.0, 16.0],
+        right: [-1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let outside = (h / 2 * w + 4) as usize; // 28.5 px from the centre
+    let render = |r: &mut HeadlessSceneRenderer, focus_z: i32| {
+        r.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            &[GridWorldTransform {
+                cutout_focus_z: focus_z,
+                cutout_focus_local: [16.0, 25.0, 16.0],
+                ..GridWorldTransform::default()
+            }],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )
+    };
+    let rgb = |p: u32| (p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff);
+
+    // Baseline: no cutout → the front wall everywhere.
+    let base = render(&mut renderer, i32::MIN);
+    assert_eq!(
+        rgb(base[centre]),
+        WALL,
+        "base centre: {:#010x}",
+        base[centre]
+    );
+
+    // Cone down the +y view axis, hard edge, reveal past the wall
+    // (cell dist ≈ 6.5) but short of the back wall (≈ 22.5); focus
+    // plane below the centre ray's grid z (16 < 100).
+    renderer.set_view_cutout(Some(GpuViewCutout {
+        tan_outer: 0.2,
+        tan_inner: 0.2,
+        margin: 2.0,
+    }));
+    let cut = render(&mut renderer, 100);
+    assert_eq!(
+        rgb(cut[centre]),
+        BACK,
+        "cone centre must see through the wall: {:#010x}",
+        cut[centre]
+    );
+    assert_eq!(
+        rgb(cut[outside]),
+        WALL,
+        "outside the cone the wall must stay: {:#010x}",
+        cut[outside]
+    );
+    // Focus plane above the centre ray's z (16 ≮ 10): the wall stays
+    // even inside the cone — the floor-in-front rule.
+    let below = render(&mut renderer, 10);
+    assert_eq!(
+        rgb(below[centre]),
+        WALL,
+        "cells at/below the focus plane must stay: {:#010x}",
+        below[centre]
+    );
+    // Off encodings: a cleared cutout AND a margin larger than the
+    // scene are both byte-identical to the baseline (decision 8).
+    renderer.set_view_cutout(None);
+    assert_eq!(
+        render(&mut renderer, i32::MIN),
+        base,
+        "cleared cutout must be byte-identical"
+    );
+    renderer.set_view_cutout(Some(GpuViewCutout {
+        tan_outer: 10.0,
+        tan_inner: 10.0,
+        margin: 1.0e6,
+    }));
+    assert_eq!(
+        render(&mut renderer, 100),
+        base,
+        "a scene-sized margin must be byte-identical"
+    );
+    renderer.set_view_cutout(None);
+}
+
+/// OC.2 — the GPU feather tapers the reveal distance across the cone
+/// band by the SAME per-cell rule the CPU test pins (visual-pass
+/// redesign — no dither): the cut edge is spatially coherent (the
+/// axis row's revealed pixels form one contiguous run — no teeth),
+/// deterministic frame-to-frame, and strictly narrower than the same
+/// cone with a hard edge.
+#[test]
+fn scene_dda_cutout_feather_tapers_reveal_radially() {
+    use roxlap_formats::color::VoxColor;
+
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let vxl = Vxl::from_dense(vsid, |_, y, _| match y {
+        8 => Some(VoxColor(0x80_C0_40_40)),
+        24 => Some(VoxColor(0x80_40_C0_40)),
+        _ => None,
+    });
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], decompress_chunk(&vxl))],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 2.0, 16.0],
+        right: [-1.0, 0.0, 0.0],
+        down: [0.0, 0.0, 1.0],
+        forward: [0.0, 1.0, 0.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let tapered = GpuViewCutout {
+        tan_outer: 0.5,
+        tan_inner: 0.1,
+        margin: 2.0,
+    };
+    let xf = [GridWorldTransform {
+        cutout_focus_local: [16.0, 25.0, 16.0],
+        cutout_focus_z: 100,
+        ..GridWorldTransform::default()
+    }];
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            &xf,
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )
+    };
+    renderer.set_view_cutout(Some(tapered));
+    let fb = render(&mut renderer);
+    let fb2 = render(&mut renderer);
+    assert_eq!(fb, fb2, "the feather taper must be deterministic");
+    const BACK: (u32, u32, u32) = (0x40, 0xC0, 0x40);
+    let rgb = |p: u32| (p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff);
+    // Per-row coherence on the axis row: BACK pixels form ONE
+    // contiguous run (whole-cell classification — no teeth).
+    let row = (h / 2) as usize * w as usize;
+    let flags: Vec<bool> = (0..w as usize)
+        .map(|px| rgb(fb[row + px]) == BACK)
+        .collect();
+    let first = flags.iter().position(|&b| b);
+    let last = flags.iter().rposition(|&b| b);
+    let (Some(first), Some(last)) = (first, last) else {
+        panic!("axis row must contain revealed pixels");
+    };
+    assert!(
+        flags[first..=last].iter().all(|&b| b),
+        "revealed run must be contiguous (no teeth): {flags:?}"
+    );
+    assert!(
+        flags.iter().any(|&b| !b),
+        "the taper must keep wall pixels on the axis row"
+    );
+    // The taper cuts a strictly SMALLER hole than a hard edge at the
+    // same outer cone.
+    renderer.set_view_cutout(Some(GpuViewCutout {
+        tan_inner: 0.5,
+        ..tapered
+    }));
+    let fb_hard = render(&mut renderer);
+    let count = |fb: &[u32]| fb.iter().filter(|&&p| rgb(p) == BACK).count();
+    let (n_taper, n_hard) = (count(&fb), count(&fb_hard));
+    assert!(
+        0 < n_taper && n_taper < n_hard,
+        "taper must shrink the hole: tapered {n_taper} vs hard {n_hard}"
+    );
+}
+
+/// OC.2 — cut faces through the keyhole use the stored-colour /
+/// run-top fallback (decision 4): cutting mid-run into a z-graded
+/// block shows EXACTLY the voxel layer at the focus plane.
+#[test]
+fn scene_dda_cutout_cut_face_pins_layer_colour() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&graded_block_chunk(vsid, 100, 140));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    renderer.set_view_cutout(Some(GpuViewCutout {
+        tan_outer: 4.0,
+        tan_inner: 4.0,
+        margin: 0.0,
+    }));
+    let fb = renderer.render_with_transforms(
+        &gpu.device,
+        &gpu.queue,
+        &scene,
+        &[cam],
+        &[GridWorldTransform {
+            cutout_focus_local: [16.0, 16.0, 130.0],
+            cutout_focus_z: 120,
+            ..GridWorldTransform::default()
+        }],
+        cam.fov_y_rad,
+        64,
+        0.0,
+    );
+    let rgb = |p: u32| (p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff);
+    assert_eq!(
+        rgb(fb[centre]),
+        (255, 0, 120),
+        "keyhole cut face must be the z=120 layer: {:#010x}",
+        fb[centre]
+    );
+}
+
+/// OC.2 — the GPU keyhole uses the CPU's exact `focus_z >> mip` FLOOR
+/// formula (the CA.3 mip gate, cutout edition): plates P (z=100) and
+/// Q (z=140) with the focus plane at 101 — mip 0 hides P and lands on
+/// Q; a coarse mip floors the plane onto P's cell so P pokes through.
+#[test]
+fn scene_dda_cutout_mip_formula_floors() {
+    use roxlap_formats::color::VoxColor;
+
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let vxl = Vxl::from_dense(vsid, |_, _, z| match z {
+        100 => Some(VoxColor(0x80ff_0064)), // P: R=0xff, B=100
+        140 => Some(VoxColor(0x80ff_008c)), // Q: R=0xff, B=140
+        _ => None,
+    });
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], decompress_chunk(&vxl))],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let centre = (h / 2 * w + w / 2) as usize;
+    renderer.set_view_cutout(Some(GpuViewCutout {
+        tan_outer: 1.0,
+        tan_inner: 1.0,
+        margin: 0.0,
+    }));
+    let xf = GridWorldTransform {
+        cutout_focus_local: [16.0, 16.0, 120.0],
+        cutout_focus_z: 101,
+        ..GridWorldTransform::default()
+    };
+    // Camera OUTSIDE the chunk (t_enter ≈ 200) so `mip_scan_dist`
+    // alone dictates the marched mip.
+    let cam = Camera {
+        position: [16.0, 16.0, -200.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 20f32.to_radians(),
+    };
+    let render_at = |r: &mut HeadlessSceneRenderer, mip_scan_dist: f32| {
+        r.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            &[xf],
+            cam.fov_y_rad,
+            64,
+            mip_scan_dist,
+        )[centre]
+    };
+    let blue = |p: u32| (p >> 16) & 0xff;
+    // LOD off → mip 0 → P hidden by the keyhole, the ray lands on Q.
+    let p_mip0 = render_at(&mut renderer, 0.0);
+    assert_eq!(
+        blue(p_mip0),
+        140,
+        "mip 0: focus plane 101 must hide plate P and hit Q: {p_mip0:#010x}"
+    );
+    // mip ≥ 1: the floored plane exposes P's cell (100 >> m == 101 >> m).
+    let p_coarse = render_at(&mut renderer, 100.0);
+    assert!(
+        blue(p_coarse) < 120,
+        "coarse mip: floor formula must expose plate P: {p_coarse:#010x}"
+    );
+}
+
+/// OC.2 — the keyhole is a VIEW aid (entry-doc non-goal): a wall
+/// hidden by the cutout still casts its sun shadow (the shadow march
+/// never sees the cutout) — the exact opposite of the CA clip's
+/// "world as if removed" gate, pinned side-by-side against it.
+#[test]
+fn scene_dda_cutout_hidden_wall_still_shadows() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    // Floor at z=100 + wall x ∈ [16,18) rising z ∈ [90, 100).
+    let chunk = decompress_chunk(&floor_with_wall_chunk(vsid, 16, 18, 90));
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    // Shallow shoulder view from −x: the wall stands BETWEEN the eye
+    // and the character column at (20, 16); the centre ray crosses it
+    // at z ≈ 92 and, once the keyhole melts it, lands on the floor
+    // beyond at x ≈ 24 — inside the wall's sun shadow.
+    let (fx, fz) = (0.747_41_f32, 0.664_36_f32); // normalize(18, 0, 16)
+    let cam = Camera {
+        position: [2.0, 16.0, 80.0],
+        right: [fz, 0.0, -fx],
+        down: [0.0, 1.0, 0.0],
+        forward: [fx, 0.0, fz],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let centre = (h / 2 * w + w / 2) as usize;
+    let lum = |p: u32| (p & 0xff) + ((p >> 8) & 0xff) + ((p >> 16) & 0xff);
+    let render = |r: &mut HeadlessSceneRenderer, clip: Option<i32>, focus_z: i32| {
+        r.render_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            &[GridWorldTransform {
+                z_clip: clip,
+                cutout_focus_z: focus_z,
+                cutout_focus_local: [20.0, 16.0, 96.0],
+                ..GridWorldTransform::default()
+            }],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )[centre]
+    };
+    // Sun toward −x and up: the wall shadows the floor strip BEYOND
+    // it (x ≳ 18) — exactly what the cut ray lands on.
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    renderer.set_scene_lights(SceneLights {
+        enabled: true,
+        grid_sun_dirs: vec![[-s, 0.0, -s]],
+        sun_color: [1.0; 3],
+        sun_intensity: 3.0,
+        sun_casts_shadow: true,
+        ambient: [0.5; 3],
+        shadow_strength: 1.0,
+        shadow_bias: 1.5,
+        shadow_max_dist: 512.0,
+        shadow_max_steps: 256,
+        ..SceneLights::default()
+    });
+    // Uncut baseline: the centre pixel is the (sun-lit) wall face.
+    let base = render(&mut renderer, None, i32::MIN);
+    // Keyhole around the column behind the wall: the wall melts, the
+    // revealed floor beyond stays in the hidden wall's shadow.
+    renderer.set_view_cutout(Some(GpuViewCutout {
+        tan_outer: 10.0,
+        tan_inner: 10.0,
+        margin: 1.0,
+    }));
+    let cut = render(&mut renderer, None, 100);
+    assert_ne!(cut, base, "the keyhole must melt the wall at the centre");
+    // Contrast: the CA clip REMOVES the wall from the world — the same
+    // floor point brightens (no occluder left to shadow it).
+    renderer.set_view_cutout(None);
+    let clipped = render(&mut renderer, Some(100), i32::MIN);
+    assert!(
+        lum(clipped) > lum(cut),
+        "world-removal must unshadow what the view cutout keeps dark: \
+         cut {cut:#010x} clipped {clipped:#010x}"
     );
 }

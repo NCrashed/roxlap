@@ -572,6 +572,8 @@ impl App {
             world_shadow: None,
             // CA.0 — the host's single-chunk world has no deck clip.
             z_clip: None,
+            // OC.0 — nor a view cutout (first-person oracle host).
+            cutout: None,
         };
 
         // The world is one chunk; its brick occupancy is independent of

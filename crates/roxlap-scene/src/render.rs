@@ -315,6 +315,132 @@ fn grid_local_lights<'a>(
     }
 }
 
+/// OC.0 — the frame's view cutout ("keyhole", stage OC) as the facade
+/// hands it to the composed render: the view-cone half-angles (already
+/// derived from the keyhole's pixel radius under the frame's own
+/// projection — hazard 1: never window/host pixels; angles are
+/// resolution- and rotation-invariant) plus the world-space camera +
+/// focus the per-grid loop converts into each grid's frame (exactly
+/// like the lights / CA clip conversions). Per-frame VIEW state —
+/// primary rays only: shadows, occluders, collision and gameplay
+/// raycasts never see it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneViewCutout {
+    /// Tangent of the cone's outer half-angle (`radius_px / focal`).
+    pub tan_outer: f32,
+    /// Tangent of the full-reveal inner half-angle
+    /// (`(radius − feather)/focal`, clamped ≥ 0): the reveal distance
+    /// tapers linearly to zero between the two.
+    pub tan_inner: f32,
+    /// World-space focus point (the controlled character).
+    pub focus_world: [f64; 3],
+    /// How far short of the character column the reveal stops, WORLD
+    /// units (non-negative); per grid it converts to voxel units
+    /// (`/vws`) before entering the ray loop.
+    pub margin: f32,
+    /// Focus-plane bias, WORLD units along grid-local z (z-down:
+    /// positive lowers the plane, cutting more). Divided by the grid's
+    /// `voxel_world_size` at the per-grid conversion.
+    pub z_bias: f64,
+}
+
+/// The composed render's bundled per-frame inputs: the positional
+/// wrapper ladder (`render_scene_composed` → `_with_materials` →
+/// `_with_materials_scratch`) had reached 17 arguments with adjacent
+/// same-typed `Option`s a compiler can't tell apart — a swapped slot
+/// would compile fine. `#[non_exhaustive]`: construct with
+/// [`ComposedFrameParams::new`] and override fields, so future frame
+/// inputs (OC.4 ghost mode, …) are field additions, not new wrappers.
+#[non_exhaustive]
+pub struct ComposedFrameParams<'a> {
+    /// World camera.
+    pub camera: &'a Camera,
+    /// Projection + scan settings.
+    pub settings: &'a OpticastSettings,
+    /// Fog + per-face side shades.
+    pub fog: CpuFog,
+    /// Solid sky colour for the per-grid temp pre-fill.
+    pub sky_color: u32,
+    /// Optional textured sky panorama.
+    pub sky: Option<&'a Sky>,
+    /// TV — global voxel-material palette.
+    pub materials: Option<&'a MaterialTable>,
+    /// TV.4 — terrain colour→material map.
+    pub terrain_materials: &'a [(Rgb, u8)],
+    /// CPU.1 — world-space dynamic lights (transformed per grid).
+    pub lights: CpuLights<'a>,
+    /// XS.2 — sprite-volume occluder (sprites cast onto terrain).
+    pub sprite_occluder: Option<&'a dyn WorldOccluder>,
+    /// OC — the frame's view cutout (keyhole).
+    pub view_cutout: Option<&'a SceneViewCutout>,
+}
+
+impl<'a> ComposedFrameParams<'a> {
+    /// Params with every optional input off — override what differs.
+    #[must_use]
+    pub fn new(camera: &'a Camera, settings: &'a OpticastSettings) -> Self {
+        Self {
+            camera,
+            settings,
+            fog: CpuFog::default(),
+            sky_color: 0,
+            sky: None,
+            materials: None,
+            terrain_materials: &[],
+            lights: CpuLights::default(),
+            sprite_occluder: None,
+            view_cutout: None,
+        }
+    }
+}
+
+/// The composed multi-grid render with its per-frame inputs bundled
+/// ([`ComposedFrameParams`]) — the production entry point (the
+/// positional wrappers below predate it and forward here). Caller
+/// pre-fills `fb` with sky and `zb` with `INFINITY`; grids z-merge in.
+#[must_use]
+pub fn render_scene_composed_frame(
+    fb: &mut [u32],
+    zb: &mut [f32],
+    pitch_pixels: usize,
+    width: u32,
+    height: u32,
+    scene: &mut Scene,
+    params: &ComposedFrameParams<'_>,
+    scratch: &mut SceneRenderScratch,
+) -> RenderOutcome {
+    render_scene_composed_scissored(
+        fb,
+        zb,
+        pitch_pixels,
+        width,
+        height,
+        scene,
+        params,
+        true,
+        scratch,
+    )
+}
+
+/// OC — the view cutout's focus in a grid's frame: world focus →
+/// grid-local VOXEL coordinates plus the biased focus-plane z
+/// (`floor()` into the kernels' `>> mip` integer domain). The ONE
+/// conversion both backends' facades feed their kernels from — a
+/// one-voxel drift between hand-copies would cut the floor out from
+/// under the character on one backend only.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn cutout_grid_local(
+    focus_world: DVec3,
+    z_bias: f64,
+    transform: &GridTransform,
+) -> (DVec3, i32) {
+    let vws = transform.voxel_world_size;
+    let local = (transform.rotation.inverse() * (focus_world - transform.origin)) / vws;
+    let plane = (local.z + z_bias / vws).floor() as i32;
+    (local, plane)
+}
+
 /// Outcome of a [`render_scene`] / [`render_scene_composed`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderOutcome {
@@ -454,6 +580,10 @@ pub fn render_scene(
             world_shadow: None,
             // CA.0 — per-grid cutaway clip (unread until CA.1).
             z_clip: grid.z_clip,
+            // OC — the view cutout flows through the composed path only
+            // (per-frame facade state, like lights); the direct path
+            // renders uncut.
+            cutout: None,
         };
         // Scan-cutoff copy (identity at vws == 1.0 → same &settings).
         let grid_settings;
@@ -711,23 +841,19 @@ pub fn render_scene_composed(
     sky_color: u32,
     sky: Option<&Sky>,
 ) -> RenderOutcome {
+    let mut params = ComposedFrameParams::new(camera, settings);
+    params.fog = fog;
+    params.sky_color = sky_color;
+    params.sky = sky;
     render_scene_composed_scissored(
         fb,
         zb,
         pitch_pixels,
         width,
         height,
-        fog,
         scene,
-        camera,
-        settings,
-        sky_color,
-        sky,
+        &params,
         true,
-        None,
-        &[],
-        CpuLights::default(),
-        None,
         &mut SceneRenderScratch::default(),
     )
 }
@@ -757,31 +883,32 @@ pub fn render_scene_composed_with_materials(
     // grids-only shadows.
     sprite_occluder: Option<&dyn WorldOccluder>,
 ) -> RenderOutcome {
+    let mut params = ComposedFrameParams::new(camera, settings);
+    params.fog = fog;
+    params.sky_color = sky_color;
+    params.sky = sky;
+    params.materials = materials;
+    params.terrain_materials = terrain_materials;
+    params.lights = lights;
+    params.sprite_occluder = sprite_occluder;
     render_scene_composed_scissored(
         fb,
         zb,
         pitch_pixels,
         width,
         height,
-        fog,
         scene,
-        camera,
-        settings,
-        sky_color,
-        sky,
+        &params,
         true,
-        materials,
-        terrain_materials,
-        lights,
-        sprite_occluder,
         &mut SceneRenderScratch::default(),
     )
 }
 
 /// [`render_scene_composed_with_materials`] with a caller-owned
-/// [`SceneRenderScratch`] (PF.7) — the per-frame render path: the temp
-/// buffer pair and per-grid scratch are reused across frames instead of
-/// re-allocated per call.
+/// [`SceneRenderScratch`] (PF.7) — the temp buffer pair and per-grid
+/// scratch are reused across frames instead of re-allocated per call.
+/// (New inputs land as [`ComposedFrameParams`] fields consumed by
+/// [`render_scene_composed_frame`] — this positional family is frozen.)
 #[allow(clippy::too_many_arguments)]
 pub fn render_scene_composed_with_materials_scratch(
     fb: &mut [u32],
@@ -801,23 +928,23 @@ pub fn render_scene_composed_with_materials_scratch(
     sprite_occluder: Option<&dyn WorldOccluder>,
     scratch: &mut SceneRenderScratch,
 ) -> RenderOutcome {
+    let mut params = ComposedFrameParams::new(camera, settings);
+    params.fog = fog;
+    params.sky_color = sky_color;
+    params.sky = sky;
+    params.materials = materials;
+    params.terrain_materials = terrain_materials;
+    params.lights = lights;
+    params.sprite_occluder = sprite_occluder;
     render_scene_composed_scissored(
         fb,
         zb,
         pitch_pixels,
         width,
         height,
-        fog,
         scene,
-        camera,
-        settings,
-        sky_color,
-        sky,
+        &params,
         true,
-        materials,
-        terrain_materials,
-        lights,
-        sprite_occluder,
         scratch,
     )
 }
@@ -835,24 +962,26 @@ fn render_scene_composed_scissored(
     pitch_pixels: usize,
     width: u32,
     height: u32,
-    fog: CpuFog,
     scene: &mut Scene,
-    camera: &Camera,
-    settings: &OpticastSettings,
-    sky_color: u32,
-    sky: Option<&Sky>,
+    params: &ComposedFrameParams<'_>,
     scissor: bool,
-    materials: Option<&MaterialTable>,
-    terrain_materials: &[(Rgb, u8)],
-    // CPU.1 — world-space dynamic lights, transformed per grid in the loop.
-    lights: CpuLights<'_>,
-    // XS.2 — world-space occluder for sprite volumes (so sprites cast shadows
-    // onto terrain). Composited with the per-frame grid occluder. `None` ⇒
-    // grids only.
-    sprite_occluder: Option<&dyn WorldOccluder>,
     // PF.7 — caller-owned reusable buffers (see [`SceneRenderScratch`]).
     scratch: &mut SceneRenderScratch,
 ) -> RenderOutcome {
+    // Every field is `Copy` (values or shared refs) — unpack under the
+    // historical local names so the body reads unchanged.
+    let &ComposedFrameParams {
+        camera,
+        settings,
+        fog,
+        sky_color,
+        sky,
+        materials,
+        terrain_materials,
+        lights,
+        sprite_occluder,
+        view_cutout,
+    } = params;
     debug_assert_eq!(fb.len(), zb.len());
     let pixel_count = (width as usize) * (height as usize);
     debug_assert_eq!(fb.len(), pixel_count);
@@ -1247,6 +1376,31 @@ fn render_scene_composed_scissored(
             world_shadow,
             // CA.0 — per-grid cutaway clip (unread until CA.1).
             z_clip: grid.z_clip,
+            // OC.0 — the frame's view cutout in this grid's terms:
+            // world focus → grid-local voxel coordinates exactly like
+            // the light transforms above; the reveal distance is a
+            // LINEAR world→voxel conversion (`/vws`, hazard 3 — the
+            // per-cell rule measures Euclidean cell distances, not
+            // opticast's `vws²` ray depth); the cone half-angles are
+            // rotation/scale-invariant and pass through.
+            cutout: view_cutout.map(|c| {
+                // The SHARED world→grid conversion (both backends'
+                // facades call it — see [`cutout_grid_local`]).
+                let (local_focus, focus_z) =
+                    cutout_grid_local(DVec3::from_array(c.focus_world), c.z_bias, &grid.transform);
+                #[allow(clippy::cast_possible_truncation)]
+                roxlap_core::dda::CpuCutout {
+                    focus_local: [
+                        local_focus.x as f32,
+                        local_focus.y as f32,
+                        local_focus.z as f32,
+                    ],
+                    tan_outer: c.tan_outer,
+                    tan_inner: c.tan_inner,
+                    margin: (f64::from(c.margin) / vws) as f32,
+                    focus_z,
+                }
+            }),
         };
         // Effective render mip + brick cache were prepared above
         // (DDA.6 uniform per-grid mip, DDA.7 cross-frame cache).
@@ -1415,23 +1569,18 @@ mod tests {
             let n = (XRES as usize) * (YRES as usize);
             let mut fb = vec![0u32; n];
             let mut zb = vec![f32::INFINITY; n];
+            let mut params = ComposedFrameParams::new(&cam, &settings);
+            params.sky_color = 0x0011_2233;
+            params.lights = lights;
             render_scene_composed_scissored(
                 &mut fb,
                 &mut zb,
                 XRES as usize,
                 XRES,
                 YRES,
-                CpuFog::default(),
                 &mut scene,
-                &cam,
-                &settings,
-                0x0011_2233,
-                None,
+                &params,
                 false,
-                None,
-                &[],
-                lights,
-                None,
                 &mut SceneRenderScratch::default(),
             );
             fb.iter()
@@ -1548,26 +1697,21 @@ mod tests {
             let n = (XRES as usize) * (YRES as usize);
             let mut fb = vec![0u32; n];
             let mut zb = vec![f32::INFINITY; n];
+            let mut params = ComposedFrameParams::new(&cam, &settings);
+            params.sky_color = 0x0011_2233;
+            params.lights = CpuLights {
+                sun_casts_shadow: casts,
+                ..base
+            };
             render_scene_composed_scissored(
                 &mut fb,
                 &mut zb,
                 XRES as usize,
                 XRES,
                 YRES,
-                CpuFog::default(),
                 &mut scene,
-                &cam,
-                &settings,
-                0x0011_2233,
-                None,
+                &params,
                 false,
-                None,
-                &[],
-                CpuLights {
-                    sun_casts_shadow: casts,
-                    ..base
-                },
-                None,
                 &mut SceneRenderScratch::default(),
             );
             fb.iter()
@@ -2140,23 +2284,18 @@ mod tests {
             let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
             let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
             let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+            let mut params = ComposedFrameParams::new(&camera, &settings);
+            params.fog = fog;
+            params.sky_color = sky_color;
             render_scene_composed_scissored(
                 &mut fb,
                 &mut zb,
                 XRES as usize,
                 XRES,
                 YRES,
-                fog,
                 scene,
-                &camera,
-                &settings,
-                sky_color,
-                None,
+                &params,
                 scissor,
-                None,
-                &[],
-                CpuLights::default(),
-                None,
                 &mut SceneRenderScratch::default(),
             );
             fb
@@ -2779,6 +2918,107 @@ mod tests {
         let cache = scene.grid(id).unwrap().billboards.as_ref().unwrap();
         assert_eq!(cache.built_z_clip, None, "stale-clip cache must rebuild");
         assert_eq!(solid_px(&scene), unclipped, "unclipped impostor restored");
+    }
+
+    /// OC.1 — composed render with only a view cutout set.
+    fn render_composed_cutout(
+        scene: &mut Scene,
+        camera: &Camera,
+        cutout: Option<&SceneViewCutout>,
+    ) -> Vec<u32> {
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        let mut params = ComposedFrameParams::new(camera, &settings);
+        params.fog = fog;
+        params.sky_color = sky_color;
+        params.view_cutout = cutout;
+        let _ = render_scene_composed_frame(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            scene,
+            &params,
+            &mut SceneRenderScratch::default(),
+        );
+        fb
+    }
+
+    /// OC.1 (hazard 3) — the cutout's world→grid conversion is
+    /// vws-aware: on a `vws = 0.25` grid the focus (and with it the
+    /// column + focus plane) must land at `world/vws` voxel
+    /// coordinates. An unscaled conversion would put the plane at
+    /// local z 30 instead of 120 — the z-gate would keep the wall and
+    /// the centre pixel would stay WALL.
+    #[test]
+    fn cutout_t_reveal_scales_with_voxel_world_size() {
+        const WALL: VoxColor = VoxColor(0x80_C0_40_40);
+        const BACK: VoxColor = VoxColor(0x80_40_C0_40);
+        let mut scene = Scene::new();
+        let mut t = GridTransform::at(DVec3::ZERO);
+        t.voxel_world_size = 0.25;
+        let id = scene.add_grid(t);
+        let grid = scene.grid_mut(id).unwrap();
+        // Grid-local planes: wall at y=40 (world y 10), back wall at
+        // y=120 (world y 30), both spanning the full x/z extent.
+        grid.set_rect(IVec3::new(0, 40, 0), IVec3::new(127, 40, 255), Some(WALL));
+        grid.set_rect(IVec3::new(0, 120, 0), IVec3::new(127, 120, 255), Some(BACK));
+        // World camera at y=2 looking +y: wall at world depth 8, back
+        // wall at world depth 28. Centre ray at world z 16 = local 64.
+        let camera = camera_at([16.0, 2.0, 16.0]);
+        let centre = (usize::try_from(YRES / 2).unwrap() * XRES as usize) + XRES as usize / 2;
+        // Whole-frustum cone; the character column at world y 20 sits
+        // between the wall (10) and the back wall (30), so the wall
+        // cuts and the back wall survives. Focus plane at local z 120
+        // (world z 30), well below the centre ray's local z 64.
+        let cut = SceneViewCutout {
+            tan_outer: 10.0,
+            tan_inner: 10.0,
+            focus_world: [16.0, 20.0, 30.0],
+            margin: 1.0,
+            z_bias: 0.0,
+        };
+        let fb = render_composed_cutout(&mut scene, &camera, Some(&cut));
+        assert_eq!(
+            fb[centre], BACK.0,
+            "the scaled grid's wall must cut in front of the column, got {:08x}",
+            fb[centre]
+        );
+        // Negative control: no cutout → the wall.
+        let fb = render_composed_cutout(&mut scene, &camera, None);
+        assert_eq!(fb[centre], WALL.0, "uncut render must show the wall");
+    }
+
+    /// OC.1 (hazard 8) — Far-tier billboards are naturally unaffected:
+    /// the impostor blit path never consults the cutout, so a Far
+    /// render with an everything-revealing cutout is byte-identical
+    /// to the uncut render.
+    #[test]
+    fn cutout_far_billboards_unaffected() {
+        let (mut scene, id) = build_one_grid_scene(DVec3::new(0.0, 200.0, 0.0));
+        scene.grid_mut(id).unwrap().lod_thresholds = crate::LodThresholds {
+            r_near: 0.0,
+            r_mid: 0.0,
+            mid_mip_levels: None,
+            mid_mip_scan_dist: None,
+        };
+        let camera = camera_at([64.0, 0.0, 100.0]);
+        let base = render_composed_cutout(&mut scene, &camera, None);
+        let cut = SceneViewCutout {
+            tan_outer: 10.0,
+            tan_inner: 10.0,
+            focus_world: [64.0, 400.0, 100.0],
+            margin: 0.0,
+            z_bias: 0.0,
+        };
+        let with_cut = render_composed_cutout(&mut scene, &camera, Some(&cut));
+        assert_eq!(
+            base, with_cut,
+            "the Far impostor blit must ignore the view cutout"
+        );
     }
 
     /// Hybrid scene: one Near grid + one Far grid. Both must render

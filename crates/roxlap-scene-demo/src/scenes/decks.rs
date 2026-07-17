@@ -30,25 +30,29 @@ use crate::scene_api::{
 };
 
 // ---- ship geometry (ship-grid-local, z-down) -------------------------
+// pub(crate): the Boarding scene (stage OC) walks the same shiplet.
 
 /// Hull XY extent (inclusive).
-const HULL_X: (i32, i32) = (24, 103);
-const HULL_Y: (i32, i32) = (32, 95);
+pub(crate) const HULL_X: (i32, i32) = (24, 103);
+pub(crate) const HULL_Y: (i32, i32) = (32, 95);
 /// Roof plate top (the shallowest hull voxel).
-const ROOF_Z: i32 = 240;
+pub(crate) const ROOF_Z: i32 = 240;
 /// Top of each deck's floor plate, top deck first. Floors are 4 voxels
-/// thick; the last one is the hull bottom (313). The chz=0/chz=1 chunk
+/// thick; the last one is the hull bottom (321). The chz=0/chz=1 chunk
 /// boundary (z = 256) falls INSIDE deck 1, so the hull genuinely spans
 /// stacked chunks — the case the absolute-z clip formula exists for.
-const FLOOR_TOPS: [i32; 3] = [262, 286, 310];
+/// The bilge is 8 voxels TALLER than the upper decks (OC.3 visual
+/// pass: with the 8-deep flood a swimming 12-voxel body floated with
+/// its head a couple of voxels under the old ceiling).
+pub(crate) const FLOOR_TOPS: [i32; 3] = [262, 286, 318];
 /// The cut plane per deck view: `z_clip` = the first VISIBLE layer.
 /// Index 0 = whole ship (no clip), 1..=3 = expose that deck.
-const DECK_CLIPS: [Option<i32>; 4] = [None, Some(242), Some(266), Some(290)];
-/// Ship grid world origin: hull bottom (local 313) lands flush on the
+pub(crate) const DECK_CLIPS: [Option<i32>; 4] = [None, Some(242), Some(266), Some(290)];
+/// Ship grid world origin: hull bottom (local 321) lands flush on the
 /// ground surface (world 419).
-const SHIP_ORIGIN_Z: f64 = 106.0;
+pub(crate) const SHIP_ORIGIN_Z: f64 = 98.0;
 /// Ground surface (world z, z-down: the plate spans 420..440).
-const GROUND_TOP: i32 = 420;
+pub(crate) const GROUND_TOP: i32 = 420;
 
 const HULL_RGB: VoxColor = VoxColor(0x80_62_66_70);
 /// Per-deck floor colours (top → bottom): wood, steel, dark bilge.
@@ -60,8 +64,156 @@ const FLOOR_RGB: [VoxColor; 3] = [
 const GROUND_RGB: VoxColor = VoxColor(0x80_4A_5E_3C);
 /// Flood water (bottom deck) — mapped to a Beer–Lambert volumetric
 /// material in `enter`, WT-style.
-const WATER_RGB: VoxColor = VoxColor(0x80_28_54_98);
-const MAT_WATER: u8 = 1;
+pub(crate) const WATER_RGB: VoxColor = VoxColor(0x80_28_54_98);
+pub(crate) const MAT_WATER: u8 = 1;
+
+/// OC.3 — stairwell footprints (grid-local): one per deck pair, on
+/// opposite room sides. 8 steps × 4 voxels along x, each dropping 3
+/// (the 24-voxel deck spacing); a walking body with `step_up > 3`
+/// climbs them back up.
+const STAIR_X: (i32, i32) = (64, 96);
+const STAIR_YS: [(i32, i32); 2] = [(38, 46), (82, 90)];
+
+/// Build the Decks/Boarding world: a two-chunk ground plate + the
+/// 3-deck shiplet (its own grid, stacked chz chunks) with the flooded
+/// bilge. `with_stairs` additionally carves a stairwell through each
+/// deck floor and builds the 3-voxel steps the Boarding character
+/// walks — the plain Decks view keeps the sealed hull its captures pin.
+pub(crate) fn build_ship_world(with_stairs: bool) -> (Scene, GridId) {
+    let mut scene = Scene::new();
+
+    // Ground: two chunks along x (world XY [0,256) × [0,128)) so
+    // the beside-the-ship actor can stand OUTSIDE the ship grid's
+    // chunk footprint — the footprint rule's "never affected" case.
+    let ground = scene.add_grid(GridTransform::identity());
+    scene.grid_mut(ground).unwrap().set_rect(
+        IVec3::new(0, 0, GROUND_TOP),
+        IVec3::new(255, 127, GROUND_TOP + 20),
+        Some(GROUND_RGB),
+    );
+
+    // The shiplet, its own grid so the clip stays grid-local.
+    let ship = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, SHIP_ORIGIN_Z)));
+    {
+        let g = scene.grid_mut(ship).unwrap();
+        let (x0, x1) = HULL_X;
+        let (y0, y1) = HULL_Y;
+        // Roof plate.
+        g.set_rect(
+            IVec3::new(x0, y0, ROOF_Z),
+            IVec3::new(x1, y1, ROOF_Z + 1),
+            Some(HULL_RGB),
+        );
+        // Perimeter walls, roof to hull bottom.
+        let zb = FLOOR_TOPS[2] + 3;
+        for (wx0, wy0, wx1, wy1) in [
+            (x0, y0, x1, y0 + 1),
+            (x0, y1 - 1, x1, y1),
+            (x0, y0, x0 + 1, y1),
+            (x1 - 1, y0, x1, y1),
+        ] {
+            g.set_rect(
+                IVec3::new(wx0, wy0, ROOF_Z),
+                IVec3::new(wx1, wy1, zb),
+                Some(HULL_RGB),
+            );
+        }
+        // Deck floors (the last is the hull bottom).
+        for (d, &ft) in FLOOR_TOPS.iter().enumerate() {
+            g.set_rect(
+                IVec3::new(x0, y0, ft),
+                IVec3::new(x1, y1, ft + 3),
+                Some(FLOOR_RGB[d]),
+            );
+        }
+        // Hazard 6 — flood the bottom deck: ordinary water voxels in
+        // the slabs (they clip with everything else) + the physics
+        // volume for completeness. Placed BEFORE the crates so the
+        // bilge crate overwrites its water cells and reads as a
+        // submerged solid through the Beer–Lambert surface, not a
+        // washed-away hole.
+        g.set_rect(
+            IVec3::new(x0 + 2, y0 + 2, FLOOR_TOPS[2] - 8),
+            IVec3::new(x1 - 2, y1 - 2, FLOOR_TOPS[2] - 1),
+            Some(WATER_RGB),
+        );
+        g.add_water_volume(
+            IVec3::new(x0 + 2, y0 + 2, FLOOR_TOPS[2] - 8),
+            IVec3::new(x1 - 2, y1 - 2, FLOOR_TOPS[2] - 1),
+        );
+        // A crate per deck so the interiors read as rooms. 12
+        // voxels tall — 4 above the 8-deep flood, so the bilge one
+        // pokes out of the water while its base reads through the
+        // Beer–Lambert surface (it overwrote its water cells).
+        for &ft in &FLOOR_TOPS {
+            g.set_rect(
+                IVec3::new(70, 58, ft - 12),
+                IVec3::new(77, 65, ft - 1),
+                Some(VoxColor(0x80_7A_5A_30)),
+            );
+        }
+        // OC.3 — the Boarding stairwells: per deck pair, carve the
+        // shaft through the UPPER deck's floor plate and build the
+        // descending steps in the room below (solid columns down to
+        // the lower plate, so water cells they cross are overwritten).
+        // Steps are 4 voxels tall (`step_up > 4` climbs them back up),
+        // so the deck drops (24 and 32) divide evenly.
+        if with_stairs {
+            for (d, &(sy0, sy1)) in STAIR_YS.iter().enumerate() {
+                let plate = FLOOR_TOPS[d];
+                let lower = FLOOR_TOPS[d + 1];
+                let (sx0, _sx1) = STAIR_X;
+                // `drop/4` steps of 4 voxels: step i's top at
+                // plate + 4(i+1), filled down to the lower plate. The
+                // LAST slot (i = n−1, top == lower) is the lower deck
+                // floor itself — building it would be a degenerate
+                // inverted z-rect that `set_rect` normalises into a
+                // 1-voxel hull-grey sill over the floor (and over the
+                // bilge flood) that the body trips on.
+                let n = (lower - plate) / 4;
+                // Shaft: the plate becomes air EXACTLY over the steps
+                // (a longer hole would leave a full-deck drop past the
+                // last step).
+                g.set_rect(
+                    IVec3::new(sx0, sy0, plate),
+                    IVec3::new(sx0 + 4 * n - 1, sy1 - 1, plate + 3),
+                    None,
+                );
+                for i in 0..n - 1 {
+                    let top = plate + 4 * (i + 1);
+                    g.set_rect(
+                        IVec3::new(sx0 + 4 * i, sy0, top),
+                        IVec3::new(sx0 + 4 * i + 3, sy1 - 1, lower - 1),
+                        Some(HULL_RGB),
+                    );
+                }
+            }
+        }
+    }
+    (scene, ship)
+}
+
+/// The per-deck cabin lights (world coords), centred in each room —
+/// shared by Decks and Boarding, culled game-side by the footprint
+/// rule (locked decision 4: the game culls, not the engine).
+pub(crate) fn cabin_lights() -> Vec<PointLight> {
+    #[allow(clippy::cast_possible_truncation)]
+    FLOOR_TOPS
+        .iter()
+        .zip([
+            [1.0_f32, 0.78, 0.45], // warm top deck
+            [0.45, 0.9, 1.0],      // cyan mid deck
+            [0.35, 0.55, 1.0],     // blue bilge
+        ])
+        .map(|(&ft, color)| PointLight {
+            position: [64.0, 56.0, (f64::from(ft) - 18.0 + SHIP_ORIGIN_Z) as f32],
+            color,
+            intensity: 3.5,
+            radius: 70.0,
+            casts_shadow: false,
+        })
+        .collect()
+}
 
 // ---- tele-iso camera --------------------------------------------------
 
@@ -114,79 +266,9 @@ pub struct DecksScene {
 impl DecksScene {
     #[must_use]
     pub fn new() -> Self {
-        let mut scene = Scene::new();
-
-        // Ground: two chunks along x (world XY [0,256) × [0,128)) so
-        // the beside-the-ship actor can stand OUTSIDE the ship grid's
-        // chunk footprint — the footprint rule's "never affected" case.
-        let ground = scene.add_grid(GridTransform::identity());
-        scene.grid_mut(ground).unwrap().set_rect(
-            IVec3::new(0, 0, GROUND_TOP),
-            IVec3::new(255, 127, GROUND_TOP + 20),
-            Some(GROUND_RGB),
-        );
-
-        // The shiplet, its own grid so the clip stays grid-local.
-        let ship = scene.add_grid(GridTransform::at(DVec3::new(0.0, 0.0, SHIP_ORIGIN_Z)));
-        {
-            let g = scene.grid_mut(ship).unwrap();
-            let (x0, x1) = HULL_X;
-            let (y0, y1) = HULL_Y;
-            // Roof plate.
-            g.set_rect(
-                IVec3::new(x0, y0, ROOF_Z),
-                IVec3::new(x1, y1, ROOF_Z + 1),
-                Some(HULL_RGB),
-            );
-            // Perimeter walls, roof to hull bottom.
-            let zb = FLOOR_TOPS[2] + 3;
-            for (wx0, wy0, wx1, wy1) in [
-                (x0, y0, x1, y0 + 1),
-                (x0, y1 - 1, x1, y1),
-                (x0, y0, x0 + 1, y1),
-                (x1 - 1, y0, x1, y1),
-            ] {
-                g.set_rect(
-                    IVec3::new(wx0, wy0, ROOF_Z),
-                    IVec3::new(wx1, wy1, zb),
-                    Some(HULL_RGB),
-                );
-            }
-            // Deck floors (the last is the hull bottom).
-            for (d, &ft) in FLOOR_TOPS.iter().enumerate() {
-                g.set_rect(
-                    IVec3::new(x0, y0, ft),
-                    IVec3::new(x1, y1, ft + 3),
-                    Some(FLOOR_RGB[d]),
-                );
-            }
-            // Hazard 6 — flood the bottom deck: ordinary water voxels in
-            // the slabs (they clip with everything else) + the physics
-            // volume for completeness. Placed BEFORE the crates so the
-            // bilge crate overwrites its water cells and reads as a
-            // submerged solid through the Beer–Lambert surface, not a
-            // washed-away hole.
-            g.set_rect(
-                IVec3::new(x0 + 2, y0 + 2, FLOOR_TOPS[2] - 8),
-                IVec3::new(x1 - 2, y1 - 2, FLOOR_TOPS[2] - 1),
-                Some(WATER_RGB),
-            );
-            g.add_water_volume(
-                IVec3::new(x0 + 2, y0 + 2, FLOOR_TOPS[2] - 8),
-                IVec3::new(x1 - 2, y1 - 2, FLOOR_TOPS[2] - 1),
-            );
-            // A crate per deck so the interiors read as rooms. 12
-            // voxels tall — 4 above the 8-deep flood, so the bilge one
-            // pokes out of the water while its base reads through the
-            // Beer–Lambert surface (it overwrote its water cells).
-            for &ft in &FLOOR_TOPS {
-                g.set_rect(
-                    IVec3::new(70, 58, ft - 12),
-                    IVec3::new(77, 65, ft - 1),
-                    Some(VoxColor(0x80_7A_5A_30)),
-                );
-            }
-        }
+        // The sealed hull (no stairwells) — the geometry the CA
+        // captures pin; Boarding builds the walkable variant.
+        let (scene, ship) = build_ship_world(false);
 
         // World-space actor spots: one per deck (standing on its floor,
         // inside the hull) + one on the ground beside the ship. The
@@ -199,23 +281,7 @@ impl DecksScene {
             .chain(std::iter::once([150.0, 56.0, GROUND_TOP as f32 - 12.0]))
             .collect();
 
-        // One cabin light per deck (world coords), centred in the room.
-        #[allow(clippy::cast_possible_truncation)]
-        let cabin_lights: Vec<PointLight> = FLOOR_TOPS
-            .iter()
-            .zip([
-                [1.0_f32, 0.78, 0.45], // warm top deck
-                [0.45, 0.9, 1.0],      // cyan mid deck
-                [0.35, 0.55, 1.0],     // blue bilge
-            ])
-            .map(|(&ft, color)| PointLight {
-                position: [64.0, 56.0, (f64::from(ft) - 18.0 + SHIP_ORIGIN_Z) as f32],
-                color,
-                intensity: 3.5,
-                radius: 70.0,
-                casts_shadow: false,
-            })
-            .collect();
+        let cabin_lights = cabin_lights();
 
         // BK.7-style capture hook: `ROXLAP_DECK=0..=3` starts on that
         // deck view (gallery shots of the cut without keyboard input).

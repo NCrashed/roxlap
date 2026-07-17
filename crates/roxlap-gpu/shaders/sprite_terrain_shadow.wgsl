@@ -5,7 +5,7 @@
 // `shield_parallel`. It re-declares the terrain occupancy bindings (16..23) and
 // duplicates scene_dda.wgsl's occupancy-reader + shadow-marcher ABI verbatim —
 // kept in lockstep with scene_dda (same buffer layouts: GridStaticMeta 176 B,
-// PerGridCamera 144 B). The 8 storage buffers push the sprite pass to 22, which
+// PerGridCamera 160 B). The 8 storage buffers push the sprite pass to 22, which
 // the renderer only binds when the device grants that many.
 const CHUNK_Z: u32 = 256u;
 const MAX_GPU_MIPS: u32 = 6u;
@@ -23,6 +23,10 @@ struct PerGridCamera {
     rot0: vec4<f32>,
     rot1: vec4<f32>,
     rot2: vec4<f32>,
+    // OC — the cutout's grid-local focus (unused here, but the
+    // array<PerGridCamera> STRIDE comes from the struct size — a
+    // truncated mirror mis-indexes every grid past 0).
+    cutout_focus_local: vec4<f32>,
 };
 struct GridStaticMeta {
     occupancy_offset: u32,

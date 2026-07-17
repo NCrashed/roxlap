@@ -165,7 +165,7 @@ impl CameraRig {
     /// CA.5 — the **tele-iso** orbit preset: place the rig `dist` back
     /// from `focus` along the (yaw, pitch) view direction, so `focus`
     /// sits dead-centre. Pair with a narrow FOV
-    /// ([`opticast_settings_fov`], ≈ 0.15 rad) for the isometric deck
+    /// (`OpticastSettings::with_fov_y`, ≈ 0.15 rad) for the isometric deck
     /// look: a distant tele camera flattens perspective convergence
     /// without any orthographic ray generation. Re-derive every frame
     /// from the CURRENT yaw/pitch to orbit `focus` under mouse-look.
@@ -197,9 +197,23 @@ pub struct CameraPose {
 /// and forwards the rest here.
 #[derive(Clone, Copy, Debug)]
 pub enum SceneInput {
-    Key { code: KeyCode, pressed: bool },
-    Mouse { button: MouseButton, pressed: bool },
-    CursorMoved { x: f64, y: f64 },
+    Key {
+        code: KeyCode,
+        pressed: bool,
+    },
+    Mouse {
+        button: MouseButton,
+        pressed: bool,
+    },
+    CursorMoved {
+        x: f64,
+        y: f64,
+    },
+    /// OC.3 — mouse-wheel scroll in "lines" (a pixel delta is folded
+    /// to lines by the host). Positive = away from the user.
+    Wheel {
+        dy: f64,
+    },
 }
 
 /// What the host lends a [`DemoScene`] each frame: the renderer, the shared

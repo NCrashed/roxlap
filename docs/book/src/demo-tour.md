@@ -30,6 +30,7 @@ cursor. WASD + mouse-look everywhere.
 | **Scale** | Per-grid `voxel_world_size`: a chunky planet (`4.0`) + a fine bobbing ship (`0.25`) at a true 16× ratio in one scene; `P` pauses the bob, `K` toggles sun shadows. | [3](scene-graph.md) |
 | **Doom** | GIF billboard sprites + an 8-way directional actor (`Q`/`E` turn it, `Space` walk/idle) — synthesised as GIFs at startup, so the full import path runs live. | [7](sprites.md) |
 | **Decks** | Cutaway deck rendering: a 3-deck shiplet under the tele-iso camera; `PgUp`/`PgDn` slides the cut (`set_grid_z_clip`), per-deck actors and cabin lights hide with their deck (the footprint rule + game-side light cull), the bilge is flooded. | [4](rendering.md) |
+| **Boarding** | The CA/OC composition in third person: a walking character (stairwells, jumps, auto-swims the flooded bilge), the deck clip following the deck they're on, and walls melting inside the keyhole (`FrameParams::view_cutout`). `K` keyhole · `V` deck-follow/manual · `C` shoulder/tele-iso · wheel resizes. | [4](rendering.md) |
 | **Picking** | Top-down cursor picking: `view_ray`/`pick`, snap-to-surface, click-to-mark. | [12](picking.md) |
 | **Primitives** | Overlay gizmos (`draw_lines`) + 2D image quads (`draw_images`) + the `pick_image` eyedropper. | [4](rendering.md) |
 | **Empty** | Just sky — the minimal `DemoScene` contract, and a handy GPU-vs-CPU present-cost baseline. | — |
@@ -52,6 +53,7 @@ variables are in [chapter 14](tuning.md)):
 | `ROXLAP_NO_MARKERS=1` | World scene: drop the LOD marker pillars (engine-only perf runs) |
 | `ROXLAP_SPRITE_GRID=n` | Sprites scene: coco field size (default 4) |
 | `ROXLAP_DECK=0..=3` | Decks scene: start on that deck view (gallery shots of the cut) |
+| `ROXLAP_BOARD_DECK=0..=2` | Boarding scene: spawn the character on that deck (2 = the flooded bilge) |
 | `ROXLAP_NO_CRUMBLE=1` | Cave demo: plain carves, no island crumble ([chapter 10](destruction.md)) |
 | `ROXLAP_RKC=path`, `ROXLAP_RKC_DUMP=path`, `ROXLAP_KFA_DUMP=path` | Animation scene: load / dump character containers |
 | `ROXLAP_AUTOFIRE=1`, `ROXLAP_NOFLASH=1`, `ROXLAP_FPS_LOG=1` | Particles / host probes: scripted explosions, flash A/B, per-second FPS log |

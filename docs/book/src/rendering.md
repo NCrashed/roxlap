@@ -215,6 +215,67 @@ ships the full pattern as the **Decks** tab
 (`ROXLAP_SCENE=Decks cargo run -p roxlap-scene-demo`, `PgUp`/`PgDn`
 slides the cut).
 
+### The keyhole cutout (third person)
+
+The deck clip cuts *ceilings above* a grid-state plane; for
+third-person play you also need to cut the *walls in front* — and
+"front" rotates with the camera, so it cannot be grid state. That is
+`FrameParams::view_cutout`: a camera-relative, screen-space keyhole
+(the classic BG3/Divinity occlusion cutout) around a world-space
+focus point, re-derived by the facade every frame:
+
+```rust,noplayground
+// Open a keyhole around the controlled character. Geometry between
+// the camera and the focus, inside a `radius_px` screen circle around
+// its projection and above the focus plane, renders as air.
+frame.view_cutout = Some(ViewCutout {
+    focus_world: chest,   // the character, world space
+    radius_px: 110.0,     // logical pixels (mouse wheel it)
+    feather_px: 24.0,     // radial taper band inside the radius
+    margin: 1.5,          // reveal stops this short of the body
+    z_bias: 6.5,          // cutting plane at the FEET (floor stays)
+});
+```
+
+A cell is hidden only when **all three** hold: its **centre** lies
+inside the view cone around the eye→focus axis (the cone is what
+`radius_px` means — the screen circle it subtends around the
+projected focus), it is closer to the eye than the nearest point of
+the character COLUMN at the cell's own height (minus `margin` — so an
+obstacle the character stands right behind melts down to the boots,
+not just to a chest-level sphere), and its grid-local z is above the
+focus plane — so the floor in front of the character stays. Classifying
+whole cells (rather than gating each ray by a screen window) keeps
+the cut edge cube-granular and spatially coherent, exactly like the
+deck clip's edges — a per-pixel rule leaves sub-cell fragments that
+read as ragged teeth wherever the boundary crosses a floor or wall at
+a shallow angle. Across the feather band the reveal *distance* tapers
+linearly to zero, closing the hole into a smooth funnel; the result
+is deterministic (identical formula on both backends) — no dither, no
+temporal shimmer. Cut faces reuse the same run-top colour fallback as
+the deck clip.
+
+**A view aid, not world removal** — the deliberate opposite of
+`z_clip`'s "world as if removed": the cutout applies to **primary
+rays only**. A keyhole-hidden wall keeps casting sun shadow into the
+hole, keeps blocking audio and gameplay raycasts, and keeps its
+collision. GPU depth picks read the cut render's depth, so clicking
+*through* the keyhole selects what you see — usually exactly what a
+third-person cursor wants. Per-frame view state: nothing is
+persisted, and `None` (the default) is byte-identical to the plain
+render.
+
+**When to use which:** deck/iso views → `Grid::z_clip`; a follow
+camera behind walls → `view_cutout`; and they compose — the natural
+pattern is a deck clip that FOLLOWS the character (expose the deck
+they are on) with the keyhole handling the walls in front. The demo's
+**Boarding** tab (`ROXLAP_SCENE=Boarding cargo run -p
+roxlap-scene-demo`) walks a character over the Decks shiplet with a
+shoulder camera that never raycast-clamps its boom, and every mode on
+a hotkey: `K` keyhole on/off, `V` deck-follow clip vs manual
+(`PgUp`/`PgDn`), `C` shoulder vs the tele-iso deck orbit, wheel =
+keyhole radius.
+
 ## Where next
 
 - [The render pipeline](render-pipeline.md) — the fixed-resolution /

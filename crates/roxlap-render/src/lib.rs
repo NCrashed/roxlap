@@ -979,6 +979,102 @@ pub struct FrameParams<'a> {
     /// — but it is a general grade hook (damage flash, night vision).
     /// `None` (the default) is byte-identical to the pre-WT.2 output.
     pub tint: Option<Tint>,
+    /// OC.0 — camera-relative occlusion cutout ([`ViewCutout`]) for
+    /// third-person play: walls between the camera and a world-space
+    /// **focus point** (the controlled character) become air inside a
+    /// screen-space circular keyhole around the projected focus, its
+    /// rim a smooth deterministic funnel — the classic BG3/Divinity
+    /// cutout. Both backends. Per-frame VIEW state (follows the
+    /// camera), unlike the
+    /// grid-state deck clip (`Grid::z_clip`, stage CA): primary rays
+    /// only — the cut wall keeps casting shadows, keeps blocking
+    /// audio/pathing/gameplay raycasts, keeps its collision. Composes
+    /// with the deck clip. `None` (the default) is byte-identical to
+    /// the pre-OC output.
+    pub view_cutout: Option<ViewCutout>,
+}
+
+/// OC.0 — a camera-relative "keyhole" through front geometry (stage
+/// OC). A cell is hidden iff ALL of: its centre lies inside the view
+/// cone that [`radius_px`](Self::radius_px) subtends around the
+/// eye→[`focus_world`](Self::focus_world) axis (the reveal distance
+/// tapers to zero across the feather band, closing the hole into a
+/// smooth funnel), it is closer to the eye than the nearest point of
+/// the character column at its own height minus
+/// [`margin`](Self::margin), and its grid-local z is above the focus
+/// plane (walls cut; the floor in front of the character stays).
+///
+/// The facade derives everything per frame inside the render call —
+/// the pixel radius converts to a cone angle under the frame's own
+/// projection, so the circle stays put under fixed-res / SSAA
+/// (`radius_px` / `feather_px` are given in **logical** pixels; the
+/// angles are resolution-invariant).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewCutout {
+    /// World-space focus point the keyhole opens around (typically the
+    /// controlled character's chest/head). Projected each frame; a
+    /// focus at/behind the near plane disables the cutout that frame.
+    pub focus_world: [f32; 3],
+    /// Keyhole radius in **logical** (post-resolve) pixels — the OUTER
+    /// edge; nothing is cut past it.
+    pub radius_px: f32,
+    /// Width of the radial taper band INSIDE the radius, logical
+    /// pixels: the reveal distance scales linearly from full at
+    /// `radius − feather` to zero at `radius`, so the keyhole's rim is
+    /// a deterministic geometric funnel (no dither — a stochastic edge
+    /// read as a noise mosaic on every surface it crossed). Wider =
+    /// softer, more conical rim. `<= 0` gives a hard edge.
+    pub feather_px: f32,
+    /// Reveal margin, world units: how far short of the character
+    /// COLUMN the cut stops. The reveal surface hugs the column — the
+    /// vertical segment at the focus xy between the focus plane (the
+    /// feet) and its mirror above the focus (the head) — so an
+    /// obstacle the character stands right behind melts down to the
+    /// boots; `margin` keeps a thin shell around the body un-cut.
+    pub margin: f32,
+    /// Focus-plane bias, world units along grid-local z (z-down:
+    /// positive lowers the cutting plane, hiding more; negative
+    /// raises it). Tune so doorway lintels cut while the character's
+    /// floor stays.
+    pub z_bias: f32,
+}
+
+impl ViewCutout {
+    /// A keyhole with the Boarding demo's tune around `focus_world`
+    /// (radius 110 px, feather 24 px, margin 1.5), with the cutting
+    /// plane placed just BELOW the focus (`z_bias` +0.5) — so pass a
+    /// focus near the character's FEET and the plane lands at floor
+    /// level, cutting front walls down to the boots while the floor
+    /// stays. Focusing the chest instead needs a positive `z_bias` of
+    /// the chest-to-feet distance (the demo: chest focus, bias +6.5);
+    /// the original head-level plane left waist-high wall stumps in
+    /// front of the character.
+    #[must_use]
+    pub fn new(focus_world: [f32; 3]) -> Self {
+        Self {
+            focus_world,
+            radius_px: 110.0,
+            feather_px: 24.0,
+            margin: 1.5,
+            z_bias: 0.5,
+        }
+    }
+}
+
+/// OC — the near-plane threshold both backends' cutout folds share
+/// (the CPU projection's `NEAR_Z` value): a focus at/behind it
+/// disables the keyhole for the frame.
+pub(crate) const CUTOUT_NEAR_Z: f64 = 0.0625;
+
+/// OC — the keyhole cone half-angle tangents from the pixel radius +
+/// feather and the frame's focal length (all in the SAME pixel
+/// units) — the ONE place the radius→angle shape lives; both backend
+/// adapters call it, so a drifting hand-copy can't change the hole's
+/// shape on one backend only. Returns `(tan_outer, tan_inner)`.
+pub(crate) fn cutout_cone_tans(radius_px: f32, feather_px: f32, focal_px: f32) -> (f32, f32) {
+    let tan_outer = radius_px.max(0.0) / focal_px;
+    let tan_inner = ((radius_px - feather_px).max(0.0) / focal_px).min(tan_outer);
+    (tan_outer, tan_inner)
 }
 
 /// WT.2 — a full-screen tint: every resolved pixel lerps toward
@@ -1055,6 +1151,7 @@ impl<'a> FrameParams<'a> {
             side_shades: [0; 6],
             lights: None,
             tint: None,
+            view_cutout: None,
         }
     }
 

@@ -46,10 +46,21 @@ struct PerGridCamera {
     // tested against every grid. `world_origin.xyz` is the grid origin;
     // `rot0/1/2.xyz` are the local→world rotation columns (world images of
     // grid-local axes x/y/z). Packed here for the same buffer-limit reason.
+    // OC.0 — `rot0.w` carries the view cutout's focus-plane z in this
+    // grid's local frame (an exact integer-valued f32, NOT a
+    // bit-carrier; grid-local absolute voxel z, z-down; `i32::MIN` =
+    // no cutout — the hit branch's first-gate sentinel).
     world_origin: vec4<f32>,
     rot0: vec4<f32>,
     rot1: vec4<f32>,
     rot2: vec4<f32>,
+    // OC — the view cutout's focus in THIS grid's frame (xyz,
+    // march/world units; w spare), converted host-side in f64 by the
+    // same shared helper the CPU path uses — the kernel does no
+    // world→grid conversion of its own (review finding: the shader
+    // copy of the formula was a per-ray cost AND a second language to
+    // keep in lockstep). Zero while the cutout is off.
+    cutout_focus_local: vec4<f32>,
 };
 
 struct GridStaticMeta {
@@ -163,6 +174,15 @@ struct Uniforms {
     // Two scalar pads (NOT vec2<u32> — keep the Rust `[u32; 2]` layout).
     _pad7b: u32,
     _pad7c: u32,
+    // OC.0 — view cutout ("keyhole"):
+    // `cutout_a = (margin, tan_outer, tan_inner, enable)` — how far
+    // short of the character column the reveal stops (world units) +
+    // the view-cone half-angle tangents (resolution-invariant) +
+    // 1.0 while a cutout is set;
+    // `cutout_b` = spare (the focus rides per grid in
+    // `PerGridCamera.cutout_focus_local`, pre-converted host-side).
+    cutout_a: vec4<f32>,
+    cutout_b: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -1013,6 +1033,23 @@ fn march_grid(
     // stays below any real cell even after the per-chunk `>> mip`, so
     // no separate enable flag is needed.
     let z_clip = grid_cameras[g].z_clip;
+    // OC.2 — the keyhole cone (CPU `CpuCutout` mirror, per-CELL
+    // classification): the focus-plane z rides the per-grid camera
+    // (integer-valued f32 lane, `i32::MIN` sentinel = off — the
+    // FIRST, one-compare gate in the hit branch); the grid-local
+    // focus arrives PRE-CONVERTED in `cutout_focus_local` (host-side
+    // f64, shared with the CPU path), and the cone axis is
+    // eye→focus. Everything here is march-frame world units.
+    let cut_focus_z = i32(grid_cameras[g].rot0.w);
+    let cut_focus_local = grid_cameras[g].cutout_focus_local.xyz;
+    var cut_axis = vec3<f32>(0.0);
+    if (u.cutout_a.w > 0.5) {
+        let a = cut_focus_local - ray_origin;
+        let al = length(a);
+        if (al > 1e-6) {
+            cut_axis = a / al;
+        }
+    }
 
     // CA follow-up — fast-forward to the grid's chunk AABB: a distant
     // eye (the tele-iso deck camera sits ~1000+ world units out)
@@ -1134,6 +1171,9 @@ fn march_grid(
             // toward -∞ — the IDENTICAL formula to the CPU sampler's
             // `z_clip >> mip` (the CA.3 parity gate pins the pair).
             let z_clip_mip = z_clip >> mip;
+            // OC.2 — focus plane in mip-cells, the same floor formula
+            // as the CPU's `focus_z >> sampler.mip` (OC.2 parity gate).
+            let cut_z_mip = cut_focus_z >> mip;
             // CA follow-up — empty-block skip (see shadow_occluded):
             // the coarse SOLID mips double as brick maps, so rays
             // cross in-chunk air in 2^gap-cell jumps instead of
@@ -1289,8 +1329,61 @@ fn march_grid(
                 // absolute mip-z < z_clip_mip) read as air, resetting
                 // `prev_solid` like real air so translucent runs
                 // restart at the cut exactly as on the CPU.
-                if ((p_chunk.z * cz_mip + p_voxel.z >= z_clip_mip)
-                    && (occ_word_cached & (1u << (z_u & 31u))) != 0u) {
+                // OC.2 — keyhole hide rule (view cutout), decided per
+                // CELL by its centre (whole cubes in or out — the CPU
+                // rule verbatim): a cell above the focus plane whose
+                // centre lies inside the tapered eye→focus cone
+                // closer than the reveal distance reads as air too —
+                // PRIMARY rays only; the shadow marches never take
+                // this branch. The z compare is first and never-true
+                // when the cutout is off (`i32::MIN` sentinel), so
+                // the cone math stays off the disabled path.
+                let cell_z_abs = p_chunk.z * cz_mip + p_voxel.z;
+                let cell_occupied = (occ_word_cached & (1u << (z_u & 31u))) != 0u;
+                var cut_hidden = false;
+                // The occupancy bit gates the cone math (two sqrt) so
+                // only actual solid cells pay it — never the far more
+                // numerous marched air cells above the plane.
+                if (cell_occupied && cell_z_abs < cut_z_mip) {
+                    let pc = chunk_origin_world
+                        + (vec3<f32>(p_voxel) + vec3<f32>(0.5)) * vsize;
+                    let dv = pc - ray_origin;
+                    let along = dot(dv, cut_axis);
+                    if (along > 0.0) {
+                        let d2 = dot(dv, dv);
+                        let tan_c = sqrt(max(d2 - along * along, 0.0)) / along;
+                        // Radial taper: full reveal inside the inner
+                        // cone, linear to zero at the outer (hard edge
+                        // when they coincide; the subnormal-free max
+                        // keeps the degenerate division finite).
+                        let s = clamp(
+                            (u.cutout_a.y - tan_c)
+                                / max(u.cutout_a.y - u.cutout_a.z, 1.17549435e-38),
+                            0.0,
+                            1.0,
+                        );
+                        // Column-hugging reveal (the CPU rule
+                        // verbatim): reference = the nearest
+                        // character-column point at the cell's own
+                        // height — the plane z (feet, mip-0 voxels →
+                        // world via vws) mirrored around the focus
+                        // gives the column top (head).
+                        let plane = f32(cut_focus_z) * vws;
+                        let top = 2.0 * cut_focus_local.z - plane;
+                        let rz = clamp(pc.z, min(top, plane), max(top, plane));
+                        let dr = vec3<f32>(
+                            cut_focus_local.x,
+                            cut_focus_local.y,
+                            rz,
+                        ) - ray_origin;
+                        let ref_dist = length(dr);
+                        cut_hidden = sqrt(d2)
+                            < max(ref_dist - u.cutout_a.x, 0.0) * s;
+                    }
+                }
+                if (cell_z_abs >= z_clip_mip
+                    && cell_occupied
+                    && !cut_hidden) {
                     if (t_hit >= best_t) {
                         return finalize_sky_grid(touched, accum, trans, ray_dir);
                     }

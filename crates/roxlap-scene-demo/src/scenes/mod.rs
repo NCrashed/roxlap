@@ -8,6 +8,7 @@
 
 pub mod animation;
 pub mod audio;
+pub mod boarding;
 pub mod decks;
 pub mod doom;
 pub mod empty;

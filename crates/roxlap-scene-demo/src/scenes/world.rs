@@ -30,10 +30,44 @@ const WALK_SPEED: f64 = 12.0;
 /// Third-person figure: 24 slab voxels tall, drawn at
 /// `BillboardActorDef::scale` world units per voxel — 0.72 world
 /// units, deliberately smaller than the 1.8 collision body so the
-/// figure reads as a marker, not a giant.
-const FIGURE_H_VOX: u32 = 24;
-const FIGURE_W_VOX: u32 = 12;
+/// figure reads as a marker, not a giant. (pub(crate): the Boarding
+/// scene reuses the same silhouette at ship scale.)
+pub(crate) const FIGURE_H_VOX: u32 = 24;
+pub(crate) const FIGURE_W_VOX: u32 = 12;
 const FIGURE_SCALE: f32 = 0.03;
+
+/// One frame of the synthetic third-person figure: a flat 2-voxel
+/// slab silhouette — head, torso, and two legs whose spread is
+/// the walk phase. Shared with the Boarding scene (OC.3).
+pub(crate) fn figure_frame(leg_spread: u32) -> Kv6 {
+    const SKIN: VoxColor = VoxColor(0x80_d8_a8_78);
+    const TUNIC: VoxColor = VoxColor(0x80_30_60_a0);
+    const BOOTS: VoxColor = VoxColor(0x80_50_40_30);
+    let cx = FIGURE_W_VOX / 2; // 6
+    Kv6::from_fn(FIGURE_W_VOX, 2, FIGURE_H_VOX, |x, _y, z| {
+        // Slab convention (formats/src/slab.rs): z = 0 is the
+        // BOTTOM of the rendered card — flip so the crown zones
+        // below land at the top.
+        let z = FIGURE_H_VOX - 1 - z;
+        match z {
+            0..=5 => {
+                // Head: a 4-wide block centred on the body.
+                (x + 2 >= cx && x < cx + 2).then_some(SKIN)
+            }
+            6..=15 => {
+                // Torso + arms: 8 wide.
+                (x + 4 >= cx && x < cx + 4).then_some(TUNIC)
+            }
+            _ => {
+                // Legs: two 2-wide columns, `leg_spread` voxels
+                // out from centre.
+                let left = cx - 2 - leg_spread;
+                let right = cx + leg_spread;
+                ((x >= left && x < left + 2) || (x >= right && x < right + 2)).then_some(BOOTS)
+            }
+        }
+    })
+}
 
 /// Camera boom length in third person (clamped by a raycast so the
 /// camera never sits inside a hill).
@@ -85,39 +119,6 @@ impl WorldScene {
         DVec3::from(eye) + DVec3::new(0.0, 0.0, self.body.def().eye_height)
     }
 
-    /// One frame of the synthetic third-person figure: a flat 2-voxel
-    /// slab silhouette — head, torso, and two legs whose spread is
-    /// the walk phase.
-    fn figure_frame(leg_spread: u32) -> Kv6 {
-        const SKIN: VoxColor = VoxColor(0x80_d8_a8_78);
-        const TUNIC: VoxColor = VoxColor(0x80_30_60_a0);
-        const BOOTS: VoxColor = VoxColor(0x80_50_40_30);
-        let cx = FIGURE_W_VOX / 2; // 6
-        Kv6::from_fn(FIGURE_W_VOX, 2, FIGURE_H_VOX, |x, _y, z| {
-            // Slab convention (formats/src/slab.rs): z = 0 is the
-            // BOTTOM of the rendered card — flip so the crown zones
-            // below land at the top.
-            let z = FIGURE_H_VOX - 1 - z;
-            match z {
-                0..=5 => {
-                    // Head: a 4-wide block centred on the body.
-                    (x + 2 >= cx && x < cx + 2).then_some(SKIN)
-                }
-                6..=15 => {
-                    // Torso + arms: 8 wide.
-                    (x + 4 >= cx && x < cx + 4).then_some(TUNIC)
-                }
-                _ => {
-                    // Legs: two 2-wide columns, `leg_spread` voxels
-                    // out from centre.
-                    let left = cx - 2 - leg_spread;
-                    let right = cx + leg_spread;
-                    ((x >= left && x < left + 2) || (x >= right && x < right + 2)).then_some(BOOTS)
-                }
-            }
-        })
-    }
-
     /// Register the figure's walk (2 frames) + idle (1 frame) states
     /// and spawn the actor at the body.
     fn spawn_tp_actor(&mut self, ctx: &mut SceneCtx) -> Option<BillboardActorId> {
@@ -126,15 +127,13 @@ impl WorldScene {
                 .expect("figure frames are non-empty + same dims")
         };
         let walk = ctx.renderer.add_voxel_clip(
-            &clip(&[Self::figure_frame(3), Self::figure_frame(0)])
+            &clip(&[figure_frame(3), figure_frame(0)])
                 .decode()
                 .expect("clip decodes"),
         );
-        let idle = ctx.renderer.add_voxel_clip(
-            &clip(&[Self::figure_frame(1)])
-                .decode()
-                .expect("clip decodes"),
-        );
+        let idle = ctx
+            .renderer
+            .add_voxel_clip(&clip(&[figure_frame(1)]).decode().expect("clip decodes"));
         let def = BillboardActorDef {
             states: vec![
                 ActorState {

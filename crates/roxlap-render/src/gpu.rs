@@ -1042,6 +1042,40 @@ impl GpuBackend {
         self.gpu
             .set_tint(frame.tint.and_then(crate::Tint::quantized));
 
+        // OC.0 — derive + forward this frame's view cutout (keyhole):
+        // the logical-pixel radius becomes a view-cone half-angle
+        // under the kernel's own vertical-FOV pinhole (hazard 1 —
+        // `radius / focal` with the focal at the logical resolution;
+        // angles are resolution-invariant, so SSAA needs nothing); a
+        // focus at/behind the near plane folds to off, like the CPU
+        // backend.
+        let cutout_fov_y = frame.fov_y_rad();
+        self.gpu.set_view_cutout(frame.view_cutout.and_then(|c| {
+            let (lw, lh) = self.gpu.logical_dims();
+            if lw == 0 || lh == 0 || cutout_fov_y <= 0.0 {
+                return None;
+            }
+            let d = DVec3::from_array(c.focus_world.map(f64::from)) - DVec3::from_array(camera.pos);
+            let cz = DVec3::from_array(camera.forward).dot(d);
+            if cz < crate::CUTOUT_NEAR_Z {
+                return None;
+            }
+            // Logical-resolution focal length in pixels, into the
+            // shared radius→angle helper (angles are resolution-
+            // invariant, so SSAA needs nothing here).
+            #[allow(clippy::cast_possible_truncation)]
+            let focal = (f64::from(lh) * 0.5 / f64::from((cutout_fov_y * 0.5).tan())) as f32;
+            if focal <= 0.0 {
+                return None;
+            }
+            let (tan_outer, tan_inner) = crate::cutout_cone_tans(c.radius_px, c.feather_px, focal);
+            Some(roxlap_gpu::GpuViewCutout {
+                tan_outer,
+                tan_inner,
+                margin: c.margin.max(0.0),
+            })
+        }));
+
         // Drop a resident built for a different scene (a scene switch swaps
         // the whole grid set). Without this the previous scene's grids —
         // e.g. the World scene's ship saucer — ghost into a gridless scene,
@@ -1101,7 +1135,7 @@ impl GpuBackend {
         // XS.3 — per-grid world transforms (parallel to `cameras`) so the
         // scene shader can lift a shadow ray to world space and test it
         // against every grid (cross-grid shadows).
-        let grid_world = self.grid_world_transforms(scene);
+        let grid_world = self.grid_world_transforms(scene, frame.view_cutout.as_ref());
         // Sprites are world-space, so they project through the world
         // camera (identity transform), not any grid-local one. Without
         // this the GPU sprite pass used `cameras[0]` and shifted every
@@ -1666,7 +1700,11 @@ impl GpuBackend {
     /// XS.3 — per-grid world transforms (parallel to [`Self::grid_cameras`]):
     /// world origin + the local→world rotation columns, for cross-grid shadows.
     #[allow(clippy::cast_possible_truncation)]
-    fn grid_world_transforms(&self, scene: &Scene) -> Vec<roxlap_gpu::GridWorldTransform> {
+    fn grid_world_transforms(
+        &self,
+        scene: &Scene,
+        view_cutout: Option<&crate::ViewCutout>,
+    ) -> Vec<roxlap_gpu::GridWorldTransform> {
         let mut out = Vec::with_capacity(self.grid_ids.len());
         for gid in &self.grid_ids {
             let Some(grid) = scene.grid(*gid) else {
@@ -1679,6 +1717,29 @@ impl GpuBackend {
                 let w = r * v;
                 [w.x as f32, w.y as f32, w.z as f32]
             };
+            // OC — the cutout's focus + focus plane in this grid's
+            // frame via the SHARED `roxlap-scene` conversion the CPU
+            // path also calls (one formula, one crate — a hand-copy
+            // drifting by a voxel would cut the floor out from under
+            // the character on one backend only). The kernel marches
+            // in world-scale grid units, so the voxel-space focus
+            // scales back by `vws`.
+            let cutout = view_cutout.map(|c| {
+                let (local, plane) = roxlap_scene::render::cutout_grid_local(
+                    DVec3::from_array(c.focus_world.map(f64::from)),
+                    f64::from(c.z_bias),
+                    &grid.transform,
+                );
+                let vws = grid.transform.voxel_world_size;
+                (
+                    [
+                        (local.x * vws) as f32,
+                        (local.y * vws) as f32,
+                        (local.z * vws) as f32,
+                    ],
+                    plane,
+                )
+            });
             out.push(roxlap_gpu::GridWorldTransform {
                 origin: [o.x as f32, o.y as f32, o.z as f32],
                 rot_cols: [col(DVec3::X), col(DVec3::Y), col(DVec3::Z)],
@@ -1694,6 +1755,10 @@ impl GpuBackend {
                     let (lo, hi) = v.footprint_xy();
                     ([lo[0] as f32, lo[1] as f32], [hi[0] as f32, hi[1] as f32])
                 }),
+                // `i32::MIN` = no cutout (the kernel's first-gate
+                // sentinel).
+                cutout_focus_z: cutout.map_or(i32::MIN, |(_, plane)| plane),
+                cutout_focus_local: cutout.map_or([0.0; 3], |(local, _)| local),
             });
         }
         out

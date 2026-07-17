@@ -25,7 +25,7 @@ use roxlap_formats::sprite::Sprite;
 use roxlap_formats::voxel_clip::{DecodedClip, VoxelFrame};
 use roxlap_scene::occluder::SceneOccluder;
 use roxlap_scene::render::{
-    render_scene_composed_with_materials_scratch, CpuFog, SceneRenderScratch,
+    render_scene_composed_frame, ComposedFrameParams, CpuFog, SceneRenderScratch, SceneViewCutout,
 };
 use roxlap_scene::Scene;
 
@@ -1376,6 +1376,38 @@ impl CpuBackend {
         let hidden_dyn = cutaway_flags(&mut self.dyn_sprites.iter());
         let hid = |flags: &[bool], i: usize| flags.get(i).copied().unwrap_or(false);
         let casts = |s: &Sprite| s.flags & invis == 0 && s.casts_shadow();
+        // OC.0 — derive the frame's view cutout: the keyhole's pixel
+        // radius becomes a view-CONE half-angle under THIS frame's
+        // rescaled settings (hazard 1 — `radius/hz` with both at the
+        // render resolution; radius arrives in LOGICAL pixels, and
+        // `hz` here is the logical focal × ssaa, so the SSAA factor
+        // scales the radius to match), and "focus at/behind the near
+        // plane" folds to off.
+        let view_cutout = frame.view_cutout.and_then(|c| {
+            let cam =
+                camera_math::derive(camera, width, height, settings.hx, settings.hy, settings.hz);
+            let f = c.focus_world;
+            let d = [f[0] - cam.pos[0], f[1] - cam.pos[1], f[2] - cam.pos[2]];
+            let cz = cam.forward[0] * d[0] + cam.forward[1] * d[1] + cam.forward[2] * d[2];
+            if f64::from(cz) < crate::CUTOUT_NEAR_Z || settings.hz <= 0.0 {
+                return None;
+            }
+            // The SSAA factor is 1..=4 — exact in f32. Radius/feather
+            // are LOGICAL pixels; `hz` here is the render focal, so
+            // both scale by ssaa into the shared radius→angle helper.
+            #[allow(clippy::cast_precision_loss)]
+            let ss = self.ssaa.max(1) as f32;
+            let (tan_outer, tan_inner) =
+                crate::cutout_cone_tans(c.radius_px * ss, c.feather_px * ss, settings.hz);
+            Some(SceneViewCutout {
+                tan_outer,
+                tan_inner,
+                focus_world: [f64::from(f[0]), f64::from(f[1]), f64::from(f[2])],
+                margin: c.margin.max(0.0),
+                z_bias: f64::from(c.z_bias),
+            })
+        });
+
         let sprite_occ = if shadows_active && frame.draw_sprites {
             let mut so = SpriteOccluder::new();
             for (i, (s, &m)) in self.sprites.iter().zip(&self.sprite_models).enumerate() {
@@ -1411,22 +1443,26 @@ impl CpuBackend {
             None
         };
 
-        let _ = render_scene_composed_with_materials_scratch(
+        // The composed render's frame inputs, bundled (the positional
+        // wrapper ladder is frozen — new inputs are params fields).
+        let mut composed = ComposedFrameParams::new(camera, &settings);
+        composed.fog = fog;
+        composed.sky_color = frame.sky_color.0;
+        composed.sky = frame.sky;
+        composed.materials = Some(&shared.materials);
+        composed.terrain_materials = &shared.terrain_materials;
+        composed.lights = cpu_lights;
+        composed.sprite_occluder = sprite_occ.as_ref().map(|o| o as &dyn WorldOccluder);
+        // OC.0 — the frame's keyhole (None ⇒ byte-identical).
+        composed.view_cutout = view_cutout.as_ref();
+        let _ = render_scene_composed_frame(
             fb,
             &mut self.zbuffer[..pixel_count],
             width as usize,
             width,
             height,
-            fog,
             scene,
-            camera,
-            &settings,
-            frame.sky_color.0,
-            frame.sky,
-            Some(&shared.materials),
-            &shared.terrain_materials,
-            cpu_lights,
-            sprite_occ.as_ref().map(|o| o as &dyn WorldOccluder),
+            &composed,
             // PF.7 — persistent temp-buffer pair + per-grid scratch.
             &mut self.scene_scratch,
         );

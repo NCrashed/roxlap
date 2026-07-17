@@ -17,6 +17,15 @@ fields, so **exhaustive struct literals must add them**
 `roxlap-scene`'s `BillboardCache.built_z_clip` (plus `Grid.z_clip`,
 which only `Grid::new` constructs — no literal breakage there).
 
+Stage **OC — occlusion cutout / keyhole** (`PORTING-CUTOUT.md`): a
+camera-relative screen-space keyhole through front geometry for
+third-person play (the BG3/Divinity cutout), complementing CA (CA cuts
+ceilings above via grid state; OC cuts walls in front via per-frame
+view state — the two compose). Additive APIs; two public structs grew
+required fields for exhaustive literals: `roxlap-core`'s
+`DdaEnv.cutout` and `roxlap-gpu`'s
+`GridWorldTransform.cutout_focus_z`.
+
 ### Added
 
 - **Per-grid cutaway clip** (CA.0/CA.1): `Grid::z_clip: Option<i32>` +
@@ -82,6 +91,67 @@ which only `Grid::new` constructs — no literal breakage there).
   at the 512-voxel chunk-stack edge. Together with the block skip:
   Decks tele view 12 → ~127 FPS, World scene ~366 FPS (NVK, 860×520),
   identical images.
+- **View cutout / keyhole** (OC.0–OC.2):
+  `FrameParams::view_cutout: Option<ViewCutout>` — walls between the
+  camera and a world-space **focus point** (the controlled character)
+  render as air inside a keyhole around the projected focus. A cell
+  hides only when ALL of: its CENTRE lies inside the view cone around
+  the eye→focus axis (what `radius_px` subtends), it is closer to the
+  eye than the nearest point of the character COLUMN at the cell's
+  own height minus `margin` (the reveal surface hugs the body, so an
+  obstacle the character stands right behind melts down to the boots
+  — a chest-level sphere left waist-high stumps), and its grid-local
+  z is above the focus plane (`z_bias`-tunable) — the floor in front
+  of the character stays. Whole-cell classification (the visual pass
+  replaced first a
+  Bayer-dithered and then a per-pixel-tapered screen window — both
+  left sub-cell fragments reading as noise/teeth wherever the
+  boundary crossed a shallow surface) keeps the cut edge
+  cube-granular and coherent, like the CA clip's edges; across the
+  feather band the reveal distance tapers linearly to zero, closing
+  the hole into a smooth deterministic funnel. The facade derives the
+  cone from the frame's own projection (resolution/SSAA-invariant
+  angles), converts the reveal distance per grid to voxel units
+  (`/vws`, pinned by a scaled-grid test) and the focus plane like the
+  CA clip (`>> mip` floor, pinned by CPU + GPU gates). **Primary rays
+  only** — the deliberate opposite of CA's "world as if removed": a
+  keyhole-hidden wall keeps casting shadows, keeps blocking
+  audio/pathing/gameplay raycasts, keeps its collision (GPU depth
+  picks follow the cut render — click *through* the keyhole selects
+  what you see). Per-frame view state: no snapshot change, `None`
+  byte-identical to pre-OC renders (the standing gate), disabled cost
+  = one never-true compare per hit. Headless GPU parity gates mirror
+  the CPU fixtures (cone/outside/floor classification, taper
+  coherence, exact cut-face colours, mip floor formula,
+  hidden-wall-still-shadows).
+- **Boarding demo tab** (OC.3): the Decks shiplet rebuilt with
+  walkable stairwells and a CC `CharacterBody` in third person — the
+  CA/OC composition showcase: the deck clip FOLLOWS the character
+  (expose the deck they are on) while the keyhole cuts the walls in
+  front, shoulder follow-camera with **no raycast boom clamp**, every
+  mode on a hotkey (`K` keyhole, `V` deck-follow vs manual
+  `PgUp`/`PgDn`, `C` shoulder vs tele-iso deck orbit, wheel = keyhole
+  radius, default sized to the logical frame), flooded bilge
+  auto-swims (WT; the bilge deck is 8 voxels taller after the visual
+  pass so a swimming body clears the ceiling).
+  `ROXLAP_BOARD_DECK=0..=2` spawns on that deck for captures. The
+  demo host forwards mouse-wheel input to scenes
+  (`SceneInput::Wheel`).
+- **Book**: the *Cutaway deck views* section grows a *keyhole
+  cutout* subsection (when to use which, the composition pattern);
+  the demo tour lists the Boarding tab.
+- **`render_scene_composed_frame` + `ComposedFrameParams`**
+  (`roxlap-scene`, review follow-up): the composed render's per-frame
+  inputs bundled into one `#[non_exhaustive]` struct — the positional
+  wrapper family (17 arguments with adjacent same-typed `Option`s) is
+  frozen; new frame inputs land as params fields. The kernels' shared
+  derivations are single-sourced too: `cutout_grid_local`
+  (`roxlap-scene`) converts the focus/plane for BOTH backends (the
+  GPU kernel now receives the per-grid local focus pre-computed —
+  no shader-side conversion), and the radius→cone-angle shape lives
+  once in `roxlap-render`.
+- (OC.4 ghost mode — cut cells at a fixed alpha instead of vanishing —
+  is explicitly deferred with its own go/no-go; v1 hides.)
 
 ### Fixed
 

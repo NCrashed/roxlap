@@ -272,6 +272,11 @@ pub struct GpuRenderer {
     /// itself, so the identity fast paths never depend on caller
     /// discipline).
     tint: Option<(u32, u8)>,
+    /// OC.0 — per-frame view cutout (keyhole); `None` writes an
+    /// a disabled cutout block (enable lane 0) into the scene uniform.
+    /// The facade forwards its derived `FrameParams::view_cutout` on
+    /// every render, like the tint.
+    view_cutout: Option<GpuViewCutout>,
     /// Lazy-built on first [`Self::render_scene`] call. Holds the
     /// multi-grid pipeline + per-grid camera uniforms.
     scene_dda: Option<SceneDdaResources>,
@@ -881,9 +886,22 @@ struct SceneDdaPerGridCamera {
     /// `rot0/1/2` (xyz) are the local→world rotation columns (world images of
     /// grid-local axes x/y/z). Packed here for the same buffer-limit reason.
     world_origin: [f32; 4],
+    /// XS.3 rotation columns; OC.0 — `rot0[3]` (unused as rotation
+    /// data) carries the grid's cutout focus-plane z as an f32 VALUE
+    /// (grid-local absolute voxel z, exact for any |z| < 2²⁴ — a real
+    /// float, not a bit-carrier, so no subnormal-flush hazard). Only
+    /// consulted while the per-cell z-gate passes (`i32::MIN` sentinel
+    /// = off).
     rot0: [f32; 4],
     rot1: [f32; 4],
     rot2: [f32; 4],
+    /// OC — the view cutout's focus in THIS grid's frame (xyz,
+    /// march/world units; w spare), converted host-side in f64 by the
+    /// shared `roxlap-scene` helper the CPU path also uses — the
+    /// kernel does no world→grid conversion of its own. Zero while
+    /// the cutout is off. Keep the WGSL mirrors' stride in lockstep
+    /// (`scene_dda.wgsl` + `sprite_terrain_shadow.wgsl`, 160 B).
+    cutout_focus_local: [f32; 4],
 }
 
 /// CA.0 — sentinel for "no cutaway clip" in
@@ -916,6 +934,7 @@ impl SceneDdaPerGridCamera {
             rot0: [1.0, 0.0, 0.0, 0.0],
             rot1: [0.0, 1.0, 0.0, 0.0],
             rot2: [0.0, 0.0, 1.0, 0.0],
+            cutout_focus_local: [0.0; 4],
         }
     }
 
@@ -926,9 +945,26 @@ impl SceneDdaPerGridCamera {
         // SC.4 — `.w` carries voxel_world_size (world units per voxel); the
         // scene DDA marcher scales chunk_dim + vsize by it.
         self.world_origin = [t.origin[0], t.origin[1], t.origin[2], t.voxel_world_size];
-        self.rot0 = [t.rot_cols[0][0], t.rot_cols[0][1], t.rot_cols[0][2], 0.0];
+        // OC.0 — the cutout focus-plane z rides rot0's spare w lane
+        // (an exact integer-valued f32; see the field docs). Gated by
+        // the i32::MIN sentinel (= off) when the facade has no cutout.
+        #[allow(clippy::cast_precision_loss)]
+        let focus_z = t.cutout_focus_z as f32;
+        self.rot0 = [
+            t.rot_cols[0][0],
+            t.rot_cols[0][1],
+            t.rot_cols[0][2],
+            focus_z,
+        ];
         self.rot1 = [t.rot_cols[1][0], t.rot_cols[1][1], t.rot_cols[1][2], 0.0];
         self.rot2 = [t.rot_cols[2][0], t.rot_cols[2][1], t.rot_cols[2][2], 0.0];
+        // OC — the pre-converted grid-local cutout focus (march units).
+        self.cutout_focus_local = [
+            t.cutout_focus_local[0],
+            t.cutout_focus_local[1],
+            t.cutout_focus_local[2],
+            0.0,
+        ];
         // CA.0 — cutaway clip rides the old `_pad3` lane (a real i32;
         // `i32::MIN` = disabled).
         self.z_clip = t.z_clip.unwrap_or(Z_CLIP_DISABLED);
@@ -997,6 +1033,20 @@ pub struct GridWorldTransform {
     /// grids. Only consulted when [`Self::z_clip`] is set; `None` ⇒
     /// the clip hides no sprites (an empty grid).
     pub cutaway_footprint: Option<([f32; 2], [f32; 2])>,
+    /// OC.0 — the view cutout's focus-plane z in this grid's local
+    /// frame (**absolute** voxel z, z-down, mip-0; z-bias already
+    /// folded in by the facade — the identical world→grid conversion
+    /// the CPU path runs, so both backends cut the same plane). The
+    /// kernel's per-cell hide rule gates on `z < cutout_focus_z >> mip`
+    /// FIRST, so `i32::MIN` (the default) disables it for one
+    /// never-true compare — the same sentinel the CPU sampler uses.
+    pub cutout_focus_z: i32,
+    /// OC — the view cutout's focus point in this grid's local frame,
+    /// **march units** (world units within the grid frame — the
+    /// grid-local voxel focus × `voxel_world_size`), converted
+    /// host-side by the same shared `roxlap-scene` helper the CPU
+    /// path uses. `[0.0; 3]` while the cutout is off.
+    pub cutout_focus_local: [f32; 3],
 }
 
 impl Default for GridWorldTransform {
@@ -1007,8 +1057,39 @@ impl Default for GridWorldTransform {
             voxel_world_size: 1.0,
             z_clip: None,
             cutaway_footprint: None,
+            cutout_focus_z: i32::MIN,
+            cutout_focus_local: [0.0; 3],
         }
     }
+}
+
+/// OC.0 — the frame's view cutout ("keyhole", stage OC) in the wire
+/// form the scene kernel consumes: the view-cone half-angle tangents
+/// (derived by the facade from the keyhole's pixel radius and the
+/// frame's focal length — resolution-invariant, so no SSAA scaling)
+/// plus the column margin. The kernel classifies whole CELLS by their
+/// centres against the tapered eye→focus cone (the same rule as the
+/// CPU `CpuCutout`); the focus itself arrives PER GRID, pre-converted
+/// into each grid's frame
+/// ([`GridWorldTransform::cutout_focus_local`], with the focus-plane
+/// z in [`GridWorldTransform::cutout_focus_z`]). Primary rays only —
+/// the shadow marches never read it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuViewCutout {
+    /// Tangent of the cone's outer half-angle (`radius_px / focal`).
+    pub tan_outer: f32,
+    /// Tangent of the full-reveal inner half-angle: the reveal
+    /// distance tapers linearly to zero between the two (a
+    /// deterministic geometric funnel rim, no dither).
+    pub tan_inner: f32,
+    /// How far short of the character COLUMN the reveal stops, world
+    /// units (non-negative). The reveal surface hugs the column — the
+    /// vertical segment at the focus xy between the focus plane
+    /// ([`GridWorldTransform::cutout_focus_z`], the feet) and its
+    /// mirror above the focus (the head) — so an obstacle the
+    /// character stands right behind cuts down to the boots, not just
+    /// to a fixed eye-distance sphere through the chest.
+    pub margin: f32,
 }
 
 #[repr(C)]
@@ -1084,6 +1165,16 @@ struct SceneDdaUniform {
     /// casters (the loop is skipped); only consulted by the capable variant.
     sprite_cast_count: u32,
     _pad7: [u32; 2],
+    /// OC.0 — view cutout cone: `[margin, tan_outer, tan_inner,
+    /// enable]`. `margin` is world units (how far short of the
+    /// character column the reveal stops); `enable` is `1.0` while a
+    /// cutout is set, `0.0` otherwise. Angles are
+    /// resolution-invariant.
+    cutout_a: [f32; 4],
+    /// OC.0 — spare (the focus now rides per grid in
+    /// `SceneDdaPerGridCamera::cutout_focus_local`, pre-converted
+    /// host-side). Kept zeroed for the WGSL layout.
+    cutout_b: [f32; 4],
 }
 
 impl GpuRenderer {
@@ -1336,6 +1427,7 @@ impl GpuRenderer {
             flip_x: false,
             render_res: RenderResolution::Native,
             ssaa: 1,
+            view_cutout: None,
             posterize: None,
             scene_dda: None,
             async_pick: std::sync::Mutex::new(pending_pick::AsyncPickState::default()),
@@ -1557,6 +1649,14 @@ impl GpuRenderer {
     /// — the facade forwards `FrameParams::tint` on every render.
     pub fn set_tint(&mut self, tint: Option<(u32, u8)>) {
         self.tint = tint.filter(|&(_, s8)| s8 > 0);
+    }
+
+    /// OC.0 — set (or clear) this frame's view cutout (keyhole).
+    /// `None` writes a disabled cutout block (the uniform's enable
+    /// lane = 0). Per-frame state — the facade forwards its derived
+    /// `FrameParams::view_cutout` on every render.
+    pub fn set_view_cutout(&mut self, cutout: Option<GpuViewCutout>) {
+        self.view_cutout = cutout;
     }
 
     /// RP.0 — the logical (retro) grid size the scene resolves to before the
@@ -1848,6 +1948,16 @@ impl GpuRenderer {
         }
         let (sun_flags, point_count) = (self.lights_sun_flags, self.lights_point_count);
 
+        // OC.0 — pack the frame's cutout cone (angles are resolution-
+        // invariant — no SSAA scaling). Absent ⇒ all-zero block with
+        // the enable lane 0.
+        let cut_on = self.view_cutout.is_some();
+        let cut = self.view_cutout.unwrap_or(GpuViewCutout {
+            tan_outer: 0.0,
+            tan_inner: 0.0,
+            margin: 0.0,
+        });
+
         let uniform = SceneDdaUniform {
             fov_y_rad,
             grid_count: scene.grid_count,
@@ -1912,6 +2022,13 @@ impl GpuRenderer {
                 0
             },
             _pad7: [0; 2],
+            cutout_a: [
+                cut.margin,
+                cut.tan_outer,
+                cut.tan_inner,
+                f32::from(u8::from(cut_on)),
+            ],
+            cutout_b: [0.0; 4],
         };
         self.queue
             .write_buffer(&dda.uniform_buf, 0, bytemuck::bytes_of(&uniform));
@@ -3150,6 +3267,11 @@ pub struct HeadlessSceneRenderer {
     terrain_materials: Box<[MaterialGpu; 256]>,
     terrain_map: Vec<[u32; 2]>,
     terrain_translucent: bool,
+    /// OC.0 — view cutout for the gate render (default none). The
+    /// headless framebuffer has no SSAA, so the window values are in
+    /// **render** pixels verbatim. Set via [`Self::set_view_cutout`];
+    /// lets the OC.2 gates exercise the keyhole path against the CPU.
+    view_cutout: Option<GpuViewCutout>,
 }
 
 impl HeadlessSceneRenderer {
@@ -3319,6 +3441,7 @@ impl HeadlessSceneRenderer {
             ),
             terrain_map: Vec::new(),
             terrain_translucent: false,
+            view_cutout: None,
         }
     }
 
@@ -3355,6 +3478,15 @@ impl HeadlessSceneRenderer {
     pub fn set_side_shades(&mut self, s: [i8; 6]) {
         let v = |i: usize| i32::from(s[i] as u8);
         self.side_shades = [[v(0), v(1), v(2), v(3)], [v(4), v(5), 0, 0]];
+    }
+
+    /// OC.0 — set (or clear) the view cutout for subsequent
+    /// [`Self::render`] calls. The per-grid focus (local frame) and
+    /// `GridWorldTransform::cutout_focus_local` / `::cutout_focus_z` via
+    /// [`Self::render_with_transforms`]. Lets the OC.2 gates exercise
+    /// the keyhole against the CPU fixtures.
+    pub fn set_view_cutout(&mut self, cutout: Option<GpuViewCutout>) {
+        self.view_cutout = cutout;
     }
 
     /// Render `scene` from `cameras` (one per grid) and read the
@@ -3570,6 +3702,11 @@ impl HeadlessSceneRenderer {
             style_bands: dl.style_bands,
             sprite_cast_count: 0, // headless renderer has no sprite pass
             _pad7: [0; 2],
+            // OC.0 — cutout cone verbatim; absent ⇒ enable lane 0.
+            cutout_a: self
+                .view_cutout
+                .map_or([0.0; 4], |c| [c.margin, c.tan_outer, c.tan_inner, 1.0]),
+            cutout_b: [0.0; 4],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
 

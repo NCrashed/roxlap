@@ -20,10 +20,11 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::scene_api::{CameraPose, CameraRig, DemoScene, InputState, SceneCtx, SceneInput};
 use crate::scenes::{
-    animation::AnimationScene, audio::AudioScene, decks::DecksScene, doom::DoomScene,
-    empty::EmptyScene, lighting::LightingScene, particles::ParticlesScene, picking::PickingScene,
-    primitives::PrimitivesScene, scale::ScaleScene, spotlight::SpotlightScene,
-    sprites::SpritesScene, transparency::TransparencyScene, world::WorldScene,
+    animation::AnimationScene, audio::AudioScene, boarding::BoardingScene, decks::DecksScene,
+    doom::DoomScene, empty::EmptyScene, lighting::LightingScene, particles::ParticlesScene,
+    picking::PickingScene, primitives::PrimitivesScene, scale::ScaleScene,
+    spotlight::SpotlightScene, sprites::SpritesScene, transparency::TransparencyScene,
+    world::WorldScene,
 };
 use crate::{
     load_png_sky, load_png_sky_rgba, SCAN_DIST_INITIAL, SCAN_DIST_MAX, SCAN_DIST_MIN,
@@ -238,6 +239,7 @@ impl Host {
             Box::new(AudioScene::new()),
             Box::new(DoomScene::new()),
             Box::new(DecksScene::new()),
+            Box::new(BoardingScene::new()),
             Box::new(PickingScene::new()),
             Box::new(PrimitivesScene::new()),
             Box::new(EmptyScene::new()),
@@ -706,6 +708,15 @@ impl ApplicationHandler for Host {
                     x: position.x,
                     y: position.y,
                 });
+            }
+            WindowEvent::MouseWheel { delta, .. } if !self.menu_open => {
+                // OC.3 — forward the wheel in "lines" (trackpad pixel
+                // deltas fold at the conventional 40 px/line).
+                let dy = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 40.0,
+                };
+                self.scene_input(SceneInput::Wheel { dy });
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
