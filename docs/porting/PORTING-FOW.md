@@ -452,6 +452,29 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   unchanged. USER VISUAL PASS (round 10) owed — the stairwell now reads
   as a dark shaft down; confirm that's acceptable vs. wanting the stairs
   themselves lit from above.
+- **Quality-review pass** (feature deemed complete for the release; a
+  round of review findings, workspace 989 green):
+  - **#2 fog off/on lost memory.** The twin sync's `for_each_live_cell`
+    walked only Visible+Heard, so a fresh twin (re-arm) never copied
+    geometry under remembered cells. Added `for_each_known_cell` (all
+    non-Unseen, walks the mask tiles); the twin's FIRST sync uses it, so
+    a re-arm repaints Memory; steady state stays on the cheap live walk.
+  - **#3 `sync == false` now re-arms** (`FowTwin::attach` fresh) instead
+    of dropping the binding and leaving the real grid `render_excluded`.
+  - **#4 book** no longer teaches `assert!(twin.sync(..))` — shows the
+    `if !sync { re-arm }` recovery.
+  - **#5 roof x-ray.** `fog_deck_index` now returns an OUT-OF-RANGE deck
+    on/above the roof or outside the hull, tripping `update`'s "off every
+    deck ⇒ nothing visible" branch — walking the roof no longer
+    shadowcasts the top-deck interior (open-air eye band, no blocker).
+  - **#6/#8 twin lifecycle.** Dropped the `exit`/`enter` detach/re-attach
+    dance (each demo scene owns its own `self.scene`, so the twin + the
+    real grid's `render_excluded` are inert while another tab is active
+    and the memory survives the round-trip) and the redundant `fow_on`
+    flag (the `twin` Option IS the state — `fn fow_on() = twin.is_some()`).
+  - **#7/#9/#10 demo polish.** Noise source mapped grid-local→world via
+    the ship transform (no hardcoded `SHIP_ORIGIN_Z`); HUD uses
+    `NOISE_PERIOD`; listener uses `CharacterBody::eye_pos()`.
 
 ## Goal
 

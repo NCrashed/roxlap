@@ -711,7 +711,11 @@ impl FogOfWar {
     }
 
     /// Every live cell — Visible and Heard — with its state. FW.1's
-    /// known-twin sync walks this to decide which chunks re-copy.
+    /// known-twin sync walks this each frame to decide which chunks
+    /// re-copy. Cheap: only the (small) live + heard sets. A cell that
+    /// has SINCE decayed to Memory keeps its already-copied geometry in
+    /// the twin, so it need not reappear here — but see
+    /// [`Self::for_each_known_cell`] for a fresh twin.
     pub fn for_each_live_cell(&self, mut f: impl FnMut(usize, IVec2, CellState)) {
         for &(x, y) in self.visible.keys() {
             f(self.visible_deck, IVec2::new(x, y), CellState::Visible);
@@ -723,6 +727,30 @@ impl FogOfWar {
                 continue;
             }
             f(deck, IVec2::new(x, y), CellState::Heard);
+        }
+    }
+
+    /// Every KNOWN cell — Visible, Memory, or Heard (state != Unseen) —
+    /// across all decks. A FRESH twin (first sync after (re)attach — fog
+    /// toggled off then on, or re-armed after a load) walks this ONCE so
+    /// it copies geometry for REMEMBERED rooms too; otherwise the mask
+    /// would say Memory while the new twin holds no geometry there, and
+    /// the remembered rooms would render empty. Steady-state syncs use
+    /// the cheap [`Self::for_each_live_cell`] (a demoted cell keeps the
+    /// copy it got while Visible). Walks the mask tiles, so O(explored).
+    pub fn for_each_known_cell(&self, mut f: impl FnMut(usize, IVec2, CellState)) {
+        for (deck, layer) in self.layers.iter().enumerate() {
+            for (&(tx, ty), tile) in &layer.mask {
+                for (idx, &b) in tile.bytes.iter().enumerate() {
+                    let state = CellState::from_bits(b >> 6);
+                    if state == CellState::Unseen {
+                        continue;
+                    }
+                    let ix = idx as i32 % TILE;
+                    let iy = idx as i32 / TILE;
+                    f(deck, IVec2::new(tx * TILE + ix, ty * TILE + iy), state);
+                }
+            }
         }
     }
 
@@ -1257,6 +1285,11 @@ impl FowTwin {
         if self.last_synced == Some(key) {
             return true;
         }
+        // First sync of a fresh twin (nothing copied yet): walk ALL known
+        // cells so REMEMBERED geometry is copied too, not just what's
+        // live this frame (#2 — else a fog off/on re-arm renders memory
+        // rooms empty). Steady state uses the cheap live-only walk.
+        let first_scan = self.last_synced.is_none();
         self.last_synced = Some(key);
 
         // Phase 1 — read the real grid: mirror, hint, and the copies due
@@ -1269,7 +1302,7 @@ impl FowTwin {
             // Every chunk under a live cell, deduped, with its real sig.
             let mut want: HashMap<IVec3, (u64, bool)> = HashMap::new();
             let decks = &fow.config().decks;
-            fow.for_each_live_cell(|deck, cell, _state| {
+            let mut collect = |deck: usize, cell: IVec2| {
                 let Some(band) = decks.get(deck) else {
                     return;
                 };
@@ -1280,7 +1313,12 @@ impl FowTwin {
                     let idx = IVec3::new(chx, chy, chz);
                     want.entry(idx).or_insert_with(|| chunk_sig_pair(real, idx));
                 }
-            });
+            };
+            if first_scan {
+                fow.for_each_known_cell(|deck, cell, _| collect(deck, cell));
+            } else {
+                fow.for_each_live_cell(|deck, cell, _| collect(deck, cell));
+            }
             let mut copies: Vec<TwinCopy> = Vec::new();
             for (idx, sig) in want {
                 if self.copied.get(&idx) != Some(&sig) {
@@ -1825,6 +1863,33 @@ mod tests {
         assert_eq!(fow.state(0, IVec2::new(25, 0)).0, CellState::Unseen);
         // Open cells before the wall are visible.
         assert_eq!(fow.state(0, IVec2::new(10, 0)).0, CellState::Visible);
+    }
+
+    /// Review #2 — a fresh twin's first sync must repaint remembered
+    /// rooms: `for_each_known_cell` reports Memory cells (so their
+    /// geometry re-copies), while the steady-state `for_each_live_cell`
+    /// does not (a demoted cell keeps the copy it got while Visible).
+    #[test]
+    fn known_cells_include_memory_live_cells_dont() {
+        use std::collections::HashSet;
+        let g = open_room();
+        let mut fow = FogOfWar::new(cfg());
+        // See the +X cells, then turn away so (20, 0) demotes to Memory.
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
+        fow.update(&g, &observer(IVec2::new(0, 0), -Vec2::X), 0.01);
+        assert_eq!(fow.state(0, IVec2::new(20, 0)).0, CellState::Memory);
+
+        let mut live = HashSet::new();
+        fow.for_each_live_cell(|_d, c, _s| {
+            live.insert((c.x, c.y));
+        });
+        assert!(!live.contains(&(20, 0)), "memory cell is not LIVE");
+
+        let mut known = HashSet::new();
+        fow.for_each_known_cell(|_d, c, _s| {
+            known.insert((c.x, c.y));
+        });
+        assert!(known.contains(&(20, 0)), "memory cell IS known");
     }
 
     #[test]

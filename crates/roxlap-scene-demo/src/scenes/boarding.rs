@@ -226,10 +226,11 @@ pub struct BoardingScene {
     /// FW.5 — fog of war. `F` toggles it: on, the ship becomes a
     /// `render_excluded` real grid shown through the known `twin`, and
     /// `render` passes the mask so only the character's cone / memory /
-    /// heard pockets render. `G` toggles the light gate.
+    /// heard pockets render. `G` toggles the light gate. The `twin`
+    /// Option IS the on/off state (see [`Self::fow_on`]) — no separate
+    /// flag to fall out of sync.
     fow: FogOfWar,
     twin: Option<FowTwin>,
-    fow_on: bool,
     light_gate_on: bool,
     /// Scripted "noise behind the wall" countdown (seconds).
     noise_timer: f64,
@@ -278,7 +279,6 @@ impl BoardingScene {
             lit_points: Vec::new(),
             fow: FogOfWar::new(ship_vision_config(false)),
             twin: None,
-            fow_on: false,
             light_gate_on: false,
             noise_timer: NOISE_PERIOD,
         }
@@ -290,11 +290,23 @@ impl BoardingScene {
     /// standing on a column lifts the head above the deck's ceiling, so
     /// the head-pick jumps to the deck ABOVE and the fog then reveals the
     /// wrong floor (the player saw nothing on the deck they stood on).
-    /// The centre stays inside the deck the feet rest on. Clamped to the
-    /// bottom deck (never `None`).
+    /// The centre stays inside the deck the feet rest on.
+    ///
+    /// Returns an OUT-OF-RANGE index (`decks.len()`) when the body is on
+    /// or above the roof, or outside the hull footprint — the observer is
+    /// on no interior deck (review #5). `FogOfWar::update` reads that as
+    /// "off every deck ⇒ nothing visible", so walking the roof can't
+    /// x-ray the rooms below: their eye band is open air with no blocker,
+    /// which would otherwise shadowcast the whole top deck as Visible.
     fn fog_deck_index(&self) -> usize {
+        let feet = self.body.pos();
         #[allow(clippy::cast_possible_truncation)]
-        let local_center = self.body.pos().z - SHIP_ORIGIN_Z - BODY_HEIGHT * 0.5;
+        let (x, y) = (feet.x.floor() as i32, feet.y.floor() as i32);
+        let inside_xy = x >= HULL_X.0 && x <= HULL_X.1 && y >= HULL_Y.0 && y <= HULL_Y.1;
+        let local_center = feet.z - SHIP_ORIGIN_Z - BODY_HEIGHT * 0.5;
+        if !inside_xy || local_center < f64::from(ROOF_Z) {
+            return FLOOR_TOPS.len(); // no interior deck — see nothing
+        }
         FLOOR_TOPS
             .iter()
             .position(|&ft| local_center <= f64::from(ft))
@@ -331,8 +343,16 @@ impl BoardingScene {
         }
     }
 
+    /// Is fog of war on? The `twin` binding IS the state — present iff on.
+    fn fow_on(&self) -> bool {
+        self.twin.is_some()
+    }
+
     /// FW.5 — turn the fog on/off: attach / detach the known twin (which
     /// flips the ship to `render_excluded` and renders the twin instead).
+    /// Re-arming after an off (a fresh twin over the surviving mask) still
+    /// shows the remembered rooms — the twin's first sync repaints Memory
+    /// geometry (`FogOfWar::for_each_known_cell`).
     fn set_fow(&mut self, on: bool) {
         if on && self.twin.is_none() {
             self.twin = Some(FowTwin::attach(&mut self.scene, self.ship));
@@ -341,7 +361,6 @@ impl BoardingScene {
                 t.detach(&mut self.scene);
             }
         }
-        self.fow_on = on;
         eprintln!("boarding: fog of war = {}", if on { "ON" } else { "off" });
     }
 
@@ -500,11 +519,9 @@ impl DemoScene for BoardingScene {
             self.saved_mip_scan = Some(ctx.renderer.gpu_mip_scan_dist());
             ctx.renderer.set_gpu_mip_scan_dist(TELE_MIP_SCAN);
         }
-        // FW.5 — re-arm the fog twin if the toggle was left on (`exit`
-        // detached it so the ship renders normally in the other tabs).
-        if self.fow_on && self.twin.is_none() {
-            self.twin = Some(FowTwin::attach(&mut self.scene, self.ship));
-        }
+        // FW.5 — nothing to do for the fog on tab re-entry: this scene
+        // owns its own `self.scene`, so the twin (and the real grid's
+        // `render_excluded`) simply persist while another tab is active.
     }
 
     fn update(&mut self, ctx: &mut SceneCtx, dt: f64) {
@@ -561,29 +578,41 @@ impl DemoScene for BoardingScene {
         // twin (the geometry the observer has seen, frozen), and fire the
         // scripted "noise behind the wall" so a heard pocket reveals live
         // geometry the character can't see.
-        if self.fow_on {
+        if self.fow_on() {
             let obs = self.fow_observer(ctx);
             #[allow(clippy::cast_possible_truncation)]
             let dtf = dt as f32;
             if let Some(g) = self.scene.grid(self.ship) {
                 self.fow.update(g, &obs, dtf);
             }
-            if let Some(twin) = &mut self.twin {
-                if !twin.sync(&mut self.scene, &self.fow) {
-                    // The twin was lost (shouldn't happen here) — re-arm.
-                    self.twin = None;
-                    self.fow_on = false;
+            if let Some(mut twin) = self.twin.take() {
+                if twin.sync(&mut self.scene, &self.fow) {
+                    self.twin = Some(twin);
+                } else {
+                    // Contract: `sync == false` ⇒ the derived twin was
+                    // lost (a snapshot load / lockstep rollback dropped
+                    // it). Re-arm per the doc: drop the stale binding and
+                    // attach a FRESH twin (whose first sync repaints the
+                    // surviving mask's memory) — never leave the real grid
+                    // `render_excluded` with nothing drawing it.
+                    self.twin = Some(FowTwin::attach(&mut self.scene, self.ship));
                 }
             }
             self.noise_timer -= dt;
             if self.noise_timer <= 0.0 {
                 self.noise_timer = NOISE_PERIOD;
-                let src = DVec3::new(
-                    NOISE_SOURCE_LOCAL[0],
-                    NOISE_SOURCE_LOCAL[1],
-                    NOISE_SOURCE_LOCAL[2] + SHIP_ORIGIN_Z,
-                );
-                let listener = self.body.pos() - DVec3::new(0.0, 0.0, EYE_HEIGHT);
+                // Author the noise source in the ship's grid-local voxel
+                // frame; the grid transform maps it to world (no hardcoded
+                // origin — review #7).
+                let ship_transform = self
+                    .scene
+                    .grid(self.ship)
+                    .map(|g| g.transform)
+                    .unwrap_or_default();
+                let local = DVec3::from(NOISE_SOURCE_LOCAL);
+                let src = ship_transform.origin
+                    + ship_transform.rotation * (local * ship_transform.voxel_world_size);
+                let listener = self.body.eye_pos();
                 roxlap_audio::hear_source(
                     &self.scene,
                     &mut self.fow,
@@ -680,7 +709,7 @@ impl DemoScene for BoardingScene {
                 code: KeyCode::KeyF,
                 pressed: true,
             } => {
-                let on = !self.fow_on;
+                let on = !self.fow_on();
                 self.set_fow(on);
             }
             SceneInput::Key {
@@ -750,10 +779,8 @@ impl DemoScene for BoardingScene {
         // FW.5 — the fog mask, keyed to the known twin grid (renders in
         // place of the render-excluded ship). Composes with the CA deck
         // clip + the OC keyhole above — all three cuts at once.
-        if self.fow_on {
-            if let Some(twin) = &self.twin {
-                frame.fow = Some((twin.twin(), &self.fow));
-            }
+        if let Some(twin) = &self.twin {
+            frame.fow = Some((twin.twin(), &self.fow));
         }
         let camera = ctx.cam.camera();
         ctx.renderer.render(&mut self.scene, &camera, &frame);
@@ -764,11 +791,10 @@ impl DemoScene for BoardingScene {
         if let Some(d) = self.saved_mip_scan.take() {
             ctx.renderer.set_gpu_mip_scan_dist(d);
         }
-        // FW.5 — detach the twin so the ship isn't left render-excluded
-        // in the other tabs (the `fow_on` flag survives; `enter` re-arms).
-        if let Some(t) = self.twin.take() {
-            t.detach(&mut self.scene);
-        }
+        // The fog twin stays attached: it lives in THIS scene's own
+        // `self.scene`, which no other tab renders, so `render_excluded`
+        // on the real grid is inert while we're away and the memory
+        // survives the round-trip (nothing to detach / re-arm).
     }
 
     fn hud_lines(&self) -> Vec<String> {
@@ -803,12 +829,12 @@ impl DemoScene for BoardingScene {
             ),
             format!(
                 "fog of war: {} (F) · light gate: {} (G){}",
-                if self.fow_on { "ON" } else { "off" },
+                if self.fow_on() { "ON" } else { "off" },
                 if self.light_gate_on { "ON" } else { "off" },
-                if self.fow_on {
-                    " · a scripted noise reveals a heard pocket every 2 s"
+                if self.fow_on() {
+                    format!(" · a scripted noise reveals a heard pocket every {NOISE_PERIOD:.0} s")
                 } else {
-                    ""
+                    String::new()
                 },
             ),
         ]

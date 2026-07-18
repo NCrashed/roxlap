@@ -302,15 +302,23 @@ let mut twin = FowTwin::attach(&mut scene, ship);
 // (it copies chunks from the real grid ONLY under seen cells, so
 // unseen geometry — and its baked light — stays frozen).
 fow.update(scene.grid(ship).unwrap(), &observer, dt);
-assert!(twin.sync(&mut scene, &fow)); // false ⇒ re-arm after a load
+// `sync` returns false when the derived twin was lost (a snapshot
+// load or lockstep rollback dropped it) — a RECOVERABLE signal, not a
+// bug. Re-arm by attaching a fresh twin; its first sync repaints the
+// surviving mask's memory. (Never leave the real grid `render_excluded`
+// with nothing drawing it.)
+if !twin.sync(&mut scene, &fow) {
+    twin = FowTwin::attach(&mut scene, ship);
+}
 
 // Render: name the twin + mask. Only the fog grid is styled; every
 // other grid renders normally. `None` (the default) is byte-identical.
 frame.fow = Some((twin.twin(), &fow));
 ```
 
-`observer` is a `FowObserver { cell, facing, deck }` in the grid's
-local frame. Sprites over Memory/Unseen cells are hidden automatically
+`observer` is a `FowObserver { cell, facing, deck, eye_z }` in the
+grid's local frame (`eye_z` is the character's eye height, so line of
+sight rides stairs and ramps, not a fixed floor). Sprites over Memory/Unseen cells are hidden automatically
 (`FogOfWar::hides_sprite` — actors on the water outside the ship
 footprint are never touched); a sound source reveals a heard pocket
 via `roxlap_audio::hear_source`, scaled by how much of it reaches the
