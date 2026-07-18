@@ -82,7 +82,10 @@ impl CellState {
 
 /// One deck's z extent, grid-local, inclusive, z-down (`z_top` is the
 /// ceiling — numerically the smallest z). The caller derives these
-/// from the same levels as CA's deck clips.
+/// from the same levels as CA's deck clips. The eye-level opacity band
+/// is NOT here — it rides the observer ([`FowObserver::eye_z`]) so LOS
+/// tracks the character's real eye over uneven ground (stairs, ramps,
+/// boulders, furniture) instead of a fixed floor-relative slab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeckBand {
     /// Ceiling z (inclusive, smallest value).
@@ -90,11 +93,6 @@ pub struct DeckBand {
     /// Floor z (inclusive, largest value) — the light gate scans down
     /// to here for the surface brightness sample.
     pub z_bottom: i32,
-    /// Top of the eye-level opacity band (inclusive).
-    pub eye_top: i32,
-    /// Bottom of the eye-level opacity band (inclusive). A cell
-    /// blocks LOS when any solid voxel lies in `[eye_top, eye_bottom]`.
-    pub eye_bottom: i32,
 }
 
 impl DeckBand {
@@ -104,6 +102,12 @@ impl DeckBand {
         (self.z_top..=self.z_bottom).contains(&z)
     }
 }
+
+/// Half-height of the eye-level opacity band around [`FowObserver::eye_z`]
+/// (cells). A voxel blocks LOS when it lies within `±EYE_HALF` of the
+/// observer's eye — thin, so the character sees OVER low obstacles
+/// (crates, rubble) at eye level rather than being walled in by them.
+const EYE_HALF: i32 = 2;
 
 /// Decision 5 — light gates vision: a cell only reaches full Visible
 /// intensity when its surface is lit. Samples the **baked** brightness
@@ -301,6 +305,10 @@ pub struct FowObserver {
     pub facing: Vec2,
     /// Active deck index into [`VisionConfig::decks`].
     pub deck: usize,
+    /// The character's eye z, grid-local (z-down). LOS is blocked by any
+    /// solid voxel within `±EYE_HALF` of it, so vision tracks the real
+    /// eye over stairs / ramps / boulders — not the deck floor.
+    pub eye_z: i32,
 }
 
 /// One 128×128 mask tile: byte per cell, state in bits 6–7, intensity
@@ -439,20 +447,39 @@ fn mix_chunk_sig(h: &mut u64, grid: &Grid, idx: IVec3) {
     fnv(h, u64::from(grid.chunk(idx).is_some()));
 }
 
-fn band_chz_range(band: &DeckBand) -> (i32, i32) {
+fn band_chz_range(band: DeckBand, eye_lo: i32, eye_hi: i32) -> (i32, i32) {
     let cs_z = crate::CHUNK_SIZE_Z as i32;
     (
-        band.z_top.min(band.eye_top).div_euclid(cs_z),
-        band.z_bottom.max(band.eye_bottom).div_euclid(cs_z),
+        band.z_top.min(eye_lo).div_euclid(cs_z),
+        band.z_bottom.max(eye_hi).div_euclid(cs_z),
     )
 }
 
-/// FNV-1a mix of the chunk signatures (plus the config generation, so
-/// light-gate retunes re-sample) backing one XY tile of a deck band.
-fn tile_key(grid: &Grid, band: &DeckBand, config_gen: u64, tx: i32, ty: i32) -> u64 {
-    let (chz_lo, chz_hi) = band_chz_range(band);
+/// Chunk-z range for a deck's RENDER extent `[z_top, z_bottom]` alone
+/// (no eye band) — used by the twin sync to copy the geometry a seen
+/// cell needs, independent of where the observer's eye happens to be.
+fn deck_chz_range(band: DeckBand) -> (i32, i32) {
+    let cs_z = crate::CHUNK_SIZE_Z as i32;
+    (band.z_top.div_euclid(cs_z), band.z_bottom.div_euclid(cs_z))
+}
+
+/// FNV-1a mix of the chunk signatures (plus the config generation and the
+/// observer's eye band, so light-gate retunes AND eye-height changes
+/// re-sample) backing one XY tile of a deck band.
+fn tile_key(
+    grid: &Grid,
+    band: DeckBand,
+    eye_lo: i32,
+    eye_hi: i32,
+    config_gen: u64,
+    tx: i32,
+    ty: i32,
+) -> u64 {
+    let (chz_lo, chz_hi) = band_chz_range(band, eye_lo, eye_hi);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     fnv(&mut h, config_gen);
+    fnv(&mut h, eye_lo as u64);
+    fnv(&mut h, eye_hi as u64);
     for chz in chz_lo..=chz_hi {
         mix_chunk_sig(&mut h, grid, IVec3::new(tx, ty, chz));
     }
@@ -466,7 +493,9 @@ fn tile_key(grid: &Grid, band: &DeckBand, config_gen: u64, tx: i32, ty: i32) -> 
 /// (the old key hung on the grid-wide `mutation_counter`).
 fn local_edit_key(
     grid: &Grid,
-    band: &DeckBand,
+    band: DeckBand,
+    eye_lo: i32,
+    eye_hi: i32,
     config_gen: u64,
     origin: IVec2,
     radius: i32,
@@ -476,7 +505,7 @@ fn local_edit_key(
     let cx_hi = (origin.x + radius).div_euclid(cs_xy);
     let cy_lo = (origin.y - radius).div_euclid(cs_xy);
     let cy_hi = (origin.y + radius).div_euclid(cs_xy);
-    let (chz_lo, chz_hi) = band_chz_range(band);
+    let (chz_lo, chz_hi) = band_chz_range(band, eye_lo, eye_hi);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     fnv(&mut h, config_gen);
     for chz in chz_lo..=chz_hi {
@@ -510,7 +539,7 @@ pub struct FogOfWar {
     /// Currently-visible cells of `visible_deck` → target intensity.
     visible: HashMap<(i32, i32), f32>,
     visible_deck: usize,
-    los_key: Option<(IVec2, i32, usize, u64, u64)>,
+    los_key: Option<(IVec2, i32, usize, i32, u64, u64)>,
     heard: Vec<HeardBlob>,
     /// Set when a blob was added, so the next tick rebuilds the union;
     /// blob expiry sets it inline. Steady state skips the rebuild.
@@ -819,12 +848,15 @@ impl FogOfWar {
         if observer.deck < self.config.decks.len() {
             let facing_q = quantize_facing(observer.facing);
             let band = self.config.decks[observer.deck];
+            let (eye_lo, eye_hi) = (observer.eye_z - EYE_HALF, observer.eye_z + EYE_HALF);
             let radius = self.config.range.max(self.config.peripheral_range).ceil() as i32;
-            let edit_key = local_edit_key(grid, &band, self.config_gen, observer.cell, radius);
+            let edit_key =
+                local_edit_key(grid, band, eye_lo, eye_hi, self.config_gen, observer.cell, radius);
             let key = (
                 observer.cell,
                 facing_q,
                 observer.deck,
+                observer.eye_z,
                 edit_key,
                 self.config_gen,
             );
@@ -864,7 +896,9 @@ impl FogOfWar {
             let mut scan = LosScan {
                 grid,
                 cfg: &self.config,
-                band: &band,
+                band,
+                eye_lo: observer.eye_z - EYE_HALF,
+                eye_hi: observer.eye_z + EYE_HALF,
                 config_gen: self.config_gen,
                 layer,
                 origin: observer.cell,
@@ -1262,7 +1296,7 @@ impl FowTwin {
                 let Some(band) = decks.get(deck) else {
                     return;
                 };
-                let (chz_lo, chz_hi) = band_chz_range(band);
+                let (chz_lo, chz_hi) = deck_chz_range(*band);
                 let chx = cell.x.div_euclid(TILE);
                 let chy = cell.y.div_euclid(TILE);
                 for chz in chz_lo..=chz_hi {
@@ -1435,7 +1469,11 @@ fn quantize_facing(f: Vec2) -> i32 {
 struct LosScan<'a> {
     grid: &'a Grid,
     cfg: &'a VisionConfig,
-    band: &'a DeckBand,
+    band: DeckBand,
+    /// Eye-level opacity band `[eye_lo, eye_hi]`, grid-local — derived
+    /// from the observer's `eye_z ± EYE_HALF`, not the deck.
+    eye_lo: i32,
+    eye_hi: i32,
     config_gen: u64,
     layer: &'a mut DeckLayer,
     origin: IVec2,
@@ -1487,7 +1525,15 @@ impl LosScan<'_> {
         let key = match self.key_memo {
             Some((t, k)) if t == (tx, ty) => k,
             _ => {
-                let k = tile_key(self.grid, self.band, self.config_gen, tx, ty);
+                let k = tile_key(
+                    self.grid,
+                    self.band,
+                    self.eye_lo,
+                    self.eye_hi,
+                    self.config_gen,
+                    tx,
+                    ty,
+                );
                 self.key_memo = Some(((tx, ty), k));
                 k
             }
@@ -1502,8 +1548,14 @@ impl LosScan<'_> {
         }
         let (w, bit) = (idx / 64, 1u64 << (idx % 64));
         if tile.computed[w] & bit == 0 {
-            let (blocked, lit) =
-                sample_cell(self.grid, self.band, self.cfg.light_gate.as_ref(), cell);
+            let (blocked, lit) = sample_cell(
+                self.grid,
+                self.band,
+                self.eye_lo,
+                self.eye_hi,
+                self.cfg.light_gate.as_ref(),
+                cell,
+            );
             tile.computed[w] |= bit;
             if blocked {
                 tile.blocked[w] |= bit;
@@ -1602,21 +1654,28 @@ impl LosScan<'_> {
 }
 
 /// Column scan for one cell, returning `(blocked, lit 0..=1)`:
-/// - **blocked** — any solid voxel in the eye band `[eye_top,
-///   eye_bottom]` (LOS occlusion); a ceiling / floor voxel never
-///   blocks.
+/// - **blocked** — any solid voxel in the eye band `[eye_lo, eye_hi]`
+///   (LOS occlusion; the band rides the observer's eye, not the deck);
+///   a ceiling / floor voxel outside the band never blocks.
 /// - **lit** — with a gate, the gate factor of the **floor** surface:
-///   the first solid at or below `eye_top` scanning down to the deck
+///   the first solid at or below `eye_lo` scanning down to the deck
 ///   floor (a ceiling plate above the eye is NOT the surface — reading
 ///   its dark underside kept fully-lit rooms permanently unseen). An
-///   emissive colour key ANYWHERE in the deck band forces `1.0`
+///   emissive colour key ANYWHERE in the scanned span forces `1.0`
 ///   (ceiling lamps light their cell) without marking it blocked. No
 ///   gate ⇒ always `1.0`; no floor found under a gate ⇒ `0.0`.
 ///
 /// Borrows the chunk once per z-layer (`chz`) rather than a per-voxel
 /// grid probe — a first-fill of a 128² tile was ~340k `voxel_split` +
 /// HashMap lookups.
-fn sample_cell(grid: &Grid, band: &DeckBand, gate: Option<&LightGate>, cell: IVec2) -> (bool, f32) {
+fn sample_cell(
+    grid: &Grid,
+    band: DeckBand,
+    eye_lo: i32,
+    eye_hi: i32,
+    gate: Option<&LightGate>,
+    cell: IVec2,
+) -> (bool, f32) {
     let cs_xy = CHUNK_SIZE_XY as i32;
     let cs_z = crate::CHUNK_SIZE_Z as i32;
     let chx = cell.x.div_euclid(cs_xy);
@@ -1624,8 +1683,8 @@ fn sample_cell(grid: &Grid, band: &DeckBand, gate: Option<&LightGate>, cell: IVe
     let ix = cell.x.rem_euclid(cs_xy) as u32;
     let iy = cell.y.rem_euclid(cs_xy) as u32;
 
-    let z_lo = band.z_top.min(band.eye_top);
-    let z_hi = band.z_bottom.max(band.eye_bottom);
+    let z_lo = band.z_top.min(eye_lo);
+    let z_hi = band.z_bottom.max(eye_hi);
 
     let mut blocked = false;
     let mut surface: Option<u8> = None;
@@ -1646,7 +1705,7 @@ fn sample_cell(grid: &Grid, band: &DeckBand, gate: Option<&LightGate>, cell: IVe
         if !Grid::chunk_voxel_solid(vxl, UVec3::new(ix, iy, iz)) {
             continue;
         }
-        if (band.eye_top..=band.eye_bottom).contains(&z) {
+        if (eye_lo..=eye_hi).contains(&z) {
             blocked = true;
         }
         if let Some(g) = gate {
@@ -1658,7 +1717,7 @@ fn sample_cell(grid: &Grid, band: &DeckBand, gate: Option<&LightGate>, cell: IVe
             }
             // Floor surface = first solid at or below eye level; skip
             // the ceiling region above the eye.
-            if surface.is_none() && z >= band.eye_top {
+            if surface.is_none() && z >= eye_lo {
                 surface = Some(color.map_or(0x80, |c| (c.0 >> 24) as u8));
             }
         } else if blocked {
@@ -1683,13 +1742,14 @@ mod tests {
     use roxlap_formats::color::VoxColor;
 
     const FLOOR_Z: i32 = 100;
+    /// Test eye height: `[EYE_Z-EYE_HALF, EYE_Z+EYE_HALF]` = [92, 96],
+    /// the old fixed band's centre — 6 voxels above the floor.
+    const EYE_Z: i32 = 94;
 
     fn band() -> DeckBand {
         DeckBand {
             z_top: 80,
             z_bottom: FLOOR_Z,
-            eye_top: 92,
-            eye_bottom: 97,
         }
     }
 
@@ -1716,6 +1776,7 @@ mod tests {
             cell,
             facing,
             deck: 0,
+            eye_z: EYE_Z,
         }
     }
 
@@ -1886,8 +1947,6 @@ mod tests {
         let lower = DeckBand {
             z_top: 110,
             z_bottom: 130,
-            eye_top: 122,
-            eye_bottom: 127,
         };
         let mut c = cfg();
         c.decks = vec![band(), lower];
@@ -1898,8 +1957,11 @@ mod tests {
         assert_eq!(fow.state(1, IVec2::new(20, 0)).0, CellState::Unseen);
 
         // Descend to deck 1: deck 0 demotes to Memory, deck 1 lights up.
+        // The eye rides down with the observer (124 ≈ 6 above the lower
+        // floor 130), as it would on a real staircase.
         let mut obs = observer(IVec2::new(0, 0), Vec2::X);
         obs.deck = 1;
+        obs.eye_z = 124;
         fow.update(&g, &obs, SETTLE);
         assert_eq!(fow.state(0, IVec2::new(20, 0)).0, CellState::Memory);
         assert_eq!(fow.state(1, IVec2::new(20, 0)).0, CellState::Visible);
@@ -2013,12 +2075,13 @@ mod tests {
     fn tile_key_changes_on_materialisation_at_version_zero() {
         let mut g = Grid::new(GridTransform::identity());
         let b = band();
-        let k_absent = tile_key(&g, &b, 0, 0, 0);
+        let (eye_lo, eye_hi) = (EYE_Z - EYE_HALF, EYE_Z + EYE_HALF);
+        let k_absent = tile_key(&g, b, eye_lo, eye_hi, 0, 0, 0);
         // Materialise chunk (0,0,0) as empty air — mirrors a stream-in:
         // version stays 0, only presence changes.
         let _ = g.ensure_chunk(IVec3::new(0, 0, 0));
         assert_eq!(g.chunk_version(IVec3::new(0, 0, 0)), 0);
-        let k_present = tile_key(&g, &b, 0, 0, 0);
+        let k_present = tile_key(&g, b, eye_lo, eye_hi, 0, 0, 0);
         assert_ne!(
             k_absent, k_present,
             "presence must change the tile key at version 0"
@@ -2710,8 +2773,8 @@ mod tests {
     fn fow_render_window_stops_at_next_floor() {
         // Two stacked decks: A ceiling 0..floor 20, B ceiling 30..floor 50.
         let cfg = VisionConfig::for_decks(vec![
-            DeckBand { z_top: 0, z_bottom: 20, eye_top: 8, eye_bottom: 12 },
-            DeckBand { z_top: 30, z_bottom: 50, eye_top: 38, eye_bottom: 42 },
+            DeckBand { z_top: 0, z_bottom: 20 },
+            DeckBand { z_top: 30, z_bottom: 50 },
         ]);
         let fow = FogOfWar::new(cfg);
         // Active deck A: window is [A.z_top 0, B.z_bottom 50].

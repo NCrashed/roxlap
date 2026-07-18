@@ -559,8 +559,6 @@ mod tests {
         let deck = DeckBand {
             z_top: 90,
             z_bottom: 200,
-            eye_top: 100,
-            eye_bottom: 105,
         };
         let mk_fow = || FogOfWar::new(VisionConfig::for_decks(vec![deck]));
         let cfg = AcousticsConfig::default();
@@ -587,6 +585,7 @@ mod tests {
                 cell: glam::IVec2::new(0, 0),
                 facing: -glam::Vec2::X,
                 deck: 0,
+                eye_z: 102,
             },
             0.1,
         );

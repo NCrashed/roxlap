@@ -128,23 +128,11 @@ fn ship_vision_config(light_gate: bool) -> VisionConfig {
         .map(|i| {
             let z_bottom = FLOOR_TOPS[i];
             let z_top = DECK_CLIPS[i + 1].expect("decks 1..=3 are clipped");
-            let mut eye = z_bottom - EYE_HEIGHT as i32; // eye above the floor
-                                                        // Visual-pass round 5 (#2): the bottom deck is FLOODED — water
-                                                        // fills up to `BILGE_WATER_TOP` and counts as solid to the LOS
-                                                        // sample, so an eye band at floor level is submerged and the
-                                                        // observer is blocked in every direction (the whole deck read
-                                                        // as unknown). Lift the flooded deck's eye into the air gap
-                                                        // just above the waterline, where the hull walls still occlude
-                                                        // but the water does not.
-            if i == FLOOR_TOPS.len() - 1 {
-                eye = BILGE_WATER_TOP - 4;
-            }
-            DeckBand {
-                z_top,
-                z_bottom,
-                eye_top: eye - 2,
-                eye_bottom: eye + 2,
-            }
+            // The eye band is no longer here — it rides the observer
+            // (`fow_observer`'s `eye_z`), so LOS tracks the character's
+            // real eye over stairs / ramps / a floating swim, not a
+            // fixed floor-relative slab.
+            DeckBand { z_top, z_bottom }
         })
         .collect();
     let mut cfg = VisionConfig::for_decks(decks);
@@ -324,11 +312,22 @@ impl BoardingScene {
         let glp = world_to_grid_local(self.body.pos(), &transform);
         let v = voxel_global(glp.chunk, glp.voxel);
         let fwd = ctx.cam.camera().forward;
+        // The character's real eye, grid-local (z-down: EYE_HEIGHT above
+        // the feet is a SMALLER z). This rides stairs / ramps / the swim
+        // instead of a fixed floor slab. One clamp remains: in the
+        // flooded bilge the solid water blocks LOS, so keep the eye band
+        // clear of the waterline (a swimmer sees ACROSS the surface, not
+        // walled in by it) — the only water-specific bit, pending a
+        // material-aware LOS sample.
+        #[allow(clippy::cast_possible_truncation)]
+        let eye_z = (self.body.pos().z - EYE_HEIGHT - SHIP_ORIGIN_Z) as i32;
+        let eye_z = eye_z.min(BILGE_WATER_TOP - 3);
         #[allow(clippy::cast_possible_truncation)]
         FowObserver {
             cell: glam::IVec2::new(v.x, v.y),
             facing: glam::Vec2::new(fwd[0] as f32, fwd[1] as f32),
             deck: self.fog_deck_index(),
+            eye_z,
         }
     }
 

@@ -415,8 +415,26 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   z-range; needs narrowing to the stair shaft only. (b) round-6 #2 not
   fixed — standing on a column OR on the stairs still blinds the player
   (the centre-based `fog_deck_index` and/or the fixed floor-level eye
-  band still misplace the observer when elevated). USER VISUAL PASS
-  (round 8) owed.
+  band still misplace the observer when elevated).
+- **Visual-pass round 8** (user asked to fix the "blind on stairs / on
+  anything above the deck floor" bug, with the design directive that the
+  eye must NOT be tied to the floor level — floors can be uneven: caves,
+  ramps, boulders, furniture). Root cause: the LOS opacity band was a
+  FIXED per-deck slab (`DeckBand.eye_top/eye_bottom`), so anywhere the
+  character's real eye left that slab — up a staircase, on a column, on
+  the floating swim — the shadowcast sampled the wrong z (solid or empty)
+  and blinded / mis-revealed them. Fix: the eye band now RIDES the
+  observer. `DeckBand` drops `eye_top/eye_bottom` (keeps just the render
+  extent `z_top/z_bottom`); `FowObserver` gains `eye_z` (grid-local); the
+  shadowcast blocks on `[eye_z ± EYE_HALF]` (EYE_HALF = 2) and the
+  opacity cache + LOS key fold in the eye band so an eye-height change
+  re-samples. The demo feeds the character's real eye
+  (`feet.z − EYE_HEIGHT`), so vision tracks stairs/ramps for free. One
+  water clamp survives in the demo (the flooded bilge's solid water still
+  blocks LOS → keep the eye band just above the waterline) pending a
+  material-aware LOS sample. CPU-only; the GPU mask layout is unchanged.
+  **STILL OPEN**: the two-deck render (round-6 #1) narrowing. USER VISUAL
+  PASS (round 9) owed.
 
 ## Goal
 
