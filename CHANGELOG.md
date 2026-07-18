@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-07-18
+
+The **SS13 deck-view trilogy**: three composable ways to see into a
+ship interior — **CA** cuts the ceilings above, **OC** cuts the walls in
+front, **FW** restricts the view to what the character knows. The demo's
+**Boarding** tab drives all three at once.
+
 Stage **CA — cutaway deck rendering** (`PORTING-CUTAWAY.md`): per-grid
 horizontal clip planes for isometric "deck view" rendering (SS13-style
 ship interiors). Additive APIs, but three public structs grew required

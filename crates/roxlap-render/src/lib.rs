@@ -994,8 +994,8 @@ pub struct FrameParams<'a> {
     /// the pre-OC output.
     pub view_cutout: Option<ViewCutout>,
     /// FW.2 — fog-of-war styling for one grid (the known twin): its
-    /// [`GridId`](roxlap_scene::GridId) plus the [`FogOfWar`]
-    /// (roxlap_scene::FogOfWar) mask to style it with. Only that grid's
+    /// [`GridId`](roxlap_scene::GridId) plus the
+    /// [`FogOfWar`](roxlap_scene::FogOfWar) mask to style it with. Only that grid's
     /// hits are dimmed / desaturated / hidden by the observer's
     /// knowledge; every other grid renders normally. CPU path (stage
     /// FW.2); the GPU path lands in FW.3. `None` (the default) is

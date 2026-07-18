@@ -22,18 +22,18 @@ path = "src/main.rs"
 env_logger = "0.11"
 glam = { workspace = true }
 png = "0.17"
-roxlap-core = { path = "../roxlap-core", version = "0.29" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.29" }
+roxlap-core = { path = "../roxlap-core", version = "0.30" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.30" }
 # RF: unified CPU/GPU renderer facade. Owns presentation + the
 # Scene→GPU bridge + the CPU compositor; `ROXLAP_GPU=1` selects the
 # GPU backend with automatic CPU fallback. The demo no longer touches
 # roxlap-gpu or softbuffer directly.
 roxlap-render = { path = "../roxlap-render", features = ["hud", "gif"] }
-roxlap-scene = { path = "../roxlap-scene", version = "0.29" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.30" }
 # AU2.3 — the Audio scene computes live acoustics through the PURE
 # core (no device, no threads), so the tab exists in every build; the
 # `audio` feature below adds actual playback via kira.
-roxlap-audio = { path = "../roxlap-audio", version = "0.29" }
+roxlap-audio = { path = "../roxlap-audio", version = "0.30" }
 winit = "0.30"
 # BB.5 — the "Doom" scene synthesises its billboard sprites as animated
 # GIFs at startup (the encoder), then feeds them back through the
