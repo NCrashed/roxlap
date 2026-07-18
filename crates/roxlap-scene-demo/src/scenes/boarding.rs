@@ -22,7 +22,10 @@ use roxlap_render::{
     DirectionalLight, Kv6, LightRig, LoopMode, Material, PointLight, ShadowFlags, ViewCutout,
     VoxelClip,
 };
-use roxlap_scene::{CharacterBody, CharacterDef, GridId, Scene, WalkInput};
+use roxlap_scene::{
+    voxel_global, world_to_grid_local, CharacterBody, CharacterDef, DeckBand, FogOfWar,
+    FowObserver, FowTwin, GridId, LightGate, Scene, VisionConfig, WalkInput,
+};
 use winit::keyboard::KeyCode;
 
 use super::decks::{
@@ -104,6 +107,47 @@ fn spawn_feet() -> DVec3 {
 const START_YAW: f64 = std::f64::consts::FRAC_PI_2;
 const START_PITCH: f64 = 0.55;
 
+/// FW.5 — how often the scripted "noise behind the wall" fires (seconds)
+/// and where its source sits (grid-local voxel, on the top deck behind a
+/// bulkhead from spawn), so the heard pocket is clearly OFF the observer.
+const NOISE_PERIOD: f64 = 2.0;
+const NOISE_SOURCE_LOCAL: [f64; 3] = [96.0, 64.0, 252.0];
+
+/// FW.5 — the ship's fog-of-war vision: one deck band per walkable deck,
+/// derived from the same [`DECK_CLIPS`]/[`FLOOR_TOPS`] the CA clip uses
+/// (band = clip plane .. floor, z-down). `light_gate` (the `G` toggle)
+/// caps vision at unlit surfaces.
+fn ship_vision_config(light_gate: bool) -> VisionConfig {
+    let decks: Vec<DeckBand> = (0..FLOOR_TOPS.len())
+        .map(|i| {
+            let z_bottom = FLOOR_TOPS[i];
+            let z_top = DECK_CLIPS[i + 1].expect("decks 1..=3 are clipped");
+            let eye = z_bottom - EYE_HEIGHT as i32; // eye level above the floor
+            DeckBand {
+                z_top,
+                z_bottom,
+                eye_top: eye - 2,
+                eye_bottom: eye + 2,
+            }
+        })
+        .collect();
+    let mut cfg = VisionConfig::for_decks(decks);
+    // Ship-scale: a ~100° cone reaching most of a deck + a small
+    // 360° peripheral, quicker memory decay than the defaults.
+    cfg.cone_half_angle = 0.9;
+    cfg.range = 60.0;
+    cfg.peripheral_range = 8.0;
+    cfg.memory_decay = 2.0;
+    if light_gate {
+        cfg.light_gate = Some(LightGate {
+            lit_brightness: 96,
+            softness: 40,
+            emissive_colors: Vec::new(),
+        });
+    }
+    cfg
+}
+
 // Four independent user toggles (deck-follow, keyhole, camera mode,
 // first-enter radius latch) — not an encoded state machine.
 #[allow(clippy::struct_excessive_bools)]
@@ -136,6 +180,16 @@ pub struct BoardingScene {
     /// (the Decks light-cull pattern, decision 4).
     cabin_lights: Vec<PointLight>,
     lit_points: Vec<PointLight>,
+    /// FW.5 — fog of war. `F` toggles it: on, the ship becomes a
+    /// `render_excluded` real grid shown through the known `twin`, and
+    /// `render` passes the mask so only the character's cone / memory /
+    /// heard pockets render. `G` toggles the light gate.
+    fow: FogOfWar,
+    twin: Option<FowTwin>,
+    fow_on: bool,
+    light_gate_on: bool,
+    /// Scripted "noise behind the wall" countdown (seconds).
+    noise_timer: f64,
 }
 
 impl BoardingScene {
@@ -176,7 +230,49 @@ impl BoardingScene {
             radius_inited: false,
             cabin_lights: cabin_lights(),
             lit_points: Vec::new(),
+            fow: FogOfWar::new(ship_vision_config(false)),
+            twin: None,
+            fow_on: false,
+            light_gate_on: false,
+            noise_timer: NOISE_PERIOD,
         }
+    }
+
+    /// FW.5 — the character's fog observer: grid-local cell, facing (the
+    /// camera's horizontal aim), and the fog deck index (0-based into
+    /// [`ship_vision_config`]'s decks, from the CA deck the body is on).
+    fn fow_observer(&self, ctx: &SceneCtx) -> FowObserver {
+        let transform = self
+            .scene
+            .grid(self.ship)
+            .map(|g| g.transform)
+            .unwrap_or_default();
+        let glp = world_to_grid_local(self.body.pos(), &transform);
+        let v = voxel_global(glp.chunk, glp.voxel);
+        let fwd = ctx.cam.camera().forward;
+        // `deck_for_body` is 0 (roof/outside) or 1..=3; the fog decks are
+        // 0..=2 — the top deck (0) covers the roof-view fallback.
+        let deck = self.deck_for_body().max(1) - 1;
+        #[allow(clippy::cast_possible_truncation)]
+        FowObserver {
+            cell: glam::IVec2::new(v.x, v.y),
+            facing: glam::Vec2::new(fwd[0] as f32, fwd[1] as f32),
+            deck,
+        }
+    }
+
+    /// FW.5 — turn the fog on/off: attach / detach the known twin (which
+    /// flips the ship to `render_excluded` and renders the twin instead).
+    fn set_fow(&mut self, on: bool) {
+        if on && self.twin.is_none() {
+            self.twin = Some(FowTwin::attach(&mut self.scene, self.ship));
+        } else if !on {
+            if let Some(t) = self.twin.take() {
+                t.detach(&mut self.scene);
+            }
+        }
+        self.fow_on = on;
+        eprintln!("boarding: fog of war = {}", if on { "ON" } else { "off" });
     }
 
     /// The deck view the character's position calls for: the deck the
@@ -291,7 +387,7 @@ impl DemoScene for BoardingScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD walks · Space jumps · mouse orbits · wheel: keyhole radius · K: keyhole · V: deck-follow cut · C: shoulder/tele-iso · PgUp/PgDn manual decks"
+        "WASD walks · Space jumps · mouse orbits · wheel: keyhole radius · K: keyhole · V: deck-follow cut · C: shoulder/tele-iso · PgUp/PgDn manual decks · F: fog of war · G: fog light gate"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -333,6 +429,11 @@ impl DemoScene for BoardingScene {
         if self.tele {
             self.saved_mip_scan = Some(ctx.renderer.gpu_mip_scan_dist());
             ctx.renderer.set_gpu_mip_scan_dist(TELE_MIP_SCAN);
+        }
+        // FW.5 — re-arm the fog twin if the toggle was left on (`exit`
+        // detached it so the ship renders normally in the other tabs).
+        if self.fow_on && self.twin.is_none() {
+            self.twin = Some(FowTwin::attach(&mut self.scene, self.ship));
         }
     }
 
@@ -384,6 +485,45 @@ impl DemoScene for BoardingScene {
         }
         if self.actor.is_some() {
             ctx.renderer.tick(&ctx.cam.camera(), dt);
+        }
+
+        // FW.5 — advance the fog of war for the character, sync the known
+        // twin (the geometry the observer has seen, frozen), and fire the
+        // scripted "noise behind the wall" so a heard pocket reveals live
+        // geometry the character can't see.
+        if self.fow_on {
+            let obs = self.fow_observer(ctx);
+            #[allow(clippy::cast_possible_truncation)]
+            let dtf = dt as f32;
+            if let Some(g) = self.scene.grid(self.ship) {
+                self.fow.update(g, &obs, dtf);
+            }
+            if let Some(twin) = &mut self.twin {
+                if !twin.sync(&mut self.scene, &self.fow) {
+                    // The twin was lost (shouldn't happen here) — re-arm.
+                    self.twin = None;
+                    self.fow_on = false;
+                }
+            }
+            self.noise_timer -= dt;
+            if self.noise_timer <= 0.0 {
+                self.noise_timer = NOISE_PERIOD;
+                let src = DVec3::new(
+                    NOISE_SOURCE_LOCAL[0],
+                    NOISE_SOURCE_LOCAL[1],
+                    NOISE_SOURCE_LOCAL[2] + SHIP_ORIGIN_Z,
+                );
+                let listener = self.body.pos() - DVec3::new(0.0, 0.0, EYE_HEIGHT);
+                roxlap_audio::hear_source(
+                    &self.scene,
+                    &mut self.fow,
+                    self.ship,
+                    src,
+                    listener,
+                    1.4,
+                    &roxlap_audio::AcousticsConfig::default(),
+                );
+            }
         }
 
         // Decision 4 — the Decks light-cull pattern: lamps on
@@ -466,6 +606,24 @@ impl DemoScene for BoardingScene {
                     }
                 );
             }
+            SceneInput::Key {
+                code: KeyCode::KeyF,
+                pressed: true,
+            } => {
+                let on = !self.fow_on;
+                self.set_fow(on);
+            }
+            SceneInput::Key {
+                code: KeyCode::KeyG,
+                pressed: true,
+            } => {
+                self.light_gate_on = !self.light_gate_on;
+                self.fow.set_config(ship_vision_config(self.light_gate_on));
+                eprintln!(
+                    "boarding: fog light gate = {}",
+                    if self.light_gate_on { "ON" } else { "off" }
+                );
+            }
             SceneInput::Wheel { dy } => {
                 #[allow(clippy::cast_possible_truncation)]
                 let step = *dy as f32 * RADIUS_STEP;
@@ -519,6 +677,14 @@ impl DemoScene for BoardingScene {
                 z_bias: Z_BIAS,
             });
         }
+        // FW.5 — the fog mask, keyed to the known twin grid (renders in
+        // place of the render-excluded ship). Composes with the CA deck
+        // clip + the OC keyhole above — all three cuts at once.
+        if self.fow_on {
+            if let Some(twin) = &self.twin {
+                frame.fow = Some((twin.twin(), &self.fow));
+            }
+        }
         let camera = ctx.cam.camera();
         ctx.renderer.render(&mut self.scene, &camera, &frame);
     }
@@ -527,6 +693,11 @@ impl DemoScene for BoardingScene {
         // Restore the entry-time GPU LOD range for the other scenes.
         if let Some(d) = self.saved_mip_scan.take() {
             ctx.renderer.set_gpu_mip_scan_dist(d);
+        }
+        // FW.5 — detach the twin so the ship isn't left render-excluded
+        // in the other tabs (the `fow_on` flag survives; `enter` re-arms).
+        if let Some(t) = self.twin.take() {
+            t.detach(&mut self.scene);
         }
     }
 
@@ -559,6 +730,16 @@ impl DemoScene for BoardingScene {
                 },
                 self.lit_points.len(),
                 self.cabin_lights.len()
+            ),
+            format!(
+                "fog of war: {} (F) · light gate: {} (G){}",
+                if self.fow_on { "ON" } else { "off" },
+                if self.light_gate_on { "ON" } else { "off" },
+                if self.fow_on {
+                    " · a scripted noise reveals a heard pocket every 2 s"
+                } else {
+                    ""
+                },
             ),
         ]
     }

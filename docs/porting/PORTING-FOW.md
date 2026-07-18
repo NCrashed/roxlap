@@ -3,7 +3,7 @@
 Entry doc written 2026-07-17 at workspace 0.29.0 + uncommitted OC tail.
 This is the **entry doc** for the fog-of-war stage — tag **FW**.
 
-## Status — FW.0 + FW.1 + FW.2 + FW.3 + FW.4 LANDED (2026-07-18); FW.5 not started
+## Status — FW STAGE COMPLETE (FW.0–FW.5 LANDED 2026-07-18); user visual pass owed
 
 - **FW.0** — `roxlap-scene/src/fow.rs`: `FogOfWar` + `VisionConfig` +
   `DeckBand` + `LightGate` + `FowObserver` (+ `CellState`, all
@@ -317,6 +317,22 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   per-instance actor-root); a fine-grained fog boundary can dismember a
   GPU-rendered KFA actor. Needs per-instance root threaded through
   `cull_bin_upload` — follow-up.
+- **FW.5** — demo + book + CHANGELOG (STAGE CLOSE). The **Boarding** tab
+  grows fog of war: `F` toggles it (attach / detach a `FowTwin`, so the
+  ship becomes the `render_excluded` real grid drawn through the twin),
+  `G` toggles the light gate; the three cuts compose (CA deck-follow +
+  OC keyhole + FW knowledge) — the tab's point. `ship_vision_config`
+  builds the deck bands from the same `DECK_CLIPS`/`FLOOR_TOPS` the CA
+  clip uses; the observer is the character (grid-local cell + camera
+  facing + CA deck); `update` advances the mask, syncs the twin, and
+  fires a scripted `hear_source` "noise behind a bulkhead" every 2 s to
+  show a heard pocket; `enter`/`exit` re-arm / detach the twin on tab
+  switch (the flag survives, the ship isn't left excluded elsewhere).
+  Book: rendering-chapter "Fog of war" section (the CA=decks /
+  OC=camera / FW=knowledge table) + demo-tour row; CHANGELOG FW stage
+  entry (additive; `DdaEnv.fow` grew for exhaustive literals). Gate:
+  workspace green, clippy/anchors clean; USER VISUAL PASS owed. Next cut
+  minor (additive APIs across the FW stage).
 
 ## Goal
 

@@ -26,6 +26,28 @@ required fields for exhaustive literals: `roxlap-core`'s
 `DdaEnv.cutout` and `roxlap-gpu`'s
 `GridWorldTransform.cutout_focus_z`.
 
+Stage **FW — fog of war / field of view** (`PORTING-FOW.md`):
+SS13-style *knowledge-based* visibility for third-person play. The
+character renders in realtime only what it currently sees (a facing
+cone + a small peripheral); geometry seen before renders frozen at the
+moment last seen (dimmed, desaturated, no live lighting); never-seen
+space is hidden; audible sound reveals temporary "heard" pockets
+through walls. Presentation-only (nothing in sim / collision / audio /
+pathing reads it — the lockstep-safe RTS tradeoff), per-grid opt-in,
+disabled ⇒ byte-identical on both backends. Works by rendering a
+**known twin** grid (copy-on-first-seen) in place of the
+`render_excluded` real grid. New: `roxlap-scene`'s `FogOfWar`,
+`FowTwin`, `VisionConfig`, `DeckBand`, `LightGate`, `FowObserver`,
+`CellState`, `FowRender`, `GpuFowMask`, `Grid::{render_excluded,
+presentation_only, gpu_residency_hint, footprint_cells}` +
+`Scene::{render_grids, query_grids}`; `roxlap-core`'s `dda::{FowStyler,
+FowVerdict, fow_style}` + `DdaEnv.fow`; `roxlap-render`'s
+`FrameParams.fow` / `ComposedFrameParams.fow`; `roxlap-gpu`'s
+`fow::pack_fog_mask`; `roxlap-audio`'s `hear_source`. Additive, but
+exhaustive struct literals of `roxlap-core`'s `DdaEnv` must add `.fow`
+(constructor / `..Default::default()` users unaffected). The demo's
+**Boarding** tab grows `F` (fog on/off) and `G` (light gate).
+
 ### Added
 
 - **Per-grid cutaway clip** (CA.0/CA.1): `Grid::z_clip: Option<i32>` +

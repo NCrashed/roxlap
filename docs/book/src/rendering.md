@@ -276,6 +276,61 @@ a hotkey: `K` keyhole on/off, `V` deck-follow clip vs manual
 (`PgUp`/`PgDn`), `C` shoulder vs the tele-iso deck orbit, wheel =
 keyhole radius.
 
+## Fog of war (knowledge-based visibility)
+
+The cutaway and the keyhole answer *"can the camera see through this
+geometry?"*. Fog of war answers a different question — *"does the
+**character** know what's there?"* — the SS13 model: you render in
+realtime only what the character currently sees (a facing cone plus a
+small peripheral), everything seen before renders frozen at the moment
+it was last seen (dimmed, desaturated, no live lighting), never-seen
+space is hidden, and audible sound punches temporary "heard" pockets
+through walls.
+
+The engine keeps this presentation-only — nothing in simulation,
+collision, audio, or pathing reads it, so it can't desync a lockstep
+game. It works by rendering a **known twin** of the real grid:
+
+```rust,ignore
+// Arm fog of war on the ship grid. `attach` registers a twin grid
+// (drawn in place of the real one, which is now `render_excluded`)
+// and returns the binding.
+let mut fow = FogOfWar::new(VisionConfig::for_decks(deck_bands));
+let mut twin = FowTwin::attach(&mut scene, ship);
+
+// Each tick: advance the mask for the character, then sync the twin
+// (it copies chunks from the real grid ONLY under seen cells, so
+// unseen geometry — and its baked light — stays frozen).
+fow.update(scene.grid(ship).unwrap(), &observer, dt);
+assert!(twin.sync(&mut scene, &fow)); // false ⇒ re-arm after a load
+
+// Render: name the twin + mask. Only the fog grid is styled; every
+// other grid renders normally. `None` (the default) is byte-identical.
+frame.fow = Some((twin.twin(), &fow));
+```
+
+`observer` is a `FowObserver { cell, facing, deck }` in the grid's
+local frame. Sprites over Memory/Unseen cells are hidden automatically
+(`FogOfWar::hides_sprite` — actors on the water outside the ship
+footprint are never touched); a sound source reveals a heard pocket
+via `roxlap_audio::hear_source`, scaled by how much of it reaches the
+listener through the geometry.
+
+**When to use which:**
+
+| Feature | Question it answers | State |
+|---|---|---|
+| `Grid::z_clip` (cutaway) | can the camera see *below* this ceiling? | grid state |
+| `FrameParams::view_cutout` (keyhole) | can the camera see *past* this wall? | per-frame view |
+| `FrameParams::fow` (fog of war) | does the *character* **know** what's here? | host-owned mask + twin |
+
+All three compose: a deck clip that follows the character, a keyhole
+for the walls in front, and the fog restricting it to what the
+character has seen. The **Boarding** tab drives all three — press `F`
+to toggle the fog and `G` its light gate (dark rooms stay unknown); a
+scripted noise behind a bulkhead lights a heard pocket every couple of
+seconds.
+
 ## Where next
 
 - [The render pipeline](render-pipeline.md) — the fixed-resolution /
