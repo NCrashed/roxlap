@@ -8,13 +8,18 @@
 //! word 0 `FOG_ENABLED` (0 = off) · 1 `FOG_GRID` (per-grid slot) · 2
 //! `FOG_DECKS_N` · 3–4 origin cell (i32) · 5 width · 6 height · 7–8
 //! `memory_dim`/`memory_desaturate` (f32 bits) · 9.. up to
-//! [`FOG_MAX_DECKS`] `(z_top, z_bottom)` i32 pairs · [`FOG_HEADER_WORDS`]..
-//! deck-major, row-major mask bytes packed 4 cells / u32.
+//! [`FOG_MAX_DECKS`] `(z_top, z_bottom)` i32 pairs · then
+//! `FOG_ACTIVE_DECK` (the observer's deck — every voxel is classified
+//! against it, not its own z) · [`FOG_HEADER_WORDS`].. deck-major,
+//! row-major mask bytes packed 4 cells / u32.
 
 /// Header word count before the packed cells (`FOG_CELLS_BASE` in WGSL).
-pub const FOG_HEADER_WORDS: usize = 17;
+pub const FOG_HEADER_WORDS: usize = 18;
 /// Max decks the shader's `fog_mask` deck loop scans (`FOG_MAX_DECKS`).
 pub const FOG_MAX_DECKS: usize = 4;
+/// Word index of the observer's active deck (`FOG_ACTIVE_DECK` in WGSL),
+/// just past the [`FOG_MAX_DECKS`] band pairs (`9 + 2*4`).
+pub const FOG_ACTIVE_DECK: usize = 17;
 
 /// FW.3 — pack a fog mask into `fog_mask` storage-buffer words.
 ///
@@ -26,6 +31,10 @@ pub const FOG_MAX_DECKS: usize = 4;
 ///   [`FOG_MAX_DECKS`]** (with a `debug_assert` + one-time warn): the
 ///   shader only scans that many, so a taller deck stack would silently
 ///   drop its top floors — the truncation is now loud.
+/// - `active_deck` — the observer's deck; every rendered voxel is
+///   classified against this layer regardless of its own z (so stairs
+///   and sub-floor seen through a hole read on the deck you stand on).
+///   Clamped to the deck count.
 /// - `cells` — deck-major, row-major mask bytes (`d*w*h + y*w + x`).
 ///
 /// Returns `FOG_HEADER_WORDS + ceil(cells.len()/4)` words.
@@ -36,6 +45,7 @@ pub fn pack_fog_mask(
     width: u32,
     height: u32,
     decks: &[[i32; 2]],
+    active_deck: usize,
     memory_dim: f32,
     memory_desaturate: f32,
     cells: &[u8],
@@ -70,6 +80,9 @@ pub fn pack_fog_mask(
         w[9 + d * 2] = band[0] as u32; // z_top
         w[9 + d * 2 + 1] = band[1] as u32; // z_bottom
     }
+    // Clamp the active deck to a valid layer so the shader index is
+    // always in-bounds even if a caller passes a stale deck.
+    w[FOG_ACTIVE_DECK] = active_deck.min(deck_count.saturating_sub(1)) as u32;
     for (i, chunk) in cells.chunks(4).enumerate() {
         let mut word = 0u32;
         for (j, &b) in chunk.iter().enumerate() {
@@ -100,6 +113,7 @@ mod tests {
             2,
             1,
             &[[10, 20], [30, 40]],
+            1,
             0.5,
             0.25,
             &[0xC1, 0x02, 0x83, 0x00],
@@ -115,14 +129,22 @@ mod tests {
         assert_eq!(f32::from_bits(w[8]), 0.25);
         assert_eq!((w[9] as i32, w[10] as i32), (10, 20));
         assert_eq!((w[11] as i32, w[12] as i32), (30, 40));
-        assert_eq!(w[17], 0x0083_02C1);
-        assert_eq!(w.len(), 18);
+        assert_eq!(w[FOG_ACTIVE_DECK], 1, "active deck");
+        assert_eq!(w[18], 0x0083_02C1);
+        assert_eq!(w.len(), 19);
     }
 
     #[test]
     fn truncates_excess_decks() {
         let decks = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]; // 5 > MAX 4
-        let w = pack_fog_mask(0, [0, 0], 1, 1, &decks, 1.0, 0.0, &[0]);
+        let w = pack_fog_mask(0, [0, 0], 1, 1, &decks, 0, 1.0, 0.0, &[0]);
         assert_eq!(w[2], FOG_MAX_DECKS as u32, "deck count clamps to MAX");
+    }
+
+    #[test]
+    fn active_deck_clamps_to_deck_count() {
+        // A stale/over-range active deck must not index past the layers.
+        let w = pack_fog_mask(0, [0, 0], 1, 1, &[[0, 1], [2, 3]], 9, 1.0, 0.0, &[0]);
+        assert_eq!(w[FOG_ACTIVE_DECK], 1, "clamped to last valid deck");
     }
 }

@@ -333,6 +333,90 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   entry (additive; `DdaEnv.fow` grew for exhaustive literals). Gate:
   workspace green, clippy/anchors clean; USER VISUAL PASS owed. Next cut
   minor (additive APIs across the FW stage).
+- **Visual-pass round 5** (user ran the Boarding tab; 4 reports fixed;
+  workspace 987 green, GPU shader re-validated):
+  1. **Stair tops / above-head read as unknown.** The verdict picked the
+     deck by `deck_for_z(hit_z)`, so a stair descending into the next
+     deck's z-band (or sub-floor seen through a stairwell hole) was
+     classified on a deck the observer hadn't seen → Hidden. Now BOTH
+     backends classify every rendered voxel against the observer's
+     **active deck** (`FogOfWar::visible_deck`), threaded to the GPU as a
+     new `FOG_ACTIVE_DECK` header word (header 17→18). Untracked strata
+     are still held back — by the per-(x,y) `Unseen → Hide` gate, not by
+     z. (`FowRender::verdict`, `fow_lookup`, `pack_fog_mask` gained
+     `active_deck`, clamped to the deck count.)
+  2. **Bottom (flooded) deck always unknown.** The bilge is fully
+     flooded to grid-local z 310 and water counts as SOLID to the LOS
+     sample, so the floor-level eye band `[308,310]` was submerged and
+     the observer was blocked in every direction. Fixed demo-side: the
+     flooded deck's fog eye sits in the air gap just above the waterline
+     (`BILGE_WATER_TOP − 4`), where the hull walls still occlude but the
+     water doesn't. (General "water blocks fog LOS" is an OWED tail — the
+     geometric sample has no material-transparency notion.)
+  3. **Light gate did nothing.** The Boarding ship was never baked (every
+     other scene bakes; Decks/Boarding didn't), so all voxels were a
+     uniform brightness 0x80 > the gate knee → never gated. Now Boarding
+     bakes the cabin lamps (`BakeMode::PointLights`: dim base ~50–75 at
+     the room ends rising to ~130–155 lamp pools; measured) and the gate
+     knee (`lit_brightness 130 − softness 45 = 85`) sits between, so lamp
+     pools read as live-seen and dim ends stay Memory even in the cone.
+  4. **Dark rings / lines at the FOV edge.** A currently-Visible cell was
+     dimmed toward `memory_dim` by its cone-edge / fade-in intensity, so
+     the rim and the turning leading-edge read as dark rings against the
+     unseen black. Now a Visible cell keeps a brightness FLOOR
+     (`VISIBLE_DIM_FLOOR = 0.7`, mirrored CPU + WGSL); Memory/Heard keep
+     the full intensity ramp (the Visible→Memory handoff still meets at
+     1.0). Config also widens `cone_taper 0.12→0.22` and speeds
+     `fade_in 240→600`.
+- **Visual-pass round 6** (user ran the round-5 build; 3 reports fixed;
+  workspace 988 green, GPU shader re-validated):
+  1. **Rays landed on ALL decks at once** (regression from round 5 #1).
+     "Classify against the active deck, ignore z" revealed the whole
+     vertical column, so rotating lit voxels on every floor. Replaced
+     with an active-deck **Z WINDOW** (`VisionConfig::classify_deck`,
+     mirrored in WGSL): the active deck owns its ceiling down to the NEXT
+     deck's floor (its band + the stair/hole shaft); a voxel below the
+     window falls back to strict `deck_for_z` gated by its OWN deck's
+     state, above the ceiling → Hidden. Stairs still show; deeper decks
+     don't leak. (`FowVerdict::Hide` returns `false` from the DDA hit
+     predicate = TRANSPARENT/continue — an unseen deck is see-through,
+     which is what lets you look down a hole.)
+  2. **Standing on a column → sees nothing, even around.** The fog deck
+     came from `deck_for_body` (HEAD-based, a CA-clip anti-flicker
+     choice); a column lifts the head above the deck ceiling so the pick
+     jumped to the deck ABOVE and the fog revealed the wrong floor. New
+     `fog_deck_index` picks by the body CENTRE vs the deck floors — stays
+     inside the deck the feet rest on — for the fog observer only (CA
+     clip unchanged; the fog's Hide-transparency exposes the right deck
+     through the intervening one).
+  3. **"Разводы" (smudges) at the cone / peripheral-ring edge still
+     there.** Round 5 floored the *brightness* but the *desaturation*
+     still ramped with cone-edge intensity → grey gradient rims. Now a
+     Visible cell is drawn fully UNSTYLED (dim 1.0, desat 0) — the
+     intensity taper shapes only Memory/Heard; the handoff still lands
+     continuous (freshly-demoted t≈1 → dim≈1/desat≈0). Removed
+     `VISIBLE_DIM_FLOOR`.
+- **Visual-pass round 7** (user asked to fix one bug at a time; this
+  round = the "разводы" only, with a 100% repro: sweep the view right
+  then left → a smudge stays at the RIGHT edge where the cone edge was).
+  Root cause: a seen cell recorded a **taper-scaled** intensity
+  (`vis * INTENSITY_MAX`), and cone-edge / fast-swept cells demoted at
+  LOW intensity → a faint gradient in the MEMORY they became (the live
+  view was already unstyled, so this only showed once the cells went to
+  memory). Fix (CPU-only, `LosScan::visit` + the visible stamp): `vis`
+  now decides only WHETHER a cell is seen; a seen cell records **full**
+  intensity and the stamp SNAPS it to full in one tick (no fade-in, so
+  even a one-frame glimpse demotes at full). Memory is now spatially
+  uniform — only the temporal fade-out/decay remains. No WGSL change (the
+  shader already reads the byte). **STILL OPEN** for later rounds:
+  (a) round-6 #1 only half-fixed — the render still reveals TWO decks
+  (current + the one below), because `classify_deck`'s window runs down
+  to the *next deck's floor* and so swallows the whole next deck's
+  z-range; needs narrowing to the stair shaft only. (b) round-6 #2 not
+  fixed — standing on a column OR on the stairs still blinds the player
+  (the centre-based `fog_deck_index` and/or the fixed floor-level eye
+  band still misplace the observer when elevated). USER VISUAL PASS
+  (round 8) owed.
 
 ## Goal
 

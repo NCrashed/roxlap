@@ -490,7 +490,17 @@ fn scene_dda_side_shades_darken_floor() {
 fn fog_mask_uniform(vsid: u32, state: u8, intensity: u8, memory_dim: f32) -> Vec<u32> {
     let byte = (state << 6) | (intensity & 63);
     let cells = vec![byte; (vsid * vsid) as usize];
-    roxlap_gpu::fow::pack_fog_mask(0, [0, 0], vsid, vsid, &[[0, 255]], memory_dim, 0.0, &cells)
+    roxlap_gpu::fow::pack_fog_mask(
+        0,
+        [0, 0],
+        vsid,
+        vsid,
+        &[[0, 255]],
+        0,
+        memory_dim,
+        0.0,
+        &cells,
+    )
 }
 
 /// FW.3 — the GPU fog mask hides Unseen cells (renders sky) and shows

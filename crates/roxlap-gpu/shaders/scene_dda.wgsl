@@ -272,7 +272,8 @@ const FOG_MEM_DIM: u32 = 7u;    // f32 bits
 const FOG_MEM_DESAT: u32 = 8u;  // f32 bits
 const FOG_DECK_BASE: u32 = 9u;  // (z_top, z_bottom) i32 pairs per deck
 const FOG_MAX_DECKS: u32 = 4u;
-const FOG_CELLS_BASE: u32 = 17u; // = FOG_DECK_BASE + 2*FOG_MAX_DECKS
+const FOG_ACTIVE_DECK: u32 = 17u; // observer's deck (voxel classified vs it)
+const FOG_CELLS_BASE: u32 = 18u; // = FOG_ACTIVE_DECK + 1
 
 // FW.3 — the per-cell verdict, mirroring `roxlap_scene::FowRender`.
 // `hidden` ⇒ treat the cell as air (marcher/shadow continues);
@@ -294,13 +295,27 @@ fn fow_lookup(g: u32, cxm: i32, cym: i32, czm: i32, mip: u32) -> FowV {
     let m0x = (cxm << mip) + half;
     let m0y = (cym << mip) + half;
     let m0z = (czm << mip) + half;
-    // deck_for_z; a z in no band is untracked → hidden (review #4).
+    // Visual-pass round 6 (#1): classify against the active deck's Z
+    // WINDOW — its band plus the stair/hole shaft down to the next deck's
+    // floor — not every z (round 5's all-z reveal lit every deck at once).
+    // A voxel below the window falls back to strict deck_for_z so it's
+    // gated by its own deck's state; outside all bands → hidden.
+    let active_deck_i = i32(fog_mask[FOG_ACTIVE_DECK]);
     let dc = i32(fog_mask[FOG_DECKS_N]);
+    let a_top = bitcast<i32>(fog_mask[FOG_DECK_BASE + u32(active_deck_i) * 2u]);
+    var a_hi: i32 = 0x7fffffff;
+    if (active_deck_i + 1 < dc) {
+        a_hi = bitcast<i32>(fog_mask[FOG_DECK_BASE + u32(active_deck_i + 1) * 2u + 1u]);
+    }
     var deck: i32 = -1;
-    for (var d: i32 = 0; d < dc; d = d + 1) {
-        let zt = bitcast<i32>(fog_mask[FOG_DECK_BASE + u32(d) * 2u]);
-        let zb = bitcast<i32>(fog_mask[FOG_DECK_BASE + u32(d) * 2u + 1u]);
-        if (m0z >= zt && m0z <= zb) { deck = d; break; }
+    if (m0z >= a_top && m0z <= a_hi) {
+        deck = active_deck_i;
+    } else {
+        for (var d: i32 = 0; d < dc; d = d + 1) {
+            let zt = bitcast<i32>(fog_mask[FOG_DECK_BASE + u32(d) * 2u]);
+            let zb = bitcast<i32>(fog_mask[FOG_DECK_BASE + u32(d) * 2u + 1u]);
+            if (m0z >= zt && m0z <= zb) { deck = d; break; }
+        }
     }
     if (deck < 0) { v.hidden = true; return v; }
     let ox = bitcast<i32>(fog_mask[FOG_ORIGIN_X]);
@@ -318,10 +333,19 @@ fn fow_lookup(g: u32, cxm: i32, cym: i32, czm: i32, mip: u32) -> FowV {
     let inten = f32(mbyte & 63u) * (1.0 / 63.0);
     let mdim = bitcast<f32>(fog_mask[FOG_MEM_DIM]);
     let mdesat = bitcast<f32>(fog_mask[FOG_MEM_DESAT]);
-    // Unified Visible/Memory taper (review #5); only `dynamic` differs.
-    v.dim = mdim + (1.0 - mdim) * inten;
-    v.desat = mdesat * (1.0 - inten);
     v.dynamic = (state == 2u); // Visible
+    // Visual-pass round 6 (#3): a Visible cell is UNSTYLED (full
+    // brightness + colour) so the cone rim / peripheral ring no longer
+    // read as dim/desaturated smudges. The intensity taper shapes only
+    // Memory/Heard; the Visible→Memory handoff still lands continuous
+    // (a freshly-demoted t≈1 cell is dim≈1 / desat≈0).
+    if (v.dynamic) {
+        v.dim = 1.0;
+        v.desat = 0.0;
+    } else {
+        v.dim = mdim + (1.0 - mdim) * inten;
+        v.desat = mdesat * (1.0 - inten);
+    }
     return v;
 }
 

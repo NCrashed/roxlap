@@ -225,6 +225,36 @@ impl VisionConfig {
     pub fn deck_for_z(&self, z: i32) -> Option<usize> {
         self.decks.iter().position(|d| d.contains_z(z))
     }
+
+    /// Visual-pass round 6 (#1) — which deck layer a rendered voxel at
+    /// grid-local `z` is classified against, given the observer's
+    /// `active` deck. The `active` deck owns a Z **WINDOW** from its own
+    /// ceiling down to the NEXT deck's floor: its band plus the
+    /// stair/hole zone below it, so a staircase descending into the next
+    /// band — visible only *through* the hole the observer sees from
+    /// above — reads on the deck they stand on. Anything OUTSIDE that
+    /// window (a deeper deck seen through a deep shaft, or the ceiling
+    /// void above) falls back to strict [`deck_for_z`], so it is gated by
+    /// its OWN per-cell state and can't leak the whole vertical column
+    /// (round-5's "ignore z entirely" revealed every deck at once).
+    #[must_use]
+    pub fn classify_deck(&self, z: i32, active: usize) -> Option<usize> {
+        let Some(band) = self.decks.get(active) else {
+            return self.deck_for_z(z);
+        };
+        // z-down: the ceiling (z_top) is the small end, the floor
+        // (z_bottom) the large end. The window runs from this deck's
+        // ceiling to the next deck's floor (its band + the shaft below).
+        let hi = self
+            .decks
+            .get(active + 1)
+            .map_or(i32::MAX, |next| next.z_bottom);
+        if z >= band.z_top && z <= hi {
+            Some(active)
+        } else {
+            self.deck_for_z(z)
+        }
+    }
 }
 
 /// FW.3 — the fog mask flattened for GPU upload (see
@@ -243,6 +273,11 @@ pub struct GpuFowMask {
     /// Per-deck `(z_top, z_bottom)` inclusive bands (deck order matches
     /// the `deck` axis of `cells`).
     pub decks: Vec<[i32; 2]>,
+    /// Visual-pass round 5 (#1): the observer's ACTIVE deck — the layer
+    /// every rendered voxel is classified against, regardless of its z.
+    /// (The CPU [`FowRender`] reads [`FogOfWar::visible_deck`] directly;
+    /// the GPU gets it here.)
+    pub active_deck: usize,
     /// Deck-major, row-major mask bytes (state in bits 6–7, intensity in
     /// bits 0–5); `d*width*height + y*width + x`.
     pub cells: Vec<u8>,
@@ -753,6 +788,7 @@ impl FogOfWar {
                 .iter()
                 .map(|d| [d.z_top, d.z_bottom])
                 .collect(),
+            active_deck: self.visible_deck,
             cells,
             memory_dim: self.config.memory_dim,
             memory_desaturate: self.config.memory_desaturate,
@@ -853,22 +889,21 @@ impl FogOfWar {
                 membership_changed = true;
             }
         }
-        // Stamps: state bits flip to Visible immediately; intensity
-        // fades via the transition map.
-        for (&(x, y), &target) in &new_visible {
+        // Stamps: state flips to Visible AND intensity snaps to full at
+        // once. Visual-pass round 7 (#3): no fade-in — a cell only
+        // briefly in the cone (the edge sweeping past as you turn) must
+        // still demote at FULL intensity, or it leaves a faint memory
+        // streak where the cone edge passed. The fade-in was invisible
+        // live anyway (Visible is unstyled); dropping it makes the memory
+        // uniform regardless of sweep speed. Any pending decay is
+        // cancelled — the cell is fully lit again.
+        for &(x, y) in new_visible.keys() {
             if !old.contains_key(&(x, y)) {
                 membership_changed = true;
             }
             let cell = IVec2::new(x, y);
-            let cur = self.layers[deck].byte(cell);
-            let intensity = cur & INTENSITY_MAX;
-            changed |= self.layers[deck].write(cell, pack(CellState::Visible, intensity));
-            let key = (deck, x, y);
-            if (f32::from(intensity) - target).abs() > SETTLE_EPS {
-                self.transitions
-                    .entry(key)
-                    .or_insert_with(|| f32::from(intensity));
-            }
+            changed |= self.layers[deck].write(cell, pack(CellState::Visible, INTENSITY_MAX));
+            self.transitions.remove(&(deck, x, y));
         }
         self.visible = new_visible;
         if membership_changed {
@@ -1331,38 +1366,36 @@ impl roxlap_core::dda::FowStyler for FowRender<'_> {
     fn verdict(&self, x: i32, y: i32, z: i32) -> roxlap_core::dda::FowVerdict {
         use roxlap_core::dda::FowVerdict;
         let cfg = self.fow.config();
-        // FW.2 review #4 — a z outside EVERY deck band is untracked
-        // geometry: the inter-deck hull, sub-floor machinery, ceiling
-        // voids a chunk-granular twin copy dragged in for a neighbour
-        // cell. The fog knows nothing about it, so HIDE it — the old
-        // `LIVE` default rendered whole never-seen chunk strata at full
-        // brightness through floor gaps and under the cutaway clip.
-        let Some(deck) = cfg.deck_for_z(z) else {
+        // Visual-pass round 6 (#1): classify against the observer's
+        // active-deck Z WINDOW (its band + the stair/hole shaft down to
+        // the next floor), NOT every z. Round 5's "ignore z" revealed the
+        // whole vertical column, so on startup rotating the observer lit
+        // voxels on every deck at once; a voxel below the window is gated
+        // by its own deck's state instead. Outside every band → Hide.
+        let Some(deck) = cfg.classify_deck(z, self.fow.visible_deck()) else {
             return FowVerdict::Hide;
         };
         let (state, intensity) = self.fow.state(deck, IVec2::new(x, y));
         let t = f32::from(intensity) / f32::from(INTENSITY_MAX);
-        // FW.2 review #5 — Visible and Memory share ONE dim/desaturate
-        // curve keyed on intensity, so the Visible→Memory handoff (the
-        // state flips in one frame while the intensity is still high,
-        // then decays via fade_out) is a smooth taper, NOT a
-        // 1.0→memory_dim jump on the back edge of the FOV every turn.
-        // Cone-edge cells (lower intensity) sit further down the same
-        // ramp; the centre (t == 1) is exactly full. Only the dynamic
-        // rig differs between the two states (memory is never relit).
-        let dim = cfg.memory_dim + (1.0 - cfg.memory_dim) * t;
-        let desaturate = cfg.memory_desaturate * (1.0 - t);
         match state {
             CellState::Unseen => FowVerdict::Hide,
+            // Visual-pass round 6 (#3): a currently-Visible cell is drawn
+            // UNSTYLED — full brightness, full colour — so the cone rim
+            // and the peripheral ring stop reading as dim/desaturated
+            // smudges ("разводы") against the unseen black. The intensity
+            // taper only shapes MEMORY now. The Visible→Memory handoff is
+            // still continuous: a cell demotes at whatever intensity it
+            // holds, and a freshly-demoted cell (t≈1) lands at dim≈1 /
+            // desat≈0 — matching the Visible it just was — then decays.
             CellState::Visible => FowVerdict::Show {
                 dynamic: true,
-                dim,
-                desaturate,
+                dim: 1.0,
+                desaturate: 0.0,
             },
             CellState::Memory | CellState::Heard => FowVerdict::Show {
                 dynamic: false,
-                dim,
-                desaturate,
+                dim: cfg.memory_dim + (1.0 - cfg.memory_dim) * t,
+                desaturate: cfg.memory_desaturate * (1.0 - t),
             },
         }
     }
@@ -1509,7 +1542,15 @@ impl LosScan<'_> {
         if vis <= 0.0 {
             return;
         }
-        let target = vis * f32::from(INTENSITY_MAX);
+        // Visual-pass round 7 (#3): `vis` (the cone/peripheral/light
+        // taper) decides only WHETHER the cell is seen; a seen cell
+        // records FULL intensity, not a taper-scaled one. Visible cells
+        // are drawn unstyled, so the scaling was invisible live and only
+        // shaped the MEMORY a cell became — a cone-edge / fast-swept cell
+        // demoted at low intensity and left a faint gradient "развод"
+        // where the cone edge had passed. Full intensity → spatially
+        // uniform memory; only the temporal decay remains.
+        let target = f32::from(INTENSITY_MAX);
         let e = self.out.entry((cell.x, cell.y)).or_insert(0.0);
         *e = e.max(target);
     }
@@ -1774,17 +1815,23 @@ mod tests {
     }
 
     #[test]
-    fn intensity_fades_gradually() {
+    fn visible_snaps_full_then_memory_fades_gradually() {
+        // Visual-pass round 7 (#3): a seen cell snaps to FULL intensity
+        // in ONE tick (no fade-in) so the memory it later becomes is
+        // spatially uniform — a briefly-glimpsed cell can't leave a faint
+        // gradient. The gradual fade is now the MEMORY fall-out only.
         let g = open_room();
         let mut fow = FogOfWar::new(cfg());
         let cell = IVec2::new(20, 0);
-        // fade_in 240/s × 0.05 s = 12 units — mid-fade after one tick.
-        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), 0.05);
+        // One tiny tick: already fully Visible (was: a partial fade-in).
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), 0.001);
+        assert_eq!(fow.state(0, cell), (CellState::Visible, INTENSITY_MAX));
+        // Turn away: Memory, and its intensity falls GRADUALLY (fade-out),
+        // not instantly, so the memory eases out over time.
+        fow.update(&g, &observer(IVec2::new(0, 0), -Vec2::X), 0.05);
         let (state, mid) = fow.state(0, cell);
-        assert_eq!(state, CellState::Visible);
-        assert!(mid > 0 && mid < INTENSITY_MAX, "mid-fade, got {mid}");
-        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
-        assert_eq!(fow.state(0, cell).1, INTENSITY_MAX);
+        assert_eq!(state, CellState::Memory);
+        assert!(mid > 0 && mid < INTENSITY_MAX, "mid fade-out, got {mid}");
     }
 
     #[test]
@@ -2625,20 +2672,57 @@ mod tests {
         assert_eq!(mask.cells[20 * 32 + 5], 0, "unseen cell is 0");
     }
 
-    /// Review #4 — a hit at a z OUTSIDE every deck band (untracked
-    /// inter-deck / sub-floor geometry a chunk-granular copy dragged in)
-    /// is Hidden, not shown at full brightness.
+    /// Visual-pass round 6 (#1) — the verdict classifies by the active
+    /// deck's Z WINDOW: its ceiling (`z_top`) down through the stair/hole
+    /// shaft (to the next deck's floor, or +∞ for the bottom deck). A
+    /// stair descending BELOW the band still reads on the deck you stand
+    /// on; but a voxel ABOVE the ceiling falls back to strict
+    /// `deck_for_z` (Hidden here, a one-deck config) so the column can't
+    /// leak. Untracked cells are still gated by the per-(x,y) state.
     #[test]
-    fn fow_render_out_of_band_z_is_hidden() {
+    fn fow_render_active_deck_window_classifies_by_active() {
         use roxlap_core::dda::{FowStyler, FowVerdict};
         let g = open_room();
         let mut fow = seeing_fow();
         fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
         let styler = FowRender::new(&fow);
-        // band() spans z 80..=100; z = 200 is below every deck → Hide,
-        // even at an (x, y) the observer sees.
-        assert_eq!(styler.verdict(20, 0, 200), FowVerdict::Hide);
+        // (20, 0) is a seen cell. band() is 80..=100, the only deck, so
+        // its window is [80, +∞): z in band and z BELOW it (a descending
+        // stair / sub-floor) both show; the observer stands here.
+        assert!(matches!(styler.verdict(20, 0, 90), FowVerdict::Show { .. }));
+        assert!(matches!(
+            styler.verdict(20, 0, 200),
+            FowVerdict::Show { .. }
+        ));
+        // z ABOVE the deck ceiling (< z_top 80) is outside the window and
+        // in no band → Hidden (the ceiling void doesn't leak).
         assert_eq!(styler.verdict(20, 0, 0), FowVerdict::Hide);
+        // A cell the observer never saw is Hidden — the (x,y) state gate.
+        assert_eq!(styler.verdict(5, 20, 90), FowVerdict::Hide);
+    }
+
+    /// Visual-pass round 6 (#1) — the multi-deck window: a voxel BELOW the
+    /// active deck's floor but ABOVE the next deck's floor (the stair
+    /// shaft) reads on the active deck; a voxel below the NEXT floor falls
+    /// to that deck's own (gated) state, so a deep shaft can't reveal
+    /// every deck at once.
+    #[test]
+    fn fow_render_window_stops_at_next_floor() {
+        // Two stacked decks: A ceiling 0..floor 20, B ceiling 30..floor 50.
+        let cfg = VisionConfig::for_decks(vec![
+            DeckBand { z_top: 0, z_bottom: 20, eye_top: 8, eye_bottom: 12 },
+            DeckBand { z_top: 30, z_bottom: 50, eye_top: 38, eye_bottom: 42 },
+        ]);
+        let fow = FogOfWar::new(cfg);
+        // Active deck A: window is [A.z_top 0, B.z_bottom 50].
+        assert_eq!(fow.config().classify_deck(10, 0), Some(0)); // A's band
+        assert_eq!(fow.config().classify_deck(25, 0), Some(0)); // A→B shaft
+        assert_eq!(fow.config().classify_deck(40, 0), Some(0)); // still window
+        assert_eq!(fow.config().classify_deck(55, 0), None); // below B floor
+        // Active deck B: window [B.z_top 30, +∞); A's band is above it →
+        // strict deck_for_z picks A.
+        assert_eq!(fow.config().classify_deck(10, 1), Some(0));
+        assert_eq!(fow.config().classify_deck(40, 1), Some(1));
     }
 
     /// Review #5 — the Visible→Memory seam is continuous: a cell at full

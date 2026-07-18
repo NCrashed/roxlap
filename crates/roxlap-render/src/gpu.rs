@@ -1053,6 +1053,7 @@ impl GpuBackend {
             mask.width,
             mask.height,
             &mask.decks,
+            mask.active_deck,
             mask.memory_dim,
             mask.memory_desaturate,
             &mask.cells,

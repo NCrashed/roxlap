@@ -23,8 +23,8 @@ use roxlap_render::{
     VoxelClip,
 };
 use roxlap_scene::{
-    voxel_global, world_to_grid_local, CharacterBody, CharacterDef, DeckBand, FogOfWar,
-    FowObserver, FowTwin, GridId, LightGate, Scene, VisionConfig, WalkInput,
+    voxel_global, world_to_grid_local, BakeLight, BakeMode, CharacterBody, CharacterDef, DeckBand,
+    FogOfWar, FowObserver, FowTwin, GridId, LightGate, Scene, VisionConfig, WalkInput,
 };
 use winit::keyboard::KeyCode;
 
@@ -113,6 +113,12 @@ const START_PITCH: f64 = 0.55;
 const NOISE_PERIOD: f64 = 2.0;
 const NOISE_SOURCE_LOCAL: [f64; 3] = [96.0, 64.0, 252.0];
 
+/// FW.5 — grid-local z of the flooded-bilge water surface. Kept in sync
+/// with the flood fill in [`build_ship_world`] (`FLOOR_TOPS[2] - 8`);
+/// the bottom deck's fog eye sits just above it (see `ship_vision_config`
+/// #2) so the observer isn't blocked by the solid water below.
+const BILGE_WATER_TOP: i32 = FLOOR_TOPS[2] - 8;
+
 /// FW.5 — the ship's fog-of-war vision: one deck band per walkable deck,
 /// derived from the same [`DECK_CLIPS`]/[`FLOOR_TOPS`] the CA clip uses
 /// (band = clip plane .. floor, z-down). `light_gate` (the `G` toggle)
@@ -122,7 +128,17 @@ fn ship_vision_config(light_gate: bool) -> VisionConfig {
         .map(|i| {
             let z_bottom = FLOOR_TOPS[i];
             let z_top = DECK_CLIPS[i + 1].expect("decks 1..=3 are clipped");
-            let eye = z_bottom - EYE_HEIGHT as i32; // eye level above the floor
+            let mut eye = z_bottom - EYE_HEIGHT as i32; // eye above the floor
+                                                        // Visual-pass round 5 (#2): the bottom deck is FLOODED — water
+                                                        // fills up to `BILGE_WATER_TOP` and counts as solid to the LOS
+                                                        // sample, so an eye band at floor level is submerged and the
+                                                        // observer is blocked in every direction (the whole deck read
+                                                        // as unknown). Lift the flooded deck's eye into the air gap
+                                                        // just above the waterline, where the hull walls still occlude
+                                                        // but the water does not.
+            if i == FLOOR_TOPS.len() - 1 {
+                eye = BILGE_WATER_TOP - 4;
+            }
             DeckBand {
                 z_top,
                 z_bottom,
@@ -135,17 +151,56 @@ fn ship_vision_config(light_gate: bool) -> VisionConfig {
     // Ship-scale: a ~100° cone reaching most of a deck + a small
     // 360° peripheral, quicker memory decay than the defaults.
     cfg.cone_half_angle = 0.9;
+    // Visual-pass round 5 (#4): a wider angular rim + fast fade-in so the
+    // FOV edge and the turning leading-edge settle to full brightness
+    // instead of trailing as dim lines against the unseen black.
+    cfg.cone_taper = 0.22;
+    cfg.fade_in = 600.0;
     cfg.range = 60.0;
     cfg.peripheral_range = 8.0;
     cfg.memory_decay = 2.0;
     if light_gate {
+        // Visual-pass round 5 (#3): the ship bakes its cabin lamps
+        // (`BakeMode::PointLights`) into the brightness byte — a dim base
+        // (~50–75 at the room ends) rising to a bright pool (~130–155)
+        // under each lamp. The knee (`lit_brightness - softness` = 85)
+        // sits between them, so lamp-lit floor reads as seen while the
+        // dim ends stay Memory even inside the cone — "you only KNOW what
+        // the lamps light."
         cfg.light_gate = Some(LightGate {
-            lit_brightness: 96,
-            softness: 40,
+            lit_brightness: 130,
+            softness: 45,
             emissive_colors: Vec::new(),
         });
     }
     cfg
+}
+
+/// FW.5 (#3) — bake the cabin lamps statically into the ship's per-voxel
+/// brightness byte ([`BakeMode::PointLights`]: a dim base plus a bright
+/// pool per lamp), so the fog light gate has real contrast to read: lamp
+/// pools clear its knee (lit → seen) while unlit corners fall below it
+/// (dark → held at Memory even when in the cone). Boarding-only — the
+/// Decks scene keeps its uniform base — and the dynamic cabin lights
+/// still render on top for colour + the sprite fill.
+fn bake_ship_lamps(scene: &mut Scene, ship: GridId) {
+    let Some(grid) = scene.grid_mut(ship) else {
+        return;
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let lights: Vec<BakeLight> = FLOOR_TOPS
+        .iter()
+        .map(|&ft| BakeLight {
+            // Grid-local voxel frame (the ship origin only offsets z), one
+            // lamp per deck at the same spot the dynamic `cabin_lights`
+            // sit — 18 voxels above the floor.
+            pos: glam::Vec3::new(64.0, 56.0, (ft - 18) as f32),
+            radius: 80.0,
+            strength: 30_000.0,
+        })
+        .collect();
+    grid.bake_lights = lights;
+    grid.bake(BakeMode::PointLights);
 }
 
 // Four independent user toggles (deck-follow, keyhole, camera mode,
@@ -196,7 +251,10 @@ impl BoardingScene {
     #[must_use]
     pub fn new() -> Self {
         // The walkable hull: stairwells carved through each deck floor.
-        let (scene, ship) = build_ship_world(true);
+        let (mut scene, ship) = build_ship_world(true);
+        // FW.5 (#3): bake the cabin lamps so the fog light gate has
+        // brightness contrast to read (dim corners vs lit pools).
+        bake_ship_lamps(&mut scene, ship);
         let mut body = CharacterBody::new(CharacterDef {
             radius: BODY_RADIUS,
             height: BODY_HEIGHT,
@@ -238,9 +296,25 @@ impl BoardingScene {
         }
     }
 
+    /// Visual-pass round 6 (#2) — the fog deck the body is IN, 0-based
+    /// into [`ship_vision_config`]'s decks. Uses the body CENTRE against
+    /// the deck floors, NOT the head like the CA clip's `deck_for_body`:
+    /// standing on a column lifts the head above the deck's ceiling, so
+    /// the head-pick jumps to the deck ABOVE and the fog then reveals the
+    /// wrong floor (the player saw nothing on the deck they stood on).
+    /// The centre stays inside the deck the feet rest on. Clamped to the
+    /// bottom deck (never `None`).
+    fn fog_deck_index(&self) -> usize {
+        #[allow(clippy::cast_possible_truncation)]
+        let local_center = self.body.pos().z - SHIP_ORIGIN_Z - BODY_HEIGHT * 0.5;
+        FLOOR_TOPS
+            .iter()
+            .position(|&ft| local_center <= f64::from(ft))
+            .unwrap_or(FLOOR_TOPS.len() - 1)
+    }
+
     /// FW.5 — the character's fog observer: grid-local cell, facing (the
-    /// camera's horizontal aim), and the fog deck index (0-based into
-    /// [`ship_vision_config`]'s decks, from the CA deck the body is on).
+    /// camera's horizontal aim), and the fog deck the body is in.
     fn fow_observer(&self, ctx: &SceneCtx) -> FowObserver {
         let transform = self
             .scene
@@ -250,14 +324,11 @@ impl BoardingScene {
         let glp = world_to_grid_local(self.body.pos(), &transform);
         let v = voxel_global(glp.chunk, glp.voxel);
         let fwd = ctx.cam.camera().forward;
-        // `deck_for_body` is 0 (roof/outside) or 1..=3; the fog decks are
-        // 0..=2 — the top deck (0) covers the roof-view fallback.
-        let deck = self.deck_for_body().max(1) - 1;
         #[allow(clippy::cast_possible_truncation)]
         FowObserver {
             cell: glam::IVec2::new(v.x, v.y),
             facing: glam::Vec2::new(fwd[0] as f32, fwd[1] as f32),
-            deck,
+            deck: self.fog_deck_index(),
         }
     }
 
