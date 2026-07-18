@@ -19,7 +19,7 @@
 //!
 //! The per-frame flow is `render` → *(optional overlays)* → finish.
 //! Between [`SceneRenderer::render`] and the finishing
-//! [`SceneRenderer::present`] / [`SceneRenderer::paint_egui`] call, a
+//! [`SceneRenderer::present`] / `paint_egui` (`hud` feature) call, a
 //! host may overlay depth-tested world-space lines with
 //! [`SceneRenderer::draw_lines`] (editor gizmos, debug geometry — see
 //! [`Line3`]); they land in the framebuffer, occluded by the rendered
@@ -2268,7 +2268,7 @@ impl SceneRenderer {
     /// swapchain frame.
     ///
     /// Finish the frame with exactly one of [`present`](Self::present)
-    /// (no overlay) or [`paint_egui`](Self::paint_egui) (UI overlay).
+    /// (no overlay) or `paint_egui` (`hud` feature; UI overlay).
     /// Calling `render` again without finishing drops the pending frame.
     pub fn render(&mut self, scene: &mut Scene, camera: &Camera, frame: &FrameParams) {
         match &mut self.inner {
@@ -2284,10 +2284,9 @@ impl SceneRenderer {
     /// Draw world-space [`Line3`] segments over the frame
     /// [`render`](Self::render) composited, using that frame's camera +
     /// projection + depth buffer. Call **after** [`render`](Self::render)
-    /// and **before** [`present`](Self::present) /
-    /// [`paint_egui`](Self::paint_egui) — the lines land in the
-    /// framebuffer, so a subsequent `paint_egui` still draws its panels
-    /// on top.
+    /// and **before** [`present`](Self::present) / `paint_egui`
+    /// (`hud` feature) — the lines land in the framebuffer, so a
+    /// subsequent `paint_egui` still draws its panels on top.
     ///
     /// `camera` must be the one the last frame rendered with (the
     /// projection is taken from that frame). Depth-tested segments
@@ -2340,7 +2339,7 @@ impl SceneRenderer {
     /// composited — flat textured quads placed in world space, using that
     /// frame's camera + projection + depth buffer. Same contract as
     /// [`draw_lines`](Self::draw_lines): call **after** [`render`](Self::render)
-    /// and **before** [`present`](Self::present) / [`paint_egui`](Self::paint_egui).
+    /// and **before** [`present`](Self::present) / `paint_egui` (`hud` feature).
     ///
     /// UVs are perspective-correct (no affine warp on an obliquely-viewed
     /// quad). Depth-tested sprites are occluded by nearer rendered
@@ -2517,7 +2516,7 @@ impl SceneRenderer {
     }
 
     /// Present the frame [`render`](Self::render) composited, with no UI
-    /// overlay. Pairs with `render`; use [`paint_egui`](Self::paint_egui)
+    /// overlay. Pairs with `render`; use `paint_egui` (`hud` feature)
     /// instead to overlay an egui UI before presenting.
     pub fn present(&mut self) {
         match &mut self.inner {
@@ -4344,7 +4343,7 @@ impl SceneRenderer {
 /// A frame in flight (QE-B6) — returned by [`SceneRenderer::frame`].
 /// Overlays draw into the composited frame with the camera it was
 /// rendered with; exactly one present happens, by [`Self::present`] /
-/// [`Self::paint_egui`] or on drop.
+/// `paint_egui` (`hud` feature) or on drop.
 pub struct Frame<'r> {
     renderer: &'r mut SceneRenderer,
     /// The camera the frame composited with — overlays must use it.

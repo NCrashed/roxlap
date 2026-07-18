@@ -377,9 +377,9 @@ pub struct GpuRenderer {
     /// The acquired-but-not-yet-presented swapchain frame from the most
     /// recent deferred render ([`Self::render_scene`] /
     /// [`Self::render_clear_deferred`]). [`Self::present`] shows it as
-    /// is; [`Self::paint_egui`] overlays egui first. Lets a host slot a
-    /// UI pass between the marcher and present. `None` between present
-    /// and the next render.
+    /// is; `paint_egui` overlays egui first (the `hud` feature). Lets a
+    /// host slot a UI pass between the marcher and present. `None`
+    /// between present and the next render.
     pending_frame: Option<(wgpu::SurfaceTexture, wgpu::TextureView)>,
     /// PF.4 — persistent per-frame camera/light buffers + cached scene and
     /// sprite bind groups. Lazily built on the first `render_scene`.
@@ -417,7 +417,7 @@ pub struct GpuRenderer {
     /// re-used by a later upload.
     images: Vec<Option<ImageResident>>,
     /// Lazy-built `egui-wgpu` paint pipeline; created on the first
-    /// [`Self::paint_egui`] call (`hud` feature).
+    /// `paint_egui` call (`hud` feature).
     #[cfg(feature = "hud")]
     egui_renderer: Option<egui_wgpu::Renderer>,
 }
@@ -2392,7 +2392,7 @@ impl GpuRenderer {
     }
 
     /// Like [`Self::render`] (clear to colour) but **deferred**: stashes
-    /// the frame for [`Self::present`] / [`Self::paint_egui`] instead of
+    /// the frame for [`Self::present`] / `paint_egui` instead of
     /// presenting. The facade uses this before any grid is resident so a
     /// HUD can still be painted over an empty scene.
     pub fn render_clear_deferred(&mut self) {
