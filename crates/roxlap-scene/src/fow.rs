@@ -229,36 +229,6 @@ impl VisionConfig {
     pub fn deck_for_z(&self, z: i32) -> Option<usize> {
         self.decks.iter().position(|d| d.contains_z(z))
     }
-
-    /// Visual-pass round 6 (#1) — which deck layer a rendered voxel at
-    /// grid-local `z` is classified against, given the observer's
-    /// `active` deck. The `active` deck owns a Z **WINDOW** from its own
-    /// ceiling down to the NEXT deck's floor: its band plus the
-    /// stair/hole zone below it, so a staircase descending into the next
-    /// band — visible only *through* the hole the observer sees from
-    /// above — reads on the deck they stand on. Anything OUTSIDE that
-    /// window (a deeper deck seen through a deep shaft, or the ceiling
-    /// void above) falls back to strict [`deck_for_z`], so it is gated by
-    /// its OWN per-cell state and can't leak the whole vertical column
-    /// (round-5's "ignore z entirely" revealed every deck at once).
-    #[must_use]
-    pub fn classify_deck(&self, z: i32, active: usize) -> Option<usize> {
-        let Some(band) = self.decks.get(active) else {
-            return self.deck_for_z(z);
-        };
-        // z-down: the ceiling (z_top) is the small end, the floor
-        // (z_bottom) the large end. The window runs from this deck's
-        // ceiling to the next deck's floor (its band + the shaft below).
-        let hi = self
-            .decks
-            .get(active + 1)
-            .map_or(i32::MAX, |next| next.z_bottom);
-        if z >= band.z_top && z <= hi {
-            Some(active)
-        } else {
-            self.deck_for_z(z)
-        }
-    }
 }
 
 /// FW.3 — the fog mask flattened for GPU upload (see
@@ -850,8 +820,15 @@ impl FogOfWar {
             let band = self.config.decks[observer.deck];
             let (eye_lo, eye_hi) = (observer.eye_z - EYE_HALF, observer.eye_z + EYE_HALF);
             let radius = self.config.range.max(self.config.peripheral_range).ceil() as i32;
-            let edit_key =
-                local_edit_key(grid, band, eye_lo, eye_hi, self.config_gen, observer.cell, radius);
+            let edit_key = local_edit_key(
+                grid,
+                band,
+                eye_lo,
+                eye_hi,
+                self.config_gen,
+                observer.cell,
+                radius,
+            );
             let key = (
                 observer.cell,
                 facing_q,
@@ -1388,6 +1365,16 @@ pub struct FowRender<'a> {
     fow: &'a FogOfWar,
 }
 
+/// Visual-pass round 9 (#1): the verdict for an UNSEEN voxel on a deck
+/// BELOW the observer — rendered opaque and black (`dim 0`) so the ray
+/// STOPS on it (no bright sky-hole down a stairwell, no live "two decks
+/// at once") without revealing any of the unexplored deck's detail.
+const OCCLUDE_BELOW: roxlap_core::dda::FowVerdict = roxlap_core::dda::FowVerdict::Show {
+    dynamic: false,
+    dim: 0.0,
+    desaturate: 0.0,
+};
+
 impl<'a> FowRender<'a> {
     /// Wrap `fow` for a render pass.
     #[must_use]
@@ -1400,27 +1387,41 @@ impl roxlap_core::dda::FowStyler for FowRender<'_> {
     fn verdict(&self, x: i32, y: i32, z: i32) -> roxlap_core::dda::FowVerdict {
         use roxlap_core::dda::FowVerdict;
         let cfg = self.fow.config();
-        // Visual-pass round 6 (#1): classify against the observer's
-        // active-deck Z WINDOW (its band + the stair/hole shaft down to
-        // the next floor), NOT every z. Round 5's "ignore z" revealed the
-        // whole vertical column, so on startup rotating the observer lit
-        // voxels on every deck at once; a voxel below the window is gated
-        // by its own deck's state instead. Outside every band → Hide.
-        let Some(deck) = cfg.classify_deck(z, self.fow.visible_deck()) else {
-            return FowVerdict::Hide;
+        let active = self.fow.visible_deck();
+        // Visual-pass round 9 (#1): classify each voxel by its OWN deck
+        // (`deck_for_z`), then gate by that deck's state — round 6's Z
+        // WINDOW claimed the whole NEXT deck's band for the active deck,
+        // so you saw the deck below LIVE through the floor. `deck_below`
+        // = a deck lower than the one you stand on.
+        let below = |deck: usize| deck > active;
+        let Some(deck) = cfg.deck_for_z(z) else {
+            // z in a gap between bands. Below the active floor it's the
+            // stair/sub-floor shaft — occlude it dark (see the note on
+            // `Unseen` below); above, stay transparent.
+            let active_floor = cfg.decks.get(active).map_or(i32::MAX, |b| b.z_bottom);
+            return if z > active_floor {
+                OCCLUDE_BELOW
+            } else {
+                FowVerdict::Hide
+            };
         };
         let (state, intensity) = self.fow.state(deck, IVec2::new(x, y));
         let t = f32::from(intensity) / f32::from(INTENSITY_MAX);
         match state {
+            // Visual-pass round 9 (#1): an UNSEEN voxel on a deck BELOW
+            // the one you stand on is occluded OPAQUE-DARK, not made
+            // transparent — you must not see down through your own floor
+            // into an unexplored basement (that read as "two decks at
+            // once", or as a bright sky-hole down the stairwell). Unseen
+            // cells on the active deck or ABOVE it stay transparent
+            // (`Hide`) so a deck you're under — the flooded-bilge swim,
+            // round 8 — still shows through.
+            CellState::Unseen if below(deck) => OCCLUDE_BELOW,
             CellState::Unseen => FowVerdict::Hide,
-            // Visual-pass round 6 (#3): a currently-Visible cell is drawn
-            // UNSTYLED — full brightness, full colour — so the cone rim
-            // and the peripheral ring stop reading as dim/desaturated
-            // smudges ("разводы") against the unseen black. The intensity
-            // taper only shapes MEMORY now. The Visible→Memory handoff is
-            // still continuous: a cell demotes at whatever intensity it
-            // holds, and a freshly-demoted cell (t≈1) lands at dim≈1 /
-            // desat≈0 — matching the Visible it just was — then decays.
+            // A currently-Visible cell is drawn UNSTYLED — full
+            // brightness, full colour — so the cone rim / peripheral ring
+            // don't read as dim/desaturated smudges (round 6 #3). Only
+            // the active deck ever has Visible cells.
             CellState::Visible => FowVerdict::Show {
                 dynamic: true,
                 dim: 1.0,
@@ -2743,49 +2744,73 @@ mod tests {
     /// `deck_for_z` (Hidden here, a one-deck config) so the column can't
     /// leak. Untracked cells are still gated by the per-(x,y) state.
     #[test]
-    fn fow_render_active_deck_window_classifies_by_active() {
+    fn fow_render_classifies_by_own_deck() {
         use roxlap_core::dda::{FowStyler, FowVerdict};
         let g = open_room();
         let mut fow = seeing_fow();
         fow.update(&g, &observer(IVec2::new(0, 0), Vec2::X), SETTLE);
         let styler = FowRender::new(&fow);
-        // (20, 0) is a seen cell. band() is 80..=100, the only deck, so
-        // its window is [80, +∞): z in band and z BELOW it (a descending
-        // stair / sub-floor) both show; the observer stands here.
-        assert!(matches!(styler.verdict(20, 0, 90), FowVerdict::Show { .. }));
+        // (20, 0) is a seen cell on the single deck (band 80..=100): its
+        // own-band z shows LIVE.
         assert!(matches!(
-            styler.verdict(20, 0, 200),
-            FowVerdict::Show { .. }
+            styler.verdict(20, 0, 90),
+            FowVerdict::Show { dynamic: true, .. }
         ));
-        // z ABOVE the deck ceiling (< z_top 80) is outside the window and
-        // in no band → Hidden (the ceiling void doesn't leak).
+        // z BELOW the deck floor (100) is a sub-floor shaft → occluded
+        // opaque-dark (dim 0), NOT shown or made a sky-hole.
+        assert_eq!(
+            styler.verdict(20, 0, 200),
+            FowVerdict::Show {
+                dynamic: false,
+                dim: 0.0,
+                desaturate: 0.0
+            }
+        );
+        // z ABOVE the deck ceiling (< z_top 80) is transparent (Hide).
         assert_eq!(styler.verdict(20, 0, 0), FowVerdict::Hide);
-        // A cell the observer never saw is Hidden — the (x,y) state gate.
+        // An unseen cell on the active deck is transparent, not occluded.
         assert_eq!(styler.verdict(5, 20, 90), FowVerdict::Hide);
     }
 
-    /// Visual-pass round 6 (#1) — the multi-deck window: a voxel BELOW the
-    /// active deck's floor but ABOVE the next deck's floor (the stair
-    /// shaft) reads on the active deck; a voxel below the NEXT floor falls
-    /// to that deck's own (gated) state, so a deep shaft can't reveal
-    /// every deck at once.
+    /// Visual-pass round 9 (#1) — a deck BELOW the observer occludes
+    /// opaque-dark when unseen (you don't see through your floor); a deck
+    /// ABOVE stays transparent (so the deck you're under — the swim —
+    /// shows through).
     #[test]
-    fn fow_render_window_stops_at_next_floor() {
-        // Two stacked decks: A ceiling 0..floor 20, B ceiling 30..floor 50.
+    fn fow_render_below_occludes_above_transparent() {
+        use roxlap_core::dda::{FowStyler, FowVerdict};
         let cfg = VisionConfig::for_decks(vec![
-            DeckBand { z_top: 0, z_bottom: 20 },
-            DeckBand { z_top: 30, z_bottom: 50 },
+            DeckBand {
+                z_top: 0,
+                z_bottom: 20,
+            },
+            DeckBand {
+                z_top: 30,
+                z_bottom: 50,
+            },
         ]);
-        let fow = FogOfWar::new(cfg);
-        // Active deck A: window is [A.z_top 0, B.z_bottom 50].
-        assert_eq!(fow.config().classify_deck(10, 0), Some(0)); // A's band
-        assert_eq!(fow.config().classify_deck(25, 0), Some(0)); // A→B shaft
-        assert_eq!(fow.config().classify_deck(40, 0), Some(0)); // still window
-        assert_eq!(fow.config().classify_deck(55, 0), None); // below B floor
-        // Active deck B: window [B.z_top 30, +∞); A's band is above it →
-        // strict deck_for_z picks A.
-        assert_eq!(fow.config().classify_deck(10, 1), Some(0));
-        assert_eq!(fow.config().classify_deck(40, 1), Some(1));
+        let mut fow = FogOfWar::new(cfg);
+        // Observer on the TOP deck (0, the default), nothing explored.
+        // A deck-1 voxel (z=40, BELOW) that's unseen occludes dark…
+        assert_eq!(
+            FowRender::new(&fow).verdict(0, 0, 40),
+            FowVerdict::Show {
+                dynamic: false,
+                dim: 0.0,
+                desaturate: 0.0
+            }
+        );
+        // …while an unseen voxel on the active deck stays transparent.
+        assert_eq!(FowRender::new(&fow).verdict(0, 0, 10), FowVerdict::Hide);
+
+        // Descend to deck 1: a deck-0 voxel is now ABOVE → transparent,
+        // so a deck overhead never walls the observer in.
+        let g = Grid::new(GridTransform::identity());
+        let mut obs = observer(IVec2::new(0, 0), Vec2::X);
+        obs.deck = 1;
+        obs.eye_z = 40;
+        fow.update(&g, &obs, SETTLE);
+        assert_eq!(FowRender::new(&fow).verdict(9, 9, 10), FowVerdict::Hide);
     }
 
     /// Review #5 — the Visible→Memory seam is continuous: a cell at full

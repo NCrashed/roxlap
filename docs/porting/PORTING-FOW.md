@@ -433,8 +433,25 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   water clamp survives in the demo (the flooded bilge's solid water still
   blocks LOS → keep the eye band just above the waterline) pending a
   material-aware LOS sample. CPU-only; the GPU mask layout is unchanged.
-  **STILL OPEN**: the two-deck render (round-6 #1) narrowing. USER VISUAL
-  PASS (round 9) owed.
+- **Visual-pass round 9** (user: "fix the last one — we see the lower
+  deck at the same time"). Round 6's active-deck Z WINDOW claimed the
+  whole NEXT deck's band for the active deck, so the deck below rendered
+  LIVE through the floor. Replaced with per-voxel own-deck classification
+  (`deck_for_z`) + an above/below rule keyed on the observer's deck:
+  a voxel on a deck **below** the one you stand on, when **Unseen**, is
+  occluded OPAQUE-DARK (a black `Show { dim: 0 }` — `OCCLUDE_BELOW` /
+  WGSL `FowV(false,0,0,false)`) so the ray STOPS on it: no live
+  lower-deck, and no bright sky-hole down the stairwell either. A voxel
+  at or **above** the active deck stays transparent (`Hide`) so the deck
+  you're UNDER still shows through (round-8 swim/column preserved). Seen
+  lower-deck cells still read as dim Memory (you remember a basement you
+  visited). No shadow leak (FW.3 #1): same-deck unseen walls still `Hide`
+  → cast no shadow; a below-deck occluder's shadow falls downward, never
+  up onto the visible deck (the solid floor is between it and the sun).
+  `classify_deck` (round 6) removed. CPU + WGSL; GPU mask layout
+  unchanged. USER VISUAL PASS (round 10) owed — the stairwell now reads
+  as a dark shaft down; confirm that's acceptable vs. wanting the stairs
+  themselves lit from above.
 
 ## Goal
 
