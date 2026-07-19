@@ -1296,11 +1296,15 @@ struct Sampler<'a> {
     xy_mask: i32,
     z_shift: u32,
     z_mask: i32,
-    /// CA.1 — cutaway clip plane in **mip-cells** (`z_clip >> mip`;
-    /// arithmetic shift = floor, matching the GPU formula). Cells with
-    /// `c[2] < z_clip_mip` read as air. `i32::MIN` = disabled: no real
-    /// cell index is ever below it, so the gate is branch-cheap with
-    /// no `Option` unwrap per cell.
+    /// CA.1 — cutaway clip plane in **mip-cells**, `ceil(z_clip / 2^mip)`
+    /// (matching the GPU formula). Cells with `c[2] < z_clip_mip` read as
+    /// air. Round UP so a coarse cell that STRADDLES the plane is HIDDEN
+    /// (all its voxels must be at/above `z_clip` to survive) — a plain
+    /// floor kept the straddling cell, leaking the cut-away boundary
+    /// layer (e.g. a deck's ceiling) as a ring past the mip-0 radius
+    /// (`GPU_ZCLIP_MIP_BUG`). `i32::MIN` = disabled: no real cell index is
+    /// ever below it, so the gate is branch-cheap with no `Option` unwrap
+    /// per cell.
     z_clip_mip: i32,
     cur_ch: [i32; 3],
     cur_view: Option<GridView<'a>>,
@@ -1325,11 +1329,14 @@ impl<'a> Sampler<'a> {
             xy_mask: cs_xy as i32 - 1,
             z_shift: cs_z.trailing_zeros(),
             z_mask: cs_z as i32 - 1,
-            // CA.1 — mip-0 voxel z → mip-cells. Arithmetic `>>` floors
-            // toward -∞ (clip planes can be negative on stacked-chz
-            // grids), the same formula the GPU marcher uses — CA.3's
-            // parity gate depends on the two staying identical.
-            z_clip_mip: z_clip.map_or(i32::MIN, |z| z >> mip),
+            // CA.1 — mip-0 voxel z → mip-cells, rounded UP:
+            // `ceil(z / 2^mip) = (z + (2^mip - 1)) >> mip`. The identity
+            // holds for negative z too (clip planes can be negative on
+            // stacked-chz grids). Round-up hides a straddling boundary
+            // cell instead of leaking it (`GPU_ZCLIP_MIP_BUG`); the GPU
+            // marcher uses the SAME formula — CA.3's parity gate depends
+            // on the two staying identical. mip 0 ⇒ `+0 >> 0` = exact.
+            z_clip_mip: z_clip.map_or(i32::MIN, |z| (z + ((1i32 << mip) - 1)) >> mip),
             cur_ch: [0; 3],
             cur_view: None,
             cur_brick: None,
@@ -3643,14 +3650,16 @@ mod tests {
         );
     }
 
-    /// CA.1 — pins the mip formula `z_clip >> mip` (floor). At mip 1
-    /// with `z_clip = 101` the plane rounds DOWN to mip-cell 50 (voxels
-    /// 100..102), so the surface at z=100 stays visible — the accepted
-    /// coarse-mip bleed. A round-up formula would hide that cell and
-    /// the depth would jump to 102. CPU and GPU must share this exact
+    /// CA.1 — pins the mip formula `ceil(z_clip / 2^mip)` (round UP). At
+    /// mip 1 with `z_clip = 101` the plane rounds UP to mip-cell 51, so
+    /// the straddling cell 50 (voxels 100..102 — which holds voxel 100,
+    /// `100 < 101`, that the cutaway must hide) is CUT, and the first
+    /// visible layer is mip-cell 51 (voxel z=102). A plain floor kept
+    /// cell 50 and leaked the boundary layer as a ring past the mip-0
+    /// radius (`GPU_ZCLIP_MIP_BUG`). CPU and GPU must share this exact
     /// formula (CA.3 parity gate).
     #[test]
-    fn cutaway_clip_mip_formula_floors() {
+    fn cutaway_clip_mip_formula_ceils() {
         let mut vxl = roxlap_formats::vxl::Vxl::from_dense(64, |_, _, z| {
             (z >= 100).then_some(VoxColor(0x80_80_80_80))
         });
@@ -3679,9 +3688,9 @@ mod tests {
         }
         assert_ne!(fb[centre], 0, "mip-1 clipped surface must still hit");
         assert!(
-            (zb[centre] - 90.0).abs() < 1.5,
-            "mip-cell 50 (voxel z=100) must be the first visible layer \
-             (floor formula); depth {} not ≈ 90",
+            zb[centre] > 91.0,
+            "the straddling boundary cell (voxel z=100) must be CUT, not \
+             leaked — depth must move past ~90 to the next mip cell; got {}",
             zb[centre]
         );
     }

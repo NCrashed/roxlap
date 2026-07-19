@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.1] — 2026-07-19
+
+### Fixed
+
+- **GPU cutaway (`Grid::z_clip`) leaked its boundary layer at coarse
+  mips.** The per-mip clip plane used `z_clip >> mip` (a floor), so a
+  coarse mip-cell straddling the plane was kept when it should be cut —
+  the cut-away geometry's top layer (e.g. a deck's ceiling) reappeared as
+  a ring around the camera's nadir past the `gpu_mip_scan_dist` radius,
+  growing as the camera zoomed out. Both the GPU marcher
+  (`scene_dda.wgsl`) and the CPU sampler (`roxlap-core`) now round the
+  plane UP — `ceil(z_clip / 2^mip)` — so a straddling cell is hidden
+  cleanly; mip 0 is unchanged (bit-identical). The CPU backend never
+  showed the ring in practice (it renders at `mip_levels = 1`), but the
+  shared formula moves in lockstep to keep the CA.3 CPU/GPU parity gate
+  exact. Reported downstream against 0.30.0.
+
 ## [0.30.0] — 2026-07-18
 
 The **SS13 deck-view trilogy**: three composable ways to see into a

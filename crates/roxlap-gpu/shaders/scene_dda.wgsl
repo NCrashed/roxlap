@@ -702,8 +702,10 @@ fn shadow_occluded(g: u32, origin: vec3<f32>, dir: vec3<f32>, max_t: f32, t_base
             let vsid_mip_u = vsid >> mip;
             let vsid_mip = i32(vsid_mip_u);
             let cz_mip = i32(CHUNK_Z >> mip);
-            // CA.3 — same floor formula as march_grid / the CPU sampler.
-            let z_clip_mip = z_clip >> mip;
+            // CA.3 — same ceil formula as march_grid / the CPU sampler:
+            // ceil(z_clip / 2^mip). Round UP so a coarse cell straddling
+            // the plane is HIDDEN, not leaked (GPU_ZCLIP_MIP_BUG).
+            let z_clip_mip = (z_clip + ((1 << mip) - 1)) >> mip;
             // CA follow-up — empty-block skip: the SOLID bitmaps of
             // coarser mip levels double as brick maps (a clear bit
             // proves every descendant cell empty — gated by the
@@ -1291,10 +1293,12 @@ fn march_grid(
             let vsid_mip_u = vsid >> mip;
             let vsid_mip = i32(vsid_mip_u);
             let cz_mip = i32(CHUNK_Z >> mip);
-            // CA.3 — clip plane in mip-cells. Arithmetic `>>` floors
-            // toward -∞ — the IDENTICAL formula to the CPU sampler's
-            // `z_clip >> mip` (the CA.3 parity gate pins the pair).
-            let z_clip_mip = z_clip >> mip;
+            // CA.3 — clip plane in mip-cells, ceil(z_clip / 2^mip):
+            // `(z_clip + (2^mip - 1)) >> mip`. Round UP so a coarse cell
+            // straddling the plane is HIDDEN, not leaked as a ring past
+            // the mip-0 radius (GPU_ZCLIP_MIP_BUG). IDENTICAL to the CPU
+            // sampler's formula (the CA.3 parity gate pins the pair).
+            let z_clip_mip = (z_clip + ((1 << mip) - 1)) >> mip;
             // OC.2 — focus plane in mip-cells, the same floor formula
             // as the CPU's `focus_z >> sampler.mip` (OC.2 parity gate).
             let cut_z_mip = cut_focus_z >> mip;

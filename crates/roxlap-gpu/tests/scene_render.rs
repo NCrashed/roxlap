@@ -2146,16 +2146,16 @@ fn scene_dda_cutaway_clips_and_pins_cut_face_colour() {
     );
 }
 
-/// CA.3 — the GPU clip uses the CPU's exact `z_clip >> mip` FLOOR
-/// formula. Two 1-voxel plates with real air between them (P at z=100,
-/// Q at z=140) and `z_clip = 101`: at mip 0 plate P (z=100 < 101) is
-/// hidden and the ray reaches Q; at any coarse mip the odd plane
-/// floors onto P's cell (`100 >> m == 101 >> m` for m ≥ 1) so P pokes
-/// through — the accepted coarse-mip bleed. A round-up formula would
-/// show Q at BOTH mips; no `>> mip` at all would hide P at mip 0 too.
-/// The plates' blue bytes (100 vs 140) name the winning layer exactly.
+/// CA.3 — the GPU clip uses the CPU's exact `ceil(z_clip / 2^mip)` (round
+/// UP) formula. Two 1-voxel plates with real air between them (P at
+/// z=100, Q at z=140) and `z_clip = 101`: at mip 0 plate P (z=100 < 101)
+/// is hidden and the ray reaches Q; at ANY coarse mip the round-up plane
+/// keeps P's straddling cell HIDDEN too (`ceil(101/2)=51 > 50`), so Q
+/// wins at BOTH mips — no boundary-layer leak (the plain floor let P poke
+/// through as a ring past the mip-0 radius, `GPU_ZCLIP_MIP_BUG`). The
+/// plates' blue bytes (100 vs 140) name the winning layer exactly.
 #[test]
-fn scene_dda_cutaway_mip_formula_floors() {
+fn scene_dda_cutaway_mip_formula_ceils() {
     use roxlap_formats::color::VoxColor;
 
     let Some((gpu, _lock)) = try_init() else {
@@ -2213,12 +2213,14 @@ fn scene_dda_cutaway_mip_formula_floors() {
         140,
         "mip 0: clip=101 must hide plate P and hit Q: {p_mip0:#010x}"
     );
-    // mip ≥ 1 (t_enter ≈ 200 ≥ 2·mip_scan_dist): the floored plane
-    // exposes P's cell — blue must come from P's layer, far below Q's.
+    // mip ≥ 1 (t_enter ≈ 200 ≥ 2·mip_scan_dist): the round-up plane keeps
+    // P's straddling cell HIDDEN (no leak), so the ray still reaches Q —
+    // blue 140, the SAME as mip 0.
     let p_coarse = render_at(100.0);
-    assert!(
-        blue(p_coarse) < 120,
-        "coarse mip: floor formula must expose plate P: {p_coarse:#010x}"
+    assert_eq!(
+        blue(p_coarse),
+        140,
+        "coarse mip: ceil formula must still hide plate P and hit Q: {p_coarse:#010x}"
     );
 }
 
