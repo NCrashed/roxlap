@@ -3,6 +3,20 @@
 Entry doc written 2026-07-25 at workspace 0.30.1.
 This is the **entry doc** for the carve-through-floor stage — tag **CT**.
 
+## Status
+
+- **CT.0 — LANDED 2026-07-26.** `EMPTY_COLUMN_SLAB` +
+  `slab_is_empty_column` + `Vxl::column_is_empty` + module-doc section
+  in `roxlap-formats/src/vxl.rs`; `slng`/`parse`/`serialize` needed no
+  changes (their `n_floor = 0` handling already covers the sentinel).
+  Green pins: sentinel shape (incl. "bedrock placeholder is NOT
+  empty"), read-as-air, byte-equal serialize→parse round-trip. Target
+  tests `carve_full_height_empties_column` (CT.1) and
+  `vxl_empty_columns_are_sentinel_empty` (CT.2) are in-tree KNOWN-RED
+  `#[ignore]`, verified failing for the right reasons. formats suite
+  217 green / clippy / doc clean.
+- CT.1..CT.9 — not started.
+
 ## Why
 
 `delslab` clamps `y1` to `MAXZDIM-1` (`roxlap-formats/src/edit.rs:39`),
