@@ -4107,4 +4107,86 @@ mod tests {
              partial={floor_pixels} full={floor_pixels_full}"
         );
     }
+
+    /// Digger ghost-wall probe (docs/handover-stale-mips-volume-edits.md) —
+    /// the CPU half of `roxlap-gpu/tests/digger_repro.rs`. A vws=16 grid
+    /// whose terrain slab spans the chz -1|0 boundary; a shaft carved
+    /// through the boundary; camera hovers above looking straight down.
+    /// The voxel at chunk-local z=255 (grid z -1) is uncarvable
+    /// (voxlap `delslab` clamps z1 to MAXZDIM-1), so if the renderer
+    /// draws it, the centre depth reads ~284 (ghost) instead of ~444
+    /// (shaft floor at grid z 9, world 144; camera z -300).
+    #[test]
+    #[ignore = "KNOWN RED: digger chz-boundary probe (docs/handover-stale-mips-volume-edits.md). \
+                Two defects: grid z -1 (chunk-local z 255) stays voxel_solid after the carve \
+                (delslab clamp), and the CPU marcher falls through the carve-exposed untextured \
+                top (hits z 15 at depth 540 instead of z 9 at 444). Run with --ignored."]
+    fn digger_bedrock_boundary_layer_cpu_probe() {
+        let orange = 0x80_ff_80_00;
+        let mut scene = Scene::new();
+        let id = scene.add_grid(GridTransform::at_scale(DVec3::ZERO, 16.0));
+        let grid = scene.grid_mut(id).unwrap();
+        // Terrain slab grid z -8..15 (crosses the chz boundary at z 0),
+        // negative x like the digger's mirrored addressing.
+        grid.set_rect(
+            IVec3::new(-32, 0, -8),
+            IVec3::new(-1, 31, 15),
+            Some(VoxColor(orange)),
+        );
+        // 2×2 shaft through the boundary: grid z -8..8, floor at z 9.
+        grid.set_rect(IVec3::new(-16, 16, -8), IVec3::new(-15, 17, 8), None);
+        for z in [-9, -8, -2, -1, 0, 8, 9, 10, 14, 15, 16] {
+            eprintln!(
+                "data probe shaft (-16,16,{z}): solid={} colour={:?}",
+                grid.voxel_solid(IVec3::new(-16, 16, z)),
+                grid.voxel_color(IVec3::new(-16, 16, z))
+            );
+        }
+        for z in [-9, -8, -1, 0, 15, 16] {
+            eprintln!(
+                "data probe wall  (-20,16,{z}): solid={} colour={:?}",
+                grid.voxel_solid(IVec3::new(-20, 16, z)),
+                grid.voxel_color(IVec3::new(-20, 16, z))
+            );
+        }
+
+        let (_engine, fog, sky_color) = make_composed_pool(CHUNK_SIZE_XY);
+        let mut fb = vec![sky_color; pixel_count(XRES, YRES)];
+        let mut zb = vec![f32::INFINITY; pixel_count(XRES, YRES)];
+        // Hover above the shaft mouth looking straight down
+        // (right × down == forward).
+        let camera = Camera {
+            pos: [-240.0, 272.0, -300.0],
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+        };
+        let settings = OpticastSettings::for_oracle_framebuffer(XRES, YRES);
+        let outcome = render_scene_composed(
+            &mut fb,
+            &mut zb,
+            XRES as usize,
+            XRES,
+            YRES,
+            fog,
+            &mut scene,
+            &camera,
+            &settings,
+            sky_color,
+            None,
+        );
+        assert_eq!(outcome, RenderOutcome::Rendered { grids_drawn: 1 });
+        let centre = (YRES / 2) as usize * XRES as usize + (XRES / 2) as usize;
+        eprintln!(
+            "CPU digger probe: centre depth {} colour {:#010x} (444 = shaft \
+             floor, 284 = uncarvable z=255 bedrock layer at the chz boundary)",
+            zb[centre], fb[centre]
+        );
+        assert!(
+            (zb[centre] - 444.0).abs() < 20.0,
+            "centre ray must reach the shaft floor at ≈444, got {} \
+             (≈284 = the uncarvable local-z-255 bedrock layer renders)",
+            zb[centre]
+        );
+    }
 }
