@@ -263,17 +263,18 @@ mod tests {
         assert!(cube_probe(&scene, [10.0, 10.0, 65.0], 0.3));
     }
 
+    /// CT.2 — inverted from `bedrock_placeholder_is_policy`: chunks
+    /// materialise with empty-sentinel columns, so there is no
+    /// placeholder plane to opt into any more — the old bottom plane
+    /// is air under BOTH `bedrock_blocks` settings. The policy flag
+    /// now governs only genuine solid content at z = 255.
     #[test]
-    fn bedrock_placeholder_is_policy() {
-        // Any edit materialises a chunk whose columns keep the voxlap
-        // bedrock placeholder at chunk-local z = CHUNK_SIZE_Z - 1.
-        // Probe that plane far from the real voxel: air by default
-        // (the scene-demo invisible-wall fix), solid on request.
+    fn no_phantom_bedrock_plane_under_either_policy() {
         let scene = floating_voxel_scene();
         let at_bedrock = [100.0, 100.0, -100.0 + f64::from(CHUNK_SIZE_Z) - 0.5];
         assert!(!cube_probe(&scene, at_bedrock, 0.3));
         let p = DVec3::from(at_bedrock);
-        assert!(box_overlaps_solid(
+        assert!(!box_overlaps_solid(
             &scene,
             p - 0.3,
             p + 0.3,

@@ -236,13 +236,10 @@ impl Vxl {
                     x,
                     y,
                     z0: 0,
-                    // TODO(CT.2): carve z1=255 (the full [0, 256)) so the
-                    // columns become the empty sentinel. Pinned to
-                    // [0, 255) for now — CT.1 de-clamped `delslab`, and
-                    // carving through the bottom here would retire the
-                    // z=255 bedrock placeholder ahead of the CT.2
-                    // walker/test sweep (docs/porting/PORTING-CARVE.md).
-                    z1: (MAXZDIM - 2) as u8, // inclusive → carve [0, 255)
+                    // CT.2 — carve the full [0, 256): columns seed as
+                    // the empty sentinel (truly all-air, no historical
+                    // z=255 bedrock placeholder).
+                    z1: (MAXZDIM - 1) as u8,
                 });
             }
         }
@@ -1022,8 +1019,21 @@ fn build_mip_level(
             // `mixc`/`mixn` keyed on `z >> 1`. Voxlap5.c:4754-4778.
             let mut curz = [0i32; 4];
             let mut curzn = [[0i32; 4]; 4];
+            // CT.2 — does source `i` end bedrock-anchored (its terminal
+            // slab implies solid to the bottom) or in AIR (the
+            // air-terminal / empty sentinel)? Drives the dest tail.
+            let mut anchored = [true; 4];
             for i in 0..4 {
                 let mut tv = v_offset[i];
+                // CT.2 — empty-sentinel source: no voxels, no events.
+                // Exhaust it before the merge (curz >= MAXZDIM) and
+                // skip the flatten entirely.
+                if slab_is_empty_column(&data[tv..tv + 4]) {
+                    curz[i] = MAXZDIM;
+                    curzn[i] = [MAXZDIM; 4];
+                    anchored[i] = false;
+                    continue;
+                }
                 // Initial state: top of floor and end-of-floor + 1.
                 curz[i] = i32::from(data[tv + 1]);
                 curzn[i][0] = curz[i];
@@ -1052,6 +1062,9 @@ fn build_mip_level(
                     let nextptr = i32::from(data[tv]);
                     let mut z_carry = (z - oz) - (nextptr - 1);
                     if nextptr == 0 {
+                        // CT.2 — bedrock-anchored unless the terminal
+                        // is the air form (`z1c + 1 < z1`).
+                        anchored[i] = i32::from(data[tv + 2]) + 1 >= i32::from(data[tv + 1]);
                         break;
                     }
                     tv += (nextptr as usize) << 2;
@@ -1089,6 +1102,9 @@ fn build_mip_level(
             let mut n: usize = 4;
             let mut z: i32 = i32::MIN; // 0x80000000 sentinel
             let mut cz: i32 = -1;
+            // CT.2 — did any slab open at all? All-empty sources never
+            // enter the merge; the dest is then the empty sentinel.
+            let mut opened = false;
 
             loop {
                 let oz = z;
@@ -1102,11 +1118,22 @@ fn build_mip_level(
                 besti = besti.wrapping_add((delta >> 31) & (i_alt - besti));
                 z = curz[besti as usize];
                 if z >= MAXZDIM {
-                    break;
+                    // CT.2 — final flush. Voxlap's bedrock placeholder
+                    // gave every column a below-content event (z=255)
+                    // that pulled the last pending records out of the
+                    // catch-up loops; empty-sentinel sources are
+                    // event-less, so a bedrock-anchored cell must run
+                    // the catch-up once at the bottom before closing.
+                    // Air-tailed cells flushed at their off-events —
+                    // a synthetic bottom event would pad them with
+                    // phantom records.
+                    if !(anchored.iter().any(|&a| a) && opened && cstat & 0x1111 != 0) {
+                        break;
+                    }
                 }
 
                 // Maybe begin a new slab in tbuf.
-                if cstat == 0 && (z >> 1) >= ((oz + 1) >> 1) {
+                if z < MAXZDIM && cstat == 0 && (z >> 1) >= ((oz + 1) >> 1) {
                     if oz >= 0 {
                         tbuf[oldn] = ((n - oldn) >> 2) as u8;
                         tbuf[oldn + 2] = tbuf[oldn + 2].wrapping_sub(1);
@@ -1123,6 +1150,7 @@ fn build_mip_level(
                     tbuf[oldn + 1] = initial;
                     tbuf[oldn + 2] = initial;
                     cz = -1;
+                    opened = true;
                 }
 
                 if cstat & 0x1111 != 0 {
@@ -1183,6 +1211,11 @@ fn build_mip_level(
                     }
                 }
 
+                // CT.2 — flush pass done: the records are out, close up.
+                if z >= MAXZDIM {
+                    break;
+                }
+
                 // State machine update for besti.
                 let bit_pos = besti << 2;
                 cstat = ((1i32 << bit_pos).wrapping_add(cstat)) & 0x3333;
@@ -1203,6 +1236,17 @@ fn build_mip_level(
                             curzn[bi][3] = i32::from(data[new_tv + 3]);
                             curzn[bi][0] = i32::from(data[new_tv + 1]);
                             curzn[bi][1] = i32::from(data[new_tv + 2]) + 1;
+                            // CT.2 — advancing INTO an air-terminal
+                            // (`z1c + 1 < z1`): the off-event at z0
+                            // (`curzn[3]`) still fires, but there is no
+                            // further solid — kill the phantom on-event
+                            // the sentinel's own z1 would produce.
+                            if data[new_tv] == 0
+                                && i32::from(data[new_tv + 2]) + 1 < i32::from(data[new_tv + 1])
+                            {
+                                curzn[bi][0] = MAXZDIM;
+                                curzn[bi][1] = MAXZDIM;
+                            }
                             v_offset[bi] = new_tv;
                         }
                     }
@@ -1212,16 +1256,48 @@ fn build_mip_level(
             }
 
             // After loop: emit the final slab tail.
-            tbuf[oldn + 2] = tbuf[oldn + 2].wrapping_sub(1);
-            if cz >= 0 {
-                tbuf[oldn] = ((n - oldn) >> 2) as u8;
-                ensure_capacity(&mut tbuf, n + 4);
-                tbuf[n] = 0;
-                let cz_byte = (cz & 0xff) as u8;
-                tbuf[n + 1] = cz_byte;
-                tbuf[n + 2] = (cz - 1) as u8;
-                tbuf[n + 3] = cz_byte;
-                n += 4;
+            let any_bedrock = anchored.iter().any(|&a| a);
+            if opened {
+                tbuf[oldn + 2] = tbuf[oldn + 2].wrapping_sub(1);
+                if cz >= 0 {
+                    tbuf[oldn] = ((n - oldn) >> 2) as u8;
+                    ensure_capacity(&mut tbuf, n + 4);
+                    tbuf[n] = 0;
+                    if any_bedrock {
+                        let cz_byte = (cz & 0xff) as u8;
+                        tbuf[n + 1] = cz_byte;
+                        tbuf[n + 2] = (cz - 1) as u8;
+                        tbuf[n + 3] = cz_byte;
+                    } else {
+                        // CT.2 — no source reaches the bottom: the
+                        // same ceiling list (z0 = cz), but the
+                        // AIR-TERMINAL header so walkers read air
+                        // below instead of phantom bedrock.
+                        tbuf[n + 1] = 255;
+                        tbuf[n + 2] = 253;
+                        tbuf[n + 3] = (cz & 0xff) as u8;
+                    }
+                    n += 4;
+                } else if !any_bedrock {
+                    // CT.2 — content ends inside the last slab's floor
+                    // list and no source is bedrock-anchored: append
+                    // the air-terminal with an empty ceiling list
+                    // (`z0 = z1c + 1` makes `ceil_z_start == ze`).
+                    let z1c = tbuf[oldn + 2];
+                    tbuf[oldn] = ((n - oldn) >> 2) as u8;
+                    ensure_capacity(&mut tbuf, n + 4);
+                    tbuf[n] = 0;
+                    tbuf[n + 1] = 255;
+                    tbuf[n + 2] = 253;
+                    tbuf[n + 3] = z1c.wrapping_add(1);
+                    n += 4;
+                }
+            } else {
+                // CT.2 — all four sources empty: the dest column is
+                // the empty sentinel (pre-CT this was unreachable —
+                // every column carried at least the z=255 placeholder).
+                tbuf[..4].copy_from_slice(&EMPTY_COLUMN_SLAB);
+                n = 4;
             }
 
             // Commit this column's slab bytes to new_data.
@@ -2301,12 +2377,46 @@ mod tests {
         );
     }
 
-    /// CT.2 target — `Vxl::empty` columns become the sentinel instead
-    /// of the z=255 bedrock placeholder (placeholder retirement,
-    /// docs/porting/PORTING-CARVE.md).
+    /// CT.2 — the downsampler propagates emptiness and air tails up
+    /// the mip ladder: an all-empty 2×2 cell yields the empty sentinel
+    /// at the next mip, a content cell whose sources end in air gets
+    /// the air-terminal tail (no phantom bedrock at coarse mips — the
+    /// GPU's `solid_mips_are_child_supersets` gate pins the cross-
+    /// level invariant on top of this).
     #[test]
-    #[ignore = "KNOWN RED until CT.2: Vxl::empty seeds the historical z=255 \
-                bedrock placeholder, not the empty sentinel"]
+    fn generate_mips_empty_and_mixed_cells() {
+        use crate::edit::set_rect;
+        let mut vxl = Vxl::empty(8);
+        // Solid plate on the x∈[4..8) half only: the left half's 2×2
+        // cells are all-empty at every mip.
+        set_rect(
+            &mut vxl,
+            [4, 0, 100],
+            [7, 7, 140],
+            Some(VoxColor(0x80aa_bb00)),
+        );
+        vxl.generate_mips(3);
+        assert_eq!(vxl.mip_count(), 3);
+        for (mx, expect_empty) in [(0usize, true), (1, true), (2, false), (3, false)] {
+            let col = vxl.column_data_for_mip(1, mx);
+            assert_eq!(
+                slab_is_empty_column(col),
+                expect_empty,
+                "mip-1 column x={mx}: {col:?}"
+            );
+        }
+        // The mip-1 content column ends in the air-terminal (plate
+        // z 100..=140 → mip z 50..=70; nothing below).
+        let col = vxl.column_data_for_mip(1, 2);
+        assert!(
+            slab_is_empty_column(&col[col.len() - 4..]),
+            "mip-1 content column must end with the air-terminal: {col:?}"
+        );
+    }
+
+    /// CT.2 — `Vxl::empty` columns are the empty sentinel (the z=255
+    /// bedrock placeholder is retired, docs/porting/PORTING-CARVE.md).
+    #[test]
     fn vxl_empty_columns_are_sentinel_empty() {
         let vxl = Vxl::empty(2);
         for idx in 0..4 {

@@ -1092,17 +1092,20 @@ mod tests {
         // One carve through the middle.
         g.set_sphere(IVec3::new(nx / 2, ny / 2, 205), 6, None);
 
-        // Oracle: 6-conn flood from every solid voxel at z=255 (the
-        // bedrock plane all final runs share), dense over the region.
+        // Oracle: 6-conn flood from every SOLID voxel at z=255 (a
+        // final run reaching the bottom is anchored). CT.2 — columns
+        // no fill touched are the empty sentinel now, so z=255 is no
+        // longer a universal bedrock plane: seed only where solid.
         let solid = |v: IVec3| v.x >= 0 && v.x < nx && v.y >= 0 && v.y < ny && g.voxel_solid(v);
         let mut reached = std::collections::HashSet::new();
         let mut q = VecDeque::new();
         for x in 0..nx {
             for y in 0..ny {
                 let v = IVec3::new(x, y, 255);
-                assert!(g.voxel_solid(v), "bedrock plane is always solid");
-                reached.insert(v);
-                q.push_back(v);
+                if g.voxel_solid(v) {
+                    reached.insert(v);
+                    q.push_back(v);
+                }
             }
         }
         while let Some(v) = q.pop_front() {

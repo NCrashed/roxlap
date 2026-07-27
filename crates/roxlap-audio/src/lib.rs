@@ -345,10 +345,10 @@ impl Weights<'_> {
 /// one-entry chunk borrow (one HashMap probe per crossed chunk, not
 /// per voxel — the [`roxlap_scene::Grid::chunk_voxel_solid`] pattern).
 ///
-/// Caveat: voxlap's bedrock placeholder plane (chunk-local z = 255 of
-/// otherwise-empty chunks) reads as solid, so a segment grazing the
-/// world bottom accumulates it as real thickness. Keep acoustic
-/// endpoints above the bedrock plane (every demo does).
+/// CT.2 — the historical caveat about voxlap's bedrock placeholder
+/// plane (chunk-local z = 255 reading as solid in otherwise-empty
+/// chunks) is gone: empty chunks seed as sentinel columns, so a
+/// segment grazing the world bottom accumulates no phantom thickness.
 fn grid_thickness(
     grid: &roxlap_scene::Grid,
     a: DVec3,
@@ -801,11 +801,12 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_plane_counts_as_solid_documented() {
-        // Voxlap's bedrock placeholder (chunk-local z = 255 of an
-        // otherwise-empty chunk) reads as solid — documented caveat on
-        // `grid_thickness`: keep acoustic endpoints above the world
-        // bottom. This test pins the current behaviour.
+    fn empty_chunk_bottom_plane_is_acoustically_air() {
+        // CT.2 — inverted from `bedrock_plane_counts_as_solid_documented`:
+        // the z=255 bedrock placeholder is retired (empty chunks seed
+        // as sentinel columns), so a ray along the old bedrock plane
+        // accumulates NO thickness and the `grid_thickness` caveat is
+        // gone.
         let scene = scene_with(|g| {
             g.ensure_chunk(IVec3::ZERO);
         });
@@ -814,7 +815,10 @@ mod tests {
             DVec3::new(10.0, 64.0, 255.5),
             DVec3::new(20.0, 64.0, 255.5),
         );
-        assert!(t > 9.0, "bedrock plane accumulates thickness: {t}");
+        assert!(
+            t.abs() < 1e-9,
+            "empty chunk must be acoustically transparent, got thickness {t}"
+        );
     }
 
     #[test]

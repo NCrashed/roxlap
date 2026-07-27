@@ -338,19 +338,22 @@ mod tests {
 
     #[test]
     fn adapter_chz_nonzero_returns_implicit_air() {
-        // chz != 0 → bedrock-only chunk (the standard scene
-        // empty-chunk shape). Verify by checking a sample of
-        // mid-z voxels are air; bedrock at z=255 is solid.
+        // chz != 0 → an all-air chunk (the standard scene empty-chunk
+        // shape). CT.2 — that shape is the empty sentinel now: air
+        // everywhere INCLUDING z=255 (no bedrock placeholder).
         let gen = CaveChunkGenerator::new(BlueCaveGenerator, BlueCaveGenerator::default_params());
         let vxl = gen.generate(IVec3::new(0, 0, 1));
-        for &(x, y, z) in &[(0u32, 0u32, 0u32), (50, 60, 100), (CXY - 1, CXY - 1, 200)] {
+        for &(x, y, z) in &[
+            (0u32, 0u32, 0u32),
+            (50, 60, 100),
+            (CXY - 1, CXY - 1, 200),
+            (0, 0, CZ - 1),
+        ] {
             assert!(
                 !voxel_is_solid(&vxl, x, y, z),
                 "({x},{y},{z}) should be air for chz=1"
             );
         }
-        // Bedrock placeholder still present.
-        assert!(voxel_is_solid(&vxl, 0, 0, CZ - 1));
 
         // Negative chz also implicit-air.
         let vxl_neg = gen.generate(IVec3::new(0, 0, -3));

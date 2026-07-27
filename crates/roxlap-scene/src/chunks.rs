@@ -66,13 +66,10 @@ pub(crate) fn empty_chunk_vxl() -> Vxl {
     };
     vxl.reserve_edit_capacity(n_cols * CHUNK_EDIT_HEADROOM_PER_COLUMN);
 
-    // 2. Carve [0, 255) in every column to make it all-air above the
-    //    historical z=255 bedrock placeholder.
-    //    TODO(CT.2): carve z1=u8::MAX (the full [0, 256)) so columns
-    //    seed as the empty sentinel. Pinned to [0, 255) for now —
-    //    CT.1 de-clamped `delslab`, and flipping the seed here would
-    //    retire the placeholder ahead of the CT.2 walker/test sweep
-    //    (docs/porting/PORTING-CARVE.md).
+    // 2. CT.2 — carve the full [0, 256) in every column: chunks seed
+    //    as empty-sentinel columns (truly all-air; the historical
+    //    z=255 bedrock placeholder is retired,
+    //    docs/porting/PORTING-CARVE.md).
     let mut spans: Vec<Vspan> = Vec::with_capacity(n_cols);
     for y in 0..vsid {
         for x in 0..vsid {
@@ -80,7 +77,7 @@ pub(crate) fn empty_chunk_vxl() -> Vxl {
                 x,
                 y,
                 z0: 0,
-                z1: u8::MAX - 1,
+                z1: u8::MAX,
             });
         }
     }
@@ -123,6 +120,14 @@ pub(crate) fn vxl_voxel_solid(vxl: &Vxl, x: u32, y: u32, z: u32) -> bool {
             return z >= top;
         }
         top = i32::from(slab[v + 1]);
+    }
+    // CT.2 — air-terminal slab (`z1c + 1 < z1`: the empty-column
+    // sentinel or its chain-tail form): the column ends in AIR — the
+    // `top` opened above is the sentinel's own z1, not a real run.
+    // NB `z1c == z1 - 1` is voxlap's legitimate buried-bottom
+    // terminal and keeps the bedrock run below.
+    if i32::from(slab[v + 2]) + 1 < i32::from(slab[v + 1]) {
+        return false;
     }
     // Last run extends to the column bottom (bedrock).
     z >= top
@@ -813,39 +818,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// CT.2 — inverted from `empty_chunk_air_above_bedrock_on_grid_sample`:
+    /// an empty chunk is air EVERYWHERE, including z=255 (the
+    /// historical bedrock placeholder is retired; columns seed as the
+    /// empty sentinel). Stride 16 catches structural breakage without
+    /// a 4M-query brute-force scan in debug mode.
     #[test]
-    fn empty_chunk_air_above_bedrock_on_grid_sample() {
-        // Stride 16 across the chunk catches structural breakage
-        // (a corner column wrong, a z-band wrong, etc.) without the
-        // 4M-query cost of a brute-force scan in debug mode.
-        // Voxlap's slab format keeps z=255 solid as the "below the
-        // world" sentinel; the renderer's `treat_z_max_as_air` flag
-        // handles displaying it as transparent. See
-        // `project_below_bedrock_all_sky.md` for the S1.X fix.
+    fn empty_chunk_air_everywhere_on_grid_sample() {
         let vxl = empty_chunk_vxl();
-        let bedrock_z = CHUNK_SIZE_Z - 1;
         for y in (0..CHUNK_SIZE_XY).step_by(16) {
             for x in (0..CHUNK_SIZE_XY).step_by(16) {
-                for z in (0..bedrock_z).step_by(16) {
+                for z in (0..CHUNK_SIZE_Z).step_by(16) {
                     assert!(
                         !voxel_is_solid(&vxl, x, y, z),
                         "voxel ({x}, {y}, {z}) leaked solid in empty chunk"
                     );
                 }
-                // bedrock z is solid (placeholder).
-                assert!(voxel_is_solid(&vxl, x, y, bedrock_z));
+                assert!(
+                    !voxel_is_solid(&vxl, x, y, CHUNK_SIZE_Z - 1),
+                    "({x}, {y}): the retired bedrock placeholder leaked back"
+                );
             }
         }
     }
 
+    /// CT.2 — inverted from `empty_chunk_keeps_bedrock_placeholder`:
+    /// a fresh chunk's columns are the empty SENTINEL — no implicit
+    /// solid voxel at z=255 survives (that voxel was the digger
+    /// "invisible walls" root cause at chz boundaries).
     #[test]
-    fn empty_chunk_keeps_bedrock_placeholder() {
-        // Voxlap's invariant: every column carries an implicit
-        // solid voxel at z = MAXZDIM-1 = 255 even after a full
-        // carve. The renderer reads this as the bedrock placeholder.
+    fn empty_chunk_columns_are_sentinel_empty() {
         let vxl = empty_chunk_vxl();
-        assert!(voxel_is_solid(&vxl, 0, 0, CHUNK_SIZE_Z - 1));
-        assert!(voxel_is_solid(&vxl, 64, 64, CHUNK_SIZE_Z - 1));
+        assert!(!voxel_is_solid(&vxl, 0, 0, CHUNK_SIZE_Z - 1));
+        assert!(!voxel_is_solid(&vxl, 64, 64, CHUNK_SIZE_Z - 1));
+        for idx in [0usize, (64 * CHUNK_SIZE_XY + 64) as usize] {
+            assert!(vxl.column_is_empty(idx), "column {idx}");
+        }
     }
 
     #[test]

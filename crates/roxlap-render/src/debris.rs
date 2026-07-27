@@ -579,8 +579,8 @@ mod tests {
 
         let mut last_z = sys.bodies[0].pos.z;
         // 5 s: saturation takes terminal/gravity ≈ 2.7 s; nothing to
-        // land on (the island's columns are placeholder bedrock only,
-        // which the default Solidity does not count as solid).
+        // land on (CT.2 — the carved island leaves truly-empty
+        // sentinel columns; no bedrock placeholder below).
         for _ in 0..300 {
             sys.update(&scene, 1.0 / 60.0);
             if sys.bodies.is_empty() {

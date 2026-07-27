@@ -94,7 +94,46 @@ This is the **entry doc** for the carve-through-floor stage — tag **CT**.
     a QE follow-up (reserve or document).
   - Suites: formats 222 / core 143 / scene 305 / gpu (all 6 targets)
     / render (incl. new parity) / audio green; clippy 0 / doc clean.
-- CT.2..CT.5, CT.7..CT.9 — not started (CT.4 shrunk, see above).
+- **CT.2 — LANDED 2026-07-27** (placeholder retirement), pulling in
+  most of CT.3 and the rest of CT.4:
+  - Both seeds flipped: `Vxl::seeded_air` and scene's
+    `empty_chunk_vxl` carve the full `[0, 256)` — fresh chunks/worlds
+    are empty-sentinel columns, truly all-air. `from_dense` worlds no
+    longer grow a phantom ground voxel.
+  - **CT.4 rest**: `world_query::getcube` learned the air-terminal
+    (the sentinel read as `UnexposedSolid` at z∈{254,255} — caught by
+    the debris test landing on a phantom that had MOVED to z=254,
+    past collide's z==255 policy special-case). `SolidSampler` is
+    just a chunk cache over the already-taught `vxl_voxel_solid` —
+    nothing to do. Scene's `vxl_voxel_solid` taught here too (the
+    inverted S1.X tests needed honest answers).
+  - **CT.3's empty-child half**: `build_mip_level` handles sentinel
+    sources (seed-exhaust + flatten skip), air-terminal chain tails
+    (state-2 advance guard kills the phantom on-event; the off at z0
+    still fires), per-source `anchored` flags, and a reworked tail:
+    all-empty dest → sentinel, un-anchored dest → air-terminal (same
+    ceiling list, different header). Plus the subtle one: **voxlap's
+    placeholder events were load-bearing** — they pulled the last
+    pending records out of the catch-up loops; a bedrock-anchored
+    cell now runs one synthetic bottom-flush pass at exhaustion
+    (air-tailed cells must NOT get it — they flush at their
+    off-events, and padding them would re-grow phantoms).
+    Pinned by `generate_mips_empty_and_mixed_cells` (formats) + the
+    GPU `solid_mips_are_child_supersets` cross-level gate + PF.12
+    `remip_bbox == generate_mips` byte-equivalence still green.
+    Remaining for CT.3 proper: fuzz-corpus growth over CT shapes.
+  - Inverted pins: S1.X `empty_chunk_*` (air everywhere incl. z=255,
+    columns are sentinels), cavegen implicit-air chunk, collide
+    `no_phantom_bedrock_plane_under_either_policy` (the
+    `bedrock_blocks` opt-in plane is gone — the flag now governs only
+    genuine z=255 content), audio
+    `empty_chunk_bottom_plane_is_acoustically_air` (+ the
+    `grid_thickness` caveat doc), islands dense-oracle seeds only
+    from genuinely solid z=255, debris free-fall comment.
+  - Suites: formats 224 / core 143 / scene 305 / gpu (all, incl.
+    cutout + superset) / render / audio green; clippy 0 / doc clean.
+- CT.5 (islands honest un-anchoring + "carve floor → island detaches"
+  DT test), CT.3-fuzz, CT.7..CT.9 — not started.
 
 ## Why
 

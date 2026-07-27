@@ -116,6 +116,14 @@ pub fn getcube(slab_buf: &[u8], column_offsets: &[u32], vsid: u32, x: i32, y: i3
         let ceilnum = z1c - z1 - nextptr + 2;
 
         if nextptr == 0 {
+            // CT.2 — air-terminal slab (`z1c + 1 < z1`: the
+            // empty-column sentinel or its chain-tail form): the
+            // column ends in AIR, there is no unexposed material
+            // below. NB `z1c == z1 - 1` is voxlap's legitimate
+            // buried-bottom terminal and stays solid.
+            if z1c + 1 < z1 {
+                return Cube::Air;
+            }
             // Last slab and z > z1c: deepest unexposed material.
             return Cube::UnexposedSolid;
         }
