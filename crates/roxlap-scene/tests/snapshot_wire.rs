@@ -10,11 +10,15 @@
 //! fixtures untouched (SC.snap did this for v1→v2 + `voxel_world_size`;
 //! WT.0 for v2→v3 + `water_volumes`; CA.0 for v3→v4 + `z_clip`).
 //!
-//! To regenerate the **v4** fixture after deliberately changing its
+//! CT (v5) is a **semantic** bump with an identical payload shape:
+//! chunk bytes may carry the empty-sentinel / air-terminal slabs that
+//! pre-CT engines would misread as bedrock — see `SNAPSHOT_VERSION`.
+//!
+//! To regenerate the **v5** fixture after deliberately changing its
 //! reference scene (NOT after a wire-format change — see above):
 //! `cargo test -p roxlap-scene --test snapshot_wire -- --ignored`. The
-//! v1/v2/v3 fixtures are intentionally frozen (current `save_snapshot`
-//! emits v4).
+//! v1..v4 fixtures are intentionally frozen (current `save_snapshot`
+//! emits v5).
 
 use glam::{DVec3, IVec3};
 use roxlap_scene::snapshot::SnapshotLoadError;
@@ -28,6 +32,9 @@ const FIXTURE_V2: &[u8] = include_bytes!("fixtures/snapshot_v2.rxs");
 const FIXTURE_V3: &[u8] = include_bytes!("fixtures/snapshot_v3.rxs");
 /// CA.0 — a v4 blob with a cutaway clip (see [`build_clipped_scene`]).
 const FIXTURE_V4: &[u8] = include_bytes!("fixtures/snapshot_v4.rxs");
+/// CT — a v5 blob with carve-through chunk bytes (see
+/// [`build_carved_scene`]).
+const FIXTURE_V5: &[u8] = include_bytes!("fixtures/snapshot_v5.rxs");
 
 /// The scene the fixture encodes: two grids — a fully-configured
 /// named "terrain" grid with edits (versions non-zero) spanning a
@@ -234,21 +241,86 @@ fn z_clip_round_trip() {
     assert_clipped_scene(&scene);
 }
 
-/// Regenerate the checked-in **v4** fixture. Only run deliberately after a
+/// CT (v5) — the reference scene WITH chunk bytes, because the chunk
+/// bytes ARE what v5 is about: a slab with a shaft carved through the
+/// world floor (air-terminal chain tails), a fully emptied column (the
+/// empty sentinel) and a run ending exactly at z=254 (`z0 == 255 ==
+/// z1` — the degenerate-merge regression shape).
+fn build_carved_scene() -> Scene {
+    const TER: VoxColor = VoxColor(0x80_aa_bb_00);
+    let mut scene = Scene::new();
+    let id = scene.add_grid(GridTransform::at_scale(DVec3::new(0.0, 0.0, 8.0), 16.0));
+    let g = scene.grid_mut(id).expect("grid just added");
+    g.name = Some("quarry".to_owned());
+    // A slab, a bottom-reaching shaft with a survivor, an emptied
+    // column, and a to-254 pillar.
+    g.set_rect(IVec3::new(0, 0, 200), IVec3::new(15, 15, 255), Some(TER));
+    g.set_rect(IVec3::new(4, 4, 230), IVec3::new(5, 5, 255), None);
+    g.set_rect(IVec3::new(8, 8, 0), IVec3::new(8, 8, 255), None);
+    g.set_rect(IVec3::new(20, 20, 100), IVec3::new(20, 20, 254), Some(TER));
+    scene
+}
+
+/// Assert `scene` matches [`build_carved_scene`] — the carve-through
+/// shapes must survive the wire round-trip exactly.
+fn assert_carved_scene(scene: &Scene) {
+    let (_, g) = scene.grids().next().expect("one grid");
+    assert_eq!(g.name.as_deref(), Some("quarry"));
+    // Survivor above the shaft, air THROUGH the old floor below it.
+    assert!(g.voxel_solid(IVec3::new(4, 4, 229)));
+    for z in [230, 240, 254, 255] {
+        assert!(
+            !g.voxel_solid(IVec3::new(4, 4, z)),
+            "shaft must stay carved through at z={z}"
+        );
+    }
+    // The emptied column is air everywhere, including z=255.
+    assert!(!g.voxel_solid(IVec3::new(8, 8, 255)));
+    assert!(!g.voxel_solid(IVec3::new(8, 8, 200)));
+    // The to-254 pillar keeps its full extent (the degenerate-merge
+    // regression shape) with air below.
+    assert!(g.voxel_solid(IVec3::new(20, 20, 100)));
+    assert!(g.voxel_solid(IVec3::new(20, 20, 254)));
+    assert!(!g.voxel_solid(IVec3::new(20, 20, 255)));
+    // Untouched slab column is intact.
+    assert!(g.voxel_solid(IVec3::new(1, 1, 255)));
+    assert!(!g.voxel_solid(IVec3::new(1, 1, 199)));
+}
+
+/// CT — a v5 blob (carve-through chunk bytes) stays loadable, the same
+/// forever-promise as the earlier fixtures.
+#[test]
+fn v5_fixture_loads() {
+    let scene =
+        Scene::load_snapshot(FIXTURE_V5).expect("checked-in v5 fixture must stay loadable forever");
+    assert_carved_scene(&scene);
+}
+
+/// CT — the carve-through shapes round-trip through the CURRENT wire
+/// format (`compact_serialize_chunk` must carry sentinel / air-terminal
+/// columns byte-faithfully).
+#[test]
+fn carve_through_round_trip() {
+    let bytes = build_carved_scene().save_snapshot();
+    let scene = Scene::load_snapshot(&bytes).expect("round trip");
+    assert_carved_scene(&scene);
+}
+
+/// Regenerate the checked-in **v5** fixture. Only run deliberately after a
 /// deliberate reference-scene change (NOT after a wire-format change — bump
 /// SNAPSHOT_VERSION and add a shadow shape instead):
 /// `cargo test -p roxlap-scene --test snapshot_wire -- --ignored`
 ///
-/// The v1/v2/v3 fixtures are intentionally NOT regenerable here: current
-/// `save_snapshot` emits v4, so the frozen `snapshot_v1.rxs` /
-/// `snapshot_v2.rxs` / `snapshot_v3.rxs` (the backward-compat gates) are
-/// left untouched by design.
+/// The v1..v4 fixtures are intentionally NOT regenerable here: current
+/// `save_snapshot` emits v5, so the frozen `snapshot_v{1,2,3,4}.rxs`
+/// (the backward-compat gates) are left untouched by design — the old
+/// v4 regenerator was REMOVED when v5 froze v4.
 #[test]
-#[ignore = "writes tests/fixtures/snapshot_v4.rxs; run manually"]
-fn regenerate_v4_fixture() {
+#[ignore = "writes tests/fixtures/snapshot_v5.rxs; run manually"]
+fn regenerate_v5_fixture() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/snapshot_v4.rxs"
+        "/tests/fixtures/snapshot_v5.rxs"
     );
-    std::fs::write(path, build_clipped_scene().save_snapshot()).expect("write fixture");
+    std::fs::write(path, build_carved_scene().save_snapshot()).expect("write fixture");
 }

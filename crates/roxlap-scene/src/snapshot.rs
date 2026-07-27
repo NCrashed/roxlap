@@ -561,13 +561,24 @@ pub const SNAPSHOT_MAGIC: [u8; 4] = *b"RXSS";
 /// original shape). bincode is strictly positional, so every
 /// trailing-field addition bumps the version and freezes the previous
 /// shape as a private shadow struct: [`Scene::load_snapshot`]
-/// dispatches — v4 blobs decode [`GridSnapshot`] directly; v3/v2/v1
+/// dispatches — v4/v5 blobs decode [`GridSnapshot`] directly; v3/v2/v1
 /// blobs decode `GridSnapshotV3` / `GridSnapshotV2` / `GridSnapshotV1`
 /// and restore unclipped (and, for v2/v1, with no water; for v1,
 /// `voxel_world_size = 1.0`). `GridTransform`'s own wire form stays
 /// frozen (`#[serde(skip)]`) in ALL versions, so the forever-loadable
-/// v1/v2/v3 fixtures keep loading unchanged.
-pub const SNAPSHOT_VERSION: u32 = 4;
+/// v1..v4 fixtures keep loading unchanged.
+///
+/// **v5 (CT — carve-through-floor) is a SEMANTIC bump, not a shape
+/// change**: the struct layout is byte-identical to v4, but chunk
+/// column bytes may now carry the empty-column sentinel / air-terminal
+/// slabs (`z1c ≤ z1 − 2`, `roxlap_formats::vxl::EMPTY_COLUMN_SLAB`).
+/// Pre-CT engines (≤ 0.30, reading ≤ v4) would parse those columns but
+/// misread them as bedrock-terminated — phantom solid at chunk-local
+/// z=255 — so the bump makes them REJECT new saves loudly instead of
+/// loading them subtly wrong. Old v1..v4 saves load fine here: their
+/// placeholder columns are legitimate legacy shapes and behave exactly
+/// as they did pre-CT.
+pub const SNAPSHOT_VERSION: u32 = 5;
 
 /// Errors from [`Scene::load_snapshot`].
 #[derive(Debug)]
@@ -656,8 +667,10 @@ impl Scene {
         let payload = &bytes[8..];
         // Dispatch on the wire version: older blobs decode their frozen
         // shadow shapes (v1: no scale, no water → 1.0 + dry; v2 (SC.snap):
-        // no water → dry; v3 (WT.0): no clip → unclipped); v4 blobs decode
-        // `SceneSnapshot` directly. All funnel through `from_snapshot`.
+        // no water → dry; v3 (WT.0): no clip → unclipped); v4 and v5 blobs
+        // decode `SceneSnapshot` directly — v5 is the CT semantic bump
+        // (identical shape, sentinel-capable chunk bytes; see
+        // [`SNAPSHOT_VERSION`]). All funnel through `from_snapshot`.
         let snap: SceneSnapshot = match version {
             1 => bincode::deserialize::<SceneSnapshotV1>(payload)
                 .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?
@@ -668,7 +681,7 @@ impl Scene {
             3 => bincode::deserialize::<SceneSnapshotV3>(payload)
                 .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?
                 .into(),
-            4 => bincode::deserialize(payload)
+            4 | 5 => bincode::deserialize(payload)
                 .map_err(|e| SnapshotLoadError::Decode(e.to_string()))?,
             v => return Err(SnapshotLoadError::UnsupportedVersion(v)),
         };
@@ -711,8 +724,9 @@ mod tests {
         // that same constant) and an accidental bump would sail through
         // green while old engines stop reading new saves. Bumping the
         // version deliberately? Update this literal alongside the new
-        // shadow shape + fixture.
-        assert_eq!(&bytes[4..8], &4u32.to_le_bytes(), "expected v4 wire");
+        // shadow shape + fixture. (CT bumped 4 → 5: same shape,
+        // sentinel-capable chunk bytes — see SNAPSHOT_VERSION.)
+        assert_eq!(&bytes[4..8], &5u32.to_le_bytes(), "expected v5 wire");
         let restored = Scene::load_snapshot(&bytes).expect("round trip");
 
         let (_, g) = restored.grids().next().expect("one grid");

@@ -198,8 +198,28 @@ This is the **entry doc** for the carve-through-floor stage — tag **CT**.
     `run_ending_at_world_bottom_minus_one_stays_solid` (scene), a
     z=254 fill in `carve_parity` (would have caught it), Xvfb PPM
     captures verified before/after. 10-minute soak clean.
-- Remaining: CT.8 snapshot wire bump, CT.9 monada validation + book +
-  CHANGELOG + handover close-out.
+- **CT.8 — LANDED 2026-07-28.** Snapshot wire v4 → v5 — a **semantic**
+  bump with an identical payload shape: chunk bytes may now carry the
+  empty-sentinel / air-terminal slabs, and pre-CT engines (reading
+  ≤ v4) would misread them as bedrock-terminated — the bump makes them
+  reject new saves loudly (`UnsupportedVersion`) instead of loading
+  subtly wrong. `load_snapshot` dispatches `4 | 5` through the same
+  `SceneSnapshot` (no shadow struct needed — the shape didn't change);
+  v1..v4 fixtures stay green (their placeholder columns are legitimate
+  legacy shapes behaving exactly as pre-CT). NEW fixture
+  `snapshot_v5.rxs` — carved-through chunk bytes ARE the point:
+  bottom-carved shaft with a survivor, fully emptied column, to-254
+  pillar (the degenerate-merge regression shape) — with
+  `v5_fixture_loads` + `carve_through_round_trip`
+  (`compact_serialize_chunk` carries sentinels byte-faithfully). The
+  old v4 regenerator REMOVED (running it would have overwritten the v4
+  gate with v5 bytes); `regenerate_v5_fixture` replaces it. CLI:
+  `extract_carved_through_chunk` — a dug-through chunk exports cleanly
+  to vxl/kv6/vox (emptied columns contribute nothing; kv6 walked via
+  its ylen column tables). cli 12 green.
+- Remaining: CT.9 — monada validation via path-dep (user visual pass),
+  book, CHANGELOG (minor cut, behaviour notes: carve-through, inherit
+  retexture, islands un-anchoring, snapshot v5), handover close-out.
 
 ## Why
 

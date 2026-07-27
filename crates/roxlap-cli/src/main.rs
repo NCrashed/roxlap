@@ -546,6 +546,58 @@ mod tests {
     /// reparses as the same chunk, `.kv6`/`.vox` carry the edited
     /// voxels (minus the bedrock placeholder plane, dropped by
     /// design).
+    /// CT.8 — extracting a carved-through chunk: empty-sentinel and
+    /// air-terminal columns export cleanly in every format (no phantom
+    /// bedrock voxels reappear on the way out).
+    #[test]
+    fn extract_carved_through_chunk() {
+        use glam::{DVec3, IVec3};
+        let mut scene = roxlap_scene::Scene::new();
+        let id = scene.add_grid(roxlap_scene::GridTransform::at(DVec3::ZERO));
+        let g = scene.grid_mut(id).expect("just added");
+        g.set_rect(
+            IVec3::new(0, 0, 250),
+            IVec3::new(3, 3, 255),
+            Some(roxlap_scene::VoxColor(0x80_aa_bb_00)),
+        );
+        // One column emptied entirely, one dug through from z=252.
+        g.set_rect(IVec3::new(1, 1, 0), IVec3::new(1, 1, 255), None);
+        g.set_rect(IVec3::new(2, 2, 252), IVec3::new(2, 2, 255), None);
+        let raw = id.raw();
+        let idx = IVec3::ZERO;
+
+        let vxl_bytes = extract_chunk_bytes(&scene, raw, idx, Path::new("c.vxl")).expect("vxl");
+        let reparsed = vxl::parse(&vxl_bytes).expect("carved vxl parses");
+        assert_eq!(reparsed.voxel_color(1, 1, 255), None, "emptied column");
+        assert_eq!(reparsed.voxel_color(2, 2, 255), None, "dug-through floor");
+        assert!(reparsed.voxel_color(2, 2, 251).is_some(), "survivor kept");
+
+        let kv6_bytes = extract_chunk_bytes(&scene, raw, idx, Path::new("c.kv6")).expect("kv6");
+        let model = kv6::parse(&kv6_bytes).expect("carved kv6 parses");
+        // Walk the column-major voxel stream via the ylen tables: the
+        // emptied column (1,1) exports zero voxels, the dug-through
+        // column (2,2) nothing at z >= 252.
+        let mut cursor = 0usize;
+        for (x, row) in model.ylen.iter().enumerate() {
+            for (y, &n) in row.iter().enumerate() {
+                let col = &model.voxels[cursor..cursor + n as usize];
+                cursor += n as usize;
+                if (x, y) == (1, 1) {
+                    assert!(col.is_empty(), "emptied column must export nothing");
+                }
+                if (x, y) == (2, 2) {
+                    assert!(
+                        col.iter().all(|v| v.z < 252),
+                        "dug-through column must export nothing below the carve"
+                    );
+                }
+            }
+        }
+
+        let vox_bytes = extract_chunk_bytes(&scene, raw, idx, Path::new("c.vox")).expect("vox");
+        vox::parse(&vox_bytes).expect("carved vox parses");
+    }
+
     #[test]
     fn extract_chunk_all_formats() {
         use glam::{DVec3, IVec3};
