@@ -649,16 +649,21 @@ impl Vxl {
         let n_words = total_dwords.div_ceil(32);
         let mut vbit = vec![0u32; n_words].into_boxed_slice();
 
-        // Mark every column's dword range as allocated. Iterates over
-        // all built mips so mip-1+ tail data is preserved as
-        // "allocated" (never repurposed by voxalloc, which finds runs
-        // only in genuinely-clear bits).
+        // Mark every column's dword range as allocated — by each
+        // column's OWN `slng`-recovered length, NOT the offset-table
+        // window: post-edit `voxalloc` scatters columns, so
+        // `offset[i + 1]` is unrelated to column `i`'s end. A window
+        // could overspan (permanently leaking the covered free gap —
+        // the edit fuzzer measured exactly the tail-of-seed dwords
+        // going dead) or come out reversed/EMPTY, leaving a LIVE
+        // column unmarked for `voxalloc` to clobber. Iterates all
+        // built mips so mip-1+ data stays owned too.
         for mip in 0..self.mip_count() {
             let table = self.column_offset_for_mip(mip);
-            for window in table.windows(2) {
-                let lo = (window[0] / 4) as usize;
-                let hi = (window[1] / 4) as usize;
-                for d in lo..hi {
+            for &off in &table[..table.len() - 1] {
+                let lo = (off / 4) as usize;
+                let len = slng(&self.data[off as usize..]);
+                for d in lo..lo + len.div_ceil(4) {
                     vbit[d >> 5] |= 1u32 << (d & 31);
                 }
             }

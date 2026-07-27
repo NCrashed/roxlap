@@ -108,6 +108,14 @@ pub(crate) fn vxl_voxel_solid(vxl: &Vxl, x: u32, y: u32, z: u32) -> bool {
     let mut v = 0usize;
     while slab[v] != 0 {
         v += usize::from(slab[v]) * 4;
+        // CT — air-terminal as the ADVANCED slab: the column ends in
+        // air below `z0`. MUST come before the degenerate-merge check
+        // — a run ending at the world bottom gets `z0 == 255 == z1`,
+        // which the merge would swallow, dropping the whole run.
+        if slab[v] == 0 && i32::from(slab[v + 2]) + 1 < i32::from(slab[v + 1]) {
+            let bot = i32::from(slab[v + 3]);
+            return z >= top && z < bot;
+        }
         if slab[v + 3] >= slab[v + 1] {
             // Degenerate slab (no air gap above): merges into the
             // current run — same skip `expandrle` takes.
@@ -121,11 +129,10 @@ pub(crate) fn vxl_voxel_solid(vxl: &Vxl, x: u32, y: u32, z: u32) -> bool {
         }
         top = i32::from(slab[v + 1]);
     }
-    // CT.2 — air-terminal slab (`z1c + 1 < z1`: the empty-column
-    // sentinel or its chain-tail form): the column ends in AIR — the
-    // `top` opened above is the sentinel's own z1, not a real run.
-    // NB `z1c == z1 - 1` is voxlap's legitimate buried-bottom
-    // terminal and keeps the bedrock run below.
+    // CT.2 — the whole-empty sentinel as the ONLY slab (`z1c + 1 <
+    // z1`): air everywhere — the `top` opened above is the sentinel's
+    // own z1, not a real run. NB `z1c == z1 - 1` is voxlap's
+    // legitimate buried-bottom terminal and keeps the bedrock run.
     if i32::from(slab[v + 2]) + 1 < i32::from(slab[v + 1]) {
         return false;
     }
@@ -840,6 +847,27 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// CT — a run whose content ends exactly at z=254 (the scene-demo
+    /// hills shape: insert to `z_hill_max = 254` over an empty
+    /// column) produces an air-terminal with `z0 == 255 == z1`; the
+    /// walkers must close the run there, not swallow it via the
+    /// degenerate-merge check (the "CPU terrain vanishes" demo
+    /// regression).
+    #[test]
+    fn run_ending_at_world_bottom_minus_one_stays_solid() {
+        let mut g = Grid::new(GridTransform::identity());
+        g.set_rect(
+            IVec3::new(4, 4, 100),
+            IVec3::new(6, 6, 254),
+            Some(VoxColor(0x80_44_55_66)),
+        );
+        assert!(g.voxel_solid(IVec3::new(5, 5, 100)));
+        assert!(g.voxel_solid(IVec3::new(5, 5, 200)));
+        assert!(g.voxel_solid(IVec3::new(5, 5, 254)));
+        assert!(!g.voxel_solid(IVec3::new(5, 5, 255)), "air-terminal below");
+        assert!(!g.voxel_solid(IVec3::new(5, 5, 99)), "air above");
     }
 
     /// CT.2 — inverted from `empty_chunk_keeps_bedrock_placeholder`:

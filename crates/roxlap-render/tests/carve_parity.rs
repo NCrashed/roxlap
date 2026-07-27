@@ -33,6 +33,11 @@ fn cpu_gpu_hit_verdicts_agree_at_carve_sites() {
     set_rect(&mut vxl, [8, 8, 120], [8, 8, 255], None);
     // Full-column carve (empty sentinel).
     set_rect(&mut vxl, [10, 10, 0], [10, 10, 255], None);
+    // Content ending EXACTLY at z=254: the air-terminal gets
+    // `z0 == 255 == z1`, which the walkers' degenerate-merge check
+    // must not swallow (the "CPU terrain vanishes" demo regression —
+    // the scene-demo hills insert to 254).
+    set_rect(&mut vxl, [12, 2, 100], [14, 6, 254], Some(TER));
 
     let up = decompress_chunk(&vxl);
     let m0 = &up.mips[0];

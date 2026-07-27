@@ -494,6 +494,38 @@ pub(crate) fn compilerle(
 
             if exit_to_rlendit2 {
                 if ze >= MAXZDIM {
+                    // CT — dangling tail records. Pre-CT the bedrock
+                    // placeholder of ANY neighbour forced a burial
+                    // event at z=255 whose sub-slab took ownership of
+                    // the records written since the floor close; an
+                    // air-tailed neighbour now keeps the exposure to
+                    // the very bottom, so a bottom-reaching run can
+                    // end with records the slab's floor list does not
+                    // cover — `slng` would under-count the chain and
+                    // the allocator would leak the difference on the
+                    // next dealloc (found by the edit fuzzer). Fold
+                    // the dangle into a buried-bottom terminal: its
+                    // floor is the z=255 record, its ceilings are the
+                    // rest (walkers degenerate-merge it into the same
+                    // bottom-reaching run — semantics unchanged).
+                    let t_z1 = i32::from(cbuf[onext + 1]);
+                    let t_z1c = i32::from(cbuf[onext + 2]);
+                    let floor_bytes = 4 + usize::try_from((t_z1c - t_z1 + 1).max(0))
+                        .expect("floor count >= 0")
+                        * 4;
+                    if n - onext > floor_bytes {
+                        let mut last = [0u8; 4];
+                        last.copy_from_slice(&cbuf[n - 4..n]);
+                        cbuf[onext] = u8::try_from((n - 4 - onext) >> 2)
+                            .expect("slab dword count fits in u8");
+                        cbuf[n - 4] = 0;
+                        cbuf[n - 3] = 255;
+                        cbuf[n - 2] = 255;
+                        cbuf[n - 1] = 255;
+                        cbuf[n..n + 4].copy_from_slice(&last);
+                        onext = n - 4;
+                        n += 4;
+                    }
                     break 'outer;
                 }
                 i += 2;
@@ -1018,6 +1050,20 @@ impl<'v> ScumCtx<'v> {
             )
         };
 
+        // CT hardening — the allocator recovers a column's length via
+        // `slng` on dealloc, so the encoder's byte count and the slab
+        // chain's self-described length MUST agree or the pool leaks
+        // (the freed span would be shorter than the allocation).
+        // CT hardening — the allocator recovers a column's length via
+        // `slng` on dealloc, so the encoder's byte count and the slab
+        // chain's self-described length MUST agree or the pool leaks
+        // (the freed span would be shorter than the allocation; the
+        // dangling-tail case was found by the edit fuzzer).
+        debug_assert_eq!(
+            crate::vxl::slng(&self.cbuf[..written]),
+            written,
+            "compilerle chain length disagrees with slng at ({x}, {y})"
+        );
         let old_offset = self.vxl.column_offset[idx];
         self.vxl.voxdealloc(old_offset);
         let new_offset = self.vxl.voxalloc(written as u32);

@@ -302,6 +302,15 @@ impl<'a> GridView<'a> {
             v += nextptr * 4;
             let ze = i32::from(slab[v + 3]);
             let z1 = i32::from(slab[v + 1]);
+            // CT — air-terminal as the ADVANCED slab: close the open
+            // run at its z0 and stop. MUST come before the degenerate
+            // merge — a run ending at the world bottom (z=254 content)
+            // gets `z0 == 255 == z1`, which the merge check would
+            // otherwise swallow, dropping the whole run (the "CPU
+            // terrain vanishes" demo regression).
+            if slab[v] == 0 && i32::from(slab[v + 2]) + 1 < z1 {
+                return (zi >= top && zi < ze).then_some(top);
+            }
             if ze >= z1 {
                 continue; // degenerate slab — run continues
             }
@@ -345,6 +354,13 @@ impl<'a> GridView<'a> {
             v += nextptr * 4;
             let ze = i32::from(slab[v + 3]);
             let z1 = i32::from(slab[v + 1]);
+            // CT — air-terminal as the ADVANCED slab (see
+            // `voxel_run_top_mip`): close at z0 BEFORE the degenerate
+            // merge can swallow a `z0 == z1 == 255` tail.
+            if slab[v] == 0 && i32::from(slab[v + 2]) + 1 < z1 {
+                f(top, ze);
+                return;
+            }
             if ze >= z1 {
                 continue; // degenerate slab — run continues
             }

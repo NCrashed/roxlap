@@ -158,18 +158,46 @@ This is the **entry doc** for the carve-through-floor stage — tag **CT**.
     round-trip, sane per-column runs (incl. sentinel/pure-terminator),
     mip ladder builds + walks. 4 corpus seeds committed; CI's
     smoke-fuzz picks the target up automatically (`cargo fuzz list`).
-  - **The fuzzer earned its keep in under a minute**: `nextptr` is a
-    u8 dword count, and the CT.1 air-terminal made the closing slab
-    NON-terminal — so a 255+-record fully-exposed stretch (an insert
-    into an empty-sentinel column with exposed sides) overflowed it;
-    pre-CT that slab was always the uncapped terminal. Fix:
-    `compilerle` splits an oversized slab into degenerate-continuation
-    slabs (`z0 == z1` — every walker already folds them back; the
-    ceiling arithmetic stays exact for a contiguous record list), and
-    `MAXCSIZ` grew 1028 → 1088 for the extra headers. Pinned by
-    `oversized_exposed_run_splits_slabs` + the crash input promoted to
-    the corpus (`seed-oversized-slab-split`). 3-minute soak: 77k runs
-    clean.
+  - **The fuzzer earned its keep — THREE catches** (plus a live demo
+    regression fixed the same session):
+    1. `nextptr` overflow: it is a u8 dword count, and the CT.1
+       air-terminal made the closing slab NON-terminal — a
+       255+-record fully-exposed stretch overflowed it (pre-CT that
+       slab was always the uncapped terminal). Fix: `compilerle`
+       splits an oversized slab into degenerate-continuation slabs
+       (`z0 == z1`; ceiling arithmetic stays exact), `MAXCSIZ`
+       1028 → 1088. Pin `oversized_exposed_run_splits_slabs` + corpus
+       `seed-oversized-slab-split`.
+    2. Pool leak via dangling tail records: pre-CT the bedrock
+       placeholder of ANY neighbour forced a burial event at z=255
+       that took ownership of records written after a floor close; an
+       air-tailed neighbour keeps exposure to the very bottom, so a
+       bottom-reaching run could end with records no slab owned —
+       `slng` under-counted the chain and every re-edit leaked the
+       difference (~5 900 dwords/op in the crash input). Fix: the
+       rlendit2 bottom-exit folds the dangle into a buried-bottom
+       terminal (floor = the z=255 record, ceilings = the rest;
+       walkers degenerate-merge it into the same run). Plus a
+       permanent `debug_assert`: `slng(chain) == written` at every
+       flush. Corpus `seed-dangling-tail-records`.
+    3. (Latent, pre-existing, surfaced by the leak hunt)
+       `reserve_edit_capacity`'s bitmap re-sync marked offset-table
+       WINDOWS (`offset[i]..offset[i+1]`) — meaningless post-edit
+       scatter: overspanning windows permanently killed free gaps,
+       and a reversed window could leave a LIVE column unmarked for
+       `voxalloc` to clobber. Now marks each column's own
+       `slng`-recovered range.
+  - **Demo regression (user report, fixed same session)**: the
+    default World scene's terrain vanished on CPU — hills insert to
+    z=254, the air-terminal gets `z0 == 255 == z1`, and the
+    grid_view walkers' + `vxl_voxel_solid`'s degenerate-merge check
+    (`z0 >= z1`) swallowed the tail BEFORE the air-check placed at
+    the loop exit, dropping the whole run (expandrle and the GPU
+    mirror had the check ordered correctly — GPU was fine).
+    Air-check moved before the merge in all three walkers; pins:
+    `run_ending_at_world_bottom_minus_one_stays_solid` (scene), a
+    z=254 fill in `carve_parity` (would have caught it), Xvfb PPM
+    captures verified before/after. 10-minute soak clean.
 - Remaining: CT.8 snapshot wire bump, CT.9 monada validation + book +
   CHANGELOG + handover close-out.
 
