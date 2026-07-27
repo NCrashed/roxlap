@@ -132,8 +132,46 @@ This is the **entry doc** for the carve-through-floor stage — tag **CT**.
     from genuinely solid z=255, debris free-fall comment.
   - Suites: formats 224 / core 143 / scene 305 / gpu (all, incl.
     cutout + superset) / render / audio green; clippy 0 / doc clean.
-- CT.5 (islands honest un-anchoring + "carve floor → island detaches"
-  DT test), CT.3-fuzz, CT.7..CT.9 — not started.
+- **CT.5 — LANDED 2026-07-27.** Islands honest un-anchoring:
+  `chunk_column_runs` yields no runs for the empty sentinel and closes
+  an air-terminal column's last run UN-anchored; the module doc's
+  support rationale rewritten (anchoredness is a fact of the bytes,
+  not the old "z=255 is uncarvable" invariant). NEW DT gate
+  `carve_through_floor_detaches_island`: dig a bottom-standing
+  pillar's base out through the floor → the hanging top comes back as
+  an island (exact voxel count + bbox pinned). Multi-chz mid-stack
+  anchoring nuances deliberately untouched (pre-existing). Suites
+  green (scene 306), clippy clean.
+- **CT.7 + CT.3-fuzz — LANDED 2026-07-28.**
+  - CT.7: the leftovers were already handled by existing code —
+    `refresh_chunk` clears the chunk-occupancy bit
+    (`!colors.is_empty()`) and resets the slot z-extent
+    (`solid_z_extent → None`) — they only lacked a pin. NEW gate
+    `carve_all_and_refresh_renders_sky` (digger_repro.rs): fill a
+    chunk, render, carve EVERYTHING, refresh in place, re-render →
+    every pixel sky.
+  - CT.3-fuzz: NEW `edit` fuzz target — an op-stream driver
+    (insert/carve rects, sphere carves, bottom-reaching carves) living
+    in the library (`roxlap_formats::fuzz_driver`) so the committed
+    seeds also run as a stable-CI unit test
+    (`edit_fuzz_seeds_hold_invariants`); invariants: byte-stable
+    round-trip, sane per-column runs (incl. sentinel/pure-terminator),
+    mip ladder builds + walks. 4 corpus seeds committed; CI's
+    smoke-fuzz picks the target up automatically (`cargo fuzz list`).
+  - **The fuzzer earned its keep in under a minute**: `nextptr` is a
+    u8 dword count, and the CT.1 air-terminal made the closing slab
+    NON-terminal — so a 255+-record fully-exposed stretch (an insert
+    into an empty-sentinel column with exposed sides) overflowed it;
+    pre-CT that slab was always the uncapped terminal. Fix:
+    `compilerle` splits an oversized slab into degenerate-continuation
+    slabs (`z0 == z1` — every walker already folds them back; the
+    ceiling arithmetic stays exact for a contiguous record list), and
+    `MAXCSIZ` grew 1028 → 1088 for the extra headers. Pinned by
+    `oversized_exposed_run_splits_slabs` + the crash input promoted to
+    the corpus (`seed-oversized-slab-split`). 3-minute soak: 77k runs
+    clean.
+- Remaining: CT.8 snapshot wire bump, CT.9 monada validation + book +
+  CHANGELOG + handover close-out.
 
 ## Why
 

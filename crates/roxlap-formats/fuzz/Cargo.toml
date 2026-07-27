@@ -69,3 +69,9 @@ name = "snapshot"
 path = "fuzz_targets/snapshot.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "edit"
+path = "fuzz_targets/edit.rs"
+test = false
+doc = false

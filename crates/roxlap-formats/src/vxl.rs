@@ -2414,6 +2414,40 @@ mod tests {
         );
     }
 
+    /// CT — a tall fully-exposed run over an air tail splits into
+    /// degenerate continuation slabs (`z0 == z1`, walkers merge them
+    /// back). Found by the `edit` fuzzer: `nextptr` is a u8 dword
+    /// count, and the air-terminal made the closing slab
+    /// NON-terminal, so 255+ records overflowed it (pre-CT such a
+    /// slab was always the uncapped terminal).
+    #[test]
+    fn oversized_exposed_run_splits_slabs() {
+        use crate::edit::{expandrle, set_rect, MAXZDIM};
+        let mut vxl = Vxl::empty(4);
+        vxl.reserve_edit_capacity(16 * 1200);
+        let c = VoxColor(0x80_11_22_33);
+        // A lone pillar: every voxel side-exposed → one record per
+        // voxel, 255 records (> the 254 a u8-counted slab can hold)
+        // + the air tail below.
+        set_rect(&mut vxl, [1, 1, 0], [1, 1, 254], Some(c));
+        let idx = (vxl.vsid + 1) as usize;
+        let col = vxl.column_data(idx);
+        assert!(
+            col.len() > 1024,
+            "shape must exceed one slab: {}",
+            col.len()
+        );
+        let mut spans = vec![0i32; 64];
+        expandrle(col, &mut spans);
+        assert_eq!(&spans[0..4], &[0, 255, MAXZDIM, MAXZDIM]);
+        for z in [0u32, 100, 253, 254] {
+            assert_eq!(vxl.voxel_color(1, 1, z), Some(c), "z={z}");
+        }
+        assert_eq!(vxl.voxel_color(1, 1, 255), None, "air below the run");
+        let bytes = serialize(&vxl);
+        assert_eq!(serialize(&parse(&bytes).expect("parses")), bytes);
+    }
+
     /// CT.2 — `Vxl::empty` columns are the empty sentinel (the z=255
     /// bedrock placeholder is retired, docs/porting/PORTING-CARVE.md).
     #[test]

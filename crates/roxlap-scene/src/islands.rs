@@ -6,14 +6,15 @@
 //! flood over the RLE **runs** of the affected columns — a run is one
 //! BFS node (chunk-format-native, no dense decode), 6-connected,
 //! seeded from every run touching the carved bbox (±1 pad). A
-//! component that reaches a **bedrock-anchored** run (the final run of
-//! any materialised chunk's column: the `.vxl` format extends it to
-//! the column bottom, and its bottom voxel at local z=255 is
-//! uncarvable — `delslab` clamps below `MAXZDIM` — so a component
-//! containing it can never physically fall, chz stacks included) or
+//! component that reaches a **bedrock-anchored** run (one whose
+//! bedrock-terminal slab genuinely extends to the column bottom —
+//! since CT carve-through-floor that is a FACT of the column's bytes,
+//! not an invariant: a column dug through ends in the air-terminal and
+//! anchors nothing, and an emptied column has no runs at all) or
 //! grows past `budget` voxels is supported and abandoned early; only
 //! components that exhaust under budget without finding support come
-//! back as [`Island`]s.
+//! back as [`Island`]s. Digging the floor out from under a pillar
+//! therefore detaches it (`carve_through_floor_detaches_island`).
 //!
 //! Cost per call ≈ O(Σ min(component size, budget)) over the distinct
 //! components touching the bbox. False negatives are by design: a
@@ -313,15 +314,30 @@ struct Run {
 
 /// Decode one chunk-local column's solid runs, mirroring the
 /// `vxl_voxel_solid` slab walk (`chunks.rs`): run k spans
-/// `[top_k, bot_k)`; the final run extends to the column bottom and is
-/// flagged `is_final` (the format's implicit bedrock).
+/// `[top_k, bot_k)`; a run reaching the column bottom (the format's
+/// bedrock terminal) is flagged anchored.
+///
+/// CT.5 — the empty sentinel yields NO runs, and a column ending in
+/// the air-terminal closes its last run at `z0` UN-anchored: since
+/// carve-through-floor, "solid at the column bottom" is a fact, not
+/// an invariant — a column whose floor was dug out no longer counts
+/// as support, and the hanging remains become debris.
 fn chunk_column_runs(vxl: &Vxl, x: u32, y: u32, mut f: impl FnMut(i32, i32, bool)) {
     let idx = (y * vxl.vsid + x) as usize;
     let slab = vxl.column_data(idx);
+    if roxlap_formats::vxl::slab_is_empty_column(slab) {
+        return;
+    }
     let mut top = i32::from(slab[1]);
     let mut v = 0usize;
     while slab[v] != 0 {
         v += usize::from(slab[v]) * 4;
+        // CT.5 — air-terminal chain tail (`z1c + 1 < z1`): the column
+        // ends in air; close the last run at `z0`, no anchored run.
+        if slab[v] == 0 && i32::from(slab[v + 2]) + 1 < i32::from(slab[v + 1]) {
+            f(top, i32::from(slab[v + 3]), false);
+            return;
+        }
         if slab[v + 3] >= slab[v + 1] {
             // Degenerate slab (no air gap above): merges into the
             // current run — same skip `expandrle` takes.
@@ -598,6 +614,47 @@ mod tests {
     use roxlap_formats::color::VoxColor;
 
     const STONE: VoxColor = VoxColor(0x80B0_8040);
+
+    /// CT.5 — the digger consequence of carve-through-floor: a pillar
+    /// standing on the column bottom is supported; digging its base
+    /// out THROUGH the floor removes the anchor and the hanging top
+    /// comes back as an island (pre-CT the uncarvable z=255 voxel made
+    /// this scenario impossible — the pillar always kept its anchor).
+    #[test]
+    fn carve_through_floor_detaches_island() {
+        let mut g = Grid::new(GridTransform::identity());
+        // 3×3 pillar from z=200 down to the very bottom (bedrock-
+        // terminal → anchored).
+        g.set_rect(
+            IVec3::new(10, 10, 200),
+            IVec3::new(12, 12, 255),
+            Some(STONE),
+        );
+        assert!(
+            detect_islands(
+                &g,
+                IVec3::new(10, 10, 200),
+                IVec3::new(12, 12, 255),
+                100_000
+            )
+            .is_empty(),
+            "a pillar reaching the bottom is supported"
+        );
+
+        // Dig the base out through the world floor: z 240..=255 gone.
+        g.set_rect(IVec3::new(10, 10, 240), IVec3::new(12, 12, 255), None);
+        let islands = detect_islands(
+            &g,
+            IVec3::new(10, 10, 240),
+            IVec3::new(12, 12, 255),
+            100_000,
+        );
+        assert_eq!(islands.len(), 1, "the hanging top must detach");
+        // The remainder spans z 200..=239 over the 3×3 footprint.
+        assert_eq!(islands[0].voxels.len(), 3 * 3 * 40);
+        let (lo, hi) = islands[0].bbox;
+        assert_eq!((lo, hi), (IVec3::new(10, 10, 200), IVec3::new(12, 12, 239)));
+    }
 
     fn grid() -> Grid {
         Grid::new(GridTransform::identity())

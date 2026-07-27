@@ -424,6 +424,25 @@ pub(crate) fn compilerle(
         'middle: loop {
             // do { write voxel; ... } while (ia || p_z == zend)
             let exit_to_rlendit2 = loop {
+                // CT — split an oversized slab before the next record
+                // write: `nextptr` is a u8 dword count, and since the
+                // air-terminal made the closing slab NON-terminal, a
+                // long fully-exposed stretch (255+ records — e.g. an
+                // insert into an empty-sentinel column with exposed
+                // sides) can now overflow it. The continuation header
+                // is the degenerate-merge shape (`z0 == z1`): every
+                // walker folds it back into the same run, and the
+                // ceiling arithmetic stays exact because the previous
+                // part's records are contiguous from its z1.
+                if n - onext >= 255 * 4 {
+                    cbuf[onext] = 255;
+                    cbuf[onext + 2] = to_u8(p_z - 1);
+                    cbuf[n + 1] = to_u8(p_z);
+                    cbuf[n + 2] = to_u8(ze - 1);
+                    cbuf[n + 3] = to_u8(p_z);
+                    onext = n;
+                    n += 4;
+                }
                 while p_z >= tbuf2[ic].z_end {
                     ic += 1;
                 }
@@ -607,7 +626,10 @@ pub(crate) const SPAN_STRIDE: usize = 256;
 
 /// Maximum bytes a single
 /// column can occupy after re-encoding through [`compilerle`].
-pub(crate) const MAXCSIZ: usize = 1028;
+/// Voxlap's 1028 (257 dwords: 256 records + header) plus CT headroom:
+/// the oversized-slab split and the air-terminal add up to a few
+/// extra 4-byte headers per column.
+pub(crate) const MAXCSIZ: usize = 1088;
 
 /// Sentinel "no row started yet". Encoded as
 /// `0x80000000` = `i32::MIN`.

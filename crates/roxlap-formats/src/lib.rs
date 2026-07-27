@@ -31,6 +31,10 @@ pub mod edit;
 /// roxlap-core) so [`kv6`] model builders can fill per-voxel `dir`
 /// without a circular dependency; roxlap-core re-exports it.
 pub mod equivec;
+/// CT.3 — shared driver for the `edit` fuzz target; also exercised by
+/// the stable-CI seed tests. Not part of the public API surface.
+#[doc(hidden)]
+pub mod fuzz_driver;
 /// Animated-GIF → [`voxel_clip::VoxelClip`] importer for Doom-style
 /// billboard sprites (stage BB). Feature-gated behind `gif`; see
 /// [`gif_import`] + `PORTING-BILLBOARD.md`.

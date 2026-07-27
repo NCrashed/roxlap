@@ -198,6 +198,75 @@ fn digger_shaft_msd_tiny_forces_coarse() {
     ascii_depth(&depth, w, h);
 }
 
+/// CT.7 — emptying a chunk ENTIRELY and refreshing it in place must
+/// leave pure sky: `refresh_chunk` clears the chunk-occupancy bit
+/// (`!colors.is_empty()`) and resets the slot z-extent
+/// (`solid_z_extent → None`), so neither the outer chunk skip nor the
+/// `vox_z` content-box clamp keeps phantom content alive.
+#[test]
+fn carve_all_and_refresh_renders_sky() {
+    let Some((gpu, _lock)) = try_init() else {
+        panic!("no adapter");
+    };
+    let vsid = 32u32;
+    let mut v = slab_chunk(vsid, 100, 140);
+    v.reserve_edit_capacity(256 * 1024);
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], decompress_chunk(&v))],
+    };
+    let mut scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+
+    let (w, h) = (32u32, 32u32);
+    let renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, -10.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let xf = GridWorldTransform::default();
+    let render = |scene: &GpuSceneResident| {
+        renderer.render_depth_with_transforms(
+            &gpu.device,
+            &gpu.queue,
+            scene,
+            &[cam],
+            &[xf],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )
+    };
+
+    let depth = render(&scene);
+    let centre = (h / 2 * w + w / 2) as usize;
+    assert!(
+        depth[centre].is_finite() && depth[centre] < 9000.0,
+        "slab must be visible before the carve, got {}",
+        depth[centre]
+    );
+
+    // Carve EVERYTHING and refresh the same slot in place.
+    vxl_set_rect(&mut v, [0, 0, 0], [31, 31, 255], None);
+    assert!(v.column_is_empty(0), "columns emptied to the sentinel");
+    let outcome = scene.refresh_chunk(&gpu.queue, 0, [0, 0, 0], &decompress_chunk(&v));
+    assert_eq!(outcome, roxlap_gpu::RefreshOutcome::Ok);
+
+    let depth = render(&scene);
+    for (i, d) in depth.iter().enumerate() {
+        assert!(
+            !d.is_finite() || *d >= 9000.0,
+            "pixel {i} still hits phantom content at depth {d} after the \
+             empty refresh"
+        );
+    }
+}
+
 #[test]
 fn digger_shaft_with_deck_clip_sees_floor() {
     // Deck clip like monada's deck_clip while drilling in the shaft:

@@ -135,6 +135,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "log"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -189,14 +195,14 @@ dependencies = [
 
 [[package]]
 name = "roxlap-cavegen"
-version = "0.25.0"
+version = "0.30.1"
 dependencies = [
  "roxlap-formats",
 ]
 
 [[package]]
 name = "roxlap-core"
-version = "0.25.0"
+version = "0.30.1"
 dependencies = [
  "rayon",
  "roxlap-formats",
@@ -204,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "roxlap-formats"
-version = "0.25.0"
+version = "0.30.1"
 dependencies = [
  "miniz_oxide",
 ]
@@ -220,11 +226,12 @@ dependencies = [
 
 [[package]]
 name = "roxlap-scene"
-version = "0.25.0"
+version = "0.30.1"
 dependencies = [
  "bincode",
  "crossbeam-channel",
  "glam",
+ "log",
  "rayon",
  "roxlap-cavegen",
  "roxlap-core",
