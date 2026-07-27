@@ -26,6 +26,16 @@
 pub struct VoxColor(pub u32);
 
 impl VoxColor {
+    /// CT.6 — the renderers' last-resort colour for a SOLID voxel
+    /// whose column carries no usable (non-zero-RGB) colour record —
+    /// e.g. the interior of a legacy placeholder run: dark grey at
+    /// neutral brightness. The CPU DDA hit ladder falls back to this
+    /// instead of stepping THROUGH solid matter (the pre-CT.6
+    /// fall-through bug); the GPU normally inherits the nearest
+    /// textured surface instead and only degenerate no-texture
+    /// columns show this colour (PORTING-CARVE.md CT.6).
+    pub const BEDROCK_FALLBACK: VoxColor = VoxColor(0x8040_4040);
+
     /// A voxel colour at the neutral `0x80` brightness.
     #[must_use]
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {

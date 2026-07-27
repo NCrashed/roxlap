@@ -1374,9 +1374,12 @@ impl<'a> Sampler<'a> {
         (ch, loc)
     }
 
-    /// Hit colour for grid-local mip-cell `c`, or `None` for air / empty
-    /// chunk / uncoloured bedrock. Brick-gated so air inside a populated
-    /// chunk costs only a bit test, not a slab walk.
+    /// Hit colour for grid-local mip-cell `c`, or `None` for air /
+    /// empty chunk / explicit zero-RGB placeholder record. CT.6 —
+    /// solid-but-uncoloured cells HIT (with the run-top / bedrock
+    /// fallback colour) instead of being stepped through; see
+    /// [`GridView::surface_color_mip`]. Brick-gated so air inside a
+    /// populated chunk costs only a bit test, not a slab walk.
     #[allow(clippy::cast_possible_wrap)]
     fn hit(&mut self, c: [i32; 3]) -> Option<u32> {
         #[cfg(test)]

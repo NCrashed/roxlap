@@ -287,6 +287,15 @@ impl<'a> GridView<'a> {
         loop {
             let nextptr = usize::from(slab[v]);
             if nextptr == 0 {
+                // CT.6 — air-terminal slab (`z1c + 1 < z1`, the
+                // empty-column sentinel / its chain-tail form): the
+                // column ends in AIR — the `top` opened above is the
+                // sentinel's own z1, not a real run. NB `z1c == z1-1`
+                // is voxlap's legitimate buried-bottom terminal and
+                // must keep the bedrock run.
+                if i32::from(slab[v + 2]) + 1 < i32::from(slab[v + 1]) {
+                    return None;
+                }
                 // Last run extends to bedrock: [top, maxz).
                 return (zi >= top && zi < maxz).then_some(top);
             }
@@ -325,6 +334,11 @@ impl<'a> GridView<'a> {
         loop {
             let nextptr = usize::from(slab[v]);
             if nextptr == 0 {
+                // CT.6 — air-terminal (see `voxel_run_top_mip`): the
+                // column ends in air, no bottom run to emit.
+                if i32::from(slab[v + 2]) + 1 < i32::from(slab[v + 1]) {
+                    return;
+                }
                 f(top, maxz); // last run extends to bedrock
                 return;
             }
@@ -347,12 +361,19 @@ impl<'a> GridView<'a> {
     }
 
     /// DDA hit colour for voxel `(x, y, z)` at mip `mip`: the display
-    /// colour if the cell is **solid and renderable**, or `None` for
-    /// air or an uncoloured bedrock run (stepped through transparently).
+    /// colour if the cell hits, or `None` for air.
     ///
-    /// Exact colour-list cells return their own colour; interior /
-    /// side-face cells fall back to the colour of their run's top voxel
-    /// (the surface colour "bleeds" down a cliff face).
+    /// CT.6 — the hit VERDICT comes from the solid-run walk, not from
+    /// the colour fetch (pre-CT.6 a solid-but-uncoloured cell returned
+    /// `None` and the marcher stepped THROUGH solid matter — the
+    /// carve-exposed-top fall-through bug). Colour resolves as a
+    /// ladder: the cell's own record → its run-top's record (the
+    /// surface "bleeds" down a cliff face) →
+    /// [`roxlap_formats::VoxColor::BEDROCK_FALLBACK`]. One exception
+    /// keeps GPU parity: a cell whose column carries an EXPLICIT
+    /// zero-RGB record (the untextured placeholder sentinel) still
+    /// reads as air — the GPU decompressor leaves the same cells out
+    /// of its solid bitmap.
     #[must_use]
     pub fn surface_color_mip(
         &self,
@@ -362,8 +383,19 @@ impl<'a> GridView<'a> {
         mip: u32,
     ) -> Option<roxlap_formats::VoxColor> {
         let top = self.voxel_run_top_mip(x, y, z, mip)?;
-        self.voxel_color_mip(x, y, z, mip)
-            .or_else(|| self.voxel_color_mip(x, y, u32::try_from(top).ok()?, mip))
+        match self.voxel_color_raw_mip(x, y, z, mip) {
+            Some(c) if c.0 & 0x00ff_ffff != 0 => Some(c),
+            // Explicit zero-RGB record = untextured-air sentinel
+            // (GPU `decompress_column` parity).
+            Some(_) => None,
+            None => Some(
+                u32::try_from(top)
+                    .ok()
+                    .and_then(|t| self.voxel_color_raw_mip(x, y, t, mip))
+                    .filter(|c| c.0 & 0x00ff_ffff != 0)
+                    .unwrap_or(roxlap_formats::VoxColor::BEDROCK_FALLBACK),
+            ),
+        }
     }
 
     /// Surface colour of voxel `(x, y, z)` at mip 0. See
@@ -390,6 +422,25 @@ impl<'a> GridView<'a> {
         z: u32,
         mip: u32,
     ) -> Option<roxlap_formats::VoxColor> {
+        // Zero RGB = empty-chunk placeholder → untextured.
+        self.voxel_color_raw_mip(x, y, z, mip)
+            .filter(|c| c.0 & 0x00ff_ffff != 0)
+    }
+
+    /// CT.6 — like [`Self::voxel_color_mip`] but WITHOUT the zero-RGB
+    /// filter: `Some` for any explicit colour record (including the
+    /// untextured `0` sentinel), `None` only when the cell has no
+    /// record at all. The distinction drives the hit ladder in
+    /// [`Self::surface_color_mip`]: an explicit `0` is placeholder
+    /// air, an absent record is solid interior.
+    #[must_use]
+    pub fn voxel_color_raw_mip(
+        &self,
+        x: u32,
+        y: u32,
+        z: u32,
+        mip: u32,
+    ) -> Option<roxlap_formats::VoxColor> {
         let maxz = (CHUNK_SIZE_Z >> mip) as i32;
         if i64::from(z) >= i64::from(maxz) {
             return None;
@@ -399,8 +450,7 @@ impl<'a> GridView<'a> {
         let zi = z as i32;
         let texel = |b: &[u8]| -> Option<roxlap_formats::VoxColor> {
             let rgb = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-            // Zero RGB = empty-chunk placeholder → untextured.
-            (rgb & 0x00ff_ffff != 0).then_some(roxlap_formats::VoxColor(rgb))
+            Some(roxlap_formats::VoxColor(rgb))
         };
         let mut v = 0usize;
         loop {

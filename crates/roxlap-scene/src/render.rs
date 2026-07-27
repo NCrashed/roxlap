@@ -4116,11 +4116,13 @@ mod tests {
     /// (voxlap `delslab` clamps z1 to MAXZDIM-1), so if the renderer
     /// draws it, the centre depth reads ~284 (ghost) instead of ~444
     /// (shaft floor at grid z 9, world 144; camera z -300).
+    /// GREEN since CT.6 (docs/porting/PORTING-CARVE.md): CT.1 removed
+    /// the uncarvable z=255 bedrock layer (would read ≈284), CT.6
+    /// decoupled the CPU hit verdict from the colour fetch and taught
+    /// the grid-view walkers the air-terminal (pre-CT.6 the marcher
+    /// fell through the carve-exposed untextured top to ≈540). Kept as
+    /// the CPU regression gate for the digger root cause.
     #[test]
-    #[ignore = "KNOWN RED until CT.6: the CPU marcher falls through the carve-exposed \
-                untextured top (hits the textured floor at depth 540 instead of solid z 9 \
-                at 444) — the hit verdict is coupled to the colour fetch. The OTHER half \
-                (the uncarvable z=255 bedrock layer) is FIXED since CT.1. Run with --ignored."]
     fn digger_bedrock_boundary_layer_cpu_probe() {
         let orange = 0x80_ff_80_00;
         let mut scene = Scene::new();

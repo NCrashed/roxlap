@@ -133,13 +133,23 @@ fn partial_matches_full_and_refuses_reflow() {
     assert_eq!(a[1], b[1], "color_offsets diverge");
     assert_eq!(a[2], b[2], "colors diverge");
 
-    // Count-changing carve (removes voxels) must be refused untouched.
+    // Count-changing carve must be refused untouched. CT.6 made a
+    // same-height carve count-STABLE (the exposed top inherits the
+    // removed voxel's colour — one record moves, none vanish), so the
+    // count-changing case is a carve through the whole column: the
+    // empty sentinel has zero records (1 → 0).
+    //
+    // NB `remip_bbox` above rebuilt the vbuf EXACT-FIT (the compaction
+    // drops all edit headroom — a pre-CT footgun this carve surfaced:
+    // its neighbour re-encodes carry a fully-exposed side face, ~630 B
+    // per column). Top the pool back up before editing again.
+    vxl.reserve_edit_capacity(16 * 1024);
     let before = snapshot(&gpu, &part_res);
     let carve = [Vspan {
         x: 10,
         y: 10,
-        z0: 100,
-        z1: 100,
+        z0: 0,
+        z1: 255,
     }];
     set_spans(&mut vxl, &carve, None);
     vxl.remip_bbox(10, 10, 10, 10, 6);

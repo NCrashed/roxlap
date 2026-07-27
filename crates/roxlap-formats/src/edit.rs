@@ -320,6 +320,33 @@ fn build_color_table(slab: &[u8]) -> Vec<ColorRange<'_>> {
     ranges
 }
 
+/// CT.6 — nearest non-zero colour record to `z` in the ORIGINAL
+/// column's colour table (floor + ceiling lists, z-ascending). Drives
+/// the carve default: a newly-exposed voxel inherits the closest
+/// original material colour instead of the untextured-black `0` (which
+/// both marchers read as a hole — the CPU fall-through bug). `None`
+/// when the column has no usable record at all (e.g. the bedrock
+/// placeholder) — the caller keeps the sentinel `0` then.
+fn nearest_original_color(tbuf2: &[ColorRange<'_>], z: i32) -> Option<i32> {
+    let mut best: Option<(i32, i32)> = None;
+    for r in tbuf2 {
+        let n = usize::try_from((r.z_end - r.z_start).max(0)).expect("range len >= 0");
+        for i in 0..n {
+            let b = &r.colors[i * 4..i * 4 + 4];
+            let c = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if c & 0x00ff_ffff == 0 {
+                continue;
+            }
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            let d = (r.z_start + i as i32 - z).abs();
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, c));
+            }
+        }
+    }
+    best.map(|(_, c)| c)
+}
+
 /// Re-encode a column's `spans` z-range buffer to slab bytes.
 ///
 /// Encode a column's span list back to `.vxl` slab bytes. Walks `n0` (this column's
@@ -406,7 +433,18 @@ pub(crate) fn compilerle(
                     let bytes = &tbuf2[ic].colors[off..off + 4];
                     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
                 } else {
-                    colfunc(px, py, p_z)
+                    // CT.6 — colour 0 from the colfunc = "engine
+                    // picks" (the plain-carve default): inherit the
+                    // nearest original record so carve-exposed
+                    // surfaces keep the material look instead of
+                    // going untextured-black. A column with no usable
+                    // record (bedrock placeholder) keeps the 0.
+                    let c = colfunc(px, py, p_z);
+                    if c & 0x00ff_ffff == 0 {
+                        nearest_original_color(&tbuf2, p_z).unwrap_or(c)
+                    } else {
+                        c
+                    }
                 };
                 cbuf[n..n + 4].copy_from_slice(&color.to_le_bytes());
                 n += 4;
@@ -1073,7 +1111,9 @@ where
 /// colour. Convenience wrapper over [`set_spans_with_colfunc`] for
 /// the common cases:
 ///
-/// - `color = None` → carve. Newly-exposed voxels get colour 0.
+/// - `color = None` → carve. Newly-exposed voxels inherit the nearest
+///   original colour record of their column (CT.6); a column with no
+///   usable record keeps the untextured sentinel `0`.
 /// - `color = Some(c)` → insert. Inserted voxels get colour `c`.
 ///
 /// For non-constant colours (jitter, texture-mapped, position-

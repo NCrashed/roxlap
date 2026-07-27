@@ -403,6 +403,11 @@ pub(crate) fn decompress_column(
 /// column's z-extent at this mip — matches the voxlap "implicit
 /// bedrock below" assumption, halved per mip level).
 fn expand_solid_runs(slab: &[u8], cz: u32) -> Vec<(i32, i32)> {
+    // CT.6 — the empty-column sentinel (`z1c + 1 < z1` terminal as the
+    // ONLY slab): no runs at all (mirrors `expandrle`).
+    if roxlap_formats::vxl::slab_is_empty_column(slab) {
+        return Vec::new();
+    }
     // Worst case = MAXZDIM/2 alternating solid/air runs (mip-0 bound;
     // coarser mips use fewer entries).
     let mut uind = [0i32; (CHUNK_Z as usize) + 2];
@@ -411,6 +416,20 @@ fn expand_solid_runs(slab: &[u8], cz: u32) -> Vec<(i32, i32)> {
     let mut v = 0usize;
     while slab[v] != 0 {
         v += usize::from(slab[v]) * 4;
+        // CT.6 — air-terminal chain tail (`z1c + 1 < z1`): the column
+        // ends in AIR below the previous run — close it at `z0` and
+        // emit no bottom run. NB `z1c == z1 - 1` is voxlap's
+        // legitimate buried-bottom terminal (solid to bedrock) and
+        // falls through to the degenerate-merge `continue`.
+        if slab[v] == 0 && i32::from(slab[v + 2]) + 1 < i32::from(slab[v + 1]) {
+            uind[i - 1] = i32::from(slab[v + 3]);
+            let n_runs = i / 2;
+            let mut runs = Vec::with_capacity(n_runs);
+            for k in 0..n_runs {
+                runs.push((uind[2 * k], uind[2 * k + 1]));
+            }
+            return runs;
+        }
         if slab[v + 3] >= slab[v + 1] {
             continue;
         }

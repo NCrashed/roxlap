@@ -168,10 +168,10 @@ impl Grid {
     ///
     /// Use this (with [`SpanOp::Carve`]) to control the colour of the
     /// interior surface a carve newly exposes: a plain `set_sphere`
-    /// carve paints those walls colour `0` (black), whereas this lets
-    /// the closure return a crater colour, a depth gradient, jitter,
-    /// or a texture lookup. With [`SpanOp::Insert`] the closure colours
-    /// the inserted voxels.
+    /// carve inherits the nearest original colour of the column
+    /// (CT.6), whereas this lets the closure return a crater colour, a
+    /// depth gradient, jitter, or a texture lookup. With
+    /// [`SpanOp::Insert`] the closure colours the inserted voxels.
     ///
     /// `colfunc(x, y, z)` receives **grid-local** voxel coordinates
     /// (not chunk-local) and returns a voxlap-packed BGRA colour as
@@ -701,8 +701,9 @@ mod tests {
 
     /// Carving a sphere with a colfunc paints the newly-exposed
     /// interior walls with the closure's colour, whereas a plain
-    /// `set_sphere(None)` carve leaves them colour 0 (read back as
-    /// `None` / untextured by `voxel_color`).
+    /// `set_sphere(None)` carve inherits the nearest original colour
+    /// of the column (CT.6 — pre-CT.6 it left them colour 0, which
+    /// the CPU marcher then stepped through as a hole).
     #[test]
     fn set_sphere_with_colfunc_paints_exposed_interior() {
         const CRATER: VoxColor = VoxColor(0x00_44_55_66);
@@ -726,8 +727,8 @@ mod tests {
         assert!(g.voxel_solid(IVec3::new(64, 64, 55)));
         assert_eq!(g.voxel_color(IVec3::new(64, 64, 55)), Some(CRATER));
 
-        // Contrast: a plain None-carve exposes the same voxel as
-        // solid-but-black (voxel_color → None).
+        // Contrast: a plain None-carve INHERITS the nearest original
+        // colour (CT.6) — the exposed voxel keeps the material look.
         let mut g2 = Grid::new(GridTransform::identity());
         g2.set_rect(
             IVec3::new(40, 40, 40),
@@ -736,7 +737,7 @@ mod tests {
         );
         g2.set_sphere(IVec3::new(64, 64, 64), 8, None);
         assert!(g2.voxel_solid(IVec3::new(64, 64, 55)));
-        assert_eq!(g2.voxel_color(IVec3::new(64, 64, 55)), None);
+        assert_eq!(g2.voxel_color(IVec3::new(64, 64, 55)), Some(TEST_COL));
     }
 
     /// The colfunc must receive **grid-local** coordinates, not the

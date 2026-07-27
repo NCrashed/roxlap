@@ -28,7 +28,9 @@ use roxlap_gpu::{
 static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn try_init() -> Option<(HeadlessGpu, std::sync::MutexGuard<'static, ()>)> {
-    let guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match HeadlessGpu::new_blocking(GpuRendererSettings::default()) {
         Ok(gpu) => Some((gpu, guard)),
         Err(GpuInitError::NoAdapter) => {

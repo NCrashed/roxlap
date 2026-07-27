@@ -53,7 +53,48 @@ This is the **entry doc** for the carve-through-floor stage — tag **CT**.
     only (hit/colour coupling; the bedrock-layer half is gone).
   - Suites: formats 222 / core 143 / scene 304 / gpu headless / render
     / audio all green; clippy + doc clean.
-- CT.2..CT.9 — not started.
+- **CT.6 — LANDED 2026-07-27** (out of order, as planned — it was
+  independent). CPU hit/colour decouple + carve retexture:
+  - `VoxColor::BEDROCK_FALLBACK` (`0x8040_4040`, roxlap-formats) —
+    the shared last-resort colour for solid-but-recordless cells.
+  - Carve retexture: `compilerle`'s colfunc branch inherits the
+    nearest non-zero original record when the colfunc returns `0`
+    ("engine picks" — the plain-carve default); a column with no
+    usable record (bedrock placeholder) keeps the `0` sentinel.
+    `nearest_original_color` walks the colour table (floor+ceiling).
+  - `GridView::surface_color_mip` reworked: hit verdict from
+    `voxel_run_top_mip`, colour ladder own-record → run-top →
+    `BEDROCK_FALLBACK`; an EXPLICIT zero-RGB record still reads as
+    air (GPU parity). New `voxel_color_raw_mip` (records incl. zero;
+    `None` = no record) underneath.
+  - **Pulled in CT.4's grid-view half**: `voxel_run_top_mip` /
+    `for_each_run_mip` learned the air-terminal (`z1c + 1 < z1`
+    terminal → no bottom run) — without it the decoupled hit verdict
+    HIT the phantom `[255,256)` run the walkers still emitted for
+    sentinel columns (pre-CT.6 the colour coupling coincidentally hid
+    it). CT.4's remainder: `getcube`, `SolidSampler`, lighting,
+    scene's `vxl_voxel_solid` / islands / collide (CT.5).
+  - GPU mirror: `expand_solid_runs` learned both sentinel forms (the
+    chain-tail case previously left a phantom solid at z=255 — caught
+    by the new parity gate at exactly one voxel).
+  - NEW gate `roxlap-render/tests/carve_parity.rs`: per-voxel CPU
+    verdict (`surface_color_mip`) vs GPU `solid_occupancy` +
+    textured-colour parity over fill/pocket/bottom-carve/empty/
+    placeholder shapes. Pure CPU (no device) — runs everywhere.
+  - The CPU digger probe is GREEN and un-`#[ignore]`d (depth 444) —
+    both halves of the digger bug are now fixed on both backends.
+  - Test fallout, both semantic inversions: scene's
+    `set_sphere_with_colfunc_paints_exposed_interior` contrast half
+    (plain carve now inherits, not black); gpu `partial_refresh`
+    count-change case rebuilt around a full-column carve (a
+    same-height carve is count-STABLE under inherit).
+  - **Observation (pre-existing footgun, not CT)**: `remip_bbox`
+    compacts the vbuf EXACT-FIT and drops all edit headroom — the
+    partial-refresh test tops the pool back up after remip; flag for
+    a QE follow-up (reserve or document).
+  - Suites: formats 222 / core 143 / scene 305 / gpu (all 6 targets)
+    / render (incl. new parity) / audio green; clippy 0 / doc clean.
+- CT.2..CT.5, CT.7..CT.9 — not started (CT.4 shrunk, see above).
 
 ## Why
 
