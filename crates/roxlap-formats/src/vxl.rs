@@ -36,19 +36,27 @@
 //!
 //! ## The empty-column sentinel (CT — carve-through-floor)
 //!
-//! Voxlap itself cannot express a column with NO solid voxels: every
-//! walker seeds the terminal run as `[z1, 256)` and `delslab` clamps
-//! carves to `z <= 254`, so chunk-local z = 255 was historically
-//! uncarvable (the "bedrock floor"). roxlap extends the format with a
-//! canonical **empty-column sentinel**: a column whose only slab is
-//! terminal with an *empty* floor-colour list —
-//! [`EMPTY_COLUMN_SLAB`]` = [nextptr=0, z1=255, z1c=254, z0=0]`
-//! (`n_floor = z1c − z1 + 1 = 0`; 4 bytes total). Read predicate:
-//! [`slab_is_empty_column`] (`nextptr == 0 && z1c < z1`). `parse`,
-//! [`slng`] and [`serialize`] already handle the `n_floor = 0`
-//! terminal slab; no voxlap-era writer ever emits one, so the
-//! reinterpretation is safe. An empty column means **air over the
-//! whole `z ∈ [0, 256)`** — no implicit bedrock.
+//! Voxlap itself cannot express a column with NO solid voxels (or air
+//! below its last run): every walker seeds the terminal run as
+//! `[z1, 256)` and `delslab` clamps carves to `z <= 254`, so
+//! chunk-local z = 255 was historically uncarvable (the "bedrock
+//! floor"). roxlap extends the format with an **air-terminal slab**:
+//! a terminal slab with an OVER-empty floor-colour list —
+//! `z1c ≤ z1 − 2` (`n_floor = max(0, z1c − z1 + 1) = 0`). As a
+//! column's only slab it is the **empty-column sentinel**
+//! ([`EMPTY_COLUMN_SLAB`]` = [nextptr=0, z1=255, z1c=253, z0=0]`,
+//! 4 bytes, predicate [`slab_is_empty_column`]) — air over the whole
+//! `z ∈ [0, 256)`, no implicit bedrock. As a chain TAIL (after real
+//! slabs, `z0` closing the ceiling list) it means "air below the
+//! last run".
+//!
+//! `z1c = z1 − 1` (EXACTLY empty) is NOT the sentinel: voxlap's
+//! `compilerle` legitimately emits that terminal for a buried column
+//! bottom (solid to bedrock, zero textured records) and walkers merge
+//! it into the previous run. `z1c ≤ z1 − 2` is unreachable by any
+//! voxlap-era writer (floor lists close at exactly `p_z − 1`), so the
+//! reinterpretation is safe; `parse`, [`slng`] and [`serialize`]
+//! already handle `n_floor = 0` terminals.
 //!
 //! This module preserves column slab bytes verbatim in [`Vxl::data`] and
 //! exposes a per-column byte-offset table in [`Vxl::column_offset`].
@@ -228,7 +236,13 @@ impl Vxl {
                     x,
                     y,
                     z0: 0,
-                    z1: (MAXZDIM - 1) as u8, // inclusive → carve all of [0, 256)
+                    // TODO(CT.2): carve z1=255 (the full [0, 256)) so the
+                    // columns become the empty sentinel. Pinned to
+                    // [0, 255) for now — CT.1 de-clamped `delslab`, and
+                    // carving through the bottom here would retire the
+                    // z=255 bedrock placeholder ahead of the CT.2
+                    // walker/test sweep (docs/porting/PORTING-CARVE.md).
+                    z1: (MAXZDIM - 2) as u8, // inclusive → carve [0, 255)
                 });
             }
         }
@@ -793,23 +807,35 @@ pub fn slng(slab: &[u8]) -> usize {
     i + n_floor * 4 + 4
 }
 
-/// CT.0 — canonical slab bytes of a column with **no solid voxels**:
-/// a single terminal slab whose floor-colour list is empty
-/// (`n_floor = z1c − z1 + 1 = 0`). See the module doc's
-/// "empty-column sentinel" section. Writers emit exactly these bytes;
-/// readers must accept any slab matching [`slab_is_empty_column`].
-pub const EMPTY_COLUMN_SLAB: [u8; 4] = [0, 255, 254, 0];
+/// CT.0/CT.1 — canonical slab bytes of a column with **no solid
+/// voxels**: a single terminal slab with an OVER-empty floor-colour
+/// list (`z1c = z1 − 2`, `n_floor = max(0, z1c − z1 + 1) = 0`). See
+/// the module doc's "empty-column sentinel" section.
+///
+/// Why `z1c = z1 − 2` and not `z1 − 1`: voxlap's own `compilerle`
+/// routinely emits a terminal slab with `z1c = z1 − 1` (an EXACTLY
+/// empty floor list) for a column whose bottom region is buried —
+/// the `dacnt` sub-slab opened as `[p_z, p_z − 1, p_z]` becomes the
+/// terminal when the walk exits at the world bottom, and walkers
+/// merge it into the previous run as "solid to bedrock". The air
+/// sentinel must therefore be a shape no legitimate writer produces:
+/// `z1c ≤ z1 − 2` is that shape (`compilerle` closes floor lists at
+/// exactly `p_z − 1`, never lower).
+pub const EMPTY_COLUMN_SLAB: [u8; 4] = [0, 255, 253, 0];
 
-/// CT.0 — is `slab` (a column's slab chain, as returned by
+/// CT.0/CT.1 — is `slab` (a column's slab chain, as returned by
 /// [`Vxl::column_data`]) the empty-column sentinel? True when the
-/// FIRST slab is terminal (`nextptr == 0`) with an empty floor-colour
-/// list (`z1c < z1`) — the only degenerate a writer can emit, since a
-/// real solid run always carries ≥ 1 floor colour. An empty column is
-/// air over all of `z ∈ [0, 256)`: walkers must emit **no** runs for
-/// it (there is no implicit bedrock).
+/// FIRST slab is terminal (`nextptr == 0`) with an over-empty
+/// floor-colour list (`z1c + 1 < z1` — see [`EMPTY_COLUMN_SLAB`] for
+/// why `z1c == z1 − 1` does NOT qualify: that is voxlap's legitimate
+/// buried-bottom terminal). An empty column is air over all of
+/// `z ∈ [0, 256)`: walkers must emit **no** runs for it (there is no
+/// implicit bedrock). The same over-empty shape as a chain TAIL
+/// (`nextptr == 0` mid-file after real slabs) means "air below the
+/// last run" — the [`crate::edit::expandrle`] side of CT.1.
 #[must_use]
 pub fn slab_is_empty_column(slab: &[u8]) -> bool {
-    slab.len() >= 4 && slab[0] == 0 && slab[2] < slab[1]
+    slab.len() >= 4 && slab[0] == 0 && i32::from(slab[2]) + 1 < i32::from(slab[1])
 }
 
 /// `p2m[k]` — bitmask with the low `k` bits set (`(1 << k) - 1`).
@@ -2147,6 +2173,12 @@ mod tests {
         // The historical z=255 bedrock placeholder is NOT empty — it is
         // exactly the solid voxel CT exists to remove.
         assert!(!slab_is_empty_column(&[0, 255, 255, 0, 0, 0, 0, 0x80]));
+        // Voxlap's buried-bottom terminal (`z1c == z1 - 1`, an EXACTLY
+        // empty floor list — solid to bedrock, zero textured records)
+        // is NOT the sentinel: `compilerle` emits it routinely when a
+        // column's bottom region is fully buried.
+        assert!(!slab_is_empty_column(&[0, 100, 99, 100]));
+        assert!(!slab_is_empty_column(&[0, 255, 254, 255]));
     }
 
     /// CT.0 — a sentinel column reads as air everywhere, survives the
@@ -2172,12 +2204,10 @@ mod tests {
         assert!(!back.column_is_empty(1));
     }
 
-    /// CT.1 target — carving a column's full height must leave the
-    /// empty sentinel, not the uncarvable z=255 floor voxel
-    /// (`delslab` clamp, docs/porting/PORTING-CARVE.md).
+    /// CT.1 — carving a column's full height leaves the empty
+    /// sentinel, not the historically-uncarvable z=255 floor voxel
+    /// (docs/porting/PORTING-CARVE.md).
     #[test]
-    #[ignore = "KNOWN RED until CT.1: delslab clamps carves to z<=254, so the \
-                column keeps a solid voxel at z=255 instead of going empty"]
     fn carve_full_height_empties_column() {
         use crate::edit::set_rect;
         let mut vxl = Vxl::empty(4);
@@ -2195,6 +2225,80 @@ mod tests {
             "full-height carve must produce the empty sentinel"
         );
         assert_eq!(vxl.voxel_color(1, 1, 255), None);
+    }
+
+    /// CT.1 — a bottom-reaching carve that leaves survivors above
+    /// encodes the AIR-TERMINAL chain tail: the surviving run keeps
+    /// its colours, everything below it (including z=255) reads as
+    /// air, and the shape round-trips through expandrle and the
+    /// on-disk format. Re-inserting below restores solidity.
+    #[test]
+    fn carve_to_bottom_leaves_air_below_survivor() {
+        use crate::edit::{expandrle, set_rect, MAXZDIM};
+        let mut vxl = Vxl::empty(4);
+        let c = VoxColor(0x80aa_bb00);
+        set_rect(&mut vxl, [2, 2, 10], [2, 2, 255], Some(c));
+        // Carve from 40 through the bottom: survivor [10, 40).
+        set_rect(&mut vxl, [2, 2, 40], [2, 2, 255], None);
+
+        let idx = (2 * vxl.vsid + 2) as usize;
+        assert!(!vxl.column_is_empty(idx), "survivor run remains");
+        let column = vxl.column_data(idx);
+        assert!(
+            slab_is_empty_column(&column[column.len() - 4..]),
+            "chain tail is the air-terminal: {column:?}"
+        );
+        let mut spans = vec![0i32; 64];
+        expandrle(column, &mut spans);
+        assert_eq!(&spans[0..4], &[10, 40, MAXZDIM, MAXZDIM]);
+        assert_eq!(vxl.voxel_color(2, 2, 10), Some(c), "survivor top kept");
+        for z in [40, 100, 254, 255] {
+            assert_eq!(vxl.voxel_color(2, 2, z), None, "air below at z={z}");
+        }
+
+        // On-disk round-trip preserves the shape byte-equally.
+        let bytes = serialize(&vxl);
+        let back = parse(&bytes).expect("parse air-terminal world");
+        assert_eq!(serialize(&back), bytes);
+
+        // Re-insert into the carved region: solidity comes back.
+        set_rect(&mut vxl, [2, 2, 200], [2, 2, 220], Some(c));
+        let mut spans = vec![0i32; 64];
+        expandrle(vxl.column_data(idx), &mut spans);
+        assert_eq!(&spans[0..6], &[10, 40, 200, 221, MAXZDIM, MAXZDIM]);
+    }
+
+    /// CT.1 — `generate_mips` must not panic on a world containing
+    /// carved-empty (sentinel) columns: the GPU upload path re-mips
+    /// carved chunks on every refresh, so sentinels reach the
+    /// downsampler as soon as any full-height carve lands. Full mip
+    /// CORRECTNESS for empty columns is CT.3 — this pins no-panic and
+    /// an untouched mip-0.
+    #[test]
+    fn generate_mips_survives_sentinel_columns() {
+        use crate::edit::set_rect;
+        let mut vxl = Vxl::empty(4);
+        set_rect(
+            &mut vxl,
+            [0, 0, 200],
+            [3, 3, 255],
+            Some(VoxColor(0x80aa_bb00)),
+        );
+        set_rect(&mut vxl, [1, 1, 0], [1, 1, 255], None);
+        // A partial bottom-carve too: survivor + air-terminal tail.
+        set_rect(&mut vxl, [2, 2, 220], [2, 2, 255], None);
+        let (x, y) = (1u32, 1u32);
+        let idx = (y * vxl.vsid + x) as usize;
+        assert!(vxl.column_is_empty(idx), "carve emptied the column");
+        vxl.generate_mips(3);
+        assert!(vxl.mip_count() >= 2, "mips built");
+        assert!(vxl.column_is_empty(idx), "mip-0 sentinel untouched");
+        assert_eq!(vxl.voxel_color(1, 1, 255), None);
+        assert_eq!(
+            vxl.voxel_color(0, 0, 200),
+            Some(VoxColor(0x80aa_bb00)),
+            "neighbour column keeps its surface at mip-0"
+        );
     }
 
     /// CT.2 target — `Vxl::empty` columns become the sentinel instead

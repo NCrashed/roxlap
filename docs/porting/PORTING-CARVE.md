@@ -15,7 +15,45 @@ This is the **entry doc** for the carve-through-floor stage — tag **CT**.
   `vxl_empty_columns_are_sentinel_empty` (CT.2) are in-tree KNOWN-RED
   `#[ignore]`, verified failing for the right reasons. formats suite
   217 green / clippy / doc clean.
-- CT.1..CT.9 — not started.
+- **CT.1 — LANDED 2026-07-27.** Edit ops carve through the floor:
+  - `delslab` de-clamped: `y1 == MAXZDIM` carves through the bottom —
+    the consumed run becomes the PURE TERMINATOR `[MAXZDIM, MAXZDIM]`
+    (zero-length run, the spans image of the sentinel), a truncated
+    survivor gets the terminator appended (growth still ≤ 1 pair).
+  - **Encoding correction vs the CT.0 plan**: voxlap's `compilerle`
+    legitimately emits a terminal slab with an EXACTLY-empty floor
+    list (`z1c = z1 − 1`) for a buried column bottom (the `dacnt`
+    sub-slab + `p_z == MAXZDIM−1` exit) — walkers merge it into the
+    previous run as solid-to-bedrock. The air sentinel is therefore
+    the OVER-empty form **`z1c ≤ z1 − 2`**:
+    `EMPTY_COLUMN_SLAB = [0, 255, 253, 0]`, and the same shape as a
+    chain tail (`[0, 255, 253, z0]`) means "air below the last run".
+    Discovered by `scum2_batch_edits_multiple_columns_same_row` going
+    red on legitimate buried-bottom re-encodes.
+  - `expandrle` decodes both sentinel forms to the pure terminator;
+    `compilerle` emits them (empty-column guard + air-terminal at the
+    rlendit2 boundary); `insslab` works against the pure terminator
+    unchanged (verified by trace + tests).
+  - Placeholder pins for CT.2: `Vxl::seeded_air` AND roxlap-scene's
+    own `empty_chunk_vxl` (chunks.rs — found carving `z1 = 255` and
+    silently seeding sentinel chunks) carve `[0, 255)` with
+    TODO(CT.2) notes, keeping the bedrock placeholder until the
+    walker/test sweep.
+  - Tests: old clamp pins inverted (`delslab_y1_reaches_world_bottom`,
+    `set_rect_carves_through_world_bottom`); new: insslab-into-empty,
+    expandrle sentinel, full-height carve → sentinel, bottom carve
+    with survivor (bytes + round-trip + re-insert), buried-bottom NOT
+    sentinel shape pins, `generate_mips` no-panic on sentinel columns
+    (the GPU upload path re-mips carved chunks every refresh — mip
+    OUTPUT correctness stays CT.3).
+  - **The GPU half of the digger bug is already fixed**: the sentinel
+    decompresses to air (`have_surface` gate), so all four
+    `digger_repro.rs` tests are GREEN and un-`#[ignore]`d — now
+    regression gates. The CPU probe stays KNOWN-RED for its CT.6 half
+    only (hit/colour coupling; the bedrock-layer half is gone).
+  - Suites: formats 222 / core 143 / scene 304 / gpu headless / render
+    / audio all green; clippy + doc clean.
+- CT.2..CT.9 — not started.
 
 ## Why
 

@@ -160,10 +160,11 @@ fn ascii_depth(depth: &[f32], w: u32, h: u32) {
 }
 
 #[test]
-#[ignore = "KNOWN RED: uncarvable local-z-255 bedrock layer at chz boundaries \
-            (docs/handover-stale-mips-volume-edits.md, root cause section). \
-            Run with --ignored to reproduce; must pass once carve-through-floor lands."]
 fn digger_shaft_msd_8192_sees_floor() {
+    // GREEN since CT.1 (docs/porting/PORTING-CARVE.md): the bottom-
+    // reaching carve now empties the column (empty sentinel) and the
+    // GPU decompressor reads it as air — the z=255 ghost layer is
+    // gone. Kept as the regression gate for the digger root cause.
     let (d, depth, w, h) = render_depth_at(8192.0, None);
     eprintln!("=== msd=8192, no z_clip: centre depth {d} (expect ≈444) ===");
     ascii_depth(&depth, w, h);
@@ -175,9 +176,9 @@ fn digger_shaft_msd_8192_sees_floor() {
 }
 
 #[test]
-#[ignore = "KNOWN RED: same uncarvable z=255 layer as digger_shaft_msd_8192_sees_floor \
-            (proves the ghost is threshold-independent — 64 and 8192 fail identically)."]
 fn digger_shaft_msd_default64_sees_floor() {
+    // GREEN since CT.1 — see digger_shaft_msd_8192_sees_floor; this
+    // variant pins that the fix is mip-threshold-independent.
     let (d, depth, w, h) = render_depth_at(64.0, None);
     eprintln!("=== msd=64 (RenderOptions default): centre depth {d} ===");
     ascii_depth(&depth, w, h);

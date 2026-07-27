@@ -13,6 +13,14 @@
 //! sentinel pair whose `bot` is `>= MAXZDIM`; air gaps live between
 //! adjacent runs (`bot_k..top_{k+1}`).
 //!
+//! CT.1 — the sentinel pair doubles as the column's LAST solid run
+//! (`[top_s, 256)`) **when `top_s < MAXZDIM`**. A `top_s == MAXZDIM`
+//! pair is the PURE TERMINATOR: a zero-length run meaning the column
+//! has no solid below the previous runs — the spans image of the
+//! empty-column sentinel ([`crate::vxl::EMPTY_COLUMN_SLAB`]). A
+//! bottom-reaching [`delslab`] produces it; [`insslab`] inserts in
+//! front of it unchanged.
+//!
 //! The buffer is owned by the caller; the helpers run in place and
 //! assume it was sized with enough tail capacity for the worst-case
 //! growth (one extra run pair per [`delslab`] split; [`insslab`] only
@@ -28,15 +36,23 @@ pub const MAXZDIM: i32 = 256;
 /// mutated in place.
 ///
 /// - `y0 >= y1` is a no-op.
-/// - `y1 >= MAXZDIM` is clamped to `MAXZDIM - 1`.
+/// - `y1 > MAXZDIM` is clamped to `MAXZDIM`.
 /// - an empty `spans` returns early.
 ///
-/// In the worst case the carve splits one solid run in two, growing
+/// CT.1 — `y1 == MAXZDIM` carves **through the world bottom**
+/// (voxlap clamped it to `MAXZDIM - 1`, which made chunk-local z=255
+/// uncarvable — the digger "invisible walls" root cause). A carve
+/// that consumes every run leaves the pure terminator
+/// `[MAXZDIM, MAXZDIM]` — the spans image of the empty-column
+/// sentinel ([`crate::vxl::EMPTY_COLUMN_SLAB`]).
+///
+/// In the worst case the carve splits one solid run in two (or
+/// truncates the last run and appends the pure terminator), growing
 /// the list by one pair; the caller must have sized `spans` to absorb
 /// it. Does not allocate.
 pub fn delslab(spans: &mut [i32], y0: i32, mut y1: i32) {
-    if y1 >= MAXZDIM {
-        y1 = MAXZDIM - 1;
+    if y1 > MAXZDIM {
+        y1 = MAXZDIM;
     }
     if y0 >= y1 || spans.is_empty() {
         return;
@@ -44,6 +60,21 @@ pub fn delslab(spans: &mut [i32], y0: i32, mut y1: i32) {
     let mut z = 0usize;
     while y0 >= spans[z + 1] {
         z += 2;
+    }
+    // CT.1 — bottom-reaching carve: every run from y0 down goes. Run z
+    // either survives truncated to `[top, y0)` followed by a fresh
+    // pure terminator, or is consumed and becomes the terminator
+    // itself. (The historical clamp made this branch unreachable.)
+    if y1 >= MAXZDIM {
+        if y0 > spans[z] {
+            spans[z + 1] = y0;
+            spans[z + 2] = MAXZDIM;
+            spans[z + 3] = MAXZDIM;
+        } else {
+            spans[z] = MAXZDIM;
+            spans[z + 1] = MAXZDIM;
+        }
+        return;
     }
     if y0 > spans[z] {
         if y1 < spans[z + 1] {
@@ -186,11 +217,32 @@ pub fn insslab(spans: &mut [i32], y0: i32, y1: i32) {
 /// slab); it merges implicitly into the previous solid run by
 /// skipping the slab in `uind`.
 pub fn expandrle(slab: &[u8], uind: &mut [i32]) {
+    // CT.1 — the empty-column sentinel decodes to the PURE TERMINATOR
+    // (zero-length run `[MAXZDIM, MAXZDIM)`): no solid runs, no
+    // implicit bedrock.
+    if crate::vxl::slab_is_empty_column(slab) {
+        uind[0] = MAXZDIM;
+        uind[1] = MAXZDIM;
+        return;
+    }
     uind[0] = i32::from(slab[1]);
     let mut i = 2usize;
     let mut v = 0usize;
     while slab[v] != 0 {
         v += usize::from(slab[v]) * 4;
+        // CT.1 — air-terminal slab (`z1c + 1 < z1`, the chain-tail
+        // form of the empty sentinel): the column ends in AIR. Close
+        // the previous run at `z0` and stamp the pure terminator
+        // instead of a bottom-reaching run. NB `z1c == z1 - 1` is
+        // voxlap's legitimate buried-bottom terminal (solid to
+        // bedrock) — it must fall through to the degenerate-merge
+        // `continue` below (see `EMPTY_COLUMN_SLAB`).
+        if slab[v] == 0 && i32::from(slab[v + 2]) + 1 < i32::from(slab[v + 1]) {
+            uind[i - 1] = i32::from(slab[v + 3]);
+            uind[i] = MAXZDIM;
+            uind[i + 1] = MAXZDIM;
+            return;
+        }
         if slab[v + 3] >= slab[v + 1] {
             continue;
         }
@@ -304,6 +356,15 @@ pub(crate) fn compilerle(
     py: i32,
     colfunc: &mut dyn FnMut(i32, i32, i32) -> i32,
 ) -> usize {
+    // CT.1 — an empty column (pure terminator, no solid runs) encodes
+    // as the 4-byte sentinel; nothing else to walk. Neighbours never
+    // toggle their exposure bits against it (its breakpoint list has
+    // no crossings below MAXZDIM), which reads as "air all the way
+    // down" — exactly right.
+    if n0[0] >= MAXZDIM {
+        cbuf[..4].copy_from_slice(&crate::vxl::EMPTY_COLUMN_SLAB);
+        return 4;
+    }
     let tbuf2 = build_color_table(original_column);
 
     let mut p_z: i32 = n0[0];
@@ -381,6 +442,22 @@ pub(crate) fn compilerle(
                 i += 2;
                 cbuf[onext] = u8::try_from((n - onext) >> 2).expect("slab dword count fits in u8");
                 onext = n;
+                // CT.1 — pure terminator next: the column ends in AIR
+                // below the run just written (a bottom-reaching carve
+                // left survivors above). Emit the air-terminal slab —
+                // the chain-tail form of
+                // [`crate::vxl::EMPTY_COLUMN_SLAB`]: `z1 = 255`,
+                // `z1c = 253` (over-empty floor list — `z1 - 1` would
+                // collide with voxlap's buried-bottom terminal), `z0`
+                // closing the ceiling list at the previous run's end.
+                // The final `cbuf[onext] = 0` below stamps its nextptr.
+                if n0[i] >= MAXZDIM {
+                    cbuf[n + 1] = 255;
+                    cbuf[n + 2] = 253;
+                    cbuf[n + 3] = to_u8(ze);
+                    n += 4;
+                    break 'outer;
+                }
                 p_z = n0[i];
                 cbuf[n + 1] = to_u8(p_z);
                 cbuf[n + 3] = to_u8(ze);
@@ -1329,11 +1406,59 @@ mod tests {
         assert_eq!(read_slabs(&spans), [(50, 60)]);
     }
 
+    /// CT.1 — inverted from `delslab_y1_clamped_to_maxzdim_minus_1`:
+    /// `y1 == MAXZDIM` now carves THROUGH the world bottom instead of
+    /// being clamped to 255 (the old behaviour left `[10, 100)` plus
+    /// the run's z∈[100,200) tail deleted but kept z=255 uncarvable
+    /// on full-height carves).
     #[test]
-    fn delslab_y1_clamped_to_maxzdim_minus_1() {
+    fn delslab_y1_reaches_world_bottom() {
+        // Partial: the run survives truncated, pure terminator after.
         let mut spans = build_b2(&[(10, 200)]);
         delslab(&mut spans, 100, MAXZDIM);
         assert_eq!(read_slabs(&spans), [(10, 100)]);
+        assert_eq!(&spans[2..4], &[MAXZDIM, MAXZDIM], "pure terminator");
+
+        // Full: the only run is consumed → pure terminator alone.
+        let mut spans = build_b2(&[(10, 200)]);
+        delslab(&mut spans, 10, MAXZDIM);
+        assert_eq!(read_slabs(&spans), []);
+        assert_eq!(&spans[0..2], &[MAXZDIM, MAXZDIM]);
+
+        // Multi-run: everything below y0 goes, runs above survive.
+        let mut spans = build_b2(&[(10, 20), (30, 40), (50, 60)]);
+        delslab(&mut spans, 35, MAXZDIM);
+        assert_eq!(read_slabs(&spans), [(10, 20), (30, 35)]);
+
+        // Empty column: bottom-reaching carve is a no-op.
+        let mut spans = vec![MAXZDIM, MAXZDIM, 0, 0];
+        delslab(&mut spans, 0, MAXZDIM);
+        assert_eq!(&spans[0..2], &[MAXZDIM, MAXZDIM]);
+    }
+
+    /// CT.1 — insslab re-inserts into an emptied column (in front of
+    /// the pure terminator), and a full-height insert restores a
+    /// bottom-reaching run.
+    #[test]
+    fn insslab_into_pure_terminator_column() {
+        let mut spans = vec![MAXZDIM, MAXZDIM, 0, 0, 0, 0];
+        insslab(&mut spans, 40, 60);
+        assert_eq!(read_slabs(&spans), [(40, 60)]);
+        assert_eq!(&spans[2..4], &[MAXZDIM, MAXZDIM], "terminator kept");
+
+        let mut spans = vec![MAXZDIM, MAXZDIM, 0, 0, 0, 0];
+        insslab(&mut spans, 0, MAXZDIM);
+        // A run reaching the bottom IS the sentinel pair again.
+        assert_eq!(&spans[0..2], &[0, MAXZDIM]);
+    }
+
+    /// CT.1 — expandrle decodes the empty-column sentinel bytes to the
+    /// pure terminator (no runs, no implicit bedrock).
+    #[test]
+    fn expandrle_empty_sentinel_is_pure_terminator() {
+        let mut uind = vec![0i32; 8];
+        expandrle(&crate::vxl::EMPTY_COLUMN_SLAB, &mut uind);
+        assert_eq!(&uind[0..2], &[MAXZDIM, MAXZDIM]);
     }
 
     #[test]
@@ -2334,22 +2459,22 @@ mod tests {
         }
     }
 
+    /// CT.1 — inverted from `set_rect_clamps_to_world`: the XY clamp
+    /// is unchanged, but a carve past the world bottom now empties the
+    /// columns (empty sentinel) instead of leaving the historically
+    /// uncarvable z=255 voxel.
     #[test]
-    fn set_rect_clamps_to_world() {
+    fn set_rect_carves_through_world_bottom() {
         let mut vxl = build_4x4_min_solid_vxl();
         vxl.reserve_edit_capacity(8192);
         // Box extends well past world bounds — clamps to [0, 3] in
-        // each axis.
+        // each axis; z carves the full [0, 256).
         set_rect(&mut vxl, [-10, -10, -10], [100, 100, 1000], None);
-        // Every column carved over [0, MAXZDIM) → all-air.
         for idx in 0..16 {
+            assert!(vxl.column_is_empty(idx), "col {idx}");
             let mut spans = vec![0i32; SPAN_STRIDE];
             expandrle(vxl.column_data(idx), &mut spans);
-            // delslab clamps z1 to MAXZDIM-1, leaving voxel at
-            // z=MAXZDIM-1 solid. The spans reflects this: solid run
-            // [255, MAXZDIM) only.
-            assert_eq!(spans[0], 255, "col {idx}");
-            assert_eq!(spans[1], MAXZDIM, "col {idx}");
+            assert_eq!(&spans[0..2], &[MAXZDIM, MAXZDIM], "col {idx}");
         }
     }
 

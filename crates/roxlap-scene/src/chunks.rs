@@ -66,8 +66,13 @@ pub(crate) fn empty_chunk_vxl() -> Vxl {
     };
     vxl.reserve_edit_capacity(n_cols * CHUNK_EDIT_HEADROOM_PER_COLUMN);
 
-    // 2. Carve [0, 255] in every column to make it all-air.
-    //    `Vspan.z1` is inclusive per voxlap's vspans convention.
+    // 2. Carve [0, 255) in every column to make it all-air above the
+    //    historical z=255 bedrock placeholder.
+    //    TODO(CT.2): carve z1=u8::MAX (the full [0, 256)) so columns
+    //    seed as the empty sentinel. Pinned to [0, 255) for now —
+    //    CT.1 de-clamped `delslab`, and flipping the seed here would
+    //    retire the placeholder ahead of the CT.2 walker/test sweep
+    //    (docs/porting/PORTING-CARVE.md).
     let mut spans: Vec<Vspan> = Vec::with_capacity(n_cols);
     for y in 0..vsid {
         for x in 0..vsid {
@@ -75,7 +80,7 @@ pub(crate) fn empty_chunk_vxl() -> Vxl {
                 x,
                 y,
                 z0: 0,
-                z1: u8::MAX,
+                z1: u8::MAX - 1,
             });
         }
     }

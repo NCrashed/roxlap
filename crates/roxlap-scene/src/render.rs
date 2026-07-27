@@ -4117,10 +4117,10 @@ mod tests {
     /// draws it, the centre depth reads ~284 (ghost) instead of ~444
     /// (shaft floor at grid z 9, world 144; camera z -300).
     #[test]
-    #[ignore = "KNOWN RED: digger chz-boundary probe (docs/handover-stale-mips-volume-edits.md). \
-                Two defects: grid z -1 (chunk-local z 255) stays voxel_solid after the carve \
-                (delslab clamp), and the CPU marcher falls through the carve-exposed untextured \
-                top (hits z 15 at depth 540 instead of z 9 at 444). Run with --ignored."]
+    #[ignore = "KNOWN RED until CT.6: the CPU marcher falls through the carve-exposed \
+                untextured top (hits the textured floor at depth 540 instead of solid z 9 \
+                at 444) — the hit verdict is coupled to the colour fetch. The OTHER half \
+                (the uncarvable z=255 bedrock layer) is FIXED since CT.1. Run with --ignored."]
     fn digger_bedrock_boundary_layer_cpu_probe() {
         let orange = 0x80_ff_80_00;
         let mut scene = Scene::new();
