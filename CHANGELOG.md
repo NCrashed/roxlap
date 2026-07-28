@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-07-28
+
 **Carve-through-floor (stage CT)** — voxel columns can now be carved
 all the way down. Voxlap's format kept one uncarvable voxel at every
 column's bottom (chunk-local z = 255, the "bedrock floor"); any game
