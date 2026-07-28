@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.1] — 2026-07-28
+
+### Fixed
+
+- **`FowTwin::sync` froze the twin's render config on quiet frames.**
+  The twin is the only grid that draws (the real one is
+  `render_excluded`), and `sync` mirrors the real grid's render config
+  onto it — transform, `z_clip`, `render_sky`, mip override, LOD
+  thresholds. That mirror sat *behind* the P2 quiet-frame early-out,
+  which is keyed on `(mask_version, real mutation_counter)` — and
+  nothing in the mirrored set moves either key: re-posing a grid is not
+  a voxel edit and turns no cell visible or dark, and the same holds
+  for a cutaway plane. So once the mask settled, the twin stopped
+  tracking the real grid: a hull rotating over a still mask stalled on
+  screen while everything seated from its live transform slid off it,
+  and a `z_clip` deck cutaway raised on a settled frame never opened.
+  The mirror now runs on every `sync`; the early-out still gates the
+  ~πr² live-cell rescan and the chunk copies, which is all it was ever
+  meant to skip (this also matches what `sync`'s own doc already
+  promised). Hosts that worked around it by copying the config onto the
+  twin themselves can drop that code.
+
 ## [0.31.0] — 2026-07-28
 
 **Carve-through-floor (stage CT)** — voxel columns can now be carved

@@ -125,7 +125,10 @@ This is the **entry doc** for the fog-of-war stage — tag **FW**.
   orphaned map leaking) instead of `Full`, so the GPU re-uploads only
   the delta; first-seen still `Full`. (P2) quiet-frame early-out keyed
   on `(mask_version, real mutation_counter)` skips the ~πr² live-cell
-  rescan when nothing changed. (P3) the exclusion rule is single-sourced
+  rescan when nothing changed — the *copy* only: the render-config
+  mirror runs unconditionally, since neither key moves when the real
+  grid is merely re-posed or clipped, and gating it froze the twin
+  (amendment, post-0.31). (P3) the exclusion rule is single-sourced
   in `Grid::renderable` / `Grid::queryable`; `query_grids_mut` (was dead)
   now drives `pump_streaming_sync`; snapshot routes through
   `query_grids`. Full-chunk CPU clone on copy stays per decision 2 (the

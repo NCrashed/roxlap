@@ -1193,7 +1193,9 @@ pub struct FowTwin {
     copied: HashMap<IVec3, (u64, bool)>,
     /// Quiet-frame gate: `(mask_version, real mutation_counter)` of the
     /// last [`Self::sync`] that ran. Unchanged ⇒ nothing to copy, skip
-    /// the whole live-cell rescan.
+    /// the whole live-cell rescan. Gates the COPY only — the render-config
+    /// mirror runs on every `sync`, since re-posing or clipping the real
+    /// grid moves neither of these counters.
     last_synced: Option<(u64, u64)>,
 }
 
@@ -1266,7 +1268,9 @@ impl FowTwin {
     ///
     /// Cheap on quiet frames: if neither the mask nor the real grid
     /// changed since the last run it early-outs before the live-cell
-    /// rescan.
+    /// rescan. The render-config mirror is NOT part of that early-out —
+    /// it runs every frame, because the config moves without touching
+    /// either gate (see below).
     #[must_use]
     pub fn sync(&mut self, scene: &mut Scene, fow: &FogOfWar) -> bool {
         // Both grids must still exist — a lost twin means the host has
@@ -1278,9 +1282,21 @@ impl FowTwin {
             return false;
         }
 
+        // Mirror the render config FIRST, before the quiet-frame gate.
+        // Neither gate moves when it changes: re-posing the real grid is
+        // not a voxel edit (no mutation) and turns no cell visible or
+        // dark (no mask version), and the same holds for a `z_clip`
+        // cutaway, `render_sky`, or a LOD tweak. Gating the mirror on
+        // them freezes the twin — the only grid that draws — at its last
+        // busy frame: a hull rotating over a settled mask stalls on
+        // screen while everything seated from its live transform slides
+        // off it, and a cutaway raised on a quiet frame never opens.
+        let mirror = TwinMirror::read(scene.grid(self.real).expect("checked above"));
+        mirror.apply(scene.grid_mut(self.twin).expect("checked above"));
+
         // Quiet-frame early-out: the mask version moves on any
         // visibility/fade change, the mutation counter on any real edit
-        // or chunk install/evict — nothing else can change what to copy.
+        // or chunk install/evict — nothing else can change what to COPY.
         let key = (fow.mask_version(), real_mut);
         if self.last_synced == Some(key) {
             return true;
@@ -1292,12 +1308,12 @@ impl FowTwin {
         let first_scan = self.last_synced.is_none();
         self.last_synced = Some(key);
 
-        // Phase 1 — read the real grid: mirror, hint, and the copies due
-        // (with a first-seen flag: first copy bumps the whole chunk, a
-        // re-sync bumps only the edited bbox).
-        let (mirror, hint, copies) = {
+        // Phase 1 — read the real grid: the residency hint and the copies
+        // due (with a first-seen flag: first copy bumps the whole chunk, a
+        // re-sync bumps only the edited bbox). The render config was
+        // already mirrored above, unconditionally.
+        let (hint, copies) = {
             let real = scene.grid(self.real).expect("checked above");
-            let mirror = TwinMirror::read(real);
             let hint = grid_chunk_bbox(real);
             // Every chunk under a live cell, deduped, with its real sig.
             let mut want: HashMap<IVec3, (u64, bool)> = HashMap::new();
@@ -1326,7 +1342,7 @@ impl FowTwin {
                     copies.push((idx, real.chunk(idx).cloned(), sig, first_seen));
                 }
             }
-            (mirror, hint, copies)
+            (hint, copies)
         };
 
         // Phase 1b — drain each copied chunk's accumulated dirty extent
@@ -1344,7 +1360,6 @@ impl FowTwin {
 
         // Phase 2 — write the twin (disjoint borrow).
         let twin = scene.grid_mut(self.twin).expect("checked above");
-        mirror.apply(twin);
         twin.gpu_residency_hint = hint;
         let mut any_change = false;
         for ((idx, chunk, sig, first_seen), extent) in copies.into_iter().zip(extents) {
@@ -2598,6 +2613,73 @@ mod tests {
             scene.grid(twin.twin()).unwrap().mutation_counter(),
             after_first,
             "quiet frame must not re-bump the twin"
+        );
+    }
+
+    /// The quiet-frame early-out gates the chunk COPY, never the render
+    /// config: the twin is the only grid that draws, so re-posing or
+    /// clipping the real grid must reach it on any frame. Neither gate
+    /// notices such a change — re-posing is not a voxel edit and turns no
+    /// cell visible or dark — so a mirror behind the early-out freezes the
+    /// twin at its last busy frame: a rotating hull stalls on screen while
+    /// everything seated from its live transform slides off it, and a deck
+    /// cutaway raised while the mask is settled never opens.
+    #[test]
+    fn quiet_frame_still_mirrors_the_render_config() {
+        let (mut scene, real) = scene_with_room();
+        let mut twin = FowTwin::attach(&mut scene, real);
+        let mut fow = seeing_fow();
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            SETTLE,
+        );
+        assert!(twin.sync(&mut scene, &fow));
+
+        // Settle: the same pose again, so the next frame is quiet.
+        fow.update(
+            scene.grid(real).unwrap(),
+            &observer(IVec2::new(0, 0), Vec2::X),
+            1.0,
+        );
+        let quiet_mask = fow.mask_version();
+        let quiet_mut = scene.grid(real).unwrap().mutation_counter();
+
+        // Re-pose and clip the real grid — config only, no voxel touched.
+        let turned = glam::DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        {
+            let g = scene.grid_mut(real).unwrap();
+            g.transform.rotation = turned;
+            g.transform.origin = DVec3::new(3.0, -7.0, 0.0);
+            g.z_clip = Some(EYE_Z);
+            g.render_sky = true;
+        }
+        assert!(twin.sync(&mut scene, &fow));
+
+        // Guard the guard: if either gate moved, `sync` took the copy path
+        // and this would pass without the fix.
+        assert_eq!(fow.mask_version(), quiet_mask, "the mask must be settled");
+        assert_eq!(
+            scene.grid(real).unwrap().mutation_counter(),
+            quiet_mut,
+            "a config change must not count as a real-grid mutation"
+        );
+
+        let t = scene.grid(twin.twin()).unwrap();
+        let probe = DVec3::new(1.0, 0.0, 0.0);
+        assert!(
+            (t.transform.rotation * probe - turned * probe).length() < 1e-9,
+            "the twin must carry the real grid's rotation"
+        );
+        assert_eq!(t.transform.origin, DVec3::new(3.0, -7.0, 0.0));
+        assert_eq!(
+            t.z_clip,
+            Some(EYE_Z),
+            "the deck cutaway must reach the twin"
+        );
+        assert!(
+            t.render_sky,
+            "the whole mirrored set moves, not just the pose"
         );
     }
 
