@@ -85,6 +85,28 @@ chunks. They are also the engine's runtime carving path — the cave
 demo's plasma bullets and the particle system's debris craters
 (chapter 8) are `set_sphere(.., None)` at heart.
 
+### Carving through the floor
+
+Carves go **all the way down**. Voxlap's format kept one uncarvable
+voxel at every column's bottom (chunk-local z = 255, the "bedrock
+floor"), which is invisible on a classic single-layer map — but the
+moment a game maps its playable surface onto a chunk boundary (a
+drilling vehicle digging from one chunk layer into the next), that
+voxel becomes an invisible wall the player carves at forever. roxlap
+extends the format instead: a column carved to the bottom becomes
+genuinely empty (the *empty-column sentinel*), and a partial carve
+that reaches the bottom leaves air below the surviving run (the
+*air-terminal*). Both round-trip through `.vxl` serialisation and
+[snapshots](#snapshots) — which is why snapshot wire v5 exists: a
+pre-carve-through engine would misread those columns as solid rock,
+so it rejects v5 saves outright rather than loading them wrong.
+
+Nothing changes in how you call the API — `set_rect(lo, hi, None)`
+with `hi.z = 255` simply works now. The consequences are physical:
+collision, raycasts, island detection and both renderers agree the
+hole is a hole, and digging the floor out from under something
+detaches it (chapter 10).
+
 Cheap point queries pair with them:
 
 ```rust,noplayground
@@ -106,10 +128,12 @@ operation. Remember the idiom — **recolour = carve, then insert**.
 ### Colour callbacks
 
 A carve exposes interior walls the artist never coloured; the plain
-edits paint them black. The `_with_colfunc` variants
-(`set_rect_with_colfunc` / `set_sphere_with_colfunc`, with
-`SpanOp::Carve` or `SpanOp::Insert`) ask a closure for every touched
-voxel instead — position-dependent colour, jitter, texture lookups:
+edits paint them by **inheriting the nearest original colour** in the
+column, so a tunnel through sandstone looks like sandstone. The
+`_with_colfunc` variants (`set_rect_with_colfunc` /
+`set_sphere_with_colfunc`, with `SpanOp::Carve` or `SpanOp::Insert`)
+override that with a closure asked for every touched voxel —
+position-dependent colour, jitter, texture lookups:
 
 ```rust,noplayground
 {{#include ../../../crates/roxlap-scene/examples/book_scene_graph.rs:colfunc}}
@@ -254,10 +278,11 @@ unit-testable without a renderer.
 ### What counts as solid
 
 Collision reads the same voxel world the renderer draws, through a
-`Solidity` policy: the voxlap bedrock placeholder plane is a knob
-(`bedrock_blocks` — match it to how you *render* that plane, or you
-get invisible walls / fall-through floors), and an optional colour
-veto makes chosen voxels passable:
+`Solidity` policy: `bedrock_blocks` decides whether *genuine* solid
+content at a column's bottom voxel (chunk-local z = 255) blocks (empty
+chunks are truly empty since carve-through-floor — there is no phantom
+placeholder plane to opt into any more), and an optional colour veto
+makes chosen voxels passable:
 
 ```rust,noplayground
 {{#include ../../../crates/roxlap-scene/examples/book_controller.rs:veto}}

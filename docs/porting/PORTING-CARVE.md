@@ -3,7 +3,10 @@
 Entry doc written 2026-07-25 at workspace 0.30.1.
 This is the **entry doc** for the carve-through-floor stage — tag **CT**.
 
-## Status
+## Status — STAGE CLOSED 2026-07-28 (CT.0..CT.9 all landed)
+
+The digger bug is verified fixed in monada by the reporter (visual
+pass 2026-07-28). Ships in the next minor cut.
 
 - **CT.0 — LANDED 2026-07-26.** `EMPTY_COLUMN_SLAB` +
   `slab_is_empty_column` + `Vxl::column_is_empty` + module-doc section
@@ -217,9 +220,16 @@ This is the **entry doc** for the carve-through-floor stage — tag **CT**.
   `extract_carved_through_chunk` — a dug-through chunk exports cleanly
   to vxl/kv6/vox (emptied columns contribute nothing; kv6 walked via
   its ylen column tables). cli 12 green.
-- Remaining: CT.9 — monada validation via path-dep (user visual pass),
-  book, CHANGELOG (minor cut, behaviour notes: carve-through, inherit
-  retexture, islands un-anchoring, snapshot v5), handover close-out.
+- **CT.9 — LANDED 2026-07-28, STAGE CLOSED.** monada digger verified
+  fixed by the user (visual pass). Book: "Carving through the floor"
+  subsection in the scene-graph chapter (+ the colour-callback,
+  Solidity and destruction-support passages updated off the old
+  invariants). CHANGELOG: full Unreleased entry (added / behaviour
+  changes / fixes incl. the fuzzer catches) — next cut is MINOR.
+  `docs/handover-stale-mips-volume-edits.md` closed out with the
+  resolution header. Gates: check-anchors + mdbook build green.
+  NOT in scope, still owed elsewhere: the `remip_bbox`
+  compacts-away-edit-headroom footgun (QE follow-up).
 
 ## Why
 

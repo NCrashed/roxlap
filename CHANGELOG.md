@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Carve-through-floor (stage CT)** — voxel columns can now be carved
+all the way down. Voxlap's format kept one uncarvable voxel at every
+column's bottom (chunk-local z = 255, the "bedrock floor"); any game
+whose playable surface lands on a chunk-z boundary — the reported case:
+a drilling vehicle digging from one chunk layer into the next — hit it
+as an invisible wall that raycasts called air. The format now has an
+**empty-column sentinel** (a terminal slab with an over-empty floor
+list, `z1c ≤ z1 − 2`) and its chain-tail form (**air-terminal**: air
+below a column's last run); every walker on both backends, collision,
+raycasts, islands, audio occlusion, the mip downsampler and the GPU
+decompressor agree on the semantics.
+
+### Added
+
+- `roxlap_formats::vxl::EMPTY_COLUMN_SLAB` / `slab_is_empty_column` /
+  `Vxl::column_is_empty` — the empty-column encoding and predicates.
+- `roxlap_formats::VoxColor::BEDROCK_FALLBACK` — the renderers'
+  last-resort colour for solid cells with no usable colour record.
+- `GridView::voxel_color_raw_mip` — colour records including the
+  untextured `0` sentinel (`None` = no record at all).
+- An `edit` fuzz target (op-stream driver in
+  `roxlap_formats::fuzz_driver`; the committed corpus seeds also run
+  as stable-CI unit tests) and a pure-CPU CPU/GPU hit-verdict parity
+  gate (`roxlap-render/tests/carve_parity.rs`).
+
+### Changed (behaviour)
+
+- **Carves reach z = 255.** `set_rect` / `set_sphere` / `set_spans`
+  with a range through the bottom empty the column (previously
+  silently clamped to z ≤ 254). `Vxl::empty` and scene chunks seed as
+  truly-empty sentinel columns — the historical bedrock placeholder
+  plane is retired: no phantom solid at z = 255 in collision
+  (`Solidity::bedrock_blocks` now governs only genuine content),
+  raycasts, audio occlusion (the `grid_thickness` world-bottom caveat
+  is gone) or island anchoring.
+- **Plain carves inherit colour.** Newly-exposed surfaces take the
+  nearest original colour record of their column instead of
+  untextured black; `_with_colfunc` still overrides.
+- **The CPU hit verdict is decoupled from the colour fetch.** A
+  solid-but-uncoloured cell now hits (own record → run-top record →
+  `BEDROCK_FALLBACK`) instead of being stepped through — fixing rays
+  passing through carve-exposed surfaces; explicit zero-RGB records
+  still read as air on both backends (GPU parity).
+- **Islands: carving the floor out un-anchors.** A column ending in
+  air contributes no bedrock-anchored run, so digging the ground out
+  from under a structure detaches it as debris (previously the
+  uncarvable floor made such regions permanently "supported").
+- **Snapshot wire v5** — a semantic bump with an identical payload
+  shape: v5 chunk bytes may carry sentinel/air-terminal columns that
+  pre-CT engines would misread as bedrock, so those engines reject v5
+  saves loudly instead. v1..v4 saves load unchanged.
+
+### Fixed
+
+- The reported digger "invisible walls": carving the sim surface at a
+  chunk-z boundary left an undeletable solid layer rendered by both
+  backends while collision said air. Repro tests are permanent gates
+  (`roxlap-gpu/tests/digger_repro.rs`, scene CPU probe).
+- The CPU marcher fell through solid-but-uncoloured voxels (see the
+  hit-verdict decouple above).
+- Three encoder/allocator bugs surfaced by the new fuzzer — all cases
+  of voxlap's placeholder events being load-bearing: an oversized-slab
+  `nextptr` overflow (slabs now split into degenerate continuations;
+  `MAXCSIZ` 1028 → 1088), a slab-pool leak from dangling tail records
+  on bottom-reaching runs (folded into a buried-bottom terminal; plus
+  a `debug_assert` that encoder length == `slng`), and
+  `reserve_edit_capacity`'s bitmap re-sync marking offset-table
+  windows instead of real column extents (overspan leaked pool
+  permanently; a reversed window could let `voxalloc` clobber a live
+  column).
+- The scene-demo World terrain vanishing on the CPU backend (an
+  air-terminal with `z0 == 255` was swallowed by the walkers'
+  degenerate-merge check).
+
 ## [0.30.1] — 2026-07-19
 
 ### Fixed

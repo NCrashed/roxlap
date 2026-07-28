@@ -1,6 +1,16 @@
 # Handover: stale chunk mips after runtime `set_rect` edits ("invisible walls")
 
-Status: **open bug**, reported 2026-07-25 from the monada digger demo
+Status: **CLOSED 2026-07-28** — root cause was NOT stale mips but the
+voxlap format's uncarvable chunk-local z=255 voxel landing on the
+digger's sim surface (see the ROOT CAUSE section below, appended
+2026-07-25). Fixed by the **CT carve-through-floor stage**
+(`docs/porting/PORTING-CARVE.md`, CT.0..CT.9): empty-column sentinel
+encoding, carve-through edit ops, placeholder retirement, walker/
+renderer/collision agreement on both backends, islands un-anchoring,
+snapshot wire v5. Verified fixed in the monada digger by the reporter
+(visual pass, 2026-07-28). Ships in the next minor cut.
+
+Originally: **open bug**, reported 2026-07-25 from the monada digger demo
 (roxlap 0.30.0 as published on crates.io). This doc is written for a
 fresh session working in THIS repo; everything needed to reproduce,
 diagnose and validate is spelled out. File:line references below are

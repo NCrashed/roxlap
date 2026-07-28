@@ -56,10 +56,13 @@ Two properties matter in practice:
   building-sized collapses; the flood's cost is
   `O(min(region, budget))` per component, so the worst case is priced
   in advance.
-- **Support means the format's bedrock.** Every materialised chunk's
-  column bottom (local z = 255) is uncarvable by construction, so a
-  region touching it can never fall — this holds on stacked-chunk
-  grids too.
+- **Support means standing on the bottom — as a fact, not a format
+  invariant.** A region is supported when it reaches a run that
+  genuinely extends to its column's bottom (local z = 255). Since
+  carve-through-floor that is a property of the column's bytes: dig
+  the floor out from under a pillar and its anchor is gone — the
+  hanging top comes back as an island and falls, exactly as physics
+  suggests.
 
 ## Falling
 
