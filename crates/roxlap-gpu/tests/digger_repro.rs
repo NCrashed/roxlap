@@ -73,10 +73,10 @@ fn slab_chunk(vsid: u32, top: u8, bot: u8) -> Vxl {
     }
 }
 
-fn render_depth_at(msd: f32, z_clip: Option<i32>) -> (f32, Vec<f32>, u32, u32) {
-    let Some((gpu, _lock)) = try_init() else {
-        panic!("no adapter");
-    };
+/// `None` when no GPU adapter is reachable — callers skip silently
+/// (the whole-file convention, same as `scene_render.rs`).
+fn render_depth_at(msd: f32, z_clip: Option<i32>) -> Option<(f32, Vec<f32>, u32, u32)> {
+    let (gpu, _lock) = try_init()?;
     let vsid = 32u32;
     // Terrain slab grid z ∈ [-8, 15] (24 voxels thick, world -128..+256):
     //   chunk (-1,0,-1): local z 248..255  (grid z -8..-1)
@@ -141,7 +141,7 @@ fn render_depth_at(msd: f32, z_clip: Option<i32>) -> (f32, Vec<f32>, u32, u32) {
         msd,
     );
     let centre = (h / 2 * w + w / 2) as usize;
-    (depth[centre], depth, w, h)
+    Some((depth[centre], depth, w, h))
 }
 
 fn ascii_depth(depth: &[f32], w: u32, h: u32) {
@@ -167,7 +167,9 @@ fn digger_shaft_msd_8192_sees_floor() {
     // reaching carve now empties the column (empty sentinel) and the
     // GPU decompressor reads it as air — the z=255 ghost layer is
     // gone. Kept as the regression gate for the digger root cause.
-    let (d, depth, w, h) = render_depth_at(8192.0, None);
+    let Some((d, depth, w, h)) = render_depth_at(8192.0, None) else {
+        return;
+    };
     eprintln!("=== msd=8192, no z_clip: centre depth {d} (expect ≈444) ===");
     ascii_depth(&depth, w, h);
     assert!(
@@ -181,7 +183,9 @@ fn digger_shaft_msd_8192_sees_floor() {
 fn digger_shaft_msd_default64_sees_floor() {
     // GREEN since CT.1 — see digger_shaft_msd_8192_sees_floor; this
     // variant pins that the fix is mip-threshold-independent.
-    let (d, depth, w, h) = render_depth_at(64.0, None);
+    let Some((d, depth, w, h)) = render_depth_at(64.0, None) else {
+        return;
+    };
     eprintln!("=== msd=64 (RenderOptions default): centre depth {d} ===");
     ascii_depth(&depth, w, h);
     assert!(
@@ -193,7 +197,9 @@ fn digger_shaft_msd_default64_sees_floor() {
 #[test]
 fn digger_shaft_msd_tiny_forces_coarse() {
     // Force mips to SEE what the ghost looks like (documentation run).
-    let (d, depth, w, h) = render_depth_at(1.0, None);
+    let Some((d, depth, w, h)) = render_depth_at(1.0, None) else {
+        return;
+    };
     eprintln!("=== msd=1 (forced coarse): centre depth {d} ===");
     ascii_depth(&depth, w, h);
 }
@@ -206,7 +212,7 @@ fn digger_shaft_msd_tiny_forces_coarse() {
 #[test]
 fn carve_all_and_refresh_renders_sky() {
     let Some((gpu, _lock)) = try_init() else {
-        panic!("no adapter");
+        return;
     };
     let vsid = 32u32;
     let mut v = slab_chunk(vsid, 100, 140);
@@ -271,7 +277,9 @@ fn carve_all_and_refresh_renders_sky() {
 fn digger_shaft_with_deck_clip_sees_floor() {
     // Deck clip like monada's deck_clip while drilling in the shaft:
     // hide everything ABOVE grid z 2 (z < 2 cut).
-    let (d, depth, w, h) = render_depth_at(8192.0, Some(2));
+    let Some((d, depth, w, h)) = render_depth_at(8192.0, Some(2)) else {
+        return;
+    };
     eprintln!("=== msd=8192, z_clip=2: centre depth {d} (expect ≈444) ===");
     ascii_depth(&depth, w, h);
     assert!(
