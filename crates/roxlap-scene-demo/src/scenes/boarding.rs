@@ -18,7 +18,7 @@
 
 use glam::DVec3;
 use roxlap_render::{
-    ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode,
+    ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode, BillboardUp,
     DirectionalLight, Kv6, LightRig, LoopMode, Material, PointLight, ShadowFlags, ViewCutout,
     VoxelClip,
 };
@@ -447,6 +447,7 @@ impl BoardingScene {
                 },
             ],
             mode: BillboardMode::Cylindrical,
+            up: BillboardUp::World,
             lighting: BillboardLighting::FaceNormal,
             speed: 1.0,
             scale: FIGURE_SCALE,

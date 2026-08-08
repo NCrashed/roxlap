@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: `BillboardUp` — where a billboard's image vertical comes from (BB.6)
+
+Billboards took their image vertical from a world-up constant, so a
+**rolled** camera left every card leaning on screen. That is not an
+exotic camera: a host whose view frame rides a rotating grid — a
+camera bolted to a turning ship, so the deck holds still on screen
+while the starfield sweeps past — rolls by construction. Everything
+drawn from the grid followed it; the billboards did not, and crew
+sprites leaned while the deck under them looked level.
+
+`BillboardMode` now says only which way a card *faces*; the new
+`BillboardUp` says which way is *up* inside the image. The two are
+independent knobs and compose freely:
+
+- **`World`** — world up (`-z`): exactly the pre-BB.6 behaviour, and
+  still the default. Doom/Build scenes want this — its cast shadow
+  stays a sane vertical card as you orbit.
+- **`Camera`** — the camera's own up (`-camera.down`): the card never
+  leans relative to the viewer, whatever the camera's roll.
+- **`Axis([f32; 3])`** — an app-supplied world-space axis, e.g. a
+  grid's rotation applied to its local up. `Cylindrical` yaws about
+  *that* axis, so a card on a tilted deck stands on the deck — and
+  stays upright on screen for free whenever the camera rides the same
+  body. Refresh it as the body turns; a zero axis falls back to world
+  up rather than dropping the billboard.
+
+Set it per instance with `set_billboard_up`, per actor with
+`BillboardActorDef::up` / `set_actor_up`. The **anchor is invariant**
+in every combination — the basis turns about the instance position, so
+a card anchored at a character's feet keeps them planted. Cast shadows
+stay the app's call: a card whose orientation tracks the camera casts
+a shadow that rotates as you orbit, which is why this is an enum and
+not a new default.
+
+Billboard **actors** got the matching frame for their *directional*
+sprites. `dir_index` measured the camera's bearing against a world yaw
+in the world's horizontal plane, so an actor riding a rotating body
+had to compose its facing into a world yaw — and rotate-then-flatten
+does not commute with flatten-then-rotate under a tilted rotation, so
+the picked sprite drifted (reported: 0.27 rad, a third of a 45°
+sector — an actor standing still visibly turning on the spot). The new
+`ActorFacing::Dir(world_direction)`, paired with a
+`BillboardUp::Axis`, measures the bearing in the actor's own frame
+instead:
+
+```rust
+// a crew member standing on a tumbling ship's deck
+r.set_actor_pose(id, world_pos, ActorFacing::Dir(hull_rot * nose), BillboardUp::Axis(deck_up));
+```
+
+`set_actor_facing` / `set_actor_up` / `set_actor_pose` are the runtime
+setters; `set_actor_transform(id, pos, yaw)` still means what it did
+(`ActorFacing::Yaw` on a world floor). `BillboardUp::Camera`
+deliberately leaves the sector frame world-aligned — it is a statement
+about the image's roll on screen, not about the floor the actor stands
+on.
+
+Back-compat: `Cylindrical` / `Spherical` under `World` up orient and
+bin exactly as before (the world-yaw sector path is kept verbatim as a
+fast path, so existing actors pick the same sprite bit-for-bit).
+
+### Changed: `BillboardActorDef::up` (breaking)
+
+`BillboardActorDef` gained a `up: BillboardUp` field. Struct literals
+need `up: BillboardUp::World` (the previous behaviour) added, or
+`..Default::default()`; nothing else moves.
+
 ## [0.31.1] — 2026-07-28
 
 ### Fixed

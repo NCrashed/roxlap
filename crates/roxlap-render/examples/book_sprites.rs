@@ -21,7 +21,7 @@ use glam::{DVec3, IVec3};
 use roxlap_core::opticast::OpticastSettings;
 use roxlap_core::Camera;
 use roxlap_render::{
-    BackendPreference, BillboardMode, DynSpriteTransform, FrameParams, Kv6, LoopMode,
+    BackendPreference, BillboardMode, BillboardUp, DynSpriteTransform, FrameParams, Kv6, LoopMode,
     RenderOptions, Rgb, SceneRenderer, SpriteInstanceId, VoxColor, VoxelClip,
 };
 use roxlap_scene::{GridTransform, Scene};
@@ -173,9 +173,13 @@ impl ApplicationHandler for App {
         // The same clip as a Doom-style billboard: a camera-facing
         // instance. Cylindrical = yaw-only facing (stays vertical, the
         // Build-engine look); Spherical also pitches with the view.
-        renderer
+        let card = renderer
             .add_billboard_instance(clip, [0.0, 60.0, 200.0], BillboardMode::Cylindrical)
             .expect("clip just registered");
+        // Which way is up in the image is the independent knob: World (the
+        // default), Camera (never leans on screen — for a rolled camera), or
+        // Axis(v) for a card standing on a body with an up of its own.
+        renderer.set_billboard_up(card, BillboardUp::World);
         // ANCHOR_END: billboard
 
         self.renderer = Some(renderer);

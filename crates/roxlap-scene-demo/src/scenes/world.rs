@@ -9,8 +9,8 @@
 
 use glam::DVec3;
 use roxlap_render::{
-    ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode, Kv6,
-    LoopMode, ShadowFlags, VoxColor, VoxelClip,
+    ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode, BillboardUp,
+    Kv6, LoopMode, ShadowFlags, VoxColor, VoxelClip,
 };
 use roxlap_scene::{CharacterBody, CharacterDef, MoveMode, WalkInput};
 use winit::keyboard::KeyCode;
@@ -146,6 +146,7 @@ impl WorldScene {
                 },
             ],
             mode: BillboardMode::Cylindrical,
+            up: BillboardUp::World,
             lighting: BillboardLighting::FaceNormal,
             speed: 1.0,
             scale: FIGURE_SCALE,

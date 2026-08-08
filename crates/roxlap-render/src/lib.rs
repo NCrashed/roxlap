@@ -602,8 +602,10 @@ impl DynSpriteTransform {
     }
 }
 
-/// How a billboard instance turns to face the camera (BB.2). Set per
-/// instance via [`SceneRenderer::add_billboard_instance`] /
+/// How a billboard instance turns to face the camera (BB.2) — the *normal*
+/// half of billboard orientation; [`BillboardUp`] is the other half (which
+/// way is up inside the image). Set per instance via
+/// [`SceneRenderer::add_billboard_instance`] /
 /// [`set_billboard_mode`](SceneRenderer::set_billboard_mode); applied each
 /// [`face_billboards_to`](SceneRenderer::face_billboards_to).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -612,14 +614,50 @@ pub enum BillboardMode {
     /// (so a billboard record with no mode is inert).
     #[default]
     None,
-    /// Yaw-only: the slab stays vertical (image up = world up) and rotates
-    /// about the vertical axis to face the camera. The Doom/Build default —
-    /// its cast shadow stays sane (a vertical card) as the camera orbits.
+    /// Yaw-only: the slab stays upright (its plane contains the
+    /// [`BillboardUp`] axis) and rotates about that axis to face the camera.
+    /// The Doom/Build default — its cast shadow stays sane (a vertical card)
+    /// as the camera orbits, and a card anchored at its feet never leans off
+    /// that anchor.
     Cylindrical,
     /// Full face: the slab is always perpendicular to the camera direction
     /// (pitches with the view). Ideal head-on, but its cast shadow rotates
-    /// as you orbit.
+    /// as you orbit — and a card anchored at its feet leans off that anchor
+    /// at a steep pitch.
     Spherical,
+}
+
+/// Where a billboard's **image vertical** comes from (BB.6) — the axis the
+/// card's "up" points along, and (for [`BillboardMode::Cylindrical`]) the
+/// axis it yaws about.
+///
+/// Independent of [`BillboardMode`]: the mode picks the slab's *normal*,
+/// this picks its *roll* around that normal. Set per instance via
+/// [`set_billboard_up`](SceneRenderer::set_billboard_up), per actor via
+/// [`BillboardActorDef::up`] / [`set_actor_up`](SceneRenderer::set_actor_up).
+///
+/// Note this is the slab's local `+z` (image vertical) — *not*
+/// [`DynSpriteTransform::up`], which is the slab's normal.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum BillboardUp {
+    /// World up (`-z`, the voxlap convention) — the pre-BB.6 behaviour and
+    /// the Doom/Build default: cards stand on a world-aligned floor.
+    #[default]
+    World,
+    /// The **camera's** own up (`-camera.down`): the card never leans
+    /// relative to the viewer, so a rolled camera (e.g. one riding a
+    /// rotating grid) keeps upright art upright on screen. Its cast shadow
+    /// then rotates as you orbit — that is why this is opt-in.
+    Camera,
+    /// An app-supplied **world-space** axis — normalized here; a degenerate
+    /// (zero-length) axis falls back to world up.
+    ///
+    /// The one to reach for when actors ride a moving body: hand over the
+    /// body's up in world space (e.g. a [`roxlap_scene::Grid`]'s rotation
+    /// applied to `[0, 0, -1]`) and the card stands on *that* floor —
+    /// upright on a tilted deck, and upright on screen too whenever the
+    /// camera rides the same body. Refresh it whenever the body turns.
+    Axis([f32; 3]),
 }
 
 /// How a sprite/billboard instance derives its **shading normal** (BB.2b) —
@@ -653,12 +691,15 @@ struct BillboardRec {
     id: SpriteInstanceId,
     pos: [f32; 3],
     mode: BillboardMode,
+    /// BB.6 — where this card's image vertical comes from.
+    up: BillboardUp,
 }
 
 /// roxlap world up — voxlap is z-down, so up is `-z` (matches the
-/// scene-demo camera builder + the lighting bake's z convention). Billboard
-/// orientation assumes this; an app with a different up convention would
-/// need this generalised (not exposed yet — YAGNI).
+/// scene-demo camera builder + the lighting bake's z convention). This is
+/// what [`BillboardUp::World`] resolves to, the fallback for a degenerate
+/// axis, and the frame a billboard actor's directional sectors are measured
+/// in unless it is given an explicit [`BillboardUp::Axis`].
 const BILLBOARD_UP: [f32; 3] = [0.0, 0.0, -1.0];
 
 fn bb_norm(v: [f32; 3]) -> Option<[f32; 3]> {
@@ -674,38 +715,78 @@ fn bb_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+fn bb_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// `v` with its component along the **unit** axis `u` removed — the
+/// projection into the plane `u` is normal to.
+fn bb_reject(v: [f32; 3], u: [f32; 3]) -> [f32; 3] {
+    let d = bb_dot(v, u);
+    [v[0] - u[0] * d, v[1] - u[1] * d, v[2] - u[2] * d]
+}
+
+/// Resolve a [`BillboardUp`] to a unit world-space axis for this frame
+/// (BB.6). A degenerate axis — a zero `Axis`, or a camera whose basis is
+/// unusable — falls back to world up rather than dropping the billboard.
+fn billboard_up_axis(up: BillboardUp, camera: &Camera) -> [f32; 3] {
+    match up {
+        BillboardUp::World => BILLBOARD_UP,
+        #[allow(clippy::cast_possible_truncation)]
+        BillboardUp::Camera => bb_norm([
+            -camera.down[0] as f32,
+            -camera.down[1] as f32,
+            -camera.down[2] as f32,
+        ])
+        .unwrap_or(BILLBOARD_UP),
+        BillboardUp::Axis(v) => bb_norm(v).unwrap_or(BILLBOARD_UP),
+    }
+}
+
 /// The camera-facing basis for a billboard at `pos` (the slab's local axes:
 /// `+x` = image horizontal, `+y` = normal toward the camera, `+z` = image
-/// vertical). Returns `None` for [`BillboardMode::None`] or a degenerate
-/// pose (camera on the sprite's vertical axis for cylindrical; looking
-/// straight along world-up for spherical) — the caller then skips it.
+/// vertical, along the [`BillboardUp`] axis). Returns `None` only for
+/// [`BillboardMode::None`]; a degenerate pose falls back to a fixed facing
+/// so the position still lands.
+///
+/// The anchor is invariant: the basis turns about `pos`, so a card anchored
+/// at a character's feet keeps them planted whatever `mode`/`up` say.
 fn billboard_transform(
     pos: [f32; 3],
-    cam: [f64; 3],
+    camera: &Camera,
     mode: BillboardMode,
+    up: BillboardUp,
 ) -> Option<DynSpriteTransform> {
+    let cam = camera.pos;
     #[allow(clippy::cast_possible_truncation)]
     let to_cam = [
         cam[0] as f32 - pos[0],
         cam[1] as f32 - pos[1],
         cam[2] as f32 - pos[2],
     ];
-    // `+y` = slab normal toward the camera (horizontal-only for
-    // cylindrical). Degenerate view axes (camera exactly overhead /
-    // exactly at the pos — e.g. a third-person camera the instant
-    // before its boom applies) fall back to a fixed facing instead
-    // of returning None: the card is edge-on/invisible right then
-    // anyway, but the POSITION update must never be dropped, or the
-    // actor freezes at its last pose (the CC.4 third-person bug).
+    let up = billboard_up_axis(up, camera);
+    // `+y` = slab normal toward the camera (projected into the card's
+    // floor plane for cylindrical). Degenerate view axes (camera exactly
+    // on the up axis through the sprite / exactly at the pos — e.g. a
+    // third-person camera the instant before its boom applies) fall back
+    // to a fixed facing instead of returning None: the card is
+    // edge-on/invisible right then anyway, but the POSITION update must
+    // never be dropped, or the actor freezes at its last pose (the CC.4
+    // third-person bug).
     const FALLBACK: [f32; 3] = [0.0, 1.0, 0.0];
     let ny = match mode {
-        BillboardMode::Cylindrical => bb_norm([to_cam[0], to_cam[1], 0.0]).unwrap_or(FALLBACK),
+        BillboardMode::Cylindrical => bb_norm(bb_reject(to_cam, up)).unwrap_or(FALLBACK),
         BillboardMode::Spherical => bb_norm(to_cam).unwrap_or(FALLBACK),
         BillboardMode::None => return None,
     };
     // `+x` = image horizontal = screen-right (non-mirrored): up × normal.
-    let nx = bb_norm(bb_cross(BILLBOARD_UP, ny)).unwrap_or([1.0, 0.0, 0.0]);
-    // `+z` = image vertical (≈ world up; exactly world up for cylindrical).
+    // A view straight along the up axis (spherical only — cylindrical's
+    // normal is perpendicular to it by construction) degenerates; fall
+    // back to the world axis, then to a fixed one.
+    let nx = bb_norm(bb_cross(up, ny))
+        .or_else(|| bb_norm(bb_cross(BILLBOARD_UP, ny)))
+        .unwrap_or([1.0, 0.0, 0.0]);
+    // `+z` = image vertical (≈ the up axis; exactly it for cylindrical).
     let nz = bb_cross(ny, nx);
     Some(DynSpriteTransform {
         pos,
@@ -806,6 +887,10 @@ pub struct BillboardActorDef {
     pub states: Vec<ActorState>,
     /// How the slab turns to face the camera (default [`BillboardMode::Cylindrical`]).
     pub mode: BillboardMode,
+    /// Where the card's image vertical points, and the axis its directional
+    /// sectors are measured about (BB.6; default [`BillboardUp::World`]).
+    /// Change it live with [`SceneRenderer::set_actor_up`].
+    pub up: BillboardUp,
     /// Shading-normal mode (BB.2b; default [`BillboardLighting::FaceNormal`]).
     pub lighting: BillboardLighting,
     /// Playback rate of the state animation (`1.0` = authored speed,
@@ -825,6 +910,7 @@ impl Default for BillboardActorDef {
         Self {
             states: Vec::new(),
             mode: BillboardMode::Cylindrical,
+            up: BillboardUp::World,
             lighting: BillboardLighting::FaceNormal,
             speed: 1.0,
             scale: 1.0,
@@ -840,6 +926,34 @@ fn speed_to_q8(speed: f32) -> i32 {
     (speed * 256.0).round() as i32
 }
 
+/// Which way a [`BillboardActor`](SceneRenderer::add_billboard_actor) faces
+/// — the reference the directional-sprite picker measures the camera's
+/// bearing against (BB.6).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ActorFacing {
+    /// World yaw in radians (the BB.4 spelling, and the default): `0` faces
+    /// `+x`, increasing toward `+y`. Assumes the actor stands on a
+    /// world-aligned floor.
+    Yaw(f64),
+    /// A **world-space direction vector**, projected into the actor's floor
+    /// plane (the plane its [`BillboardUp`] axis is normal to).
+    ///
+    /// The spelling for an actor riding a moving body: hand over the body's
+    /// nose in world space (its rotation applied to the local facing) and
+    /// the sector is measured in the body's own frame. Composing a *yaw*
+    /// instead would not survive a tilted rotation — rotate-then-flatten and
+    /// flatten-then-rotate disagree, so the picked sprite drifts as the body
+    /// turns.
+    Dir([f32; 3]),
+}
+
+impl Default for ActorFacing {
+    /// Yaw `0` — facing `+x` on a world-aligned floor.
+    fn default() -> Self {
+        Self::Yaw(0.0)
+    }
+}
+
 /// A live directional billboard: one clip instance whose directional clip is
 /// reselected by view angle and whose animation plays a named state.
 struct BillboardActor {
@@ -849,10 +963,12 @@ struct BillboardActor {
     states: Vec<ActorState>,
     cur_state: usize,
     pos: [f32; 3],
-    /// World yaw the actor "faces" (radians); the dir picker compares the
-    /// camera's bearing against it.
-    facing_yaw: f64,
+    /// Which way the actor "faces"; the dir picker compares the camera's
+    /// bearing against it, in the frame set by [`Self::up`].
+    facing: ActorFacing,
     mode: BillboardMode,
+    /// BB.6 — image vertical + the axis the directional sectors turn about.
+    up: BillboardUp,
     clock: ClipClock,
     /// The directional clip currently shown, to avoid redundant clip swaps.
     showing: Option<VoxelClipId>,
@@ -866,27 +982,94 @@ impl BillboardActor {
     fn pick_dir(&self, cam: [f64; 3]) -> usize {
         dir_index(
             self.pos,
-            self.facing_yaw,
+            self.facing,
+            actor_ground_axis(self.up),
             cam,
             self.states[self.cur_state].dirs.len(),
         )
     }
 }
 
-/// Bin a camera's bearing (relative to an actor at `pos` facing `facing_yaw`)
-/// into one of `n` viewing-direction sectors. Index 0 = viewed-from-front
-/// (camera in the actor's facing direction), increasing counter-clockwise.
-/// `n <= 1` or a camera directly above/below ⇒ 0.
-fn dir_index(pos: [f32; 3], facing_yaw: f64, cam: [f64; 3], n: usize) -> usize {
+/// The axis an actor's directional sectors turn about (BB.6): its
+/// [`BillboardUp::Axis`] when it has one, world up otherwise.
+///
+/// [`BillboardUp::Camera`] deliberately maps to **world** up: it is a
+/// statement about the image's roll on screen, not about the floor the actor
+/// stands on — binning sectors about the camera's own up would re-pick the
+/// sprite as you pitch or roll the view. An actor on a moving deck wants
+/// [`BillboardUp::Axis`], which does both.
+fn actor_ground_axis(up: BillboardUp) -> [f32; 3] {
+    match up {
+        BillboardUp::World | BillboardUp::Camera => BILLBOARD_UP,
+        BillboardUp::Axis(v) => bb_norm(v).unwrap_or(BILLBOARD_UP),
+    }
+}
+
+/// Bin a camera's bearing (relative to an actor at `pos` facing `facing`,
+/// standing on the floor `ground` is normal to) into one of `n`
+/// viewing-direction sectors. Index 0 = viewed-from-front (camera in the
+/// actor's facing direction), increasing counter-clockwise. `n <= 1` or a
+/// camera directly above/below ⇒ 0.
+///
+/// `ground` must be **unit** — [`actor_ground_axis`] guarantees it.
+fn dir_index(
+    pos: [f32; 3],
+    facing: ActorFacing,
+    ground: [f32; 3],
+    cam: [f64; 3],
+    n: usize,
+) -> usize {
     if n <= 1 {
         return 0;
     }
-    let dx = cam[0] - f64::from(pos[0]);
-    let dy = cam[1] - f64::from(pos[1]);
-    if dx * dx + dy * dy < 1e-12 {
-        return 0; // camera directly above/below → no horizontal bearing
-    }
-    let rel = (dy.atan2(dx) - facing_yaw).rem_euclid(std::f64::consts::TAU);
+    let rel = match facing {
+        // Fast path — a world-aligned floor and a yaw: the BB.4 expression,
+        // unchanged (so every pre-BB.6 actor bins bit-for-bit as before).
+        ActorFacing::Yaw(yaw) if ground == BILLBOARD_UP => {
+            let dx = cam[0] - f64::from(pos[0]);
+            let dy = cam[1] - f64::from(pos[1]);
+            if dx * dx + dy * dy < 1e-12 {
+                return 0; // camera directly above/below → no horizontal bearing
+            }
+            (dy.atan2(dx) - yaw).rem_euclid(std::f64::consts::TAU)
+        }
+        // General frame: the signed angle from the facing to the camera,
+        // both flattened into the actor's floor plane. Measured about
+        // `-ground` (i.e. "down"), which is what makes the world case
+        // above — where down is `+z` and the angle runs `+x` → `+y` — the
+        // same convention.
+        _ => {
+            let u = [
+                f64::from(ground[0]),
+                f64::from(ground[1]),
+                f64::from(ground[2]),
+            ];
+            let f = match facing {
+                ActorFacing::Yaw(yaw) => [yaw.cos(), yaw.sin(), 0.0],
+                ActorFacing::Dir(d) => [f64::from(d[0]), f64::from(d[1]), f64::from(d[2])],
+            };
+            let t = [
+                cam[0] - f64::from(pos[0]),
+                cam[1] - f64::from(pos[1]),
+                cam[2] - f64::from(pos[2]),
+            ];
+            let reject = |v: [f64; 3]| {
+                let d = v[0] * u[0] + v[1] * u[1] + v[2] * u[2];
+                [v[0] - u[0] * d, v[1] - u[1] * d, v[2] - u[2] * d]
+            };
+            let (fp, tp) = (reject(f), reject(t));
+            let len2 = |v: [f64; 3]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+            if len2(fp) < 1e-12 || len2(tp) < 1e-12 {
+                return 0; // camera on the up axis, or a facing along it
+            }
+            // sin·|fp||tp| = (fp × tp)·(−u), cos·|fp||tp| = fp·tp.
+            let sin = -((fp[1] * tp[2] - fp[2] * tp[1]) * u[0]
+                + (fp[2] * tp[0] - fp[0] * tp[2]) * u[1]
+                + (fp[0] * tp[1] - fp[1] * tp[0]) * u[2]);
+            let cos = fp[0] * tp[0] + fp[1] * tp[1] + fp[2] * tp[2];
+            sin.atan2(cos).rem_euclid(std::f64::consts::TAU)
+        }
+    };
     let sector = std::f64::consts::TAU / n as f64;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let idx = (rel / sector).round() as usize % n;
@@ -3242,7 +3425,12 @@ impl SceneRenderer {
             ..Default::default()
         };
         let id = self.add_clip_instance_posed(clip, xf)?;
-        self.billboards.push(BillboardRec { id, pos, mode });
+        self.billboards.push(BillboardRec {
+            id,
+            pos,
+            mode,
+            up: BillboardUp::World,
+        });
         Some(id)
     }
 
@@ -3250,6 +3438,18 @@ impl SceneRenderer {
     pub fn set_billboard_mode(&mut self, id: SpriteInstanceId, mode: BillboardMode) {
         if let Some(b) = self.billboards.iter_mut().find(|b| b.id == id) {
             b.mode = mode;
+        }
+    }
+
+    /// Change where a billboard instance's **image vertical** points (BB.6)
+    /// — world up (the spawn default), the camera's up, or an app-supplied
+    /// axis. Takes effect on the next
+    /// [`face_billboards_to`](Self::face_billboards_to); a card riding a
+    /// turning body wants this re-set as the body turns. No-op on a
+    /// non-billboard id.
+    pub fn set_billboard_up(&mut self, id: SpriteInstanceId, up: BillboardUp) {
+        if let Some(b) = self.billboards.iter_mut().find(|b| b.id == id) {
+            b.up = up;
         }
     }
 
@@ -3270,14 +3470,13 @@ impl SceneRenderer {
     /// instance was removed are pruned; a degenerate pose (camera on the
     /// sprite's vertical axis) is skipped for that frame.
     pub fn face_billboards_to(&mut self, camera: &Camera) {
-        let cam = camera.pos;
         let dyn_map = &self.dyn_map;
         let mut updates: Vec<(SpriteInstanceId, DynSpriteTransform)> = Vec::new();
         self.billboards.retain(|b| {
             if dyn_map.dyn_index(b.id).is_none() {
                 return false; // the instance was removed → drop the record
             }
-            if let Some(xf) = billboard_transform(b.pos, cam, b.mode) {
+            if let Some(xf) = billboard_transform(b.pos, camera, b.mode, b.up) {
                 updates.push((b.id, xf));
             }
             true
@@ -3340,8 +3539,9 @@ impl SceneRenderer {
             states: def.states,
             cur_state: 0,
             pos,
-            facing_yaw,
+            facing: ActorFacing::Yaw(facing_yaw),
             mode: def.mode,
+            up: def.up,
             clock,
             showing: None,
             speed: def.speed,
@@ -3375,17 +3575,74 @@ impl SceneRenderer {
         true
     }
 
-    /// Move/turn an actor. Its orientation + directional clip update on the
+    /// Move/turn an actor on a world-aligned floor — the shorthand for
+    /// [`set_actor_facing`](Self::set_actor_facing) with an
+    /// [`ActorFacing::Yaw`]. Its orientation + directional clip update on the
     /// next [`update_billboard_actors`](Self::update_billboard_actors). No-op
     /// on a stale id.
     pub fn set_actor_transform(&mut self, id: BillboardActorId, pos: [f32; 3], facing_yaw: f64) {
+        self.set_actor_pose_inner(id, Some(pos), Some(ActorFacing::Yaw(facing_yaw)), None);
+    }
+
+    /// Turn an actor, in whatever frame it stands in (BB.6) — a world yaw,
+    /// or a world-space direction for an actor riding a moving body.
+    /// Returns `false` on a stale id.
+    pub fn set_actor_facing(&mut self, id: BillboardActorId, facing: ActorFacing) -> bool {
+        self.set_actor_pose_inner(id, None, Some(facing), None)
+    }
+
+    /// Change an actor's up axis at runtime (BB.6) — the per-actor
+    /// counterpart to [`BillboardActorDef::up`]. Both the card's image
+    /// vertical and the axis its directional sectors turn about. Returns
+    /// `false` on a stale id.
+    pub fn set_actor_up(&mut self, id: BillboardActorId, up: BillboardUp) -> bool {
+        self.set_actor_pose_inner(id, None, None, Some(up))
+    }
+
+    /// Position + facing + up axis in one call (BB.6) — the per-frame update
+    /// for an actor riding a moving body, where all three change together:
+    ///
+    /// ```ignore
+    /// // crew member standing on a tumbling ship's deck
+    /// r.set_actor_pose(id, world_pos, ActorFacing::Dir(hull_rot * nose), BillboardUp::Axis(deck_up));
+    /// ```
+    ///
+    /// Returns `false` on a stale id.
+    pub fn set_actor_pose(
+        &mut self,
+        id: BillboardActorId,
+        pos: [f32; 3],
+        facing: ActorFacing,
+        up: BillboardUp,
+    ) -> bool {
+        self.set_actor_pose_inner(id, Some(pos), Some(facing), Some(up))
+    }
+
+    /// Shared body of the pose setters: apply the `Some` parts, leave the
+    /// rest. `false` on a stale id.
+    fn set_actor_pose_inner(
+        &mut self,
+        id: BillboardActorId,
+        pos: Option<[f32; 3]>,
+        facing: Option<ActorFacing>,
+        up: Option<BillboardUp>,
+    ) -> bool {
         let Some(idx) = self.actor_map.index(id) else {
-            return;
+            return false;
         };
-        if let Some(a) = self.billboard_actors[idx].as_mut() {
+        let Some(a) = self.billboard_actors[idx].as_mut() else {
+            return false;
+        };
+        if let Some(pos) = pos {
             a.pos = pos;
-            a.facing_yaw = facing_yaw;
         }
+        if let Some(facing) = facing {
+            a.facing = facing;
+        }
+        if let Some(up) = up {
+            a.up = up;
+        }
+        true
     }
 
     /// Change an actor's lighting mode at runtime (BB.2b) — the per-actor
@@ -3461,7 +3718,7 @@ impl SceneRenderer {
                 desired
             });
             let frame = a.clock.tick(dt);
-            let xf = billboard_transform(a.pos, cam, a.mode).map(|mut xf| {
+            let xf = billboard_transform(a.pos, camera, a.mode, a.up).map(|mut xf| {
                 for axis in [&mut xf.right, &mut xf.up, &mut xf.forward] {
                     for c in axis.iter_mut() {
                         *c *= a.scale;
@@ -4669,6 +4926,21 @@ mod tests {
     fn unit(v: [f32; 3]) -> bool {
         (dot(v, v) - 1.0).abs() < 1e-5
     }
+    /// A camera at `pos` with the canonical level basis. `billboard_transform`
+    /// reads only `pos` unless the billboard asks for `BillboardUp::Camera`.
+    fn cam_at(pos: [f64; 3]) -> Camera {
+        Camera::from_yaw_pitch(pos, 0.0, 0.0)
+    }
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5)
+    }
+    /// Orthonormal (and so non-degenerate) slab basis.
+    fn orthonormal(xf: &DynSpriteTransform) -> bool {
+        [xf.right, xf.up, xf.forward].iter().all(|v| unit(*v))
+            && dot(xf.right, xf.up).abs() < 1e-5
+            && dot(xf.up, xf.forward).abs() < 1e-5
+            && dot(xf.right, xf.forward).abs() < 1e-5
+    }
 
     #[test]
     fn billboard_cylindrical_faces_camera_upright_and_ignores_height() {
@@ -4676,8 +4948,9 @@ mod tests {
         // at the camera horizontally; image vertical (local +z) is world up.
         let xf = billboard_transform(
             [0.0, 0.0, 0.0],
-            [10.0, 0.0, 0.0],
+            &cam_at([10.0, 0.0, 0.0]),
             BillboardMode::Cylindrical,
+            BillboardUp::World,
         )
         .expect("non-degenerate");
         assert_eq!(xf.up, [1.0, 0.0, 0.0]); // normal → toward camera
@@ -4687,8 +4960,9 @@ mod tests {
                                                 // the same (vertical) basis.
         let high = billboard_transform(
             [0.0, 0.0, 0.0],
-            [10.0, 0.0, -50.0],
+            &cam_at([10.0, 0.0, -50.0]),
             BillboardMode::Cylindrical,
+            BillboardUp::World,
         )
         .unwrap();
         assert_eq!(high.up, xf.up);
@@ -4707,7 +4981,13 @@ mod tests {
         // Camera above (-z) and in front (+x): the normal tilts up; the
         // image vertical gains an up-tilt too (unlike cylindrical).
         let cam = [10.0, 0.0, -10.0];
-        let xf = billboard_transform([0.0, 0.0, 0.0], cam, BillboardMode::Spherical).unwrap();
+        let xf = billboard_transform(
+            [0.0, 0.0, 0.0],
+            &cam_at(cam),
+            BillboardMode::Spherical,
+            BillboardUp::World,
+        )
+        .unwrap();
         // Normal (local +y) = normalized direction to the camera.
         let n = bb_norm([cam[0] as f32, cam[1] as f32, cam[2] as f32]).unwrap();
         for (u, ni) in xf.up.iter().zip(n.iter()) {
@@ -4726,25 +5006,27 @@ mod tests {
     #[test]
     fn dir_index_bins_view_angle_front_ccw() {
         let o = [0.0, 0.0, 0.0];
+        let w = BILLBOARD_UP; // world-aligned floor
+        let yaw = ActorFacing::Yaw;
         // N == 1 (non-directional) is always 0, regardless of camera.
-        assert_eq!(dir_index(o, 0.0, [5.0, 3.0, 0.0], 1), 0);
+        assert_eq!(dir_index(o, yaw(0.0), w, [5.0, 3.0, 0.0], 1), 0);
         // 8-way, actor facing +x (yaw 0). Camera in front (+x) = front = 0.
-        assert_eq!(dir_index(o, 0.0, [10.0, 0.0, 0.0], 8), 0);
+        assert_eq!(dir_index(o, yaw(0.0), w, [10.0, 0.0, 0.0], 8), 0);
         // Camera at +y (90° CCW from facing) → sector 2 (90° / 45°).
-        assert_eq!(dir_index(o, 0.0, [0.0, 10.0, 0.0], 8), 2);
+        assert_eq!(dir_index(o, yaw(0.0), w, [0.0, 10.0, 0.0], 8), 2);
         // Camera behind (−x, 180°) → sector 4.
-        assert_eq!(dir_index(o, 0.0, [-10.0, 0.0, 0.0], 8), 4);
+        assert_eq!(dir_index(o, yaw(0.0), w, [-10.0, 0.0, 0.0], 8), 4);
         // Camera at −y (270°) → sector 6.
-        assert_eq!(dir_index(o, 0.0, [0.0, -10.0, 0.0], 8), 6);
+        assert_eq!(dir_index(o, yaw(0.0), w, [0.0, -10.0, 0.0], 8), 6);
         // Rotating the actor's facing rotates the picked sector: facing +y
         // (yaw 90°), camera at +y is now "front" → 0.
         let fy = std::f64::consts::FRAC_PI_2;
-        assert_eq!(dir_index(o, fy, [0.0, 10.0, 0.0], 8), 0);
+        assert_eq!(dir_index(o, yaw(fy), w, [0.0, 10.0, 0.0], 8), 0);
         // Camera straight overhead (no horizontal bearing) → 0.
-        assert_eq!(dir_index(o, 0.0, [0.0, 0.0, -10.0], 8), 0);
+        assert_eq!(dir_index(o, yaw(0.0), w, [0.0, 0.0, -10.0], 8), 0);
         // 4-way still bins front/left/back/right.
-        assert_eq!(dir_index(o, 0.0, [10.0, 0.0, 0.0], 4), 0);
-        assert_eq!(dir_index(o, 0.0, [0.0, 10.0, 0.0], 4), 1);
+        assert_eq!(dir_index(o, yaw(0.0), w, [10.0, 0.0, 0.0], 4), 0);
+        assert_eq!(dir_index(o, yaw(0.0), w, [0.0, 10.0, 0.0], 4), 1);
     }
 
     #[test]
@@ -4804,19 +5086,240 @@ mod tests {
         // camera at the actor's own xy column degenerated every
         // frame). The card is edge-on right then, so the facing
         // itself is cosmetically irrelevant.
+        let overhead = cam_at([1.0, 2.0, -10.0]);
         let xf = billboard_transform(
             [1.0, 2.0, 0.0],
-            [1.0, 2.0, -10.0],
+            &overhead,
             BillboardMode::Cylindrical,
+            BillboardUp::World,
         )
         .expect("degenerate cylindrical falls back, not drops");
         assert_eq!(xf.pos, [1.0, 2.0, 0.0], "position always lands");
-        let xf = billboard_transform([1.0, 2.0, 0.0], [1.0, 2.0, -10.0], BillboardMode::Spherical)
-            .expect("degenerate spherical falls back, not drops");
+        let xf = billboard_transform(
+            [1.0, 2.0, 0.0],
+            &overhead,
+            BillboardMode::Spherical,
+            BillboardUp::World,
+        )
+        .expect("degenerate spherical falls back, not drops");
         assert_eq!(xf.pos, [1.0, 2.0, 0.0]);
+        // BB.6: a spherical card looking straight down its own up axis is
+        // the other degenerate pose — it must fall back too, not spin out.
+        let xf = billboard_transform(
+            [1.0, 2.0, 0.0],
+            &overhead,
+            BillboardMode::Spherical,
+            BillboardUp::Axis([0.0, 0.0, -1.0]),
+        )
+        .expect("view along the up axis falls back");
+        assert_eq!(xf.pos, [1.0, 2.0, 0.0]);
+        assert!(orthonormal(&xf), "fallback basis is still usable");
         // None mode is never auto-oriented.
+        assert!(billboard_transform(
+            [0.0, 0.0, 0.0],
+            &cam_at([10.0, 0.0, 0.0]),
+            BillboardMode::None,
+            BillboardUp::World
+        )
+        .is_none());
+    }
+
+    // ---- BB.6: billboard up axis -----------------------------------------
+
+    /// Rotate `v` about the unit-ish `axis` by `ang` (Rodrigues).
+    fn rot(v: [f64; 3], axis: [f64; 3], ang: f64) -> [f64; 3] {
+        let m = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        let n = [axis[0] / m, axis[1] / m, axis[2] / m];
+        let (s, c) = ang.sin_cos();
+        let d = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
+        let cr = [
+            n[1] * v[2] - n[2] * v[1],
+            n[2] * v[0] - n[0] * v[2],
+            n[0] * v[1] - n[1] * v[0],
+        ];
+        [
+            v[0] * c + cr[0] * s + n[0] * d * (1.0 - c),
+            v[1] * c + cr[1] * s + n[1] * d * (1.0 - c),
+            v[2] * c + cr[2] * s + n[2] * d * (1.0 - c),
+        ]
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    fn to_f32(v: [f64; 3]) -> [f32; 3] {
+        [v[0] as f32, v[1] as f32, v[2] as f32]
+    }
+
+    #[test]
+    fn billboard_camera_up_rides_a_rolled_camera() {
+        // A camera looking down −x at the origin, rolled 30° about its own
+        // forward axis — the monada case: the view frame rides a turning
+        // grid, so `right`/`down` are no longer level with the world.
+        let mut cam = Camera::from_yaw_pitch([10.0, 0.0, 0.0], std::f64::consts::PI, 0.0);
+        let (s, c) = 30f64.to_radians().sin_cos();
+        let (r0, d0) = (cam.right, cam.down);
+        cam.right = [
+            r0[0] * c + d0[0] * s,
+            r0[1] * c + d0[1] * s,
+            r0[2] * c + d0[2] * s,
+        ];
+        cam.down = [
+            -r0[0] * s + d0[0] * c,
+            -r0[1] * s + d0[1] * c,
+            -r0[2] * s + d0[2] * c,
+        ];
+        let cam_up = to_f32([-cam.down[0], -cam.down[1], -cam.down[2]]);
+        let o = [0.0, 0.0, 0.0];
+
+        // World up (pre-BB.6, unchanged): the card ignores the roll, so on
+        // screen it leans by exactly the roll angle — the reported bug.
+        let world = billboard_transform(o, &cam, BillboardMode::Cylindrical, BillboardUp::World)
+            .expect("non-degenerate");
+        assert_eq!(world.forward, BILLBOARD_UP);
+        assert!(dot(world.forward, cam_up) < 0.99, "leans against the view");
+
+        // Camera up: the image vertical IS the camera's up, so the card
+        // stays upright on screen whatever the camera's roll.
+        let locked = billboard_transform(o, &cam, BillboardMode::Spherical, BillboardUp::Camera)
+            .expect("non-degenerate");
+        assert!(close(locked.forward, cam_up), "image vertical = camera up");
+        assert!(close(locked.up, [1.0, 0.0, 0.0]), "normal → toward camera");
+        assert!(orthonormal(&locked));
+        assert_eq!(locked.pos, o, "the anchor never moves");
+
+        // Cylindrical + Camera up is meaningful too: same roll, normal still
+        // in the plane the up axis is normal to.
+        let cyl = billboard_transform(o, &cam, BillboardMode::Cylindrical, BillboardUp::Camera)
+            .expect("non-degenerate");
+        assert!(close(cyl.forward, cam_up));
+        assert!(dot(cyl.up, cam_up).abs() < 1e-5);
+        assert!(orthonormal(&cyl));
+    }
+
+    #[test]
+    fn billboard_axis_up_stands_on_a_tilted_deck() {
+        // Deck up = world up tilted 40° about +x. A cylindrical card on that
+        // deck stands along the deck's up, not the world's.
+        let deck = to_f32(rot([0.0, 0.0, -1.0], [1.0, 0.0, 0.0], 40f64.to_radians()));
+        let xf = billboard_transform(
+            [0.0, 0.0, 0.0],
+            &cam_at([10.0, 0.0, 0.0]),
+            BillboardMode::Cylindrical,
+            BillboardUp::Axis(deck),
+        )
+        .expect("non-degenerate");
+        assert!(close(xf.forward, deck), "image vertical = the deck's up");
         assert!(
-            billboard_transform([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], BillboardMode::None).is_none()
+            dot(xf.up, deck).abs() < 1e-5,
+            "normal lies in the deck plane"
+        );
+        assert!(orthonormal(&xf));
+        assert_eq!(xf.pos, [0.0, 0.0, 0.0], "the anchor never moves");
+
+        // A zero axis is not a way to lose a billboard: it falls back to
+        // world up, matching `BillboardUp::World` exactly.
+        let zero = billboard_transform(
+            [0.0, 0.0, 0.0],
+            &cam_at([10.0, 0.0, 0.0]),
+            BillboardMode::Cylindrical,
+            BillboardUp::Axis([0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        let world = billboard_transform(
+            [0.0, 0.0, 0.0],
+            &cam_at([10.0, 0.0, 0.0]),
+            BillboardMode::Cylindrical,
+            BillboardUp::World,
+        )
+        .unwrap();
+        assert_eq!(zero.forward, world.forward);
+        assert_eq!(zero.right, world.right);
+        assert_eq!(zero.up, world.up);
+    }
+
+    #[test]
+    fn actor_ground_axis_follows_only_an_explicit_axis() {
+        // Camera-up is about the image's roll on screen, not the floor the
+        // actor stands on: its sectors stay world-framed.
+        assert_eq!(actor_ground_axis(BillboardUp::World), BILLBOARD_UP);
+        assert_eq!(actor_ground_axis(BillboardUp::Camera), BILLBOARD_UP);
+        assert_eq!(
+            actor_ground_axis(BillboardUp::Axis([0.0, 0.0, -2.0])),
+            BILLBOARD_UP,
+            "normalized"
+        );
+        assert_eq!(
+            actor_ground_axis(BillboardUp::Axis([0.0, 0.0, 0.0])),
+            BILLBOARD_UP,
+            "degenerate axis falls back"
+        );
+    }
+
+    #[test]
+    fn dir_index_dir_facing_matches_yaw_on_a_world_floor() {
+        // The two spellings agree wherever both are meaningful (so moving a
+        // world-floor actor onto `ActorFacing::Dir` changes nothing).
+        let o = [0.0, 0.0, 0.0];
+        for k in 0..24 {
+            // Off the sector boundaries: the two paths are different
+            // floating-point expressions, so a bearing landing exactly on a
+            // `round()` tie is free to fall either way.
+            let a = (f64::from(k) + 0.37) * std::f64::consts::TAU / 24.0;
+            let cam = [30.0 * a.cos(), 30.0 * a.sin(), -4.0];
+            for fk in 0..7 {
+                let f = f64::from(fk) * 0.7;
+                let by_yaw = dir_index(o, ActorFacing::Yaw(f), BILLBOARD_UP, cam, 8);
+                let dir = to_f32([f.cos(), f.sin(), 0.0]);
+                let by_dir = dir_index(o, ActorFacing::Dir(dir), BILLBOARD_UP, cam, 8);
+                assert_eq!(by_yaw, by_dir, "yaw {f} vs dir at camera angle {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn dir_index_measures_the_bearing_in_the_actors_own_frame() {
+        // The whole configuration — floor, facing, camera — rotated about a
+        // TILTED axis (the ship's tumble). The sector must be invariant:
+        // an actor standing still on a turning deck must not appear to spin.
+        let axis = [0.6, 0.0, 1.0];
+        let ang = 1.4;
+        let up = to_f32(rot([0.0, 0.0, -1.0], axis, ang));
+        let facing = to_f32(rot([1.0, 0.0, 0.0], axis, ang));
+        let mut framed = Vec::new();
+        let mut naive = Vec::new();
+        for k in 0..64 {
+            // Off the sector boundaries (see the note in the sibling test):
+            // a tie is free to fall either way.
+            let a = (f64::from(k) + 0.37) * std::f64::consts::TAU / 64.0;
+            let flat = [30.0 * a.cos(), 30.0 * a.sin(), -6.0];
+            let world = dir_index([0.0; 3], ActorFacing::Yaw(0.0), BILLBOARD_UP, flat, 8);
+            // Same camera, seen in the rotated frame.
+            let cam = rot(flat, axis, ang);
+            framed.push((
+                world,
+                dir_index([0.0; 3], ActorFacing::Dir(facing), up, cam, 8),
+            ));
+            // What a consumer gets by composing a *world yaw* instead:
+            // rotate-then-flatten ≠ flatten-then-rotate under a tilt.
+            let yaw = f64::from(facing[1]).atan2(f64::from(facing[0]));
+            naive.push(dir_index(
+                [0.0; 3],
+                ActorFacing::Yaw(yaw),
+                BILLBOARD_UP,
+                cam,
+                8,
+            ));
+        }
+        for (world, framed) in &framed {
+            assert_eq!(world, framed, "sector is invariant under the deck's turn");
+        }
+        let drifted = framed
+            .iter()
+            .zip(naive.iter())
+            .filter(|((_, f), n)| f != *n)
+            .count();
+        assert!(
+            drifted >= 2,
+            "the world-yaw spelling is what drifts — that is the bug this fixes \
+             (framed {framed:?} vs naive {naive:?})"
         );
     }
 

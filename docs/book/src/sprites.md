@@ -101,6 +101,18 @@ special path:
 its cast shadow stays a sane vertical card); `Spherical` also pitches
 with the view. `tick` re-faces every billboard each frame.
 
+**Which way is up** is the other half, and a separate knob:
+`BillboardUp` (`set_billboard_up`, `BillboardActorDef::up`,
+`set_actor_up`). `World` is world up — the default, and what a
+Doom/Build scene wants. `Camera` takes the camera's own up, so a
+**rolled** camera never leaves the art leaning; `Axis(v)` takes a
+world-space axis you supply — hand over a grid's up and cards stand on
+that grid's deck however it is tilted, and `Cylindrical` yaws about it
+instead of the world vertical. Whichever you pick, the card turns
+about its anchor, so a figure's feet stay planted. The trade is
+shadows: a card that tracks the camera casts a shadow that turns as
+you orbit, which is why world up stays the default.
+
 **Importing 2D art**: with the `gif` / `png` cargo features,
 `gif_import` / `png_import` turn an animated GIF or a PNG sequence
 into a voxel clip — each frame a 1-voxel-thick cutout slab, palette
@@ -111,9 +123,16 @@ monsters: draw (or rip) sprite sheets, import, place.
 for such monsters: a `BillboardActorDef` holds named **states**
 ("walk", "attack", …), each with **N-way directional clips** (8-way
 in the demo); every `tick` the renderer picks the clip from the
-camera's bearing versus the actor's `facing_yaw`, faces it, and
+camera's bearing versus the actor's facing, faces it, and
 advances its animation. Drive gameplay with `set_actor_state` /
-`set_actor_transform` / `set_actor_tint`. Lighting per actor or
+`set_actor_transform` / `set_actor_tint`. An actor riding a moving
+body — crew on a turning ship — wants `set_actor_pose` instead: give
+it `ActorFacing::Dir(world_direction)` and `BillboardUp::Axis(deck_up)`
+and both the card's vertical and its directional sector are measured
+in the deck's frame, so it neither leans nor spins on the spot as the
+hull turns. (Composing that facing into a world *yaw* is what does not
+survive a tilted rotation: flattening and rotating do not commute.)
+Lighting per actor or
 instance via `BillboardLighting` — `FullBright` for pickups and
 projectiles that shouldn't darken in shadow.
 `BillboardActorDef::scale` sets world units per slab voxel (`1.0` =

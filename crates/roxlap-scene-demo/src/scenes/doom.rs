@@ -19,15 +19,22 @@
 //!   `face_billboards_to`, whose **lighting mode** (BB.2b: `FaceNormal` /
 //!   `WorldUp` / `AmbientOnly` / `FullBright`) cycles with `L` (the flame is
 //!   `FullBright` — emissive).
+//! - **`BillboardUp`** (BB.6) — `R` rolls the camera (the case a camera
+//!   riding a rotating grid hits), `U` cycles the monster + signpost through
+//!   `World` / `Camera` / `Axis` up: under roll the world-up cards lean with
+//!   the view, the camera-up ones stay upright on screen, and the `Axis` one
+//!   stands on a deck tilted 25° off world up.
 //!
 //! Controls: WASD+mouse fly · `Q`/`E` turn the monster · `Space` walk/idle ·
-//! `K` toggle sun shadows · `L` cycle the signpost's lighting mode.
+//! `K` toggle sun shadows · `L` cycle the signpost's lighting mode ·
+//! `R` roll the camera · `U` cycle the billboard up axis.
 
 use glam::{DVec3, IVec3};
+use roxlap_core::Camera;
 use roxlap_render::VoxColor;
 use roxlap_render::{
     gif_import::{voxel_clip_from_gif, GifImportOpts},
-    ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode,
+    ActorState, BillboardActorDef, BillboardActorId, BillboardLighting, BillboardMode, BillboardUp,
     DirectionalLight, LightRig, ShadowFlags, SpriteInstanceId, VoxelClipId,
 };
 use roxlap_scene::{GridTransform, Scene};
@@ -66,6 +73,36 @@ pub struct DoomScene {
     /// BB.2b — the monster actor's lighting mode, cycled by `O` (dogfoods
     /// the runtime `set_actor_lighting`).
     monster_light: BillboardLighting,
+    /// BB.6 — camera roll about its forward axis (radians), stepped by `R`.
+    /// Stands in for a camera riding a rotating grid, which is where a
+    /// world-up card visibly leans.
+    cam_roll: f64,
+    /// BB.6 — up axis of the monster + signpost, cycled by `U`.
+    billboard_up: BillboardUp,
+}
+
+/// BB.6 — a 25°-off-world "deck" up axis: what an actor standing on a
+/// tilted platform would be given (`grid rotation × world up`).
+const DECK_UP: BillboardUp = BillboardUp::Axis([0.0, 0.422_618_3, -0.906_307_8]);
+
+/// Roll `cam` about its own forward axis by `ang` radians (the demo's stand-in
+/// for a camera whose frame rides a turning grid).
+fn rolled(cam: &Camera, ang: f64) -> Camera {
+    let (s, c) = ang.sin_cos();
+    let (r, d) = (cam.right, cam.down);
+    Camera {
+        right: [
+            r[0] * c + d[0] * s,
+            r[1] * c + d[1] * s,
+            r[2] * c + d[2] * s,
+        ],
+        down: [
+            -r[0] * s + d[0] * c,
+            -r[1] * s + d[1] * c,
+            -r[2] * s + d[2] * c,
+        ],
+        ..*cam
+    }
 }
 
 impl DoomScene {
@@ -82,7 +119,14 @@ impl DoomScene {
             standalone: None,
             standalone_light: BillboardLighting::FaceNormal,
             monster_light: BillboardLighting::FaceNormal,
+            cam_roll: 0.0,
+            billboard_up: BillboardUp::World,
         }
+    }
+
+    /// The frame's camera — the shared fly-rig, rolled by `R` (BB.6).
+    fn camera(&self, ctx: &SceneCtx) -> Camera {
+        rolled(&ctx.cam.camera(), self.cam_roll)
     }
 
     /// A grass floor with two stone pillars — vertical geometry for the sun
@@ -144,7 +188,7 @@ impl DemoScene for DoomScene {
     }
 
     fn controls(&self) -> &'static str {
-        "WASD fly · Q/E turn monster · Space walk/idle · K sun shadows · L signpost light · O monster light"
+        "WASD fly · Q/E turn monster · Space walk/idle · K sun shadows · L signpost light · O monster light · R camera roll · U up axis"
     }
 
     fn start_pose(&self) -> CameraPose {
@@ -183,6 +227,8 @@ impl DemoScene for DoomScene {
                 },
             ],
             mode: BillboardMode::Cylindrical,
+            // BB.6 — cycled at runtime by `U` (see `set_actor_up`).
+            up: BillboardUp::World,
             lighting: BillboardLighting::FaceNormal,
             speed: 1.0,
             scale: 1.0,
@@ -202,6 +248,7 @@ impl DemoScene for DoomScene {
                 dirs: vec![flame],
             }],
             mode: BillboardMode::Cylindrical,
+            up: BillboardUp::World,
             // A flame is emissive — full-bright so it glows instead of being
             // dimmed by the scene's ambient/sun.
             lighting: BillboardLighting::FullBright,
@@ -230,7 +277,10 @@ impl DemoScene for DoomScene {
         self.clock += dt;
         // One tick drives the directional actors (pick dir-clip +
         // animate + face camera) and orients the standalone billboard.
-        ctx.renderer.tick(&ctx.cam.camera(), dt);
+        // The camera it faces must be the one we render with — roll
+        // included, or `BillboardUp::Camera` would face a phantom.
+        let camera = self.camera(ctx);
+        ctx.renderer.tick(&camera, dt);
     }
 
     fn on_input(&mut self, ctx: &mut SceneCtx, ev: &SceneInput) {
@@ -274,6 +324,26 @@ impl DemoScene for DoomScene {
                 }
                 eprintln!("signpost lighting = {:?}", self.standalone_light);
             }
+            KeyCode::KeyR => {
+                // BB.6 — roll the camera 15° a step (six steps = 90°).
+                self.cam_roll += 15f64.to_radians();
+                eprintln!("camera roll = {:.0}°", self.cam_roll.to_degrees());
+            }
+            KeyCode::KeyU => {
+                // BB.6 — cycle where the cards' image vertical comes from.
+                // Under roll: World leans with the view, Camera stays
+                // upright on screen, Axis stands on the tilted deck.
+                self.billboard_up = match self.billboard_up {
+                    BillboardUp::World => BillboardUp::Camera,
+                    BillboardUp::Camera => DECK_UP,
+                    BillboardUp::Axis(_) => BillboardUp::World,
+                };
+                ctx.renderer.set_actor_up(monster, self.billboard_up);
+                if let Some(s) = self.standalone {
+                    ctx.renderer.set_billboard_up(s, self.billboard_up);
+                }
+                eprintln!("billboard up = {:?}", self.billboard_up);
+            }
             KeyCode::KeyO => {
                 // BB.2b — cycle the monster actor's lighting via set_actor_lighting.
                 self.monster_light = cycle_lighting(self.monster_light);
@@ -304,7 +374,7 @@ impl DemoScene for DoomScene {
             bands: 6,
             shadow_tint: [0.16, 0.2, 0.34],
         });
-        let camera = ctx.cam.camera();
+        let camera = self.camera(ctx);
         ctx.renderer.render(&mut self.scene, &camera, &frame);
     }
 
@@ -319,6 +389,15 @@ impl DemoScene for DoomScene {
             format!(
                 "lighting — signpost {:?} (L) · monster {:?} (O)",
                 self.standalone_light, self.monster_light
+            ),
+            format!(
+                "up axis {} (U) · camera roll {:.0}° (R)",
+                match self.billboard_up {
+                    BillboardUp::World => "World",
+                    BillboardUp::Camera => "Camera",
+                    BillboardUp::Axis(_) => "Axis (25° deck)",
+                },
+                self.cam_roll.to_degrees(),
             ),
         ]
     }
