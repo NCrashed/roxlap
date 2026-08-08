@@ -14,10 +14,10 @@ readme.workspace = true
 
 [dependencies]
 # Both backends + the scene/world types they consume.
-roxlap-core = { path = "../roxlap-core", version = "0.31" }
-roxlap-formats = { path = "../roxlap-formats", version = "0.31" }
-roxlap-scene = { path = "../roxlap-scene", version = "0.31" }
-roxlap-gpu = { path = "../roxlap-gpu", version = "0.31" }
+roxlap-core = { path = "../roxlap-core", version = "0.32" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.32" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.32" }
+roxlap-gpu = { path = "../roxlap-gpu", version = "0.32" }
 glam = { workspace = true }
 # QE.2b — diagnostics through the `log` facade (hosts pick the logger).
 log = { workspace = true }

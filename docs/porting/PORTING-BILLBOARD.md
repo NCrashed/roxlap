@@ -385,7 +385,8 @@ One sub-stage per commit, each green on `cargo test/clippy/build
 --workspace`. BB.0 (pure formats) + BB.1 land first; billboarding + shadow
 flags next; the actor + demo close the stage. **BB.6** re-opened the stage
 in 2026-08 for the up-axis generalisation (see the row above); the
-originating request is `docs/handover-billboard-camera-up.md`.
+originating request is `docs/handover-billboard-camera-up.md`, and it ships
+in **0.32.0** (MINOR — one new `BillboardActorDef` field).
 
 ## Post-stage follow-ups (landed)
 

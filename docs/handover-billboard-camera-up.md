@@ -1,8 +1,8 @@
 # Handover: billboards keep world up, so a ROLLED camera leans them
 
-Status: **IMPLEMENTED 2026-08-08 as BB.6** — see `PORTING-BILLBOARD.md`
-(BB.6 row) and the CHANGELOG's `[Unreleased]`. What landed, versus the
-proposal below:
+Status: **IMPLEMENTED 2026-08-08 as BB.6**, cut as **roxlap 0.32.0** — see
+`PORTING-BILLBOARD.md` (BB.6 row) and the CHANGELOG. What landed, versus
+the proposal below:
 
 - The **second spelling** was taken: `BillboardUp {World, Camera, Axis([f32;3])}`
   is an independent knob on `BillboardMode`, not a fourth mode. `Axis` was

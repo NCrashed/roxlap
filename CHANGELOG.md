@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.32.0] — 2026-08-08
+
+**Billboard up axis (BB.6)** — a billboard's image vertical was a
+world-up constant, which is fine until the camera rolls. It does roll
+as soon as the view frame rides a rotating grid (a camera bolted to a
+turning ship, so its deck holds still on screen), and then every
+upright card leans while the deck under it looks level. `BillboardMode`
+now picks only which way a card faces; the new `BillboardUp` picks
+which way is up inside it — world up (unchanged, still the default),
+the camera's own up, or an app-supplied axis such as a grid's. Actors
+got the matching frame for their directional sprites, so one standing
+on a turning deck no longer drifts through its sprite rotations.
+MINOR: additive except one new `BillboardActorDef` field.
+
 ### Added: `BillboardUp` — where a billboard's image vertical comes from (BB.6)
 
 Billboards took their image vertical from a world-up constant, so a
@@ -3633,7 +3647,13 @@ Initial public release of the roxlap workspace.
 [0.1.1]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.1
 [0.1.0]: https://github.com/NCrashed/roxlap/releases/tag/v0.1.0
 
-[Unreleased]: https://github.com/NCrashed/roxlap/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/NCrashed/roxlap/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/NCrashed/roxlap/compare/v0.31.1...v0.32.0
+[0.31.1]: https://github.com/NCrashed/roxlap/compare/v0.31.0...v0.31.1
+[0.31.0]: https://github.com/NCrashed/roxlap/compare/v0.30.1...v0.31.0
+[0.30.1]: https://github.com/NCrashed/roxlap/compare/v0.30.0...v0.30.1
+[0.30.0]: https://github.com/NCrashed/roxlap/compare/v0.29.0...v0.30.0
+[0.29.0]: https://github.com/NCrashed/roxlap/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/NCrashed/roxlap/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/NCrashed/roxlap/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/NCrashed/roxlap/compare/v0.25.0...v0.26.0

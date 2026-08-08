@@ -18,10 +18,10 @@ categories = ["game-development", "multimedia::audio"]
 # — the trait boundary `AudioOut` keeps the backend swappable; see
 # docs/porting/PORTING-AUDIO.md.
 [dependencies]
-roxlap-scene = { path = "../roxlap-scene", version = "0.31" }
+roxlap-scene = { path = "../roxlap-scene", version = "0.32" }
 # AU2.0 — colour→material classification for per-material absorption
 # (the same `material_for_color` map the renderer + debris system use).
-roxlap-formats = { path = "../roxlap-formats", version = "0.31" }
+roxlap-formats = { path = "../roxlap-formats", version = "0.32" }
 glam = { workspace = true }
 # AU.2 — pinned MINOR (kira has a history of breaking track-API
 # redesigns: 0.9→0.10→0.12); every kira type stays behind `AudioOut`.
