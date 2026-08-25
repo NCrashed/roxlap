@@ -172,6 +172,20 @@ pub struct VisionConfig {
     /// per-deck query. Must stay the same length across
     /// [`FogOfWar::set_config`] calls (layers are keyed by index).
     pub decks: Vec<DeckBand>,
+    /// Whether never-seen ground on the observer's OWN deck is drawn as
+    /// opaque black instead of being treated as air.
+    ///
+    /// Default `false`, which is the first-person reading: you are inside
+    /// a hull, so unexplored floor is a hole and the ray carries on to the
+    /// wall behind it. Seen from above and outdoors that same hole shows
+    /// the **sky** through the ground, which reads as missing terrain
+    /// rather than as unknown terrain. A strategy map wants the other
+    /// answer — Warcraft III's black mask — and gets it by setting this.
+    ///
+    /// Unseen ground on a deck *below* the observer is already occluded
+    /// this way regardless, for the same reason at a smaller scale: it
+    /// stops a stairwell being a bright hole down through the floor.
+    pub unseen_occludes: bool,
     /// Decision 5 — `None` = geometric visibility only.
     pub light_gate: Option<LightGate>,
     /// Intensity rise rate toward a live (Visible/Heard) target.
@@ -209,6 +223,7 @@ impl VisionConfig {
             peripheral_range: 12.0,
             edge_taper: 4.0,
             decks,
+            unseen_occludes: false,
             light_gate: None,
             fade_in: 240.0,
             fade_out: 120.0,
@@ -259,6 +274,8 @@ pub struct GpuFowMask {
     pub memory_dim: f32,
     /// [`VisionConfig::memory_desaturate`].
     pub memory_desaturate: f32,
+    /// [`VisionConfig::unseen_occludes`].
+    pub unseen_occludes: bool,
     /// [`FogOfWar::mask_version`] this snapshot was taken at (upload gate).
     pub version: u64,
 }
@@ -844,6 +861,7 @@ impl FogOfWar {
             cells,
             memory_dim: self.config.memory_dim,
             memory_desaturate: self.config.memory_desaturate,
+            unseen_occludes: self.config.unseen_occludes,
             version: self.mask_version,
         }
     }
@@ -1533,7 +1551,11 @@ impl roxlap_core::dda::FowStyler for FowRender<'_> {
             // cells on the active deck or ABOVE it stay transparent
             // (`Hide`) so a deck you're under — the flooded-bilge swim,
             // round 8 — still shows through.
-            CellState::Unseen if below(deck) => OCCLUDE_BELOW,
+            // …and a map that says so occludes unexplored ground on the
+            // observer's own deck too. Outdoors, `Hide` shows the sky
+            // through the ground, which reads as no terrain rather than
+            // as unknown terrain.
+            CellState::Unseen if below(deck) || cfg.unseen_occludes => OCCLUDE_BELOW,
             CellState::Unseen => FowVerdict::Hide,
             // A currently-Visible cell is drawn UNSTYLED — full
             // brightness, full colour — so the cone rim / peripheral ring

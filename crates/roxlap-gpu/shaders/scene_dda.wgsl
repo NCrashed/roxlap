@@ -261,7 +261,8 @@ struct PointLight {
 // with `roxlap-render`'s packer. Binding 22 — 19..21 are the
 // conditional sprite-cast slots, so 22 is always free.
 @group(0) @binding(22) var<storage, read> fog_mask: array<u32>;
-const FOG_ENABLED: u32 = 0u;    // 0 = off
+const FOG_ENABLED: u32 = 0u;    // flags word; 0 = off
+const FOG_FLAG_UNSEEN_OCCLUDES: u32 = 2u; // bit 1: unseen renders opaque black
 const FOG_GRID: u32 = 1u;       // scene-grid index the mask applies to
 const FOG_DECKS_N: u32 = 2u;    // number of decks
 const FOG_ORIGIN_X: u32 = 3u;   // grid-local cell of buffer (0,0), i32
@@ -333,8 +334,12 @@ fn fow_lookup(g: u32, cxm: i32, cym: i32, czm: i32, mip: u32) -> FowV {
     let mbyte = (word >> ((idx & 3u) * 8u)) & 0xffu;
     let state = mbyte >> 6u;
     if (state == 0u) { // Unseen
-        // Below the observer's deck → occlude opaque-dark; else transparent.
-        if (deck > active_deck_i) {
+        // Below the observer's deck → occlude opaque-dark; else
+        // transparent, unless the map asked for unexplored ground to be
+        // opaque everywhere (outdoors, transparent shows the SKY through
+        // the ground and reads as missing terrain, not unknown terrain).
+        if (deck > active_deck_i
+            || (fog_mask[FOG_ENABLED] & FOG_FLAG_UNSEEN_OCCLUDES) != 0u) {
             return FowV(false, 0.0, 0.0, false);
         }
         v.hidden = true;

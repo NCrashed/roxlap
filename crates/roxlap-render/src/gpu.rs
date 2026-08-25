@@ -1056,6 +1056,7 @@ impl GpuBackend {
             mask.active_deck,
             mask.memory_dim,
             mask.memory_desaturate,
+            mask.unseen_occludes,
             &mask.cells,
         );
         self.gpu.set_fog_mask(&words);

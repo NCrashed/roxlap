@@ -499,6 +499,7 @@ fn fog_mask_uniform(vsid: u32, state: u8, intensity: u8, memory_dim: f32) -> Vec
         0,
         memory_dim,
         0.0,
+        false,
         &cells,
     )
 }

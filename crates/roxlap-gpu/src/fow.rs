@@ -5,7 +5,8 @@
 //! change lands in one place, not three.
 //!
 //! Buffer layout (mirrors `scene_dda.wgsl`'s `FOG_*` consts):
-//! word 0 `FOG_ENABLED` (0 = off) · 1 `FOG_GRID` (per-grid slot) · 2
+//! word 0 `FOG_FLAGS` (0 = off; bit 0 on, bit 1
+//! [`FOG_FLAG_UNSEEN_OCCLUDES`]) · 1 `FOG_GRID` (per-grid slot) · 2
 //! `FOG_DECKS_N` · 3–4 origin cell (i32) · 5 width · 6 height · 7–8
 //! `memory_dim`/`memory_desaturate` (f32 bits) · 9.. up to
 //! [`FOG_MAX_DECKS`] `(z_top, z_bottom)` i32 pairs · then
@@ -15,6 +16,16 @@
 
 /// Header word count before the packed cells (`FOG_CELLS_BASE` in WGSL).
 pub const FOG_HEADER_WORDS: usize = 18;
+/// Word 0, bit 0: fog is on at all. A zero word 0 is the disabled buffer.
+pub const FOG_FLAG_ON: u32 = 1;
+/// Word 0, bit 1: never-seen ground on the observer's OWN deck renders
+/// opaque black rather than as air
+/// ([`VisionConfig::unseen_occludes`](../../roxlap_scene/fow/struct.VisionConfig.html)).
+///
+/// A flag bit in word 0 rather than a new header word, because the header
+/// layout is mirrored by hand in three places and widening it is the
+/// change most likely to go wrong quietly.
+pub const FOG_FLAG_UNSEEN_OCCLUDES: u32 = 2;
 /// Max decks the shader's `fog_mask` deck loop scans (`FOG_MAX_DECKS`).
 pub const FOG_MAX_DECKS: usize = 4;
 /// Word index of the observer's active deck (`FOG_ACTIVE_DECK` in WGSL),
@@ -48,6 +59,7 @@ pub fn pack_fog_mask(
     active_deck: usize,
     memory_dim: f32,
     memory_desaturate: f32,
+    unseen_occludes: bool,
     cells: &[u8],
 ) -> Vec<u32> {
     if decks.len() > FOG_MAX_DECKS {
@@ -67,7 +79,12 @@ pub fn pack_fog_mask(
     let deck_count = decks.len().min(FOG_MAX_DECKS);
     let cell_words = cells.len().div_ceil(4);
     let mut w = vec![0u32; FOG_HEADER_WORDS + cell_words];
-    w[0] = 1; // FOG_ENABLED
+    w[0] = FOG_FLAG_ON
+        | if unseen_occludes {
+            FOG_FLAG_UNSEEN_OCCLUDES
+        } else {
+            0
+        };
     w[1] = grid_index; // FOG_GRID
     w[2] = deck_count as u32; // FOG_DECKS_N
     w[3] = origin_cell[0] as u32; // FOG_ORIGIN_X (bitcast i32)
@@ -116,9 +133,10 @@ mod tests {
             1,
             0.5,
             0.25,
+            false,
             &[0xC1, 0x02, 0x83, 0x00],
         );
-        assert_eq!(w[0], 1);
+        assert_eq!(w[0], FOG_FLAG_ON);
         assert_eq!(w[1], 3);
         assert_eq!(w[2], 2);
         assert_eq!(w[3] as i32, -128);
@@ -137,14 +155,29 @@ mod tests {
     #[test]
     fn truncates_excess_decks() {
         let decks = [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]; // 5 > MAX 4
-        let w = pack_fog_mask(0, [0, 0], 1, 1, &decks, 0, 1.0, 0.0, &[0]);
+        let w = pack_fog_mask(0, [0, 0], 1, 1, &decks, 0, 1.0, 0.0, false, &[0]);
         assert_eq!(w[2], FOG_MAX_DECKS as u32, "deck count clamps to MAX");
+    }
+
+    /// The occlude-unexplored choice rides word 0 beside the on bit, so a
+    /// shader that reads word 0 as a plain boolean would silently treat a
+    /// shrouded map as fog-off. Both bits, checked together.
+    #[test]
+    fn unseen_occludes_is_a_flag_beside_the_on_bit() {
+        let plain = pack_fog_mask(0, [0, 0], 1, 1, &[[0, 1]], 0, 1.0, 0.0, false, &[0]);
+        assert_eq!(plain[0], FOG_FLAG_ON);
+        assert_eq!(plain[0] & FOG_FLAG_UNSEEN_OCCLUDES, 0);
+
+        let shrouded = pack_fog_mask(0, [0, 0], 1, 1, &[[0, 1]], 0, 1.0, 0.0, true, &[0]);
+        assert_eq!(shrouded[0] & FOG_FLAG_ON, FOG_FLAG_ON, "still on");
+        assert_eq!(shrouded[0] & FOG_FLAG_UNSEEN_OCCLUDES, FOG_FLAG_UNSEEN_OCCLUDES);
+        assert_ne!(shrouded[0], 0, "a zero word 0 is the disabled buffer");
     }
 
     #[test]
     fn active_deck_clamps_to_deck_count() {
         // A stale/over-range active deck must not index past the layers.
-        let w = pack_fog_mask(0, [0, 0], 1, 1, &[[0, 1], [2, 3]], 9, 1.0, 0.0, &[0]);
+        let w = pack_fog_mask(0, [0, 0], 1, 1, &[[0, 1], [2, 3]], 9, 1.0, 0.0, false, &[0]);
         assert_eq!(w[FOG_ACTIVE_DECK], 1, "clamped to last valid deck");
     }
 }
