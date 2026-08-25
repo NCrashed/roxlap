@@ -1010,6 +1010,25 @@ struct BillboardActor {
 }
 
 impl BillboardActor {
+    /// This actor's slab transform for `camera`, scaled to world units.
+    ///
+    /// An actor poses itself from its OWN `mode` and `up`; it is not in the
+    /// `billboards` list [`SceneRenderer::face_billboards_to`] walks. That
+    /// is why [`SceneRenderer::set_actor_mode`] has to write this struct's
+    /// field rather than route through
+    /// [`set_billboard_mode`](SceneRenderer::set_billboard_mode), which
+    /// would find no record and quietly change nothing.
+    fn pose(&self, camera: &Camera) -> Option<DynSpriteTransform> {
+        billboard_transform(self.pos, camera, self.mode, self.up).map(|mut xf| {
+            for axis in [&mut xf.right, &mut xf.up, &mut xf.forward] {
+                for c in axis.iter_mut() {
+                    *c *= self.scale;
+                }
+            }
+            xf
+        })
+    }
+
     /// Pick the directional clip index for a camera at `cam` (world). See
     /// [`dir_index`].
     fn pick_dir(&self, cam: [f64; 3]) -> usize {
@@ -3679,19 +3698,26 @@ impl SceneRenderer {
     }
 
     /// Change how an actor turns to face the camera at runtime (BB.7) — the
-    /// per-actor counterpart to [`BillboardActorDef::mode`], routed to its
-    /// billboard instance via
-    /// [`set_billboard_mode`](Self::set_billboard_mode). The setter a host
-    /// needs to switch a scene between eye-facing and view-plane sprites
-    /// without respawning every actor. Returns `false` on a stale id.
+    /// per-actor counterpart to [`BillboardActorDef::mode`]. The setter a
+    /// host needs to switch a scene between eye-facing and view-plane
+    /// sprites without respawning every actor. Returns `false` on a stale
+    /// id.
+    ///
+    /// Writes the actor's own `mode`, NOT
+    /// [`set_billboard_mode`](Self::set_billboard_mode): an actor poses
+    /// itself in [`update_billboard_actors`](Self::update_billboard_actors)
+    /// from that field, and is not in the `billboards` list
+    /// [`face_billboards_to`](Self::face_billboards_to) walks. Routing it
+    /// through the instance setter compiles, finds no record, and silently
+    /// does nothing.
     pub fn set_actor_mode(&mut self, id: BillboardActorId, mode: BillboardMode) -> bool {
         let Some(idx) = self.actor_map.index(id) else {
             return false;
         };
-        let Some(inst) = self.billboard_actors[idx].as_ref().map(|a| a.inst) else {
+        let Some(a) = self.billboard_actors[idx].as_mut() else {
             return false;
         };
-        self.set_billboard_mode(inst, mode);
+        a.mode = mode;
         true
     }
 
@@ -3768,14 +3794,7 @@ impl SceneRenderer {
                 desired
             });
             let frame = a.clock.tick(dt);
-            let xf = billboard_transform(a.pos, camera, a.mode, a.up).map(|mut xf| {
-                for axis in [&mut xf.right, &mut xf.up, &mut xf.forward] {
-                    for c in axis.iter_mut() {
-                        *c *= a.scale;
-                    }
-                }
-                xf
-            });
+            let xf = a.pose(camera);
             actions.push(Action {
                 inst: a.inst,
                 set_clip,
@@ -5308,6 +5327,49 @@ mod tests {
         let view = to_f32([-cam.forward[0], -cam.forward[1], -cam.forward[2]]);
         assert!(close(sph.up, view), "normal is the view axis");
         assert!(orthonormal(&sph));
+    }
+
+    /// The bug the two tests above did not catch, because they exercised
+    /// the maths and not the wiring.
+    ///
+    /// `set_actor_mode` first routed through `set_billboard_mode`, which
+    /// searches the `billboards` list — and an actor is not in it. The call
+    /// compiled, found nothing, returned, and the sprites never changed.
+    /// So this asserts what an actor actually poses itself from.
+    #[test]
+    fn an_actor_poses_from_its_own_mode() {
+        let cam = Camera::from_yaw_pitch([100.0, 0.0, 0.0], std::f64::consts::PI, 0.0);
+        let mut actor = BillboardActor {
+            scale: 1.0,
+            inst: SpriteInstanceId { slot: 0, gen: 0 },
+            states: vec![ActorState {
+                name: "idle".to_string(),
+                dirs: Vec::new(),
+            }],
+            cur_state: 0,
+            // Well off-axis, where the two models disagree at all.
+            pos: [0.0, 100.0, 0.0],
+            facing: ActorFacing::Yaw(0.0),
+            mode: BillboardMode::Cylindrical,
+            up: BillboardUp::World,
+            clock: ClipClock::new(&[], LoopMode::Loop, 256, 0.0),
+            showing: None,
+            speed: 1.0,
+        };
+
+        let eye = actor.pose(&cam).expect("non-degenerate");
+        actor.mode = BillboardMode::CylindricalViewPlane;
+        let flat = actor.pose(&cam).expect("non-degenerate");
+        assert!(
+            !close(eye.up, flat.up),
+            "the mode field has to reach the pose: {:?} vs {:?}",
+            eye.up,
+            flat.up,
+        );
+
+        // And it is the view-plane answer, not merely a different one.
+        let view = to_f32([-cam.forward[0], -cam.forward[1], -cam.forward[2]]);
+        assert!(close(flat.up, view));
     }
 
     #[test]
