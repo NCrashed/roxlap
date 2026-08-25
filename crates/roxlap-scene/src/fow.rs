@@ -497,11 +497,26 @@ struct HeardBlob {
     ttl: f32,
 }
 
+/// Everything about one observer that the shadowcast's result depends on.
+/// Equal keys mean the same visible set, so the pass can be skipped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ObserverKey {
+    cell: IVec2,
+    /// Quantised, since a fractional turn cannot move a cell boundary.
+    facing: i32,
+    eye_z: i32,
+    /// Covers grid edits near this observer — a wall knocked down opens
+    /// sight without anyone moving.
+    edit_key: u64,
+    config_gen: u64,
+}
+
 /// The fog-of-war state for ONE FW-enabled grid (entry-doc decision
 /// 3): per-deck mask layers, the LOS cache, heard blobs, and the
 /// fade/decay state machine. Owned by the host beside the scene;
-/// call [`Self::update`] once per tick with the observed character's
-/// grid-local pose.
+/// call [`Self::update`] (one observer) or
+/// [`Self::update_many`] (a party, a side) once per tick with their
+/// grid-local poses.
 pub struct FogOfWar {
     config: VisionConfig,
     config_gen: u64,
@@ -509,7 +524,16 @@ pub struct FogOfWar {
     /// Currently-visible cells of `visible_deck` → target intensity.
     visible: HashMap<(i32, i32), f32>,
     visible_deck: usize,
-    los_key: Option<(IVec2, i32, usize, i32, u64, u64)>,
+    /// One entry per observer whose LOS the current `visible` set was
+    /// built from — the "nothing moved, skip the shadowcast" cache.
+    ///
+    /// A list rather than a hash of the observers: a collision here is a
+    /// fog that silently stops updating, and next to a shadowcast an
+    /// exact compare over a handful of keys costs nothing.
+    los_key: Vec<ObserverKey>,
+    /// Whether [`los_key`](Self::los_key) describes a real previous pass.
+    /// Distinguishes "no observers last time" from "never ran".
+    los_valid: bool,
     heard: Vec<HeardBlob>,
     /// Set when a blob was added, so the next tick rebuilds the union;
     /// blob expiry sets it inline. Steady state skips the rebuild.
@@ -541,7 +565,8 @@ impl FogOfWar {
             layers,
             visible: HashMap::new(),
             visible_deck: 0,
-            los_key: None,
+            los_key: Vec::new(),
+            los_valid: false,
             heard: Vec::new(),
             heard_dirty: false,
             heard_cells: HashMap::new(),
@@ -828,57 +853,92 @@ impl FogOfWar {
     /// [`Grid::mutation_counter`] key), restamp heard blobs, and step
     /// every fading cell by `dt` seconds.
     pub fn update(&mut self, grid: &Grid, observer: &FowObserver, dt: f32) {
+        self.update_many(grid, std::slice::from_ref(observer), dt);
+    }
+
+    /// Advance the fog one tick from **several** observers at once: what
+    /// is visible is the union of what each of them can see.
+    ///
+    /// The one-observer [`update`](Self::update) is the first-person
+    /// model — a character looking down a corridor. A strategy game is the
+    /// other shape: a dozen units, each seeing all round itself, and
+    /// ground stays explored once anyone has walked it. That difference
+    /// is entirely in the count, so it is the only thing this adds; a
+    /// 360° observer is one whose `facing` is zero-length, which the cone
+    /// already reads as "peripheral only".
+    ///
+    /// **One deck at a time.** `visible` is the visible set of a single
+    /// deck by construction, so the deck comes from the first observer
+    /// and any observer on another one is ignored. A map whose units
+    /// stand on two decks at once needs a per-deck visible set, which is
+    /// a wider change than this.
+    ///
+    /// An empty slice means nobody is looking: everything visible demotes
+    /// to memory, which is also what a wiped-out side should see.
+    pub fn update_many(&mut self, grid: &Grid, observers: &[FowObserver], dt: f32) {
         let mut changed = false;
+        let deck = observers.first().map_or(self.visible_deck, |o| o.deck);
 
         // Deck switch: demote the whole visible set of the old deck.
-        if observer.deck != self.visible_deck && !self.visible.is_empty() {
+        if deck != self.visible_deck && !self.visible.is_empty() {
             let old = std::mem::take(&mut self.visible);
-            let deck = self.visible_deck;
+            let previous = self.visible_deck;
             for (cell, _) in old {
-                changed |= self.demote_to_memory(deck, IVec2::new(cell.0, cell.1));
+                changed |= self.demote_to_memory(previous, IVec2::new(cell.0, cell.1));
             }
-            self.los_key = None;
+            self.los_valid = false;
             self.sprite_epoch = self.sprite_epoch.wrapping_add(1); // visible set emptied
         }
-        self.visible_deck = observer.deck;
+        self.visible_deck = deck;
 
-        // LOS recompute when the key moves.
-        if observer.deck < self.config.decks.len() {
-            let facing_q = quantize_facing(observer.facing);
-            let band = self.config.decks[observer.deck];
-            let (eye_lo, eye_hi) = (observer.eye_z - EYE_HALF, observer.eye_z + EYE_HALF);
+        // Only the observers this pass actually casts from: the named
+        // deck, and a deck the config knows about.
+        let live: Vec<&FowObserver> = if deck < self.config.decks.len() {
+            observers.iter().filter(|o| o.deck == deck).collect()
+        } else {
+            Vec::new()
+        };
+
+        if live.is_empty() {
+            // Nobody looking (or every observer off a configured deck):
+            // nothing is visible.
+            if !self.visible.is_empty() {
+                let old = std::mem::take(&mut self.visible);
+                for (cell, _) in old {
+                    changed |= self
+                        .demote_to_memory(deck.min(self.layers.len()), IVec2::new(cell.0, cell.1));
+                }
+                self.sprite_epoch = self.sprite_epoch.wrapping_add(1); // visible set emptied
+            }
+            self.los_key.clear();
+            self.los_valid = true;
+        } else {
+            // LOS recompute when any observer's key moves.
+            let band = self.config.decks[deck];
             let radius = self.config.range.max(self.config.peripheral_range).ceil() as i32;
-            let edit_key = local_edit_key(
-                grid,
-                band,
-                eye_lo,
-                eye_hi,
-                self.config_gen,
-                observer.cell,
-                radius,
-            );
-            let key = (
-                observer.cell,
-                facing_q,
-                observer.deck,
-                observer.eye_z,
-                edit_key,
-                self.config_gen,
-            );
-            if self.los_key != Some(key) {
-                self.los_key = Some(key);
-                changed |= self.recompute_los(grid, observer);
+            let keys: Vec<ObserverKey> = live
+                .iter()
+                .map(|o| ObserverKey {
+                    cell: o.cell,
+                    facing: quantize_facing(o.facing),
+                    eye_z: o.eye_z,
+                    edit_key: local_edit_key(
+                        grid,
+                        band,
+                        o.eye_z - EYE_HALF,
+                        o.eye_z + EYE_HALF,
+                        self.config_gen,
+                        o.cell,
+                        radius,
+                    ),
+                    config_gen: self.config_gen,
+                })
+                .collect();
+            if !self.los_valid || self.los_key != keys {
+                self.los_key = keys;
+                self.los_valid = true;
+                changed |= self.recompute_los(grid, &live);
             }
-        } else if !self.visible.is_empty() {
-            // Observer off every configured deck: nothing is visible.
-            let old = std::mem::take(&mut self.visible);
-            for (cell, _) in old {
-                changed |= self.demote_to_memory(
-                    observer.deck.min(self.layers.len()),
-                    IVec2::new(cell.0, cell.1),
-                );
-            }
-            self.sprite_epoch = self.sprite_epoch.wrapping_add(1); // visible set emptied
         }
 
         changed |= self.update_heard(dt);
@@ -892,11 +952,15 @@ impl FogOfWar {
     /// Rebuild the visible set via shadowcast; diff against the old
     /// one, stamping states and queueing fades. Returns whether any
     /// mask byte changed.
-    fn recompute_los(&mut self, grid: &Grid, observer: &FowObserver) -> bool {
-        let deck = observer.deck;
+    fn recompute_los(&mut self, grid: &Grid, observers: &[&FowObserver]) -> bool {
+        let deck = self.visible_deck;
         let band = self.config.decks[deck];
+        // One scan per observer, all writing into the same map: a cell
+        // two of them can see is visible once, at the brighter of the two
+        // intensities, which is what `LosScan` already does for overlap
+        // within a single cone.
         let mut new_visible: HashMap<(i32, i32), f32> = HashMap::new();
-        {
+        for observer in observers {
             let layer = &mut self.layers[deck];
             let mut scan = LosScan {
                 grid,
@@ -1861,6 +1925,112 @@ mod tests {
         assert_eq!(fow.state(0, IVec2::new(60, 0)).0, CellState::Unseen);
         // Full intensity well inside the cone.
         assert_eq!(fow.state(0, IVec2::new(20, 0)).1, INTENSITY_MAX);
+    }
+
+    /// A 360° observer is one with no facing — the cone already reads a
+    /// zero-length vector as "peripheral only". That is what a strategy
+    /// unit is, so it wants no new config.
+    #[test]
+    fn a_facingless_observer_sees_all_round() {
+        let g = open_room();
+        let mut c = cfg();
+        c.peripheral_range = 20.0;
+        let mut fow = FogOfWar::new(c);
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::ZERO), SETTLE);
+
+        for at in [
+            IVec2::new(15, 0),
+            IVec2::new(-15, 0),
+            IVec2::new(0, 15),
+            IVec2::new(0, -15),
+        ] {
+            assert_eq!(fow.state(0, at).0, CellState::Visible, "{at:?}");
+        }
+        assert_eq!(fow.state(0, IVec2::new(30, 0)).0, CellState::Unseen);
+    }
+
+    /// The point of `update_many`: what a party sees is the union of what
+    /// each of them sees, and neither of them takes the other's sight
+    /// away.
+    #[test]
+    fn several_observers_see_the_union() {
+        let g = open_room();
+        let mut c = cfg();
+        c.peripheral_range = 15.0;
+        let (near_a, near_b) = (IVec2::new(-30, 0), IVec2::new(30, 0));
+
+        // Apart, neither can see the other's ground.
+        let mut solo = FogOfWar::new(c.clone());
+        solo.update(&g, &observer(near_a, Vec2::ZERO), SETTLE);
+        assert_eq!(solo.state(0, near_b).0, CellState::Unseen);
+
+        let mut party = FogOfWar::new(c);
+        party.update_many(
+            &g,
+            &[
+                observer(near_a, Vec2::ZERO),
+                observer(near_b, Vec2::ZERO),
+            ],
+            SETTLE,
+        );
+        assert_eq!(party.state(0, near_a).0, CellState::Visible);
+        assert_eq!(party.state(0, near_b).0, CellState::Visible);
+        // And the gap between them is still nobody's.
+        assert_eq!(party.state(0, IVec2::new(0, 0)).0, CellState::Unseen);
+    }
+
+    /// Ground one observer walked past stays explored when the party
+    /// moves on — the memory half of what makes a map worth exploring.
+    #[test]
+    fn ground_a_party_leaves_becomes_memory_not_unseen() {
+        let g = open_room();
+        let mut fow = FogOfWar::new(cfg());
+        let walked = IVec2::new(-30, 0);
+
+        fow.update_many(&g, &[observer(walked, Vec2::ZERO)], SETTLE);
+        assert_eq!(fow.state(0, walked).0, CellState::Visible);
+
+        fow.update_many(&g, &[observer(IVec2::new(40, 0), Vec2::ZERO)], SETTLE);
+        assert_eq!(
+            fow.state(0, walked).0,
+            CellState::Memory,
+            "explored ground must not go back to unseen",
+        );
+    }
+
+    /// Nobody looking is a legal state, not a reason to keep the last
+    /// frame's sight: a side with no units left sees only what it
+    /// remembers.
+    #[test]
+    fn no_observers_demotes_everything_to_memory() {
+        let g = open_room();
+        let mut fow = FogOfWar::new(cfg());
+        let at = IVec2::new(10, 0);
+
+        fow.update_many(&g, &[observer(IVec2::new(0, 0), Vec2::ZERO)], SETTLE);
+        assert_eq!(fow.state(0, at).0, CellState::Visible);
+
+        fow.update_many(&g, &[], SETTLE);
+        assert_eq!(fow.state(0, at).0, CellState::Memory);
+    }
+
+    /// The skip-the-shadowcast cache has to notice one observer of many
+    /// moving. Keyed per observer for exactly this reason.
+    #[test]
+    fn moving_one_of_several_observers_refreshes_the_fog() {
+        let g = open_room();
+        let mut c = cfg();
+        c.peripheral_range = 15.0;
+        let mut fow = FogOfWar::new(c);
+        let anchor = observer(IVec2::new(-30, 0), Vec2::ZERO);
+
+        fow.update_many(&g, &[anchor, observer(IVec2::new(0, 0), Vec2::ZERO)], SETTLE);
+        assert_eq!(fow.state(0, IVec2::new(30, 0)).0, CellState::Unseen);
+
+        // The anchor is unchanged; only the second one walked.
+        fow.update_many(&g, &[anchor, observer(IVec2::new(30, 0), Vec2::ZERO)], SETTLE);
+        assert_eq!(fow.state(0, IVec2::new(30, 0)).0, CellState::Visible);
+        assert_eq!(fow.state(0, IVec2::new(-30, 0)).0, CellState::Visible);
     }
 
     #[test]
