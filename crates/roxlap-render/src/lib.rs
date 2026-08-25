@@ -625,6 +625,25 @@ pub enum BillboardMode {
     /// as you orbit — and a card anchored at its feet leans off that anchor
     /// at a steep pitch.
     Spherical,
+    /// Yaw-only like [`Cylindrical`](Self::Cylindrical), but aimed at the
+    /// **view plane** instead of at the eye: every card in the scene takes
+    /// the same yaw, read off the camera's forward direction rather than
+    /// its own direction to the camera position.
+    ///
+    /// The difference is nil at the centre of the screen and grows with the
+    /// angle off-axis: under a 90° horizontal field of view a card at the
+    /// edge is turned ~45° away from one in the middle, so a sprite that
+    /// looks square-on when the camera is pointed at it stands nearly
+    /// side-on once it drifts to the edge. Eye-facing is what a *volume*
+    /// wants (a tree, a puff of smoke — it really is at that bearing);
+    /// view-plane is what a **2D sprite** wants, where the art is drawn to
+    /// be seen flat and any turn is a defect. This is what Doom and Build
+    /// actually did.
+    CylindricalViewPlane,
+    /// [`Spherical`](Self::Spherical) aimed at the view plane rather than
+    /// the eye, on the same argument as
+    /// [`CylindricalViewPlane`](Self::CylindricalViewPlane).
+    SphericalViewPlane,
 }
 
 /// Where a billboard's **image vertical** comes from (BB.6) — the axis the
@@ -774,9 +793,23 @@ fn billboard_transform(
     // never be dropped, or the actor freezes at its last pose (the CC.4
     // third-person bug).
     const FALLBACK: [f32; 3] = [0.0, 1.0, 0.0];
+    // The view-plane modes aim every card the same way — back along the
+    // camera's forward axis — instead of each card at the eye. Same
+    // direction dead centre, up to half the field of view apart at the
+    // edges.
+    #[allow(clippy::cast_possible_truncation)]
+    let to_view = [
+        -camera.forward[0] as f32,
+        -camera.forward[1] as f32,
+        -camera.forward[2] as f32,
+    ];
     let ny = match mode {
         BillboardMode::Cylindrical => bb_norm(bb_reject(to_cam, up)).unwrap_or(FALLBACK),
         BillboardMode::Spherical => bb_norm(to_cam).unwrap_or(FALLBACK),
+        BillboardMode::CylindricalViewPlane => {
+            bb_norm(bb_reject(to_view, up)).unwrap_or(FALLBACK)
+        }
+        BillboardMode::SphericalViewPlane => bb_norm(to_view).unwrap_or(FALLBACK),
         BillboardMode::None => return None,
     };
     // `+x` = image horizontal = screen-right (non-mirrored): up × normal.
@@ -3645,6 +3678,23 @@ impl SceneRenderer {
         true
     }
 
+    /// Change how an actor turns to face the camera at runtime (BB.7) — the
+    /// per-actor counterpart to [`BillboardActorDef::mode`], routed to its
+    /// billboard instance via
+    /// [`set_billboard_mode`](Self::set_billboard_mode). The setter a host
+    /// needs to switch a scene between eye-facing and view-plane sprites
+    /// without respawning every actor. Returns `false` on a stale id.
+    pub fn set_actor_mode(&mut self, id: BillboardActorId, mode: BillboardMode) -> bool {
+        let Some(idx) = self.actor_map.index(id) else {
+            return false;
+        };
+        let Some(inst) = self.billboard_actors[idx].as_ref().map(|a| a.inst) else {
+            return false;
+        };
+        self.set_billboard_mode(inst, mode);
+        true
+    }
+
     /// Change an actor's lighting mode at runtime (BB.2b) — the per-actor
     /// counterpart to [`BillboardActorDef::lighting`], routed to its clip
     /// instance via [`set_sprite_instance_lighting`](Self::set_sprite_instance_lighting).
@@ -5192,6 +5242,72 @@ mod tests {
         assert!(close(cyl.forward, cam_up));
         assert!(dot(cyl.up, cam_up).abs() < 1e-5);
         assert!(orthonormal(&cyl));
+    }
+
+    /// What the view-plane modes are for (BB.7): off-axis cards stop
+    /// turning.
+    ///
+    /// Eye-facing aims each card at the camera position, so two cards side
+    /// by side under a wide field of view take different yaws and the
+    /// outer one stands part-way side-on. That is right for a volume — a
+    /// tree really is at that bearing — and wrong for a 2D sprite, whose
+    /// art is drawn to be seen flat.
+    #[test]
+    fn view_plane_billboards_share_one_yaw() {
+        // Looking down −x from +x, level. Two cards at the same depth, one
+        // dead ahead and one well off to the side.
+        let cam = Camera::from_yaw_pitch([100.0, 0.0, 0.0], std::f64::consts::PI, 0.0);
+        let centre = [0.0, 0.0, 0.0];
+        let edge = [0.0, 100.0, 0.0]; // 45° off-axis from the eye
+
+        let eye_c = billboard_transform(centre, &cam, BillboardMode::Cylindrical, BillboardUp::World)
+            .expect("non-degenerate");
+        let eye_e = billboard_transform(edge, &cam, BillboardMode::Cylindrical, BillboardUp::World)
+            .expect("non-degenerate");
+        // The reported defect, as a number: 45° apart.
+        assert!(
+            dot(eye_c.up, eye_e.up) < 0.72,
+            "eye-facing cards should disagree off-axis: {:?} vs {:?}",
+            eye_c.up,
+            eye_e.up,
+        );
+
+        let flat_c =
+            billboard_transform(centre, &cam, BillboardMode::CylindricalViewPlane, BillboardUp::World)
+                .expect("non-degenerate");
+        let flat_e =
+            billboard_transform(edge, &cam, BillboardMode::CylindricalViewPlane, BillboardUp::World)
+                .expect("non-degenerate");
+        assert!(close(flat_c.up, flat_e.up), "view-plane cards share a yaw");
+        assert!(orthonormal(&flat_c));
+        assert!(orthonormal(&flat_e));
+        assert_eq!(flat_e.pos, edge, "the anchor never moves");
+
+        // Dead ahead the two models agree, which is why the defect only
+        // shows once something drifts off centre.
+        assert!(close(eye_c.up, flat_c.up));
+    }
+
+    /// The view-plane modes keep the promises the eye-facing ones make:
+    /// cylindrical stays upright about the up axis, spherical faces square.
+    #[test]
+    fn view_plane_billboards_keep_their_axis_promises() {
+        let cam = Camera::from_yaw_pitch([80.0, 0.0, -60.0], std::f64::consts::PI, 0.6);
+        let at = [0.0, 40.0, 0.0];
+
+        let cyl = billboard_transform(at, &cam, BillboardMode::CylindricalViewPlane, BillboardUp::World)
+            .expect("non-degenerate");
+        assert_eq!(cyl.forward, BILLBOARD_UP, "image vertical is world up");
+        assert!(dot(cyl.up, BILLBOARD_UP).abs() < 1e-5, "normal is level");
+        assert!(orthonormal(&cyl));
+
+        // Spherical pitches with the view, so its normal is the view axis
+        // itself rather than a levelled copy of it.
+        let sph = billboard_transform(at, &cam, BillboardMode::SphericalViewPlane, BillboardUp::World)
+            .expect("non-degenerate");
+        let view = to_f32([-cam.forward[0], -cam.forward[1], -cam.forward[2]]);
+        assert!(close(sph.up, view), "normal is the view axis");
+        assert!(orthonormal(&sph));
     }
 
     #[test]
