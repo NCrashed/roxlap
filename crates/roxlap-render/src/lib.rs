@@ -3043,8 +3043,8 @@ impl SceneRenderer {
     /// material_id)` that make matching-colour world (grid) voxels translucent
     /// — glass walls, water pools. The materials themselves are defined via
     /// [`define_material`](Self::define_material). An empty map (the default)
-    /// keeps all terrain opaque. The CPU backend composites these today; the
-    /// GPU backend renders them once the TV.6 device path lands.
+    /// keeps all terrain opaque. Composited by both backends (CPU since TV.4,
+    /// GPU since TV.6).
     pub fn set_terrain_materials(&mut self, map: &[(Rgb, u8)]) {
         if self.state.terrain_materials != map {
             self.state.terrain_materials = map.to_vec();
@@ -3181,9 +3181,8 @@ impl SceneRenderer {
     /// for this whole instance's opacity + blend mode. `0` (the default) is
     /// opaque. Stale handles are ignored.
     ///
-    /// Only the CPU backend composites translucent sprites today; the GPU
-    /// backend retains the value for the forthcoming device-side path (see
-    /// `PORTING-TRANSPARENCY.md`).
+    /// Composited by both backends (CPU since TV.1, GPU since TV.2's
+    /// two-sweep sprite path).
     pub fn set_sprite_instance_material(&mut self, id: SpriteInstanceId, material: u8) {
         let Some(dyn_index) = self.dyn_map.dyn_index(id) else {
             return;
