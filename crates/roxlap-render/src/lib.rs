@@ -3750,6 +3750,72 @@ impl SceneRenderer {
         true
     }
 
+    /// Set an actor's voxel-material id at runtime — the per-actor
+    /// counterpart to
+    /// [`set_sprite_instance_material`](Self::set_sprite_instance_material),
+    /// routed to its clip instance. `0` (the default) is opaque. Returns
+    /// `false` on a stale id.
+    ///
+    /// With [`set_actor_alpha`](Self::set_actor_alpha), what an app needs to
+    /// draw an actor as a **preview**: a translucent copy of a character
+    /// standing where one would be placed. Tint cannot do it — tint is
+    /// colour, and a solid figure in a different colour reads as a
+    /// character that is already there.
+    ///
+    /// Survives the directional clip swaps
+    /// [`update_billboard_actors`](Self::update_billboard_actors) makes as
+    /// the camera turns: an actor keeps one clip instance for its life, and
+    /// a swap retargets that instance rather than replacing it.
+    pub fn set_actor_material(&mut self, id: BillboardActorId, material: u8) -> bool {
+        let Some(idx) = self.actor_map.index(id) else {
+            return false;
+        };
+        let Some(inst) = self.billboard_actors[idx].as_ref().map(|a| a.inst) else {
+            return false;
+        };
+        self.set_sprite_instance_material(inst, material);
+        true
+    }
+
+    /// Set an actor's per-instance alpha multiplier at runtime, `0..=255`
+    /// (`255` = unscaled) — the per-actor counterpart to
+    /// [`set_sprite_instance_alpha`](Self::set_sprite_instance_alpha),
+    /// routed to its clip instance. Returns `false` on a stale id.
+    ///
+    /// Scales the **material's** opacity, so it does nothing on an actor
+    /// still wearing the opaque default: pair it with
+    /// [`set_actor_material`](Self::set_actor_material) and a material
+    /// declared `AlphaBlend`.
+    pub fn set_actor_alpha(&mut self, id: BillboardActorId, alpha_mul: u8) -> bool {
+        let Some(idx) = self.actor_map.index(id) else {
+            return false;
+        };
+        let Some(inst) = self.billboard_actors[idx].as_ref().map(|a| a.inst) else {
+            return false;
+        };
+        self.set_sprite_instance_alpha(inst, alpha_mul);
+        true
+    }
+
+    /// Toggle an actor's shadow participation at runtime — the per-actor
+    /// counterpart to
+    /// [`set_sprite_instance_shadow_flags`](Self::set_sprite_instance_shadow_flags),
+    /// routed to its clip instance. Returns `false` on a stale id.
+    ///
+    /// The third setter a preview needs. An actor that is not there yet must
+    /// not darken the ground under it, or the preview reads as a character
+    /// already standing on it -- which is the one thing it is not.
+    pub fn set_actor_shadow_flags(&mut self, id: BillboardActorId, shadows: ShadowFlags) -> bool {
+        let Some(idx) = self.actor_map.index(id) else {
+            return false;
+        };
+        let Some(inst) = self.billboard_actors[idx].as_ref().map(|a| a.inst) else {
+            return false;
+        };
+        self.set_sprite_instance_shadow_flags(inst, shadows);
+        true
+    }
+
     /// Remove an actor and its clip instance. Returns `false` on a stale id.
     pub fn remove_billboard_actor(&mut self, id: BillboardActorId) -> bool {
         let Some(idx) = self.actor_map.index(id) else {
