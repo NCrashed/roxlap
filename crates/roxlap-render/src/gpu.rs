@@ -907,6 +907,33 @@ impl GpuBackend {
             .pixel_ray(camera.right, camera.down, camera.forward, rx, ry)
     }
 
+    /// The window pixel a world point falls on. See
+    /// [`SceneRenderer::screen_of`].
+    pub(crate) fn screen_of(&self, camera: &Camera, world: [f64; 3]) -> Option<(f64, f64)> {
+        let rel = [
+            world[0] - camera.pos[0],
+            world[1] - camera.pos[1],
+            world[2] - camera.pos[2],
+        ];
+        let (rx, ry) = self
+            .gpu
+            .screen_of(camera.right, camera.down, camera.forward, rel)?;
+        Some(self.render_to_window_f(rx, ry))
+    }
+
+    /// …and back the other way from [`window_to_render_f`].
+    fn render_to_window_f(&self, x: f64, y: f64) -> (f64, f64) {
+        let (rw, rh) = self.gpu.render_dims();
+        let (nw, nh) = self.gpu.surface_dims();
+        if rw == 0 || rh == 0 || (rw, rh) == (nw, nh) {
+            return (x, y);
+        }
+        (
+            x * f64::from(nw) / f64::from(rw),
+            y * f64::from(nh) / f64::from(rh),
+        )
+    }
+
     /// Map a window (native) pixel to the render-target (logical) grid.
     /// Identity under `RenderResolution::Native`.
     fn window_to_render_f(&self, x: f64, y: f64) -> (f64, f64) {

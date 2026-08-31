@@ -221,6 +221,34 @@ impl GpuRenderer {
         Some((pixels, w, h))
     }
 
+    /// The render-target pixel a camera-relative offset falls on, under
+    /// the GPU marcher's projection -- the exact inverse of
+    /// [`Self::pixel_ray`]. `None` before the first scene render, or for
+    /// a point at or behind the eye.
+    #[must_use]
+    pub fn screen_of(
+        &self,
+        right: [f64; 3],
+        down: [f64; 3],
+        forward: [f64; 3],
+        rel: [f64; 3],
+    ) -> Option<(f64, f64)> {
+        let dda = self.scene_dda.as_ref()?;
+        let (w, h) = dda.storage_size;
+        if w == 0 || h == 0 || self.last_fov_y_rad <= 0.0 {
+            return None;
+        }
+        pinhole_screen_of(
+            right,
+            down,
+            forward,
+            rel,
+            f64::from(w),
+            f64::from(h),
+            f64::from(self.last_fov_y_rad),
+        )
+    }
+
     /// World-space view-ray direction (un-normalised) for window pixel
     /// `(x, y)`, under the GPU marcher's projection — the canonical GPU
     /// unproject, mirroring `scene_dda.wgsl`'s `render_scene`
@@ -281,6 +309,93 @@ pub fn pinhole_pixel_ray(
         forward[1] + kx * right[1] - ky * down[1],
         forward[2] + kx * right[2] - ky * down[2],
     ]
+}
+
+/// The window pixel a world offset falls on under the same vertical-FOV
+/// pinhole [`pinhole_pixel_ray`] unprojects — its exact inverse.
+///
+/// `rel` is the point **relative to the camera**; the basis is
+/// orthonormal, so camera space is three dot products. `None` for a point
+/// at or behind the eye plane, which has no pixel: a caller drawing a
+/// marker over something must not be handed a coordinate for a thing
+/// behind it.
+///
+/// Standalone for the reason its inverse is: unit-testable without a
+/// device, and round-trippable against it.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn pinhole_screen_of(
+    right: [f64; 3],
+    down: [f64; 3],
+    forward: [f64; 3],
+    rel: [f64; 3],
+    w: f64,
+    h: f64,
+    fov_y_rad: f64,
+) -> Option<(f64, f64)> {
+    let dot = |v: [f64; 3]| v[0] * rel[0] + v[1] * rel[1] + v[2] * rel[2];
+    let ahead = dot(forward);
+    if ahead <= 0.0 || w <= 0.0 || h <= 0.0 || fov_y_rad <= 0.0 {
+        return None;
+    }
+    let half_h = (fov_y_rad * 0.5).tan();
+    let half_w = half_h * (w / h);
+    // `pinhole_pixel_ray` builds `forward + kx·right - ky·down`, so an
+    // orthonormal basis reads the two back off directly.
+    let (kx, ky) = (dot(right) / ahead, -dot(down) / ahead);
+    let ndc_x = kx / half_w;
+    let ndc_y_top = ky / half_h;
+    Some((
+        (ndc_x + 1.0) * 0.5 * w - 0.5,
+        (1.0 - ndc_y_top) * 0.5 * h - 0.5,
+    ))
+}
+
+#[cfg(test)]
+mod screen_of_tests {
+    use super::{pinhole_pixel_ray, pinhole_screen_of};
+
+    const RIGHT: [f64; 3] = [1.0, 0.0, 0.0];
+    const DOWN: [f64; 3] = [0.0, 1.0, 0.0];
+    const FWD: [f64; 3] = [0.0, 0.0, 1.0];
+    const W: f64 = 800.0;
+    const H: f64 = 600.0;
+    const FOV: f64 = 1.2;
+
+    /// **The round trip is the whole test.** Unproject a pixel, walk any
+    /// distance down the ray, project it back: the same pixel. That holds
+    /// whatever the projection is, so it cannot pass by agreeing with a
+    /// convention this file also got wrong.
+    #[test]
+    fn a_pixel_unprojected_and_projected_back_is_the_same_pixel() {
+        for &(x, y) in &[
+            (0.0, 0.0),
+            (W / 2.0, H / 2.0),
+            (W - 1.0, H - 1.0),
+            (17.0, 533.0),
+            (799.0, 3.0),
+        ] {
+            let dir = pinhole_pixel_ray(RIGHT, DOWN, FWD, x, y, W, H, FOV);
+            for far in [0.5, 1.0, 250.0] {
+                let rel = [dir[0] * far, dir[1] * far, dir[2] * far];
+                let (bx, by) = pinhole_screen_of(RIGHT, DOWN, FWD, rel, W, H, FOV)
+                    .expect("a point down a view ray is on screen");
+                assert!(
+                    (bx - x).abs() < 1e-9 && (by - y).abs() < 1e-9,
+                    "({x}, {y}) at {far} came back as ({bx}, {by})",
+                );
+            }
+        }
+    }
+
+    /// A point behind the eye has no pixel. Answering one would put a
+    /// marker for something at the player's back on the far side of the
+    /// screen, which reads as a thing that is there.
+    #[test]
+    fn nothing_behind_the_eye_has_a_pixel() {
+        assert!(pinhole_screen_of(RIGHT, DOWN, FWD, [0.0, 0.0, -5.0], W, H, FOV).is_none());
+        assert!(pinhole_screen_of(RIGHT, DOWN, FWD, [3.0, 1.0, 0.0], W, H, FOV).is_none());
+    }
 }
 
 #[cfg(test)]

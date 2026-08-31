@@ -4693,6 +4693,29 @@ impl SceneRenderer {
         })
     }
 
+    /// Canonical world→screen project: the window pixel a world point
+    /// falls on, under whichever projection the last frame used. The
+    /// inverse of [`view_ray`](Self::view_ray), and the one entry point
+    /// both backends honour -- hosts never reconstruct the projection,
+    /// which matters twice as much here because the two backends do not
+    /// share one.
+    ///
+    /// `None` before the first frame, and for anything at or behind the
+    /// eye plane: a point behind the camera has no pixel, and answering
+    /// one would put a marker for something at the player's back on the
+    /// far side of the screen, where it reads as a thing that is there.
+    ///
+    /// **What it is for is world-anchored HUD** -- an icon over a body, a
+    /// number over a wound, a name over a door. Everything else the HUD
+    /// draws is screen-space and needs none of this.
+    #[must_use]
+    pub fn screen_of(&self, camera: &Camera, world: [f64; 3]) -> Option<(f64, f64)> {
+        match &self.inner {
+            BackendImpl::Cpu(c) => c.screen_of(camera, world),
+            BackendImpl::Gpu(g) => g.screen_of(camera, world),
+        }
+    }
+
     /// One-call screen→world voxel pick: unproject pixel `(x, y)` with
     /// the active backend's projection, read the last frame's depth
     /// there, reconstruct the world hit, and resolve it to the owning
