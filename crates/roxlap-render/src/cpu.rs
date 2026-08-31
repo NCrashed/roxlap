@@ -288,37 +288,6 @@ pub(crate) fn setcamera_pixel_ray(
     ]
 }
 
-/// The logical pixel a world offset falls on under the same projection
-/// [`setcamera_pixel_ray`] unprojects — its exact inverse.
-///
-/// `rel` is the point **relative to the camera**; the basis is
-/// orthonormal (see `roxlap_core::camera_math`), so camera space is three
-/// dot products. `None` for a point at or behind the eye plane, which has
-/// no pixel.
-pub(crate) fn setcamera_screen_of(
-    right: [f64; 3],
-    down: [f64; 3],
-    forward: [f64; 3],
-    rel: [f64; 3],
-    hx: f32,
-    hy: f32,
-    hz: f32,
-) -> Option<(f64, f64)> {
-    let dot = |v: [f64; 3]| v[0] * rel[0] + v[1] * rel[1] + v[2] * rel[2];
-    let ahead = dot(forward);
-    if ahead <= 0.0 {
-        return None;
-    }
-    // The ray through `(x, y)` is `(x-hx)·right + (y-hy)·down + hz·forward`,
-    // so the offsets come back as the other two coordinates scaled to
-    // where `forward` reads `hz`.
-    let t = f64::from(hz) / ahead;
-    Some((
-        f64::from(hx) + dot(right) * t,
-        f64::from(hy) + dot(down) * t,
-    ))
-}
-
 /// RP.1 — box-average one `s × s` march block into a single logical pixel.
 /// `fb` is the march framebuffer (`0x00RRGGBB`, row stride `march_w`); the
 /// block's top-left is `(lx·s, ly·s)`. Per-channel round-to-nearest via integer
@@ -717,37 +686,6 @@ impl CpuBackend {
             hy,
             hz,
         ))
-    }
-
-    /// The window pixel a world point falls on. See
-    /// [`SceneRenderer::screen_of`].
-    pub(crate) fn screen_of(&self, camera: &Camera, world: [f64; 3]) -> Option<(f64, f64)> {
-        let (hx, hy, hz) = self.last_hxyz;
-        if hz <= 0.0 {
-            return None;
-        }
-        let rel = [
-            world[0] - camera.pos[0],
-            world[1] - camera.pos[1],
-            world[2] - camera.pos[2],
-        ];
-        let (lx, ly) =
-            setcamera_screen_of(camera.right, camera.down, camera.forward, rel, hx, hy, hz)?;
-        Some(self.logical_to_window_f(lx, ly))
-    }
-
-    /// …and back the other way from [`window_to_logical_f`], for a
-    /// projection that lands in the logical grid the frame marched at.
-    fn logical_to_window_f(&self, x: f64, y: f64) -> (f64, f64) {
-        let (lw, lh) = self.last_dims;
-        let (nw, nh) = self.current_dims;
-        if lw == 0 || lh == 0 || (lw, lh) == (nw, nh) {
-            return (x, y);
-        }
-        (
-            x * f64::from(nw) / f64::from(lw),
-            y * f64::from(nh) / f64::from(lh),
-        )
     }
 
     /// Map a window (native) pixel coordinate to the logical render-target
@@ -2677,50 +2615,5 @@ mod blend_tests {
             blend_rgb(0x00_FF_FF_FF, 0xFF_FF_FF_FF, 200) & 0xFF00_0000,
             0
         );
-    }
-}
-
-#[cfg(test)]
-mod screen_of_tests {
-    use super::{setcamera_pixel_ray, setcamera_screen_of};
-
-    const RIGHT: [f64; 3] = [1.0, 0.0, 0.0];
-    const DOWN: [f64; 3] = [0.0, 1.0, 0.0];
-    const FWD: [f64; 3] = [0.0, 0.0, 1.0];
-    const HX: f32 = 400.0;
-    const HY: f32 = 300.0;
-    const HZ: f32 = 400.0;
-
-    /// **The round trip is the whole test.** Unproject a pixel, walk any
-    /// distance down the ray, project it back: the same pixel. That holds
-    /// whatever the projection is, so it cannot pass by agreeing with a
-    /// convention this file also got wrong.
-    #[test]
-    fn a_pixel_unprojected_and_projected_back_is_the_same_pixel() {
-        for &(x, y) in &[
-            (0.0, 0.0),
-            (400.0, 300.0),
-            (799.0, 599.0),
-            (23.0, 411.0),
-            (612.0, 7.0),
-        ] {
-            let dir = setcamera_pixel_ray(RIGHT, DOWN, FWD, x, y, HX, HY, HZ);
-            for far in [0.25, 1.0, 900.0] {
-                let rel = [dir[0] * far, dir[1] * far, dir[2] * far];
-                let (bx, by) = setcamera_screen_of(RIGHT, DOWN, FWD, rel, HX, HY, HZ)
-                    .expect("a point down a view ray is on screen");
-                assert!(
-                    (bx - x).abs() < 1e-9 && (by - y).abs() < 1e-9,
-                    "({x}, {y}) at {far} came back as ({bx}, {by})",
-                );
-            }
-        }
-    }
-
-    /// A point at or behind the eye plane has no pixel.
-    #[test]
-    fn nothing_behind_the_eye_has_a_pixel() {
-        assert!(setcamera_screen_of(RIGHT, DOWN, FWD, [0.0, 0.0, -9.0], HX, HY, HZ).is_none());
-        assert!(setcamera_screen_of(RIGHT, DOWN, FWD, [5.0, 5.0, 0.0], HX, HY, HZ).is_none());
     }
 }
