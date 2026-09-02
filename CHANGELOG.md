@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The fog mask can be coarser than the grid** —
+  `VisionConfig::cell_span`, grid columns per mask cell (default `1`,
+  which is every existing mask unchanged, byte for byte). A hull is
+  authored at a voxel to the cell and wants the fog there; an outdoor
+  map's voxels are a texture, sixteen to the cell a body stands on, and
+  a per-column mask made it pay twice over — the shadowcast covered
+  `span²` times the cells it needed, and it re-ran whenever an observer
+  crossed a *column*, i.e. every frame anyone walked. Both come back by
+  `span²`: a 64-cell field with a ten-cell sight went from a ~20 ms
+  pass a couple of times a second to one under a millisecond.
+
+  Every coordinate on the module's surface stays a grid column — the
+  span is a resolution, not a change of frame — so `state`, `hear`,
+  `hides_sprite`, `FowObserver::cell` and the `for_each_*` walks are
+  what they were. What changes is the grain: a column's state is its
+  block's, and the fog's edge steps in blocks. Spans are rounded down to
+  a power of two within a chunk, so a mask cell never straddles the
+  seam a chunk index is taken at, and `set_config` drops the mask when
+  the span changes rather than keeping cells written at the old grain.
+
+  GPU: `GpuFowMask` carries the span and `pack_fog_mask` takes it,
+  packed as its `log2` into the flags word (`FOG_SPAN_SHIFT`); the
+  shader shifts a voxel's XY down by it before indexing.
+
 ## [0.32.0] — 2026-08-08
 
 **Billboard up axis (BB.6)** — a billboard's image vertical was a

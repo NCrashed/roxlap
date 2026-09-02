@@ -495,6 +495,7 @@ fn fog_mask_uniform(vsid: u32, state: u8, intensity: u8, memory_dim: f32) -> Vec
         [0, 0],
         vsid,
         vsid,
+        1,
         &[[0, 255]],
         0,
         memory_dim,
@@ -564,6 +565,98 @@ fn scene_dda_fog_mask_hides_unseen_shows_visible() {
     renderer.set_fog_mask(&[]);
     let cleared = render(&mut renderer);
     assert_eq!(cleared, base, "disabled fog is byte-identical");
+}
+
+/// A mask CELL may be wider than a grid column (`VisionConfig::
+/// cell_span`): the shader shifts a voxel's XY down by the span's `log2`
+/// before indexing. Two things have to hold, and a mask that merely fits
+/// would pass the first alone — so this checks both: a span-4 mask a
+/// quarter the width still covers the whole floor (the shift happens at
+/// all), and blanking ONE cell of it blanks exactly its own block, with
+/// the neighbouring block still drawn (the index lands where it should).
+#[test]
+fn scene_dda_fog_mask_spans_blocks_of_columns() {
+    let Some((gpu, _lock)) = try_init() else {
+        return;
+    };
+    let vsid = 32u32;
+    let chunk = decompress_chunk(&floor_chunk(vsid)); // floor voxel at z=100
+    let grid = GridUpload {
+        vsid,
+        origin_chunk: [0, 0, 0],
+        chunks_dims: [1, 1, 1],
+        pool_dims: [1, 1, 1],
+        chunks: vec![([0, 0, 0], chunk)],
+    };
+    let scene = GpuSceneResident::upload(&gpu.device, &SceneUpload { grids: vec![grid] });
+    let (w, h) = (64u32, 64u32);
+    let mut renderer = HeadlessSceneRenderer::new(&gpu.device, &gpu.queue, w, h);
+    let cam = Camera {
+        position: [16.0, 16.0, 50.0],
+        right: [1.0, 0.0, 0.0],
+        down: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, 1.0],
+        fov_y_rad: 60f32.to_radians(),
+    };
+    let px = |dx: u32| ((h / 2) * w + w / 2 + dx) as usize;
+    let render = |r: &mut HeadlessSceneRenderer| {
+        r.render(
+            &gpu.device,
+            &gpu.queue,
+            &scene,
+            &[cam],
+            cam.fov_y_rad,
+            64,
+            0.0,
+        )
+    };
+
+    // A span-4 mask over the same ground: 8x8 cells, not 32x32 columns.
+    let span = 4u32;
+    let cells_wide = vsid / span;
+    let mask = |cells: &[u8]| {
+        roxlap_gpu::fow::pack_fog_mask(
+            0,
+            [0, 0],
+            cells_wide,
+            cells_wide,
+            span,
+            &[[0, 255]],
+            0,
+            1.0,
+            0.0,
+            false,
+            cells,
+        )
+    };
+
+    let visible = vec![2u8 << 6 | 63; (cells_wide * cells_wide) as usize];
+    renderer.set_fog_mask(&mask(&visible));
+    let all = render(&mut renderer);
+    assert!(
+        is_block_color(all[px(0)]),
+        "a quarter-width mask must still cover the floor — the shader \
+         did not shift, got {:#08x}",
+        all[px(0)],
+    );
+
+    // The camera sits over column (16, 16) — cell (4, 4) at this span —
+    // and eight pixels right is about seven columns, so it lands in the
+    // NEXT cell along. Blank the centre cell only.
+    let mut one_out = visible.clone();
+    one_out[(4 * cells_wide + 4) as usize] = 0;
+    renderer.set_fog_mask(&mask(&one_out));
+    let holed = render(&mut renderer);
+    assert!(
+        !is_block_color(holed[px(0)]),
+        "the blanked block must read as sky, got {:#08x}",
+        holed[px(0)],
+    );
+    assert!(
+        is_block_color(holed[px(8)]),
+        "…and only that block: its neighbour is still floor, got {:#08x}",
+        holed[px(8)],
+    );
 }
 
 /// FW.3 — a Memory cell at low intensity renders dimmer than the live

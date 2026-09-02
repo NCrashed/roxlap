@@ -263,6 +263,7 @@ struct PointLight {
 @group(0) @binding(22) var<storage, read> fog_mask: array<u32>;
 const FOG_ENABLED: u32 = 0u;    // flags word; 0 = off
 const FOG_FLAG_UNSEEN_OCCLUDES: u32 = 2u; // bit 1: unseen renders opaque black
+const FOG_SPAN_SHIFT: u32 = 8u; // bits 8-12: log2 of columns per mask cell
 const FOG_GRID: u32 = 1u;       // scene-grid index the mask applies to
 const FOG_DECKS_N: u32 = 2u;    // number of decks
 const FOG_ORIGIN_X: u32 = 3u;   // grid-local cell of buffer (0,0), i32
@@ -326,8 +327,13 @@ fn fow_lookup(g: u32, cxm: i32, cym: i32, czm: i32, mip: u32) -> FowV {
     let oy = bitcast<i32>(fog_mask[FOG_ORIGIN_Y]);
     let w = i32(fog_mask[FOG_WIDTH]);
     let h = i32(fog_mask[FOG_HEIGHT]);
-    let lx = m0x - ox;
-    let ly = m0y - oy;
+    // The mask may be coarser than the grid: a cell spans
+    // `1 << span` columns per axis, and the buffer is indexed in cells.
+    // An arithmetic shift is floor division, so a column left of the
+    // grid origin lands in the block it is inside.
+    let span = (fog_mask[FOG_ENABLED] >> FOG_SPAN_SHIFT) & 31u;
+    let lx = (m0x >> span) - ox;
+    let ly = (m0y >> span) - oy;
     if (lx < 0 || lx >= w || ly < 0 || ly >= h) { v.hidden = true; return v; }
     let idx = u32(deck) * u32(w) * u32(h) + u32(ly) * u32(w) + u32(lx);
     let word = fog_mask[FOG_CELLS_BASE + (idx >> 2u)];

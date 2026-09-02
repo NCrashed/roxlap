@@ -172,6 +172,30 @@ pub struct VisionConfig {
     /// per-deck query. Must stay the same length across
     /// [`FogOfWar::set_config`] calls (layers are keyed by index).
     pub decks: Vec<DeckBand>,
+    /// How many grid columns one mask cell spans, per axis. `1` (the
+    /// default) is a mask cell per column — what a hull wants, where a
+    /// voxel is about ten centimetres and a crewman peers round a
+    /// doorframe.
+    ///
+    /// **What the fog can resolve, told apart from what the grid can.**
+    /// A strategy map's voxels are a texture, not a unit of thought: an
+    /// outdoor grid at sixteen columns to the cell asks the shadowcast
+    /// for two hundred and fifty six times the cells it needs, and
+    /// recomputes the lot whenever an observer crosses a *column* —
+    /// sixteen times per cell walked. Both of those are the span, not
+    /// the sight radius, and both come back by a factor of `span²`.
+    ///
+    /// Every coordinate crossing this module's surface stays a grid
+    /// column — the span is a resolution, not a change of frame — so a
+    /// caller sets it and nothing else moves. What it costs is the
+    /// obvious thing: the fog's edge steps in blocks of `span`, and a
+    /// column's state is its block's.
+    ///
+    /// Rounded down to a power of two in `1..=`[`CHUNK_SIZE_XY`], so a
+    /// mask cell never straddles two chunks.
+    ///
+    /// [`CHUNK_SIZE_XY`]: crate::CHUNK_SIZE_XY
+    pub cell_span: u32,
     /// Whether never-seen ground on the observer's OWN deck is drawn as
     /// opaque black instead of being treated as air.
     ///
@@ -223,6 +247,7 @@ impl VisionConfig {
             peripheral_range: 12.0,
             edge_taper: 4.0,
             decks,
+            cell_span: 1,
             unseen_occludes: false,
             light_gate: None,
             fade_in: 240.0,
@@ -253,12 +278,17 @@ impl VisionConfig {
 /// bands + styling, so the two backends agree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuFowMask {
-    /// Grid-local cell coordinate of the buffer's `(0, 0)`.
+    /// Mask-cell coordinate of the buffer's `(0, 0)`, grid-local: a
+    /// column's cell is `column >> log2(cell_span)`.
     pub origin_cell: [i32; 2],
-    /// Buffer width in cells.
+    /// Buffer width in mask cells.
     pub width: u32,
-    /// Buffer height in cells.
+    /// Buffer height in mask cells.
     pub height: u32,
+    /// Grid columns one mask cell spans, per axis
+    /// ([`VisionConfig::cell_span`], validated). The shader shifts a
+    /// voxel's XY down by its `log2` before indexing `cells`.
+    pub cell_span: u32,
     /// Per-deck `(z_top, z_bottom)` inclusive bands (deck order matches
     /// the `deck` axis of `cells`).
     pub decks: Vec<[i32; 2]>,
@@ -384,6 +414,30 @@ struct DeckLayer {
     opacity: FastMap<(i32, i32), OpacityTile>,
 }
 
+/// The validated [`VisionConfig::cell_span`] as a shift.
+///
+/// Rounded DOWN to a power of two and capped at the chunk width, so a
+/// mask cell is always a whole number of columns and never straddles two
+/// chunks -- the twin's copy list and the opacity tiles both index by
+/// chunk, and a cell across a seam would belong to two of them.
+fn span_shift_of(config: &VisionConfig) -> u32 {
+    let span = config.cell_span.clamp(1, CHUNK_SIZE_XY);
+    // `ilog2` of a non-power-of-two rounds down, which is the clamp.
+    span.ilog2()
+}
+
+/// The column a mask cell is sampled at: its middle.
+///
+/// **The middle, not the corner.** A block's occlusion has to stand for
+/// the whole of it, and a corner sample reads the seam between two cells
+/// -- a wall drawn along a cell edge would block the block it is not in
+/// and pass the one it is.
+#[inline]
+fn sample_column(cell: IVec2, span_shift: u32) -> IVec2 {
+    let half = (1 << span_shift) >> 1;
+    IVec2::new((cell.x << span_shift) + half, (cell.y << span_shift) + half)
+}
+
 fn split_cell(cell: IVec2) -> ((i32, i32), usize) {
     let tx = cell.x.div_euclid(TILE);
     let ty = cell.y.div_euclid(TILE);
@@ -453,22 +507,35 @@ fn deck_chz_range(band: DeckBand) -> (i32, i32) {
 /// FNV-1a mix of the chunk signatures (plus the config generation and the
 /// observer's eye band, so light-gate retunes AND eye-height changes
 /// re-sample) backing one XY tile of a deck band.
+/// A tile is `TILE` MASK cells across, which is `TILE << span_shift`
+/// columns -- one chunk column at span 1, and a square of them above
+/// that, all of which have to be in the key or an edit in the tile's
+/// far corner would not invalidate its samples.
 fn tile_key(
     grid: &Grid,
     band: DeckBand,
     eye_lo: i32,
     eye_hi: i32,
     config_gen: u64,
+    span_shift: u32,
     tx: i32,
     ty: i32,
 ) -> u64 {
     let (chz_lo, chz_hi) = band_chz_range(band, eye_lo, eye_hi);
+    let cs_xy = CHUNK_SIZE_XY as i32;
+    // Chunks per tile axis: at least one, and the mask cell divides the
+    // chunk, so this is exact.
+    let per = ((TILE << span_shift) / cs_xy).max(1);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     fnv(&mut h, config_gen);
     fnv(&mut h, eye_lo as u64);
     fnv(&mut h, eye_hi as u64);
     for chz in chz_lo..=chz_hi {
-        mix_chunk_sig(&mut h, grid, IVec3::new(tx, ty, chz));
+        for cy in 0..per {
+            for cx in 0..per {
+                mix_chunk_sig(&mut h, grid, IVec3::new(tx * per + cx, ty * per + cy, chz));
+            }
+        }
     }
     h
 }
@@ -537,6 +604,10 @@ struct ObserverKey {
 pub struct FogOfWar {
     config: VisionConfig,
     config_gen: u64,
+    /// `log2` of the validated [`VisionConfig::cell_span`] — every
+    /// column↔mask-cell conversion is this shift, so the power of two is
+    /// checked once rather than divided by everywhere.
+    span_shift: u32,
     layers: Vec<DeckLayer>,
     /// Currently-visible cells of `visible_deck` → target intensity.
     visible: HashMap<(i32, i32), f32>,
@@ -576,9 +647,11 @@ impl FogOfWar {
     #[must_use]
     pub fn new(config: VisionConfig) -> Self {
         let layers = config.decks.iter().map(|_| DeckLayer::default()).collect();
+        let span_shift = span_shift_of(&config);
         Self {
             config,
             config_gen: 0,
+            span_shift,
             layers,
             visible: HashMap::new(),
             visible_deck: 0,
@@ -611,8 +684,41 @@ impl FogOfWar {
             self.config.decks.len(),
             "FW deck count is fixed per FogOfWar (layers are index-keyed)"
         );
+        // A span change re-frames every stored cell, so the memory it
+        // was written at no longer means what it says: drop it rather
+        // than leave blocks of the old grain lying in the mask.
+        let span_shift = span_shift_of(&config);
+        if span_shift != self.span_shift {
+            self.layers = config.decks.iter().map(|_| DeckLayer::default()).collect();
+            self.visible.clear();
+            self.heard.clear();
+            self.heard_cells.clear();
+            self.transitions.clear();
+            self.los_valid = false;
+            self.span_shift = span_shift;
+        }
         self.config = config;
         self.config_gen += 1;
+    }
+
+    /// One mask cell's width in grid columns.
+    #[must_use]
+    pub fn cell_span(&self) -> u32 {
+        1 << self.span_shift
+    }
+
+    /// The mask cell a grid column falls in. Arithmetic shift, so a
+    /// column left of the origin lands in the block it is inside rather
+    /// than the one truncation would round it toward.
+    #[inline]
+    fn mask_of(&self, column: IVec2) -> IVec2 {
+        IVec2::new(column.x >> self.span_shift, column.y >> self.span_shift)
+    }
+
+    /// …and back: the mask cell's low-corner column.
+    #[inline]
+    fn column_of(&self, cell: IVec2) -> IVec2 {
+        IVec2::new(cell.x << self.span_shift, cell.y << self.span_shift)
     }
 
     /// Bumped whenever any mask byte changes — FW.3 gates the GPU
@@ -638,14 +744,16 @@ impl FogOfWar {
         self.visible_deck
     }
 
-    /// What the observer knows about `cell` on `deck`, plus the
-    /// current fade intensity `0..=63`.
+    /// What the observer knows about the grid column `cell` on `deck`,
+    /// plus the current fade intensity `0..=63`. Under a
+    /// [`VisionConfig::cell_span`] wider than one column, that is what
+    /// the column's block knows.
     #[must_use]
     pub fn state(&self, deck: usize, cell: IVec2) -> (CellState, u8) {
         let Some(layer) = self.layers.get(deck) else {
             return (CellState::Unseen, 0);
         };
-        let b = layer.byte(cell);
+        let b = layer.byte(self.mask_of(cell));
         (CellState::from_bits(b >> 6), b & INTENSITY_MAX)
     }
 
@@ -660,16 +768,20 @@ impl FogOfWar {
         if deck >= self.config.decks.len() || loudness <= 0.0 {
             return false;
         }
-        let r = self.config.heard_radius * loudness;
+        // In mask cells, like everything the blob is later compared
+        // against -- the radius and the taper are declared in columns.
+        let span = self.cell_span() as f32;
+        let centre = self.mask_of(cell);
+        let r = self.config.heard_radius * loudness / span;
         let ri = r.ceil() as i32;
-        let taper = self.config.edge_taper.max(1.0);
+        let taper = (self.config.edge_taper / span).max(1.0);
         let mut cells = Vec::new();
         for dy in -ri..=ri {
             for dx in -ri..=ri {
                 let d = f64::from(dx * dx + dy * dy).sqrt() as f32;
                 let t = ((r - d) / taper).clamp(0.0, 1.0);
                 if t > 0.0 {
-                    cells.push((cell + IVec2::new(dx, dy), t * f32::from(INTENSITY_MAX)));
+                    cells.push((centre + IVec2::new(dx, dy), t * f32::from(INTENSITY_MAX)));
                 }
             }
         }
@@ -758,9 +870,13 @@ impl FogOfWar {
     /// has SINCE decayed to Memory keeps its already-copied geometry in
     /// the twin, so it need not reappear here — but see
     /// [`Self::for_each_known_cell`] for a fresh twin.
+    /// Cells are reported as their low-corner grid COLUMN, so a caller
+    /// walking them into chunk indices needs to know nothing about
+    /// [`VisionConfig::cell_span`] (a mask cell never straddles a chunk).
     pub fn for_each_live_cell(&self, mut f: impl FnMut(usize, IVec2, CellState)) {
         for &(x, y) in self.visible.keys() {
-            f(self.visible_deck, IVec2::new(x, y), CellState::Visible);
+            let at = self.column_of(IVec2::new(x, y));
+            f(self.visible_deck, at, CellState::Visible);
         }
         for &(deck, x, y) in self.heard_cells.keys() {
             // A cell the active deck also sees is reported once, as
@@ -768,7 +884,7 @@ impl FogOfWar {
             if deck == self.visible_deck && self.visible.contains_key(&(x, y)) {
                 continue;
             }
-            f(deck, IVec2::new(x, y), CellState::Heard);
+            f(deck, self.column_of(IVec2::new(x, y)), CellState::Heard);
         }
     }
 
@@ -790,7 +906,8 @@ impl FogOfWar {
                     }
                     let ix = idx as i32 % TILE;
                     let iy = idx as i32 / TILE;
-                    f(deck, IVec2::new(tx * TILE + ix, ty * TILE + iy), state);
+                    let at = self.column_of(IVec2::new(tx * TILE + ix, ty * TILE + iy));
+                    f(deck, at, state);
                 }
             }
         }
@@ -820,6 +937,13 @@ impl FogOfWar {
     /// [`Self::mask_version`].
     #[must_use]
     pub fn gpu_mask(&self, origin_cell: IVec2, width: u32, height: u32) -> GpuFowMask {
+        // The caller sizes the rectangle in grid COLUMNS (a residency
+        // hint is chunks); the buffer holds mask CELLS. Round the origin
+        // down and the extent up, so the rectangle the caller asked for
+        // is covered whatever the span.
+        let origin_cell = self.mask_of(origin_cell);
+        let span = self.cell_span();
+        let (width, height) = (width.div_ceil(span), height.div_ceil(span));
         let (w, h) = (width as usize, height as usize);
         let deck_count = self.config.decks.len();
         let mut cells = vec![0u8; deck_count * w * h];
@@ -851,6 +975,7 @@ impl FogOfWar {
             origin_cell: [origin_cell.x, origin_cell.y],
             width,
             height,
+            cell_span: span,
             decks: self
                 .config
                 .decks
@@ -931,13 +1056,19 @@ impl FogOfWar {
             self.los_key.clear();
             self.los_valid = true;
         } else {
-            // LOS recompute when any observer's key moves.
+            // LOS recompute when any observer's key moves. The cell is
+            // the observer's MASK cell: a body that has not left its
+            // block cannot have changed what the block can see, so a
+            // wide span is also how often this pass runs, not only how
+            // much of it there is. The edit key stays in columns -- it
+            // is about the geometry in view, which the grid keeps at its
+            // own grain.
             let band = self.config.decks[deck];
             let radius = self.config.range.max(self.config.peripheral_range).ceil() as i32;
             let keys: Vec<ObserverKey> = live
                 .iter()
                 .map(|o| ObserverKey {
-                    cell: o.cell,
+                    cell: self.mask_of(o.cell),
                     facing: quantize_facing(o.facing),
                     eye_z: o.eye_z,
                     edit_key: local_edit_key(
@@ -978,17 +1109,29 @@ impl FogOfWar {
         // intensities, which is what `LosScan` already does for overlap
         // within a single cone.
         let mut new_visible: HashMap<(i32, i32), f32> = HashMap::new();
+        let span_shift = self.span_shift;
+        // The scan works in mask cells throughout, so the declared
+        // reaches -- which are columns, like every other coordinate on
+        // this module's surface -- come in divided by the span.
+        let span = f32::from(u16::try_from(1u32 << span_shift).unwrap_or(1));
+        let reach = Reach {
+            range: self.config.range / span,
+            peripheral: self.config.peripheral_range / span,
+            taper: (self.config.edge_taper / span).max(1.0),
+        };
         for observer in observers {
             let layer = &mut self.layers[deck];
             let mut scan = LosScan {
                 grid,
                 cfg: &self.config,
+                reach,
+                span_shift,
                 band,
                 eye_lo: observer.eye_z - EYE_HALF,
                 eye_hi: observer.eye_z + EYE_HALF,
                 config_gen: self.config_gen,
                 layer,
-                origin: observer.cell,
+                origin: IVec2::new(observer.cell.x >> span_shift, observer.cell.y >> span_shift),
                 facing: normalize_facing(observer.facing),
                 out: &mut new_visible,
                 key_memo: None,
@@ -1606,9 +1749,24 @@ fn quantize_facing(f: Vec2) -> i32 {
 /// 8-octant algorithm) over the deck's opacity, classifying every
 /// LOS-clear cell against the cone/peripheral shape and the light
 /// gate.
+/// What one scan reaches, in MASK cells — [`VisionConfig`]'s own
+/// reaches are columns, and dividing them once per scan keeps the span
+/// out of the per-cell arithmetic.
+#[derive(Clone, Copy)]
+struct Reach {
+    range: f32,
+    peripheral: f32,
+    taper: f32,
+}
+
 struct LosScan<'a> {
     grid: &'a Grid,
     cfg: &'a VisionConfig,
+    /// The reaches this scan measures against, in mask cells.
+    reach: Reach,
+    /// `log2` of the mask's cell span: what turns a mask cell into the
+    /// column the grid is actually sampled at.
+    span_shift: u32,
     band: DeckBand,
     /// Eye-level opacity band `[eye_lo, eye_hi]`, grid-local — derived
     /// from the observer's `eye_z ± EYE_HALF`, not the deck.
@@ -1639,7 +1797,7 @@ const OCTANTS: [[i32; 4]; 8] = [
 
 impl LosScan<'_> {
     fn radius(&self) -> i32 {
-        self.cfg.range.max(self.cfg.peripheral_range).ceil() as i32
+        self.reach.range.max(self.reach.peripheral).ceil() as i32
     }
 
     fn run(&mut self) {
@@ -1671,6 +1829,7 @@ impl LosScan<'_> {
                     self.eye_lo,
                     self.eye_hi,
                     self.config_gen,
+                    self.span_shift,
                     tx,
                     ty,
                 );
@@ -1694,7 +1853,7 @@ impl LosScan<'_> {
                 self.eye_lo,
                 self.eye_hi,
                 self.cfg.light_gate.as_ref(),
-                cell,
+                sample_column(cell, self.span_shift),
             );
             tile.computed[w] |= bit;
             if blocked {
@@ -1709,13 +1868,13 @@ impl LosScan<'_> {
     /// `(dx, dy)` from the origin and record its target intensity.
     fn visit(&mut self, cell: IVec2, dx: i32, dy: i32) {
         let d = f64::from(dx * dx + dy * dy).sqrt() as f32;
-        let taper = self.cfg.edge_taper.max(1.0);
+        let taper = self.reach.taper;
         let mut vis = 0.0f32;
-        if d <= self.cfg.peripheral_range {
-            vis = ((self.cfg.peripheral_range - d) / taper).clamp(0.0, 1.0);
+        if d <= self.reach.peripheral {
+            vis = ((self.reach.peripheral - d) / taper).clamp(0.0, 1.0);
         }
         if let Some(f) = self.facing {
-            if d <= self.cfg.range && d > 0.0 {
+            if d <= self.reach.range && d > 0.0 {
                 let dir = Vec2::new(dx as f32, dy as f32) / d;
                 let ang = dir.dot(f).clamp(-1.0, 1.0).acos();
                 if ang <= self.cfg.cone_half_angle {
@@ -1969,6 +2128,125 @@ mod tests {
             assert_eq!(fow.state(0, at).0, CellState::Visible, "{at:?}");
         }
         assert_eq!(fow.state(0, IVec2::new(30, 0)).0, CellState::Unseen);
+    }
+
+    /// **A span is a resolution, not a change of frame.** Every column
+    /// of a block answers what the block knows, the reaches stay the
+    /// columns they were declared in, and a caller that never sets a
+    /// span cannot tell the difference.
+    #[test]
+    fn a_coarse_mask_answers_per_block_in_the_columns_it_was_asked_in() {
+        let g = open_room();
+        let mut c = cfg();
+        c.peripheral_range = 20.0;
+        c.cell_span = 4;
+        let mut fow = FogOfWar::new(c);
+        assert_eq!(fow.cell_span(), 4);
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::ZERO), SETTLE);
+
+        // Inside the peripheral reach, which is still twenty COLUMNS.
+        assert_eq!(fow.state(0, IVec2::new(16, 0)).0, CellState::Visible);
+        // …and out of it, which a mask in cells would have put at five.
+        assert_eq!(fow.state(0, IVec2::new(40, 0)).0, CellState::Unseen);
+        // Every column of a block agrees, because the block is the cell.
+        for dx in 0..4 {
+            for dy in 0..4 {
+                assert_eq!(
+                    fow.state(0, IVec2::new(16 + dx, dy)).0,
+                    CellState::Visible,
+                    "column ({dx}, {dy}) of a visible block",
+                );
+            }
+        }
+    }
+
+    /// …and a body that has not left its block does not pay for a
+    /// shadowcast, which is the whole reason to widen one. A column step
+    /// inside the block moves nothing; the step that crosses it does.
+    #[test]
+    fn a_coarse_mask_recomputes_when_a_block_is_crossed_and_not_before() {
+        let g = open_room();
+        let mut c = cfg();
+        c.peripheral_range = 20.0;
+        c.cell_span = 8;
+        let mut fow = FogOfWar::new(c);
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::ZERO), SETTLE);
+        let settled = fow.mask_version();
+
+        // Four columns along: the same block, so nothing was recast and
+        // nothing faded — the mask is byte-for-byte where it was.
+        fow.update(&g, &observer(IVec2::new(4, 0), Vec2::ZERO), 0.0);
+        assert_eq!(fow.mask_version(), settled, "a step inside the block");
+
+        // …and over the seam, where the rim really does move.
+        fow.update(&g, &observer(IVec2::new(8, 0), Vec2::ZERO), 0.0);
+        assert_ne!(fow.mask_version(), settled, "a step across the seam");
+    }
+
+    /// Retuning the span re-frames every stored cell, so the memory it
+    /// was written at no longer means what it says: the mask starts
+    /// again rather than keeping blocks of the old grain.
+    #[test]
+    fn a_span_change_forgets_what_was_written_at_the_old_one() {
+        let g = open_room();
+        let mut c = cfg();
+        c.peripheral_range = 20.0;
+        let mut fow = FogOfWar::new(c.clone());
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::ZERO), SETTLE);
+        assert_eq!(fow.state(0, IVec2::new(10, 0)).0, CellState::Visible);
+
+        c.cell_span = 4;
+        fow.set_config(c);
+        assert_eq!(fow.state(0, IVec2::new(10, 0)).0, CellState::Unseen);
+        // …and the next pass fills it again at the new grain.
+        fow.update(&g, &observer(IVec2::new(0, 0), Vec2::ZERO), SETTLE);
+        assert_eq!(fow.state(0, IVec2::new(10, 0)).0, CellState::Visible);
+    }
+
+    /// A span is a power of two and no wider than a chunk, so a mask
+    /// cell never straddles the seam a chunk index is taken at. What a
+    /// caller writes is rounded down to one.
+    #[test]
+    fn a_span_is_rounded_to_a_power_of_two_within_a_chunk() {
+        let span_of = |ask: u32| {
+            let mut c = cfg();
+            c.cell_span = ask;
+            FogOfWar::new(c).cell_span()
+        };
+        assert_eq!(span_of(0), 1, "no span is a cell per column");
+        assert_eq!(span_of(1), 1);
+        assert_eq!(span_of(16), 16);
+        assert_eq!(span_of(24), 16, "rounded down");
+        assert_eq!(span_of(4096), CHUNK_SIZE_XY, "capped at the chunk");
+    }
+
+    /// A live cell is reported as a COLUMN, whatever the span — the twin
+    /// walks these into chunk indices, and a mask cell reported in its
+    /// own units would land the chunk `span` times too near the origin.
+    #[test]
+    fn live_cells_are_reported_in_columns() {
+        let g = open_room();
+        let mut c = cfg();
+        c.peripheral_range = 20.0;
+        c.cell_span = 16;
+        let mut fow = FogOfWar::new(c);
+        fow.update(&g, &observer(IVec2::new(64, 64), Vec2::ZERO), SETTLE);
+
+        let mut seen = Vec::new();
+        fow.for_each_live_cell(|_, at, _| seen.push(at));
+        assert!(!seen.is_empty(), "something is visible at all");
+        assert!(
+            seen.iter().any(|at| at.x >= 48 && at.y >= 48),
+            "the observer's own block is reported near it, not near the \
+             origin: {seen:?}",
+        );
+        for at in &seen {
+            assert_eq!(
+                (at.x % 16, at.y % 16),
+                (0, 0),
+                "a block is reported by its low corner: {at:?}",
+            );
+        }
     }
 
     /// The point of `update_many`: what a party sees is the union of what
@@ -2349,12 +2627,12 @@ mod tests {
         let mut g = Grid::new(GridTransform::identity());
         let b = band();
         let (eye_lo, eye_hi) = (EYE_Z - EYE_HALF, EYE_Z + EYE_HALF);
-        let k_absent = tile_key(&g, b, eye_lo, eye_hi, 0, 0, 0);
+        let k_absent = tile_key(&g, b, eye_lo, eye_hi, 0, 0, 0, 0);
         // Materialise chunk (0,0,0) as empty air — mirrors a stream-in:
         // version stays 0, only presence changes.
         let _ = g.ensure_chunk(IVec3::new(0, 0, 0));
         assert_eq!(g.chunk_version(IVec3::new(0, 0, 0)), 0);
-        let k_present = tile_key(&g, b, eye_lo, eye_hi, 0, 0, 0);
+        let k_present = tile_key(&g, b, eye_lo, eye_hi, 0, 0, 0, 0);
         assert_ne!(
             k_absent, k_present,
             "presence must change the tile key at version 0"
