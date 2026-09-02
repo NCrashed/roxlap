@@ -4796,9 +4796,43 @@ impl Drop for Frame<'_> {
     }
 }
 
+/// RP.0 — carry a pixel from one raster to another: the window and the
+/// grid the scene is actually marched in.
+///
+/// **Both directions, one rule.** A host hands in window pixels (a
+/// cursor) and gets window pixels back (a projected point), while the
+/// marcher works in its own grid — so every one of those crossings is
+/// this ratio, and the pair that went missing was the way back. Identity
+/// when the two rasters agree, which is `RenderResolution::Native` and
+/// was every frame before the scene could be marched smaller.
+pub(crate) fn rescale_pixel(x: f64, y: f64, from: (u32, u32), to: (u32, u32)) -> (f64, f64) {
+    if from.0 == 0 || from.1 == 0 || from == to {
+        return (x, y);
+    }
+    (
+        x * f64::from(to.0) / f64::from(from.0),
+        y * f64::from(to.1) / f64::from(from.1),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RP.0 — a pixel carried between the window and the march grid comes
+    /// home, and a raster that matches is left alone (the identity path
+    /// every native frame takes).
+    #[test]
+    fn rescale_pixel_round_trips_between_rasters() {
+        let (win, march) = ((1920, 1080), (960, 540));
+        let (mx, my) = rescale_pixel(1600.0, 900.0, win, march);
+        assert!((mx - 800.0).abs() < 1e-9 && (my - 450.0).abs() < 1e-9);
+        let (wx, wy) = rescale_pixel(mx, my, march, win);
+        assert!((wx - 1600.0).abs() < 1e-9 && (wy - 900.0).abs() < 1e-9);
+        // Same raster, and a degenerate one, are both left verbatim.
+        assert_eq!(rescale_pixel(3.5, 4.5, win, win), (3.5, 4.5));
+        assert_eq!(rescale_pixel(3.5, 4.5, (0, 0), win), (3.5, 4.5));
+    }
 
     /// RP.0 — `Native` resolves to the window size verbatim (the byte-identical
     /// gate), `Fixed` ignores the window, `Scale` scales + clamps, and every

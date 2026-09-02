@@ -691,15 +691,21 @@ impl CpuBackend {
     /// Map a window (native) pixel coordinate to the logical render-target
     /// coordinate the last frame marched at. Identity under `Native`.
     fn window_to_logical_f(&self, x: f64, y: f64) -> (f64, f64) {
-        let (lw, lh) = self.last_dims;
-        let (nw, nh) = self.current_dims;
-        if nw == 0 || nh == 0 || (lw, lh) == (nw, nh) {
-            return (x, y);
-        }
-        (
-            x * f64::from(lw) / f64::from(nw),
-            y * f64::from(lh) / f64::from(nh),
-        )
+        crate::rescale_pixel(x, y, self.current_dims, self.last_dims)
+    }
+
+    /// …and back: a logical pixel as the window pixel it is blitted to.
+    /// The inverse of [`Self::window_to_logical_f`], for the projection
+    /// that answers in the frame it drew.
+    fn logical_to_window_f(&self, x: f32, y: f32) -> (f32, f32) {
+        let (wx, wy) = crate::rescale_pixel(
+            f64::from(x),
+            f64::from(y),
+            self.last_dims,
+            self.current_dims,
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        (wx as f32, wy as f32)
     }
 
     /// World-t depth at window pixel `(x, y)` from the last frame's z-buffer
@@ -1987,7 +1993,10 @@ impl CpuBackend {
         }
         let cx = cam.right[0] * d[0] + cam.right[1] * d[1] + cam.right[2] * d[2];
         let cy = cam.down[0] * d[0] + cam.down[1] * d[1] + cam.down[2] * d[2];
-        Some((hx + cx * hz / cz, hy + cy * hz / cz))
+        // RP.0 — the projection was derived at the LOGICAL size, and the
+        // caller is placing something over the window (this is `pixel_ray`
+        // run backwards, and that takes window pixels).
+        Some(self.logical_to_window_f(hx + cx * hz / cz, hy + cy * hz / cz))
     }
 
     /// Rasterise world-space textured quads ([`QuadDraw`]) over the

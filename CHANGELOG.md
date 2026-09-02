@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`project_point` answered in march pixels, not window pixels.** Its
+  contract is `view_ray` run backwards — window pixels in, window pixels
+  out — and `view_ray` maps the window into the march grid (RP.0), but
+  the way back was never applied. Identical under
+  `RenderResolution::Native`, so it only showed once a host marched the
+  scene smaller than its window: everything a host pinned over a world
+  point (a label, a menu, a marker) drifted toward the top-left corner by
+  the render scale. Both backends now map the projection back, through
+  one shared rescale rather than a fourth hand-written ratio.
+
 ### Added
 
 - **The fog mask can be coarser than the grid** —

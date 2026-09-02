@@ -910,15 +910,7 @@ impl GpuBackend {
     /// Map a window (native) pixel to the render-target (logical) grid.
     /// Identity under `RenderResolution::Native`.
     fn window_to_render_f(&self, x: f64, y: f64) -> (f64, f64) {
-        let (rw, rh) = self.gpu.render_dims();
-        let (nw, nh) = self.gpu.surface_dims();
-        if nw == 0 || nh == 0 || (rw, rh) == (nw, nh) {
-            return (x, y);
-        }
-        (
-            x * f64::from(rw) / f64::from(nw),
-            y * f64::from(rh) / f64::from(nh),
-        )
+        crate::rescale_pixel(x, y, self.gpu.surface_dims(), self.gpu.render_dims())
     }
 
     fn window_to_render_u(&self, x: u32, y: u32) -> (u32, u32) {
@@ -1398,13 +1390,31 @@ impl GpuBackend {
     /// Project a world point to window pixels under the marcher's
     /// projection. See [`SceneRenderer::project_point`].
     pub(crate) fn project_point(&self, camera: &Camera, world: [f32; 3]) -> Option<(f32, f32)> {
-        self.gpu.project_point(
+        let (px, py) = self.gpu.project_point(
             camera.pos.map(|v| v as f32),
             camera.right.map(|v| v as f32),
             camera.down.map(|v| v as f32),
             camera.forward.map(|v| v as f32),
             world,
-        )
+        )?;
+        // RP.0 — the marcher projects into the RENDER grid, and the caller
+        // is placing something over the window (this is `pixel_ray` run
+        // backwards, and that takes window pixels).
+        Some(self.render_to_window_f(px, py))
+    }
+
+    /// Map a render-target (logical) pixel back to the window it is
+    /// blitted to. The inverse of [`Self::window_to_render_f`]; identity
+    /// under `RenderResolution::Native`.
+    fn render_to_window_f(&self, x: f32, y: f32) -> (f32, f32) {
+        let (wx, wy) = crate::rescale_pixel(
+            f64::from(x),
+            f64::from(y),
+            self.gpu.render_dims(),
+            self.gpu.surface_dims(),
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        (wx as f32, wy as f32)
     }
 
     /// Draw world-space 2D image sprites over the pending frame — the
