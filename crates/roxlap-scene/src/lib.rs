@@ -72,7 +72,7 @@ pub use billboard::{canonical_viewpoints, BillboardCache, BillboardSnapshot};
 pub use character::{CharacterBody, CharacterDef, MoveMode, WalkInput};
 pub use chunks::{BakeLight, BakeMode};
 pub use collide::{box_overlaps_solid, grid_box_overlaps_solid, point_overlaps_solid, Solidity};
-pub use edit::SpanOp;
+pub use edit::{ColumnSpan, SpanOp};
 pub use fow::{
     CellState, DeckBand, FogOfWar, FowObserver, FowRender, FowTwin, GpuFowMask, LightGate,
     VisionConfig,
