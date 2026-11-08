@@ -76,6 +76,11 @@ pub(crate) struct GpuBackend {
     /// scene's ship) would ghost into a gridless scene. (The CPU backend
     /// renders straight from the scene each frame, so it can't go stale.)
     resident_scene_grids: Vec<u32>,
+    /// Which scene value the resident was built from. A replacement scene
+    /// can reuse the same grid ids and chunk versions as the one it
+    /// replaces; without this its unedited chunks would never re-upload
+    /// and the old geometry would stay on screen.
+    resident_scene: Option<roxlap_scene::SceneInstance>,
     /// Per-grid record of what the resident scene last synced (QE.3b —
     /// one struct with its invariants documented in place, replacing
     /// two parallel vectors whose update rules lived only in comments).
@@ -205,6 +210,7 @@ impl GpuBackend {
             grid_ids: Vec::new(),
             last_fog: None,
             resident_scene_grids: Vec::new(),
+            resident_scene: None,
             sync: Vec::new(),
             sprite_registry: None,
             sprite_instances: Vec::new(),
@@ -1477,10 +1483,11 @@ impl GpuBackend {
         // use the same filter as `upload_scene` or the set never matches.
         let mut ids: Vec<u32> = scene.render_grids().map(|(g, _)| g.raw()).collect();
         ids.sort_unstable();
-        ids == self.resident_scene_grids
+        ids == self.resident_scene_grids && self.resident_scene == Some(scene.instance())
     }
 
     fn upload_scene(&mut self, scene: &Scene) {
+        self.resident_scene = Some(scene.instance());
         // Snapshot the scene's grid set so a later scene switch is detected
         // (see `resident_matches_scene`). Recorded even when no grids are
         // uploadable yet — the empty set still has to match next frame.

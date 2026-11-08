@@ -1080,6 +1080,21 @@ impl Grid {
     }
 }
 
+/// Which [`Scene`] value this is. Every scene gets a fresh one when it
+/// is made (new, default or from a snapshot), so a renderer that keeps
+/// per-scene GPU state can tell a replacement scene from the one it
+/// uploaded, even when the two hold the same grid ids and chunk
+/// versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SceneInstance(u64);
+
+impl Default for SceneInstance {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// Top-level scene container. Holds a flat collection of grids
 /// keyed by [`GridId`].
 ///
@@ -1089,6 +1104,7 @@ impl Grid {
 #[derive(Debug, Default)]
 pub struct Scene {
     grids: HashMap<GridId, Grid>,
+    instance: SceneInstance,
     next_grid_id: u32,
     /// S7.3: per-scene streaming pool + result channel. Stored on
     /// the `Scene` so `pump_streaming` can dispatch background
@@ -1104,6 +1120,12 @@ impl Scene {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This scene's identity; see [`SceneInstance`].
+    #[must_use]
+    pub fn instance(&self) -> SceneInstance {
+        self.instance
     }
 
     /// Number of grids currently registered.
@@ -2102,5 +2124,23 @@ mod tests {
         assert_eq!(g.select_lod(DVec3::new(200.0, 0.0, 0.0)), Lod::Mid);
         // 500 units → Far.
         assert_eq!(g.select_lod(DVec3::new(600.0, 0.0, 0.0)), Lod::Far);
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+
+    #[test]
+    fn every_scene_is_a_new_instance() {
+        let a = Scene::new();
+        let b = Scene::default();
+        assert_ne!(a.instance(), b.instance());
+        // Same grids, same ids, still another scene.
+        let mut c = Scene::new();
+        let mut d = Scene::new();
+        assert_eq!(c.add_grid(GridTransform::identity()), d.add_grid(GridTransform::identity()));
+        assert_ne!(c.instance(), d.instance());
+        assert_eq!(c.instance(), c.instance());
     }
 }
