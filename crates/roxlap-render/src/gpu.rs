@@ -1182,10 +1182,13 @@ impl GpuBackend {
             self.resident = None;
         }
 
+        if self.resident.is_some() && !self.refresh_dirty(scene) {
+            // An edited chunk outgrew its colour slot: rebuild with slots
+            // sized for it rather than draw it with clipped colours.
+            self.resident = None;
+        }
         if self.resident.is_none() {
             self.upload_scene(scene);
-        } else {
-            self.refresh_dirty(scene);
         }
 
         // FW.3 — upload the fog-of-war mask for the twin grid (or clear
@@ -1599,10 +1602,13 @@ impl GpuBackend {
     /// [`DirtyExtent`](roxlap_scene::DirtyExtent) is consumed at sync
     /// time (the future partial-refresh path keys on it; consuming now
     /// keeps the "changes since the GPU last synced" contract exact).
-    fn refresh_dirty(&mut self, scene: &mut Scene) {
+    /// Returns `false` when a chunk no longer fits its colour slot and
+    /// the resident must be rebuilt with a larger stride.
+    fn refresh_dirty(&mut self, scene: &mut Scene) -> bool {
         let Some(resident) = self.resident.as_mut() else {
-            return;
+            return true;
         };
+        let mut fits = true;
         let queue = self.gpu.queue();
         let mut decompressed = 0u32;
         let mut evicted = 0u32;
@@ -1688,6 +1694,10 @@ impl GpuBackend {
                 }
                 let upload = roxlap_gpu::decompress_chunk(vxl);
                 let outcome = resident.refresh_chunk(queue, scene_idx, idx3, &upload);
+                if outcome == roxlap_gpu::RefreshOutcome::ColorsTruncated {
+                    log::info!("chunk {chunk_ivec3} outgrew its colour slot; re-uploading the scene");
+                    fits = false;
+                }
                 if outcome == roxlap_gpu::RefreshOutcome::ChunkOutOfBbox {
                     complete = false;
                 } else {
@@ -1719,6 +1729,7 @@ impl GpuBackend {
         if decompressed > 8 || evicted > 0 {
             log::debug!("refreshed {decompressed} chunks, evicted {evicted}");
         }
+        fits
     }
 
     /// DL — translate the per-frame world-space [`LightRig`] into each

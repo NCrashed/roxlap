@@ -107,9 +107,25 @@ impl MipLayout {
 /// per column at slopes/cliffs; 256 KiB gives ~1.8× headroom.
 /// Memory cost on the demo's 32×32×1 static grid: 1024 slots ×
 /// 256 KiB = 256 MiB colours (~830 MiB resident scene total).
-/// Chunks past the cap truncate with a stderr warn; GPU.7
-/// sliding-window storage removes the cap entirely.
+/// This is the floor; a grid with denser chunks gets a larger stride
+/// (see [`colors_stride_for`]), and a chunk that outgrows its slot at
+/// run time reports [`RefreshOutcome::ColorsTruncated`] so the caller
+/// can rebuild the resident with room for it.
 pub const COLORS_PER_CHUNK_WORDS: u32 = 65536;
+
+/// Room left over the densest chunk when a grid's colour stride is
+/// chosen, as a fraction of it. Runtime edits add colours (a carve
+/// exposes new wall surface); without room the densest chunk overflows
+/// its slot on its first edit.
+const COLORS_HEADROOM_DIV: usize = 4;
+
+/// The per-slot colour stride for a grid whose densest chunk holds
+/// `max_chunk_colors`: [`COLORS_PER_CHUNK_WORDS`] at least, and a
+/// quarter more than the densest chunk.
+#[must_use]
+pub fn colors_stride_for(max_chunk_colors: usize) -> usize {
+    (COLORS_PER_CHUNK_WORDS as usize).max(max_chunk_colors + max_chunk_colors / COLORS_HEADROOM_DIV)
+}
 
 /// Number of separate storage bindings the concatenated occupancy
 /// buffer is split ("paged") across. A single storage binding may
@@ -420,7 +436,7 @@ impl GpuSceneResident {
                 .map(|(_, c)| c.mips.iter().map(|m| m.colors.len()).sum::<usize>())
                 .max()
                 .unwrap_or(0);
-            let colors_stride = (COLORS_PER_CHUNK_WORDS as usize).max(max_chunk_colors);
+            let colors_stride = colors_stride_for(max_chunk_colors);
             grid_colors_strides.push(colors_stride as u32);
 
             // Validate pool_dims are powers of 2 — required for the
@@ -794,7 +810,7 @@ impl GpuSceneResident {
             let remaining = colors_stride.saturating_sub(color_cursor);
             let n = mip.colors.len().min(remaining);
             if n < mip.colors.len() {
-                eprintln!(
+                log::debug!(
                     "roxlap-gpu refresh_chunk: scene_idx={scene_idx} chunk_idx={chunk_idx:?} \
                      mip {m} colours overflow stride {colors_stride}; truncating",
                 );
@@ -1341,9 +1357,9 @@ pub enum RefreshOutcome {
     /// The chunk was installed/refreshed in full — every mip's
     /// occupancy, offsets, and colours are resident.
     Ok,
-    /// The chunk's colour count exceeded `COLORS_PER_CHUNK_WORDS`;
-    /// the GPU sees the first `stride` colours. Bump
-    /// `COLORS_PER_CHUNK_WORDS` for content that hits this.
+    /// The chunk's colours outgrew its slot's stride; the GPU sees the
+    /// first `stride` of them. Rebuild the resident (a fresh upload sizes
+    /// the stride for the chunk as it is now).
     ColorsTruncated,
     /// Retained for ABI compatibility; the GPU.7 modular pool no
     /// longer rejects chunks by bbox.
@@ -1530,5 +1546,20 @@ mod tests {
         // The whole ladder is only ~1/7 larger than mip-0 alone
         // (geometric 1 + 1/8 + 1/64 + …) — here on the doubled base.
         assert!(l.occ_words_per_slot < 2 * 128 * 128 * 8 * 5 / 4);
+    }
+}
+
+#[cfg(test)]
+mod stride_tests {
+    use super::*;
+
+    #[test]
+    fn stride_leaves_room_over_the_densest_chunk() {
+        let floor = COLORS_PER_CHUNK_WORDS as usize;
+        assert_eq!(colors_stride_for(0), floor);
+        assert_eq!(colors_stride_for(floor / 2), floor);
+        // A chunk exactly at the floor still gets room to grow.
+        assert_eq!(colors_stride_for(floor), floor + floor / 4);
+        assert_eq!(colors_stride_for(72_126), 72_126 + 18_031);
     }
 }
