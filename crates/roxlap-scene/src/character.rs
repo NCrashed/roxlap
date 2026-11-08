@@ -681,13 +681,21 @@ impl CharacterBody {
 
         // Snap down: must land within step_up, else it wasn't a
         // ledge (walking off into air is the normal fall path, not a
-        // step).
-        if self.move_axis(scene, 2, self.def.step_up + SKIN) {
-            true
-        } else {
-            self.pos = saved;
-            false
+        // step). In moves of at most one voxel: `move_axis` clamps to
+        // the plane the leading face crossed last, which is only the
+        // surface when one plane was crossed, so a step_up above one
+        // voxel would otherwise leave the body hovering over a lower
+        // ledge.
+        let mut left = self.def.step_up + SKIN;
+        while left > 0.0 {
+            let d = left.min(1.0);
+            if self.move_axis(scene, 2, d) {
+                return true;
+            }
+            left -= d;
         }
+        self.pos = saved;
+        false
     }
 
     /// Thin skin box just below the feet. After a landing clamp the
@@ -1046,6 +1054,36 @@ mod tests {
         };
         for _ in 0..240 {
             body.walk(&scene, DT, input);
+        }
+        assert!(body.pos().x > 106.0, "walked onto the ledge");
+        assert!(
+            (body.pos().z - (99.0 - SKIN)).abs() < 1e-9,
+            "feet on the ledge plane, got {}",
+            body.pos().z
+        );
+        assert!(body.on_ground());
+    }
+
+    /// A step height of several voxels must still land flush on a
+    /// shorter ledge: the snap down crosses more than one cell plane,
+    /// and a single clamped move would leave the body hovering.
+    #[test]
+    fn tall_step_up_lands_flush_on_a_low_ledge() {
+        let scene = ledge_scene(99);
+        let mut body = body_on_ground(&scene);
+        body.def_mut().step_up = 2.1;
+        let input = WalkInput {
+            wish: DVec3::new(1.0, 0.0, 0.0),
+            jump: false,
+            sink: false,
+        };
+        for _ in 0..240 {
+            body.walk(&scene, DT, input);
+            assert!(
+                body.pos().z >= 99.0 - SKIN - 1e-9,
+                "lifted above the ledge plane: {}",
+                body.pos().z
+            );
         }
         assert!(body.pos().x > 106.0, "walked onto the ledge");
         assert!(
